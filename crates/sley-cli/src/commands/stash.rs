@@ -49,7 +49,7 @@ pub(super) enum StashListFormat {
     },
 }
 
-pub(crate) fn cmd_stash(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_stash(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("-h") | Some("--help") => {
             stash_usage_stdout();
@@ -60,28 +60,28 @@ pub(crate) fn cmd_stash(args: &[String]) -> Result<()> {
             stash_usage_stderr();
             Err(GitError::Exit(129))
         }
-        Some("apply") => cmd_stash_apply(&args[1..]),
-        Some("branch") => cmd_stash_branch(&args[1..]),
-        Some("clear") => cmd_stash_clear(&args[1..]),
-        Some("create") => cmd_stash_create(&args[1..]),
-        Some("drop") => cmd_stash_drop(&args[1..]),
-        Some("export") => cmd_stash_export(&args[1..]),
-        Some("import") => cmd_stash_import(&args[1..]),
-        Some("list") => cmd_stash_list(&args[1..]),
-        Some("pop") => cmd_stash_pop(&args[1..]),
-        Some("push") => cmd_stash_push(&args[1..]),
-        Some("save") => cmd_stash_save(&args[1..]),
-        Some("show") => cmd_stash_show(&args[1..]),
-        Some("store") => cmd_stash_store(&args[1..]),
+        Some("apply") => cmd_stash_apply(cli_session, &args[1..]),
+        Some("branch") => cmd_stash_branch(cli_session, &args[1..]),
+        Some("clear") => cmd_stash_clear(cli_session, &args[1..]),
+        Some("create") => cmd_stash_create(cli_session, &args[1..]),
+        Some("drop") => cmd_stash_drop(cli_session, &args[1..]),
+        Some("export") => cmd_stash_export(cli_session, &args[1..]),
+        Some("import") => cmd_stash_import(cli_session, &args[1..]),
+        Some("list") => cmd_stash_list(cli_session, &args[1..]),
+        Some("pop") => cmd_stash_pop(cli_session, &args[1..]),
+        Some("push") => cmd_stash_push(cli_session, &args[1..]),
+        Some("save") => cmd_stash_save(cli_session, &args[1..]),
+        Some("show") => cmd_stash_show(cli_session, &args[1..]),
+        Some("store") => cmd_stash_store(cli_session, &args[1..]),
         // No subcommand: assume `git stash push` (git's `push_stash_unassumed`
         // fallback). In this "assumed" mode a bare positional token that isn't a
         // pathspec after `--` is rejected, so `git stash -q drop` errors instead
         // of silently stashing a pathspec named `drop`.
         Some(_) => {
             stash_reject_assumed_push_token(args)?;
-            cmd_stash_push(args)
+            cmd_stash_push(cli_session, args)
         }
-        None => cmd_stash_push(&[]),
+        None => cmd_stash_push(cli_session, &[]),
     }
 }
 
@@ -260,26 +260,26 @@ struct AppliedStash {
     display: String,
 }
 
-fn cmd_stash_apply(args: &[String]) -> Result<()> {
+fn cmd_stash_apply(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut options = setup_stash_apply_options(args, "apply")?;
     options.reinstate_index = Some(
         options
             .reinstate_index
-            .unwrap_or(stash_index_config_default()?),
+            .unwrap_or(stash_index_config_default(cli_session)?),
     );
-    apply_stash_entry(options)?;
+    apply_stash_entry(cli_session, options)?;
     Ok(())
 }
 
-fn cmd_stash_pop(args: &[String]) -> Result<()> {
+fn cmd_stash_pop(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut options = setup_stash_apply_options(args, "pop")?;
     options.reinstate_index = Some(
         options
             .reinstate_index
-            .unwrap_or(stash_index_config_default()?),
+            .unwrap_or(stash_index_config_default(cli_session)?),
     );
     let quiet = options.quiet;
-    let applied = apply_stash_entry(options)?;
+    let applied = apply_stash_entry(cli_session, options)?;
     drop_stash_entry(
         &applied.common_git_dir,
         applied.format,
@@ -289,7 +289,7 @@ fn cmd_stash_pop(args: &[String]) -> Result<()> {
     )
 }
 
-fn cmd_stash_branch(args: &[String]) -> Result<()> {
+fn cmd_stash_branch(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     if args.is_empty() {
         eprintln!("No branch name specified");
         return Err(GitError::Exit(1));
@@ -307,8 +307,7 @@ fn cmd_stash_branch(args: &[String]) -> Result<()> {
         .get(1)
         .cloned()
         .unwrap_or_else(|| "refs/stash@{0}".to_string());
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
@@ -327,21 +326,24 @@ fn cmd_stash_branch(args: &[String]) -> Result<()> {
         .first()
         .ok_or_else(|| GitError::InvalidObject(format!("stash {stash_oid} has no parent")))?;
     cmd_checkout(&["-b".to_string(), branch.clone(), base_oid.to_hex()])?;
-    let applied = apply_stash_entry(StashApplyOptions {
-        quiet: false,
-        reinstate_index: Some(true),
-        explicit_selector: true,
-        selector: match args.get(1) {
-            Some(spec) => parse_stash_drop_selector(spec).unwrap_or(0),
-            None => 0,
+    let applied = apply_stash_entry(
+        cli_session,
+        StashApplyOptions {
+            quiet: false,
+            reinstate_index: Some(true),
+            explicit_selector: true,
+            selector: match args.get(1) {
+                Some(spec) => parse_stash_drop_selector(spec).unwrap_or(0),
+                None => 0,
+            },
+            spec: args.get(1).cloned(),
+            display,
+            direct_oid: Some(stash_oid),
+            label_ours: None,
+            label_theirs: None,
+            label_base: None,
         },
-        spec: args.get(1).cloned(),
-        display,
-        direct_oid: Some(stash_oid),
-        label_ours: None,
-        label_theirs: None,
-        label_base: None,
-    })?;
+    )?;
     if args
         .get(1)
         .is_none_or(|spec| stash_argument_names_stash_ref(spec))
@@ -400,9 +402,11 @@ fn stash_apply_usage(command: &str) {
     eprintln!();
 }
 
-fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+fn apply_stash_entry(
+    cli_session: &crate::session::CliSession,
+    options: StashApplyOptions,
+) -> Result<AppliedStash> {
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
@@ -514,7 +518,7 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
         if tracked_tree_unchanged {
             println!("Already up to date.");
         }
-        cmd_status(&[])?;
+        cmd_status(cli_session, &[])?;
     }
     if let StashApplyOutcome::Conflict = outcome {
         // git leaves the conflict in the worktree/index and exits nonzero so the
@@ -1084,7 +1088,7 @@ fn restore_stash_tree_entries_to_worktree(
     Ok(())
 }
 
-fn cmd_stash_clear(args: &[String]) -> Result<()> {
+fn cmd_stash_clear(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     if let Some(arg) = args.first() {
         if arg.starts_with('-') {
             eprintln!("error: unknown option `{}'", arg.trim_start_matches('-'));
@@ -1095,8 +1099,7 @@ fn cmd_stash_clear(args: &[String]) -> Result<()> {
         eprintln!("error: git stash clear with arguments is unimplemented");
         return Err(GitError::Exit(1));
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
@@ -1109,7 +1112,7 @@ fn cmd_stash_clear(args: &[String]) -> Result<()> {
     }
 }
 
-fn cmd_stash_drop(args: &[String]) -> Result<()> {
+fn cmd_stash_drop(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut specs = Vec::new();
     for arg in args {
@@ -1140,8 +1143,7 @@ fn cmd_stash_drop(args: &[String]) -> Result<()> {
         None => 0,
     };
 
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     drop_stash_entry(&common_git_dir, format, selector, &display, quiet)
@@ -1155,18 +1157,19 @@ fn drop_stash_entry(
     quiet: bool,
 ) -> Result<()> {
     let store = FileRefStore::new(common_git_dir, format);
-    let mut entries = store.read_reflog("refs/stash")?;
-    if entries.is_empty() {
-        eprintln!("No stash entries found.");
-        return Err(GitError::Exit(1));
-    }
-    if selector >= entries.len() {
-        eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
-        return Err(GitError::Exit(128));
-    }
-    let entry_index = entries.len() - 1 - selector;
-    let dropped = entries.remove(entry_index);
-    if entries.is_empty() {
+    let plan =
+        match sley_sequencer::stash::plan_stash_drop(store.read_reflog("refs/stash")?, selector) {
+            Ok(plan) => plan,
+            Err(sley_sequencer::stash::StashDropError::Empty) => {
+                eprintln!("No stash entries found.");
+                return Err(GitError::Exit(1));
+            }
+            Err(sley_sequencer::stash::StashDropError::OutOfRange { available }) => {
+                eprintln!("fatal: log for 'stash' only has {available} entries");
+                return Err(GitError::Exit(128));
+            }
+        };
+    if plan.remaining.is_empty() {
         match store.delete_ref("refs/stash") {
             Ok(_) | Err(GitError::NotFound(_)) => {
                 let _ = fs::remove_file(common_git_dir.join("logs").join("refs/stash"));
@@ -1174,9 +1177,8 @@ fn drop_stash_entry(
             Err(err) => return Err(err),
         }
     } else {
-        let new_top = entries
-            .last()
-            .map(|entry| entry.new_oid)
+        let new_top = plan
+            .new_tip
             .ok_or_else(|| GitError::InvalidFormat("stash reflog has no top entry".into()))?;
         let mut tx = store.transaction();
         tx.update(RefUpdate {
@@ -1186,10 +1188,10 @@ fn drop_stash_entry(
             reflog: None,
         });
         tx.commit()?;
-        store.write_reflog("refs/stash", &entries)?;
+        store.write_reflog("refs/stash", &plan.remaining)?;
     }
     if !quiet {
-        println!("Dropped {display} ({})", dropped.new_oid.to_hex());
+        println!("Dropped {display} ({})", plan.dropped.new_oid.to_hex());
     }
     Ok(())
 }
@@ -1230,10 +1232,16 @@ fn stash_drop_usage() {
     eprintln!();
 }
 
-fn cmd_stash_create(args: &[String]) -> Result<()> {
-    if let Some(created) =
-        create_stash_commit(args, false, false, StashCreateMode::Worktree, &[], false)?
-    {
+fn cmd_stash_create(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    if let Some(created) = create_stash_commit(
+        cli_session,
+        args,
+        false,
+        false,
+        StashCreateMode::Worktree,
+        &[],
+        false,
+    )? {
         println!("{}", created.oid);
     }
     Ok(())
@@ -1245,7 +1253,7 @@ enum StashCreateMode {
     Staged,
 }
 
-fn cmd_stash_push(args: &[String]) -> Result<()> {
+fn cmd_stash_push(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut include_untracked = false;
     let mut include_ignored = false;
@@ -1445,6 +1453,7 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(1));
         }
         return stash_push_patch(
+            cli_session,
             &message_args,
             &pathspecs,
             quiet,
@@ -1454,6 +1463,7 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
         );
     }
     let Some(created) = create_stash_commit(
+        cli_session,
         &message_args,
         include_untracked,
         include_ignored,
@@ -1492,6 +1502,7 @@ fn stash_patch_option_requires_patch_error<T>(option: &str) -> Result<T> {
 }
 
 fn stash_push_patch(
+    cli_session: &crate::session::CliSession,
     message_args: &[String],
     pathspecs: &[String],
     quiet: bool,
@@ -1499,8 +1510,7 @@ fn stash_push_patch(
     inter_hunk_context: Option<i64>,
     auto_advance: bool,
 ) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
@@ -1550,6 +1560,7 @@ fn stash_push_patch(
         &git_dir,
         &common_git_dir,
         &worktree_root,
+        &sley_core::original_cwd().unwrap_or_else(|| cli_session.cwd().to_path_buf()),
         format,
         &original_entries,
         pathspecs,
@@ -1569,6 +1580,7 @@ fn stash_record_selected_patch(
     git_dir: &Path,
     common_git_dir: &Path,
     worktree_root: &Path,
+    preserved_cwd: &Path,
     format: ObjectFormat,
     original_entries: &[IndexEntry],
     pathspecs: &[String],
@@ -1648,6 +1660,7 @@ fn stash_record_selected_patch(
         git_dir: git_dir.to_path_buf(),
         common_git_dir: common_git_dir.to_path_buf(),
         worktree_root: worktree_root.to_path_buf(),
+        preserved_cwd: preserved_cwd.to_path_buf(),
         untracked_paths: Vec::new(),
         pathspec_paths: Vec::new(),
         has_pathspec: false,
@@ -1712,7 +1725,7 @@ fn stash_restore_index_bytes(index_path: &Path, original: Option<&[u8]>) -> Resu
     Ok(())
 }
 
-fn cmd_stash_save(args: &[String]) -> Result<()> {
+fn cmd_stash_save(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut include_untracked = false;
     let mut include_ignored = false;
@@ -1872,6 +1885,7 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(1));
         }
         return stash_push_patch(
+            cli_session,
             &message_args,
             &[],
             quiet,
@@ -1881,6 +1895,7 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
         );
     }
     let Some(created) = create_stash_commit(
+        cli_session,
         &message_args,
         include_untracked,
         include_ignored,
@@ -1910,23 +1925,34 @@ fn store_created_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> 
 
 fn record_created_stash(created: &CreatedStash) -> Result<()> {
     let store = FileRefStore::new(&created.common_git_dir, created.format);
-    let old_oid = match store.read_ref("refs/stash")? {
-        Some(RefTarget::Direct(oid)) => oid,
-        Some(RefTarget::Symbolic(_)) | None => zero_oid(created.format)?,
+    commit_stash_store_plan(
+        &store,
+        created.oid,
+        created.committer.clone(),
+        created.message.as_bytes().to_vec(),
+    )?;
+    Ok(())
+}
+
+fn commit_stash_store_plan(
+    store: &FileRefStore,
+    stash_oid: ObjectId,
+    committer: Vec<u8>,
+    message: Vec<u8>,
+) -> Result<bool> {
+    let plan = sley_sequencer::stash::plan_stash_store(sley_sequencer::stash::StashStoreOptions {
+        current: store.read_ref("refs/stash")?,
+        stash_oid,
+        committer,
+        message,
+    });
+    let Some(update) = plan.update else {
+        return Ok(false);
     };
     let mut tx = store.transaction();
-    tx.update(RefUpdate {
-        name: "refs/stash".to_string(),
-        expected: None,
-        new: RefTarget::Direct(created.oid),
-        reflog: Some(ReflogEntry {
-            old_oid,
-            new_oid: created.oid,
-            committer: created.committer.clone(),
-            message: created.message.as_bytes().to_vec(),
-        }),
-    });
-    tx.commit()
+    tx.update(update);
+    tx.commit()?;
+    Ok(true)
 }
 
 fn cleanup_stored_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> Result<()> {
@@ -1936,9 +1962,9 @@ fn cleanup_stored_stash(created: CreatedStash, quiet: bool, keep_index: bool) ->
     }
 
     for path in &created.untracked_paths {
-        remove_stashed_untracked_path(&created.worktree_root, path)?;
+        remove_stashed_untracked_path(&created.worktree_root, path, &created.preserved_cwd)?;
     }
-    prune_empty_untracked_dirs_preserving_cwd(&created.worktree_root)?;
+    prune_empty_untracked_dirs_preserving_cwd(&created.worktree_root, &created.preserved_cwd)?;
 
     if created.pathspec_paths.is_empty() {
         if !created.has_pathspec {
@@ -1993,6 +2019,7 @@ struct CreatedStash {
     git_dir: PathBuf,
     common_git_dir: PathBuf,
     worktree_root: PathBuf,
+    preserved_cwd: PathBuf,
     untracked_paths: Vec<Vec<u8>>,
     pathspec_paths: Vec<PathBuf>,
     has_pathspec: bool,
@@ -2001,6 +2028,7 @@ struct CreatedStash {
 }
 
 fn create_stash_commit(
+    cli_session: &crate::session::CliSession,
     args: &[String],
     include_untracked: bool,
     include_ignored: bool,
@@ -2008,8 +2036,32 @@ fn create_stash_commit(
     pathspecs: &[String],
     quiet: bool,
 ) -> Result<Option<CreatedStash>> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
+    create_stash_commit_at(
+        &git_dir,
+        cli_session.cwd(),
+        args,
+        include_untracked,
+        include_ignored,
+        mode,
+        pathspecs,
+        quiet,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_stash_commit_at(
+    git_dir: &Path,
+    cwd: &Path,
+    args: &[String],
+    include_untracked: bool,
+    include_ignored: bool,
+    mode: StashCreateMode,
+    pathspecs: &[String],
+    quiet: bool,
+) -> Result<Option<CreatedStash>> {
+    let cwd = cwd.to_path_buf();
+    let git_dir = git_dir.to_path_buf();
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
@@ -2197,6 +2249,7 @@ fn create_stash_commit(
         index_oid: index_commit,
         git_dir,
         common_git_dir,
+        preserved_cwd: sley_core::original_cwd().unwrap_or_else(|| cwd.clone()),
         worktree_root,
         untracked_paths,
         pathspec_paths,
@@ -2244,12 +2297,12 @@ fn stash_identity_from_env(role: &str) -> Result<Vec<u8>> {
     sley_sequencer::format_commit_identity(&name, &email, &date)
 }
 
-fn stash_index_config_default() -> Result<bool> {
+fn stash_index_config_default(cli_session: &crate::session::CliSession) -> Result<bool> {
     if let Some(value) = global_config_value("stash.index")? {
         return Ok(sley_config::parse_config_bool(&value).unwrap_or(false));
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let context = sley_config::ConfigIncludeContext::new(
         Some(common_git_dir.clone()),
@@ -2264,20 +2317,20 @@ fn stash_index_config_default() -> Result<bool> {
             &mut config,
             &parameters,
             &context,
-            &cwd,
+            cwd,
         );
     }
     Ok(config.get_bool("stash", None, "index").unwrap_or(false))
 }
 
 fn stash_show_include_untracked_config_default(
+    cwd: &Path,
     git_dir: &Path,
     common_git_dir: &Path,
 ) -> Result<bool> {
     if let Some(value) = global_config_value("stash.showIncludeUntracked")? {
         return Ok(sley_config::parse_config_bool(&value).unwrap_or(false));
     }
-    let cwd = env::current_dir()?;
     let context = sley_config::ConfigIncludeContext::new(
         Some(common_git_dir.to_path_buf()),
         repo_current_branch_name(git_dir),
@@ -2291,7 +2344,7 @@ fn stash_show_include_untracked_config_default(
             &mut config,
             &parameters,
             &context,
-            &cwd,
+            cwd,
         );
     }
     Ok(config
@@ -2542,7 +2595,11 @@ fn stash_untracked_entries(
     Ok(entries)
 }
 
-fn remove_stashed_untracked_path(worktree_root: &Path, path: &[u8]) -> Result<()> {
+fn remove_stashed_untracked_path(
+    worktree_root: &Path,
+    path: &[u8],
+    preserved_cwd: &Path,
+) -> Result<()> {
     let path = worktree_root.join(stash_repo_path_to_os_path(path)?);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -2574,7 +2631,7 @@ fn remove_stashed_untracked_path(worktree_root: &Path, path: &[u8]) -> Result<()
     while let Some(directory) = parent {
         if directory == worktree_root
             || directory.join(".git").exists()
-            || stash_path_is_original_cwd(directory)
+            || stash_path_is_original_cwd(directory, preserved_cwd)
         {
             break;
         }
@@ -2601,17 +2658,17 @@ fn stash_untracked_display_path(worktree_root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn stash_path_is_original_cwd(path: &Path) -> bool {
-    let Some(cwd) = sley_core::original_cwd().or_else(|| env::current_dir().ok()) else {
-        return false;
-    };
-    let cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
+fn stash_path_is_original_cwd(path: &Path, preserved_cwd: &Path) -> bool {
+    let cwd = fs::canonicalize(preserved_cwd).unwrap_or_else(|_| preserved_cwd.to_path_buf());
     let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     path == cwd
 }
 
-fn prune_empty_untracked_dirs_preserving_cwd(worktree_root: &Path) -> Result<()> {
-    fn visit(root: &Path, dir: &Path) -> Result<()> {
+fn prune_empty_untracked_dirs_preserving_cwd(
+    worktree_root: &Path,
+    preserved_cwd: &Path,
+) -> Result<()> {
+    fn visit(root: &Path, dir: &Path, preserved_cwd: &Path) -> Result<()> {
         let read = match fs::read_dir(dir) {
             Ok(read) => read,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -2624,8 +2681,8 @@ fn prune_empty_untracked_dirs_preserving_cwd(worktree_root: &Path) -> Result<()>
                 continue;
             }
             if entry.file_type()?.is_dir() {
-                visit(root, &path)?;
-                if !stash_path_is_original_cwd(&path) {
+                visit(root, &path, preserved_cwd)?;
+                if !stash_path_is_original_cwd(&path, preserved_cwd) {
                     match fs::remove_dir(&path) {
                         Ok(()) => {}
                         Err(err)
@@ -2640,7 +2697,7 @@ fn prune_empty_untracked_dirs_preserving_cwd(worktree_root: &Path) -> Result<()>
         }
         Ok(())
     }
-    visit(worktree_root, worktree_root)
+    visit(worktree_root, worktree_root, preserved_cwd)
 }
 
 fn stash_repo_path_to_os_path(path: &[u8]) -> Result<PathBuf> {
@@ -2694,7 +2751,7 @@ fn stash_file_mode(_metadata: &fs::Metadata) -> u32 {
     0o100644
 }
 
-fn cmd_stash_store(args: &[String]) -> Result<()> {
+fn cmd_stash_store(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut message = b"Created via \"git stash store\".".to_vec();
     let mut commits = Vec::new();
     let mut index = 0;
@@ -2731,8 +2788,7 @@ fn cmd_stash_store(args: &[String]) -> Result<()> {
     }
     let commit = &commits[0];
 
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -2746,26 +2802,8 @@ fn cmd_stash_store(args: &[String]) -> Result<()> {
     validate_stash_like_commit(&db, format, &stash_oid)?;
 
     let store = FileRefStore::new(&common_git_dir, format);
-    let old_oid = match store.read_ref("refs/stash")? {
-        Some(RefTarget::Direct(oid)) => oid,
-        Some(RefTarget::Symbolic(_)) | None => zero_oid(format)?,
-    };
-    if old_oid == stash_oid {
-        return Ok(());
-    }
-    let mut tx = store.transaction();
-    tx.update(RefUpdate {
-        name: "refs/stash".to_string(),
-        expected: None,
-        new: RefTarget::Direct(stash_oid),
-        reflog: Some(ReflogEntry {
-            old_oid,
-            new_oid: stash_oid,
-            committer: default_committer(),
-            message,
-        }),
-    });
-    tx.commit()
+    commit_stash_store_plan(&store, stash_oid, default_committer(), message)?;
+    Ok(())
 }
 
 /// Resolve a `git stash <subcmd> [<stash>]` argument to its stash commit oid,
@@ -2870,7 +2908,7 @@ enum StashShowMode {
     NoPatch,
 }
 
-fn cmd_stash_show(args: &[String]) -> Result<()> {
+fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut mode = StashShowMode::Stat;
     let mut quiet = false;
     let mut exit_code = false;
@@ -3269,12 +3307,15 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
     {
         show_patch = true;
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     if !untracked_option_seen {
-        include_untracked = stash_show_include_untracked_config_default(&git_dir, &common_git_dir)?;
+        include_untracked = stash_show_include_untracked_config_default(
+            cli_session.cwd(),
+            &git_dir,
+            &common_git_dir,
+        )?;
     }
     let store = FileRefStore::new(&common_git_dir, format);
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -3538,10 +3579,9 @@ fn stash_show_usage() {
     eprintln!();
 }
 
-fn cmd_stash_list(args: &[String]) -> Result<()> {
+fn cmd_stash_list(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let options = setup_stash_list_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
@@ -3614,7 +3654,7 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
             if options.combined_patch {
                 write_stash_list_combined_patch(&mut io::stdout(), &db, format, &commit)?;
             } else {
-                write_stash_list_patch(&mut io::stdout(), &db, format, &commit)?;
+                write_stash_list_patch(&mut io::stdout(), &common_git_dir, &db, format, &commit)?;
             }
         }
     }
@@ -3906,6 +3946,7 @@ fn stash_list_age_filters_match(commit: &Commit, options: &StashListOptions) -> 
 
 fn write_stash_list_patch(
     stdout: &mut impl Write,
+    common_git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     commit: &Commit,
@@ -3921,12 +3962,9 @@ fn write_stash_list_patch(
         &commit.tree,
         sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
-    let abbrev = repository_abbrev(
-        &common_git_dir_for_git_dir(&crate::session::cli_git_dir()?)?,
-        format,
-    )?
-    .unwrap_or(7)
-    .min(format.hex_len());
+    let abbrev = repository_abbrev(common_git_dir, format)?
+        .unwrap_or(7)
+        .min(format.hex_len());
     for entry in &entries {
         let options = DiffRenderOptions {
             line_indicators: sley_diff_merge::render::LineIndicators::default(),
@@ -4026,7 +4064,7 @@ fn write_stash_list_combined_patch(
     Ok(())
 }
 
-fn cmd_stash_export(args: &[String]) -> Result<()> {
+fn cmd_stash_export(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut print = false;
     let mut to_ref: Option<String> = None;
     let mut specs = Vec::new();
@@ -4060,8 +4098,7 @@ fn cmd_stash_export(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(1));
     }
 
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let mut db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -4167,13 +4204,12 @@ fn write_stash_export_chain(
     Ok(previous)
 }
 
-fn cmd_stash_import(args: &[String]) -> Result<()> {
+fn cmd_stash_import(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     if args.len() != 1 || args.first().is_some_and(|arg| arg.starts_with('-')) {
         eprintln!("usage: git stash import <commit>");
         return Err(GitError::Exit(129));
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -4189,7 +4225,7 @@ fn cmd_stash_import(args: &[String]) -> Result<()> {
         let object = db.read_object(&stash_oid)?;
         let stash = Commit::parse(format, &object.body)?;
         let message = String::from_utf8_lossy(&stash.message);
-        store_stash_commit(&stash_oid, message.trim_end_matches('\n'))?;
+        store_stash_commit(cli_session, &stash_oid, message.trim_end_matches('\n'))?;
     }
     Ok(())
 }
@@ -4254,8 +4290,20 @@ fn stash_export_identity() -> Vec<u8> {
 /// `git stash create autostash` for the rebase autostash machinery: returns
 /// the stash commit oid without touching `refs/stash`, `None` when the tree
 /// is clean.
-pub(crate) fn create_stash_for_autostash() -> Result<Option<ObjectId>> {
-    Ok(create_stash_commit(
+pub(crate) fn create_stash_for_autostash(
+    cli_session: &crate::session::CliSession,
+) -> Result<Option<ObjectId>> {
+    let git_dir = cli_session.git_dir()?;
+    create_stash_for_autostash_at(&git_dir, cli_session.cwd())
+}
+
+pub(crate) fn create_stash_for_autostash_at(
+    git_dir: &Path,
+    cwd: &Path,
+) -> Result<Option<ObjectId>> {
+    Ok(create_stash_commit_at(
+        git_dir,
+        cwd,
         &["autostash".to_string()],
         false,
         false,
@@ -4267,38 +4315,45 @@ pub(crate) fn create_stash_for_autostash() -> Result<Option<ObjectId>> {
 }
 
 /// `git stash store -m <message> -q <oid>` equivalent.
-pub(crate) fn store_stash_commit(stash_oid: &ObjectId, message: &str) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+pub(crate) fn store_stash_commit(
+    cli_session: &crate::session::CliSession,
+    stash_oid: &ObjectId,
+    message: &str,
+) -> Result<()> {
+    let git_dir = cli_session.git_dir()?;
+    store_stash_commit_at(&git_dir, stash_oid, message)
+}
+
+pub(crate) fn store_stash_commit_at(
+    git_dir: &Path,
+    stash_oid: &ObjectId,
+    message: &str,
+) -> Result<()> {
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     validate_stash_like_commit(&db, format, stash_oid)?;
     let store = FileRefStore::new(&common_git_dir, format);
-    let old_oid = match store.read_ref("refs/stash")? {
-        Some(RefTarget::Direct(oid)) => oid,
-        Some(RefTarget::Symbolic(_)) | None => zero_oid(format)?,
-    };
-    let mut tx = store.transaction();
-    tx.update(RefUpdate {
-        name: "refs/stash".to_string(),
-        expected: None,
-        new: RefTarget::Direct(*stash_oid),
-        reflog: Some(ReflogEntry {
-            old_oid,
-            new_oid: *stash_oid,
-            committer: default_committer(),
-            message: message.as_bytes().to_vec(),
-        }),
-    });
-    tx.commit()
+    commit_stash_store_plan(
+        &store,
+        *stash_oid,
+        default_committer(),
+        message.as_bytes().to_vec(),
+    )?;
+    Ok(())
 }
 
 /// `git stash apply <oid>` with all output suppressed; `Ok(false)` when the
 /// stash cannot be applied cleanly (the caller stores it instead).
-pub(crate) fn apply_stash_commit_quietly(stash_oid: &ObjectId) -> Result<bool> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+pub(crate) fn apply_stash_commit_quietly(
+    cli_session: &crate::session::CliSession,
+    stash_oid: &ObjectId,
+) -> Result<bool> {
+    let git_dir = cli_session.git_dir()?;
+    apply_stash_commit_quietly_at(&git_dir, stash_oid)
+}
+
+pub(crate) fn apply_stash_commit_quietly_at(git_dir: &Path, stash_oid: &ObjectId) -> Result<bool> {
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;

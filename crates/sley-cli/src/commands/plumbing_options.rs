@@ -1,21 +1,5 @@
 use super::replace::{ReplaceListFormat, ReplaceMode, ReplaceOptions};
-use super::rerere::{RerereOptions, RerereSubcommand};
-use crate::commands::cli_options::opt_bool;
 use crate::*;
-use sley_options::{OptionSpec, ParsedValue, parse_options};
-
-const RERERE_USAGE: &[&str] =
-    &["git rerere [clear | forget <pathspec>... | diff | status | remaining | gc]"];
-
-fn rerere_option_specs() -> &'static [OptionSpec<'static>] {
-    static SPECS: &[OptionSpec<'static>] = &[opt_bool(
-        None,
-        Some("rerere-autoupdate"),
-        sley_options::OptFlags::NONE,
-        "register clean resolutions in index",
-    )];
-    SPECS
-}
 
 pub(super) fn setup_replace_options(args: &[String]) -> Result<ReplaceOptions> {
     let mut force = false;
@@ -199,47 +183,6 @@ fn replace_usage<T>() -> Result<T> {
     eprintln!("    --[no-]raw            do not pretty-print contents for --edit");
     eprintln!("    --[no-]format <format>");
     eprintln!("                          use this format");
-    eprintln!();
-    Err(GitError::Exit(129))
-}
-
-pub(super) fn setup_rerere_options(args: &[String]) -> Result<RerereOptions> {
-    let parsed = match parse_options(args, rerere_option_specs(), RERERE_USAGE) {
-        Ok(parsed) => parsed,
-        Err(_) => return rerere_usage(),
-    };
-    let mut autoupdate = None;
-    for option in &parsed.options {
-        if option.long == Some("rerere-autoupdate") {
-            if let ParsedValue::Bool(value) = option.value {
-                autoupdate = Some(value);
-            }
-        }
-    }
-    let mut subcommand = None;
-    let mut paths = Vec::new();
-    for arg in &parsed.positionals {
-        match *arg {
-            "clear" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Clear),
-            "forget" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Forget),
-            "gc" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Gc),
-            "status" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Status),
-            _ if subcommand.is_none() => return rerere_usage(),
-            value => paths.push(value.to_string()),
-        }
-    }
-    if matches!(subcommand, Some(RerereSubcommand::Forget)) && paths.is_empty() {
-        eprintln!("warning: 'git rerere forget' without paths is deprecated");
-    }
-    let _ = autoupdate;
-    Ok(RerereOptions { subcommand, paths })
-}
-
-fn rerere_usage<T>() -> Result<T> {
-    eprintln!("usage: git rerere [clear | forget <pathspec>... | diff | status | remaining | gc]");
-    eprintln!();
-    eprintln!("    --[no-]rerere-autoupdate");
-    eprintln!("                          register clean resolutions in index");
     eprintln!();
     Err(GitError::Exit(129))
 }

@@ -12,20 +12,20 @@ use worktree_options::{
     setup_worktree_repair_options, setup_worktree_unlock_options,
 };
 
-pub(crate) fn cmd_worktree(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let Some(subcommand) = args.first().map(String::as_str) else {
         eprintln!("error: need a subcommand");
         return worktree_usage();
     };
     match subcommand {
-        "add" => cmd_worktree_add(&args[1..]),
-        "list" => cmd_worktree_list(&args[1..]),
-        "prune" => cmd_worktree_prune(&args[1..]),
-        "lock" => cmd_worktree_lock(&args[1..]),
-        "move" => cmd_worktree_move(&args[1..]),
-        "remove" => cmd_worktree_remove(&args[1..]),
-        "repair" => cmd_worktree_repair(&args[1..]),
-        "unlock" => cmd_worktree_unlock(&args[1..]),
+        "add" => cmd_worktree_add(cli_session, &args[1..]),
+        "list" => cmd_worktree_list(cli_session, &args[1..]),
+        "prune" => cmd_worktree_prune(cli_session, &args[1..]),
+        "lock" => cmd_worktree_lock(cli_session, &args[1..]),
+        "move" => cmd_worktree_move(cli_session, &args[1..]),
+        "remove" => cmd_worktree_remove(cli_session, &args[1..]),
+        "repair" => cmd_worktree_repair(cli_session, &args[1..]),
+        "unlock" => cmd_worktree_unlock(cli_session, &args[1..]),
         _ => {
             eprintln!("error: unknown subcommand: '{subcommand}'");
             worktree_usage()
@@ -140,10 +140,13 @@ struct WorktreeTrackedEntry {
     oid: ObjectId,
 }
 
-pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_add(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut options = setup_worktree_add_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let path = resolve_cli_path(&cwd, &options.path);
@@ -361,10 +364,12 @@ fn write_linked_worktree_head(
     Ok(())
 }
 
-pub(crate) fn cmd_worktree_list(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_list(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = setup_worktree_list_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let entries = collect_worktree_list_entries(&common_git_dir, format, options.expire)?;
@@ -383,10 +388,12 @@ fn worktree_usage<T>() -> Result<T> {
     Err(GitError::Exit(129))
 }
 
-pub(crate) fn cmd_worktree_prune(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_prune(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = setup_worktree_prune_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let mut kept = prune_worktree_admins(&common_git_dir, &options)?;
     let main_path = fs::canonicalize(&common_git_dir).unwrap_or_else(|_| common_git_dir.clone());
@@ -561,10 +568,13 @@ fn remove_empty_worktrees_dir(common_git_dir: &Path) {
     let _ = fs::remove_dir(common_git_dir.join("worktrees"));
 }
 
-pub(crate) fn cmd_worktree_lock(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_lock(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = setup_worktree_lock_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let admin = find_linked_worktree_admin(&common_git_dir, &cwd, &options.path)?;
     if admin.locked_reason.is_some() {
@@ -583,10 +593,13 @@ pub(crate) fn cmd_worktree_lock(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_worktree_unlock(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_unlock(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let path = setup_worktree_unlock_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let admin = find_linked_worktree_admin(&common_git_dir, &cwd, &path)?;
     if admin.locked_reason.is_none() {
@@ -597,10 +610,13 @@ pub(crate) fn cmd_worktree_unlock(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_worktree_remove(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_remove(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = setup_worktree_remove_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let admin = find_linked_worktree_admin_for_remove(&common_git_dir, &cwd, &options.path)?;
@@ -631,10 +647,13 @@ pub(crate) fn cmd_worktree_remove(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_worktree_move(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_move(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = setup_worktree_move_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let admin = find_linked_worktree_admin_for_move(&common_git_dir, &cwd, &options.source)?;
     if let Some(reason) = admin.locked_reason.as_ref()
@@ -665,10 +684,13 @@ pub(crate) fn cmd_worktree_move(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_worktree_repair(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_repair(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = setup_worktree_repair_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let relative_paths = options.relative_paths.unwrap_or_else(|| {
         GitConfig::read(common_git_dir.join("config"))

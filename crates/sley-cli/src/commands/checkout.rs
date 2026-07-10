@@ -2301,7 +2301,10 @@ fn checkout_merge_autostash_branch_switch(
         return Ok(());
     }
 
-    let stash_oid = match commands::stash::create_stash_for_autostash()? {
+    let stash_oid = match commands::stash::create_stash_for_autostash_at(
+        git_dir,
+        worktree_root,
+    )? {
         Some(oid) => oid,
         None => {
             eprintln!("fatal: Cannot autostash");
@@ -2334,17 +2337,18 @@ fn checkout_merge_autostash_branch_switch(
         recurse_submodules,
         false,
     ) {
-        let _ = commands::stash::apply_stash_commit_quietly(&stash_oid);
+        let _ = commands::stash::apply_stash_commit_quietly_at(git_dir, &stash_oid);
         return Err(err);
     }
-    let applied = commands::stash::apply_stash_commit_quietly(&stash_oid).unwrap_or(false);
+    let applied =
+        commands::stash::apply_stash_commit_quietly_at(git_dir, &stash_oid).unwrap_or(false);
     if applied {
         if !quiet {
             eprintln!("Applied autostash.");
         }
         return Ok(());
     }
-    if commands::stash::store_stash_commit(&stash_oid, "autostash").is_ok() {
+    if commands::stash::store_stash_commit_at(git_dir, &stash_oid, "autostash").is_ok() {
         checkout_print_autostash_conflict_advice();
         if !quiet {
             eprintln!("The following paths have local changes:");

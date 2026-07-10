@@ -15,7 +15,38 @@ use submodule_options::{
     setup_submodule_update_options,
 };
 
-pub(crate) fn cmd_submodule(args: &[String]) -> Result<()> {
+struct SuperprojectContext {
+    cwd: PathBuf,
+    repo: sley::Repository,
+    git_dir: PathBuf,
+    format: ObjectFormat,
+    worktree_root: PathBuf,
+}
+
+impl SuperprojectContext {
+    fn open(cli_session: &crate::session::CliSession) -> Result<Self> {
+        let repo = cli_session.open_repository()?;
+        let git_dir = repo.git_dir().to_path_buf();
+        let format = repo.object_format();
+        let worktree_root = require_work_tree(&git_dir)?;
+        Ok(Self {
+            cwd: cli_session.cwd().to_path_buf(),
+            repo,
+            git_dir,
+            format,
+            worktree_root,
+        })
+    }
+
+    fn objects(&self) -> &FileObjectDatabase {
+        self.repo.object_database()
+    }
+}
+
+pub(crate) fn cmd_submodule(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut index = 0;
     let mut quiet = false;
     let mut leading = Vec::new();
@@ -52,51 +83,51 @@ pub(crate) fn cmd_submodule(args: &[String]) -> Result<()> {
         index += 1;
         let mut rest = leading.clone();
         rest.extend_from_slice(&args[index..]);
-        return cmd_submodule_status(&rest, quiet);
+        return cmd_submodule_status(cli_session, &rest, quiet);
     }
     if matches!(args.get(index).map(String::as_str), Some("add")) {
         index += 1;
-        return cmd_submodule_add(&args[index..], quiet);
+        return cmd_submodule_add(cli_session, &args[index..], quiet);
     }
     if matches!(args.get(index).map(String::as_str), Some("update")) {
         index += 1;
-        return cmd_submodule_update(&args[index..], quiet);
+        return cmd_submodule_update(cli_session, &args[index..], quiet);
     }
     if matches!(args.get(index).map(String::as_str), Some("init")) {
         index += 1;
-        return cmd_submodule_init(&args[index..], quiet);
+        return cmd_submodule_init(cli_session, &args[index..], quiet);
     }
     if matches!(args.get(index).map(String::as_str), Some("deinit")) {
         index += 1;
-        return cmd_submodule_deinit(&args[index..], quiet);
+        return cmd_submodule_deinit(cli_session, &args[index..], quiet);
     }
     if matches!(args.get(index).map(String::as_str), Some("sync")) {
         index += 1;
-        return cmd_submodule_sync(&args[index..], quiet);
+        return cmd_submodule_sync(cli_session, &args[index..], quiet);
     }
     if matches!(args.get(index).map(String::as_str), Some("absorbgitdirs")) {
         index += 1;
-        return cmd_submodule_absorbgitdirs(&args[index..], quiet);
+        return cmd_submodule_absorbgitdirs(cli_session, &args[index..], quiet);
     }
     if matches!(args.get(index).map(String::as_str), Some("foreach")) {
         index += 1;
-        return cmd_submodule_foreach(&args[index..], quiet);
+        return cmd_submodule_foreach(cli_session, &args[index..], quiet);
     }
     if matches!(args.get(index).map(String::as_str), Some("summary")) {
         index += 1;
-        return cmd_submodule_summary(&args[index..], quiet);
+        return cmd_submodule_summary(cli_session, &args[index..], quiet);
     }
     if matches!(args.get(index).map(String::as_str), Some("set-branch")) {
         index += 1;
-        return cmd_submodule_set_branch(&args[index..], quiet);
+        return cmd_submodule_set_branch(cli_session, &args[index..], quiet);
     }
     if matches!(args.get(index).map(String::as_str), Some("set-url")) {
         index += 1;
-        return cmd_submodule_set_url(&args[index..], quiet);
+        return cmd_submodule_set_url(cli_session, &args[index..], quiet);
     }
     let mut rest = leading;
     rest.extend_from_slice(&args[index..]);
-    cmd_submodule_status(&rest, quiet)
+    cmd_submodule_status(cli_session, &rest, quiet)
 }
 
 #[derive(Debug)]
@@ -159,16 +190,28 @@ struct SubmoduleUpdateOptions<'a> {
     paths: Vec<&'a str>,
 }
 
-fn cmd_submodule_status(args: &[String], quiet: bool) -> Result<()> {
+fn cmd_submodule_status(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+    quiet: bool,
+) -> Result<()> {
     let options = setup_submodule_status_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-    let submodules = read_submodule_configs(&worktree_root)?;
-    let index = read_repository_index(&git_dir, format)?;
-    validate_status_submodule_mappings(&cwd, &worktree_root, &index, &submodules, &options.paths)?;
-    let selected = filter_submodules(&cwd, &worktree_root, submodules, &options.paths)?;
+    let context = SuperprojectContext::open(cli_session)?;
+    let submodules = read_submodule_configs(&context.worktree_root)?;
+    let index = read_repository_index(&context.git_dir, context.format)?;
+    validate_status_submodule_mappings(
+        &context.cwd,
+        &context.worktree_root,
+        &index,
+        &submodules,
+        &options.paths,
+    )?;
+    let selected = filter_submodules(
+        &context.cwd,
+        &context.worktree_root,
+        submodules,
+        &options.paths,
+    )?;
     if quiet || options.quiet {
         return Ok(());
     }
@@ -176,9 +219,9 @@ fn cmd_submodule_status(args: &[String], quiet: bool) -> Result<()> {
     for submodule in selected {
         print_submodule_status_tree(
             &mut stdout,
-            &cwd,
-            &worktree_root,
-            format,
+            &context.cwd,
+            &context.worktree_root,
+            context.format,
             &index,
             &submodule,
             options.cached,
@@ -188,12 +231,17 @@ fn cmd_submodule_status(args: &[String], quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
+fn cmd_submodule_add(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+    quiet: bool,
+) -> Result<()> {
     let options = setup_submodule_add_options(args, quiet)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let context = SuperprojectContext::open(cli_session)?;
+    let cwd = &context.cwd;
+    let git_dir = &context.git_dir;
+    let format = context.format;
+    let worktree_root = &context.worktree_root;
     if (options.repository.starts_with("../") || options.repository.starts_with("./"))
         && normalize_lexical_path(&cwd) != normalize_lexical_path(&worktree_root)
     {
@@ -333,12 +381,17 @@ fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_submodule_update(args: &[String], quiet: bool) -> Result<()> {
+fn cmd_submodule_update(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+    quiet: bool,
+) -> Result<()> {
     let options = setup_submodule_update_options(args, quiet)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let context = SuperprojectContext::open(cli_session)?;
+    let cwd = &context.cwd;
+    let git_dir = &context.git_dir;
+    let format = context.format;
+    let worktree_root = &context.worktree_root;
     if options.init {
         let mut init_args = options
             .paths
@@ -351,7 +404,7 @@ fn cmd_submodule_update(args: &[String], quiet: bool) -> Result<()> {
         if !options.super_prefix.is_empty() {
             init_args.push(format!("--super-prefix={}", options.super_prefix));
         }
-        cmd_submodule_init(&init_args, options.quiet)?;
+        cmd_submodule_init(cli_session, &init_args, options.quiet)?;
     }
     let index = read_repository_index(&git_dir, format)?;
     let submodules = read_submodule_configs(&worktree_root)?;
@@ -1243,12 +1296,17 @@ fn stage_submodule_paths(
     Ok(())
 }
 
-fn cmd_submodule_init(args: &[String], quiet: bool) -> Result<()> {
+fn cmd_submodule_init(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+    quiet: bool,
+) -> Result<()> {
     let (paths, quiet, super_prefix) = setup_submodule_init_options(args, quiet)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let context = SuperprojectContext::open(cli_session)?;
+    let cwd = &context.cwd;
+    let git_dir = &context.git_dir;
+    let format = context.format;
+    let worktree_root = &context.worktree_root;
     let submodules = read_submodule_configs(&worktree_root)?;
 
     // git's `module_list_compute` lists the INDEX gitlinks, then `init_submodule`
@@ -1350,11 +1408,16 @@ fn path_selected_by_specs(cwd: &Path, worktree_root: &Path, path: &str, specs: &
     })
 }
 
-fn cmd_submodule_deinit(args: &[String], quiet: bool) -> Result<()> {
+fn cmd_submodule_deinit(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+    quiet: bool,
+) -> Result<()> {
     let options = setup_submodule_deinit_options(args, quiet)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let context = SuperprojectContext::open(cli_session)?;
+    let cwd = &context.cwd;
+    let git_dir = &context.git_dir;
+    let worktree_root = &context.worktree_root;
     let submodules = read_submodule_configs(&worktree_root)?;
     if submodules.is_empty() {
         return Ok(());
@@ -1417,11 +1480,16 @@ fn cmd_submodule_deinit(args: &[String], quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_submodule_sync(args: &[String], quiet: bool) -> Result<()> {
+fn cmd_submodule_sync(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+    quiet: bool,
+) -> Result<()> {
     let (paths, quiet, recursive, super_prefix) = setup_submodule_sync_options(args, quiet)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let context = SuperprojectContext::open(cli_session)?;
+    let cwd = &context.cwd;
+    let git_dir = &context.git_dir;
+    let worktree_root = &context.worktree_root;
     let submodules = read_submodule_configs(&worktree_root)?;
     let selected = filter_submodule_configs(&cwd, &worktree_root, &submodules, &paths)?;
     let mut config = read_repo_config(&git_dir)?;
@@ -1572,12 +1640,17 @@ fn recurse_submodule_sync(submodule_root: &Path, display: &str, quiet: bool) -> 
     Err(GitError::Exit(128))
 }
 
-fn cmd_submodule_absorbgitdirs(args: &[String], quiet: bool) -> Result<()> {
+fn cmd_submodule_absorbgitdirs(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+    quiet: bool,
+) -> Result<()> {
     let (paths, quiet, super_prefix) = setup_submodule_absorbgitdirs_options(args, quiet)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let context = SuperprojectContext::open(cli_session)?;
+    let cwd = &context.cwd;
+    let git_dir = &context.git_dir;
+    let format = context.format;
+    let worktree_root = &context.worktree_root;
     // git's `module_list_compute`: iterate EVERY gitlink in the index (in index
     // order), not just `.gitmodules`-configured ones — a gitlink with no mapping
     // must still be visited so absorb can die "could not lookup name".
@@ -1782,12 +1855,17 @@ fn recurse_submodule_absorbgitdirs(sub_root: &Path, display: &str, quiet: bool) 
     Err(GitError::Exit(code))
 }
 
-fn cmd_submodule_foreach(args: &[String], quiet: bool) -> Result<()> {
+fn cmd_submodule_foreach(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+    quiet: bool,
+) -> Result<()> {
     let options = setup_submodule_foreach_options(args, quiet)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let context = SuperprojectContext::open(cli_session)?;
+    let cwd = &context.cwd;
+    let git_dir = &context.git_dir;
+    let format = context.format;
+    let worktree_root = &context.worktree_root;
     let submodules = read_submodule_configs(&worktree_root)?;
     let index = read_repository_index(&git_dir, format)?;
     run_submodule_foreach_tree(&cwd, &worktree_root, &index, &submodules, &options)
@@ -1808,16 +1886,21 @@ struct SubmoduleSummaryEntry {
     oid_dst: ObjectId,
 }
 
-fn cmd_submodule_summary(args: &[String], quiet: bool) -> Result<()> {
+fn cmd_submodule_summary(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+    quiet: bool,
+) -> Result<()> {
     let options = setup_submodule_summary_options(args, quiet)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let context = SuperprojectContext::open(cli_session)?;
+    let cwd = &context.cwd;
+    let git_dir = &context.git_dir;
+    let format = context.format;
+    let worktree_root = &context.worktree_root;
     if options.quiet || options.summary_limit == Some(0) {
         return Ok(());
     }
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let db = context.objects();
 
     // module_summary: the leading operand is the `<commit>` ONLY if it resolves
     // to an object (git's `repo_get_oid`); otherwise it's a pathspec and the
@@ -1836,7 +1919,7 @@ fn cmd_submodule_summary(args: &[String], quiet: bool) -> Result<()> {
 
     // module_summary: resolve the source-side commit. With a commit arg, use it;
     // otherwise HEAD, falling back to the empty tree before the first commit.
-    let head_tree = summary_source_tree(&db, &git_dir, format, commit.as_deref())?;
+    let head_tree = summary_source_tree(db, git_dir, format, commit.as_deref())?;
 
     let index = read_repository_index(&git_dir, format)?;
     let mut entries = if options.files {
@@ -2178,11 +2261,15 @@ fn diff_gitlink_sides(
     entries
 }
 
-fn cmd_submodule_set_url(args: &[String], quiet: bool) -> Result<()> {
+fn cmd_submodule_set_url(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+    quiet: bool,
+) -> Result<()> {
     let (path, new_url, quiet) = setup_submodule_set_url_options(args, quiet)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let context = SuperprojectContext::open(cli_session)?;
+    let git_dir = &context.git_dir;
+    let worktree_root = &context.worktree_root;
     let gitmodules_path = worktree_root.join(".gitmodules");
     let mut gitmodules = GitConfig::read(&gitmodules_path)?;
     let Some(name) = submodule_name_for_exact_path(&gitmodules, path) else {
@@ -2237,11 +2324,14 @@ enum SubmoduleSetBranchAction<'a> {
     Default,
 }
 
-fn cmd_submodule_set_branch(args: &[String], quiet: bool) -> Result<()> {
+fn cmd_submodule_set_branch(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+    quiet: bool,
+) -> Result<()> {
     let (path, action, _quiet) = setup_submodule_set_branch_options(args, quiet)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let context = SuperprojectContext::open(cli_session)?;
+    let worktree_root = &context.worktree_root;
     let gitmodules_path = worktree_root.join(".gitmodules");
     let mut gitmodules = GitConfig::read(&gitmodules_path)?;
     let Some(name) = submodule_name_for_exact_path(&gitmodules, path) else {

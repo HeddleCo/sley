@@ -65,8 +65,8 @@ fn set_hook_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
     }
 }
 
-fn refresh_commit_selection_cache_tree() -> Result<()> {
-    let git_dir = crate::session::cli_git_dir()?;
+fn refresh_commit_selection_cache_tree(cli_session: &crate::session::CliSession) -> Result<()> {
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let odb = FileObjectDatabase::from_git_dir(&git_dir, format);
     sley_worktree::refresh_repository_cache_tree(&git_dir, format, &odb)
@@ -160,7 +160,10 @@ fn expand_commit_short_clusters(args: &[String]) -> Result<Vec<String>> {
     Ok(expanded)
 }
 
-pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
+pub(crate) fn cmd_commit(
+    cli_session: &crate::session::CliSession,
+    raw_args: &[String],
+) -> Result<()> {
     // `-h`/`--help` is handled by upstream's parse-options before any repo
     // state is consulted (so it works in a broken repository). Honour it first.
     if raw_args.iter().any(|arg| arg == "-h" || arg == "--help") {
@@ -910,14 +913,20 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     if status_mode != CommitStatusMode::Normal {
-        return cmd_commit_status_preview(status_mode, status_null, amend, commit_untracked);
+        return cmd_commit_status_preview(
+            cli_session,
+            status_mode,
+            status_null,
+            amend,
+            commit_untracked,
+        );
     }
     if dry_run {
-        return cmd_commit_long_status_preview(amend, commit_untracked);
+        return cmd_commit_long_status_preview(cli_session, amend, commit_untracked);
     }
     if interactive && !patch {
         commands::add_interactive::cmd_add_interactive(&pathspec_args)?;
-        refresh_commit_selection_cache_tree()?;
+        refresh_commit_selection_cache_tree(cli_session)?;
     }
     if patch {
         commands::add_interactive::cmd_add_patch(
@@ -926,7 +935,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             inter_hunk_context,
             true,
         )?;
-        refresh_commit_selection_cache_tree()?;
+        refresh_commit_selection_cache_tree(cli_session)?;
         if template_file.is_none()
             && file_message.is_none()
             && message_chunks.is_empty()
@@ -935,7 +944,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             return Ok(());
         }
     }
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let repo_config = read_repo_config(&git_dir).ok();
     if !gpg_sign && !no_gpg_sign {
@@ -1474,7 +1483,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         match commit_index_tree_if_changed(&git_dir, format, &commit_odb)? {
             Some(tree) => Some(tree),
             None => {
-                print_clean_commit_status(&git_dir, format)?;
+                print_clean_commit_status(cli_session, &git_dir, format)?;
                 return Err(GitError::Exit(1));
             }
         }
@@ -1562,7 +1571,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     }
     commands::hooks::run_hook("reference-transaction", commands::hooks::HookRun::default())?;
     commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
-    run_auto_maintenance_after_commit(&git_dir)?;
+    run_auto_maintenance_after_commit(cli_session, &git_dir)?;
     if amend
         && !no_post_rewrite
         && let Some(old_oid) = amended_old_oid
@@ -1579,7 +1588,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn run_auto_maintenance_after_commit(git_dir: &Path) -> Result<()> {
+fn run_auto_maintenance_after_commit(
+    cli_session: &crate::session::CliSession,
+    git_dir: &Path,
+) -> Result<()> {
     commands::pack::trace2_touch();
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
@@ -1597,7 +1609,7 @@ fn run_auto_maintenance_after_commit(git_dir: &Path) -> Result<()> {
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let _ = commands::pack::cmd_maintenance(&run_args);
+    let _ = commands::pack::cmd_maintenance(cli_session, &run_args);
     Ok(())
 }
 
@@ -2307,6 +2319,7 @@ enum CommitStatusMode {
 }
 
 fn cmd_commit_status_preview(
+    cli_session: &crate::session::CliSession,
     mode: CommitStatusMode,
     null: bool,
     amend: bool,
@@ -2317,7 +2330,9 @@ fn cmd_commit_status_preview(
         CommitStatusMode::Normal => {}
         CommitStatusMode::Short => args.push("--short".to_string()),
         CommitStatusMode::Porcelain => args.push("--porcelain".to_string()),
-        CommitStatusMode::Long => return cmd_commit_long_status_preview(amend, untracked),
+        CommitStatusMode::Long => {
+            return cmd_commit_long_status_preview(cli_session, amend, untracked);
+        }
     }
     if null {
         args.push("-z".to_string());
@@ -2329,15 +2344,16 @@ fn cmd_commit_status_preview(
             sley_worktree::StatusUntrackedMode::All => "--untracked-files=all".to_string(),
         });
     }
-    cmd_status(&args)
+    cmd_status(cli_session, &args)
 }
 
 fn cmd_commit_long_status_preview(
+    cli_session: &crate::session::CliSession,
     amend: bool,
     untracked_override: Option<sley_worktree::StatusUntrackedMode>,
 ) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     let config = read_repo_config(&git_dir).map_err(report_config_setup_error)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
@@ -3372,9 +3388,13 @@ pub(crate) fn render_commit_editor_status_for_rebase(
     render_commit_template_status(git_dir, format, comment_char, amend, None)
 }
 
-fn print_clean_commit_status(git_dir: &Path, format: ObjectFormat) -> Result<()> {
+fn print_clean_commit_status(
+    cli_session: &crate::session::CliSession,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
     let _ = (git_dir, format);
-    let _ = cmd_commit_long_status_preview(false, None);
+    let _ = cmd_commit_long_status_preview(cli_session, false, None);
     Ok(())
 }
 

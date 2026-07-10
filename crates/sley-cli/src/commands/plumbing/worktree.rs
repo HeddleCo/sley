@@ -8,7 +8,10 @@ use super::add::{
     advise_on_updating_sparse_paths, normalize_add_absolute_path,
 };
 
-pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_rm(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut paths = Vec::new();
     let mut recursive = false;
     let mut quiet = false;
@@ -122,8 +125,8 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
         );
         return Err(GitError::Exit(128));
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let path_base = match cwd.strip_prefix(&worktree_root) {
@@ -170,7 +173,10 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_mv(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut paths = Vec::new();
     let mut force = false;
     let mut dry_run = false;
@@ -221,8 +227,8 @@ pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
             "mv currently supports <source>... <destination>".into(),
         ));
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let destination = if paths[paths.len() - 1].is_absolute() {

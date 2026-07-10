@@ -109,7 +109,10 @@ enum PackReuseMode {
     Multi,
 }
 
-pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_pack_objects(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut options = PackObjectsOptions::default();
     let mut saw_dashdash = false;
     for arg in args {
@@ -288,7 +291,7 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     }
     validate_pack_objects_options(&options)?;
 
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     options.write_reverse_index = read_repo_config(&git_dir)?

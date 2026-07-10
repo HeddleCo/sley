@@ -5465,7 +5465,7 @@ fn create_merge_autostash(
     if !dirty {
         return Ok(false);
     }
-    let Some(oid) = commands::stash::create_stash_for_autostash()? else {
+    let Some(oid) = commands::stash::create_stash_for_autostash_at(git_dir, worktree_root)? else {
         eprintln!("fatal: Cannot autostash");
         return Err(GitError::Exit(128));
     };
@@ -5502,7 +5502,7 @@ fn save_squash_conflict_autostash(git_dir: &Path, format: ObjectFormat) {
     let Ok(oid) = ObjectId::from_hex(format, &oid_text) else {
         return;
     };
-    if commands::stash::store_stash_commit(&oid, "autostash").is_ok() {
+    if commands::stash::store_stash_commit_at(git_dir, &oid, "autostash").is_ok() {
         println!("When finished, apply stashed changes with `git stash pop`");
     } else {
         eprintln!("error: cannot store {oid_text}");
@@ -5523,12 +5523,13 @@ fn apply_or_save_merge_autostash(git_dir: &Path, format: ObjectFormat, attempt_a
         return;
     };
     let applied =
-        attempt_apply && commands::stash::apply_stash_commit_quietly(&oid).unwrap_or(false);
+        attempt_apply
+            && commands::stash::apply_stash_commit_quietly_at(git_dir, &oid).unwrap_or(false);
     if applied {
         eprintln!("Applied autostash.");
         return;
     }
-    let stored = commands::stash::store_stash_commit(&oid, "autostash").is_ok();
+    let stored = commands::stash::store_stash_commit_at(git_dir, &oid, "autostash").is_ok();
     if !stored {
         eprintln!("error: cannot store {oid_text}");
     } else if attempt_apply {

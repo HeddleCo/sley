@@ -227,8 +227,8 @@ pub(crate) fn cmd_diff_tree(
                 .cloned()
                 .collect();
             if setup_args.len() == 1 {
-                let cwd = env::current_dir()?;
-                let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+                let cwd = cli_session.cwd().to_path_buf();
+                let git_dir = cli_session.git_dir()?;
                 let format = repository_object_format(&git_dir)?;
                 let config = read_repo_config(&git_dir)?;
                 let db = FileObjectDatabase::from_git_dir(&git_dir, format);

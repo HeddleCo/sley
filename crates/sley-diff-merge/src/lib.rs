@@ -7,6 +7,7 @@ mod merge_trees;
 mod name;
 mod name_status;
 mod patch;
+pub mod porcelain;
 pub mod range;
 pub mod render;
 pub mod ws;

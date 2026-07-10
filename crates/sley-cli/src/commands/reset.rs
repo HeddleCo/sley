@@ -14,7 +14,10 @@ usage: git reset [--mixed | --soft | --hard | --merge | --keep] [-q] [<commit>]
    or: git reset --patch [<tree-ish>] [--] [<pathspec>...]
 ";
 
-pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_reset(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut positionals = Vec::new();
     let mut quiet = false;
     let mut recurse_submodules = None;
@@ -182,8 +185,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             interhunk: inter_hunk_context.map(|value| value as usize),
             ..commands::add_patch::PatchConfig::default()
         };
-        cfg.reset_interactive =
-            sley_config::read_repo_config(&crate::session::cli_git_dir()?, None)
+        cfg.reset_interactive = sley_config::read_repo_config(&cli_session.git_dir()?, None)
                 .ok()
                 .and_then(|config| {
                     config
@@ -199,8 +201,8 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             cfg,
         );
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     // git's `setup_work_tree()` (builtin/reset.c): every reset that touches the
     // working tree — `--hard`, `--merge`, `--keep` — must run in a work tree, so
     // a bare repository refuses with "this operation must be run in a work

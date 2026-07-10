@@ -4638,10 +4638,17 @@ fn apply_rebase_autostash(common_git_dir: &Path, state_dir: &Path) -> Result<()>
         let _ = fs::remove_file(&autostash_path);
         let format = repository_object_format(common_git_dir)?;
         if let Ok(oid) = ObjectId::from_hex(format, text.trim()) {
-            let applied = commands::stash::apply_stash_commit_quietly(&oid).unwrap_or(false);
+            let applied = commands::stash::apply_stash_commit_quietly_at(common_git_dir, &oid)
+                .unwrap_or(false);
             if applied {
                 eprintln!("Applied autostash.");
-            } else if commands::stash::store_stash_commit(&oid, "autostash").is_ok() {
+            } else if commands::stash::store_stash_commit_at(
+                common_git_dir,
+                &oid,
+                "autostash",
+            )
+            .is_ok()
+            {
                 print_rebase_autostash_conflict_advice();
             }
         }

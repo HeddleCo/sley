@@ -215,18 +215,28 @@ struct LineBlame {
     charge_seq: usize,
 }
 
-pub(crate) fn cmd_blame(args: &[String]) -> Result<()> {
-    run_blame(args, false)
+pub(crate) fn cmd_blame(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    run_blame(cli_session, args, false)
 }
 
 /// `git annotate` — `git blame` with the annotate-compatible output mode forced
 /// on (equivalent to `git blame -c`). Shares all of blame's parsing and the
 /// scoreboard; only the output format differs.
-pub(crate) fn cmd_annotate(args: &[String]) -> Result<()> {
-    run_blame(args, true)
+pub(crate) fn cmd_annotate(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    run_blame(cli_session, args, true)
 }
 
-fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
+fn run_blame(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+    force_compat: bool,
+) -> Result<()> {
     let mut options = match parse_blame_args(args)? {
         BlameArgs::Run(mut options) => {
             if force_compat {
@@ -240,7 +250,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         }
     };
 
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();

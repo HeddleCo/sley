@@ -7,7 +7,10 @@ use sley::{GitError, Result};
 
 use crate::repository_object_format;
 
-pub(crate) fn cmd_write_tree(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_write_tree(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut missing_ok = false;
     let mut prefix = None;
     let mut idx = 0;
@@ -36,7 +39,7 @@ pub(crate) fn cmd_write_tree(args: &[String]) -> Result<()> {
         }
         idx += 1;
     }
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let oid = sley_worktree::write_tree_from_index_with_options(
         git_dir,

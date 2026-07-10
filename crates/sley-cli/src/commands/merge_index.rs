@@ -32,7 +32,10 @@ struct MergeIndexStages {
     theirs: Option<(u32, ObjectId)>,
 }
 
-pub(crate) fn cmd_merge_index(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_merge_index(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut idx = 0;
     let mut one_shot = false;
     let mut quiet = false;
@@ -50,7 +53,7 @@ pub(crate) fn cmd_merge_index(args: &[String]) -> Result<()> {
     };
     idx += 1;
 
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let mut index = read_worktree_index(&git_dir, format)?;

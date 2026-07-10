@@ -886,7 +886,10 @@ fn verify_reftable(
 }
 
 /// `git refs verify [--strict] [--verbose]`.
-pub(crate) fn cmd_refs_verify(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_refs_verify(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut strict = false;
     let mut verbose = false;
     for arg in args {
@@ -910,7 +913,7 @@ pub(crate) fn cmd_refs_verify(args: &[String]) -> Result<()> {
         }
     }
 
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let common_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let opts = RefsVerifyOptions::from_repo(&git_dir, strict, verbose);

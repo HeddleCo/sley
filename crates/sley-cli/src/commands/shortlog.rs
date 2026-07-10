@@ -82,7 +82,10 @@ struct ShortlogEntry {
     subjects: Vec<Vec<u8>>,
 }
 
-pub(crate) fn cmd_shortlog(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_shortlog(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut options = parse_shortlog_args(args)?;
     if options.groups.is_empty() {
         options.groups.push(ShortlogGroup::Author);
@@ -92,9 +95,9 @@ pub(crate) fn cmd_shortlog(args: &[String]) -> Result<()> {
     let mut index: HashMap<String, usize> = HashMap::new();
 
     if !options.has_input_specs {
-        read_shortlog_from_stdin(&options, &mut groups, &mut index)?;
+        read_shortlog_from_stdin(cli_session, &options, &mut groups, &mut index)?;
     } else {
-        read_shortlog_from_revisions(&options, &mut groups, &mut index)?;
+        read_shortlog_from_revisions(cli_session, &options, &mut groups, &mut index)?;
     }
 
     sort_shortlog_groups(&mut groups, options.numbered);
@@ -336,11 +339,12 @@ fn shortlog_unknown_short_option(tail: &str) -> Result<()> {
 /// Resolve every revision argument, walk the graph, apply filters/limit, and
 /// fold each commit's subject into its author (or committer) bucket.
 fn read_shortlog_from_revisions(
+    cli_session: &crate::session::CliSession,
     options: &ShortlogOptions,
     groups: &mut Vec<ShortlogEntry>,
     index: &mut HashMap<String, usize>,
 ) -> Result<()> {
-    let repo = match RepositoryContext::discover_current() {
+    let repo = match RepositoryContext::from_session(cli_session) {
         Ok(repo) => repo,
         Err(err) => {
             if !options.setup_args.is_empty() {
@@ -449,6 +453,7 @@ fn read_shortlog_from_revisions(
 /// paragraphs — is ignored, and `--max-count`/`-<n>` has no effect here, exactly
 /// as upstream (it is a revision-walk concept).
 fn read_shortlog_from_stdin(
+    cli_session: &crate::session::CliSession,
     options: &ShortlogOptions,
     groups: &mut Vec<ShortlogEntry>,
     index: &mut HashMap<String, usize>,
@@ -463,7 +468,7 @@ fn read_shortlog_from_stdin(
     // git's shortlog always mailmaps. The stdin path may run outside a repo
     // (`git log ... | git shortlog`), so prefer the repo mailmap when one is
     // discoverable and fall back to a cwd-relative `.mailmap` otherwise.
-    let mailmap = match RepositoryContext::discover_current() {
+    let mailmap = match RepositoryContext::from_session(cli_session) {
         Ok(repo) => {
             let format = repo.format();
             commands::utility::Mailmap::load_default(repo.git_dir(), format)?

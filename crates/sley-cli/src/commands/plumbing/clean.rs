@@ -3,7 +3,10 @@
 use crate::*;
 use sley::plumbing::{sley_core, sley_index, sley_worktree};
 
-pub(crate) fn cmd_clean(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_clean(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut dry_run = false;
     let mut force_count = 0u8;
     let mut force_was_mentioned = false;
@@ -82,8 +85,8 @@ pub(crate) fn cmd_clean(args: &[String]) -> Result<()> {
             value => path_args.push(value.to_string()),
         }
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     let config = read_repo_config(&git_dir)?;
     let require_force = config
         .get_bool("clean", None, "requireForce")

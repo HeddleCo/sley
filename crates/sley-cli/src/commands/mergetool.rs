@@ -21,9 +21,12 @@ struct UnmergedPath {
     remote: Option<IndexEntry>,
 }
 
-pub(crate) fn cmd_mergetool(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_mergetool(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = parse_mergetool_args(args)?;
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let config = repo.config();
     let gui = options
         .gui

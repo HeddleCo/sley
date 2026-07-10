@@ -1,5 +1,6 @@
 //! `git branch` dispatcher.
 
+use super::BranchCommandContext;
 use super::branch_options::{
     setup_branch_create_options, setup_branch_delete_options, setup_branch_format_list_options,
     setup_branch_general_list_options, setup_branch_move_options,
@@ -21,12 +22,11 @@ use super::positional::dispatch_branch_positional_args;
 use super::upstream::run_branch_upstream_options;
 use crate::*;
 
-pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let repo = RepositoryContext::discover(&cwd)?;
-    let git_dir = repo.git_dir();
-    let format = repo.format();
-    let store = repo.refs();
+pub(crate) fn cmd_branch(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    let context = BranchCommandContext::open(cli_session)?;
+    let git_dir = context.git_dir();
+    let format = context.format();
+    let store = &context.refs;
     // git validates branch.autosetuprebase up front, so even a plain listing
     // fails on a malformed value (t3200 #145/#146).
     validate_autosetuprebase(&read_repo_config(git_dir)?)?;
@@ -80,7 +80,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         } else if force {
             force_delete_branches(git_dir, format, store, &branches, quiet)
         } else {
-            delete_merged_branches(git_dir, format, store, &branches, quiet)
+            delete_merged_branches(git_dir, format, context.objects(), store, &branches, quiet)
         };
     }
     if let Some(create) = setup_branch_create_options(args)? {
@@ -89,7 +89,7 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
     if let Some(list) = setup_branch_general_list_options(git_dir, args)? {
         return run_branch_general_list_options(git_dir, format, store, list);
     }
-    dispatch_branch_positional_args(git_dir, format, store, args)
+    dispatch_branch_positional_args(&context, args)
 }
 pub(super) fn branch_has_conflicting_action_modes(args: &[String]) -> bool {
     let mut delete = false;

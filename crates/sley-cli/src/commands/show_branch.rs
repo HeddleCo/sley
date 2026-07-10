@@ -109,11 +109,14 @@ struct HeadInfo {
     oid: ObjectId,
 }
 
-pub(crate) fn cmd_show_branch(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_show_branch(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = parse_args(args)?;
 
     let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let refs = FileRefStore::new(git_dir.clone(), format);

@@ -48,10 +48,13 @@ fn rerere_option_specs() -> &'static [OptionSpec<'static>] {
     SPECS
 }
 
-pub(crate) fn cmd_rerere(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_rerere(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = setup_rerere_options(args)?;
     let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     match options.subcommand {

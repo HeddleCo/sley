@@ -24,7 +24,10 @@ enum DiagnoseMode {
     All,
 }
 
-pub(crate) fn cmd_diagnose(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_diagnose(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut output: Option<String> = None;
     let mut suffix = "%Y-%m-%d-%H%M".to_string();
     let mut mode = DiagnoseMode::Stats;
@@ -85,7 +88,7 @@ pub(crate) fn cmd_diagnose(args: &[String]) -> Result<()> {
         }
     }
 
-    create_diagnostics_archive(&zip_path, mode)?;
+    create_diagnostics_archive(cli_session, &zip_path, mode)?;
     Ok(())
 }
 
@@ -117,9 +120,13 @@ fn parse_mode(value: &str) -> Result<DiagnoseMode> {
 /// Build the diagnostics zip, mirroring `create_diagnostics_archive`. The
 /// human-readable header (version + repository root + disk info) is written to
 /// stdout and also captured as the `diagnostics.log` virtual file.
-fn create_diagnostics_archive(zip_path: &Path, mode: DiagnoseMode) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+fn create_diagnostics_archive(
+    cli_session: &crate::session::CliSession,
+    zip_path: &Path,
+    mode: DiagnoseMode,
+) -> Result<()> {
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let worktree = worktree_root_for_git_dir(&git_dir)
         .ok()

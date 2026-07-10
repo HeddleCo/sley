@@ -95,7 +95,10 @@ struct SparseContext {
     prefix: Vec<u8>,
 }
 
-pub(crate) fn cmd_sparse_checkout(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_sparse_checkout(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let Some(sub) = args.first() else {
         eprintln!("error: need a subcommand");
         eprintln!("{SPARSE_USAGE}");
@@ -103,14 +106,14 @@ pub(crate) fn cmd_sparse_checkout(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(129));
     };
     match sub.as_str() {
-        "init" => cmd_sparse_init(&args[1..]),
-        "list" => cmd_sparse_list(&args[1..]),
-        "set" => cmd_sparse_set(&args[1..]),
-        "add" => cmd_sparse_add(&args[1..]),
-        "reapply" => cmd_sparse_reapply(&args[1..]),
-        "disable" => cmd_sparse_disable(&args[1..]),
-        "check-rules" => cmd_sparse_check_rules(&args[1..]),
-        "clean" => cmd_sparse_clean(&args[1..]),
+        "init" => cmd_sparse_init(cli_session, &args[1..]),
+        "list" => cmd_sparse_list(cli_session, &args[1..]),
+        "set" => cmd_sparse_set(cli_session, &args[1..]),
+        "add" => cmd_sparse_add(cli_session, &args[1..]),
+        "reapply" => cmd_sparse_reapply(cli_session, &args[1..]),
+        "disable" => cmd_sparse_disable(cli_session, &args[1..]),
+        "check-rules" => cmd_sparse_check_rules(cli_session, &args[1..]),
+        "clean" => cmd_sparse_clean(cli_session, &args[1..]),
         other => {
             eprintln!("error: unknown subcommand: `{other}'");
             eprintln!("{SPARSE_USAGE}");
@@ -124,7 +127,7 @@ pub(crate) fn cmd_sparse_checkout(args: &[String]) -> Result<()> {
 // Subcommand implementations
 // --------------------------------------------------------------------------
 
-fn cmd_sparse_init(args: &[String]) -> Result<()> {
+fn cmd_sparse_init(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut cone = ConeFlag::Unset;
     let mut sparse_index = SparseIndexFlag::Unset;
     for arg in args {
@@ -136,7 +139,7 @@ fn cmd_sparse_init(args: &[String]) -> Result<()> {
             other => return unknown_option(other, INIT_HELP),
         }
     }
-    let ctx = sparse_context()?;
+    let ctx = sparse_context(cli_session)?;
     // Cone is the default for a fresh init, but a plain `init` over an existing
     // sparse checkout preserves the recorded mode.
     let cone_mode = match cone {
@@ -173,8 +176,8 @@ fn apply_sparse_index_flag(ctx: &SparseContext, flag: SparseIndexFlag) -> Result
     }
 }
 
-fn cmd_sparse_list(args: &[String]) -> Result<()> {
-    let ctx = sparse_context()?;
+fn cmd_sparse_list(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    let ctx = sparse_context(cli_session)?;
     // Upstream verifies the worktree is sparse before it parses options, so an
     // unknown option on a non-sparse worktree still reports "not sparse".
     if !sparse_checkout_enabled(&ctx)? {
@@ -210,9 +213,9 @@ fn cmd_sparse_list(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_sparse_set(args: &[String]) -> Result<()> {
+fn cmd_sparse_set(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let parsed = parse_set_like(args, SET_HELP, true)?;
-    let ctx = sparse_context()?;
+    let ctx = sparse_context(cli_session)?;
     // `set` resolves the cone mode now: an explicit flag wins, otherwise an
     // already-initialized worktree keeps its mode, and a brand new one defaults
     // to cone.
@@ -250,8 +253,8 @@ fn cmd_sparse_set(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_sparse_add(args: &[String]) -> Result<()> {
-    let ctx = sparse_context()?;
+fn cmd_sparse_add(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    let ctx = sparse_context(cli_session)?;
     // Upstream checks for an existing sparse-checkout before option parsing.
     if !sparse_checkout_enabled(&ctx)? {
         eprintln!("fatal: no sparse-checkout to add to");
@@ -297,8 +300,8 @@ fn cmd_sparse_add(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_sparse_reapply(args: &[String]) -> Result<()> {
-    let ctx = sparse_context()?;
+fn cmd_sparse_reapply(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    let ctx = sparse_context(cli_session)?;
     // Upstream requires an active sparse-checkout before it parses options.
     if !sparse_checkout_enabled(&ctx)? {
         eprintln!("fatal: must be in a sparse-checkout to reapply sparsity patterns");
@@ -328,12 +331,12 @@ fn cmd_sparse_reapply(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_sparse_disable(args: &[String]) -> Result<()> {
+fn cmd_sparse_disable(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     // `disable` has no options; reject flags but ignore stray positionals.
     if let Some(arg) = args.iter().find(|arg| arg.starts_with('-')) {
         return unknown_option(arg.as_str(), DISABLE_HELP);
     }
-    let ctx = sparse_context()?;
+    let ctx = sparse_context(cli_session)?;
     // Re-expand the worktree to the full set: the recursive `/**` pattern matches
     // every path at every depth in full (gitignore) matching, so every
     // skip-worktree bit is cleared and missing files are restored.
@@ -376,7 +379,10 @@ const CHECK_RULES_HELP: &str = "usage: git sparse-checkout check-rules [-z] [--s
 /// input and output are NUL-delimited and input paths are taken verbatim;
 /// otherwise a leading-`"` line is C-unquoted on input and any matching path is
 /// re-quoted with git's `quote_c_style` on output.
-fn cmd_sparse_check_rules(args: &[String]) -> Result<()> {
+fn cmd_sparse_check_rules(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut cone = ConeFlag::Unset;
     let mut null_terminated = false;
     let mut rules_file: Option<String> = None;
@@ -402,7 +408,7 @@ fn cmd_sparse_check_rules(args: &[String]) -> Result<()> {
         }
     }
 
-    let ctx = sparse_context_no_worktree()?;
+    let ctx = sparse_context_no_worktree(cli_session)?;
 
     // Resolve the matching mode. With --rules-file and no explicit cone flag,
     // upstream defaults to cone. Otherwise an explicit flag wins, then the
@@ -520,8 +526,8 @@ const CLEAN_HELP: &str = "usage: git sparse-checkout clean [-n|--dry-run]\n\n   
 /// directory entries). It is the worktree-cleanup counterpart of the sparse
 /// index: an out-of-cone directory that still has stray files on disk is
 /// removed wholesale.
-fn cmd_sparse_clean(args: &[String]) -> Result<()> {
-    let ctx = sparse_context()?;
+fn cmd_sparse_clean(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    let ctx = sparse_context(cli_session)?;
     if !sparse_checkout_enabled(&ctx)? {
         eprintln!("fatal: must be in a sparse-checkout to clean directories");
         return Err(GitError::Exit(128));
@@ -1273,12 +1279,12 @@ fn clean_pattern_line(raw: &[u8]) -> &[u8] {
 /// but `check-rules`). Mirrors upstream's `setup_work_tree()` at the head of
 /// each handler: a bare repository fails with "this operation must be run in a
 /// work tree".
-fn sparse_context() -> Result<SparseContext> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+fn sparse_context(cli_session: &crate::session::CliSession) -> Result<SparseContext> {
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = require_work_tree(&git_dir)?;
-    let prefix = sparse_prefix(&worktree_root)?;
+    let prefix = sparse_prefix(&worktree_root, cwd)?;
     Ok(SparseContext {
         git_dir,
         worktree_root,
@@ -1290,10 +1296,9 @@ fn sparse_context() -> Result<SparseContext> {
 /// Computes git's `prefix`: the worktree-relative path from the worktree top to
 /// the current directory, with a trailing `/` (empty at the top). Used to
 /// resolve cone-mode directory arguments supplied from a subdirectory.
-fn sparse_prefix(worktree_root: &Path) -> Result<Vec<u8>> {
-    let cwd = env::current_dir()?;
+fn sparse_prefix(worktree_root: &Path, cwd: &Path) -> Result<Vec<u8>> {
     let canonical_root = fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.into());
-    let canonical_cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
+    let canonical_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let Ok(rel) = canonical_cwd.strip_prefix(&canonical_root) else {
         return Ok(Vec::new());
     };
@@ -1309,9 +1314,8 @@ fn sparse_prefix(worktree_root: &Path) -> Result<Vec<u8>> {
 /// `setup_work_tree()` and so runs in a bare repository. The worktree root is
 /// only used to anchor relative paths, so a bare repo falls back to the git
 /// directory's parent (it is never read for `check-rules`).
-fn sparse_context_no_worktree() -> Result<SparseContext> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+fn sparse_context_no_worktree(cli_session: &crate::session::CliSession) -> Result<SparseContext> {
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?
         .unwrap_or_else(|| git_dir.parent().unwrap_or(&git_dir).to_path_buf());

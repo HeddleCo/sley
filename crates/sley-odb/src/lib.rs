@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod gc;
 mod install;
 mod loose;
 mod midx;
@@ -16,6 +17,7 @@ mod reachability;
 mod registry;
 mod repack;
 
+pub use gc::*;
 pub use install::*;
 pub use loose::*;
 pub use midx::*;

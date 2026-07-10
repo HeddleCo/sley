@@ -6,8 +6,12 @@ use sley::plumbing::{sley_object, sley_refs, sley_rev};
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
 
-pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
-    for_each_ref_core(args, "git for-each-ref")
+pub(crate) fn cmd_for_each_ref(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let git_dir = cli_session.git_dir()?;
+    for_each_ref_core(&git_dir, args, "git for-each-ref")
 }
 
 /// The `-h` usage banner, matching git's parse_options output byte-for-byte.
@@ -58,7 +62,12 @@ fn print_for_each_ref_usage(usage_cmd: &str) {
 /// The shared core of `git for-each-ref` and its clone `git refs list` (see
 /// builtin/refs.c::cmd_refs_list, which calls for_each_ref_core). The only
 /// per-command difference is the program name printed in the `-h` usage banner.
-pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> {
+pub(crate) fn for_each_ref_core(
+    git_dir: &Path,
+    args: &[String],
+    usage_cmd: &str,
+) -> Result<()> {
+    let git_dir = git_dir.to_path_buf();
     let mut format_spec = "%(objectname) %(objecttype)\t%(refname)".to_string();
     let mut count = None;
     let mut omit_empty = false;
@@ -312,7 +321,6 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         return Err(GitError::Exit(128));
     }
     let needs = ForEachRefNeeds::analyze(&format_spec);
-    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let objectname_abbrev = repository_abbrev(&git_dir, format)?;
     let points_at = points_at_revs

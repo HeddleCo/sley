@@ -121,8 +121,17 @@ pub(super) fn run_branch_move_options(
             };
             let head_reflog_message =
                 format!("Branch: renamed {old_ref} to {new_ref}").into_bytes();
-            if let Err(err) = store.move_branch(&old_branch, &new_branch, options.force, committer)
-            {
+            if let Err(err) = sley_refs::branch::transfer_branch(
+                store,
+                sley_refs::branch::BranchTransferOptions {
+                    kind: sley_refs::branch::BranchTransferKind::Move,
+                    source: old_branch.clone(),
+                    destination: new_branch.clone(),
+                    force: options.force,
+                    committer,
+                },
+            ) {
+                let err = err.into_git_error();
                 return branch_move_failed(err, "rename");
             }
             let linked_update = update_all_worktree_heads(git_dir, &old_ref, &new_ref);
@@ -153,8 +162,17 @@ pub(super) fn run_branch_move_options(
         }
         BranchMoveKind::Copy => {
             let committer = branch_reflog_committer_identity(store, &old_branch)?;
-            if let Err(err) = store.copy_branch(&old_branch, &new_branch, options.force, committer)
-            {
+            if let Err(err) = sley_refs::branch::transfer_branch(
+                store,
+                sley_refs::branch::BranchTransferOptions {
+                    kind: sley_refs::branch::BranchTransferKind::Copy,
+                    source: old_branch.clone(),
+                    destination: new_branch.clone(),
+                    force: options.force,
+                    committer,
+                },
+            ) {
+                let err = err.into_git_error();
                 return branch_move_failed(err, "copy");
             }
             copy_branch_config(git_dir, &old_branch, &new_branch)?;

@@ -29,7 +29,10 @@ pub(crate) fn head_commit_oid(refs: &FileRefStore) -> Result<Option<ObjectId>> {
     }
 }
 
-pub(crate) fn cmd_merge_base(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_merge_base(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut all = false;
     let mut is_ancestor = false;
     let mut independent = false;
@@ -86,8 +89,7 @@ pub(crate) fn cmd_merge_base(args: &[String]) -> Result<()> {
             "merge-base requires at least one commit for this mode".into(),
         ));
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     if fork_point {

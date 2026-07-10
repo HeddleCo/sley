@@ -7,7 +7,10 @@ use sley::plumbing::{sley_core, sley_diff_merge, sley_object, sley_odb, sley_rev
 use crate::*;
 use sley_pathspec::normalized_revwalk_pathspec;
 
-pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_rev_list(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut setup_args = Vec::new();
     let mut parents = false;
     let mut children = false;
@@ -390,7 +393,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let author_filters = parse_log_filter_patterns(&author_patterns, regexp_mode)?;
     let committer_filters = parse_log_filter_patterns(&committer_patterns, regexp_mode)?;
     let grep_filters = parse_log_filter_patterns(&grep_patterns, regexp_mode)?;
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let output_encoding = log_output_encoding(&config);

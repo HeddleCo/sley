@@ -2,16 +2,19 @@
 
 use crate::*;
 
-pub(crate) fn cmd_bundle(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_bundle(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let Some(subcommand) = args.first().map(String::as_str) else {
         print_bundle_usage();
         return Err(GitError::Exit(129));
     };
     match subcommand {
-        "create" => cmd_bundle_create(&args[1..]),
-        "verify" => cmd_bundle_verify(&args[1..]),
+        "create" => cmd_bundle_create(cli_session, &args[1..]),
+        "verify" => cmd_bundle_verify(cli_session, &args[1..]),
         "list-heads" => cmd_bundle_list_heads(&args[1..]),
-        "unbundle" => cmd_bundle_unbundle(&args[1..]),
+        "unbundle" => cmd_bundle_unbundle(cli_session, &args[1..]),
         _ => {
             print_bundle_usage();
             Err(GitError::Exit(129))
@@ -37,7 +40,7 @@ fn bundle_usage_error(usage: &str) -> Result<()> {
     eprint!("{usage}");
     Err(GitError::Exit(129))
 }
-fn cmd_bundle_create(args: &[String]) -> Result<()> {
+fn cmd_bundle_create(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut progress = false;
     let mut version = None;
@@ -75,8 +78,7 @@ fn cmd_bundle_create(args: &[String]) -> Result<()> {
     let Some(path) = path else {
         return bundle_usage_error(BUNDLE_CREATE_USAGE);
     };
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let options = parse_bundle_revision_args(&rev_args)?;
@@ -143,7 +145,7 @@ fn cmd_bundle_create(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_bundle_verify(args: &[String]) -> Result<()> {
+fn cmd_bundle_verify(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut path = None;
     for arg in args {
@@ -160,8 +162,7 @@ fn cmd_bundle_verify(args: &[String]) -> Result<()> {
     let Some(path) = path else {
         return bundle_usage_error(BUNDLE_VERIFY_USAGE);
     };
-    let cwd = env::current_dir()?;
-    let git_dir = match crate::session::cli_git_dir_from(&cwd) {
+    let git_dir = match cli_session.git_dir() {
         Ok(git_dir) => git_dir,
         Err(_) => {
             eprintln!("error: need a repository to verify a bundle");
@@ -188,7 +189,7 @@ fn cmd_bundle_list_heads(args: &[String]) -> Result<()> {
     print_bundle_refs(&bundle.references, refs)
 }
 
-fn cmd_bundle_unbundle(args: &[String]) -> Result<()> {
+fn cmd_bundle_unbundle(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut progress = false;
     let mut path = None;
     let mut refs = Vec::new();
@@ -205,8 +206,7 @@ fn cmd_bundle_unbundle(args: &[String]) -> Result<()> {
     let Some(path) = path else {
         return bundle_usage_error(BUNDLE_UNBUNDLE_USAGE);
     };
-    let cwd = env::current_dir()?;
-    let git_dir = match crate::session::cli_git_dir_from(&cwd) {
+    let git_dir = match cli_session.git_dir() {
         Ok(git_dir) => git_dir,
         Err(_) => {
             eprintln!("fatal: Need a repository to unbundle.");

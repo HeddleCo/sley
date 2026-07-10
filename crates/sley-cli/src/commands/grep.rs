@@ -239,7 +239,10 @@ fn parse_grep_bool(value: Option<&str>) -> bool {
     }
 }
 
-pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_grep(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut opts = GrepOptions::new();
     // `positionals` is the post-option token stream (pattern, revs, paths). A `--`
     // among them is preserved as the literal marker `\0DD\0` so the later rev/path
@@ -483,7 +486,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         opts.push_pattern(positionals.remove(0));
     }
 
-    let repo = match RepositoryContext::discover_current() {
+    let repo = match RepositoryContext::from_session(cli_session) {
         Ok(repo) => Some(repo),
         Err(err) => {
             if no_index || grep_fallback_to_no_index()? {

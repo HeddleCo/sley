@@ -404,7 +404,7 @@ pub fn stream_short_status_with_options<F>(
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
     options: ShortStatusOptions,
-    mut emit: F,
+    emit: F,
 ) -> Result<()>
 where
     F: for<'a> FnMut(ShortStatusRow<'a>) -> Result<StreamControl>,
@@ -412,19 +412,40 @@ where
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    stream_short_status_with_database(worktree_root, git_dir, format, &db, options, emit)
+}
+
+/// Stream status rows while reusing a caller-owned object database.
+///
+/// Repository facades should prefer this entry point so status shares decoded
+/// object, pack, and replacement caches with the rest of the session instead
+/// of reopening the object store for every command.
+pub fn stream_short_status_with_database<F>(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    options: ShortStatusOptions,
+    mut emit: F,
+) -> Result<()>
+where
+    F: for<'a> FnMut(ShortStatusRow<'a>) -> Result<StreamControl>,
+{
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
     if !options.include_ignored
         && let Some(()) = stream_short_status_borrowed_head_matches_index_if_possible(
             worktree_root,
             git_dir,
             format,
-            &db,
+            db,
             options.untracked_mode,
             &mut emit,
         )?
     {
         return Ok(());
     }
-    for entry in collect_short_status_with_options(worktree_root, git_dir, format, options)? {
+    for entry in collect_short_status_with_database(worktree_root, git_dir, format, db, options)? {
         if emit(entry.as_row())?.is_stop() {
             break;
         }
@@ -432,7 +453,7 @@ where
     Ok(())
 }
 
-pub(crate) fn collect_short_status_with_options(
+pub fn collect_short_status_with_options(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -441,12 +462,25 @@ pub(crate) fn collect_short_status_with_options(
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    collect_short_status_with_database(worktree_root, git_dir, format, &db, options)
+}
+
+/// Collect status rows while reusing a caller-owned object database.
+pub fn collect_short_status_with_database(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    options: ShortStatusOptions,
+) -> Result<Vec<ShortStatusEntry>> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
     if !options.include_ignored
         && let Some(entries) = short_status_borrowed_head_matches_index_if_possible(
             worktree_root,
             git_dir,
             format,
-            &db,
+            db,
             options.untracked_mode,
         )?
     {
@@ -458,10 +492,10 @@ pub(crate) fn collect_short_status_with_options(
     // comparison can stream directly from the parsed index and avoid building a
     // second path-sorted copy of every tracked entry.
     let (mut parsed_index, mut stat_cache, mut head_matches_index) =
-        read_index_with_stat_cache(git_dir, format, &db)?;
+        read_index_with_stat_cache(git_dir, format, db)?;
     let sparse_checkout_active = sparse_checkout_active_for_status(git_dir, &parsed_index);
     if sparse_checkout_active && parsed_index.entries.iter().any(IndexEntry::is_sparse_dir) {
-        expand_sparse_index(&mut parsed_index, &db, format)?;
+        expand_sparse_index(&mut parsed_index, db, format)?;
         stat_cache = IndexStatCache::from_index_mtime(&parsed_index, stat_cache.index_mtime);
         head_matches_index = false;
     }
@@ -476,7 +510,7 @@ pub(crate) fn collect_short_status_with_options(
             worktree_root,
             git_dir,
             format,
-            &db,
+            db,
             &parsed_index,
             &stat_cache,
             true,
@@ -519,7 +553,7 @@ pub(crate) fn collect_short_status_with_options(
     let head = if head_matches_index {
         None
     } else {
-        Some(head_tree_entries(git_dir, format, &db)?)
+        Some(head_tree_entries(git_dir, format, db)?)
     };
     let known_tracked_paths = index.keys().cloned().collect::<BTreeSet<_>>();
     let tracked_paths = if options.untracked_mode == StatusUntrackedMode::None {

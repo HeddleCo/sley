@@ -20,7 +20,38 @@ use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord};
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 
-pub(crate) fn cmd_remote(args: &[String]) -> Result<()> {
+pub(crate) struct RemoteCommandContext {
+    git_dir: PathBuf,
+    format: ObjectFormat,
+    refs: FileRefStore,
+}
+
+impl RemoteCommandContext {
+    pub(crate) fn open(cli_session: &crate::session::CliSession) -> Result<Self> {
+        let git_dir = cli_session.git_dir()?;
+        let format = repository_object_format(&git_dir)?;
+        let refs = FileRefStore::new(&git_dir, format);
+        Ok(Self {
+            git_dir,
+            format,
+            refs,
+        })
+    }
+
+    fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
+    fn format(&self) -> ObjectFormat {
+        self.format
+    }
+
+    fn refs(&self) -> &FileRefStore {
+        &self.refs
+    }
+}
+
+pub(crate) fn cmd_remote(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut verbose = false;
     let mut idx = 0;
     while idx < args.len() {
@@ -32,19 +63,33 @@ pub(crate) fn cmd_remote(args: &[String]) -> Result<()> {
         idx += 1;
     }
     if idx == args.len() {
-        return remote_list(verbose);
+        return remote_list(&RemoteCommandContext::open(cli_session)?, verbose);
     }
     match args[idx].as_str() {
-        "add" => cmd_remote_add(&args[idx + 1..]),
-        "get-url" => cmd_remote_get_url(&args[idx + 1..]),
-        "prune" => cmd_remote_prune(&args[idx + 1..]),
-        "rename" => cmd_remote_rename(&args[idx + 1..]),
-        "remove" | "rm" => cmd_remote_remove(&args[idx + 1..]),
-        "set-branches" => cmd_remote_set_branches(&args[idx + 1..]),
-        "set-head" => cmd_remote_set_head(&args[idx + 1..]),
-        "set-url" => cmd_remote_set_url(&args[idx + 1..]),
-        "show" => cmd_remote_show(&args[idx + 1..]),
-        "update" => cmd_remote_update(&args[idx + 1..], verbose),
+        "add" => cmd_remote_add(&RemoteCommandContext::open(cli_session)?, &args[idx + 1..]),
+        "get-url" => {
+            cmd_remote_get_url(&RemoteCommandContext::open(cli_session)?, &args[idx + 1..])
+        }
+        "prune" => cmd_remote_prune(&RemoteCommandContext::open(cli_session)?, &args[idx + 1..]),
+        "rename" => cmd_remote_rename(&RemoteCommandContext::open(cli_session)?, &args[idx + 1..]),
+        "remove" | "rm" => {
+            cmd_remote_remove(&RemoteCommandContext::open(cli_session)?, &args[idx + 1..])
+        }
+        "set-branches" => {
+            cmd_remote_set_branches(&RemoteCommandContext::open(cli_session)?, &args[idx + 1..])
+        }
+        "set-head" => {
+            cmd_remote_set_head(&RemoteCommandContext::open(cli_session)?, &args[idx + 1..])
+        }
+        "set-url" => {
+            cmd_remote_set_url(&RemoteCommandContext::open(cli_session)?, &args[idx + 1..])
+        }
+        "show" => cmd_remote_show(&RemoteCommandContext::open(cli_session)?, &args[idx + 1..]),
+        "update" => cmd_remote_update(
+            &RemoteCommandContext::open(cli_session)?,
+            &args[idx + 1..],
+            verbose,
+        ),
         other => {
             // Upstream `builtin/remote.c`: an unknown subcommand emits
             // `error("unknown subcommand: \`%s'")` then `usage_with_options`
@@ -118,9 +163,8 @@ fn remote_seturl_usage_error() -> GitError {
     )
 }
 
-fn remote_list(verbose: bool) -> Result<()> {
-    let git_dir = crate::session::cli_git_dir()?;
-    let config = read_repo_config(&git_dir)?;
+fn remote_list(context: &RemoteCommandContext, verbose: bool) -> Result<()> {
+    let config = read_repo_config(context.git_dir())?;
     let mut stdout = io::stdout();
     for name in remote_names(&config) {
         if verbose {
@@ -142,7 +186,7 @@ fn remote_list(verbose: bool) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_remote_add(context: &RemoteCommandContext, args: &[String]) -> Result<()> {
     let mut branches = Vec::new();
     let mut master = None;
     let mut tag_opt = None;
@@ -205,101 +249,64 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
     let name = positional[0];
     let url = positional[1];
     validate_remote_name(name)?;
-    let git_dir = crate::session::cli_git_dir()?;
-    let mut config = read_repo_config_on_disk(&git_dir)?;
-    if mirror != RemoteAddMirror::None && master.is_some() {
-        eprintln!("fatal: specifying a master branch makes no sense with --mirror");
-        return Err(GitError::Exit(128));
-    }
-    if matches!(mirror, RemoteAddMirror::Push) && !branches.is_empty() {
-        eprintln!("fatal: specifying branches to track makes sense only with fetch mirrors");
-        return Err(GitError::Exit(128));
-    }
-    // Build the section body from the parsed options, then let the shared editor
-    // append it (and reject a duplicate remote).
-    let mut entries = vec![ConfigEntry::new("url", Some(url.to_string()))];
-    match mirror {
-        RemoteAddMirror::Fetch | RemoteAddMirror::Both => {
-            if branches.is_empty() {
-                entries.push(ConfigEntry::new("fetch", Some("+refs/*:refs/*".into())));
-            } else {
-                for branch in &branches {
-                    entries.push(ConfigEntry::new(
-                        "fetch",
-                        Some(remote_add_fetch_refspec(name, branch, mirror)),
-                    ));
-                }
-            }
+    let git_dir = context.git_dir();
+    let mut config = read_repo_config_on_disk(git_dir)?;
+    let outcome = match sley_remote::add_remote(
+        &mut config,
+        &sley_remote::AddRemoteOptions {
+            name: name.to_string(),
+            url: url.to_string(),
+            branches: branches.clone(),
+            master,
+            tags: match tag_opt.as_deref() {
+                Some("--tags") => sley_remote::RemoteTagMode::All,
+                Some("--no-tags") => sley_remote::RemoteTagMode::None,
+                _ => sley_remote::RemoteTagMode::Default,
+            },
+            mirror,
+            fetch,
+        },
+    ) {
+        Ok(outcome) => outcome,
+        Err(sley_remote::RemoteAdminError::MasterWithMirror) => {
+            eprintln!("fatal: specifying a master branch makes no sense with --mirror");
+            return Err(GitError::Exit(128));
         }
-        RemoteAddMirror::Push => {
-            entries.push(ConfigEntry::new("mirror", Some("true".into())));
+        Err(sley_remote::RemoteAdminError::TrackingWithPushMirror) => {
+            eprintln!("fatal: specifying branches to track makes sense only with fetch mirrors");
+            return Err(GitError::Exit(128));
         }
-        RemoteAddMirror::None => {
-            if branches.is_empty() {
-                entries.push(ConfigEntry::new(
-                    "fetch",
-                    Some(sley_config::remotes::default_fetch_refspec(name)),
-                ));
-            } else {
-                for branch in &branches {
-                    entries.push(ConfigEntry::new(
-                        "fetch",
-                        Some(remote_add_fetch_refspec(name, branch, mirror)),
-                    ));
-                }
-            }
-        }
-    }
-    if let Some(tag_opt) = tag_opt {
-        entries.push(ConfigEntry::new("tagOpt", Some(tag_opt)));
-    }
-    if mirror == RemoteAddMirror::Both {
-        entries.push(ConfigEntry::new("mirror", Some("true".into())));
-    }
-    // Upstream `builtin/remote.c::check_remote_collision`: a new remote may not
-    // nest with an existing one. When the new name is `<existing>/…` it is a
-    // subset of that remote; when an existing name is `<new>/…` the new name is
-    // a superset. Either collision dies (exit 128).
-    for existing in remote_names(&config) {
-        if let Some(rest) = name.strip_prefix(&existing)
-            && rest.starts_with('/')
-        {
+        Err(sley_remote::RemoteAdminError::NameSubset { existing }) => {
             eprintln!("fatal: remote name '{name}' is a subset of existing remote '{existing}'");
             return Err(GitError::Exit(128));
         }
-        if let Some(rest) = existing.strip_prefix(name)
-            && rest.starts_with('/')
-        {
+        Err(sley_remote::RemoteAdminError::NameSuperset { existing }) => {
             eprintln!("fatal: remote name '{name}' is a superset of existing remote '{existing}'");
             return Err(GitError::Exit(128));
         }
-    }
-    match sley_config::remotes::add_remote(&mut config, name, entries) {
-        Ok(()) => {}
-        Err(sley_config::remotes::RemoteEditError::AlreadyExists) => {
-            // Upstream `builtin/remote.c::add`: `error("remote %s already
-            // exists.")` then `exit(3)`. A remote counts as existing when it has
-            // any config (e.g. a foreign-vcs `remote.<name>.vcs`), which the
-            // `[remote "<name>"]` section presence already captures.
+        Err(sley_remote::RemoteAdminError::AlreadyExists) => {
             eprintln!("error: remote {name} already exists.");
             return Err(GitError::Exit(3));
         }
-        Err(sley_config::remotes::RemoteEditError::NotFound) => {
+        Err(sley_remote::RemoteAdminError::NotFound) => {
             return Err(GitError::remote_not_found(name));
         }
-    }
-    write_repo_config(&git_dir, &config)?;
+        Err(sley_remote::RemoteAdminError::RenameCollision) => {
+            return Err(GitError::Command(
+                "unexpected rename collision while adding remote".into(),
+            ));
+        }
+    };
+    write_repo_config(git_dir, &config)?;
     // `-f`/`--fetch`: git runs `git fetch <name>` immediately after configuring
     // the remote (builtin/remote.c `add()`), so the tracking refs exist before
     // `-m`'s master HEAD is set.
-    if fetch {
+    if outcome.fetch {
         cmd_fetch(&[name.to_string()])?;
         if matches!(mirror, RemoteAddMirror::Fetch | RemoteAddMirror::Both)
-            && let Ok(branch) = discover_local_remote_head_branch(&config, name, &git_dir)
+            && let Ok(branch) = discover_local_remote_head_branch(&config, name, git_dir)
         {
-            let format = repository_object_format(&git_dir)?;
-            let store = FileRefStore::new(&git_dir, format);
-            let mut tx = store.transaction();
+            let mut tx = context.refs().transaction();
             tx.update(RefUpdate {
                 name: "HEAD".to_string(),
                 expected: None,
@@ -309,28 +316,13 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
             let _ = tx.commit();
         }
     }
-    if let Some(master) = master {
-        let format = repository_object_format(&git_dir)?;
-        let store = FileRefStore::new(&git_dir, format);
-        let mut tx = store.transaction();
-        tx.update(RefUpdate {
-            name: format!("refs/remotes/{name}/HEAD"),
-            expected: None,
-            new: RefTarget::Symbolic(format!("refs/remotes/{name}/{master}")),
-            reflog: None,
-        });
-        tx.commit()?;
+    if let Some(plan) = outcome.master_head {
+        sley_remote::apply_remote_head(context.refs(), &plan)?;
     }
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RemoteAddMirror {
-    None,
-    Fetch,
-    Push,
-    Both,
-}
+pub(crate) type RemoteAddMirror = sley_remote::RemoteMirror;
 
 fn parse_remote_add_mirror(value: &str) -> Result<RemoteAddMirror> {
     match value {
@@ -342,7 +334,7 @@ fn parse_remote_add_mirror(value: &str) -> Result<RemoteAddMirror> {
     }
 }
 
-pub(crate) fn cmd_remote_get_url(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_remote_get_url(context: &RemoteCommandContext, args: &[String]) -> Result<()> {
     let mut all = false;
     let mut push = false;
     let mut positional = Vec::new();
@@ -360,8 +352,7 @@ pub(crate) fn cmd_remote_get_url(args: &[String]) -> Result<()> {
     }
     let name = positional[0];
     validate_remote_name(name)?;
-    let git_dir = crate::session::cli_git_dir()?;
-    let config = read_repo_config(&git_dir)?;
+    let config = read_repo_config(context.git_dir())?;
     let mut urls = if push {
         remote_config_values(&config, name, "pushurl")
     } else {
@@ -388,33 +379,36 @@ pub(crate) fn cmd_remote_get_url(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_remote_remove(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_remote_remove(context: &RemoteCommandContext, args: &[String]) -> Result<()> {
     if args.len() != 1 {
         return Err(remote_remove_usage_error());
     }
     let name = &args[0];
     validate_remote_name(name)?;
-    let git_dir = crate::session::cli_git_dir()?;
-    let mut config = read_repo_config_on_disk(&git_dir)?;
-    let warn_skipped_local_branches = remote_remove_maps_outside_remote_tracking(&config, name);
-    match sley_config::remotes::remove_remote(&mut config, name) {
-        Ok(()) => {}
-        Err(sley_config::remotes::RemoteEditError::NotFound) => {
+    let git_dir = context.git_dir();
+    let mut config = read_repo_config_on_disk(git_dir)?;
+    let outcome = match sley_remote::remove_remote(&mut config, name) {
+        Ok(outcome) => outcome,
+        Err(sley_remote::RemoteAdminError::NotFound) => {
             // Upstream `builtin/remote.c::rm`: `error("No such remote: '%s'")`
             // then `exit(2)`.
             eprintln!("error: No such remote: '{name}'");
             return Err(GitError::Exit(2));
         }
-        Err(sley_config::remotes::RemoteEditError::AlreadyExists) => {
+        Err(sley_remote::RemoteAdminError::AlreadyExists) => {
             return Err(GitError::Command(format!("remote {name} already exists")));
         }
+        Err(error) => {
+            return Err(GitError::Command(format!(
+                "remote remove planning failed: {error:?}"
+            )));
+        }
+    };
+    write_repo_config(git_dir, &config)?;
+    if outcome.warn_local_branches {
+        warn_remote_remove_skipped_local_branches(git_dir, context.format())?;
     }
-    write_repo_config(&git_dir, &config)?;
-    let format = repository_object_format(&git_dir)?;
-    if warn_skipped_local_branches {
-        warn_remote_remove_skipped_local_branches(&git_dir, format)?;
-    }
-    remove_remote_tracking_refs(&git_dir, format, name)
+    remove_remote_tracking_refs(git_dir, context.format(), name)
 }
 
 /// `git remote update [-p|--prune] [(<group> | <remote>)...]`.
@@ -427,7 +421,11 @@ pub(crate) fn cmd_remote_remove(args: &[String]) -> Result<()> {
 /// as a bare remote name. We resolve the remote set here and fetch each one in
 /// turn (sley's `fetch` is single-remote), matching that behavior without the
 /// process fan-out.
-pub(crate) fn cmd_remote_update(args: &[String], verbose: bool) -> Result<()> {
+pub(crate) fn cmd_remote_update(
+    context: &RemoteCommandContext,
+    args: &[String],
+    verbose: bool,
+) -> Result<()> {
     let mut prune: Option<bool> = None;
     let mut groups: Vec<String> = Vec::new();
     let mut iter = args.iter();
@@ -443,8 +441,7 @@ pub(crate) fn cmd_remote_update(args: &[String], verbose: bool) -> Result<()> {
         }
     }
 
-    let git_dir = crate::session::cli_git_dir()?;
-    let config = read_repo_config(&git_dir)?;
+    let config = read_repo_config(context.git_dir())?;
 
     // Resolve the requested groups/remotes into a de-duplicated, order-preserving
     // list of concrete remote names.
@@ -508,7 +505,7 @@ pub(crate) fn cmd_remote_update(args: &[String], verbose: bool) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_remote_prune(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_remote_prune(context: &RemoteCommandContext, args: &[String]) -> Result<()> {
     let mut dry_run = false;
     let mut names = Vec::new();
     let mut positional_only = false;
@@ -532,19 +529,18 @@ pub(crate) fn cmd_remote_prune(args: &[String]) -> Result<()> {
     if names.is_empty() {
         return Err(GitError::Command("remote prune requires <name>".into()));
     }
-    let git_dir = crate::session::cli_git_dir()?;
-    let config = read_repo_config(&git_dir)?;
-    let format = repository_object_format(&git_dir)?;
-    let store = FileRefStore::new(&git_dir, format);
+    let git_dir = context.git_dir();
+    let config = read_repo_config(git_dir)?;
+    let store = context.refs();
     let mut stdout = io::stdout();
     for name in names {
         validate_remote_name(name)?;
-        prune_remote_tracking_refs(&mut stdout, &config, &store, &git_dir, name, dry_run)?;
+        prune_remote_tracking_refs(&mut stdout, &config, store, git_dir, name, dry_run)?;
     }
     Ok(())
 }
 
-pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_remote_rename(context: &RemoteCommandContext, args: &[String]) -> Result<()> {
     // `--[no-]progress` is accepted (and ignored — sley does not render rename
     // progress) before the two positional names, matching git's option parsing.
     let progress = args.iter().any(|arg| arg == "--progress");
@@ -557,86 +553,43 @@ pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
     }
     let old = positional[0];
     let new = positional[1];
-    let git_dir = crate::session::cli_git_dir()?;
-    let mut config = read_repo_config_on_disk(&git_dir)?;
-    sley_config::remotes::augment_with_legacy_remote_files(&mut config, &git_dir);
+    let git_dir = context.git_dir();
+    let mut config = read_repo_config_on_disk(git_dir)?;
+    sley_config::remotes::augment_with_legacy_remote_files(&mut config, git_dir);
     // Upstream `builtin/remote.c::mv` order: the old remote's existence is
     // checked first (`error` + `exit(2)`), then the new name's collision
     // (`exit(3)`), and only then the new name's format (`die`, exit 128). The
     // old name is never format-validated — a configured remote with an odd name
     // can still be renamed away.
-    let old_exists = config
-        .sections
-        .iter()
-        .any(|section| section.name == "remote" && section.subsection.as_deref() == Some(old));
-    if !old_exists {
-        eprintln!("error: No such remote: '{old}'");
-        return Err(GitError::Exit(2));
-    }
-    if old != new
-        && config
-            .sections
-            .iter()
-            .any(|section| section.name == "remote" && section.subsection.as_deref() == Some(new))
-    {
-        eprintln!("error: remote {new} already exists.");
-        return Err(GitError::Exit(3));
-    }
+    let outcome = match sley_remote::rename_remote(&mut config, old, new) {
+        Ok(outcome) => outcome,
+        Err(sley_remote::RemoteAdminError::NotFound) => {
+            eprintln!("error: No such remote: '{old}'");
+            return Err(GitError::Exit(2));
+        }
+        Err(sley_remote::RemoteAdminError::RenameCollision) => {
+            eprintln!("error: remote {new} already exists.");
+            return Err(GitError::Exit(3));
+        }
+        Err(error) => {
+            return Err(GitError::Command(format!(
+                "remote rename planning failed: {error:?}"
+            )));
+        }
+    };
     validate_remote_name(new)?;
     if old == new {
-        remove_legacy_remote_file(&git_dir, old)?;
-        write_repo_config(&git_dir, &config)?;
+        remove_legacy_remote_file(git_dir, old)?;
+        write_repo_config(git_dir, &config)?;
         return Ok(());
     }
-    let rename_tracking_refs = remote_config_values(&config, old, "fetch")
-        .iter()
-        .any(|refspec| fetch_refspec_targets_remote_tracking(refspec, old));
-    let mut renamed = false;
-    for section in &mut config.sections {
-        if section.name == "remote" && section.subsection.as_deref() == Some(old) {
-            section.subsection = Some(new.to_string());
-            for entry in &mut section.entries {
-                if entry.key.eq_ignore_ascii_case("fetch")
-                    && let Some(value) = &mut entry.value
-                {
-                    *value = value.replace(
-                        &format!("refs/remotes/{old}/"),
-                        &format!("refs/remotes/{new}/"),
-                    );
-                }
-            }
-            move_remote_fetch_entries_to_end(section);
-            renamed = true;
-        } else if section.name == "branch" {
-            for entry in &mut section.entries {
-                if (entry.key.eq_ignore_ascii_case("remote")
-                    || entry.key.eq_ignore_ascii_case("pushRemote"))
-                    && entry.value.as_deref() == Some(old)
-                {
-                    entry.value = Some(new.to_string());
-                }
-            }
-        } else if section.name == "remote" && section.subsection.is_none() {
-            for entry in &mut section.entries {
-                if entry.key.eq_ignore_ascii_case("pushDefault")
-                    && entry.value.as_deref() == Some(old)
-                {
-                    entry.value = Some(new.to_string());
-                }
-            }
-        }
-    }
-    if !renamed {
-        return Err(GitError::remote_not_found(old));
-    }
-    remove_legacy_remote_file(&git_dir, old)?;
-    write_repo_config(&git_dir, &config)?;
-    let format = repository_object_format(&git_dir)?;
+    remove_legacy_remote_file(git_dir, old)?;
+    write_repo_config(git_dir, &config)?;
     if progress {
         trace2_remote_rename_progress();
     }
-    if rename_tracking_refs {
-        match rename_remote_tracking_refs(&git_dir, format, old, new) {
+    if outcome.rename_tracking_refs {
+        match rename_remote_tracking_refs(git_dir, context.format(), old, new) {
             Ok(()) => Ok(()),
             Err(_) => {
                 eprintln!("error: renaming remote references failed");
@@ -649,19 +602,6 @@ pub(crate) fn cmd_remote_rename(args: &[String]) -> Result<()> {
     }
 }
 
-fn move_remote_fetch_entries_to_end(section: &mut ConfigSection) {
-    let mut fetch_entries = Vec::new();
-    let entries = mem::take(&mut section.entries);
-    for entry in entries {
-        if entry.key.eq_ignore_ascii_case("fetch") {
-            fetch_entries.push(entry);
-        } else {
-            section.entries.push(entry);
-        }
-    }
-    section.entries.extend(fetch_entries);
-}
-
 fn remove_legacy_remote_file(git_dir: &Path, name: &str) -> Result<()> {
     for dir in ["remotes", "branches"] {
         let path = git_dir.join(dir).join(name);
@@ -672,25 +612,11 @@ fn remove_legacy_remote_file(git_dir: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn fetch_refspec_targets_remote_tracking(refspec: &str, remote: &str) -> bool {
-    let Some((_, dst)) = refspec.strip_prefix('+').unwrap_or(refspec).split_once(':') else {
-        return false;
-    };
-    dst.starts_with(&format!("refs/remotes/{remote}/"))
-}
-
 fn remove_remote_tracking_refs(git_dir: &Path, format: ObjectFormat, remote: &str) -> Result<()> {
     let prefix = format!("refs/remotes/{remote}/");
     remove_remote_packed_refs(git_dir, format, &prefix)?;
     remove_remote_ref_dir(git_dir, "refs", remote)?;
     remove_remote_ref_dir(git_dir, "logs/refs", remote)
-}
-
-fn remote_remove_maps_outside_remote_tracking(config: &GitConfig, remote: &str) -> bool {
-    remote_config_values(config, remote, "fetch")
-        .iter()
-        .filter_map(|refspec| refspec.rsplit_once(':').map(|(_, dst)| dst))
-        .any(|dst| dst == "refs/*" || dst == "+refs/*")
 }
 
 fn warn_remote_remove_skipped_local_branches(git_dir: &Path, format: ObjectFormat) -> Result<()> {
@@ -837,8 +763,14 @@ fn prune_remote_tracking_refs(
     let remote_store = FileRefStore::new(&remote_git_dir, remote_format);
     let remote_refs = remote_store.list_refs()?;
     let local_refs = store.list_refs()?;
-    let stale_refs = stale_refs_for_remote_fetch(config, remote, &remote_refs, &local_refs);
-    if stale_refs.is_empty() {
+    let remote_head = format!("refs/remotes/{remote}/HEAD");
+    let head_target = match store.read_ref(&remote_head)? {
+        Some(RefTarget::Symbolic(target)) => Some(target),
+        Some(RefTarget::Direct(_)) | None => None,
+    };
+    let plan =
+        sley_remote::plan_remote_prune(config, remote, &remote_refs, &local_refs, head_target);
+    if plan.stale_refs.is_empty() {
         return Ok(());
     }
     let display_url = remote_config_values(config, remote, "url")
@@ -847,18 +779,13 @@ fn prune_remote_tracking_refs(
         .unwrap_or_else(|| remote.into());
     writeln!(stdout, "Pruning {remote}")?;
     writeln!(stdout, "URL: {display_url}")?;
-    let remote_head = format!("refs/remotes/{remote}/HEAD");
-    let head_target = match store.read_ref(&remote_head)? {
-        Some(RefTarget::Symbolic(target)) => Some(target),
-        Some(RefTarget::Direct(_)) | None => None,
-    };
-    for refname in stale_refs {
+    for refname in plan.stale_refs {
         let display = refname
             .strip_prefix("refs/remotes/")
             .unwrap_or(refname.as_str());
         if dry_run {
             writeln!(stdout, " * [would prune] {display}")?;
-            if head_target.as_deref() == Some(refname.as_str()) {
+            if plan.head_target.as_deref() == Some(refname.as_str()) {
                 writeln!(
                     stdout,
                     " refs/remotes/{remote}/HEAD will become dangling after {refname} is deleted"
@@ -876,7 +803,7 @@ fn prune_remote_tracking_refs(
             None => {}
         }
         writeln!(stdout, " * [pruned] {display}")?;
-        if head_target.as_deref() == Some(refname.as_str()) {
+        if plan.head_target.as_deref() == Some(refname.as_str()) {
             writeln!(
                 stdout,
                 " refs/remotes/{remote}/HEAD has become dangling after {refname} was deleted"
@@ -884,43 +811,6 @@ fn prune_remote_tracking_refs(
         }
     }
     Ok(())
-}
-
-fn stale_refs_for_remote_fetch(
-    config: &GitConfig,
-    remote: &str,
-    remote_refs: &[sley_refs::Ref],
-    local_refs: &[sley_refs::Ref],
-) -> Vec<String> {
-    let mut stale = BTreeSet::new();
-    for spec in remote_config_values(config, remote, "fetch") {
-        let Some((src_prefix, dst_prefix)) = fetch_refspec_prefixes(&spec) else {
-            continue;
-        };
-        let remote_names = branch_names_with_prefix(remote_refs, src_prefix)
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        for suffix in branch_names_with_prefix(local_refs, dst_prefix) {
-            if !remote_names.contains(&suffix) {
-                stale.insert(format!("{dst_prefix}{suffix}"));
-            }
-        }
-    }
-    stale.into_iter().collect()
-}
-
-fn fetch_refspec_prefixes(spec: &str) -> Option<(&str, &str)> {
-    if spec.starts_with('^') {
-        return None;
-    }
-    let spec = spec.strip_prefix('+').unwrap_or(spec);
-    let (src, dst) = spec.split_once(':')?;
-    if src == "refs/*" && dst == "refs/*" {
-        return Some(("refs/heads/", "refs/heads/"));
-    }
-    let src_prefix = src.strip_suffix('*')?;
-    let dst_prefix = dst.strip_suffix('*')?;
-    Some((src_prefix, dst_prefix))
 }
 
 fn remove_remote_packed_refs(git_dir: &Path, format: ObjectFormat, old_prefix: &str) -> Result<()> {
@@ -963,7 +853,10 @@ fn rename_remote_ref_dir(git_dir: &Path, root: &str, old: &str, new: &str) -> Re
     Ok(())
 }
 
-pub(crate) fn cmd_remote_set_branches(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_remote_set_branches(
+    context: &RemoteCommandContext,
+    args: &[String],
+) -> Result<()> {
     let mut add = false;
     let mut positional = Vec::new();
     for arg in args {
@@ -983,37 +876,22 @@ pub(crate) fn cmd_remote_set_branches(args: &[String]) -> Result<()> {
     for branch in branches {
         validate_remote_branch_name(branch)?;
     }
-    let git_dir = crate::session::cli_git_dir()?;
-    let mut config = read_repo_config_on_disk(&git_dir)?;
-    let mirror_fetch = remote_config_values(&config, name, "fetch")
+    let git_dir = context.git_dir();
+    let mut config = read_repo_config_on_disk(git_dir)?;
+    let branches = branches
         .iter()
-        .any(|value| value == "+refs/*:refs/*");
-    let Some(section) =
-        config.sections.iter_mut().rev().find(|section| {
-            section.name == "remote" && section.subsection.as_deref() == Some(name)
-        })
-    else {
-        return Err(GitError::remote_not_found(name));
-    };
-    if !add {
-        section
-            .entries
-            .retain(|entry| !entry.key.eq_ignore_ascii_case("fetch"));
+        .map(|branch| (*branch).to_string())
+        .collect::<Vec<_>>();
+    match sley_remote::set_remote_branches(&mut config, name, &branches, add) {
+        Ok(()) => write_repo_config(git_dir, &config),
+        Err(sley_remote::RemoteAdminError::NotFound) => Err(GitError::remote_not_found(name)),
+        Err(error) => Err(GitError::Command(format!(
+            "remote set-branches planning failed: {error:?}"
+        ))),
     }
-    for branch in branches {
-        section.entries.push(ConfigEntry::new(
-            "fetch",
-            Some(if mirror_fetch {
-                format!("+refs/{branch}:refs/{branch}")
-            } else {
-                remote_branch_fetch_refspec(name, branch)
-            }),
-        ));
-    }
-    write_repo_config(&git_dir, &config)
 }
 
-pub(crate) fn cmd_remote_set_head(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_remote_set_head(context: &RemoteCommandContext, args: &[String]) -> Result<()> {
     let mut action = RemoteSetHeadAction::Branch;
     let mut positional = Vec::new();
     for arg in args {
@@ -1045,20 +923,18 @@ pub(crate) fn cmd_remote_set_head(args: &[String]) -> Result<()> {
         }
     };
     validate_remote_name(name)?;
-    let git_dir = crate::session::cli_git_dir()?;
-    let mut config = read_repo_config_on_disk(&git_dir)?;
+    let git_dir = context.git_dir();
+    let mut config = read_repo_config_on_disk(git_dir)?;
     if !remote_exists(&config, name) {
         return Err(GitError::remote_not_found(name));
     }
-    let format = repository_object_format(&git_dir)?;
-    let store = FileRefStore::new(&git_dir, format);
+    let store = context.refs();
     let head = format!("refs/remotes/{name}/HEAD");
     if action == RemoteSetHeadAction::Delete {
-        let _ = store.delete_symbolic_ref(&head)?;
-        return Ok(());
+        return sley_remote::apply_remote_head(store, &sley_remote::RemoteHeadPlan::delete(name));
     }
     if action == RemoteSetHeadAction::Auto {
-        let branch = match discover_local_remote_head_branch(&config, name, &git_dir) {
+        let branch = match discover_local_remote_head_branch(&config, name, git_dir) {
             Ok(branch) => branch,
             Err(_) => {
                 eprintln!("error: Cannot determine remote HEAD");
@@ -1083,14 +959,9 @@ pub(crate) fn cmd_remote_set_head(args: &[String]) -> Result<()> {
             Some(RefTarget::Direct(oid)) => Some(RemoteSetHeadOld::Detached(oid.to_hex())),
             None => None,
         };
-        let mut tx = store.transaction();
-        tx.update(RefUpdate {
-            name: head,
-            expected: None,
-            new: RefTarget::Symbolic(target),
-            reflog: None,
-        });
-        if tx.commit().is_err() {
+        if sley_remote::apply_remote_head(store, &sley_remote::RemoteHeadPlan::set(name, &branch))
+            .is_err()
+        {
             eprintln!("error: Could not set up refs/remotes/{name}/HEAD");
             return Err(GitError::Exit(1));
         }
@@ -1099,7 +970,7 @@ pub(crate) fn cmd_remote_set_head(args: &[String]) -> Result<()> {
             .is_some_and(|value| value.eq_ignore_ascii_case("always"))
         {
             set_remote_section_value(&mut config, name, "followRemoteHEAD", "warn");
-            write_repo_config(&git_dir, &config)?;
+            write_repo_config(git_dir, &config)?;
         }
         match old_display.as_ref() {
             Some(RemoteSetHeadOld::Symbolic(old)) if old == &branch => {
@@ -1129,14 +1000,7 @@ pub(crate) fn cmd_remote_set_head(args: &[String]) -> Result<()> {
         eprintln!("error: Not a valid ref: {target}");
         return Err(GitError::Exit(1));
     }
-    let mut tx = store.transaction();
-    tx.update(RefUpdate {
-        name: head,
-        expected: None,
-        new: RefTarget::Symbolic(target),
-        reflog: None,
-    });
-    tx.commit()
+    sley_remote::apply_remote_head(store, &sley_remote::RemoteHeadPlan::set(name, branch))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1197,7 +1061,7 @@ fn discover_local_remote_head_branch(
     }
 }
 
-pub(crate) fn cmd_remote_set_url(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_remote_set_url(context: &RemoteCommandContext, args: &[String]) -> Result<()> {
     let mut push = false;
     let mut add = false;
     let mut delete = false;
@@ -1227,12 +1091,12 @@ pub(crate) fn cmd_remote_set_url(args: &[String]) -> Result<()> {
     let url = positional[1];
     let old_url = positional.get(2).copied();
     validate_remote_name(name)?;
-    let git_dir = crate::session::cli_git_dir()?;
-    let mut config = read_repo_config_on_disk(&git_dir)?;
+    let git_dir = context.git_dir();
+    let mut config = read_repo_config_on_disk(git_dir)?;
     let kind = if push {
-        sley_config::remotes::SetUrlKind::Push
+        sley_remote::SetUrlKind::Push
     } else {
-        sley_config::remotes::SetUrlKind::Fetch
+        sley_remote::SetUrlKind::Fetch
     };
     let key = kind.key();
     // `--delete`/`<oldurl>` select URLs with git's value-pattern matcher; build
@@ -1240,35 +1104,29 @@ pub(crate) fn cmd_remote_set_url(args: &[String]) -> Result<()> {
     let delete_matcher = delete.then(|| SimpleConfigRegex::parse(url));
     let old_url_matcher = old_url.map(SimpleConfigRegex::parse);
     let op = if add {
-        sley_config::remotes::SetUrlOp::Add { url }
+        sley_remote::SetUrlOp::Add { url }
     } else if let Some(matcher) = &delete_matcher {
-        sley_config::remotes::SetUrlOp::Delete {
+        sley_remote::SetUrlOp::Delete {
             matches: &|value| matcher.is_match(value),
         }
     } else if let Some(matcher) = &old_url_matcher {
-        sley_config::remotes::SetUrlOp::Replace {
+        sley_remote::SetUrlOp::Replace {
             url,
             matches: &|value| matcher.is_match(value),
         }
     } else {
-        sley_config::remotes::SetUrlOp::Set { url }
+        sley_remote::SetUrlOp::Set { url }
     };
-    match sley_config::remotes::set_url(&mut config, name, kind, op) {
-        Ok(()) => write_repo_config(&git_dir, &config),
-        Err(sley_config::remotes::SetUrlError::RemoteNotFound) => {
-            Err(GitError::remote_not_found(name))
-        }
-        Err(sley_config::remotes::SetUrlError::NoMatch) => {
+    match sley_remote::set_url(&mut config, name, kind, op) {
+        Ok(()) => write_repo_config(git_dir, &config),
+        Err(sley_remote::SetUrlError::RemoteNotFound) => Err(GitError::remote_not_found(name)),
+        Err(sley_remote::SetUrlError::NoMatch) => {
             // Only reachable for the `<oldurl>` (replace) form.
             remote_set_url_no_match(old_url.unwrap_or(url))
         }
-        Err(sley_config::remotes::SetUrlError::DeleteNoMatch) => {
-            remote_set_url_delete_no_match(name, key)
-        }
-        Err(sley_config::remotes::SetUrlError::DeleteAllFetchUrls) => {
-            remote_set_url_delete_all_fetch_urls()
-        }
-        Err(sley_config::remotes::SetUrlError::MultipleValues) => {
+        Err(sley_remote::SetUrlError::DeleteNoMatch) => remote_set_url_delete_no_match(name, key),
+        Err(sley_remote::SetUrlError::DeleteAllFetchUrls) => remote_set_url_delete_all_fetch_urls(),
+        Err(sley_remote::SetUrlError::MultipleValues) => {
             remote_set_url_multiple_values(name, key, url)
         }
     }
@@ -1295,7 +1153,7 @@ fn remote_set_url_multiple_values(name: &str, key: &str, url: &str) -> Result<()
     Err(GitError::Exit(128))
 }
 
-pub(crate) fn cmd_remote_show(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_remote_show(context: &RemoteCommandContext, args: &[String]) -> Result<()> {
     let mut no_query = false;
     let mut names = Vec::new();
     let mut positional_only = false;
@@ -1316,20 +1174,18 @@ pub(crate) fn cmd_remote_show(args: &[String]) -> Result<()> {
         }
     }
     if names.is_empty() {
-        return remote_list(false);
+        return remote_list(context, false);
     }
-    let git_dir = crate::session::cli_git_dir()?;
-    let config = read_repo_config(&git_dir)?;
-    let format = repository_object_format(&git_dir)?;
-    let store = FileRefStore::new(&git_dir, format);
-    let refs = store.list_refs()?;
+    let git_dir = context.git_dir();
+    let config = read_repo_config(git_dir)?;
+    let refs = context.refs().list_refs()?;
     let mut stdout = io::stdout();
     for name in names {
         validate_remote_name(name)?;
         if no_query {
             write_remote_show_no_query(&mut stdout, &config, &refs, name)?;
         } else {
-            write_remote_show_query(&mut stdout, &config, &refs, name, &git_dir)?;
+            write_remote_show_query(&mut stdout, &config, &refs, name, git_dir)?;
         }
     }
     Ok(())
@@ -1853,25 +1709,6 @@ fn remote_show_ref_display(name: &str, full_ref_names: bool) -> &str {
 
 fn local_branch_names(refs: &[sley_refs::Ref]) -> Vec<String> {
     branch_names_with_prefix(refs, "refs/heads/")
-}
-pub(super) fn remote_branch_fetch_refspec(remote: &str, branch: &str) -> String {
-    format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}")
-}
-
-pub(super) fn remote_add_fetch_refspec(
-    remote: &str,
-    branch: &str,
-    mirror: RemoteAddMirror,
-) -> String {
-    if matches!(mirror, RemoteAddMirror::Fetch | RemoteAddMirror::Both) {
-        if branch == "*" {
-            "+refs/*:refs/*".to_string()
-        } else {
-            format!("+refs/{branch}:refs/{branch}")
-        }
-    } else {
-        remote_branch_fetch_refspec(remote, branch)
-    }
 }
 fn validate_remote_branch_name(name: &str) -> Result<()> {
     if name.is_empty() || name.starts_with('-') {

@@ -3,7 +3,10 @@
 use crate::*;
 use sley::plumbing::sley_rev;
 
-pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_commit_tree(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut tree = None;
     let mut parents = Vec::new();
     let mut message_chunks = Vec::new();
@@ -71,7 +74,7 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
     let Some(tree) = tree else {
         return commit_tree_requires_one_tree_error();
     };
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     // git resolves the tree and each `-p` parent as a revision-ish (so a tag,
     // branch, `HEAD^`, abbreviated oid, or `<rev>^{tree}` all work), peeling the

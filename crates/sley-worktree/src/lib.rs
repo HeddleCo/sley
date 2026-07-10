@@ -45,6 +45,7 @@ mod index_io;
 mod move_remove;
 mod read_tree;
 mod status;
+mod status_plan;
 mod types_admin;
 
 // `attributes` and `index_io` hold only crate-internal helpers (no `pub`
@@ -59,6 +60,7 @@ pub use index_io::{StatCleanFilterValidator, fill_index_entry_stat_cache};
 pub use move_remove::*;
 pub use read_tree::*;
 pub use status::*;
+pub use status_plan::*;
 pub use types_admin::*;
 
 #[cfg(test)]

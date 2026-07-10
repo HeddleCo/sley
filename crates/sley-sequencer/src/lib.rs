@@ -1,5 +1,6 @@
 pub mod rebase;
 pub mod replay;
+pub mod stash;
 
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag};

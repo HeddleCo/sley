@@ -19,7 +19,10 @@ struct DifftoolOptions {
     diff_args: Vec<String>,
 }
 
-pub(crate) fn cmd_difftool(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_difftool(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = parse_difftool_args(args)?;
     if options.extcmd.is_some() && (options.cli_tool.is_some() || options.gui == Some(true)) {
         return Err(GitError::Command(
@@ -32,10 +35,10 @@ pub(crate) fn cmd_difftool(args: &[String]) -> Result<()> {
         ));
     }
     if options.diff_args.iter().any(|arg| arg == "--no-index") {
-        return run_no_index_difftool(&options);
+        return run_no_index_difftool(cli_session, &options);
     }
 
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let git_dir = repo.git_dir();
     let worktree_root = repo.worktree_root()?;
     let config = repo.config();
@@ -567,7 +570,10 @@ fn symlink_worktree_file(target: PathBuf, link: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_no_index_difftool(options: &DifftoolOptions) -> Result<()> {
+fn run_no_index_difftool(
+    cli_session: &crate::session::CliSession,
+    options: &DifftoolOptions,
+) -> Result<()> {
     let paths: Vec<&String> = options
         .diff_args
         .iter()
@@ -576,7 +582,7 @@ fn run_no_index_difftool(options: &DifftoolOptions) -> Result<()> {
     if paths.len() < 2 {
         return Err(GitError::Exit(129));
     }
-    let config = load_no_index_difftool_config()?;
+    let config = load_no_index_difftool_config(cli_session)?;
     let tool = resolve_difftool_tool(&config, options, false)?;
     let envs = ToolEnvironment {
         local: PathBuf::from(paths[0]),
@@ -605,8 +611,8 @@ fn run_no_index_difftool(options: &DifftoolOptions) -> Result<()> {
     }
 }
 
-fn load_no_index_difftool_config() -> Result<GitConfig> {
-    if let Ok(repo) = RepositoryContext::discover_current() {
+fn load_no_index_difftool_config(cli_session: &crate::session::CliSession) -> Result<GitConfig> {
+    if let Ok(repo) = RepositoryContext::from_session(cli_session) {
         return Ok(repo.config().clone());
     }
 

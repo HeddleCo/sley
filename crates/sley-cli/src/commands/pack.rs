@@ -53,12 +53,15 @@ struct IndexPackOptions {
     max_input_size: Option<u64>,
 }
 
-pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_index_pack(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = setup_index_pack_options(args)?;
     // The hash algorithm is taken from `--object-format` when given, else from
     // the surrounding repository. A `<pack-file>` argument (not `--stdin`) can
     // run outside any repo, so only fall back to repo discovery when needed.
-    let repo = match crate::session::cli_git_dir() {
+    let repo = match cli_session.git_dir() {
         Ok(git_dir) => match common_git_dir_for_git_dir(&git_dir) {
             Ok(common_git_dir) => {
                 let format = match options.object_format {
@@ -1401,7 +1404,7 @@ fn repack_write_server_info_file(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut prune = false;
     let mut quiet = false;
     let mut all = false;
@@ -1494,7 +1497,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             }
         }
     }
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
@@ -1546,6 +1549,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             ));
         }
         return cmd_repack_geometric(
+            cli_session,
             &git_dir,
             &common_git_dir,
             format,
@@ -1562,6 +1566,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
     if cruft {
         validate_repack_cruft_numeric_config(&config)?;
         return cmd_repack_cruft(
+            cli_session,
             &git_dir,
             &common_git_dir,
             format,
@@ -1639,7 +1644,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
         if write_bitmaps {
             midx_args.push("--bitmap".to_string());
         }
-        cmd_multi_pack_index_write(&midx_args)?;
+        cmd_multi_pack_index_write(cli_session, &midx_args)?;
     }
     if update_server_info {
         let updated_from_result = match result.as_ref() {
@@ -1649,7 +1654,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             None => false,
         };
         if !updated_from_result {
-            crate::commands::refs::cmd_update_server_info(&[])?;
+            crate::commands::refs::update_server_info_at(&common_git_dir, &[])?;
         }
     }
     let _ = quiet;
@@ -1686,6 +1691,7 @@ fn strip_pack_suffix(name: &str) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_repack_geometric(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     common_git_dir: &Path,
     format: ObjectFormat,
@@ -1712,7 +1718,7 @@ fn cmd_repack_geometric(
             && pack_dir_has_packs(common_git_dir, format)?
             && !midx_covers_current_packs(common_git_dir, format)?
         {
-            cmd_multi_pack_index_write(&[])?;
+            cmd_multi_pack_index_write(cli_session, &[])?;
         }
         return Ok(());
     }
@@ -1738,7 +1744,7 @@ fn cmd_repack_geometric(
         if write_bitmaps {
             midx_args.push("--bitmap".to_string());
         }
-        cmd_multi_pack_index_write(&midx_args)?;
+        cmd_multi_pack_index_write(cli_session, &midx_args)?;
     }
     let _ = git_dir;
     Ok(())
@@ -1819,6 +1825,7 @@ fn display_git_config_path(git_dir: &Path, config_path: &Path) -> String {
 /// `git repack --cruft [--cruft-expiration=<t>] [--expire-to=<dir>] [-d]`.
 #[allow(clippy::too_many_arguments)]
 fn cmd_repack_cruft(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     common_git_dir: &Path,
     format: ObjectFormat,
@@ -1883,7 +1890,7 @@ fn cmd_repack_cruft(
     }
 
     if write_midx && pack_dir_has_packs(common_git_dir, format)? {
-        cmd_multi_pack_index_write(&[])?;
+        cmd_multi_pack_index_write(cli_session, &[])?;
     }
     Ok(())
 }
@@ -2071,9 +2078,9 @@ struct GcOptions {
     expire_to: Option<String>,
 }
 
-pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_gc(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let options = setup_gc_options(args)?;
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
@@ -2130,6 +2137,7 @@ pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
 
     gc_write_pid(&common_git_dir)?;
     let result = gc_run_locked(
+        cli_session,
         &git_dir,
         &common_git_dir,
         format,
@@ -2148,6 +2156,7 @@ pub(crate) fn cmd_gc(args: &[String]) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn gc_run_locked(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     common_git_dir: &Path,
     format: ObjectFormat,
@@ -2158,133 +2167,40 @@ fn gc_run_locked(
     auto_mode: GcAutoMode,
 ) -> Result<()> {
     if !options.skip_foreground_tasks {
-        gc_before_repack(git_dir, common_git_dir, format, config)?;
+        gc_before_repack(cli_session, git_dir, common_git_dir, format, config)?;
     }
 
     let roots = repack_traversal_roots(&git_dir, &common_git_dir, format)?;
     let keep_pack_stems = gc_keep_pack_stems(common_git_dir, config, options)?;
 
-    // builtin/gc.c add_repack_all_option: pick the repack flavour.
-    if auto_mode == GcAutoMode::Incremental {
-        trace_gc_repack(&["repack", "-d", "-l", "--no-write-bitmap-index"]);
-        if let Some(result) = sley_odb::repack_loose_objects(&common_git_dir, format)? {
-            sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
-        }
-    } else if prune_expire.as_deref() == Some("now")
-        && !(cruft_packs && options.expire_to.is_some())
-    {
-        // prune_expire=="now" with cruft (no expire-to): immediate drop via -a.
-        trace_gc_repack(&["repack", "-d", "-l", "-a"]);
-        let repack_options = sley_odb::RepackOptions {
-            local: true,
-            force_rewrite: false,
-            pack_kept_objects: false,
-            keep_pack_stems,
-        };
-        if let Some(result) = sley_odb::repack_reachable_objects_with_options(
-            &common_git_dir,
-            format,
-            &roots,
-            &repack_options,
-        )? {
-            sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
-        }
-        gc_remove_cruft_packs(&common_git_dir)?;
-        if let Some(spec) = prune_expire.as_deref() {
-            let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
-            gc_prune_expired_loose(&common_git_dir, format, &roots, expire)?;
-        }
-    } else if cruft_packs {
-        // Default: reachable pack + cruft pack, cruft expiry = prune_expire.
-        let cruft_expiration = match prune_expire.as_deref() {
-            Some(spec) => parse_cruft_expiration(spec)?,
-            None => None,
-        };
-        let mut trace_args = vec!["repack", "-d", "-l", "--cruft"];
-        let cruft_expiration_arg;
-        if let Some(spec) = prune_expire.as_deref() {
-            cruft_expiration_arg = format!("--cruft-expiration={spec}");
-            trace_args.push(&cruft_expiration_arg);
-        }
-        let max_cruft_size_arg;
-        if let Some(size) = options
+    // builtin/gc.c add_repack_all_option: pick the repack flavour in the ODB
+    // engine, leaving this layer to execute the selected filesystem operation.
+    let gc_plan = sley_odb::plan_gc_repack(sley_odb::GcRepackPlanOptions {
+        incremental: auto_mode == GcAutoMode::Incremental,
+        prune_expire: prune_expire.as_deref(),
+        cruft_packs,
+        expire_to: options.expire_to.as_deref(),
+        max_cruft_size: options
             .max_cruft_size
-            .or_else(|| gc_config_u64(config, "maxCruftSize"))
-        {
-            max_cruft_size_arg = format!("--max-cruft-size={size}");
-            trace_args.push(&max_cruft_size_arg);
-        }
-        let expire_to_arg;
-        if let Some(expire_to) = options.expire_to.as_deref() {
-            expire_to_arg = format!("--expire-to={expire_to}");
-            trace_args.push(&expire_to_arg);
-        }
-        let filter_arg;
-        if let Some(filter) = config.get("gc", None, "repackFilter") {
-            filter_arg = format!("--filter={filter}");
-            trace_args.push(&filter_arg);
-        }
-        let filter_to_arg;
-        if let Some(filter_to) = config.get("gc", None, "repackFilterTo") {
-            filter_to_arg = format!("--filter-to={filter_to}");
-            trace_args.push(&filter_to_arg);
-        }
-        trace_gc_repack(&trace_args);
-        let repack_options = sley_odb::RepackOptions {
-            local: true,
-            force_rewrite: false,
-            pack_kept_objects: false,
-            keep_pack_stems,
-        };
-        let result = sley_odb::repack_cruft_with_options(
-            &common_git_dir,
-            format,
-            &roots,
-            cruft_expiration,
-            &repack_options,
-        )?;
-        sley_odb::install_cruft_repack_result(&common_git_dir, format, &result, true)?;
-        if let Some(expire_to) = options.expire_to.as_deref() {
-            if let Some(cruft) = result.cruft.as_ref() {
-                write_expire_to_cruft_pack(
-                    &common_git_dir,
-                    format,
-                    expire_to,
-                    &cruft.oids,
-                    cruft_expiration,
-                )?;
+            .or_else(|| gc_config_u64(config, "maxCruftSize")),
+        repack_filter: config.get("gc", None, "repackFilter"),
+        repack_filter_to: config.get("gc", None, "repackFilterTo"),
+    })
+    .map_err(|error| GitError::Command(error.to_string()))?;
+    let trace_args = gc_plan
+        .trace_args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    trace_gc_repack(&trace_args);
+    match gc_plan.mode {
+        sley_odb::GcRepackMode::Incremental => {
+            if let Some(result) = sley_odb::repack_loose_objects(&common_git_dir, format)? {
+                sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
             }
         }
-    } else {
-        // gc.cruftPacks=false: repack reachable objects, then prune loose
-        // unreachable objects older than gc.pruneExpire/--prune.
-        let mut trace_args = vec!["repack", "-d", "-l", "-A"];
-        let unpack_unreachable_arg;
-        if let Some(spec) = prune_expire.as_deref() {
-            unpack_unreachable_arg = format!("--unpack-unreachable={spec}");
-            trace_args.push(&unpack_unreachable_arg);
-        }
-        let filter_arg;
-        if let Some(filter) = config.get("gc", None, "repackFilter") {
-            filter_arg = format!("--filter={filter}");
-            trace_args.push(&filter_arg);
-        }
-        let filter_to_arg;
-        if let Some(filter_to) = config.get("gc", None, "repackFilterTo") {
-            filter_to_arg = format!("--filter-to={filter_to}");
-            trace_args.push(&filter_to_arg);
-        }
-        trace_gc_repack(&trace_args);
-        let filtered_repack = config.get("gc", None, "repackFilter") == Some("blob:none");
-        if filtered_repack {
-            gc_repack_blob_none_filter(
-                &common_git_dir,
-                format,
-                &roots,
-                options.expire_to.as_deref(),
-                config.get("gc", None, "repackFilterTo"),
-            )?;
-        } else {
+        sley_odb::GcRepackMode::Immediate => {
+            // prune_expire=="now" with cruft (no expire-to): immediate drop via -a.
             let repack_options = sley_odb::RepackOptions {
                 local: true,
                 force_rewrite: false,
@@ -2297,30 +2213,96 @@ fn gc_run_locked(
                 &roots,
                 &repack_options,
             )? {
-                gc_unpack_recent_unreachable_from_repack(
+                sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+            }
+            gc_remove_cruft_packs(&common_git_dir)?;
+            if let Some(spec) = prune_expire.as_deref() {
+                let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
+                gc_prune_expired_loose(&common_git_dir, format, &roots, expire)?;
+            }
+        }
+        sley_odb::GcRepackMode::Cruft => {
+            // Default: reachable pack + cruft pack, cruft expiry = prune_expire.
+            let cruft_expiration = match prune_expire.as_deref() {
+                Some(spec) => parse_cruft_expiration(spec)?,
+                None => None,
+            };
+            let repack_options = sley_odb::RepackOptions {
+                local: true,
+                force_rewrite: false,
+                pack_kept_objects: false,
+                keep_pack_stems,
+            };
+            let result = sley_odb::repack_cruft_with_options(
+                &common_git_dir,
+                format,
+                &roots,
+                cruft_expiration,
+                &repack_options,
+            )?;
+            sley_odb::install_cruft_repack_result(&common_git_dir, format, &result, true)?;
+            if let Some(expire_to) = options.expire_to.as_deref() {
+                if let Some(cruft) = result.cruft.as_ref() {
+                    write_expire_to_cruft_pack(
+                        &common_git_dir,
+                        format,
+                        expire_to,
+                        &cruft.oids,
+                        cruft_expiration,
+                    )?;
+                }
+            }
+        }
+        sley_odb::GcRepackMode::Reachable => {
+            // gc.cruftPacks=false: repack reachable objects, then prune loose
+            // unreachable objects older than gc.pruneExpire/--prune.
+            let filtered_repack = config.get("gc", None, "repackFilter") == Some("blob:none");
+            if filtered_repack {
+                gc_repack_blob_none_filter(
                     &common_git_dir,
                     format,
                     &roots,
-                    prune_expire.as_deref(),
-                    &result,
+                    options.expire_to.as_deref(),
+                    config.get("gc", None, "repackFilterTo"),
                 )?;
-                sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+            } else {
+                let repack_options = sley_odb::RepackOptions {
+                    local: true,
+                    force_rewrite: false,
+                    pack_kept_objects: false,
+                    keep_pack_stems,
+                };
+                if let Some(result) = sley_odb::repack_reachable_objects_with_options(
+                    &common_git_dir,
+                    format,
+                    &roots,
+                    &repack_options,
+                )? {
+                    gc_unpack_recent_unreachable_from_repack(
+                        &common_git_dir,
+                        format,
+                        &roots,
+                        prune_expire.as_deref(),
+                        &result,
+                    )?;
+                    sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+                }
             }
-        }
-        if filtered_repack {
-            return Ok(());
-        }
-        if let Some(spec) = prune_expire.as_deref() {
-            let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
-            gc_prune_expired_loose(&common_git_dir, format, &roots, expire)?;
-        } else {
-            let expire = parse_prune_expire(
-                config
-                    .get("gc", None, "pruneExpire")
-                    .unwrap_or("2.weeks.ago"),
-                "gc.pruneExpire",
-            )?;
-            gc_pack_recent_unreachable_loose(&common_git_dir, format, &roots, expire)?;
+            if filtered_repack {
+                return Ok(());
+            }
+            if let Some(spec) = prune_expire.as_deref() {
+                let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
+                gc_prune_expired_loose(&common_git_dir, format, &roots, expire)?;
+            } else {
+                let expire = parse_prune_expire(
+                    config
+                        .get("gc", None, "pruneExpire")
+                        .unwrap_or("2.weeks.ago"),
+                    "gc.pruneExpire",
+                )?;
+                gc_pack_recent_unreachable_loose(&common_git_dir, format, &roots, expire)?;
+            }
         }
     }
 
@@ -2333,7 +2315,7 @@ fn gc_run_locked(
         sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
     }
     gc_clean_pack_garbage(&repository_objects_dir(&common_git_dir).join("pack"))?;
-    crate::commands::refs::cmd_update_server_info(&[])?;
+    crate::commands::refs::update_server_info_at(&common_git_dir, &[])?;
     if gc_write_commit_graph(config) {
         let progress = if gc_progress_requested(options) {
             "--progress"
@@ -2557,6 +2539,7 @@ fn gc_loose_fanout_count(common_git_dir: &Path, fanout: &str) -> Result<u64> {
 }
 
 fn gc_before_repack(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     common_git_dir: &Path,
     format: ObjectFormat,
@@ -2567,12 +2550,12 @@ fn gc_before_repack(
             "builtin/gc.c:0",
             "trace: built-in: git pack-refs --all --prune",
         );
-        commands::pack::cmd_pack_refs(&["--all".to_string(), "--prune".to_string()])?;
+        commands::pack::cmd_pack_refs(cli_session, &["--all".to_string(), "--prune".to_string()])?;
     }
     let reflog_expire_never = is_config_never(config, "gc", "reflogExpire");
     let reflog_unreachable_never = is_config_never(config, "gc", "reflogExpireUnreachable");
     if !(reflog_expire_never && reflog_unreachable_never) {
-        let mut expire_args = vec!["expire".to_string(), "--all".to_string()];
+        let mut expire_args = vec!["--all".to_string()];
         if reflog_expire_never {
             expire_args.push("--expire=never".to_string());
         }
@@ -2581,9 +2564,12 @@ fn gc_before_repack(
         }
         crate::setup::git_trace_line(
             "builtin/gc.c:0",
-            &format!("trace: built-in: git reflog {}", expire_args.join(" ")),
+            &format!(
+                "trace: built-in: git reflog expire {}",
+                expire_args.join(" ")
+            ),
         );
-        let _ = commands::refs::cmd_reflog(&expire_args);
+        let _ = commands::refs::reflog_expire_at(git_dir, &expire_args);
     }
     let _ = (git_dir, format);
     Ok(())
@@ -2924,7 +2910,10 @@ fn parse_gc_size(value: &str) -> Result<u64> {
     Ok(size)
 }
 
-pub(crate) fn cmd_maintenance(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_maintenance(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let Some(subcommand) = args.first().map(String::as_str) else {
         eprintln!("error: need a subcommand");
         return maintenance_usage();
@@ -2938,12 +2927,12 @@ pub(crate) fn cmd_maintenance(args: &[String]) -> Result<()> {
             println!();
             Err(GitError::Exit(129))
         }
-        "run" => cmd_maintenance_run(&args[1..]),
-        "is-needed" => cmd_maintenance_is_needed(&args[1..]),
-        "register" => cmd_maintenance_register(&args[1..]),
-        "unregister" => cmd_maintenance_unregister(&args[1..]),
-        "start" => cmd_maintenance_start(&args[1..]),
-        "stop" => cmd_maintenance_stop(&args[1..]),
+        "run" => cmd_maintenance_run(cli_session, &args[1..]),
+        "is-needed" => cmd_maintenance_is_needed(cli_session, &args[1..]),
+        "register" => cmd_maintenance_register(cli_session, &args[1..]),
+        "unregister" => cmd_maintenance_unregister(cli_session, &args[1..]),
+        "start" => cmd_maintenance_start(cli_session, &args[1..]),
+        "stop" => cmd_maintenance_stop(cli_session, &args[1..]),
         // git's parse-options subcommand dispatch quotes the offending token with
         // a backtick + apostrophe, not a matched pair (parse-options.c).
         _ => {
@@ -2985,7 +2974,7 @@ const MAINTENANCE_TASKS: &[&str] = &[
     "rerere-gc",
 ];
 
-fn cmd_maintenance_run(args: &[String]) -> Result<()> {
+fn cmd_maintenance_run(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut quiet = true;
     let mut auto = false;
     let mut detach = false;
@@ -3047,7 +3036,7 @@ fn cmd_maintenance_run(args: &[String]) -> Result<()> {
     }
 
     trace2_touch();
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
     let selected = maintenance_select_tasks(&config, &tasks, schedule.as_deref())?;
@@ -3454,7 +3443,10 @@ fn maintenance_reflog_expire_needed(common_git_dir: &Path, config: &GitConfig) -
     Ok(false)
 }
 
-fn cmd_maintenance_is_needed(args: &[String]) -> Result<()> {
+fn cmd_maintenance_is_needed(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut auto = false;
     let mut schedule = None;
     let mut tasks = Vec::new();
@@ -3488,7 +3480,7 @@ fn cmd_maintenance_is_needed(args: &[String]) -> Result<()> {
         }
         index += 1;
     }
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
     let selected = maintenance_select_tasks(&config, &tasks, schedule.as_deref())?;
@@ -3924,9 +3916,12 @@ fn count_dir_entries(path: &Path) -> Result<usize> {
         .count())
 }
 
-fn cmd_maintenance_register(args: &[String]) -> Result<()> {
+fn cmd_maintenance_register(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let config_file = parse_maintenance_config_file(args, "register")?;
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let repo = env::current_dir()?.display().to_string();
 
@@ -3952,9 +3947,12 @@ fn cmd_maintenance_register(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_maintenance_unregister(args: &[String]) -> Result<()> {
+fn cmd_maintenance_unregister(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let (config_file, force) = parse_maintenance_unregister_args(args)?;
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let repo = env::current_dir()?.display().to_string();
     let missing_repo_value = report_missing_maintenance_repo(&common_git_dir);
@@ -4138,20 +4136,20 @@ enum MaintenanceScheduler {
     Schtasks,
 }
 
-fn cmd_maintenance_start(args: &[String]) -> Result<()> {
+fn cmd_maintenance_start(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let scheduler = parse_maintenance_start_args(args)?;
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let scheduler = scheduler.unwrap_or(MaintenanceScheduler::Systemd);
     update_background_schedule(&common_git_dir, Some(scheduler))?;
-    cmd_maintenance_register(&[])
+    cmd_maintenance_register(cli_session, &[])
 }
 
-fn cmd_maintenance_stop(args: &[String]) -> Result<()> {
+fn cmd_maintenance_stop(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     if !args.is_empty() {
         return maintenance_subcommand_usage("stop");
     }
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     update_background_schedule(&common_git_dir, None)
 }
@@ -4486,7 +4484,10 @@ fn xdg_config_home() -> PathBuf {
 /// `git unpack-objects` — explode a pack stream from stdin into loose objects
 /// (upstream `builtin/unpack-objects.c`). `-n` parses without writing; the
 /// other upstream flags are accepted and inert for this in-process path.
-pub(crate) fn cmd_unpack_objects(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_unpack_objects(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut dry_run = false;
     let mut strict = false;
     for arg in args {
@@ -4504,9 +4505,9 @@ pub(crate) fn cmd_unpack_objects(args: &[String]) -> Result<()> {
             }
         }
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
+    let repository = cli_session.open_repository()?;
+    let git_dir = repository.git_dir();
+    let format = repository.object_format();
     let mut pack_bytes = Vec::new();
     io::Read::read_to_end(&mut io::stdin().lock(), &mut pack_bytes)?;
     if dry_run {
@@ -4519,12 +4520,14 @@ pub(crate) fn cmd_unpack_objects(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(exit));
         }
     }
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    sley_odb::unpack_packfile_objects(&pack_bytes, format, db.loose())?;
+    sley_odb::unpack_packfile_objects(&pack_bytes, format, repository.object_database().loose())?;
     Ok(())
 }
 
-pub(crate) fn cmd_count_objects(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_count_objects(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut verbose = false;
     let mut human_readable = false;
     for arg in args {
@@ -4554,8 +4557,7 @@ pub(crate) fn cmd_count_objects(args: &[String]) -> Result<()> {
             }
         }
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let stats = count_objects_stats(&git_dir, format)?;
     if verbose {
@@ -4602,10 +4604,12 @@ struct PackRefsOptions {
     exclude: Vec<String>,
 }
 
-pub(crate) fn cmd_pack_refs(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_pack_refs(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = setup_pack_refs_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let core_fsync = global_config_value("core.fsync")?;
@@ -5400,26 +5404,27 @@ struct PruneOptions {
     heads: Vec<String>,
 }
 
-pub(crate) fn cmd_prune(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_prune(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let options = setup_prune_options(args)?;
-    let git_dir = crate::session::cli_git_dir()?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let format = repository_object_format(&common_git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let repository = cli_session.open_repository()?;
+    let git_dir = repository.git_dir();
+    let common_git_dir = repository.common_dir();
+    let format = repository.object_format();
+    let db = repository.object_database();
     let mut roots = prune_roots(&git_dir, &common_git_dir, format, &options.heads)?;
     roots.extend(prune_recent_object_roots(
-        &db,
-        &common_git_dir,
+        db,
+        common_git_dir,
         format,
         options.expire,
     )?);
-    roots.extend(prune_recent_hook_roots(&common_git_dir, format)?);
+    roots.extend(prune_recent_hook_roots(common_git_dir, format)?);
     roots.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     roots.dedup();
-    let reachable = collect_reachable_object_ids(&db, format, roots.iter().copied())?;
+    let reachable = collect_reachable_object_ids(db, format, roots.iter().copied())?;
     let mut candidates = Vec::new();
-    for oid in prune_unreachable_loose(&common_git_dir, format, roots.iter().copied(), false)? {
-        if prune_object_is_expired(&db, &oid, options.expire)? {
+    for oid in prune_unreachable_loose(common_git_dir, format, roots.iter().copied(), false)? {
+        if prune_object_is_expired(db, &oid, options.expire)? {
             candidates.push(oid);
         }
     }
@@ -5443,7 +5448,7 @@ pub(crate) fn cmd_prune(args: &[String]) -> Result<()> {
         }
     }
     prune_shallow_file(
-        &common_git_dir,
+        common_git_dir,
         format,
         &reachable,
         options.dry_run,
@@ -6170,7 +6175,10 @@ usage: git multi-pack-index [--object-dir <dir>] [--[no-]bitmap]
                             [--[no-]progress] <subcommand> [<options>]
 ";
 
-pub(crate) fn cmd_multi_pack_index(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_multi_pack_index(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     // git accepts the shared options (`--object-dir`, `--[no-]progress`,
     // `--[no-]bitmap`) *before* the subcommand; collect them and prepend them to
     // the subcommand's own args so the per-subcommand parser sees them too.
@@ -6210,11 +6218,11 @@ pub(crate) fn cmd_multi_pack_index(args: &[String]) -> Result<()> {
     let rest: Vec<String> = iter.cloned().collect();
     let combined: Vec<String> = global.into_iter().chain(rest).collect();
     match subcommand.as_str() {
-        "compact" => cmd_multi_pack_index_compact(&combined),
-        "expire" => cmd_multi_pack_index_expire(&combined),
-        "repack" => cmd_multi_pack_index_repack(&combined),
-        "write" => cmd_multi_pack_index_write(&combined),
-        "verify" => cmd_multi_pack_index_verify(&combined),
+        "compact" => cmd_multi_pack_index_compact(cli_session, &combined),
+        "expire" => cmd_multi_pack_index_expire(cli_session, &combined),
+        "repack" => cmd_multi_pack_index_repack(cli_session, &combined),
+        "write" => cmd_multi_pack_index_write(cli_session, &combined),
+        "verify" => cmd_multi_pack_index_verify(cli_session, &combined),
         other => {
             eprintln!("error: unknown subcommand: `{other}'");
             eprint!("{MULTI_PACK_INDEX_USAGE}");
@@ -6223,9 +6231,12 @@ pub(crate) fn cmd_multi_pack_index(args: &[String]) -> Result<()> {
     }
 }
 
-fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+fn cmd_multi_pack_index_write(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let write_bitmap_lookup_table = config
@@ -6853,9 +6864,12 @@ fn clear_incremental_midx_sidecars(pack_dir: &Path, format: ObjectFormat) -> Res
     Ok(())
 }
 
-fn cmd_multi_pack_index_compact(args: &[String]) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+fn cmd_multi_pack_index_compact(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     let mut write_bitmap = false;
@@ -7161,9 +7175,12 @@ fn pack_is_cruft(pack_dir: &Path, idx_name: &str) -> bool {
     pack_dir.join(idx_name).with_extension("mtimes").exists()
 }
 
-fn cmd_multi_pack_index_repack(args: &[String]) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+fn cmd_multi_pack_index_repack(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let (object_dir, progress, batch_size) =
         parse_midx_object_dir_and_progress(args, &cwd, &git_dir, "repack")?;
@@ -7318,9 +7335,12 @@ fn cmd_multi_pack_index_repack(args: &[String]) -> Result<()> {
     write_default_midx(&object_dir, format)
 }
 
-fn cmd_multi_pack_index_verify(args: &[String]) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+fn cmd_multi_pack_index_verify(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     // Upstream defaults progress to a tty heuristic; when stderr is not a tty
@@ -7689,9 +7709,12 @@ fn u64_be8(bytes: &[u8]) -> u64 {
     u64::from_be_bytes(buf)
 }
 
-fn cmd_multi_pack_index_expire(args: &[String]) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+fn cmd_multi_pack_index_expire(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let (object_dir, progress, _) =
         parse_midx_object_dir_and_progress(args, &cwd, &git_dir, "expire")?;
@@ -7833,7 +7856,10 @@ fn pack_redundant_scan_dir(
 /// `git pack-redundant`: report packs every one of whose objects also live in
 /// some other pack (so the pack can be deleted without losing reachability).
 /// Deprecated upstream; gated behind `--i-still-use-this`.
-pub(crate) fn cmd_pack_redundant(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_pack_redundant(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut load_all_packs = false;
     let mut verbose = false;
     let mut alt_odb = false;
@@ -7880,8 +7906,8 @@ pub(crate) fn cmd_pack_redundant(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let objects_dir = repository_objects_dir(&common_git_dir);

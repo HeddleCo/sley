@@ -70,13 +70,16 @@ struct MergeFileOptions {
     operands: Vec<String>,
 }
 
-pub(crate) fn cmd_merge_file(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_merge_file(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = match parse_merge_file_args(args)? {
         Some(options) => options,
         // A bare `--no-...`/help-style path that already produced its output.
         None => return Ok(()),
     };
-    run_merge_file(&options)
+    run_merge_file(cli_session, &options)
 }
 
 /// Parse the command line the way git's parse-options front-end does. Returns
@@ -292,9 +295,12 @@ struct MergeInputs {
     theirs_name: String,
 }
 
-fn run_merge_file(options: &MergeFileOptions) -> Result<()> {
+fn run_merge_file(
+    cli_session: &crate::session::CliSession,
+    options: &MergeFileOptions,
+) -> Result<()> {
     let inputs = if options.object_id {
-        read_object_id_inputs(&options.operands)?
+        read_object_id_inputs(cli_session, &options.operands)?
     } else {
         read_file_inputs(&options.operands)?
     };
@@ -327,7 +333,7 @@ fn run_merge_file(options: &MergeFileOptions) -> Result<()> {
         &theirs_label,
     );
 
-    emit_result(options, &inputs, &merged.content)?;
+    emit_result(cli_session, options, &inputs, &merged.content)?;
 
     if merged.conflicts == 0 {
         Ok(())
@@ -398,8 +404,11 @@ fn stat_error_text(err: &std::io::Error) -> String {
 /// Read the three operands as object ids (full or abbreviated), reusing the
 /// object database to resolve and load each blob. Output labels default to the
 /// resolved (full) object ids, as git does in `--object-id` mode.
-fn read_object_id_inputs(operands: &[String]) -> Result<MergeInputs> {
-    let git_dir = crate::session::cli_git_dir()?;
+fn read_object_id_inputs(
+    cli_session: &crate::session::CliSession,
+    operands: &[String],
+) -> Result<MergeInputs> {
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
@@ -856,7 +865,12 @@ fn write_divider(out: &mut Vec<u8>, marker_size: usize) {
 
 /// Deliver the merged blob: to stdout with `-p`, to a freshly written object
 /// (printing its id) in `--object-id` mode, or back into the current file.
-fn emit_result(options: &MergeFileOptions, inputs: &MergeInputs, content: &[u8]) -> Result<()> {
+fn emit_result(
+    cli_session: &crate::session::CliSession,
+    options: &MergeFileOptions,
+    inputs: &MergeInputs,
+    content: &[u8],
+) -> Result<()> {
     if options.to_stdout {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
@@ -864,7 +878,7 @@ fn emit_result(options: &MergeFileOptions, inputs: &MergeInputs, content: &[u8])
         return Ok(());
     }
     if options.object_id {
-        let git_dir = crate::session::cli_git_dir()?;
+        let git_dir = cli_session.git_dir()?;
         let format = repository_object_format(&git_dir)?;
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let oid = db.write_object(EncodedObject::new(ObjectType::Blob, content.to_vec()))?;

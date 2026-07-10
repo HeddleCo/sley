@@ -9,7 +9,7 @@ use crate::{
     commit_encoding, commit_subject, core_big_file_threshold, effective_pathspec_flags,
     global_lazy_fetch_enabled, log_reencode_message, normalize_absolute_cli_pathspec,
     repository_object_format, sley_config, sley_core, sley_diff_merge, sley_odb, sley_pretty,
-    sley_remote, sley_rev, sley_worktree, status_quote_path, status_quote_path_full,
+    sley_remote, sley_rev, sley_worktree, status_quote_path,
 };
 use sley::plumbing::sley_object::{Commit, EncodedObject, ObjectType};
 use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
@@ -18,7 +18,6 @@ use sley::plumbing::sley_rev::diff_options::{
 };
 use sley_grep;
 use sley_pathspec::{LsFilesPathFilter, parse_normalized_pathspec_element, pathspec_filters_match};
-use sley_strbuf_expand;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -28,53 +27,37 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 
+pub(crate) use sley_diff_merge::porcelain::{
+    LineStats as DiffLineStats, StatEntry as DiffStatEntryData, StatOptions as DiffStatOptions,
+};
+
+struct CliDiffRenderServices;
+
+impl sley_diff_merge::porcelain::RenderServices for CliDiffRenderServices {
+    fn display_width(&self, rendered: &str) -> i64 {
+        sley_strbuf_expand::strwidth(rendered.as_bytes()) as i64
+    }
+}
+
+fn map_porcelain_render(
+    result: std::result::Result<
+        sley_diff_merge::porcelain::RenderOutcome,
+        sley_diff_merge::porcelain::RenderError,
+    >,
+) -> Result<()> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(sley_diff_merge::porcelain::RenderError::Output(error)) => Err(error.into()),
+    }
+}
+
 pub(crate) fn write_diff_summary_entry(
     stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
 ) -> Result<()> {
-    match entry.status {
-        sley_diff_merge::NameStatus::Added => {
-            let mode = entry.new_mode.unwrap_or(0);
-            let path = status_quote_path(&entry.path, false);
-            writeln!(stdout, " create mode {mode:06o} {path}")?;
-        }
-        sley_diff_merge::NameStatus::Deleted => {
-            let mode = entry.old_mode.unwrap_or(0);
-            let path = status_quote_path(&entry.path, false);
-            writeln!(stdout, " delete mode {mode:06o} {path}")?;
-        }
-        sley_diff_merge::NameStatus::Renamed(score) => {
-            if let Some(old_path) = &entry.old_path {
-                // git's `show_rename_copy` compresses a common path prefix/suffix
-                // into `pfx{a => b}sfx` via `pprint_rename`.
-                let pretty = diff_stat_pprint_rename(old_path, &entry.path, true);
-                writeln!(stdout, " rename {pretty} ({score}%)")?;
-            }
-        }
-        sley_diff_merge::NameStatus::Copied(score) => {
-            if let Some(old_path) = &entry.old_path {
-                let pretty = diff_stat_pprint_rename(old_path, &entry.path, true);
-                writeln!(stdout, " copy {pretty} ({score}%)")?;
-            }
-        }
-        // A modify and a typechange both route through git's `diff_summary`
-        // `default:` arm → `show_mode_change`, which prints ` mode change a => b`
-        // whenever the two modes differ (a typechange's modes always differ).
-        sley_diff_merge::NameStatus::Modified | sley_diff_merge::NameStatus::TypeChanged => {
-            if entry.old_mode != entry.new_mode
-                && let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
-            {
-                let path = status_quote_path(&entry.path, false);
-                writeln!(
-                    stdout,
-                    " mode change {old_mode:06o} => {new_mode:06o} {path}"
-                )?;
-            }
-        }
-        // Unmerged paths produce no `--summary` line.
-        sley_diff_merge::NameStatus::Unmerged => {}
-    }
-    Ok(())
+    map_porcelain_render(sley_diff_merge::porcelain::render_summary_entry(
+        stdout, entry,
+    ))
 }
 
 pub(crate) fn write_diff_raw_entry(
@@ -85,60 +68,18 @@ pub(crate) fn write_diff_raw_entry(
     abbrev: Option<usize>,
     format: ObjectFormat,
 ) -> Result<()> {
-    let old_mode = entry.old_mode.unwrap_or(0);
-    let new_mode = entry.new_mode.unwrap_or(0);
-    let old_oid = diff_raw_oid(entry.old_oid.as_ref(), false, abbrev, format);
-    let new_oid = diff_raw_oid(entry.new_oid.as_ref(), zero_worktree_oids, abbrev, format);
-    write!(
+    map_porcelain_render(sley_diff_merge::porcelain::render_raw_entry(
         stdout,
-        ":{old_mode:06o} {new_mode:06o} {old_oid} {new_oid} {}",
-        entry.status.label()
-    )?;
-    if z {
-        stdout.write_all(b"\0")?;
-        if let Some(old_path) = &entry.old_path {
-            stdout.write_all(old_path)?;
-            stdout.write_all(b"\0")?;
-        }
-        stdout.write_all(&entry.path)?;
-        stdout.write_all(b"\0")?;
-    } else {
-        if let Some(old_path) = &entry.old_path {
-            let old_path = status_quote_path(old_path, false);
-            write!(stdout, "\t{old_path}")?;
-        }
-        let path = status_quote_path(&entry.path, false);
-        writeln!(stdout, "\t{path}")?;
-    }
-    Ok(())
-}
-
-fn diff_raw_oid(
-    oid: Option<&ObjectId>,
-    zero: bool,
-    abbrev: Option<usize>,
-    format: ObjectFormat,
-) -> String {
-    let zero_width = abbrev.unwrap_or_else(|| format.hex_len());
-    let mut hex = if zero {
-        "0".repeat(zero_width)
-    } else {
-        oid.map(|oid| {
-            let hex = oid.to_hex();
-            let width = abbrev.unwrap_or(hex.len()).min(hex.len());
-            hex[..width].to_string()
-        })
-        .unwrap_or_else(|| "0".repeat(zero_width))
-    };
-    // git's diff_aligned_abbrev: under GIT_PRINT_SHA1_ELLIPSIS=yes an
-    // abbreviated raw oid carries a "..." tail (the old-style aligned form
-    // t4013's default cells still exercise).
-    if hex.len() < format.hex_len()
-        && std::env::var("GIT_PRINT_SHA1_ELLIPSIS").is_ok_and(|value| value == "yes")
-    {
-        hex.push_str("...");
-    }
-    hex
+        entry,
+        sley_diff_merge::porcelain::RawOptions {
+            nul_terminated: z,
+            zero_new_oid: zero_worktree_oids,
+            abbrev,
+            object_format: format,
+            print_hash_ellipsis: std::env::var("GIT_PRINT_SHA1_ELLIPSIS")
+                .is_ok_and(|value| value == "yes"),
+        },
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -1354,93 +1295,23 @@ pub(crate) fn write_diff_numstat_materialized_entry(
     stats: DiffLineStats,
     z: bool,
 ) -> Result<()> {
-    let stats = if matches!(entry.status, sley_diff_merge::NameStatus::Unmerged) {
-        DiffLineStats::Text {
-            inserted: 0,
-            deleted: 0,
-        }
-    } else {
-        stats
-    };
-    if z {
-        write_diff_numstat_counts(stdout, stats)?;
-        if let Some(old_path) = &entry.old_path {
-            stdout.write_all(b"\0")?;
-            stdout.write_all(old_path)?;
-            stdout.write_all(b"\0")?;
-            stdout.write_all(&entry.path)?;
-            stdout.write_all(b"\0")?;
-        } else {
-            stdout.write_all(&entry.path)?;
-            stdout.write_all(b"\0")?;
-        }
-    } else {
-        write_diff_numstat_counts(stdout, stats)?;
-        if let Some(old_path) = &entry.old_path {
-            // Renames/copies print the brace-collapsed form, like the stat rows.
-            writeln!(
-                stdout,
-                "{}",
-                diff_stat_pprint_rename(old_path, &entry.path, true)
-            )?;
-        } else {
-            let path = status_quote_path(&entry.path, false);
-            writeln!(stdout, "{path}")?;
-        }
-    }
-    Ok(())
-}
-
-fn write_diff_numstat_counts(stdout: &mut dyn Write, stats: DiffLineStats) -> Result<()> {
-    match stats {
-        DiffLineStats::Binary { .. } => write!(stdout, "-\t-\t")?,
-        DiffLineStats::Text { inserted, deleted } => write!(stdout, "{inserted}\t{deleted}\t")?,
-    }
-    Ok(())
+    map_porcelain_render(sley_diff_merge::porcelain::render_numstat_entry(
+        stdout, entry, stats, z,
+    ))
 }
 
 pub(crate) fn write_diff_shortstat_materialized(
     stdout: &mut dyn Write,
     entries: &[DiffStatEntryData<'_>],
 ) -> Result<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-    let (inserted, deleted) = diff_stat_totals(entries);
-    write_diff_stat_summary_line(
-        stdout,
-        diff_stat_changed_file_count(entries),
-        inserted,
-        deleted,
-    )
+    map_porcelain_render(sley_diff_merge::porcelain::render_shortstat(
+        stdout, entries,
+    ))
 }
 
 /// git `decimal_width()`: columns needed to print `number` in decimal.
 pub(crate) fn diff_stat_decimal_width(number: usize) -> i64 {
-    let mut width = 1i64;
-    let mut number = number / 10;
-    while number > 0 {
-        width += 1;
-        number /= 10;
-    }
-    width
-}
-
-/// git `scale_linear()`: scale `it` into `width` columns of a graph whose
-/// largest row is `max_change`, guaranteeing at least one column for any
-/// nonzero change.
-fn diff_stat_scale_linear(it: i64, width: i64, max_change: i64) -> i64 {
-    if it == 0 {
-        return 0;
-    }
-    1 + (it * (width - 1) / max_change)
-}
-
-/// Display width of a stat row name. git uses `utf8_strwidth`, so East-Asian
-/// wide characters count as two columns and zero-width marks as none; paths that
-/// need quoting come out of `status_quote_path` as ASCII (width == byte count).
-fn diff_stat_display_width(name: &str) -> i64 {
-    sley_strbuf_expand::strwidth(name.as_bytes()) as i64
+    sley_diff_merge::porcelain::decimal_width(number)
 }
 
 pub(crate) fn write_diff_stat_materialized_with_widths(
@@ -1449,195 +1320,22 @@ pub(crate) fn write_diff_stat_materialized_with_widths(
     options: DiffStatOptions,
     widths: DiffStatWidths,
 ) -> Result<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-    let DiffStatOptions {
-        compact_summary,
-        stat_count,
-        color,
-        quote_path_fully,
-    } = options;
-    let rows = diff_stat_rows_from_materialized(entries, compact_summary, quote_path_fully);
-
-    let mut count = stat_count.unwrap_or(rows.len()).min(rows.len());
-
-    // Pass 1: longest name, max change count, binary column width.
-    let mut max_len = 0i64;
-    let mut max_change = 0i64;
-    let mut number_width = 0i64;
-    let mut bin_width = 0i64;
-    for row in rows.iter().take(count) {
-        let len = diff_stat_display_width(&row.path);
-        max_len = max_len.max(len);
-        match row.stats {
-            DiffStatStats::Unmerged => {
-                bin_width = bin_width.max("Unmerged".len() as i64);
-            }
-            DiffStatStats::Binary {
-                old_size,
-                new_size,
-                unchanged,
-            } => {
-                // "Bin XXX -> YYY bytes"; an unchanged blob renders plain "Bin"
-                // (sizes treated as 0/0, exactly like git's same-contents case).
-                let (added, deleted) = if unchanged {
-                    (0, 0)
-                } else {
-                    (new_size, old_size)
-                };
-                let w = 14 + diff_stat_decimal_width(added) + diff_stat_decimal_width(deleted);
-                bin_width = bin_width.max(w);
-                number_width = number_width.max(3);
-            }
-            DiffStatStats::Text { inserted, deleted } => {
-                max_change = max_change.max((inserted + deleted) as i64);
-            }
-        }
-    }
-    count = count.min(rows.len());
-
-    let mut width = if widths.stat_width == -1 {
+    let stat_width = if widths.stat_width == -1 {
         sley_pretty::term_columns() - widths.line_prefix_width
-    } else if widths.stat_width != 0 {
+    } else {
         widths.stat_width
-    } else {
-        80
     };
-    number_width = diff_stat_decimal_width(max_change as usize).max(number_width);
-
-    // Guarantee 3/8*16 == 6 for the graph part and 5/8*16 == 10 for the name.
-    if width < 16 + 6 + number_width {
-        width = 16 + 6 + number_width;
-    }
-
-    // First assign sizes that are wanted, ignoring available width.
-    let mut graph_width = if max_change + 4 > bin_width {
-        max_change
-    } else {
-        bin_width - 4
-    };
-    if widths.graph_width > 0 && widths.graph_width < graph_width {
-        graph_width = widths.graph_width;
-    }
-    let mut name_width = if widths.name_width > 0 && widths.name_width < max_len {
-        widths.name_width
-    } else {
-        max_len
-    };
-
-    // Adjust adjustable widths not to exceed maximum width.
-    if name_width + number_width + 6 + graph_width > width {
-        if graph_width > width * 3 / 8 - number_width - 6 {
-            graph_width = width * 3 / 8 - number_width - 6;
-            if graph_width < 6 {
-                graph_width = 6;
-            }
-        }
-        if widths.graph_width > 0 && graph_width > widths.graph_width {
-            graph_width = widths.graph_width;
-        }
-        if name_width > width - number_width - 6 - graph_width {
-            name_width = width - number_width - 6 - graph_width;
-        } else {
-            graph_width = width - number_width - 6 - name_width;
-        }
-    }
-
-    let number_width = number_width.max(0) as usize;
-    for row in rows.iter().take(count) {
-        // "scale" the filename: strip leading characters (then snap to the
-        // next '/') behind a "..." marker when it overflows the name column.
-        let mut len = name_width;
-        let full_name = row.path.as_str();
-        let name_len = diff_stat_display_width(full_name);
-        let mut name = full_name;
-        let mut marker = "";
-        if name_width < name_len {
-            marker = "...";
-            len -= 3;
-            if len < 0 {
-                len = 0;
-            }
-            while diff_stat_display_width(name) > len {
-                let mut chars = name.chars();
-                chars.next();
-                name = chars.as_str();
-            }
-            if let Some(pos) = name.find('/') {
-                name = &name[pos..];
-            }
-        }
-        let padding = (len - diff_stat_display_width(name)).max(0) as usize;
-
-        match row.stats {
-            DiffStatStats::Unmerged => {
-                writeln!(stdout, " {marker}{name}{:padding$} | Unmerged", "")?;
-            }
-            DiffStatStats::Binary {
-                old_size,
-                new_size,
-                unchanged,
-            } => {
-                write!(
-                    stdout,
-                    " {marker}{name}{:padding$} | {:>number_width$}",
-                    "", "Bin"
-                )?;
-                if unchanged {
-                    writeln!(stdout)?;
-                    continue;
-                }
-                let old_size = color_stat_deleted(&old_size.to_string(), color);
-                let new_size = color_stat_inserted(&new_size.to_string(), color);
-                writeln!(stdout, " {old_size} -> {new_size} bytes")?;
-            }
-            DiffStatStats::Text { inserted, deleted } => {
-                let total_changed = inserted + deleted;
-                let mut add = inserted as i64;
-                let mut del = deleted as i64;
-                if graph_width <= max_change && max_change > 0 {
-                    let mut total = diff_stat_scale_linear(add + del, graph_width, max_change);
-                    if total < 2 && add > 0 && del > 0 {
-                        // width >= 2 due to the sanity check
-                        total = 2;
-                    }
-                    if add < del {
-                        add = diff_stat_scale_linear(add, graph_width, max_change);
-                        del = total - add;
-                    } else {
-                        del = diff_stat_scale_linear(del, graph_width, max_change);
-                        add = total - del;
-                    }
-                }
-                write!(
-                    stdout,
-                    " {marker}{name}{:padding$} | {total_changed:>number_width$}{}",
-                    "",
-                    if total_changed > 0 { " " } else { "" }
-                )?;
-                let mut graph = String::new();
-                if add > 0 {
-                    let pluses = std::iter::repeat_n('+', add as usize).collect::<String>();
-                    graph.push_str(&color_stat_inserted(&pluses, color));
-                }
-                if del > 0 {
-                    let minuses = std::iter::repeat_n('-', del as usize).collect::<String>();
-                    graph.push_str(&color_stat_deleted(&minuses, color));
-                }
-                writeln!(stdout, "{graph}")?;
-            }
-        }
-    }
-    if count < rows.len() {
-        writeln!(stdout, " ...")?;
-    }
-
-    // Totals cover every row (display truncation does not affect them);
-    // binary rows count as changed files but contribute no line counts;
-    // unmerged rows are displayed but skipped from both totals.
-    let (adds, dels) = diff_stat_totals(entries);
-    write_diff_stat_summary_line(stdout, diff_stat_changed_file_count(entries), adds, dels)
+    map_porcelain_render(sley_diff_merge::porcelain::render_stat(
+        stdout,
+        entries,
+        options,
+        sley_diff_merge::porcelain::StatLayout {
+            stat_width,
+            name_width: widths.name_width,
+            graph_width: widths.graph_width,
+        },
+        &CliDiffRenderServices,
+    ))
 }
 
 pub(crate) fn write_diff_stat_materialized(
@@ -1855,44 +1553,9 @@ pub(crate) fn write_diff_stat_summary_line(
     inserted: usize,
     deleted: usize,
 ) -> Result<()> {
-    write!(
-        stdout,
-        " {} {} changed",
-        files,
-        plural(files, "file", "files")
-    )?;
-    if inserted > 0 || deleted == 0 {
-        write!(
-            stdout,
-            ", {inserted} {}(+)",
-            plural(inserted, "insertion", "insertions")
-        )?;
-    }
-    if deleted > 0 || inserted == 0 {
-        write!(
-            stdout,
-            ", {deleted} {}(-)",
-            plural(deleted, "deletion", "deletions")
-        )?;
-    }
-    writeln!(stdout)?;
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DiffStatOptions {
-    pub(crate) compact_summary: bool,
-    pub(crate) stat_count: Option<usize>,
-    pub(crate) color: bool,
-    /// git's `quote_path_fully` (`core.quotePath`, default true): when false,
-    /// non-ASCII bytes in the diffstat name are shown verbatim rather than
-    /// octal-escaped.
-    pub(crate) quote_path_fully: bool,
-}
-
-pub(crate) struct DiffStatEntryData<'a> {
-    pub(crate) entry: &'a sley_diff_merge::NameStatusEntry,
-    pub(crate) stats: DiffLineStats,
+    map_porcelain_render(sley_diff_merge::porcelain::render_stat_summary(
+        stdout, files, inserted, deleted,
+    ))
 }
 
 enum DiffBlobContent {
@@ -1956,99 +1619,7 @@ pub(crate) fn collect_diff_stat_entries_with_worktree_clean<'a>(
 }
 
 pub(crate) fn diff_stat_totals(entries: &[DiffStatEntryData<'_>]) -> (usize, usize) {
-    let mut inserted = 0;
-    let mut deleted = 0;
-    for entry in entries {
-        if matches!(entry.entry.status, sley_diff_merge::NameStatus::Unmerged) {
-            continue;
-        }
-        if let DiffLineStats::Text {
-            inserted: entry_inserted,
-            deleted: entry_deleted,
-        } = entry.stats
-        {
-            inserted += entry_inserted;
-            deleted += entry_deleted;
-        }
-    }
-    (inserted, deleted)
-}
-
-fn diff_stat_changed_file_count(entries: &[DiffStatEntryData<'_>]) -> usize {
-    entries
-        .iter()
-        .filter(|entry| !matches!(entry.entry.status, sley_diff_merge::NameStatus::Unmerged))
-        .count()
-}
-
-fn diff_stat_rows_from_materialized(
-    entries: &[DiffStatEntryData<'_>],
-    compact_summary: bool,
-    quote_path_fully: bool,
-) -> Vec<DiffStatRow> {
-    let mut rows = Vec::with_capacity(entries.len());
-    for data in entries {
-        let stats = if matches!(data.entry.status, sley_diff_merge::NameStatus::Unmerged) {
-            DiffStatStats::Unmerged
-        } else {
-            match data.stats {
-                DiffLineStats::Binary {
-                    old_size,
-                    new_size,
-                    unchanged,
-                } => DiffStatStats::Binary {
-                    old_size,
-                    new_size,
-                    unchanged,
-                },
-                DiffLineStats::Text { inserted, deleted } => {
-                    DiffStatStats::Text { inserted, deleted }
-                }
-            }
-        };
-        rows.push(DiffStatRow {
-            path: diff_stat_path(data.entry, compact_summary, quote_path_fully),
-            stats,
-        });
-    }
-    rows
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DiffStatRow {
-    path: String,
-    stats: DiffStatStats,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiffStatStats {
-    Unmerged,
-    Binary {
-        old_size: usize,
-        new_size: usize,
-        unchanged: bool,
-    },
-    Text {
-        inserted: usize,
-        deleted: usize,
-    },
-}
-
-fn diff_stat_path(
-    entry: &sley_diff_merge::NameStatusEntry,
-    compact_summary: bool,
-    quote_path_fully: bool,
-) -> String {
-    let mut path = if let Some(old_path) = &entry.old_path {
-        diff_stat_pprint_rename(old_path, &entry.path, quote_path_fully)
-    } else {
-        status_quote_path_full(&entry.path, false, quote_path_fully)
-    };
-    if compact_summary && let Some(summary) = diff_compact_summary_label(entry) {
-        path.push(' ');
-        path.push_str(summary);
-    }
-    path
+    sley_diff_merge::porcelain::stat_totals(entries)
 }
 
 /// git `pprint_rename()`: collapse a rename's common directory prefix and
@@ -2056,111 +1627,7 @@ fn diff_stat_path(
 /// `old => new` form when either side needs c-style quoting or when nothing
 /// is shared.
 pub(crate) fn diff_stat_pprint_rename(a: &[u8], b: &[u8], quote_path_fully: bool) -> String {
-    let quoted_a = status_quote_path_full(a, false, quote_path_fully);
-    let quoted_b = status_quote_path_full(b, false, quote_path_fully);
-    if quoted_a.starts_with('"') || quoted_b.starts_with('"') {
-        return format!("{quoted_a} => {quoted_b}");
-    }
-    let len_a = a.len();
-    let len_b = b.len();
-
-    // Find common prefix (must end in a slash to count).
-    let mut pfx_length = 0usize;
-    let mut idx = 0usize;
-    while idx < len_a && idx < len_b && a[idx] == b[idx] {
-        if a[idx] == b'/' {
-            pfx_length = idx + 1;
-        }
-        idx += 1;
-    }
-
-    // Find common suffix, walking back from the (virtual) terminating NUL.
-    // With a common prefix the walk may run one byte into the prefix to see
-    // the same slash; without one it must not underrun the strings.
-    let mut sfx_length = 0usize;
-    let pfx_adjust_for_slash: isize = if pfx_length > 0 { 1 } else { 0 };
-    let mut oi = len_a as isize;
-    let mut ni = len_b as isize;
-    let lower = pfx_length as isize - pfx_adjust_for_slash;
-    while oi >= lower && ni >= lower {
-        let oc = if oi == len_a as isize {
-            0
-        } else {
-            a[oi as usize]
-        };
-        let nc = if ni == len_b as isize {
-            0
-        } else {
-            b[ni as usize]
-        };
-        if oc != nc {
-            break;
-        }
-        if oc == b'/' {
-            sfx_length = len_a - oi as usize;
-        }
-        oi -= 1;
-        ni -= 1;
-    }
-
-    // pfx{mid-a => mid-b}sfx  |  {pfx-a => pfx-b}sfx  |  pfx{sfx-a => sfx-b}
-    // |  name-a => name-b
-    let a_midlen = len_a.saturating_sub(pfx_length + sfx_length);
-    let b_midlen = len_b.saturating_sub(pfx_length + sfx_length);
-    let mut name = String::new();
-    if pfx_length + sfx_length > 0 {
-        name.push_str(&String::from_utf8_lossy(&a[..pfx_length]));
-        name.push('{');
-    }
-    name.push_str(&String::from_utf8_lossy(
-        &a[pfx_length..pfx_length + a_midlen],
-    ));
-    name.push_str(" => ");
-    name.push_str(&String::from_utf8_lossy(
-        &b[pfx_length..pfx_length + b_midlen],
-    ));
-    if pfx_length + sfx_length > 0 {
-        name.push('}');
-        name.push_str(&String::from_utf8_lossy(&a[len_a - sfx_length..]));
-    }
-    name
-}
-
-fn diff_compact_summary_label(entry: &sley_diff_merge::NameStatusEntry) -> Option<&'static str> {
-    match (entry.old_mode, entry.new_mode) {
-        (None, Some(_)) => Some("(new)"),
-        (Some(_), None) => Some("(gone)"),
-        (Some(old), Some(new)) if old != new => {
-            let old_exec = old & 0o111 != 0;
-            let new_exec = new & 0o111 != 0;
-            match (old_exec, new_exec) {
-                (false, true) => Some("(mode +x)"),
-                (true, false) => Some("(mode -x)"),
-                _ => Some("(mode)"),
-            }
-        }
-        _ => None,
-    }
-}
-
-fn color_stat_inserted(value: &str, color: bool) -> String {
-    if color {
-        format!("\x1b[32m{value}\x1b[m")
-    } else {
-        value.to_string()
-    }
-}
-
-fn color_stat_deleted(value: &str, color: bool) -> String {
-    if color {
-        format!("\x1b[31m{value}\x1b[m")
-    } else {
-        value.to_string()
-    }
-}
-
-fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
-    if count == 1 { singular } else { plural }
+    sley_diff_merge::porcelain::pprint_rename(a, b, quote_path_fully)
 }
 
 /// The synthetic blob content git diffs a gitlink as: `Subproject commit
@@ -3081,19 +2548,6 @@ pub(crate) fn read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u
 
 pub(crate) fn repo_path_to_path(path: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(path).into_owned())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DiffLineStats {
-    Binary {
-        old_size: usize,
-        new_size: usize,
-        unchanged: bool,
-    },
-    Text {
-        inserted: usize,
-        deleted: usize,
-    },
 }
 
 pub(crate) fn diff_line_stats(old: Option<&[u8]>, new: Option<&[u8]>) -> DiffLineStats {

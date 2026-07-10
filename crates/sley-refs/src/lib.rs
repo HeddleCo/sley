@@ -20,6 +20,9 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod branch;
+pub mod migration;
+
 /// Match a refname component against Git's ref-filter wildcard rules.
 ///
 /// `*` spans slashes, `?` matches one byte, bracket classes and backslash
@@ -1054,6 +1057,18 @@ impl FileRefStore {
         format: ObjectFormat,
     ) -> Self {
         Self::new_with_reference_backend_env(git_dir, format, false)
+    }
+
+    /// Git directory this store was opened for.
+    #[must_use]
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
+    /// Object format used by reference targets and reflogs.
+    #[must_use]
+    pub const fn object_format(&self) -> ObjectFormat {
+        self.format
     }
 
     fn new_with_reference_backend_env(

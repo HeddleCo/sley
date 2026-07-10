@@ -6350,7 +6350,10 @@ fn create_autostash(ctx: &Ctx, use_apply_backend: bool) -> Result<()> {
     if !dirty {
         return Ok(());
     }
-    let created = commands::stash::create_stash_for_autostash()?;
+    let created = commands::stash::create_stash_for_autostash_at(
+        &ctx.git_dir,
+        &ctx.worktree_root,
+    )?;
     let Some(oid) = created else {
         eprintln!("fatal: Cannot autostash");
         return Err(GitError::Exit(128));
@@ -6419,13 +6422,15 @@ fn apply_save_autostash_text(ctx: &Ctx, text: &str, attempt_apply: bool) {
         return;
     };
     let applied =
-        attempt_apply && commands::stash::apply_stash_commit_quietly(&oid).unwrap_or(false);
+        attempt_apply
+            && commands::stash::apply_stash_commit_quietly_at(&ctx.git_dir, &oid)
+                .unwrap_or(false);
     if applied {
         eprintln!("Applied autostash.");
         return;
     }
     // Store the stash for later.
-    let stored = commands::stash::store_stash_commit(&oid, "autostash").is_ok();
+    let stored = commands::stash::store_stash_commit_at(&ctx.git_dir, &oid, "autostash").is_ok();
     if !stored {
         eprintln!("error: cannot store {oid_text}");
     } else if attempt_apply {

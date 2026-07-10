@@ -319,7 +319,10 @@ impl sley_odb::ObjectReader for FastImportDatabase {
     }
 }
 
-pub(crate) fn cmd_fast_import(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_fast_import(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     // Accept and ignore the options test_commit_bulk pairs us with; reject
     // anything we don't model so a caller never gets a silently-wrong import.
     let mut require_done = false;
@@ -394,7 +397,7 @@ pub(crate) fn cmd_fast_import(args: &[String]) -> Result<()> {
         }
     }
 
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let mut db = FastImportDatabase::new(FileObjectDatabase::from_git_dir(&git_dir, format));
     let store = FileRefStore::new(&git_dir, format);

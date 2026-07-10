@@ -16,7 +16,10 @@ use crate::{
     resolve_cli_path, status_quote_path, worktree_prefix, write_check_attr_state,
 };
 
-pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_check_ignore(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut read_stdin = false;
     let mut quiet = false;
     let mut verbose = false;
@@ -99,7 +102,7 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
@@ -290,7 +293,10 @@ fn write_check_ignore_quoted(stdout: &mut impl Write, path: &[u8]) -> Result<()>
     Ok(())
 }
 
-pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_check_attr(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut read_stdin = false;
     let mut all = false;
     let mut z = false;
@@ -379,7 +385,7 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
         ));
     }
 
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();

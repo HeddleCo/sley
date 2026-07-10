@@ -68,7 +68,10 @@ fn parse_sought_entry(format: ObjectFormat, raw: &str) -> SoughtRef {
     }
 }
 
-pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_fetch_pack(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut flags = FetchPackFlags::default();
     let mut index = 0;
     while index < args.len() {
@@ -128,8 +131,7 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
 
     // Upstream fetch-pack is RUN_SETUP: repository discovery precedes
     // everything, including --diag-url.
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
 
     if flags.diag_url {

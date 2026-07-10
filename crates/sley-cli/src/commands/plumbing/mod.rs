@@ -11,7 +11,6 @@ mod fsck;
 mod init;
 mod prune_packed;
 mod replace;
-mod rerere;
 mod worktree;
 
 #[path = "../plumbing_options.rs"]

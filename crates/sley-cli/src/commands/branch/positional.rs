@@ -22,6 +22,7 @@
 
 #![allow(clippy::expect_used)]
 
+use super::BranchCommandContext;
 use super::create::{branch_create_set_tracking, create_branch_from_start};
 use super::delete::{delete_merged_branches, force_delete_branches, force_update_branch};
 use super::list::*;
@@ -33,11 +34,12 @@ use super::positional_table::{
 use crate::*;
 
 pub(super) fn dispatch_branch_positional_args(
-    git_dir: &Path,
-    format: ObjectFormat,
-    store: &FileRefStore,
+    context: &BranchCommandContext,
     args: &[String],
 ) -> Result<()> {
+    let git_dir = context.git_dir();
+    let format = context.format();
+    let store = &context.refs;
     match args {
         [] => print_branch_list(store, BranchListMode::Local),
         [flag] if flag == "--list" => print_branch_list(store, BranchListMode::Local),
@@ -5935,7 +5937,7 @@ pub(super) fn dispatch_branch_positional_args(
             force_delete_branches(git_dir, format, store, branches, false)
         }
         [flag, branches @ ..] if flag == "-d" || flag == "--delete" => {
-            delete_merged_branches(git_dir, format, store, branches, false)
+            delete_merged_branches(git_dir, format, context.objects(), store, branches, false)
         }
         [flag, branch] if flag == "-f" || flag == "--force" => {
             force_update_branch(git_dir, format, store, branch, None).map(|_| ())

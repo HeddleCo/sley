@@ -84,16 +84,25 @@ fn usage_text(action: ReplayAction) -> &'static str {
     }
 }
 
-pub(crate) fn cmd_cherry_pick(args: &[String]) -> Result<()> {
-    run_replay(ReplayAction::Pick, args)
+pub(crate) fn cmd_cherry_pick(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    run_replay(cli_session, ReplayAction::Pick, args)
 }
 
-pub(crate) fn cmd_revert(args: &[String]) -> Result<()> {
-    run_replay(ReplayAction::Revert, args)
+pub(crate) fn cmd_revert(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    run_replay(cli_session, ReplayAction::Revert, args)
 }
 
-pub(crate) fn cmd_replay(args: &[String]) -> Result<()> {
-    run_git_replay(args)
+pub(crate) fn cmd_replay(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    run_git_replay(cli_session, args)
 }
 
 const REPLAY_USAGE: &str = "\
@@ -141,7 +150,7 @@ struct GitReplayPlan {
     reflog_message: Vec<u8>,
 }
 
-fn run_git_replay(args: &[String]) -> Result<()> {
+fn run_git_replay(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let parsed = parse_git_replay_args(args)?;
     if parsed.onto.is_some() && parsed.advance.is_some() {
         eprintln!("fatal: options '--onto' and '--advance' cannot be used together");
@@ -180,8 +189,8 @@ fn run_git_replay(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root =
@@ -935,10 +944,13 @@ impl ReplayCtx {
     }
 }
 
-fn run_replay(action: ReplayAction, args: &[String]) -> Result<()> {
+fn run_replay(
+    cli_session: &crate::session::CliSession,
+    action: ReplayAction,
+    args: &[String],
+) -> Result<()> {
     let parsed = parse_replay_args(action, args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;

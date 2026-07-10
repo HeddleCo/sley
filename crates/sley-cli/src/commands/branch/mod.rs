@@ -15,6 +15,31 @@ mod positional;
 mod positional_table;
 mod upstream;
 
+pub(super) struct BranchCommandContext {
+    pub(super) repository: sley::Repository,
+    pub(super) refs: crate::FileRefStore,
+}
+
+impl BranchCommandContext {
+    pub(super) fn open(session: &crate::session::CliSession) -> crate::Result<Self> {
+        let repository = session.open_repository()?;
+        let refs = repository.references();
+        Ok(Self { repository, refs })
+    }
+
+    pub(super) fn git_dir(&self) -> &std::path::Path {
+        self.repository.git_dir()
+    }
+
+    pub(super) fn format(&self) -> crate::ObjectFormat {
+        self.repository.object_format()
+    }
+
+    pub(super) fn objects(&self) -> &crate::sley_odb::FileObjectDatabase {
+        self.repository.object_database()
+    }
+}
+
 // Names in scope for branch_options.rs (`use super::{...}`).
 use create::BranchCreateOptions;
 use delete::{BranchDeleteMode, BranchDeleteOptions};

@@ -145,9 +145,12 @@ fn checkout_index_option_specs() -> &'static [OptionSpec<'static>] {
     SPECS
 }
 
-pub(crate) fn cmd_checkout_index(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_checkout_index(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = setup_checkout_index_options(args)?;
-    run_checkout_index(options)
+    run_checkout_index(cli_session, options)
 }
 
 /// Stage bits live in the upper nibble of the index entry flags.
@@ -238,7 +241,10 @@ fn parse_checkout_index_stage(value: &str) -> Result<CheckoutIndexStage> {
     }
 }
 
-fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
+fn run_checkout_index(
+    cli_session: &crate::session::CliSession,
+    options: CheckoutIndexOptions,
+) -> Result<()> {
     if options.all && !options.paths.is_empty() {
         eprintln!("fatal: git checkout-index: don't mix '--all' and explicit filenames");
         return Err(GitError::Exit(128));
@@ -259,7 +265,7 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let repo = match RepositoryContext::discover_current() {
+    let repo = match RepositoryContext::from_session(cli_session) {
         Ok(repo) => repo,
         Err(GitError::NotFound(_)) => {
             eprintln!("fatal: not a git repository (or any of the parent directories): .git");

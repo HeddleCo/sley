@@ -10,7 +10,7 @@ use sley_notes::{
     upsert_note, upsert_note_for_with_options, write_notes,
 };
 
-pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_notes(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     // Parse the global `--ref <ref>` / `--no-ref` option, which may appear
     // before the subcommand. Everything after the (optional) subcommand is
     // handed to that subcommand's own parser.
@@ -53,7 +53,7 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
         None => ("list", &[][..]),
     };
 
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     // Resolve the notes ref against the effective config (includes + `-c` /
     // `GIT_CONFIG_*` overrides) so `core.notesRef` honours the same config the

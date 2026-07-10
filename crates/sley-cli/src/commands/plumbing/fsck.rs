@@ -7,7 +7,10 @@ use sley::plumbing::{
 
 use super::commit_graph::{OpenResult, open_commit_graph_bytes, verify_commit_graph_bytes};
 
-pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_fsck(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut progress = true;
     let mut report_dangling = true;
     let mut report_unreachable = false;
@@ -54,7 +57,7 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
         }
     }
     let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
 
     // Resolve `fsck.<msgid>` severity overrides from the repo config (folds in

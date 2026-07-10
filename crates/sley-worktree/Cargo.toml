@@ -20,6 +20,7 @@ sley-odb.workspace = true
 sley-pathspec.workspace = true
 sley-refs.workspace = true
 sley-rev.workspace = true
+sley-submodule.workspace = true
 sley-unpack-trees.workspace = true
 
 [lints]

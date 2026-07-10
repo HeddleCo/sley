@@ -22,10 +22,18 @@
 use std::path::Path;
 
 use sley_config::GitConfig;
+pub use sley_config::remotes::{SetUrlError, SetUrlKind, SetUrlOp, set_url};
 use sley_core::{ObjectFormat, Result};
 use sley_transport::GitCredential;
 
+mod admin;
 mod install;
+pub use admin::{
+    AddRemoteOptions, AddRemoteOutcome, RemoteAdminError, RemoteHeadMutation, RemoteHeadPlan,
+    RemoteMirror, RemotePrunePlan, RemoteTagMode, RemoveRemoteOutcome, RenameRemoteOutcome,
+    add_remote, apply_remote_head, plan_remote_prune, remote_branch_fetch_refspec, remove_remote,
+    rename_remote, set_remote_branches,
+};
 pub use install::{
     install_protocol_v2_fetch_promisor_response_from_reader,
     install_protocol_v2_fetch_response_from_reader,

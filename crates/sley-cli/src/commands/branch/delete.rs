@@ -233,6 +233,7 @@ pub(super) fn force_update_branch(
 pub(super) fn delete_merged_branches(
     git_dir: &Path,
     format: ObjectFormat,
+    db: &FileObjectDatabase,
     store: &FileRefStore,
     branches: &[String],
     quiet: bool,
@@ -242,12 +243,11 @@ pub(super) fn delete_merged_branches(
         return Err(GitError::Exit(128));
     }
 
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let config = read_repo_config(git_dir)?;
     let head_reachable = resolve_revision(git_dir, format, "HEAD")
         .ok()
-        .and_then(|head| sley_rev::peel_to_commit(&db, format, &head).ok())
-        .map(|head| sley_rev::reachable_commit_oids(git_dir, format, &db, [head], false))
+        .and_then(|head| sley_rev::peel_to_commit(db, format, &head).ok())
+        .map(|head| sley_rev::reachable_commit_oids(git_dir, format, db, [head], false))
         .transpose()?;
 
     let mut failed = false;
@@ -277,7 +277,7 @@ pub(super) fn delete_merged_branches(
             failed = true;
             continue;
         };
-        let Ok(tip) = sley_rev::peel_to_commit(&db, format, &oid) else {
+        let Ok(tip) = sley_rev::peel_to_commit(db, format, &oid) else {
             eprintln!("error: branch '{branch}' not found");
             failed = true;
             continue;
@@ -285,7 +285,7 @@ pub(super) fn delete_merged_branches(
         let reachable = branch_delete_reachable_base(
             store,
             git_dir,
-            &db,
+            db,
             format,
             &config,
             &name,

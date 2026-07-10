@@ -116,16 +116,19 @@ fn usage_error() -> GitError {
 }
 
 /// `git merge-tree` entry point.
-pub(crate) fn cmd_merge_tree(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_merge_tree(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = parse_merge_tree_args(args)?;
     reject_trivial_incompatible_options(&options)?;
     if options.stdin {
-        return run_stdin_merges(&options);
+        return run_stdin_merges(cli_session, &options);
     }
     let mode = resolve_merge_tree_mode(&options)?;
     match mode {
-        MergeTreeMode::RealMerge => run_real_merge(&options),
-        MergeTreeMode::TrivialMerge => run_trivial_merge(&options),
+        MergeTreeMode::RealMerge => run_real_merge(cli_session, &options),
+        MergeTreeMode::TrivialMerge => run_trivial_merge(cli_session, &options),
         MergeTreeMode::Auto => Err(usage_error()),
     }
 }
@@ -334,15 +337,17 @@ struct MergeOutcome {
     clean: bool,
 }
 
-fn run_real_merge(options: &MergeTreeOptions) -> Result<()> {
+fn run_real_merge(
+    cli_session: &crate::session::CliSession,
+    options: &MergeTreeOptions,
+) -> Result<()> {
     let _quiet_cleanup = if options.quiet {
-        let cwd = env::current_dir()?;
-        let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+        let git_dir = cli_session.git_dir()?;
         Some(QuietLooseObjectCleanup::new(git_dir)?)
     } else {
         None
     };
-    let outcome = compute_real_merge(options)?;
+    let outcome = compute_real_merge(cli_session, options)?;
 
     if options.quiet {
         return if outcome.clean {
@@ -422,9 +427,12 @@ fn loose_object_files(git_dir: &Path) -> Result<BTreeSet<PathBuf>> {
     Ok(files)
 }
 
-fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+fn compute_real_merge(
+    cli_session: &crate::session::CliSession,
+    options: &MergeTreeOptions,
+) -> Result<MergeOutcome> {
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let db = crate::repository::open_object_database(&git_dir, format)?;
 
@@ -612,7 +620,10 @@ fn merge_tree_detect_renames(git_dir: &Path) -> bool {
     config.get_bool("diff", None, "renames") != Some(false)
 }
 
-fn run_stdin_merges(options: &MergeTreeOptions) -> Result<()> {
+fn run_stdin_merges(
+    cli_session: &crate::session::CliSession,
+    options: &MergeTreeOptions,
+) -> Result<()> {
     if options.merge_base.is_some() {
         eprintln!("fatal: --merge-base and --stdin cannot be used together");
         return Err(GitError::Exit(128));
@@ -643,7 +654,7 @@ fn run_stdin_merges(options: &MergeTreeOptions) -> Result<()> {
         batch.quiet = false;
         batch.stdin = false;
 
-        let outcome = compute_real_merge(&batch)?;
+        let outcome = compute_real_merge(cli_session, &batch)?;
         out.write_all(if outcome.clean { b"1\0" } else { b"0\0" })?;
         emit_real_merge_to(&mut out, &batch, &outcome)?;
         out.write_all(b"\0")?;
@@ -1260,9 +1271,11 @@ fn emit_messages(
 /// One side's view of a path in the trivial merge: present (mode, oid) or absent.
 type TrivialEntry = Option<(u32, ObjectId)>;
 
-fn run_trivial_merge(options: &MergeTreeOptions) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+fn run_trivial_merge(
+    cli_session: &crate::session::CliSession,
+    options: &MergeTreeOptions,
+) -> Result<()> {
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let db = crate::repository::open_object_database(&git_dir, format)?;
 
