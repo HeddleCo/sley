@@ -420,6 +420,74 @@ fn am_skip_matches_git() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// A failed three-way apply can leave a directory where HEAD has a file. The
+/// directory's children are apply-owned cleanup paths, so `am --skip` must
+/// remove them and restore HEAD instead of misclassifying them as unrelated
+/// untracked data.
+#[test]
+fn am_skip_cleans_directory_file_conflict_paths() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("am-skip-directory-file");
+    let source = root.join("source");
+    let git_target = root.join("git");
+    let rs_target = root.join("rs");
+    let numbers = (1..=10)
+        .map(|number| number.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+
+    for repo in [&source, &git_target, &rs_target] {
+        fs::create_dir_all(repo).expect("create D/F repo");
+        git_ok(repo, &["init", "-q", "-b", "main"]);
+        write(repo, "numbers", &numbers);
+        git_ok(repo, &["add", "numbers"]);
+        git_ok(repo, &["commit", "-q", "-m", "initial"]);
+    }
+
+    fs::create_dir(source.join("foo")).expect("create source foo directory");
+    write(&source.join("foo"), "bar", "content\n");
+    fs::write(source.join("numbers"), format!("{numbers}11\n")).expect("edit source numbers");
+    git_ok(&source, &["add", "foo", "numbers"]);
+    git_ok(&source, &["commit", "-q", "-m", "directory and edit"]);
+
+    for target in [&git_target, &rs_target] {
+        write(target, "foo", "content\n");
+        fs::write(target.join("numbers"), format!("{numbers}eleven\n"))
+            .expect("edit target numbers");
+        git_ok(target, &["add", "foo", "numbers"]);
+        git_ok(target, &["commit", "-q", "-m", "file and edit"]);
+    }
+
+    let patches_dir = root.join("patches");
+    fs::create_dir_all(&patches_dir).expect("create patch directory");
+    git_ok(
+        &source,
+        &[
+            "format-patch",
+            "-1",
+            "-o",
+            patches_dir.to_string_lossy().as_ref(),
+            "HEAD",
+        ],
+    );
+    let patch = patch_paths(&patches_dir).remove(0);
+    assert!(!git(&git_target, &["am", "-3", &patch]).status.success());
+    assert!(!sley(&rs_target, &["am", "-3", &patch]).status.success());
+
+    let expected = git(&git_target, &["am", "--skip"]);
+    let actual = sley(&rs_target, &["am", "--skip"]);
+    assert_outputs_equal("am --skip after D/F conflict", &expected, &actual);
+    assert_repos_equal(&git_target, &rs_target);
+    assert!(!git_target.join(".git/rebase-apply").exists());
+    assert!(!rs_target.join(".git/rebase-apply").exists());
+    assert!(git_ok(&rs_target, &["ls-files", "-u"]).is_empty());
+
+    fs::remove_dir_all(&root).ok();
+}
+
 /// A `-3` fallback that succeeds (non-overlapping edits) reconstructs the base
 /// from the patch's blobs and 3-way merges; both binaries produce the same merge
 /// output, the same commit OID, and the same worktree.
@@ -586,6 +654,72 @@ fn am_empty_and_in_progress_match_git() {
     let g = git(&git_target, &["am", garbage.to_string_lossy().as_ref()]);
     let r = sley(&rs_target, &["am", garbage.to_string_lossy().as_ref()]);
     assert_outputs_equal("am while in progress", &g, &r);
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// `am --reject` keeps every hunk that applies, writes the failed fragment to
+/// `<path>.rej`, leaves the index at HEAD, and persists the option for retry.
+#[test]
+fn am_reject_partially_applies_and_writes_reject_like_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("am-reject");
+    let source = root.join("source");
+    init_repo(&source, "0\n2\n3\n4\n5\n6\n7\n");
+    write(&source, "file.txt", "One\n2\n3\n4\n5\nSix\n7\n");
+    git_ok(&source, &["add", "file.txt"]);
+    git_ok(&source, &["commit", "-q", "-m", "two separated changes"]);
+
+    let patches = root.join("patches");
+    fs::create_dir_all(&patches).expect("create patch directory");
+    git_ok(
+        &source,
+        &[
+            "format-patch",
+            "-1",
+            "-o",
+            patches.to_string_lossy().as_ref(),
+            "HEAD",
+        ],
+    );
+    let patch = patch_paths(&patches).remove(0);
+
+    let git_target = root.join("git");
+    let rs_target = root.join("rs");
+    for target in [&git_target, &rs_target] {
+        init_repo(target, "1\n2\n3\n4\n5\n6\n7\n");
+    }
+
+    let g = git(&git_target, &["am", "--reject", &patch]);
+    let r = sley(&rs_target, &["am", "--reject", &patch]);
+    assert!(
+        !g.status.success(),
+        "Git fixture unexpectedly applied cleanly"
+    );
+    assert!(!r.status.success(), "Sley unexpectedly applied cleanly");
+
+    assert_eq!(
+        fs::read(rs_target.join("file.txt")).expect("Sley partial file"),
+        fs::read(git_target.join("file.txt")).expect("Git partial file"),
+        "partially-applied worktree bytes differ"
+    );
+    assert_eq!(
+        fs::read(rs_target.join("file.txt.rej")).expect("Sley reject file"),
+        fs::read(git_target.join("file.txt.rej")).expect("Git reject file"),
+        "reject-file bytes differ"
+    );
+    assert_eq!(
+        git_ok(&rs_target, &["diff-files", "--name-only"]),
+        git_ok(&git_target, &["diff-files", "--name-only"]),
+        "index/worktree separation differs"
+    );
+    assert_eq!(
+        fs::read(rs_target.join(".git/rebase-apply/apply-opt")).expect("Sley apply-opt"),
+        fs::read(git_target.join(".git/rebase-apply/apply-opt")).expect("Git apply-opt"),
+        "persisted apply options differ"
+    );
 
     fs::remove_dir_all(&root).ok();
 }

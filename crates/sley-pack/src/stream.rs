@@ -168,7 +168,11 @@ impl<'a, R> PackReadStream<'a, R>
 where
     R: Read,
 {
-    pub(crate) fn new(reader: &'a mut R, format: ObjectFormat, pack_len: Option<u64>) -> Result<Self> {
+    pub(crate) fn new(
+        reader: &'a mut R,
+        format: ObjectFormat,
+        pack_len: Option<u64>,
+    ) -> Result<Self> {
         let trailer_len = format.raw_len() as u64;
         let trailer_position = pack_len
             .map(|pack_len| {
@@ -230,7 +234,11 @@ where
         Ok(())
     }
 
-    pub(crate) fn read_entry_bytes(&mut self, bytes: &mut [u8], crc: &mut crc32fast::Hasher) -> Result<()> {
+    pub(crate) fn read_entry_bytes(
+        &mut self,
+        bytes: &mut [u8],
+        crc: &mut crc32fast::Hasher,
+    ) -> Result<()> {
         self.read_pack_bytes(bytes)?;
         crc.update(bytes);
         Ok(())

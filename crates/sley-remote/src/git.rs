@@ -22,19 +22,18 @@ use crate::install::{
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
-    parse_protocol_v2_fetch_features, parse_receive_pack_features, parse_refspec,
-    parse_upload_pack_features, plan_push_commands,
+    GitService, ProtocolV2CommandOptions, ProtocolV2FetchRequest, ProtocolV2FetchShallowInfo,
+    ProtocolV2LsRefsRequest, ProtocolVersion, ReceivePackCommand, ReceivePackFeatures,
+    RefAdvertisement, TransportHandshake, UploadPackFeatures, UploadPackNegotiationRequest,
+    UploadPackRequest, parse_protocol_v2_fetch_features, parse_receive_pack_features,
+    parse_refspec, parse_upload_pack_features, plan_push_commands,
     protocol_v2_ls_refs_records_to_ref_advertisement_set, protocol_v2_object_format,
-    read_protocol_v2_advertisement, read_protocol_v2_ls_refs_response,
-    read_receive_pack_report_status, read_ref_advertisement_set, write_protocol_v2_command_request,
-    write_protocol_v2_fetch_request, write_upload_pack_negotiation_request,
-    write_upload_pack_request, GitService, ProtocolV2CommandOptions, ProtocolV2FetchRequest,
-    ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRequest, ProtocolVersion, ReceivePackCommand,
-    ReceivePackFeatures, ReceivePackPushRequestOptions, RefAdvertisement, TransportHandshake,
-    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRequest,
+    read_protocol_v2_advertisement, read_protocol_v2_ls_refs_response, read_ref_advertisement_set,
+    write_protocol_v2_command_request, write_protocol_v2_fetch_request,
+    write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::FileRefStore;
-use sley_transport::{write_service_request, RemoteTransport, RemoteUrl, ServiceRequest};
+use sley_transport::{RemoteTransport, RemoteUrl, ServiceRequest, write_service_request};
 
 use crate::git_proxy::GitConnection;
 use crate::{PushOutcome, PushRequest};
@@ -483,6 +482,7 @@ fn connect_git_service(
         .ok_or_else(|| GitError::InvalidFormat("git:// remote is missing a host".into()))?;
     let port = remote.port.unwrap_or(GIT_DAEMON_PORT);
     let mut stream = crate::git_proxy::connect_git_transport(config, host, port)?;
+    let protocol = protocol.or_else(|| configured_git_protocol_v1(config));
     let request = ServiceRequest {
         service,
         path: remote.path.clone(),
@@ -494,6 +494,11 @@ fn connect_git_service(
     write_service_request(&mut stream, &request)?;
     stream.flush()?;
     Ok(stream)
+}
+
+fn configured_git_protocol_v1(config: Option<&GitConfig>) -> Option<ProtocolVersion> {
+    (config.and_then(|config| config.get("protocol", None, "version")) == Some("1"))
+        .then_some(ProtocolVersion::V1)
 }
 
 fn git_protocol_v2_command_options(format: ObjectFormat) -> Vec<Capability> {
@@ -651,6 +656,18 @@ mod tests {
 
     use sley_protocol::{ProtocolVersion, RefAdvertisement, RefAdvertisementSet};
     use sley_transport::read_service_request;
+
+    #[test]
+    fn configured_protocol_v1_is_added_to_git_daemon_requests() {
+        let config = GitConfig::parse(b"[protocol]\n\tversion = 1\n").expect("config");
+        assert_eq!(
+            configured_git_protocol_v1(Some(&config)),
+            Some(ProtocolVersion::V1)
+        );
+        let config = GitConfig::parse(b"[protocol]\n\tversion = 2\n").expect("config");
+        assert_eq!(configured_git_protocol_v1(Some(&config)), None);
+        assert_eq!(configured_git_protocol_v1(None), None);
+    }
 
     #[test]
     fn ls_remote_git_sends_daemon_request_and_reads_advertisements() {

@@ -12,7 +12,7 @@
 //! A glob of the crate root brings every shared helper/type into scope via
 //! descendant-privacy; see commands::stash for the rationale.
 use crate::*;
-use sley::plumbing::{sley_diff_merge};
+use sley::plumbing::sley_diff_merge;
 
 /// One path of a combined merge diff: the merge result plus each parent's state
 /// for that path (mirrors git's `struct combine_diff_path`).

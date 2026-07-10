@@ -1,7 +1,7 @@
-//! Engine-level parity harness: compare [`sley`] library output against oracle git.
+//! Engine-level parity harness: compare `sley` library output against oracle git.
 //!
 //! Integration tests in `crates/sley/tests/parity/` use this module to exercise
-//! [`sley::Repository`] (and related library APIs) directly while diffing
+//! `sley::Repository` (and related library APIs) directly while diffing
 //! stdout, stderr, exit codes, and optional on-disk files against upstream git
 //! run in a hermetic environment (see [`crate::hermetic_git_command`]).
 //!
@@ -90,7 +90,7 @@ impl HermeticRepo {
     /// Initialize a bare repository at `{root}/{name}` and return its path.
     pub fn init_bare(&self, name: &str) -> PathBuf {
         let bare = self.root.join(name);
-        self.oracle_ok_in(&self.path(), &["init", "-q", "--bare", name, "-b", "main"]);
+        self.oracle_ok_in(self.path(), &["init", "-q", "--bare", name, "-b", "main"]);
         bare
     }
 
@@ -141,12 +141,7 @@ impl HermeticRepo {
         for path in paths {
             self.oracle_ok(&["add", path]);
         }
-        self.oracle_ok_with_identity(&[
-            "commit",
-            "-m",
-            message,
-            "-q",
-        ]);
+        self.oracle_ok_with_identity(&["commit", "-m", message, "-q"]);
     }
 
     /// Run oracle git in this repo's root, returning full output.
@@ -216,7 +211,8 @@ pub fn hermetic_repo(name: &str) -> HermeticRepo {
 /// Assert two byte slices are equal, with a readable diff context.
 pub fn assert_bytes_eq(actual: &[u8], expected: &[u8], context: &str) {
     assert_eq!(
-        actual, expected,
+        actual,
+        expected,
         "{context}\nactual stdout:\n{}\nexpected stdout:\n{}",
         String::from_utf8_lossy(actual),
         String::from_utf8_lossy(expected)
@@ -231,23 +227,24 @@ pub fn assert_stdout_eq(actual: &EngineOutput, expected: &EngineOutput, context:
 /// Default comparison: exit code, stdout, stderr, and tracked files.
 pub fn assert_engine_parity(case_name: &str, sley: &EngineOutput, oracle: &EngineOutput) {
     assert_eq!(
-        sley.exit_code, oracle.exit_code,
+        sley.exit_code,
+        oracle.exit_code,
         "{case_name}: exit code differed\nsley stderr:\n{}\noracle stderr:\n{}",
         String::from_utf8_lossy(&sley.stderr),
         String::from_utf8_lossy(&oracle.stderr)
     );
-    assert_stdout_eq(
-        sley,
-        oracle,
-        &format!("{case_name}: stdout differed"),
-    );
+    assert_stdout_eq(sley, oracle, &format!("{case_name}: stdout differed"));
     assert_eq!(
-        sley.stderr, oracle.stderr,
+        sley.stderr,
+        oracle.stderr,
         "{case_name}: stderr differed\nsley stderr:\n{}\noracle stderr:\n{}",
         String::from_utf8_lossy(&sley.stderr),
         String::from_utf8_lossy(&oracle.stderr)
     );
-    assert_eq!(sley.files, oracle.files, "{case_name}: file snapshot differed");
+    assert_eq!(
+        sley.files, oracle.files,
+        "{case_name}: file snapshot differed"
+    );
 }
 
 /// One engine parity scenario: shared setup, library runner, oracle runner, compare.
@@ -384,11 +381,9 @@ pub fn git_config_line(value: Option<&str>) -> Vec<u8> {
 /// Format multiple config values the way `git config --get-all` prints them.
 pub fn git_config_get_all_lines(values: &[Option<&str>]) -> Vec<u8> {
     let mut out = Vec::new();
-    for value in values {
-        if let Some(value) = value {
-            out.extend_from_slice(value.as_bytes());
-            out.push(b'\n');
-        }
+    for value in values.iter().flatten() {
+        out.extend_from_slice(value.as_bytes());
+        out.push(b'\n');
     }
     out
 }
@@ -444,9 +439,6 @@ mod tests {
 
     #[test]
     fn git_config_get_all_joins_with_newlines() {
-        assert_eq!(
-            git_config_get_all_lines(&[Some("a"), Some("b")]),
-            b"a\nb\n"
-        );
+        assert_eq!(git_config_get_all_lines(&[Some("a"), Some("b")]), b"a\nb\n");
     }
 }

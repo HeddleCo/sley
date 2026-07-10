@@ -785,8 +785,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
             base_info: base_info.as_ref(),
         })?;
         if options.graph {
-            buffer =
-                format_patch_graph_prefix(&buffer, idx == 0, resolved.signature.as_deref());
+            buffer = format_patch_graph_prefix(&buffer, idx == 0, resolved.signature.as_deref());
         }
         let file_name = if options.numbered_files {
             seq.to_string()
@@ -3933,7 +3932,8 @@ fn format_patch_diff_options<'a>(
     abbrev: usize,
 ) -> crate::DiffRenderOptions<'a> {
     crate::DiffRenderOptions {
-                line_indicators: sley_diff_merge::render::LineIndicators::default(),
+        line_indicators: sley_diff_merge::render::LineIndicators::default(),
+        suppress_blank_empty: false,
         binary: options.binary,
         anchors: &[],
         allow_textconv: false,

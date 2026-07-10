@@ -10,11 +10,11 @@ use std::io::{self, Read, Write};
 use sley::plumbing::sley_rev;
 use sley_core::DateMode;
 use sley_notes::NotesRef;
-use sley_pretty::{CompiledLogFormat, LogFormatDialect, LogFormatContext};
+use sley_pretty::{CompiledLogFormat, LogFormatContext, LogFormatDialect};
 
 use crate::commands::log::{
-    compiled_format_uses_notes, expand_notes_glob, format_commit_pretty_with_notes,
-    resolve_pretty_spec, ResolvedPretty,
+    ResolvedPretty, compiled_format_uses_notes, expand_notes_glob, format_commit_pretty_with_notes,
+    resolve_pretty_spec,
 };
 use crate::*;
 
@@ -212,8 +212,7 @@ fn format_rev_revs_line(
     let record = read_rev_list_commit_record(db, format, commit)?;
     let decorations = HashMap::new();
     let mailmap = EmptyMailmap;
-    let context =
-        format_rev_log_context(&decorations, &mailmap, abbrev_len, format_rev.date_mode);
+    let context = format_rev_log_context(&decorations, &mailmap, abbrev_len, format_rev.date_mode);
     Ok(Some(format_commit_pretty_with_notes(
         git_dir,
         format,
@@ -242,8 +241,7 @@ fn format_rev_text_input(
     let hex_len = object_format.hex_len();
     let decorations = HashMap::new();
     let mailmap = EmptyMailmap;
-    let context =
-        format_rev_log_context(&decorations, &mailmap, abbrev_len, format_rev.date_mode);
+    let context = format_rev_log_context(&decorations, &mailmap, abbrev_len, format_rev.date_mode);
     for record in read_input_records(input, nul_input) {
         let mut segment_start = 0usize;
         let mut counter = 0usize;
@@ -254,7 +252,9 @@ fn format_rev_text_input(
                 counter = 0;
             } else {
                 counter += 1;
-                let next_is_hex = record.get(index + 1).is_some_and(|next| is_lower_hex(*next));
+                let next_is_hex = record
+                    .get(index + 1)
+                    .is_some_and(|next| is_lower_hex(*next));
                 if counter == hex_len && !next_is_hex {
                     let hex_start = index + 1 - hex_len;
                     let hex = &record[hex_start..=index];

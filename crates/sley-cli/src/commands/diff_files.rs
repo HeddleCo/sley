@@ -781,6 +781,7 @@ fn render_diff_files_entries(
         |stdout, entry| {
             let patch_options = DiffRenderOptions {
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                suppress_blank_empty: false,
                 binary: false,
                 anchors: &[],
                 allow_textconv: false,

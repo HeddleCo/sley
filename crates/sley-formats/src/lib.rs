@@ -11,7 +11,7 @@
 
 use sley_config::{ConfigEntry, ConfigSection, GitConfig};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -124,6 +124,32 @@ pub struct ReftableLogRecord {
     pub value: ReftableLogValue,
 }
 
+/// Serialization controls for a reftable table.
+///
+/// These are the writer settings exposed by Git's reftable backend. A zero
+/// block size or restart interval is normalized to Git's defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReftableWriteOptions {
+    /// Maximum uncompressed block size, including the table header in the
+    /// first block.
+    pub block_size: u32,
+    /// Maximum number of records between forced restart points.
+    pub restart_interval: u16,
+    /// Whether to emit the object-to-ref-block index when the ref section has
+    /// enough blocks to require a ref index.
+    pub index_objects: bool,
+}
+
+impl Default for ReftableWriteOptions {
+    fn default() -> Self {
+        Self {
+            block_size: REFTABLE_DEFAULT_BLOCK_SIZE,
+            restart_interval: 16,
+            index_objects: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reftable {
     pub header: ReftableHeader,
@@ -223,67 +249,479 @@ impl Reftable {
         refs: &[ReftableRefRecord],
         logs: &[ReftableLogRecord],
     ) -> Result<Vec<u8>> {
+        Self::write_with_options(
+            format,
+            min_update_index,
+            max_update_index,
+            refs,
+            logs,
+            ReftableWriteOptions::default(),
+        )
+    }
+
+    /// Serialize refs and logs using explicit reftable writer settings.
+    pub fn write_with_options(
+        format: ObjectFormat,
+        min_update_index: u64,
+        max_update_index: u64,
+        refs: &[ReftableRefRecord],
+        logs: &[ReftableLogRecord],
+        mut options: ReftableWriteOptions,
+    ) -> Result<Vec<u8>> {
+        if options.block_size == 0 {
+            options.block_size = REFTABLE_DEFAULT_BLOCK_SIZE;
+        }
+        if options.restart_interval == 0 {
+            options.restart_interval = 16;
+        }
+        if options.block_size > REFTABLE_MAX_BLOCK_SIZE {
+            return Err(GitError::InvalidFormat(
+                "reftable block size exceeds maximum".into(),
+            ));
+        }
         let version = match format {
             ObjectFormat::Sha1 => ReftableVersion::V1,
             ObjectFormat::Sha256 => ReftableVersion::V2,
         };
         let header = ReftableHeader {
             version,
-            block_size: REFTABLE_DEFAULT_BLOCK_SIZE,
+            block_size: options.block_size,
             min_update_index,
             max_update_index,
             object_format: format,
         };
-        let mut refs = refs.to_vec();
-        refs.sort_by(|left, right| left.name.cmp(&right.name));
-        let mut out = write_reftable_header(header)?;
-        if !refs.is_empty() {
-            let block_start = out.len();
-            out.push(b'r');
-            out.extend_from_slice(&[0, 0, 0]);
-            let mut previous_name = Vec::new();
-            let mut restart_offsets = Vec::new();
-            for record in &refs {
-                if record.update_index < min_update_index || record.update_index > max_update_index
-                {
-                    return Err(GitError::InvalidFormat(format!(
-                        "reftable ref {} update index {} outside header bounds",
-                        record.name, record.update_index
-                    )));
-                }
-                restart_offsets.push(out.len() as u32);
-                write_reftable_ref_record(
-                    &mut out,
-                    format,
-                    min_update_index,
-                    &previous_name,
+        write_reftable_with_options(header, refs, logs, options)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReftableWriterRecord {
+    key: Vec<u8>,
+    value_type: u8,
+    value: Vec<u8>,
+    object_ids: Vec<ObjectId>,
+}
+
+#[derive(Debug)]
+struct ReftableWriterBlock {
+    bytes: Vec<u8>,
+    last_key: Vec<u8>,
+    record_indices: Vec<usize>,
+    offset: u64,
+}
+
+fn write_reftable_with_options(
+    header: ReftableHeader,
+    refs: &[ReftableRefRecord],
+    logs: &[ReftableLogRecord],
+    options: ReftableWriteOptions,
+) -> Result<Vec<u8>> {
+    let mut ref_records = refs
+        .iter()
+        .map(|record| reftable_ref_writer_record(header, record))
+        .collect::<Result<Vec<_>>>()?;
+    ref_records.sort_by(|left, right| left.key.cmp(&right.key));
+
+    let mut log_records = logs
+        .iter()
+        .map(|record| reftable_log_writer_record(header.object_format, record))
+        .collect::<Result<Vec<_>>>()?;
+    log_records.sort_by(|left, right| left.key.cmp(&right.key));
+
+    let mut out = write_reftable_header(header)?;
+    let mut ref_index_position = 0;
+    let mut obj_position = 0;
+    let mut obj_id_len = 0;
+    let mut obj_index_position = 0;
+    let mut log_position = 0;
+    let mut log_index_position = 0;
+
+    let first_header_len = header.version.header_len();
+    let mut ref_blocks = if ref_records.is_empty() {
+        Vec::new()
+    } else {
+        build_reftable_blocks(
+            b'r',
+            &ref_records,
+            options.block_size,
+            first_header_len,
+            options.restart_interval,
+            false,
+        )?
+    };
+    if !ref_blocks.is_empty() {
+        append_first_reftable_section(&mut out, &mut ref_blocks, options.block_size)?;
+    }
+
+    if ref_blocks.len() > 3 {
+        ref_index_position = append_reftable_index_levels(&mut out, &ref_blocks, options, true)?;
+
+        if options.index_objects {
+            let object_records =
+                reftable_object_writer_records(&ref_records, &ref_blocks, header.object_format);
+            if !object_records.is_empty() {
+                obj_id_len = object_records[0].key.len() as u8;
+                let mut object_blocks = build_reftable_blocks(
+                    b'o',
+                    &object_records,
+                    options.block_size,
                     0,
-                    record,
+                    options.restart_interval,
+                    false,
                 )?;
-                previous_name = record.name.as_bytes().to_vec();
+                align_reftable_output(&mut out, options.block_size);
+                obj_position = out.len() as u64;
+                append_reftable_blocks(&mut out, &mut object_blocks, options.block_size, false);
+                if object_blocks.len() > 3 {
+                    obj_index_position =
+                        append_reftable_index_levels(&mut out, &object_blocks, options, true)?;
+                }
             }
-            for offset in &restart_offsets {
-                write_u24(&mut out, *offset)?;
-            }
-            let restart_count = u16::try_from(restart_offsets.len())
-                .map_err(|_| GitError::InvalidFormat("too many reftable restart offsets".into()))?;
-            out.extend_from_slice(&restart_count.to_be_bytes());
-            let block_len = out.len();
-            if block_len > REFTABLE_MAX_BLOCK_SIZE as usize {
+        }
+    }
+
+    let first_log_header = if ref_blocks.is_empty() {
+        first_header_len
+    } else {
+        0
+    };
+    let mut log_blocks = if log_records.is_empty() {
+        Vec::new()
+    } else {
+        build_reftable_blocks(
+            b'g',
+            &log_records,
+            options.block_size,
+            first_log_header,
+            options.restart_interval,
+            true,
+        )?
+    };
+    if !log_blocks.is_empty() {
+        log_position = if first_log_header == 0 {
+            out.len() as u64
+        } else {
+            // Git records a zero section offset when the log block is the
+            // table's first block; readers infer that it begins immediately
+            // after the table header. Non-zero offsets are only used when a
+            // ref/object section precedes the logs.
+            0
+        };
+        if first_log_header == 0 {
+            append_reftable_blocks(&mut out, &mut log_blocks, options.block_size, true);
+        } else {
+            append_first_reftable_section(&mut out, &mut log_blocks, options.block_size)?;
+        }
+        if log_blocks.len() > 3 {
+            log_index_position =
+                append_reftable_index_levels(&mut out, &log_blocks, options, false)?;
+        }
+    }
+
+    out.extend_from_slice(&write_reftable_footer(
+        header,
+        ref_index_position,
+        obj_position,
+        obj_id_len,
+        obj_index_position,
+        log_position,
+        log_index_position,
+    )?);
+    Ok(out)
+}
+
+fn reftable_ref_writer_record(
+    header: ReftableHeader,
+    record: &ReftableRefRecord,
+) -> Result<ReftableWriterRecord> {
+    if record.update_index < header.min_update_index
+        || record.update_index > header.max_update_index
+    {
+        return Err(GitError::InvalidFormat(format!(
+            "reftable ref {} update index {} outside header bounds",
+            record.name, record.update_index
+        )));
+    }
+    let mut value = Vec::new();
+    write_reftable_varint(&mut value, record.update_index - header.min_update_index);
+    let (value_type, object_ids) = match &record.value {
+        ReftableRefValue::Deletion => (0, Vec::new()),
+        ReftableRefValue::Direct(oid) => {
+            if oid.format() != header.object_format {
                 return Err(GitError::InvalidFormat(
-                    "reftable ref block exceeds maximum size".into(),
+                    "reftable direct ref object format mismatch".into(),
                 ));
             }
-            write_u24_at(&mut out, block_start + 1, block_len as u32)?;
+            value.extend_from_slice(oid.as_bytes());
+            (1, vec![*oid])
         }
-        let log_position = if logs.is_empty() {
-            0
-        } else {
-            write_reftable_log_block(&mut out, format, logs)?
-        };
-        out.extend_from_slice(&write_reftable_footer(header, 0, 0, 0, 0, log_position)?);
-        Ok(out)
+        ReftableRefValue::Peeled { target, peeled } => {
+            if target.format() != header.object_format || peeled.format() != header.object_format {
+                return Err(GitError::InvalidFormat(
+                    "reftable peeled ref object format mismatch".into(),
+                ));
+            }
+            value.extend_from_slice(target.as_bytes());
+            value.extend_from_slice(peeled.as_bytes());
+            (2, vec![*target, *peeled])
+        }
+        ReftableRefValue::Symbolic(target) => {
+            write_reftable_string(&mut value, target.as_bytes());
+            (3, Vec::new())
+        }
+    };
+    Ok(ReftableWriterRecord {
+        key: record.name.as_bytes().to_vec(),
+        value_type,
+        value,
+        object_ids,
+    })
+}
+
+fn reftable_log_writer_record(
+    format: ObjectFormat,
+    record: &ReftableLogRecord,
+) -> Result<ReftableWriterRecord> {
+    let mut value = Vec::new();
+    let value_type = match &record.value {
+        ReftableLogValue::Deletion => 0,
+        ReftableLogValue::Update(update) => {
+            write_reftable_log_value(&mut value, format, update)?;
+            1
+        }
+    };
+    Ok(ReftableWriterRecord {
+        key: reftable_log_key(&record.refname, record.update_index),
+        value_type,
+        value,
+        object_ids: Vec::new(),
+    })
+}
+
+fn build_reftable_blocks(
+    block_type: u8,
+    records: &[ReftableWriterRecord],
+    block_size: u32,
+    first_header_len: usize,
+    restart_interval: u16,
+    compress: bool,
+) -> Result<Vec<ReftableWriterBlock>> {
+    let block_size = block_size as usize;
+    let mut blocks = Vec::new();
+    let mut next_record = 0;
+    let mut header_len = first_header_len;
+    while next_record < records.len() {
+        let mut encoded = Vec::new();
+        let mut restart_offsets = Vec::new();
+        let mut record_indices = Vec::new();
+        let mut previous_key = Vec::new();
+        let block_begin = next_record;
+        while next_record < records.len() {
+            let record = &records[next_record];
+            let force_restart = record_indices.len() % usize::from(restart_interval) == 0;
+            let prefix_len = if force_restart {
+                0
+            } else {
+                common_prefix_len(&previous_key, &record.key)
+            };
+            let mut entry = Vec::new();
+            write_reftable_varint(&mut entry, prefix_len as u64);
+            let suffix = &record.key[prefix_len..];
+            write_reftable_varint(
+                &mut entry,
+                ((suffix.len() as u64) << 3) | u64::from(record.value_type),
+            );
+            entry.extend_from_slice(suffix);
+            entry.extend_from_slice(&record.value);
+            let is_restart = prefix_len == 0;
+            let restart_count = restart_offsets.len() + usize::from(is_restart);
+            let raw_len = header_len + 4 + encoded.len() + entry.len() + restart_count * 3 + 2;
+            if raw_len > block_size {
+                if record_indices.is_empty() {
+                    return Err(GitError::InvalidFormat("entry too large".into()));
+                }
+                break;
+            }
+            if is_restart {
+                restart_offsets.push((header_len + 4 + encoded.len()) as u32);
+            }
+            encoded.extend_from_slice(&entry);
+            record_indices.push(next_record);
+            previous_key.clone_from(&record.key);
+            next_record += 1;
+        }
+
+        if next_record == block_begin {
+            return Err(GitError::InvalidFormat("entry too large".into()));
+        }
+        let last_key = records[next_record - 1].key.clone();
+        let mut body = Vec::new();
+        body.push(block_type);
+        body.extend_from_slice(&[0, 0, 0]);
+        body.extend_from_slice(&encoded);
+        for offset in &restart_offsets {
+            write_u24(&mut body, *offset)?;
+        }
+        let restart_count = u16::try_from(restart_offsets.len())
+            .map_err(|_| GitError::InvalidFormat("too many reftable restart offsets".into()))?;
+        body.extend_from_slice(&restart_count.to_be_bytes());
+        let raw_len = header_len + body.len();
+        write_u24_at(&mut body, 1, raw_len as u32)?;
+        if compress {
+            let compressed = deflate_zlib(&body[4..])?;
+            body.truncate(4);
+            body.extend_from_slice(&compressed);
+        }
+        blocks.push(ReftableWriterBlock {
+            bytes: body,
+            last_key,
+            record_indices,
+            offset: 0,
+        });
+        header_len = 0;
     }
+    Ok(blocks)
+}
+
+fn append_first_reftable_section(
+    out: &mut Vec<u8>,
+    blocks: &mut [ReftableWriterBlock],
+    block_size: u32,
+) -> Result<()> {
+    for (index, block) in blocks.iter_mut().enumerate() {
+        if index == 0 {
+            block.offset = 0;
+        } else {
+            align_reftable_output(out, block_size);
+            block.offset = out.len() as u64;
+        }
+        out.extend_from_slice(&block.bytes);
+    }
+    Ok(())
+}
+
+fn append_reftable_blocks(
+    out: &mut Vec<u8>,
+    blocks: &mut [ReftableWriterBlock],
+    block_size: u32,
+    unpadded: bool,
+) {
+    for (index, block) in blocks.iter_mut().enumerate() {
+        if index != 0 && !unpadded {
+            align_reftable_output(out, block_size);
+        }
+        block.offset = out.len() as u64;
+        out.extend_from_slice(&block.bytes);
+    }
+}
+
+fn align_reftable_output(out: &mut Vec<u8>, block_size: u32) {
+    let block_size = block_size as usize;
+    let remainder = out.len() % block_size;
+    if remainder != 0 {
+        out.resize(out.len() + block_size - remainder, 0);
+    }
+}
+
+fn reftable_index_writer_records(blocks: &[ReftableWriterBlock]) -> Vec<ReftableWriterRecord> {
+    blocks
+        .iter()
+        .map(|block| {
+            let mut value = Vec::new();
+            write_reftable_varint(&mut value, block.offset);
+            ReftableWriterRecord {
+                key: block.last_key.clone(),
+                value_type: 0,
+                value,
+                object_ids: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+fn append_reftable_index_levels(
+    out: &mut Vec<u8>,
+    indexed_blocks: &[ReftableWriterBlock],
+    options: ReftableWriteOptions,
+    align_first: bool,
+) -> Result<u64> {
+    let mut records = reftable_index_writer_records(indexed_blocks);
+    let mut first_level = true;
+    loop {
+        if (first_level && align_first) || !first_level {
+            align_reftable_output(out, options.block_size);
+        }
+        let highest_position = out.len() as u64;
+        let mut blocks = build_reftable_blocks(
+            b'i',
+            &records,
+            options.block_size,
+            0,
+            options.restart_interval,
+            false,
+        )?;
+        append_reftable_blocks(out, &mut blocks, options.block_size, false);
+        if blocks.len() <= 3 {
+            return Ok(highest_position);
+        }
+        records = reftable_index_writer_records(&blocks);
+        first_level = false;
+    }
+}
+
+fn reftable_object_writer_records(
+    records: &[ReftableWriterRecord],
+    blocks: &[ReftableWriterBlock],
+    format: ObjectFormat,
+) -> Vec<ReftableWriterRecord> {
+    let mut offsets = BTreeMap::<Vec<u8>, Vec<u64>>::new();
+    for block in blocks {
+        for index in &block.record_indices {
+            for oid in &records[*index].object_ids {
+                let entry = offsets.entry(oid.as_bytes().to_vec()).or_default();
+                if entry.last() != Some(&block.offset) {
+                    entry.push(block.offset);
+                }
+            }
+        }
+    }
+    if offsets.is_empty() {
+        return Vec::new();
+    }
+    let keys = offsets.keys().cloned().collect::<Vec<_>>();
+    let common = keys
+        .windows(2)
+        .map(|pair| common_prefix_len(&pair[0], &pair[1]))
+        .max()
+        .unwrap_or(1);
+    let prefix_len = (common + 1).max(2).min(format.raw_len());
+    offsets
+        .into_iter()
+        .map(|(oid, block_offsets)| {
+            let count = block_offsets.len();
+            let value_type = if (1..8).contains(&count) {
+                count as u8
+            } else {
+                0
+            };
+            let mut value = Vec::new();
+            if value_type == 0 {
+                write_reftable_varint(&mut value, count as u64);
+            }
+            if let Some(first) = block_offsets.first() {
+                write_reftable_varint(&mut value, *first);
+                for pair in block_offsets.windows(2) {
+                    write_reftable_varint(&mut value, pair[1] - pair[0]);
+                }
+            }
+            ReftableWriterRecord {
+                key: oid[..prefix_len].to_vec(),
+                value_type,
+                value,
+                object_ids: Vec::new(),
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -401,6 +839,7 @@ fn write_reftable_footer(
     obj_id_len: u8,
     obj_index_position: u64,
     log_position: u64,
+    log_index_position: u64,
 ) -> Result<Vec<u8>> {
     if obj_id_len > 31 {
         return Err(GitError::InvalidFormat(
@@ -412,7 +851,7 @@ fn write_reftable_footer(
     out.extend_from_slice(&((obj_position << 5) | u64::from(obj_id_len)).to_be_bytes());
     out.extend_from_slice(&obj_index_position.to_be_bytes());
     out.extend_from_slice(&log_position.to_be_bytes());
-    out.extend_from_slice(&0u64.to_be_bytes());
+    out.extend_from_slice(&log_index_position.to_be_bytes());
     let crc = crc32(&out);
     out.extend_from_slice(&crc.to_be_bytes());
     Ok(out)
@@ -545,57 +984,6 @@ fn parse_reftable_ref_record(
     })
 }
 
-fn write_reftable_ref_record(
-    out: &mut Vec<u8>,
-    format: ObjectFormat,
-    min_update_index: u64,
-    previous_name: &[u8],
-    prefix_len: usize,
-    record: &ReftableRefRecord,
-) -> Result<()> {
-    let name = record.name.as_bytes();
-    if prefix_len > previous_name.len() || prefix_len > name.len() {
-        return Err(GitError::InvalidFormat(
-            "reftable ref prefix exceeds name".into(),
-        ));
-    }
-    let value_type = match &record.value {
-        ReftableRefValue::Deletion => 0,
-        ReftableRefValue::Direct(_) => 1,
-        ReftableRefValue::Peeled { .. } => 2,
-        ReftableRefValue::Symbolic(_) => 3,
-    };
-    write_reftable_varint(out, prefix_len as u64);
-    write_reftable_varint(out, (((name.len() - prefix_len) as u64) << 3) | value_type);
-    out.extend_from_slice(&name[prefix_len..]);
-    write_reftable_varint(out, record.update_index - min_update_index);
-    match &record.value {
-        ReftableRefValue::Deletion => {}
-        ReftableRefValue::Direct(oid) => {
-            if oid.format() != format {
-                return Err(GitError::InvalidFormat(
-                    "reftable direct ref object format mismatch".into(),
-                ));
-            }
-            out.extend_from_slice(oid.as_bytes());
-        }
-        ReftableRefValue::Peeled { target, peeled } => {
-            if target.format() != format || peeled.format() != format {
-                return Err(GitError::InvalidFormat(
-                    "reftable peeled ref object format mismatch".into(),
-                ));
-            }
-            out.extend_from_slice(target.as_bytes());
-            out.extend_from_slice(peeled.as_bytes());
-        }
-        ReftableRefValue::Symbolic(target) => {
-            write_reftable_varint(out, target.len() as u64);
-            out.extend_from_slice(target.as_bytes());
-        }
-    }
-    Ok(())
-}
-
 /// Encode the on-disk key for a log record: `refname \0 <8-byte big-endian ts>`,
 /// where `ts = ~0 - update_index` so larger update indices sort first
 /// (reftable/record.c::reftable_log_record_key).
@@ -606,87 +994,6 @@ fn reftable_log_key(refname: &str, update_index: u64) -> Vec<u8> {
     let ts = u64::MAX - update_index;
     key.extend_from_slice(&ts.to_be_bytes());
     key
-}
-
-/// Write the single `'g'` log block to `out`, deflating its body, and return the
-/// byte offset at which the block begins (its `log_position` in the footer).
-///
-/// The body is built uncompressed first — `[type:1][len:3]` header, then the
-/// prefix-compressed log records, the be24 restart offsets, and the be16 restart
-/// count — and then everything after the 4-byte header is zlib-deflated and
-/// written back over the uncompressed bytes (reftable/block.c::block_writer_finish).
-fn write_reftable_log_block(
-    out: &mut Vec<u8>,
-    format: ObjectFormat,
-    logs: &[ReftableLogRecord],
-) -> Result<u64> {
-    // git sorts log records by (refname asc, update_index desc) which is exactly
-    // ascending key order, since the key embeds the reversed update index.
-    let mut logs = logs.to_vec();
-    logs.sort_by(|left, right| match left.refname.cmp(&right.refname) {
-        std::cmp::Ordering::Equal => right.update_index.cmp(&left.update_index),
-        order => order,
-    });
-
-    let block_start = out.len() as u64;
-    let header_off = out.len();
-    out.push(b'g');
-    out.extend_from_slice(&[0, 0, 0]);
-
-    // Build the uncompressed block body (records + restart table) in a scratch
-    // buffer so we can deflate the whole thing in one shot.
-    let mut body = Vec::new();
-    let mut previous_key: Vec<u8> = Vec::new();
-    let mut restart_offsets: Vec<u32> = Vec::new();
-    // The uncompressed body's record region starts right after the 4-byte block
-    // header; restart offsets are relative to the block start (header_off==0
-    // here because the body buffer holds only post-header bytes, and git's
-    // restart offsets point at the record start counting from the block's first
-    // byte — i.e. the post-header offset plus 4).
-    for (index, record) in logs.iter().enumerate() {
-        let key = reftable_log_key(&record.refname, record.update_index);
-        let restart = index == 0;
-        let prefix_len = if restart {
-            0
-        } else {
-            common_prefix_len(&previous_key, &key)
-        };
-        if restart {
-            restart_offsets.push((body.len() + 4) as u32);
-        }
-        let val_type = match &record.value {
-            ReftableLogValue::Deletion => 0u64,
-            ReftableLogValue::Update(_) => 1u64,
-        };
-        let suffix = &key[prefix_len..];
-        write_reftable_varint(&mut body, prefix_len as u64);
-        write_reftable_varint(&mut body, ((suffix.len() as u64) << 3) | val_type);
-        body.extend_from_slice(suffix);
-        if let ReftableLogValue::Update(update) = &record.value {
-            write_reftable_log_value(&mut body, format, update)?;
-        }
-        previous_key = key;
-    }
-    for offset in &restart_offsets {
-        write_u24(&mut body, *offset)?;
-    }
-    let restart_count = u16::try_from(restart_offsets.len())
-        .map_err(|_| GitError::InvalidFormat("too many reftable log restart offsets".into()))?;
-    body.extend_from_slice(&restart_count.to_be_bytes());
-
-    // The 3-byte block length records the *uncompressed* on-disk size
-    // (4-byte header + uncompressed body), per block_writer_finish.
-    let uncompressed_len = 4 + body.len();
-    if uncompressed_len > REFTABLE_MAX_BLOCK_SIZE as usize {
-        return Err(GitError::InvalidFormat(
-            "reftable log block exceeds maximum size".into(),
-        ));
-    }
-    write_u24_at(out, header_off + 1, uncompressed_len as u32)?;
-
-    let compressed = deflate_zlib(&body)?;
-    out.extend_from_slice(&compressed);
-    Ok(block_start)
 }
 
 fn write_reftable_log_value(
@@ -746,16 +1053,21 @@ fn parse_reftable_log_section(
     footer_start: usize,
     header: ReftableHeader,
 ) -> Result<Vec<ReftableLogRecord>> {
-    if footer.log_position == 0 {
+    let first_block = header.version.header_len();
+    let log_position = if footer.log_position != 0 {
+        footer.log_position as usize
+    } else if bytes.get(first_block) == Some(&b'g') {
+        first_block
+    } else {
         return Ok(Vec::new());
-    }
+    };
     let log_end = [footer.log_index_position, footer_start as u64]
         .into_iter()
         .filter(|position| *position != 0)
         .min()
         .unwrap_or(footer_start as u64) as usize;
     let mut logs = Vec::new();
-    let mut offset = footer.log_position as usize;
+    let mut offset = log_position;
     while offset < log_end {
         if bytes[offset] == 0 {
             offset += 1;
@@ -2622,6 +2934,11 @@ pub struct InitOptions {
     /// Value to record as `core.worktree` in the new repository's config
     /// (init-db.c writes it when the git directory is not `<worktree>/.git`).
     pub core_worktree: Option<String>,
+    /// Object directory to initialize instead of `<git_dir>/objects`, as
+    /// supplied by `GIT_OBJECT_DIRECTORY`. The repository metadata remains in
+    /// `git_dir`; only the object store's `info` and `pack` directories are
+    /// created at this path.
+    pub object_dir: Option<PathBuf>,
     pub object_format: ObjectFormat,
     /// Whether `object_format` came from an explicit `--object-format` flag (as
     /// opposed to an env/config default). On reinit, an explicit format that differs
@@ -2803,12 +3120,17 @@ impl RepositoryBootstrap {
             .unwrap_or_else(|| git_dir.clone());
 
         create_shared_dir(&git_dir, options.shared_repository.as_deref())?;
+        let object_dir = options
+            .object_dir
+            .as_deref()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| git_dir.join("objects"));
         create_shared_dir(
-            git_dir.join("objects/info"),
+            object_dir.join("info"),
             options.shared_repository.as_deref(),
         )?;
         create_shared_dir(
-            git_dir.join("objects/pack"),
+            object_dir.join("pack"),
             options.shared_repository.as_deref(),
         )?;
 
@@ -2871,6 +3193,19 @@ impl RepositoryBootstrap {
 
         let config_path = git_dir.join("config");
         if !config_path.exists() {
+            let config_context = sley_config::ConfigIncludeContext::new(
+                Some(sley_config::git_dir_for_include_context(&git_dir)),
+                None,
+            );
+            let log_all_ref_updates_is_configured =
+                sley_config::load_pre_dispatch_config(None, &config_context)
+                    .ok()
+                    .and_then(|config| {
+                        config
+                            .get("core", None, "logAllRefUpdates")
+                            .map(str::to_owned)
+                    })
+                    .is_some();
             fs::write(
                 config_path,
                 build_init_config(
@@ -2880,6 +3215,7 @@ impl RepositoryBootstrap {
                     ref_storage,
                     alt_ref_storage.as_ref().map(|backend| backend.raw.as_str()),
                     options.core_worktree.as_deref(),
+                    log_all_ref_updates_is_configured,
                 )
                 .to_canonical_bytes(),
             )?;
@@ -2949,6 +3285,7 @@ impl RepositoryLayout {
         RepositoryBootstrap::init(InitOptions {
             git_dir_override: None,
             core_worktree: None,
+            object_dir: None,
             worktree: path.as_ref().to_path_buf(),
             object_format,
             object_format_explicit: false,
@@ -2971,6 +3308,7 @@ fn build_init_config(
     ref_storage: RefStorageFormat,
     ref_storage_value: Option<&str>,
     core_worktree: Option<&str>,
+    log_all_ref_updates_is_configured: bool,
 ) -> GitConfig {
     let uses_extensions = object_format == ObjectFormat::Sha256
         || ref_storage == RefStorageFormat::Reftable
@@ -2985,9 +3323,12 @@ fn build_init_config(
     ];
     if !bare {
         // init-db.c `create_default_files`: a non-bare init records
-        // `core.logallrefupdates = true` (unless a template config already
-        // chose a value, which `apply_init_template` honours by overriding).
-        core_entries.push(ConfigEntry::new("logallrefupdates", Some("true".into())));
+        // `core.logallrefupdates = true` only when no earlier config layer
+        // chose a value. In particular, a global `false` must remain effective
+        // instead of being shadowed by a freshly-written local `true`.
+        if !log_all_ref_updates_is_configured {
+            core_entries.push(ConfigEntry::new("logallrefupdates", Some("true".into())));
+        }
         if let Some(worktree) = core_worktree {
             core_entries.push(ConfigEntry::new("worktree", Some(worktree.into())));
         }
@@ -3491,6 +3832,71 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn reftable_small_blocks_write_ref_and_object_indexes() {
+        let commit = oid("24b24cf8a829f5b8c30dfc018b0a459a2ccaf380");
+        let mut refs = vec![
+            ReftableRefRecord {
+                name: "HEAD".into(),
+                update_index: 8,
+                value: ReftableRefValue::Symbolic("refs/heads/master".into()),
+            },
+            ReftableRefRecord {
+                name: "refs/heads/master".into(),
+                update_index: 8,
+                value: ReftableRefValue::Direct(commit),
+            },
+            ReftableRefRecord {
+                name: "refs/tags/initial".into(),
+                update_index: 8,
+                value: ReftableRefValue::Direct(commit),
+            },
+        ];
+        refs.extend((1..=5).map(|index| ReftableRefRecord {
+            name: format!("refs/heads/branch-{index}"),
+            update_index: 8,
+            value: ReftableRefValue::Direct(commit),
+        }));
+        let options = ReftableWriteOptions {
+            block_size: 100,
+            ..ReftableWriteOptions::default()
+        };
+        let bytes = Reftable::write_with_options(ObjectFormat::Sha1, 1, 8, &refs, &[], options)
+            .expect("small-block table should serialize");
+        let footer = parse_reftable_footer(&bytes, ReftableVersion::V1)
+            .expect("small-block footer should parse");
+        let table = Reftable::parse(&bytes).expect("small-block table should round-trip");
+
+        assert_eq!(table.refs.len(), refs.len());
+        assert_eq!(footer.ref_index_position, 400);
+        assert_eq!(footer.obj_position, 500);
+        assert_eq!(footer.obj_id_len, 2);
+        assert_eq!(bytes[24], b'r');
+        assert_eq!(bytes[100], b'r');
+        assert_eq!(bytes[200], b'r');
+        assert_eq!(bytes[300], b'r');
+        assert_eq!(bytes[400], b'i');
+        assert_eq!(bytes[500], b'o');
+
+        let without_objects = Reftable::write_with_options(
+            ObjectFormat::Sha1,
+            1,
+            8,
+            &refs,
+            &[],
+            ReftableWriteOptions {
+                index_objects: false,
+                ..options
+            },
+        )
+        .expect("object index can be disabled");
+        let footer = parse_reftable_footer(&without_objects, ReftableVersion::V1)
+            .expect("footer without object index should parse");
+        assert_eq!(footer.ref_index_position, 400);
+        assert_eq!(footer.obj_position, 0);
+        assert_eq!(footer.obj_id_len, 0);
     }
 
     #[test]
@@ -4410,6 +4816,7 @@ mod tests {
         let layout = RepositoryBootstrap::init(InitOptions {
             git_dir_override: None,
             core_worktree: None,
+            object_dir: None,
             worktree: repo.clone(),
             object_format: ObjectFormat::Sha1,
             object_format_explicit: false,
@@ -4442,6 +4849,7 @@ mod tests {
         let layout = RepositoryBootstrap::init(InitOptions {
             git_dir_override: None,
             core_worktree: None,
+            object_dir: None,
             worktree: worktree.clone(),
             object_format: ObjectFormat::Sha1,
             object_format_explicit: false,
@@ -4464,12 +4872,42 @@ mod tests {
     }
 
     #[test]
+    fn repository_bootstrap_initializes_an_external_object_directory() {
+        let root = unique_temp_dir("init-external-object-dir");
+        let repo = root.join("repo");
+        let object_dir = root.join("objects");
+        let layout = RepositoryBootstrap::init(InitOptions {
+            git_dir_override: None,
+            core_worktree: None,
+            object_dir: Some(object_dir.clone()),
+            worktree: repo,
+            object_format: ObjectFormat::Sha1,
+            object_format_explicit: false,
+            bare: false,
+            initial_branch: "main".into(),
+            template_dir: None,
+            copy_template_config: false,
+            separate_git_dir: None,
+            shared_repository: None,
+            ref_storage: RefStorageFormat::Files,
+            ref_storage_explicit: false,
+        })
+        .expect("init should succeed");
+
+        assert!(object_dir.join("info").is_dir());
+        assert!(object_dir.join("pack").is_dir());
+        assert!(!layout.git_dir.join("objects/pack").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn repository_bootstrap_reftable_writes_extension_and_table() {
         let root = unique_temp_dir("init-reftable");
         let repo = root.join("repo");
         let layout = RepositoryBootstrap::init(InitOptions {
             git_dir_override: None,
             core_worktree: None,
+            object_dir: None,
             worktree: repo,
             object_format: ObjectFormat::Sha1,
             object_format_explicit: false,
@@ -4498,12 +4936,41 @@ mod tests {
     }
 
     #[test]
+    fn init_config_preserves_an_existing_log_all_ref_updates_choice() {
+        let inherited = build_init_config(
+            ObjectFormat::Sha1,
+            false,
+            &None,
+            RefStorageFormat::Reftable,
+            None,
+            None,
+            true,
+        );
+        assert_eq!(inherited.get("core", None, "logAllRefUpdates"), None);
+
+        let defaulted = build_init_config(
+            ObjectFormat::Sha1,
+            false,
+            &None,
+            RefStorageFormat::Reftable,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(
+            defaulted.get("core", None, "logAllRefUpdates"),
+            Some("true")
+        );
+    }
+
+    #[test]
     fn repository_bootstrap_honors_shared_repository_config() {
         let root = unique_temp_dir("init-shared");
         let repo = root.join("repo");
         let layout = RepositoryBootstrap::init(InitOptions {
             git_dir_override: None,
             core_worktree: None,
+            object_dir: None,
             worktree: repo,
             object_format: ObjectFormat::Sha1,
             object_format_explicit: false,

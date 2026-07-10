@@ -10,16 +10,16 @@
 //! this module is therefore confined to the REPL and the byte-exact prompt /
 //! table formatting that the upstream t3701 oracle pins down.
 
+use sley::plumbing::sley_config;
 use std::env;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use sley::plumbing::{sley_config};
 
 use sley::GitConfig;
 use sley::{GitError, Result};
 
-use crate::{worktree_root_for_git_dir};
+use crate::worktree_root_for_git_dir;
 
 /// Resolve the path to the running sley binary so the engine can re-invoke
 /// data-producing subcommands (diff, add, reset, apply) the same way git

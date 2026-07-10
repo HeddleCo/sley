@@ -1,7 +1,7 @@
 //! Branch upstream (tracking) configuration.
 
 use super::config::{remove_branch_config, write_branch_repo_config};
-use super::operand::{branch_resolve_local_branch_operand, BranchOperandKind};
+use super::operand::{BranchOperandKind, branch_resolve_local_branch_operand};
 use crate::*;
 use sley::plumbing::{sley_refs, sley_rev};
 
@@ -57,7 +57,10 @@ pub(super) fn run_branch_upstream_options(
     }
 }
 
-pub(super) fn branch_upstream_resolve_previous_checkout(git_dir: &Path, upstream: &str) -> Result<String> {
+pub(super) fn branch_upstream_resolve_previous_checkout(
+    git_dir: &Path,
+    upstream: &str,
+) -> Result<String> {
     let Some(inner) = upstream
         .strip_prefix("@{-")
         .and_then(|value| value.strip_suffix('}'))

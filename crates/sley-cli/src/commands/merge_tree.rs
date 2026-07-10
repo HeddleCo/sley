@@ -21,7 +21,7 @@
 //! private ones), so every helper, type, and re-export visible at the crate root
 //! is in scope here without re-listing it.
 use crate::*;
-use sley::plumbing::{sley_config, sley_core, sley_rev};
+use sley::plumbing::{sley_config, sley_core, sley_rev, sley_worktree};
 
 /// Which top-level mode `git merge-tree` runs in. Selected explicitly via
 /// `--write-tree` / `--trivial-merge`, otherwise inferred from the positional
@@ -62,6 +62,10 @@ struct MergeTreeOptions {
     strategy_options: Vec<String>,
     /// Positional arguments (the branches / trees to merge).
     positionals: Vec<String>,
+    /// Whether the invocation explicitly used any option other than
+    /// `--trivial-merge`. Upstream rejects every such spelling in trivial mode,
+    /// including negated options and the explicit `--` separator.
+    trivial_incompatible_option: bool,
 }
 
 impl Default for MergeTreeOptions {
@@ -77,6 +81,7 @@ impl Default for MergeTreeOptions {
             merge_base: None,
             strategy_options: Vec::new(),
             positionals: Vec::new(),
+            trivial_incompatible_option: false,
         }
     }
 }
@@ -113,6 +118,7 @@ fn usage_error() -> GitError {
 /// `git merge-tree` entry point.
 pub(crate) fn cmd_merge_tree(args: &[String]) -> Result<()> {
     let options = parse_merge_tree_args(args)?;
+    reject_trivial_incompatible_options(&options)?;
     if options.stdin {
         return run_stdin_merges(&options);
     }
@@ -122,6 +128,14 @@ pub(crate) fn cmd_merge_tree(args: &[String]) -> Result<()> {
         MergeTreeMode::TrivialMerge => run_trivial_merge(&options),
         MergeTreeMode::Auto => Err(usage_error()),
     }
+}
+
+fn reject_trivial_incompatible_options(options: &MergeTreeOptions) -> Result<()> {
+    if options.mode == MergeTreeMode::TrivialMerge && options.trivial_incompatible_option {
+        eprintln!("fatal: --trivial-merge is incompatible with all other options");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
 }
 
 /// Parse the command-line arguments into a [`MergeTreeOptions`]. Mirrors upstream
@@ -137,41 +151,83 @@ fn parse_merge_tree_args(args: &[String]) -> Result<MergeTreeOptions> {
             continue;
         }
         match arg.as_str() {
-            "--" => positional_only = true,
+            "--" | "--end-of-options" => {
+                positional_only = true;
+                options.trivial_incompatible_option = true;
+            }
             "--write-tree" => options.mode = MergeTreeMode::RealMerge,
             "--trivial-merge" => options.mode = MergeTreeMode::TrivialMerge,
-            "-z" => options.nul = true,
-            "--name-only" => options.name_only = true,
-            "--messages" => options.messages = Some(true),
-            "--no-messages" => options.messages = Some(false),
-            "--quiet" => options.quiet = true,
-            "--no-quiet" => options.quiet = false,
-            "--allow-unrelated-histories" => options.allow_unrelated_histories = true,
-            "--no-allow-unrelated-histories" => options.allow_unrelated_histories = false,
-            "--stdin" => options.stdin = true,
+            "-z" => {
+                options.nul = true;
+                options.trivial_incompatible_option = true;
+            }
+            "--name-only" => {
+                options.name_only = true;
+                options.trivial_incompatible_option = true;
+            }
+            "--messages" => {
+                options.messages = Some(true);
+                options.trivial_incompatible_option = true;
+            }
+            "--no-messages" => {
+                options.messages = Some(false);
+                options.trivial_incompatible_option = true;
+            }
+            "--quiet" => {
+                options.quiet = true;
+                options.trivial_incompatible_option = true;
+            }
+            "--no-quiet" => {
+                options.quiet = false;
+                options.trivial_incompatible_option = true;
+            }
+            "--allow-unrelated-histories" => {
+                options.allow_unrelated_histories = true;
+                options.trivial_incompatible_option = true;
+            }
+            "--no-allow-unrelated-histories" => {
+                options.allow_unrelated_histories = false;
+                options.trivial_incompatible_option = true;
+            }
+            "--stdin" => {
+                options.stdin = true;
+                options.trivial_incompatible_option = true;
+            }
             "--merge-base" => {
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("merge-tree --merge-base requires a value".into())
                 })?;
                 options.merge_base = Some(value.clone());
+                options.trivial_incompatible_option = true;
             }
-            "--no-merge-base" => options.merge_base = None,
+            "--no-merge-base" => {
+                options.merge_base = None;
+                options.trivial_incompatible_option = true;
+            }
             "-X" | "--strategy-option" => {
                 let value = iter
                     .next()
                     .ok_or_else(|| GitError::Command("merge-tree -X requires a value".into()))?;
                 options.strategy_options.push(value.clone());
+                options.trivial_incompatible_option = true;
+            }
+            "--no-strategy-option" => {
+                options.strategy_options.clear();
+                options.trivial_incompatible_option = true;
             }
             value if value.starts_with("--merge-base=") => {
                 options.merge_base = value.strip_prefix("--merge-base=").map(str::to_string);
+                options.trivial_incompatible_option = true;
             }
             value if value.starts_with("--strategy-option=") => {
                 if let Some(value) = value.strip_prefix("--strategy-option=") {
                     options.strategy_options.push(value.to_string());
                 }
+                options.trivial_incompatible_option = true;
             }
             value if value.starts_with("-X") && value.len() > 2 => {
                 options.strategy_options.push(value[2..].to_string());
+                options.trivial_incompatible_option = true;
             }
             value if value.starts_with('-') && value != "-" => {
                 if let Some(name) = value.strip_prefix("--") {
@@ -252,6 +308,11 @@ struct ConflictedStage {
 /// the default, newline-separated section) and the machine-stable `-z` form
 /// (a path list, a stable conflict-type token, and the human message).
 struct InfoMessage {
+    /// Path used by merge-ort to sort this message. This is not always the
+    /// first path in the machine-readable payload (notably rename/rename).
+    sort_path: Vec<u8>,
+    /// Stable order for multiple notices at the same logical path.
+    order: u8,
     /// Paths/branches involved (used only in `-z` output).
     paths: Vec<Vec<u8>>,
     /// Stable short type, e.g. `Auto-merging` or `CONFLICT (contents)`.
@@ -365,7 +426,7 @@ fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
     let cwd = env::current_dir()?;
     let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let db = crate::repository::open_object_database(&git_dir, format)?;
 
     let branch1 = &options.positionals[0];
     let branch2 = &options.positionals[1];
@@ -405,8 +466,49 @@ fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
 
     let strategy = parse_strategy_favor(&options.strategy_options)?;
     let detect_renames = merge_tree_detect_renames(&git_dir);
+    let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
+    let explicit_attr_source = global_attr_source().or_else(|| env::var("GIT_ATTR_SOURCE").ok());
+    let attr_source_tree = explicit_attr_source
+        .as_deref()
+        .map(|source| resolve_tree_ish(&git_dir, &db, format, source))
+        .transpose()?;
+    let worktree_attributes = if attr_source_tree.is_none() {
+        worktree_root
+            .as_ref()
+            .and_then(|root| sley_worktree::StandardAttributeMatcher::from_worktree_root(root).ok())
+    } else {
+        None
+    };
+    let path_favor = |path: &[u8]| match merge_tree_merge_attribute(
+        path,
+        attr_source_tree.as_ref(),
+        worktree_attributes.as_ref(),
+        worktree_root.as_deref(),
+        &git_dir,
+        &db,
+        format,
+    ) {
+        Some(sley_worktree::AttributeState::Value(value)) if value == b"union" => {
+            sley_diff_merge::MergeFavor::Union
+        }
+        _ => sley_diff_merge::MergeFavor::None,
+    };
+    let path_is_binary = |path: &[u8]| {
+        matches!(
+            merge_tree_merge_attribute(
+                path,
+                attr_source_tree.as_ref(),
+                worktree_attributes.as_ref(),
+                worktree_root.as_deref(),
+                &git_dir,
+                &db,
+                format,
+            ),
+            Some(sley_worktree::AttributeState::Unset)
+        )
+    };
     ensure_merge_tree_inputs_readable(&db, format, base_tree.as_ref(), &ours_tree, &theirs_tree)?;
-    let mut write_db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let mut write_db = db.clone();
     let merge = match sley_diff_merge::merge_trees(
         &mut write_db,
         format,
@@ -418,8 +520,9 @@ fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
             theirs_label: branch2,
             ancestor_label: "merged common ancestors",
             favor: strategy,
-            path_favor: None,
+            path_favor: Some(&path_favor),
             path_marker_size: None,
+            path_is_binary: Some(&path_is_binary),
             detect_renames,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             rename_limit: 0,
@@ -432,6 +535,28 @@ fn compute_real_merge(options: &MergeTreeOptions) -> Result<MergeOutcome> {
         Err(err) => return Err(merge_tree_merge_error(err)),
     };
     Ok(render_merge_outcome(&merge, branch1, branch2))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_tree_merge_attribute(
+    path: &[u8],
+    attr_source_tree: Option<&ObjectId>,
+    worktree_attributes: Option<&sley_worktree::StandardAttributeMatcher>,
+    worktree_root: Option<&Path>,
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Option<sley_worktree::AttributeState> {
+    let requested = [b"merge".to_vec()];
+    let checks = if let (Some(tree), Some(root)) = (attr_source_tree, worktree_root) {
+        sley_worktree::standard_attributes_for_path_from_tree(
+            root, git_dir, db, format, tree, path, &requested, false,
+        )
+        .ok()?
+    } else {
+        worktree_attributes?.attributes_for_path(path, &requested, false)
+    };
+    checks.into_iter().next().and_then(|check| check.state)
 }
 
 fn ensure_merge_tree_inputs_readable(
@@ -549,6 +674,7 @@ fn stdin_record_options(
         merge_base: None,
         strategy_options: options.strategy_options.clone(),
         positionals: Vec::new(),
+        trivial_incompatible_option: false,
     };
 
     match tokens.as_slice() {
@@ -692,6 +818,8 @@ fn render_merge_outcome(
         let path = &entry.path;
         if entry.auto_merged {
             messages.push(InfoMessage {
+                sort_path: path.clone(),
+                order: 10,
                 paths: vec![path.clone()],
                 stable_type: "Auto-merging".to_string(),
                 message: format!("Auto-merging {}", String::from_utf8_lossy(path)),
@@ -704,6 +832,8 @@ fn render_merge_outcome(
             sley_diff_merge::MergeConflictKind::Content { add_add } => {
                 let conflict_kind = if *add_add { "add/add" } else { "content" };
                 messages.push(InfoMessage {
+                    sort_path: path.clone(),
+                    order: 20,
                     paths: vec![path.clone()],
                     stable_type: "CONFLICT (contents)".to_string(),
                     message: format!(
@@ -714,6 +844,8 @@ fn render_merge_outcome(
             }
             sley_diff_merge::MergeConflictKind::RenameContent { .. } => {
                 messages.push(InfoMessage {
+                    sort_path: path.clone(),
+                    order: 20,
                     paths: vec![path.clone()],
                     stable_type: "CONFLICT (contents)".to_string(),
                     message: format!(
@@ -727,6 +859,8 @@ fn render_merge_outcome(
                 theirs_path,
             } => {
                 messages.push(InfoMessage {
+                    sort_path: path.clone(),
+                    order: 20,
                     paths: vec![ours_path.clone(), theirs_path.clone(), path.clone()],
                     stable_type: "CONFLICT (rename/rename)".to_string(),
                     message: format!(
@@ -745,6 +879,8 @@ fn render_merge_outcome(
                 theirs_label,
             } => {
                 messages.push(InfoMessage {
+                    sort_path: old_path.clone(),
+                    order: 20,
                     paths: vec![old_path.clone(), ours_path.clone(), theirs_path.clone()],
                     stable_type: "CONFLICT (rename/rename)".to_string(),
                     message: format!(
@@ -758,6 +894,8 @@ fn render_merge_outcome(
             sley_diff_merge::MergeConflictKind::RenameRenameOneToTwoStage => {}
             sley_diff_merge::MergeConflictKind::DirRenameSplit { source_dir } => {
                 messages.push(InfoMessage {
+                    sort_path: source_dir.clone(),
+                    order: 20,
                     paths: vec![source_dir.clone()],
                     stable_type: "CONFLICT (directory rename split)".to_string(),
                     message: format!(
@@ -771,6 +909,8 @@ fn render_merge_outcome(
                 modified_in,
             } => {
                 messages.push(InfoMessage {
+                    sort_path: path.clone(),
+                    order: 20,
                     paths: vec![path.clone()],
                     stable_type: "CONFLICT (modify/delete)".to_string(),
                     message: format!(
@@ -785,7 +925,9 @@ fn render_merge_outcome(
                 deleted_in,
             } => {
                 messages.push(InfoMessage {
-                    paths: vec![old_path.clone(), path.clone()],
+                    sort_path: path.clone(),
+                    order: 20,
+                    paths: vec![path.clone(), old_path.clone()],
                     stable_type: "CONFLICT (rename/delete)".to_string(),
                     message: format!(
                         "CONFLICT (rename/delete): {old} renamed to {new} in {renamed_in}, but deleted in {deleted_in}.",
@@ -799,7 +941,9 @@ fn render_merge_outcome(
                 moved_from,
             } => {
                 messages.push(InfoMessage {
-                    paths: vec![original_path.clone(), path.clone()],
+                    sort_path: path.clone(),
+                    order: 20,
+                    paths: vec![path.clone(), original_path.clone()],
                     stable_type: "CONFLICT (file/directory)".to_string(),
                     message: format!(
                         "CONFLICT (file/directory): directory in the way of {old} from {moved_from}; moving it to {new} instead.",
@@ -828,8 +972,10 @@ fn render_merge_outcome(
                     ),
                 };
                 messages.push(InfoMessage {
-                    paths: vec![old_path.clone(), path.clone()],
-                    stable_type: "CONFLICT (file location)".to_string(),
+                    sort_path: path.clone(),
+                    order: 0,
+                    paths: vec![path.clone(), old_path.clone()],
+                    stable_type: "CONFLICT (directory rename suggested)".to_string(),
                     message,
                 });
             }
@@ -840,6 +986,8 @@ fn render_merge_outcome(
                     .collect::<Vec<_>>()
                     .join(", ");
                 messages.push(InfoMessage {
+                    sort_path: path.clone(),
+                    order: 20,
                     paths: vec![path.clone()],
                     stable_type: "CONFLICT (implicit dir rename)".to_string(),
                     message: format!(
@@ -859,6 +1007,8 @@ fn render_merge_outcome(
                 let renamed_both = ours_renamed.is_some() && theirs_renamed.is_some();
                 let which = if renamed_both { "both" } else { "one" };
                 messages.push(InfoMessage {
+                    sort_path: original_path.clone(),
+                    order: 20,
                     paths: msg_paths,
                     // Upstream's `type_short_descriptions[CONFLICT_DISTINCT_MODES]`
                     // is "CONFLICT (distinct modes)" even though the human line
@@ -874,6 +1024,92 @@ fn render_merge_outcome(
         }
         push_conflicted_stages(&mut conflicted, path, &entry.stages);
     }
+    for event in &merge.info_messages {
+        match event {
+            sley_diff_merge::MergeInfoMessage::AutoMerge { path } => {
+                messages.push(InfoMessage {
+                    sort_path: path.clone(),
+                    order: 10,
+                    paths: vec![path.clone()],
+                    stable_type: "Auto-merging".to_string(),
+                    message: format!("Auto-merging {}", String::from_utf8_lossy(path)),
+                });
+            }
+            sley_diff_merge::MergeInfoMessage::DirRenameLocationConflict {
+                old_path,
+                new_path,
+                renamed_from,
+                added_in,
+                dir_renamed_in,
+            } => {
+                let message = match renamed_from {
+                    Some(source) => format!(
+                        "CONFLICT (file location): {source} renamed to {old} in {added_in}, inside a directory that was renamed in {dir_renamed_in}, suggesting it should perhaps be moved to {new}.",
+                        source = String::from_utf8_lossy(source),
+                        old = String::from_utf8_lossy(old_path),
+                        new = String::from_utf8_lossy(new_path),
+                    ),
+                    None => format!(
+                        "CONFLICT (file location): {old} added in {added_in} inside a directory that was renamed in {dir_renamed_in}, suggesting it should perhaps be moved to {new}.",
+                        old = String::from_utf8_lossy(old_path),
+                        new = String::from_utf8_lossy(new_path),
+                    ),
+                };
+                messages.push(InfoMessage {
+                    sort_path: new_path.clone(),
+                    order: 0,
+                    paths: vec![new_path.clone(), old_path.clone()],
+                    stable_type: "CONFLICT (directory rename suggested)".to_string(),
+                    message,
+                });
+            }
+            sley_diff_merge::MergeInfoMessage::RenameDeleteConflict {
+                old_path,
+                new_path,
+                renamed_in,
+                deleted_in,
+            } => {
+                messages.push(InfoMessage {
+                    sort_path: new_path.clone(),
+                    order: 1,
+                    paths: vec![new_path.clone(), old_path.clone()],
+                    stable_type: "CONFLICT (rename/delete)".to_string(),
+                    message: format!(
+                        "CONFLICT (rename/delete): {old} renamed to {new} in {renamed_in}, but deleted in {deleted_in}.",
+                        old = String::from_utf8_lossy(old_path),
+                        new = String::from_utf8_lossy(new_path),
+                    ),
+                });
+            }
+            sley_diff_merge::MergeInfoMessage::ModifyDeleteConflict {
+                path,
+                deleted_in,
+                modified_in,
+            } => {
+                messages.push(InfoMessage {
+                    sort_path: path.clone(),
+                    order: 30,
+                    paths: vec![path.clone()],
+                    stable_type: "CONFLICT (modify/delete)".to_string(),
+                    message: format!(
+                        "CONFLICT (modify/delete): {path} deleted in {deleted_in} and modified in {modified_in}.  Version {modified_in} of {path} left in tree.",
+                        path = String::from_utf8_lossy(path),
+                    ),
+                });
+            }
+            // These are merge-porcelain progress messages, not merge-tree's
+            // structured conflict records. The directory-location conflict
+            // variant above carries the merge-tree-applicable form.
+            sley_diff_merge::MergeInfoMessage::DirRenameSkippedDueToRerename { .. }
+            | sley_diff_merge::MergeInfoMessage::DirRenameApplied { .. } => {}
+        }
+    }
+    messages.sort_by(|left, right| {
+        left.sort_path
+            .cmp(&right.sort_path)
+            .then_with(|| left.order.cmp(&right.order))
+            .then_with(|| left.paths.cmp(&right.paths))
+    });
     let _ = (ours_label, theirs_label);
 
     conflicted.sort_by(|left, right| {
@@ -1028,7 +1264,7 @@ fn run_trivial_merge(options: &MergeTreeOptions) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let db = crate::repository::open_object_database(&git_dir, format)?;
 
     let base_tree = resolve_tree_ish(&git_dir, &db, format, &options.positionals[0])?;
     let ours_tree = resolve_tree_ish(&git_dir, &db, format, &options.positionals[1])?;
@@ -1042,6 +1278,8 @@ fn run_trivial_merge(options: &MergeTreeOptions) -> Result<()> {
     all_paths.extend(base_map.keys().cloned());
     all_paths.extend(ours_map.keys().cloned());
     all_paths.extend(theirs_map.keys().cloned());
+    let mut all_paths: Vec<Vec<u8>> = all_paths.into_iter().collect();
+    all_paths.sort_by(|left, right| trivial_path_cmp(left, right));
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -1063,6 +1301,22 @@ fn run_trivial_merge(options: &MergeTreeOptions) -> Result<()> {
 
     out.flush()?;
     Ok(())
+}
+
+fn trivial_path_cmp(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    if right
+        .strip_prefix(left)
+        .is_some_and(|suffix| suffix.starts_with(b"/"))
+    {
+        return std::cmp::Ordering::Greater;
+    }
+    if left
+        .strip_prefix(right)
+        .is_some_and(|suffix| suffix.starts_with(b"/"))
+    {
+        return std::cmp::Ordering::Less;
+    }
+    left.cmp(right)
 }
 
 /// One stage line of a trivial-merge record.
@@ -1097,8 +1351,10 @@ fn emit_trivial_path(
     }
 
     // The diff is from ours (branch1) to the merged result.
-    let ours_bytes = blob_bytes(db, ours)?;
-    write_unified_hunks(out, &ours_bytes, &result_bytes)?;
+    if let Some(result_bytes) = result_bytes {
+        let ours_bytes = blob_bytes(db, ours)?;
+        write_unified_hunks(out, &ours_bytes, &result_bytes)?;
+    }
     Ok(())
 }
 
@@ -1111,7 +1367,7 @@ fn trivial_resolution(
     base: &TrivialEntry,
     ours: &TrivialEntry,
     theirs: &TrivialEntry,
-) -> Result<(&'static str, Vec<TrivialStageLine>, Vec<u8>)> {
+) -> Result<(&'static str, Vec<TrivialStageLine>, Option<Vec<u8>>)> {
     // Helper to build a stage line from a present entry.
     let line = |label: &'static str, entry: &TrivialEntry| -> Option<TrivialStageLine> {
         entry.as_ref().map(|(mode, oid)| TrivialStageLine {
@@ -1128,12 +1384,16 @@ fn trivial_resolution(
                 .into_iter()
                 .flatten()
                 .collect();
-            Ok(("removed in remote", lines, Vec::new()))
+            Ok(("removed in remote", lines, Some(Vec::new())))
         }
         // Added only on the remote side: result is their version.
         (None, None, Some((_, their_oid))) => {
             let lines = [line("their", theirs)].into_iter().flatten().collect();
-            Ok(("added in remote", lines, merge_read_blob(db, their_oid)?))
+            Ok((
+                "added in remote",
+                lines,
+                Some(merge_read_blob(db, their_oid)?),
+            ))
         }
         // Both sides added the file (with differing content): a content merge with
         // `.our` / `.their` markers.
@@ -1143,7 +1403,7 @@ fn trivial_resolution(
                 .into_iter()
                 .flatten()
                 .collect();
-            Ok(("added in both", lines, result))
+            Ok(("added in both", lines, Some(result)))
         }
         (Some((_, base_oid)), our_entry, their_entry) => {
             let base_bytes = merge_read_blob(db, base_oid)?;
@@ -1164,7 +1424,7 @@ fn trivial_resolution(
                             oid: *their_oid,
                         }),
                     ];
-                    Ok(("merged", lines, their_bytes))
+                    Ok(("merged", lines, Some(their_bytes)))
                 }
                 // Changed on both sides: a content merge with `.our` / `.their`.
                 (Some(_), Some(_)) => {
@@ -1173,25 +1433,24 @@ fn trivial_resolution(
                         .into_iter()
                         .flatten()
                         .collect();
-                    Ok(("changed in both", lines, result))
+                    Ok(("changed in both", lines, Some(result)))
                 }
                 // Removed locally but changed remotely.
                 (None, Some(_)) => {
-                    let result = trivial_content_merge(db, &base_bytes, &None, theirs)?;
                     let lines = [line("base", base), line("their", theirs)]
                         .into_iter()
                         .flatten()
                         .collect();
-                    Ok(("removed in local", lines, result))
+                    Ok(("removed in local", lines, None))
                 }
                 // Any remaining shape resolves to ours and is filtered out before
                 // reaching here; emit nothing meaningful.
-                _ => Ok(("merged", Vec::new(), blob_bytes(db, ours)?)),
+                _ => Ok(("merged", Vec::new(), Some(blob_bytes(db, ours)?))),
             }
         }
         // Cases that resolve to `ours` (added locally only, or no entry at all)
         // are filtered out before reaching here.
-        _ => Ok(("merged", Vec::new(), blob_bytes(db, ours)?)),
+        _ => Ok(("merged", Vec::new(), Some(blob_bytes(db, ours)?))),
     }
 }
 

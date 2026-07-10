@@ -15,9 +15,9 @@
 //! `write_diff_stat`, etc.). This keeps every output mode byte-identical with
 //! `git diff` for the formats both commands share.
 
+use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_rev};
 use std::io::{self, Write};
 use std::path::Path;
-use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_rev};
 
 use sley::{GitError, ObjectFormat, ObjectId, Result};
 
@@ -330,10 +330,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     let entries = if cached {
         if inexact_renames {
             sley_diff_merge::diff_name_status_tree_index_with_options(
-                git_dir,
-                format,
-                &tree_oid,
-                options,
+                git_dir, format, &tree_oid, options,
             )?
         } else {
             sley_diff_merge::diff_name_status_tree_index_with_options(
@@ -642,6 +639,7 @@ fn render(
         for entry in entries {
             let options = DiffRenderOptions {
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                suppress_blank_empty: false,
                 binary: false,
                 anchors: &[],
                 allow_textconv: false,

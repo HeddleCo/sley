@@ -2,24 +2,25 @@
 //! apply the same worktree-to-blob conversions that Git uses for path-aware
 //! hashing.
 
-use std::env;
+use sley::plumbing::sley_worktree;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use sley::plumbing::{sley_worktree};
 
 use sley::GitConfig;
-use sley::{GitError, ObjectFormat, Result};
 use sley::plumbing::sley_object::ObjectType;
-use sley::plumbing::sley_odb::LooseObjectStore;
+use sley::{GitError, ObjectFormat, Repository, Result};
 
 use super::args::{
     GitArgCursor, LongOption, Terminator, option_takes_no_value, switch_requires_value, usage_error,
 };
 use crate::*;
 
-pub(crate) fn cmd_hash_object(args: &[String]) -> Result<()> {
-    HashObjectInvocation::parse(args)?.execute()
+pub(crate) fn cmd_hash_object(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    HashObjectInvocation::parse(args)?.execute(cli_session)
 }
 
 struct HashObjectInvocation {
@@ -260,28 +261,33 @@ impl HashObjectInvocation {
         Ok(())
     }
 
-    fn execute(mut self) -> Result<()> {
+    fn execute(mut self, cli_session: &crate::session::CliSession) -> Result<()> {
         if !self.read_stdin && !self.read_stdin_paths && self.paths.is_empty() {
             return Ok(());
         }
-        let cwd = env::current_dir()?;
-        let repo_git_dir = crate::session::cli_git_dir_from(&cwd).ok();
+        let cwd = cli_session.cwd().to_path_buf();
+        // Repository discovery belongs to the invocation session. Once open,
+        // the embeddable facade is the source of repository layout, format,
+        // and object-store state for the rest of this command.
+        let repository = cli_session.open_repository().ok();
+        let repo_git_dir = repository.as_ref().map(sley::Repository::git_dir);
         let _big_file_threshold = core_big_file_threshold(repo_git_dir.as_deref())?;
-        let mut store = None;
-        if self.write {
-            let git_dir = repo_git_dir
+        let store = if self.write {
+            let repository = repository
                 .as_ref()
                 .ok_or_else(|| GitError::repository_not_found("not a git repository"))?;
-            let repo_format = repository_object_format(git_dir)?;
             if !self.explicit_format {
-                self.format = repo_format;
+                self.format = repository.object_format();
             }
-            store = Some(LooseObjectStore::from_git_dir(git_dir, self.format));
+            Some(repository)
         } else if !self.explicit_format
-            && let Some(git_dir) = repo_git_dir.as_ref()
+            && let Some(repository) = repository.as_ref()
         {
-            self.format = repository_object_format(git_dir)?;
-        }
+            self.format = repository.object_format();
+            None
+        } else {
+            None
+        };
         // Caching the worktree `.gitattributes` chain pays for itself whenever
         // more than one path is hashed in this process — `--stdin-paths` (many,
         // count unknown up front) OR multiple positional paths. Gating only on
@@ -304,7 +310,7 @@ impl HashObjectInvocation {
                 &cwd,
                 None,
                 filter_context.as_ref(),
-                store.as_mut(),
+                store,
                 &mut stdout,
             )?;
         }
@@ -325,7 +331,7 @@ impl HashObjectInvocation {
                         &cwd,
                         Some(path),
                         filter_context.as_ref(),
-                        store.as_mut(),
+                        store,
                         stdout,
                     )?;
                     Ok(())
@@ -339,7 +345,7 @@ impl HashObjectInvocation {
                 &cwd,
                 Some(path),
                 filter_context.as_ref(),
-                store.as_mut(),
+                store,
                 &mut stdout,
             )?;
         }
@@ -352,7 +358,7 @@ impl HashObjectInvocation {
         cwd: &Path,
         source_path: Option<&Path>,
         filter_context: Option<&HashObjectFilterContext>,
-        store: Option<&mut LooseObjectStore>,
+        store: Option<&Repository>,
         stdout: &mut dyn Write,
     ) -> Result<()> {
         let body = self.filters.apply(body, cwd, source_path, filter_context)?;
@@ -570,15 +576,15 @@ fn print_hash_object(
     format: ObjectFormat,
     body: Vec<u8>,
     literally: bool,
-    store: Option<&mut LooseObjectStore>,
+    store: Option<&Repository>,
     stdout: &mut dyn Write,
 ) -> Result<()> {
     if !literally {
         super::hash_object_fsck::check_object(object_type, format, &body)?;
     }
     let object = sley_object::EncodedObject::new(object_type, body);
-    let oid = if let Some(store) = store {
-        store.write_object(object)?
+    let oid = if let Some(repository) = store {
+        repository.write_object(object)?
     } else {
         object.object_id(format)?
     };

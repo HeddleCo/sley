@@ -20,17 +20,6 @@ die() { printf 'run-upstream-tests-waves: %s\n' "$*" >&2; exit 1; }
 
 [ -x "$runner" ] || [ -f "$runner" ] || die "serial runner missing: $runner"
 
-DEFAULT_TESTS="
-t0001-init.sh
-t1006-cat-file.sh
-t1007-hash-object.sh
-t1300-config.sh
-t1500-rev-parse.sh
-t3000-ls-files-others.sh
-t3103-ls-tree-misc.sh
-t1401-symbolic-ref.sh
-"
-
 waves=${SLEY_UPSTREAM_WAVES:-${SLEY_TEST_WAVES:-4}}
 case $waves in
     *[!0-9]* | 0 | "") die "SLEY_UPSTREAM_WAVES must be a positive integer" ;;
@@ -42,7 +31,10 @@ esac
 
 selection=$*
 if [ -z "$selection" ]; then
-    selection=${SLEY_TESTS:-$DEFAULT_TESTS}
+    selection=${SLEY_TESTS:-curated}
+fi
+if [ "$selection" = "curated" ]; then
+    selection=$(sh "$runner" --list-curated) || die "curated manifest validation/listing failed"
 fi
 [ -n "$selection" ] || die "no upstream scripts selected"
 
@@ -50,10 +42,22 @@ report=${SLEY_REPORT:-$repo_root/crates/sley-testkit/upstream-report.txt}
 summary=${SLEY_SUMMARY:-${report%.txt}-summary.csv}
 history=${SLEY_HISTORY:-$repo_root/crates/sley-testkit/upstream-history.csv}
 timings=${SLEY_TIMINGS:-${summary%.csv}-timings.csv}
+cells=${SLEY_CELLS:-${summary%.csv}-cells.csv}
+details=${SLEY_DETAILS:-${summary%.csv}-details.csv}
+comparison=${SLEY_COMPARISON:-${summary%.csv}-comparison.csv}
+comparison_summary=${SLEY_COMPARISON_SUMMARY:-${comparison%.csv}-summary.csv}
 run_label=${SLEY_RUN_LABEL:-}
 if [ -z "$run_label" ]; then
     run_label=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date 2>/dev/null || printf 'unknown')
 fi
+
+# Artifact paths are frequently rooted in a fresh certification directory.
+# Create every parent before launching workers so a missing report directory
+# cannot start an expensive run whose merged outputs are impossible to write.
+for artifact in "$report" "$summary" "$history" "$timings" "$cells" "$details" "$comparison" "$comparison_summary"; do
+    artifact_parent=$(dirname -- "$artifact")
+    mkdir -p "$artifact_parent" || die "could not create artifact directory: $artifact_parent"
+done
 
 tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/sley-upstream-waves.XXXXXX") \
     || die "could not create temp wave root"
@@ -106,6 +110,12 @@ if [ ! -f "$history" ]; then
     printf 'label,script,command,result,ok,notok,total\n' > "$history"
 fi
 printf 'label,script,command,result,elapsed_ms,ok,notok,total,plan_total\n' > "$timings"
+printf 'target,script,cell,status,raw_result,directive,description\n' > "$cells"
+printf 'target,script,result,exit_code,pass,fail,todo,skip,total_cells,plan_total,abort,timeout,missing_cells,extra_cells\n' > "$details"
+if [ -n "${SLEY_ORACLE_CELLS:-}" ]; then
+    printf 'script,cell,oracle_status,sley_status,comparison\n' > "$comparison"
+    printf 'script,oracle_result,sley_result,oracle_cells,sley_cells,cell_vector,correctness,unexpected_sley_skips,missing_sley_cells,extra_sley_cells,performance_eligible,performance_comparison\n' > "$comparison_summary"
+fi
 
 active_waves=""
 i=1
@@ -114,13 +124,33 @@ while [ "$i" -le "$waves" ]; do
     if [ -n "$tests" ]; then
         active_waves="$active_waves $i"
         (
-            SLEY_TESTS="$tests" \
-            SLEY_REPORT="$tmp_root/wave-$i/report.txt" \
-            SLEY_SUMMARY="$tmp_root/wave-$i/summary.csv" \
-            SLEY_HISTORY="$tmp_root/wave-$i/history.csv" \
-            SLEY_TIMINGS="$tmp_root/wave-$i/timings.csv" \
-            SLEY_RUN_LABEL="$run_label-wave-$i" \
-            SLEY_TEST_TIMEOUT="$timeout_secs" \
+            export SLEY_TESTS="$tests"
+            export SLEY_REPORT="$tmp_root/wave-$i/report.txt"
+            export SLEY_SUMMARY="$tmp_root/wave-$i/summary.csv"
+            export SLEY_HISTORY="$tmp_root/wave-$i/history.csv"
+            export SLEY_TIMINGS="$tmp_root/wave-$i/timings.csv"
+            export SLEY_CELLS="$tmp_root/wave-$i/cells.csv"
+            export SLEY_DETAILS="$tmp_root/wave-$i/details.csv"
+            export SLEY_RUN_LABEL="$run_label-wave-$i"
+            export SLEY_TEST_TIMEOUT="$timeout_secs"
+            if [ -n "${SLEY_ORACLE_CELLS:-}" ]; then
+                awk -F, -v tests=" $tests " '
+                    FNR == 1 { print; next }
+                    {
+                        script = $2
+                        gsub(/^"|"$/, "", script)
+                        if (index(tests, " " script " ")) print
+                    }
+                ' "$SLEY_ORACLE_CELLS" > "$tmp_root/wave-$i/oracle-cells.csv"
+                export SLEY_ORACLE_CELLS="$tmp_root/wave-$i/oracle-cells.csv"
+                if [ -n "${SLEY_ORACLE_DETAILS:-}" ] && [ -f "$SLEY_ORACLE_DETAILS" ]; then
+                    awk -F, -v tests=" $tests " 'FNR == 1 || index(tests, " " $2 " ") { print }' \
+                        "$SLEY_ORACLE_DETAILS" > "$tmp_root/wave-$i/oracle-details.csv"
+                    export SLEY_ORACLE_DETAILS="$tmp_root/wave-$i/oracle-details.csv"
+                fi
+                export SLEY_COMPARISON="$tmp_root/wave-$i/comparison.csv"
+                export SLEY_COMPARISON_SUMMARY="$tmp_root/wave-$i/comparison-summary.csv"
+            fi
             sh "$runner"
         ) > "$tmp_root/wave-$i/stdout.txt" 2> "$tmp_root/wave-$i/stderr.txt" &
         printf '%s\n' "$!" > "$tmp_root/wave-$i/pid"
@@ -165,6 +195,18 @@ for i in $active_waves; do
     if [ -f "$tmp_root/wave-$i/timings.csv" ]; then
         tail -n +2 "$tmp_root/wave-$i/timings.csv" >> "$timings"
     fi
+    if [ -f "$tmp_root/wave-$i/cells.csv" ]; then
+        tail -n +2 "$tmp_root/wave-$i/cells.csv" >> "$cells"
+    fi
+    if [ -f "$tmp_root/wave-$i/details.csv" ]; then
+        tail -n +2 "$tmp_root/wave-$i/details.csv" >> "$details"
+    fi
+    if [ -f "$tmp_root/wave-$i/comparison.csv" ]; then
+        tail -n +2 "$tmp_root/wave-$i/comparison.csv" >> "$comparison"
+    fi
+    if [ -f "$tmp_root/wave-$i/comparison-summary.csv" ]; then
+        tail -n +2 "$tmp_root/wave-$i/comparison-summary.csv" >> "$comparison_summary"
+    fi
 done
 
 {
@@ -179,14 +221,16 @@ done
             ok += $4;
             notok += $5;
             if ($3 == "PASS") passed++;
+            else if ($3 == "SKIP") skipped++;
             else if ($3 == "TIMEOUT") timedout++;
+            else if ($3 == "ABORT") aborted++;
             else failed++;
         }
         END {
             total = ok + notok;
             pct = (total > 0) ? int((ok * 100) / total) : 0;
             printf "\nASSERTION SUMMARY: ok=%d fail=%d total=%d pass=%d%%\n", ok, notok, total, pct;
-            printf "SCRIPT SUMMARY: %d script(s): %d passed, %d failed, %d timed out.\n", scripts, passed, failed, timedout;
+            printf "SCRIPT SUMMARY: %d script(s): %d passed, %d skipped, %d failed, %d aborted, %d timed out.\n", scripts, passed, skipped, failed, aborted, timedout;
         }
     ' "$summary"
     printf 'WAVE SUMMARY: %s active wave(s), %s wave(s) returned non-zero.\n' \
@@ -198,8 +242,14 @@ log "Full merged report written to: $report"
 log "Merged machine-readable summary: $summary"
 log "Pass-rate history (appended): $history"
 log "Merged per-script timings: $timings"
+log "Merged exact TAP cells: $cells"
+log "Merged per-script classifications: $details"
+if [ -n "${SLEY_ORACLE_CELLS:-}" ]; then
+    log "Merged oracle/Sley cell comparison: $comparison"
+    log "Merged oracle/Sley comparison summary: $comparison_summary"
+fi
 
-if awk -F, 'NR > 1 && $3 != "PASS" { exit 1 }' "$summary"; then
+if awk -F, 'NR > 1 && $3 != "PASS" && $3 != "SKIP" { exit 1 }' "$summary"; then
     exit 0
 fi
 exit 1

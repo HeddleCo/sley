@@ -161,7 +161,7 @@ impl CacheEntry {
     }
 
     /// git's `o->df_conflict_entry`: the D/F-conflict sentinel placed into a
-    /// tree slot by [`unpack_trees`]. See [`CacheEntry::df_conflict`].
+    /// tree slot by [`unpack_trees`]. See `CacheEntry::df_conflict`.
     pub fn df_conflict_marker() -> Self {
         Self {
             mode: 0,
@@ -1019,7 +1019,7 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
     if merge_fn == MergeFn::ThreeWay && opts.head_idx == 1 && trees.len() >= 3 {
         effective.head_idx = trees.len() - 1;
     }
-    if merge_fn == MergeFn::ThreeWay && effective.head_idx + 1 >= trees.len() + 1 {
+    if merge_fn == MergeFn::ThreeWay && effective.head_idx + 1 > trees.len() {
         return Err(GitError::InvalidFormat(format!(
             "unpack_trees: invalid head_idx {} for {} tree(s)",
             effective.head_idx,

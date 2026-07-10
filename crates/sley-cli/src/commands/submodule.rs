@@ -10,8 +10,9 @@ mod submodule_options;
 use submodule_options::{
     setup_submodule_absorbgitdirs_options, setup_submodule_add_options,
     setup_submodule_deinit_options, setup_submodule_foreach_options, setup_submodule_init_options,
-    setup_submodule_set_branch_options, setup_submodule_set_url_options, setup_submodule_status_options,
-    setup_submodule_summary_options, setup_submodule_sync_options, setup_submodule_update_options,
+    setup_submodule_set_branch_options, setup_submodule_set_url_options,
+    setup_submodule_status_options, setup_submodule_summary_options, setup_submodule_sync_options,
+    setup_submodule_update_options,
 };
 
 pub(crate) fn cmd_submodule(args: &[String]) -> Result<()> {

@@ -1019,15 +1019,20 @@ fn unique_external_diff_temp_dir() -> Result<PathBuf> {
     ))
 }
 
-fn diff_should_use_implicit_no_index(path_args: &[String], explicit_paths: &[String]) -> bool {
+fn diff_should_use_implicit_no_index(
+    path_args: &[String],
+    explicit_paths: &[String],
+    outside_repository: bool,
+) -> bool {
     let total = path_args.len() + explicit_paths.len();
     if total != 2 {
         return false;
     }
-    path_args
-        .iter()
-        .chain(explicit_paths)
-        .any(|path| diff_arg_looks_outside_worktree(path))
+    outside_repository
+        || path_args
+            .iter()
+            .chain(explicit_paths)
+            .any(|path| diff_arg_looks_outside_worktree(path))
 }
 
 fn diff_arg_looks_outside_worktree(path: &str) -> bool {
@@ -1191,8 +1196,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         ));
     }
     let cwd = env::current_dir()?;
-    let implicit_no_index =
-        !no_index && diff_should_use_implicit_no_index(&path_args, &explicit_paths);
+    let outside_repository = crate::session::cli_git_dir_from(&cwd).is_err();
+    let implicit_no_index = !no_index
+        && diff_should_use_implicit_no_index(&path_args, &explicit_paths, outside_repository);
     if no_index || implicit_no_index {
         let mut paths = path_args;
         if head {
@@ -1211,6 +1217,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 raw_abbrev,
                 patch_abbrev,
                 patch_full_index,
+                patch_binary,
                 allow_external,
                 exit_code,
                 output: output.as_deref(),
@@ -1240,6 +1247,10 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     }
     let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let repo_config = read_repo_config(&git_dir).ok();
+    let suppress_blank_empty = repo_config
+        .as_ref()
+        .and_then(|config| config.get_bool("diff", None, "suppressblankempty"))
+        .unwrap_or(false);
     let resolved_context =
         sley_rev::diff_options::resolve_diff_context(context, repo_config.as_ref())?;
     let patch_context = if diff_patch_context_control {
@@ -1610,10 +1621,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         diff.entries
                     } else {
                         sley_diff_merge::diff_name_status_tree_index_with_options(
-                            &git_dir,
-                            format,
-                            tree,
-                            options,
+                            &git_dir, format, tree, options,
                         )?
                     }
                 } else {
@@ -1644,21 +1652,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 if inexact_renames {
                     let diff =
                         sley_diff_merge::diff_name_status_trees_with_options_and_diagnostics(
-                        &db,
-                        format,
-                        left,
-                        right,
-                        options,
-                    )?;
+                            &db, format, left, right, options,
+                        )?;
                     rename_limit_diagnostics = diff.rename_limit;
                     diff.entries
                 } else {
                     sley_diff_merge::diff_name_status_trees_with_options(
-                        &db,
-                        format,
-                        left,
-                        right,
-                        options,
+                        &db, format, left, right, options,
                     )?
                 }
             }
@@ -1670,20 +1670,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         }
     } else if cached {
         if inexact_renames {
-            let diff =
-                sley_diff_merge::diff_name_status_head_index_with_options_and_diagnostics(
-                    &git_dir,
-                    format,
-                    options,
-                )?;
+            let diff = sley_diff_merge::diff_name_status_head_index_with_options_and_diagnostics(
+                &git_dir, format, options,
+            )?;
             rename_limit_diagnostics = diff.rename_limit;
             diff.entries
         } else {
-            sley_diff_merge::diff_name_status_head_index_with_options(
-                &git_dir,
-                format,
-                options,
-            )?
+            sley_diff_merge::diff_name_status_head_index_with_options(&git_dir, format, options)?
         }
     } else if head {
         let head_tree = diff_peel_rev_tree(&git_dir, format, &db, "HEAD")?;
@@ -2139,16 +2132,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     prefix_already_written: false,
                 },
                 |entry| {
-                    let lookup_entry =
-                        diff_relative_lookup_entry(entry, &relative_lookup_entries);
+                    let lookup_entry = diff_relative_lookup_entry(entry, &relative_lookup_entries);
                     zero_all_worktree_oids
                         || (zero_worktree_oids
-                            && lookup_entry
-                                .new_oid
-                                .as_ref()
-                                .is_none_or(|oid| {
-                                    index_oids.get(&lookup_entry.path[..]) != Some(oid)
-                                }))
+                            && lookup_entry.new_oid.as_ref().is_none_or(|oid| {
+                                index_oids.get(&lookup_entry.path[..]) != Some(oid)
+                            }))
                 },
                 |stdout, entry| {
                     if cached_unmerged_paths.contains(entry.path.as_bytes()) {
@@ -2185,13 +2174,10 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         }
                         _ => None,
                     };
-                    let lookup_entry =
-                        diff_relative_lookup_entry(entry, &relative_lookup_entries);
+                    let lookup_entry = diff_relative_lookup_entry(entry, &relative_lookup_entries);
                     let relative_materialized = !relative_lookup_entries.is_empty();
                     let materialized_contents = if !is_gitlink_pair(lookup_entry)
-                        && (relative_materialized
-                            || use_worktree_old
-                            || worktree_clean.is_some())
+                        && (relative_materialized || use_worktree_old || worktree_clean.is_some())
                     {
                         Some((
                             diff_entry_old_content_for_diff(
@@ -2217,6 +2203,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         .map(|(old, new)| (old.as_deref(), new.as_deref()));
                     let options = DiffRenderOptions {
                         line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                        suppress_blank_empty,
                         binary: patch_binary,
                         db: &db,
                         worktree_root: worktree_root.as_deref(),
@@ -2283,16 +2270,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     prefix_already_written: false,
                 },
                 |entry| {
-                    let lookup_entry =
-                        diff_relative_lookup_entry(entry, &relative_lookup_entries);
+                    let lookup_entry = diff_relative_lookup_entry(entry, &relative_lookup_entries);
                     zero_all_worktree_oids
                         || (zero_worktree_oids
-                            && lookup_entry
-                                .new_oid
-                                .as_ref()
-                                .is_none_or(|oid| {
-                                    index_oids.get(&lookup_entry.path[..]) != Some(oid)
-                                }))
+                            && lookup_entry.new_oid.as_ref().is_none_or(|oid| {
+                                index_oids.get(&lookup_entry.path[..]) != Some(oid)
+                            }))
                 },
                 |_, _| Ok(()),
             )?;
@@ -2477,10 +2460,7 @@ fn write_diff_combined_three_tree(
     Ok(!out.is_empty())
 }
 
-fn diff_unmerged_index_paths(
-    git_dir: &Path,
-    format: ObjectFormat,
-) -> Result<BTreeSet<Vec<u8>>> {
+fn diff_unmerged_index_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet<Vec<u8>>> {
     let index_path = sley_worktree::repository_index_path(git_dir);
     if !index_path.exists() {
         return Ok(BTreeSet::new());
@@ -3194,6 +3174,7 @@ struct DiffNoIndexParams<'a> {
     raw_abbrev: Option<Option<usize>>,
     patch_abbrev: Option<usize>,
     patch_full_index: bool,
+    patch_binary: bool,
     allow_external: bool,
     exit_code: bool,
     output: Option<&'a str>,
@@ -3435,7 +3416,8 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
         for entry in &entries {
             let options = DiffRenderOptions {
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
-                binary: false,
+                suppress_blank_empty: false,
+                binary: params.patch_binary,
                 anchors: params.anchored,
                 allow_textconv: true,
                 db: &db,

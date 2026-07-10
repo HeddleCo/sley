@@ -136,6 +136,9 @@ pub struct PackBitmapIndex {
     pub type_bitmaps: PackBitmapTypeBitmaps,
     pub entries: Vec<PackBitmapEntry>,
     pub pseudo_merges: Vec<PackBitmapPseudoMerge>,
+    /// Whether the serialised bitmap carries the commit lookup-table
+    /// extension. The table itself is derived deterministically from entries.
+    pub lookup_table: bool,
     pub name_hash_cache: Option<Vec<u32>>,
 }
 
@@ -445,9 +448,9 @@ impl<'a> PackIndexView<'a> {
         for idx in 0..self.count {
             let oid_start = idx * hash_len;
             let oid_bytes = &oid_table[oid_start..oid_start + hash_len];
-            if idx > 0 && oid_bytes <= &oid_table[oid_start - hash_len..oid_start] {
+            if idx > 0 && oid_bytes < &oid_table[oid_start - hash_len..oid_start] {
                 return Err(GitError::InvalidFormat(
-                    "pack index object ids are not strictly ascending".into(),
+                    "pack index object ids are not sorted".into(),
                 ));
             }
             validate_pack_index_oid_fanout(idx, oid_bytes, &self.fanout)?;
@@ -475,9 +478,9 @@ impl<'a> PackIndexView<'a> {
             if idx > 0 {
                 let previous_oid_start = oid_start - entry_len;
                 let previous_oid = &entry_table[previous_oid_start..previous_oid_start + hash_len];
-                if previous_oid >= oid_bytes {
+                if previous_oid > oid_bytes {
                     return Err(GitError::InvalidFormat(
-                        "pack index object ids are not strictly sorted".into(),
+                        "pack index object ids are not sorted".into(),
                     ));
                 }
             }
@@ -671,6 +674,20 @@ impl PackIndex {
     }
 
     pub fn write_v2_for_pack(pack_bytes: &[u8], format: ObjectFormat) -> Result<PackIndexBuild> {
+        Self::write_v2_for_pack_with_base(pack_bytes, format, |_| Ok(None))
+    }
+
+    /// Validate and index a pack while resolving ref-deltas against an external
+    /// object source. This powers `index-pack --fix-thin`; self-contained packs
+    /// use [`Self::write_v2_for_pack`].
+    pub fn write_v2_for_pack_with_base<F>(
+        pack_bytes: &[u8],
+        format: ObjectFormat,
+        mut external_base: F,
+    ) -> Result<PackIndexBuild>
+    where
+        F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+    {
         let trailer_len = format.raw_len();
         if pack_bytes.len() < 12 + trailer_len {
             return Err(GitError::InvalidFormat("pack file too short".into()));
@@ -783,7 +800,7 @@ impl PackIndex {
             )));
         }
 
-        let resolved = resolve_pack_entries(parsed_entries, format, &mut |_| Ok(None))?;
+        let resolved = resolve_pack_entries(parsed_entries, format, &mut external_base)?;
         let entries = resolved
             .iter()
             .zip(raw_entries)
@@ -872,7 +889,11 @@ impl PackIndex {
         Self::parse_impl(bytes, format, false)
     }
 
-    pub(crate) fn parse_impl(bytes: &[u8], format: ObjectFormat, verify_checksum: bool) -> Result<Self> {
+    pub(crate) fn parse_impl(
+        bytes: &[u8],
+        format: ObjectFormat,
+        verify_checksum: bool,
+    ) -> Result<Self> {
         let hash_len = format.raw_len();
         if bytes.len() < 4 {
             return Err(GitError::InvalidFormat("pack index too short".into()));
@@ -951,12 +972,13 @@ impl PackIndex {
             let crc_start = crc_table.start + idx * 4;
             let offset_start = small_offset_table.start + idx * 4;
             let oid_bytes = &bytes[oid_start..oid_start + hash_len];
-            // Object ids must be strictly ascending: lookup binary-searches them,
-            // and the fanout must match the first byte. A malformed/forged index
-            // (e.g. from a received pack) would otherwise yield silent misses.
-            if idx > 0 && oid_bytes <= &bytes[oid_start - hash_len..oid_start] {
+            // Object ids must be non-decreasing: Git permits duplicate objects
+            // in an incoming pack, and represents every copy in the index. The
+            // fanout must still match the first byte so binary search cannot
+            // silently miss the duplicate run.
+            if idx > 0 && oid_bytes < &bytes[oid_start - hash_len..oid_start] {
                 return Err(GitError::InvalidFormat(
-                    "pack index object ids are not strictly ascending".into(),
+                    "pack index object ids are not sorted".into(),
                 ));
             }
             let expected_min = if oid_bytes[0] == 0 {
@@ -997,7 +1019,11 @@ impl PackIndex {
         })
     }
 
-    pub(crate) fn parse_v1_impl(bytes: &[u8], format: ObjectFormat, verify_checksum: bool) -> Result<Self> {
+    pub(crate) fn parse_v1_impl(
+        bytes: &[u8],
+        format: ObjectFormat,
+        verify_checksum: bool,
+    ) -> Result<Self> {
         let hash_len = format.raw_len();
         if bytes.len() < 256 * 4 + 2 * hash_len {
             return Err(GitError::InvalidFormat("pack index too short".into()));
@@ -1048,10 +1074,10 @@ impl PackIndex {
             let start = entry_table.start + idx * entry_len;
             let oid = ObjectId::from_raw(format, &bytes[start + 4..start + entry_len])?;
             if let Some(previous) = &previous_oid
-                && previous.as_bytes() >= oid.as_bytes()
+                && previous.as_bytes() > oid.as_bytes()
             {
                 return Err(GitError::InvalidFormat(
-                    "pack index object ids are not strictly sorted".into(),
+                    "pack index object ids are not sorted".into(),
                 ));
             }
             previous_oid = Some(oid);
@@ -1093,14 +1119,6 @@ impl PackIndex {
         }
         let mut entries = entries.iter().collect::<Vec<_>>();
         entries.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
-        for pair in entries.windows(2) {
-            if pair[0].oid.as_bytes() == pair[1].oid.as_bytes() {
-                return Err(GitError::InvalidFormat(format!(
-                    "pack index contains duplicate object id {}",
-                    pair[0].oid
-                )));
-            }
-        }
         let mut fanout = [0u32; 256];
         for entry in &entries {
             if entry.oid.format() != format {
@@ -1175,14 +1193,6 @@ impl PackIndex {
         }
         let mut entries = entries.iter().collect::<Vec<_>>();
         entries.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
-        for pair in entries.windows(2) {
-            if pair[0].oid.as_bytes() == pair[1].oid.as_bytes() {
-                return Err(GitError::InvalidFormat(format!(
-                    "pack index contains duplicate object id {}",
-                    pair[0].oid
-                )));
-            }
-        }
         let mut fanout = [0u32; 256];
         for entry in &entries {
             if entry.oid.format() != format {
@@ -1286,34 +1296,22 @@ impl PackReverseIndex {
             )));
         }
         if &bytes[..4] != b"RIDX" {
-            return Err(GitError::InvalidFormat(
-                "missing reverse index signature".into(),
-            ));
+            return Err(GitError::InvalidFormat("unknown signature".into()));
         }
         let version = u32_be(&bytes[4..8]);
         if version != 1 {
-            return Err(GitError::Unsupported(format!(
-                "reverse index version {version}"
+            return Err(GitError::InvalidFormat(format!(
+                "unsupported version {version}"
             )));
         }
         let hash_id = u32_be(&bytes[8..12]);
         if hash_id != hash_function_id(format) {
             return Err(GitError::InvalidFormat(format!(
-                "reverse index hash id {hash_id} does not match {}",
-                format.name()
+                "unsupported hash id {hash_id}"
             )));
         }
 
         let index_checksum_offset = bytes.len() - hash_len;
-        let actual_index_checksum =
-            sley_core::digest_bytes(format, &bytes[..index_checksum_offset])?;
-        let index_checksum = ObjectId::from_raw(format, &bytes[index_checksum_offset..])?;
-        if actual_index_checksum != index_checksum {
-            return Err(GitError::InvalidFormat(format!(
-                "reverse index checksum mismatch: expected {index_checksum}, got {actual_index_checksum}"
-            )));
-        }
-
         let pack_checksum_offset = index_checksum_offset - hash_len;
         let pack_checksum =
             ObjectId::from_raw(format, &bytes[pack_checksum_offset..index_checksum_offset])?;
@@ -1325,6 +1323,15 @@ impl PackReverseIndex {
             offset += 4;
         }
         validate_position_permutation(&positions)?;
+
+        // Structural validation intentionally precedes the checksum: fsck
+        // reports a corrupted table row as an invalid rev-index position.
+        let actual_index_checksum =
+            sley_core::digest_bytes(format, &bytes[..index_checksum_offset])?;
+        let index_checksum = ObjectId::from_raw(format, &bytes[index_checksum_offset..])?;
+        if actual_index_checksum != index_checksum {
+            return Err(GitError::InvalidFormat("invalid checksum".into()));
+        }
 
         Ok(Self {
             version,
@@ -1455,6 +1462,7 @@ impl PackMtimes {
 impl PackBitmapIndex {
     pub const OPTION_FULL_DAG: u16 = 0x0001;
     pub const OPTION_HASH_CACHE: u16 = 0x0004;
+    pub const OPTION_LOOKUP_TABLE: u16 = 0x0010;
     pub const OPTION_PSEUDO_MERGES: u16 = 0x0020;
 
     pub fn parse(bytes: &[u8], format: ObjectFormat, object_count: usize) -> Result<Self> {
@@ -1477,8 +1485,10 @@ impl PackBitmapIndex {
             )));
         }
         let options = u16_be(&bytes[6..8]);
-        let known_options =
-            Self::OPTION_FULL_DAG | Self::OPTION_HASH_CACHE | Self::OPTION_PSEUDO_MERGES;
+        let known_options = Self::OPTION_FULL_DAG
+            | Self::OPTION_HASH_CACHE
+            | Self::OPTION_LOOKUP_TABLE
+            | Self::OPTION_PSEUDO_MERGES;
         if options & !known_options != 0 {
             return Err(GitError::Unsupported(format!(
                 "bitmap index options {:#06x}",
@@ -1487,13 +1497,7 @@ impl PackBitmapIndex {
         }
         let entry_count = u32_be(&bytes[8..12]) as usize;
         let checksum_offset = bytes.len() - hash_len;
-        let actual_index_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
         let index_checksum = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
-        if actual_index_checksum != index_checksum {
-            return Err(GitError::InvalidFormat(format!(
-                "bitmap index checksum mismatch: expected {index_checksum}, got {actual_index_checksum}"
-            )));
-        }
         let mut extras_end = checksum_offset;
         let hash_cache_range = if options & Self::OPTION_HASH_CACHE != 0 {
             let cache_len = object_count
@@ -1506,6 +1510,21 @@ impl PackBitmapIndex {
             }
             extras_end -= cache_len;
             Some(extras_end..extras_end + cache_len)
+        } else {
+            None
+        };
+        let lookup_table = options & Self::OPTION_LOOKUP_TABLE != 0;
+        let lookup_table_range = if lookup_table {
+            let table_len = entry_count
+                .checked_mul(16)
+                .ok_or_else(|| GitError::InvalidFormat("bitmap lookup table overflow".into()))?;
+            if table_len > extras_end {
+                return Err(GitError::InvalidFormat(
+                    "truncated bitmap lookup table".into(),
+                ));
+            }
+            extras_end -= table_len;
+            Some(extras_end..extras_end + table_len)
         } else {
             None
         };
@@ -1597,6 +1616,28 @@ impl PackBitmapIndex {
         } else {
             None
         };
+        if let Some(range) = lookup_table_range {
+            for row in bytes[range].chunks_exact(16) {
+                let commit_position = u32_be(&row[..4]);
+                let entry_offset = u64_be(&row[4..12]);
+                let xor_row = u32_be(&row[12..16]);
+                if commit_position as usize >= object_count
+                    || entry_offset as usize >= entries_end
+                    || (xor_row != u32::MAX && xor_row as usize >= entry_count)
+                {
+                    return Err(GitError::InvalidFormat(
+                        "corrupt bitmap lookup table".into(),
+                    ));
+                }
+            }
+        }
+
+        let actual_index_checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])?;
+        if actual_index_checksum != index_checksum {
+            return Err(GitError::InvalidFormat(format!(
+                "bitmap index checksum mismatch: expected {index_checksum}, got {actual_index_checksum}"
+            )));
+        }
 
         Ok(Self {
             version,
@@ -1612,6 +1653,7 @@ impl PackBitmapIndex {
             },
             entries,
             pseudo_merges,
+            lookup_table,
             name_hash_cache,
         })
     }
@@ -1931,7 +1973,11 @@ impl MultiPackIndex {
         Self::parse_impl(bytes, format, false)
     }
 
-    pub(crate) fn parse_impl(bytes: &[u8], format: ObjectFormat, verify_checksum: bool) -> Result<Self> {
+    pub(crate) fn parse_impl(
+        bytes: &[u8],
+        format: ObjectFormat,
+        verify_checksum: bool,
+    ) -> Result<Self> {
         let hash_len = format.raw_len();
         if bytes.len() < 12 + 12 + hash_len {
             return Err(GitError::InvalidFormat(
@@ -2490,7 +2536,11 @@ pub(crate) fn read_pack_index_fanout(bytes: &[u8], offset: &mut usize) -> Result
     Ok(fanout)
 }
 
-pub(crate) fn validate_pack_index_oid_fanout(idx: usize, oid_bytes: &[u8], fanout: &[u32; 256]) -> Result<()> {
+pub(crate) fn validate_pack_index_oid_fanout(
+    idx: usize,
+    oid_bytes: &[u8],
+    fanout: &[u32; 256],
+) -> Result<()> {
     let expected_min = if oid_bytes[0] == 0 {
         0
     } else {

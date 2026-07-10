@@ -2,8 +2,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use super::config::{
-    read_repo_config, read_repo_config_on_disk, remote_exists, remote_names,
-    validate_remote_name, write_repo_config,
+    read_repo_config, read_repo_config_on_disk, remote_exists, remote_names, validate_remote_name,
+    write_repo_config,
 };
 use super::fetch::cmd_fetch;
 use super::resolve::{local_remote_git_dir, ls_remote_git_dir};
@@ -1858,7 +1858,11 @@ pub(super) fn remote_branch_fetch_refspec(remote: &str, branch: &str) -> String 
     format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}")
 }
 
-pub(super) fn remote_add_fetch_refspec(remote: &str, branch: &str, mirror: RemoteAddMirror) -> String {
+pub(super) fn remote_add_fetch_refspec(
+    remote: &str,
+    branch: &str,
+    mirror: RemoteAddMirror,
+) -> String {
     if matches!(mirror, RemoteAddMirror::Fetch | RemoteAddMirror::Both) {
         if branch == "*" {
             "+refs/*:refs/*".to_string()

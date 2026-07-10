@@ -16,6 +16,7 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
     let mut force = false;
     let mut dry_run = false;
     let mut ignore_unmatch = false;
+    let mut sparse = false;
     let mut parsing_options = true;
     let mut pathspec_from_file: Option<PathBuf> = None;
     let mut pathspec_file_nul = false;
@@ -44,7 +45,8 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
             "--no-cached" => cached = false,
             "--ignore-unmatch" => ignore_unmatch = true,
             "--no-ignore-unmatch" => ignore_unmatch = false,
-            "--sparse" | "--no-sparse" => {}
+            "--sparse" => sparse = true,
+            "--no-sparse" => sparse = false,
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
             "--pathspec-from-file" => {
@@ -150,6 +152,7 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
             force,
             dry_run,
             ignore_unmatch,
+            sparse,
         },
         config_parameters_env.as_deref(),
     )?;

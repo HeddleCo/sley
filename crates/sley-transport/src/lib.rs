@@ -9,10 +9,10 @@ use std::io::{Read, Write};
 pub mod credential;
 
 pub use credential::{
-    cmd_credential_cache, cmd_credential_cache_daemon, cmd_credential_store,
-    credential_announce_capabilities, credential_approve, credential_fill, credential_next_state,
-    credential_read, credential_reject, credential_set_all_capabilities, credential_write,
-    CredentialOpType, GitCredential, TIME_MAX,
+    CredentialOpType, GitCredential, TIME_MAX, cmd_credential_cache, cmd_credential_cache_daemon,
+    cmd_credential_store, credential_announce_capabilities, credential_approve, credential_fill,
+    credential_next_state, credential_read, credential_reject, credential_set_all_capabilities,
+    credential_write,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,17 +338,15 @@ pub fn read_service_discovery_response(
     let mut frames = read_pkt_line_frames_until_flush(reader)?;
     // Smart HTTP with `Git-Protocol: version=2` omits the `# service=` preamble and
     // flush that precede the v2 capability advertisement (upstream http-backend.c).
-    if let Some(PktLineFrame::Data(payload)) = frames.first() {
-        if trim_trailing_lf(payload) == b"version 2" {
-            return Ok(ServiceDiscoveryResponse {
-                announcement: ServiceAnnouncement {
-                    service: GitService::UploadPack,
-                },
-                payload: ServiceDiscoveryPayload::ProtocolV2(parse_protocol_v2_advertisement(
-                    &frames,
-                )?),
-            });
-        }
+    if let Some(PktLineFrame::Data(payload)) = frames.first()
+        && trim_trailing_lf(payload) == b"version 2"
+    {
+        return Ok(ServiceDiscoveryResponse {
+            announcement: ServiceAnnouncement {
+                service: GitService::UploadPack,
+            },
+            payload: ServiceDiscoveryPayload::ProtocolV2(parse_protocol_v2_advertisement(&frames)?),
+        });
     }
     frames.extend(read_pkt_line_frames_until_flush(reader)?);
     parse_service_discovery_response(format, &frames)
@@ -425,15 +423,18 @@ pub(crate) fn parse_legacy_git_credential_impl(input: &[u8]) -> Result<GitCreden
     let mut credential = GitCredential::default();
     let mut lines = input.split(|byte| *byte == b'\n');
     let mut finished = false;
-    while let Some(line) = lines.next() {
+    for line in lines.by_ref() {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
             finished = true;
             break;
         }
-        let line = std::str::from_utf8(line).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+        let line =
+            std::str::from_utf8(line).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
         let Some((key, value)) = line.split_once('=') else {
-            return Err(GitError::InvalidFormat("credential line is missing = delimiter".into()));
+            return Err(GitError::InvalidFormat(
+                "credential line is missing = delimiter".into(),
+            ));
         };
         if key.is_empty() {
             return Err(GitError::InvalidFormat("credential key is empty".into()));
@@ -624,11 +625,27 @@ fn http_remote_origin(remote: &RemoteUrl) -> Result<String> {
 }
 
 pub fn ssh_service_command(service: GitService, repository_path: &str) -> Result<String> {
+    ssh_service_command_with_program(service.as_str(), repository_path)
+}
+
+/// Build the remote-shell command for an explicitly selected service program
+/// (for example `clone --upload-pack=<path>`). The program is intentionally
+/// preserved as a shell command, matching Git's `--upload-pack` contract; the
+/// repository argument remains independently validated and shell-quoted.
+pub fn ssh_service_command_with_program(program: &str, repository_path: &str) -> Result<String> {
+    if program.is_empty()
+        || program
+            .bytes()
+            .any(|byte| matches!(byte, 0 | b'\n' | b'\r'))
+    {
+        return Err(GitError::InvalidFormat(
+            "SSH service program contains an invalid delimiter".into(),
+        ));
+    }
     validate_ssh_repository_path(repository_path)?;
     let repository_path = ssh_service_repository_path(repository_path);
     Ok(format!(
-        "{} {}",
-        service.as_str(),
+        "{program} {}",
         quote_ssh_repository_path(repository_path)
     ))
 }
@@ -663,6 +680,20 @@ pub fn ssh_process_args_with_ip(
     service: GitService,
     variant: SshCommandVariant,
     ip_version: Option<SshIpVersion>,
+) -> Result<Vec<String>> {
+    ssh_process_args_with_ip_and_command(remote, service, variant, ip_version, None)
+}
+
+/// Build SSH argv while allowing the caller to override the remote service
+/// program. This is the typed transport seam behind porcelain options such as
+/// `clone --upload-pack=<path>`; host, port, IP-family, and repository quoting
+/// remain identical to [`ssh_process_args_with_ip`].
+pub fn ssh_process_args_with_ip_and_command(
+    remote: &RemoteUrl,
+    service: GitService,
+    variant: SshCommandVariant,
+    ip_version: Option<SshIpVersion>,
+    service_program: Option<&str>,
 ) -> Result<Vec<String>> {
     if remote.transport != RemoteTransport::Ssh {
         return Err(GitError::InvalidFormat(
@@ -711,7 +742,10 @@ pub fn ssh_process_args_with_ip(
         }
     }
     args.push(ssh_host_argument(remote)?);
-    args.push(ssh_service_command(service, &remote.path)?);
+    args.push(match service_program {
+        Some(program) => ssh_service_command_with_program(program, &remote.path)?,
+        None => ssh_service_command(service, &remote.path)?,
+    });
     Ok(args)
 }
 
@@ -2233,8 +2267,7 @@ mod tests {
     fn git_credentials_accept_responses_at_size_limit() {
         let prefix = b"protocol=https\npadding=";
         let suffix = b"\n\n";
-        let padding_len =
-            MAX_GIT_CREDENTIAL_RESPONSE_BYTES - prefix.len() - suffix.len();
+        let padding_len = MAX_GIT_CREDENTIAL_RESPONSE_BYTES - prefix.len() - suffix.len();
         let mut input = Vec::with_capacity(MAX_GIT_CREDENTIAL_RESPONSE_BYTES);
         input.extend_from_slice(prefix);
         input.extend(std::iter::repeat_n(b'x', padding_len));
@@ -2242,7 +2275,8 @@ mod tests {
         assert_eq!(input.len(), MAX_GIT_CREDENTIAL_RESPONSE_BYTES);
 
         let mut reader = input.as_slice();
-        let credential = read_git_credential(&mut reader).expect("at-limit response should succeed");
+        let credential =
+            read_git_credential(&mut reader).expect("at-limit response should succeed");
         assert_eq!(credential.protocol.as_deref(), Some("https"));
         assert_eq!(
             credential.extra,
@@ -2451,6 +2485,31 @@ mod tests {
             ssh_service_command(GitService::UploadArchive, "/srv/it's.git")
                 .expect("test operation should succeed"),
             "git-upload-archive '/srv/it'\\''s.git'"
+        );
+        assert_eq!(
+            ssh_service_command_with_program("./tools/git-upload-pack", "/srv/repo.git")
+                .expect("explicit service command"),
+            "./tools/git-upload-pack '/srv/repo.git'"
+        );
+        assert!(ssh_service_command_with_program("bad\ncommand", "/srv/repo.git").is_err());
+    }
+
+    #[test]
+    fn ssh_process_args_honor_explicit_service_program() {
+        let remote = parse_remote_url("localhost:/path/to/repo").expect("ssh remote");
+        assert_eq!(
+            ssh_process_args_with_ip_and_command(
+                &remote,
+                GitService::UploadPack,
+                SshCommandVariant::Simple,
+                None,
+                Some("./something/bin/git-upload-pack"),
+            )
+            .expect("ssh args"),
+            vec![
+                "localhost".to_string(),
+                "./something/bin/git-upload-pack '/path/to/repo'".to_string(),
+            ]
         );
     }
 

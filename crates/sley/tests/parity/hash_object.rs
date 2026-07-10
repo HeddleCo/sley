@@ -1,7 +1,7 @@
 //! `hash-object` engine parity via [`Repository::write_blob`].
 
 use sley::Repository;
-use sley_testkit::engine_parity::{git_oid_line, EngineOutput, EngineParityCase};
+use sley_testkit::engine_parity::{EngineOutput, EngineParityCase, git_oid_line};
 
 fn blob_hash_output(repo: &Repository, bytes: &[u8]) -> EngineOutput {
     let oid = repo.write_blob(bytes).expect("write_blob");
@@ -88,10 +88,7 @@ fn multiline_text_matches_oracle() {
     EngineParityCase::new("hash-object-multiline").run(
         |fixture| {
             fixture.init_default();
-            fixture.write_file(
-                "lines.txt",
-                b"alpha\nbeta\ngamma\n",
-            );
+            fixture.write_file("lines.txt", b"alpha\nbeta\ngamma\n");
         },
         |fixture| {
             let repo = Repository::discover(fixture.path()).expect("discover");
@@ -213,11 +210,9 @@ fn written_blob_type_matches_oracle() {
             EngineOutput::stdout(stdout)
         },
         |fixture| {
-            let oid = String::from_utf8_lossy(
-                &fixture.oracle_ok(&["hash-object", "typed.txt"]),
-            )
-            .trim()
-            .to_string();
+            let oid = String::from_utf8_lossy(&fixture.oracle_ok(&["hash-object", "typed.txt"]))
+                .trim()
+                .to_string();
             fixture.oracle(&["cat-file", "-t", &oid])
         },
     );
@@ -255,11 +250,10 @@ fn written_blob_exists_matches_oracle() {
             EngineOutput::stdout(Vec::new())
         },
         |fixture| {
-            let oid = String::from_utf8_lossy(
-                &fixture.oracle_ok(&["hash-object", "persisted.txt"]),
-            )
-            .trim()
-            .to_string();
+            let oid =
+                String::from_utf8_lossy(&fixture.oracle_ok(&["hash-object", "persisted.txt"]))
+                    .trim()
+                    .to_string();
             fixture.oracle(&["cat-file", "-e", &oid])
         },
     );
@@ -334,11 +328,9 @@ fn blob_size_header_matches_oracle() {
             EngineOutput::stdout(format!("{size}\n").into_bytes())
         },
         |fixture| {
-            let oid = String::from_utf8_lossy(
-                &fixture.oracle_ok(&["hash-object", "sized.txt"]),
-            )
-            .trim()
-            .to_string();
+            let oid = String::from_utf8_lossy(&fixture.oracle_ok(&["hash-object", "sized.txt"]))
+                .trim()
+                .to_string();
             fixture.oracle(&["cat-file", "-s", &oid])
         },
     );

@@ -8,12 +8,11 @@ use std::path::PathBuf;
 use sley::plumbing::sley_config;
 use sley::{GitError, Result};
 use sley_transport::{
-    cmd_credential_cache as transport_cmd_credential_cache,
+    CredentialOpType, GitCredential, cmd_credential_cache as transport_cmd_credential_cache,
     cmd_credential_cache_daemon as transport_cmd_credential_cache_daemon,
-    cmd_credential_store as transport_cmd_credential_store,
-    credential_announce_capabilities, credential_approve, credential_fill, credential_next_state,
-    credential_read, credential_reject, credential_set_all_capabilities, credential_write,
-    CredentialOpType, GitCredential,
+    cmd_credential_store as transport_cmd_credential_store, credential_announce_capabilities,
+    credential_approve, credential_fill, credential_next_state, credential_read, credential_reject,
+    credential_set_all_capabilities, credential_write,
 };
 
 use crate::injected_config_parameters;
@@ -86,12 +85,8 @@ fn load_credential_config_stack() -> Result<sley_config::ConfigStack> {
         if let Ok(git_dir) = crate::session::cli_git_dir_from(&cwd) {
             if let Ok(common) = common_git_dir_for_git_dir(&git_dir) {
                 let local_path = config_display_path(common.join("config"));
-                let _ = stack.push_file(
-                    &local_path,
-                    sley_config::ConfigScope::Local,
-                    true,
-                    &context,
-                );
+                let _ =
+                    stack.push_file(&local_path, sley_config::ConfigScope::Local, true, &context);
                 if worktree_config_extension_enabled(&common) {
                     let worktree_path = config_display_path(git_dir.join("config.worktree"));
                     let _ = stack.push_file(

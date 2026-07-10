@@ -1250,6 +1250,7 @@ fn run_diff_request(
                 colors: None,
                 word_diff: None,
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                suppress_blank_empty: false,
                 no_index_contents: None,
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,

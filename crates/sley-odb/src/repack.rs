@@ -1,46 +1,28 @@
-use flate2::Compression;
-use flate2::read::ZlibDecoder;
-use flate2::write::ZlibEncoder;
-use flate2::{Decompress, FlushDecompress};
-use parking_lot::RwLock;
-use std::sync::Mutex;
-use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
-use sley_formats::{Bundle, BundleReference};
-use sley_object::{
-    Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object,
-    tree_entry_object_type,
-};
-use sley_pack::{
-    MultiPackIndex, MultiPackIndexOidLookup, PackBitmapIndex, PackBitmapWriter, PackFile,
-    PackIndex, PackIndexByteSource, PackIndexEntry, PackIndexViewData, PackInput,
-    PackReverseIndex, PackStreamIndexBuild, PackWrite, PackWriteOptions, PackWriteSummary,
-};
+use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
+use sley_pack::{PackFile, PackIndex, PackIndexEntry, PackInput};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::{env, fs};
+use std::sync::Arc;
 
-use crate::{
-    grafted_parents, implied_empty_tree_object, unique_temp_path, with_missing_object_context,
-    ObjectReader, ObjectWriter,
-};
+use crate::{ObjectReader, grafted_parents};
 
-use crate::install::{write_pack_component, write_promisor_pack_sidecar, RawPackInstaller, ReachablePackFile, ReachablePackWriteSummary};
-use crate::pack::FileObjectDatabase;
-use crate::reachability::{
-    BitmapPseudoMergeGroup, ReachablePackObject, ReachablePackObjectMeta, ReachablePackObjectsForWrite,
-    build_midx_bitmap, build_pack_bitmap, collect_reachable_object_ids_excluding,
-    collect_reachable_object_ids_excluding_promised_missing,
-    collect_reachable_object_ids_tolerating_missing, collect_reachable_pack_objects_for_write,
-    existing_pack_files, loose_object_id_set, loose_object_ids, pack_inputs, prune_loose_objects,
-    prune_obsolete_pack_paths, prune_stale_multi_pack_index, remove_file_if_exists,
-    sort_reachable_pack_metadata,
-};
-use crate::registry::{alternate_object_dirs, collect_packed_object_ids, object_ids_in_objects_dir, repository_objects_dir};
+use crate::install::{write_pack_component, write_promisor_pack_sidecar};
 use crate::loose::LooseObjectStore;
+use crate::pack::FileObjectDatabase;
 use crate::pack::promisor_pack_object_ids;
+use crate::reachability::{
+    BitmapPseudoMergeGroup, ReachabilityBitmapOptions, ReachablePackObject,
+    build_pack_bitmap_with_cached_objects, build_pack_name_hash_cache,
+    collect_reachable_object_ids_excluding_promised_missing, existing_pack_files, loose_object_ids,
+    pack_inputs, prune_loose_objects, prune_obsolete_pack_paths, prune_stale_multi_pack_index,
+    remove_file_if_exists,
+};
+use crate::registry::{
+    alternate_object_dirs, collect_packed_object_ids, object_ids_in_objects_dir,
+    repository_objects_dir,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepackResult {
@@ -63,16 +45,228 @@ pub struct RepackResult {
     promisor: bool,
     pack_checksum: ObjectId,
     index_entries: Vec<PackIndexEntry>,
+    /// Object types plus shared commit/tree bodies retained from the repack
+    /// walk until an optional bitmap is built. Blob bodies are deliberately not
+    /// retained; bitmap construction only needs their type and pack position.
+    bitmap_cache: Vec<RepackBitmapObject>,
+    loose_prune_outcome: LooseObjectPruneOutcome,
+}
+
+/// Whether installing a repack result accounts for every loose object that is
+/// duplicated by a surviving pack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LooseObjectPruneOutcome {
+    /// [`install_repack_result`] has enough provenance to perform the complete
+    /// packed-loose cleanup itself.
+    Complete,
+    /// Retained or promisor packs may duplicate loose objects outside the new
+    /// pack, so the caller must run the broader packed-loose cleanup.
+    FollowUpRequired,
+}
+
+impl RepackResult {
+    /// Return the object type retained by the repack walk, when `oid` belongs
+    /// to the result's packed closure.
+    pub fn cached_object_type(&self, oid: &ObjectId) -> Option<ObjectType> {
+        self.bitmap_cache
+            .binary_search_by(|entry| entry.oid.as_bytes().cmp(oid.as_bytes()))
+            .ok()
+            .map(|index| self.bitmap_cache[index].object_type)
+    }
+
+    pub const fn loose_object_prune_outcome(&self) -> LooseObjectPruneOutcome {
+        self.loose_prune_outcome
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepackBitmapObject {
+    oid: ObjectId,
+    object_type: ObjectType,
+    graph_object: Option<Arc<EncodedObject>>,
+}
+
+fn bitmap_object_cache(objects: &[ReachablePackObject]) -> Vec<RepackBitmapObject> {
+    let mut cache = objects
+        .iter()
+        .map(|entry| RepackBitmapObject {
+            oid: entry.oid,
+            object_type: entry.object.object_type,
+            graph_object: matches!(
+                entry.object.object_type,
+                ObjectType::Commit | ObjectType::Tree
+            )
+            .then(|| Arc::clone(&entry.object)),
+        })
+        .collect::<Vec<_>>();
+    cache.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
+    cache
+}
+
+fn bitmap_lookup_cache(
+    objects: &[RepackBitmapObject],
+) -> (
+    HashMap<ObjectId, ObjectType>,
+    HashMap<ObjectId, Arc<EncodedObject>>,
+) {
+    let mut object_types = HashMap::with_capacity(objects.len());
+    let mut graph_objects = HashMap::new();
+    for entry in objects {
+        object_types.insert(entry.oid, entry.object_type);
+        if let Some(object) = &entry.graph_object {
+            graph_objects.insert(entry.oid, Arc::clone(object));
+        }
+    }
+    (object_types, graph_objects)
+}
+
+/// Reuse an existing single pack when the reachability walk proves that its
+/// object set is already exactly the requested repack output. This is common
+/// when `repack -adb` is repeated solely to rebuild bitmap selection metadata:
+/// recompressing identical canonical objects cannot change the pack bytes, but
+/// costs substantially more than reading the already-validated pack and index.
+///
+/// The exact set comparison is deliberately strict. Multiple packs, missing
+/// index files, unreachable objects in the existing pack, or newly reachable
+/// objects all fall back to the ordinary writer path.
+fn reuse_exact_single_pack(
+    objects_dir: &Path,
+    format: ObjectFormat,
+    objects: &[ReachablePackObject],
+    retained_pack_stems: &[String],
+) -> Result<Option<RepackResult>> {
+    let pack_paths = existing_pack_files(&objects_dir.join("pack"))?;
+    let [pack_path] = pack_paths.as_slice() else {
+        return Ok(None);
+    };
+    let index_path = pack_path.with_extension("idx");
+    let Ok(index_bytes) = fs::read(&index_path) else {
+        return Ok(None);
+    };
+    let index = match PackIndex::parse(&index_bytes, format) {
+        Ok(index) => index,
+        Err(_) => return Ok(None),
+    };
+    if index.entries.len() != objects.len() {
+        return Ok(None);
+    }
+    let reachable: HashSet<ObjectId> = objects.iter().map(|entry| entry.oid).collect();
+    if index
+        .entries
+        .iter()
+        .any(|entry| !reachable.contains(&entry.oid))
+    {
+        return Ok(None);
+    }
+    let pack = match fs::read(pack_path) {
+        Ok(pack) => pack,
+        Err(_) => return Ok(None),
+    };
+    validate_pack_checksum(&pack, format, &index.pack_checksum, "reused repack")?;
+
+    let canonical_name = format!("pack-{}.pack", index.pack_checksum.to_hex());
+    let obsolete_packs =
+        if pack_path.file_name().and_then(|name| name.to_str()) != Some(&canonical_name) {
+            vec![pack_path.clone()]
+        } else {
+            Vec::new()
+        };
+    let mut packed_loose = loose_object_ids(objects_dir, format)?
+        .into_iter()
+        .filter(|oid| reachable.contains(oid))
+        .collect::<Vec<_>>();
+    packed_loose.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+    Ok(Some(RepackResult {
+        pack,
+        idx: index_bytes,
+        object_count: index.entries.len(),
+        obsolete_packs,
+        packed_loose,
+        retained_pack_stems: retained_pack_stems.to_vec(),
+        promisor: false,
+        pack_checksum: index.pack_checksum,
+        index_entries: index.entries,
+        bitmap_cache: bitmap_object_cache(objects),
+        loose_prune_outcome: LooseObjectPruneOutcome::FollowUpRequired,
+    }))
+}
+
+struct RepackBitmapReader<'a> {
+    cached: &'a HashMap<ObjectId, Arc<EncodedObject>>,
+    fallback: &'a FileObjectDatabase,
+}
+
+impl ObjectReader for RepackBitmapReader<'_> {
+    fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
+        self.cached
+            .get(oid)
+            .map(Arc::clone)
+            .map_or_else(|| self.fallback.read_object(oid), Ok)
+    }
+
+    fn is_shallow_graft(&self, oid: &ObjectId) -> bool {
+        self.fallback.is_shallow_graft(oid)
+    }
+
+    fn has_shallow_grafts(&self) -> bool {
+        self.fallback.has_shallow_grafts()
+    }
+
+    fn is_promised_object(&self, oid: &ObjectId) -> bool {
+        self.fallback.is_promised_object(oid)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct RepackOptions {
     /// Do not borrow objects from alternates (`git repack --local`).
     pub local: bool,
+    /// Force fresh object compression even when one existing pack already has
+    /// the exact reachable set (`git repack -f` / `-F`).
+    pub force_rewrite: bool,
     /// Repack objects that are already in `.keep` / `--keep-pack` packs.
     pub pack_kept_objects: bool,
     /// Explicit `--keep-pack=<name>` pack stems (`pack-<checksum>`).
     pub keep_pack_stems: HashSet<String>,
+}
+
+/// Installation policy for pack companions produced by a repack.
+///
+/// Repository configuration remains a caller concern; the ODB engine receives
+/// the already-resolved reverse-index policy explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepackInstallOptions {
+    pub prune: bool,
+    pub write_reverse_index: bool,
+    pub write_bitmap_lookup_table: bool,
+    pub write_bitmap_hash_cache: bool,
+}
+
+impl RepackInstallOptions {
+    pub const fn new(prune: bool) -> Self {
+        Self {
+            prune,
+            write_reverse_index: true,
+            write_bitmap_lookup_table: false,
+            write_bitmap_hash_cache: true,
+        }
+    }
+
+    pub const fn with_reverse_index(mut self, write_reverse_index: bool) -> Self {
+        self.write_reverse_index = write_reverse_index;
+        self
+    }
+
+    pub const fn with_bitmap_extensions(
+        mut self,
+        write_lookup_table: bool,
+        write_hash_cache: bool,
+    ) -> Self {
+        self.write_bitmap_lookup_table = write_lookup_table;
+        self.write_bitmap_hash_cache = write_hash_cache;
+        self
+    }
 }
 
 /// Gather every object in `git_dir` (loose objects and every existing pack) and
@@ -189,6 +383,16 @@ pub fn repack_reachable_objects_with_options(
         return Ok(None);
     }
 
+    if !options.force_rewrite
+        && let Some(mut reused) =
+            reuse_exact_single_pack(&objects_dir, format, &objects, &retained_pack_stems)?
+    {
+        if retained_pack_stems.is_empty() && promisor_oids.is_empty() {
+            reused.loose_prune_outcome = LooseObjectPruneOutcome::Complete;
+        }
+        return Ok(Some(reused));
+    }
+
     let inputs = pack_inputs(&objects);
     let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
     let object_count = written.entries.len();
@@ -210,6 +414,11 @@ pub fn repack_reachable_objects_with_options(
 
     let pack_checksum = written.checksum;
     let index_entries = written.entries.clone();
+    let loose_prune_outcome = if retained_pack_stems.is_empty() && promisor_oids.is_empty() {
+        LooseObjectPruneOutcome::Complete
+    } else {
+        LooseObjectPruneOutcome::FollowUpRequired
+    };
     Ok(Some(RepackResult {
         pack: written.pack,
         idx: written.index,
@@ -220,6 +429,8 @@ pub fn repack_reachable_objects_with_options(
         promisor: false,
         pack_checksum,
         index_entries,
+        bitmap_cache: bitmap_object_cache(&objects),
+        loose_prune_outcome,
     }))
 }
 
@@ -349,6 +560,8 @@ pub fn repack_all_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option
         promisor: false,
         pack_checksum: written.checksum,
         index_entries: written.entries,
+        bitmap_cache: bitmap_object_cache(&objects),
+        loose_prune_outcome: LooseObjectPruneOutcome::FollowUpRequired,
     }))
 }
 
@@ -416,6 +629,8 @@ pub fn repack_promisor_objects(
         promisor: true,
         pack_checksum,
         index_entries,
+        bitmap_cache: bitmap_object_cache(&objects),
+        loose_prune_outcome: LooseObjectPruneOutcome::FollowUpRequired,
     }))
 }
 
@@ -462,6 +677,8 @@ pub fn repack_loose_objects(git_dir: &Path, format: ObjectFormat) -> Result<Opti
         promisor: false,
         pack_checksum,
         index_entries,
+        bitmap_cache: bitmap_object_cache(&objects),
+        loose_prune_outcome: LooseObjectPruneOutcome::FollowUpRequired,
     }))
 }
 
@@ -701,6 +918,8 @@ pub fn repack_geometric(
             promisor: false,
             pack_checksum,
             index_entries,
+            bitmap_cache: bitmap_object_cache(&objects),
+            loose_prune_outcome: LooseObjectPruneOutcome::FollowUpRequired,
         }),
         rolled_up_packs,
     })
@@ -742,6 +961,25 @@ pub fn install_repack_result_with_bitmap(
     bitmap_tips: Option<&HashSet<ObjectId>>,
     bitmap_pseudo_merge_groups: Option<&[BitmapPseudoMergeGroup]>,
 ) -> Result<()> {
+    install_repack_result_with_bitmap_options(
+        git_dir,
+        format,
+        result,
+        RepackInstallOptions::new(prune),
+        bitmap_tips,
+        bitmap_pseudo_merge_groups,
+    )
+}
+
+/// Install a repack using an explicit sidecar policy.
+pub fn install_repack_result_with_bitmap_options(
+    git_dir: &Path,
+    format: ObjectFormat,
+    result: &RepackResult,
+    options: RepackInstallOptions,
+    bitmap_tips: Option<&HashSet<ObjectId>>,
+    bitmap_pseudo_merge_groups: Option<&[BitmapPseudoMergeGroup]>,
+) -> Result<()> {
     let objects_dir = repository_objects_dir(git_dir);
     let pack_dir = objects_dir.join("pack");
     fs::create_dir_all(&pack_dir)?;
@@ -766,30 +1004,60 @@ pub fn install_repack_result_with_bitmap(
     let new_pack_path = pack_dir.join(format!("{pack_name}.pack"));
     let new_rev_path = pack_dir.join(format!("{pack_name}.rev"));
     let new_index_path = pack_dir.join(format!("{pack_name}.idx"));
-    // git writes a `.rev` alongside every repacked pack (`pack.writeReverseIndex`
-    // defaults to true). Write it before the `.idx` so the index never becomes
-    // visible ahead of its companions, mirroring upstream's finalize order.
-    let reverse_index = sley_pack::PackReverseIndex::write(
-        format,
-        &sley_pack::pack_order_index_positions(&parsed_index.entries),
-        &result.pack_checksum,
-    )?;
+    // Repack defaults to a reverse index. When the caller disables it through
+    // configuration, skip the optional sidecar while retaining the same
+    // pack-before-index visibility ordering.
+    let reverse_index = if options.write_reverse_index {
+        Some(sley_pack::PackReverseIndex::write(
+            format,
+            &sley_pack::pack_order_index_positions(&parsed_index.entries),
+            &result.pack_checksum,
+        )?)
+    } else {
+        None
+    };
     write_pack_component(&new_pack_path, &result.pack)?;
-    write_pack_component(&new_rev_path, &reverse_index)?;
+    if let Some(reverse_index) = reverse_index {
+        write_pack_component(&new_rev_path, &reverse_index)?;
+    } else {
+        remove_file_if_exists(&new_rev_path)?;
+    }
     write_pack_component(&new_index_path, &result.idx)?;
     let new_promisor_path = write_promisor_pack_sidecar(&pack_dir, &pack_name, result.promisor)?;
 
     if let Some(tips) = bitmap_tips {
         // Build before pruning: the closure walk reads objects through the
-        // pre-existing packs/loose store (the new pack holds the same bytes).
+        // shared objects retained by the repack walk, falling back to the
+        // pre-existing packs/loose store only for an external delta base.
         let database = FileObjectDatabase::new(objects_dir.clone(), format);
-        if let Some(bitmap) = build_pack_bitmap(
-            &database,
+        let (object_types, graph_objects) = bitmap_lookup_cache(&result.bitmap_cache);
+        let bitmap_reader = RepackBitmapReader {
+            cached: &graph_objects,
+            fallback: &database,
+        };
+        let name_hash_cache = if options.write_bitmap_hash_cache {
+            Some(build_pack_name_hash_cache(
+                &bitmap_reader,
+                format,
+                &result.index_entries,
+                &object_types,
+            )?)
+        } else {
+            None
+        };
+        if let Some(bitmap) = build_pack_bitmap_with_cached_objects(
+            &bitmap_reader,
             format,
             &result.index_entries,
             &result.pack_checksum,
             tips,
             bitmap_pseudo_merge_groups.unwrap_or(&[]),
+            &object_types,
+            &ReachabilityBitmapOptions {
+                write_lookup_table: options.write_bitmap_lookup_table,
+                name_hash_cache,
+                restrict_to_tips: false,
+            },
         )? {
             // Unlike the pack/idx/rev (content-addressed by the pack
             // checksum), the bitmap depends on selection inputs (e.g.
@@ -801,7 +1069,7 @@ pub fn install_repack_result_with_bitmap(
         }
     }
 
-    if !prune {
+    if !options.prune {
         return Ok(());
     }
 
@@ -873,13 +1141,20 @@ pub fn install_geometric_repack_result(
 
     if let Some(tips) = bitmap_tips {
         let database = FileObjectDatabase::new(objects_dir.clone(), format);
-        if let Some(bitmap) = build_pack_bitmap(
-            &database,
+        let (object_types, graph_objects) = bitmap_lookup_cache(&result.bitmap_cache);
+        let bitmap_reader = RepackBitmapReader {
+            cached: &graph_objects,
+            fallback: &database,
+        };
+        if let Some(bitmap) = build_pack_bitmap_with_cached_objects(
+            &bitmap_reader,
             format,
             &result.index_entries,
             &result.pack_checksum,
             tips,
             &[],
+            &object_types,
+            &ReachabilityBitmapOptions::default(),
         )? {
             let bitmap_path = pack_dir.join(format!("{pack_name}.bitmap"));
             remove_file_if_exists(&bitmap_path)?;
@@ -1062,7 +1337,7 @@ fn object_mtimes_on_disk(
     Ok(mtimes)
 }
 
-/// Public wrapper over [`build_cruft_pack`] for the `--expire-to` limbo pack.
+/// Public wrapper over `build_cruft_pack` for the `--expire-to` limbo pack.
 pub fn build_cruft_pack_pub(
     database: &FileObjectDatabase,
     format: ObjectFormat,
@@ -1167,7 +1442,11 @@ pub fn repack_cruft_with_options(
     options: &RepackOptions,
 ) -> Result<CruftRepackResult> {
     let objects_dir = repository_objects_dir(git_dir);
-    let database = FileObjectDatabase::new(objects_dir.clone(), format);
+    let database = if options.local {
+        FileObjectDatabase::without_alternates(objects_dir.clone(), format)
+    } else {
+        FileObjectDatabase::new(objects_dir.clone(), format)
+    };
     let pack_dir = objects_dir.join("pack");
     let retained_pack_stems = repack_retained_pack_stems(
         &pack_dir,
@@ -1187,10 +1466,24 @@ pub fn repack_cruft_with_options(
     };
 
     // Reachable closure → the new "reachable" pack.
+    // A local repack must not borrow an alternate-only ref root. Filter those
+    // roots before the strict closure walk; local roots still receive full
+    // missing-object validation once admitted.
+    let reachable_roots = if options.local {
+        let mut local_roots = Vec::with_capacity(roots.len());
+        for oid in roots {
+            if database.contains(oid)? {
+                local_roots.push(*oid);
+            }
+        }
+        local_roots
+    } else {
+        roots.to_vec()
+    };
     let mut reachable_ids = collect_reachable_object_ids_excluding_promised_missing(
         &database,
         format,
-        roots.iter().copied(),
+        reachable_roots,
         &promisor_oids,
     )?;
     reachable_ids.retain(|oid| !excluded_oids.contains(oid));
@@ -1228,6 +1521,8 @@ pub fn repack_cruft_with_options(
                 promisor: false,
                 pack_checksum: written.checksum,
                 index_entries: written.entries,
+                bitmap_cache: bitmap_object_cache(&objects),
+                loose_prune_outcome: LooseObjectPruneOutcome::FollowUpRequired,
             })
         }
     };
@@ -1450,4 +1745,70 @@ pub(crate) fn pack_index_entries_match_writer(
     parsed.iter().zip(writer_entries).all(|(left, right)| {
         left.oid == right.oid && left.crc32 == right.crc32 && left.offset == right.offset
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bitmap_cache_does_not_retain_blob_bodies() {
+        let blob = Arc::new(EncodedObject::new(
+            ObjectType::Blob,
+            vec![b'x'; 1024 * 1024],
+        ));
+        let oid = blob.object_id(ObjectFormat::Sha1).expect("blob id");
+        let objects = vec![ReachablePackObject {
+            oid,
+            object: Arc::clone(&blob),
+        }];
+
+        let cache = bitmap_object_cache(&objects);
+
+        assert_eq!(
+            Arc::strong_count(&blob),
+            2,
+            "only the input and caller retain the blob"
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].object_type, ObjectType::Blob);
+        assert!(cache[0].graph_object.is_none());
+    }
+
+    #[test]
+    fn repack_result_exposes_cached_types_after_oid_sorting() {
+        let blob = Arc::new(EncodedObject::new(ObjectType::Blob, b"blob".to_vec()));
+        let commit = Arc::new(EncodedObject::new(ObjectType::Commit, b"commit".to_vec()));
+        let blob_oid = blob.object_id(ObjectFormat::Sha1).expect("blob id");
+        let commit_oid = commit.object_id(ObjectFormat::Sha1).expect("commit id");
+        let objects = vec![
+            ReachablePackObject {
+                oid: blob_oid,
+                object: blob,
+            },
+            ReachablePackObject {
+                oid: commit_oid,
+                object: commit,
+            },
+        ];
+        let result = RepackResult {
+            pack: Vec::new(),
+            idx: Vec::new(),
+            object_count: objects.len(),
+            obsolete_packs: Vec::new(),
+            packed_loose: Vec::new(),
+            retained_pack_stems: Vec::new(),
+            promisor: false,
+            pack_checksum: blob_oid,
+            index_entries: Vec::new(),
+            bitmap_cache: bitmap_object_cache(&objects),
+            loose_prune_outcome: LooseObjectPruneOutcome::Complete,
+        };
+
+        assert_eq!(result.cached_object_type(&blob_oid), Some(ObjectType::Blob));
+        assert_eq!(
+            result.cached_object_type(&commit_oid),
+            Some(ObjectType::Commit)
+        );
+    }
 }

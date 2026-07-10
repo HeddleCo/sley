@@ -376,14 +376,12 @@ pub(crate) fn cmd_worktree_list(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-
 fn worktree_usage<T>() -> Result<T> {
     eprintln!(
         "usage: git worktree add [-f] [--detach] [--checkout] [--lock [--reason <string>]]\n                        [--orphan] [(-b | -B) <new-branch>] <path> [<commit-ish>]\n   or: git worktree list [-v | --porcelain [-z]]\n   or: git worktree lock [--reason <string>] <worktree>\n   or: git worktree move <worktree> <new-path>\n   or: git worktree prune [-n] [-v] [--expire <expire>]\n   or: git worktree remove [-f] <worktree>\n   or: git worktree repair [<path>...]\n   or: git worktree unlock <worktree>"
     );
     Err(GitError::Exit(129))
 }
-
 
 pub(crate) fn cmd_worktree_prune(args: &[String]) -> Result<()> {
     let options = setup_worktree_prune_options(args)?;
@@ -698,21 +696,6 @@ pub(crate) fn cmd_worktree_repair(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn collect_worktree_list_entries(
     common_git_dir: &Path,
@@ -1908,9 +1891,14 @@ fn copy_worktree_config_for_new_worktree(
             });
         }
     }
-    config.sections.retain(|section| !section.entries.is_empty());
+    config
+        .sections
+        .retain(|section| !section.entries.is_empty());
     if !config.sections.is_empty() {
-        fs::write(admin_dir.join("config.worktree"), config.to_canonical_bytes())?;
+        fs::write(
+            admin_dir.join("config.worktree"),
+            config.to_canonical_bytes(),
+        )?;
     }
     Ok(())
 }
@@ -1923,8 +1911,8 @@ fn run_worktree_add_post_checkout_hook(
 ) -> Result<()> {
     let old = ObjectId::null(format).to_hex();
     let new = new_head.to_hex();
-    let hook_cwd = fs::canonicalize(worktree_path)
-        .unwrap_or_else(|_| normalize_lexical_path(worktree_path));
+    let hook_cwd =
+        fs::canonicalize(worktree_path).unwrap_or_else(|_| normalize_lexical_path(worktree_path));
     commands::hooks::run_traditional_hook_at(
         admin_dir,
         "post-checkout",
@@ -2101,8 +2089,7 @@ pub(crate) fn branch_checked_out_worktree(
                 || normalize_lexical_path(path) == normalize_lexical_path(ignore)
         })
     };
-    if let Some(worktree) =
-        sley_worktree::find_shared_symref(common_git_dir, "HEAD", refname)?
+    if let Some(worktree) = sley_worktree::find_shared_symref(common_git_dir, "HEAD", refname)?
         && !is_ignored(&worktree.path)
     {
         return Ok(Some(

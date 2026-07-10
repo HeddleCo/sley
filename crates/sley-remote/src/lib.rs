@@ -46,24 +46,29 @@ pub use credentials::{
     http_credential_host, http_protocol_name, http_url_credential,
 };
 
+mod http_backend;
+pub use http_backend::{
+    HttpBackendOperation, HttpBackendPlan, HttpBackendRequest, HttpBackendService,
+    http_backend_service_enabled, plan_http_backend_request,
+};
+
 #[cfg(feature = "http")]
 mod http;
 #[cfg(feature = "http")]
 pub use http::{
-    HttpFetchPackRequest, HttpServiceAdvertisements, http_advertised_refs,
+    HttpFetchPackRequest, HttpOperationBatch, HttpServiceAdvertisements, http_advertised_refs,
     http_authorization_headers, http_check_status, http_protocol_v2_fetch_response,
     http_send_with_auth, http_service_advertisements, http_upload_pack_advertisements,
     http_upload_pack_features, http_validate_content_type,
     install_fetch_pack_via_http_protocol_v2_fetch, install_fetch_pack_via_http_upload_pack,
-    new_http_client, HttpOperationBatch,
-    remote_url_is_http,
+    new_http_client, remote_url_is_http,
 };
 
 mod ssh;
 pub use ssh::{
     SshFetchPackRequest, SshTransportOptions, install_fetch_pack_via_ssh_upload_pack, ssh_program,
     ssh_transport_options_from_config, ssh_upload_pack_advertisements,
-    ssh_upload_pack_advertisements_with_options,
+    ssh_upload_pack_advertisements_with_command, ssh_upload_pack_advertisements_with_options,
 };
 
 mod git;
@@ -71,6 +76,13 @@ mod git_proxy;
 pub use git::{
     GitFetchPackRequest, git_upload_pack_advertisements,
     git_upload_pack_advertisements_with_protocol, install_fetch_pack_via_git_upload_pack,
+};
+
+mod helper;
+pub use helper::{
+    RemoteHelperCapabilities, RemoteHelperRef, RemoteHelperRefValue, RemoteHelperSession,
+    RemoteHelperSpec, imported_remote_helper_advertisements, resolve_remote_helper,
+    rewrite_remote_helper_import_stream,
 };
 
 mod proc_receive;
@@ -107,13 +119,13 @@ pub use filter::{pack_filter_from_spec, pack_filter_from_spec_for_clone};
 mod fetch;
 pub use fetch::{
     FetchOptions, FetchOutcome, FetchRequest, FetchServices, FetchSource, PruneRefsInput,
-    PrunedRef, append_reachable_auto_follow_tags, apply_configured_fetch_prune_option,
-    apply_configured_partial_clone_filter, apply_configured_remote_tag_option, fetch,
-    fetch_head_source_description,
-    fetch_refspec_excludes, fetch_refspecs_for_source, mark_tag_refspec_updates_not_for_merge,
-    order_bundle_fetch_all_tags_updates, prune_refs_from_advertisements,
-    retain_missing_auto_follow_tags, write_default_fetch_head, write_fetch_head,
-    write_fetch_head_records,
+    PrunedRef, RemoteHelperFetchRequest, append_reachable_auto_follow_tags,
+    apply_configured_fetch_prune_option, apply_configured_partial_clone_filter,
+    apply_configured_remote_tag_option, fetch, fetch_head_source_description,
+    fetch_refspec_excludes, fetch_refspecs_for_source, finalize_remote_helper_fetch,
+    mark_tag_refspec_updates_not_for_merge, order_bundle_fetch_all_tags_updates,
+    prune_refs_from_advertisements, retain_missing_auto_follow_tags, write_default_fetch_head,
+    write_fetch_head, write_fetch_head_records,
 };
 
 mod pack;
@@ -130,9 +142,9 @@ pub use push::{
     apply_receive_pack_report_to_push_refs, execute_push_action_plan, execute_push_plan,
     local_push_source_refs, normalize_push_refname, normalize_push_refspec, plan_push,
     plan_push_actions, push, push_actions, push_local_uses_receive_pack_server,
-    push_local_with_report, run_local_push_post_hooks, push_url_for_display,
-    read_receive_pack_push_report, reject_non_fast_forward_pushes, stage_local_push_quarantine,
-    validate_receive_pack_report, validate_receive_pack_unpack,
+    push_local_with_report, push_local_with_report_and_objects, push_url_for_display,
+    read_receive_pack_push_report, reject_non_fast_forward_pushes, run_local_push_post_hooks,
+    stage_local_push_quarantine, validate_receive_pack_report, validate_receive_pack_unpack,
 };
 
 mod ls_remote;
@@ -147,7 +159,7 @@ mod bundle_uri;
 pub use bundle_uri::{
     BundleUriEntry, BundleUriList, bundle_uri_fetch_order, handshake_advertises_bundle_uri,
     http_remote_bundle_uri_list, parse_bundle_uri_line, prefetch_advertised_bundle_uris,
-    transfer_bundle_uri_enabled,
+    prefetch_advertised_bundle_uris_with_client, transfer_bundle_uri_enabled,
 };
 
 mod shallow;
@@ -217,7 +229,7 @@ impl CredentialProvider for NoCredentials {
 }
 
 /// Receives human-facing progress and summary events from an operation (the
-/// "To <remote>" push summary, prune notices, "Cloning into…", etc.). The
+/// `To <remote>` push summary, prune notices, "Cloning into…", etc.). The
 /// orchestration returns structured outcomes regardless; this is purely for
 /// presentation, so the default implementations discard everything.
 pub trait ProgressSink {
@@ -326,6 +338,7 @@ mod tests {
             deepen_since: None,
             deepen_not: Vec::new(),
             ssh_options: None,
+            upload_pack_command: None,
             atomic: false,
             negotiation_restrict: None,
             negotiation_include: None,
@@ -455,6 +468,8 @@ mod tests {
             quiet: true,
             force: false,
             thin: PushThinMode::Auto,
+            atomic: false,
+            push_options: Vec::new(),
         };
         let mut progress = SilentProgress;
 
@@ -618,6 +633,7 @@ mod tests {
             branch_explicit: true,
             ref_storage: sley_formats::RefStorageFormat::Files,
             ssh_options: None,
+            upload_pack_command: None,
             reject_shallow: false,
         };
         let mut clone_credentials = NoCredentials;

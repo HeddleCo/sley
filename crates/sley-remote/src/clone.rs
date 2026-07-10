@@ -42,7 +42,7 @@ use sley_odb::{FileObjectDatabase, ObjectReader};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate};
 use sley_transport::RemoteUrl;
 
-use crate::fetch::{fetch, FetchOptions, FetchSource};
+use crate::fetch::{FetchOptions, FetchSource, fetch};
 use crate::{CredentialProvider, ProgressSink};
 
 /// Internal placeholder branch used while clone initializes before it knows
@@ -124,6 +124,8 @@ pub struct CloneOptions<'a> {
     /// SSH command-line shape for the clone's internal fetch, used for
     /// clone-only flags like `-4`/`-6`.
     pub ssh_options: Option<crate::ssh::SshTransportOptions>,
+    /// Explicit SSH upload-pack program selected by clone's `--upload-pack`.
+    pub upload_pack_command: Option<&'a str>,
     /// Refuse cloning from a shallow source (`--reject-shallow`).
     pub reject_shallow: bool,
 }
@@ -206,6 +208,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
     let layout = RepositoryBootstrap::init(InitOptions {
         git_dir_override: request.git_dir_override.map(Path::to_path_buf),
         core_worktree: request.core_worktree.map(str::to_string),
+        object_dir: None,
         worktree: request.destination.to_path_buf(),
         object_format: request.format,
         object_format_explicit: false,
@@ -252,15 +255,16 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
             common_git_dir: remote_common_git_dir.clone(),
         },
     };
-    let fetch_options = clone_fetch_options(
-        request.options.depth,
-        request.options.deepen_since,
-        request.options.deepen_not.clone(),
-        request.options.filter.clone(),
-        !request.options.checkout,
-        request.options.reject_shallow,
-        request.options.ssh_options,
-    );
+    let fetch_options = clone_fetch_options(CloneFetchOptions {
+        depth: request.options.depth,
+        deepen_since: request.options.deepen_since,
+        deepen_not: request.options.deepen_not.clone(),
+        filter: request.options.filter.clone(),
+        record_promisor_refs: !request.options.checkout,
+        reject_shallow: request.options.reject_shallow,
+        ssh_options: request.options.ssh_options,
+        upload_pack_command: request.options.upload_pack_command,
+    });
     fetch(
         crate::fetch::FetchRequest {
             git_dir: &git_dir,
@@ -611,10 +615,8 @@ fn collect_tree_materialization_wants(
             collect_tree_materialization_wants(
                 remote_db, local_db, format, entry.oid, seen, wants,
             )?;
-        } else if !entry.is_gitlink() {
-            if seen.insert(entry.oid) && !local_db.contains(&entry.oid)? {
-                wants.push(entry.oid);
-            }
+        } else if !entry.is_gitlink() && seen.insert(entry.oid) && !local_db.contains(&entry.oid)? {
+            wants.push(entry.oid);
         }
     }
     Ok(())
@@ -624,7 +626,7 @@ fn collect_tree_materialization_wants(
 /// `FETCH_HEAD`, the requested shallow `depth`, and otherwise neutral (no prune, no
 /// `--tags`, not a dry run, not appending). Mirrors the options the CLI's clone
 /// paths passed.
-fn clone_fetch_options(
+struct CloneFetchOptions<'a> {
     depth: Option<u32>,
     deepen_since: Option<i64>,
     deepen_not: Vec<String>,
@@ -632,7 +634,20 @@ fn clone_fetch_options(
     record_promisor_refs: bool,
     reject_shallow: bool,
     ssh_options: Option<crate::ssh::SshTransportOptions>,
-) -> FetchOptions {
+    upload_pack_command: Option<&'a str>,
+}
+
+fn clone_fetch_options(options: CloneFetchOptions<'_>) -> FetchOptions {
+    let CloneFetchOptions {
+        depth,
+        deepen_since,
+        deepen_not,
+        filter,
+        record_promisor_refs,
+        reject_shallow,
+        ssh_options,
+        upload_pack_command,
+    } = options;
     FetchOptions {
         quiet: true,
         auto_follow_tags: true,
@@ -660,6 +675,7 @@ fn clone_fetch_options(
         deepen_since,
         deepen_not,
         ssh_options,
+        upload_pack_command: upload_pack_command.map(str::to_string),
         atomic: false,
         negotiation_restrict: None,
         negotiation_include: None,

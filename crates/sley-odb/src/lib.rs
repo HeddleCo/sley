@@ -5,8 +5,8 @@
 use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 use sley_object::{EncodedObject, ObjectType};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 mod install;
 mod loose;
@@ -61,13 +61,26 @@ pub trait ObjectWriter {
     fn write_object(&self, object: EncodedObject) -> Result<ObjectId>;
 }
 
-pub(crate) fn implied_empty_tree_object(format: ObjectFormat, oid: &ObjectId) -> Option<Arc<EncodedObject>> {
-    (*oid == ObjectId::empty_tree(format)).then(|| Arc::new(EncodedObject::new(ObjectType::Tree, Vec::new())))
+pub(crate) fn implied_empty_tree_object(
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Option<Arc<EncodedObject>> {
+    (*oid == ObjectId::empty_tree(format))
+        .then(|| Arc::new(EncodedObject::new(ObjectType::Tree, Vec::new())))
 }
 
-pub(crate) fn with_missing_object_context(err: GitError, oid: ObjectId, context: MissingObjectContext) -> GitError {
-    let kind = err.not_found_kind().and_then(sley_core::NotFoundKind::missing_object_kind);
-    match kind { Some(kind) => GitError::object_kind_not_found_in(oid, kind, context), None => err }
+pub(crate) fn with_missing_object_context(
+    err: GitError,
+    oid: ObjectId,
+    context: MissingObjectContext,
+) -> GitError {
+    let kind = err
+        .not_found_kind()
+        .and_then(sley_core::NotFoundKind::missing_object_kind);
+    match kind {
+        Some(kind) => GitError::object_kind_not_found_in(oid, kind, context),
+        None => err,
+    }
 }
 
 /// Parents of a parsed commit with the graft seam applied: empty when the
@@ -89,17 +102,16 @@ pub(crate) fn unique_temp_path(parent: &Path) -> PathBuf {
     parent.join(format!("tmp_obj_{}_{}", std::process::id(), id))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
-    use std::io::Read;
-    use std::fs;
     use sley_core::BString;
-    use sley_formats::{Bundle, BundleReference, RepositoryLayout};
+    use sley_formats::Bundle;
     use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntry};
-    use sley_pack::{MultiPackIndex, PackFile, PackIndex, PackWrite, PackWriteOptions};
+    use sley_pack::{MultiPackIndex, PackBitmapIndex, PackFile, PackIndex, PackWriteOptions};
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::io::Read;
 
     fn blob_of(byte: u8, len: usize) -> EncodedObject {
         EncodedObject::new(ObjectType::Blob, vec![byte; len])
@@ -115,6 +127,64 @@ mod tests {
             .expect("test operation should succeed")
             .as_ref()
             .clone()
+    }
+
+    #[test]
+    fn injected_replacements_affect_reads_but_not_raw_enumeration() {
+        let root = temp_root("replacement_reads");
+        let db = FileObjectDatabase::new(root.join("objects"), ObjectFormat::Sha1);
+        let original = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"original".to_vec()))
+            .expect("write original");
+        let replacement = db
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"replacement".to_vec(),
+            ))
+            .expect("write replacement");
+        let replacing = db
+            .clone()
+            .with_replacements(ObjectReplacements::new([(original, replacement)]));
+
+        assert_eq!(
+            replacing
+                .read_object(&original)
+                .expect("replacement read")
+                .body,
+            b"replacement"
+        );
+        assert_eq!(
+            replacing
+                .read_object_header(&original)
+                .expect("replacement header"),
+            Some((ObjectType::Blob, 11))
+        );
+        let ids = replacing.object_ids().expect("raw object enumeration");
+        assert!(ids.contains(&original));
+        assert!(ids.contains(&replacement));
+        assert_eq!(
+            db.read_object(&original).expect("raw read").body,
+            b"original"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replacement_policy_rejects_cycles() {
+        let first = sley_core::digest_bytes(ObjectFormat::Sha1, b"first").expect("first oid");
+        let second = sley_core::digest_bytes(ObjectFormat::Sha1, b"second").expect("second oid");
+        let replacements = ObjectReplacements::new([(first, second), (second, first)]);
+        assert!(matches!(
+            replacements.resolve(&first),
+            Err(GitError::InvalidObject(message)) if message.contains("replace depth too high")
+        ));
+    }
+
+    #[test]
+    fn replacement_policy_treats_identity_mapping_as_noop() {
+        let oid = sley_core::digest_bytes(ObjectFormat::Sha1, b"identity").expect("identity oid");
+        let replacements = ObjectReplacements::new([(oid, oid)]);
+        assert_eq!(replacements.resolve(&oid).expect("identity mapping"), oid);
     }
 
     #[test]
@@ -1183,7 +1253,8 @@ mod tests {
             .expect_err("oversized stream should be rejected");
 
         assert!(
-            err.to_string().contains("pack exceeds maximum allowed size"),
+            err.to_string()
+                .contains("pack exceeds maximum allowed size"),
             "unexpected error: {err}"
         );
         let temp_files = fs::read_dir(&pack_dir)
@@ -1209,11 +1280,7 @@ mod tests {
                 entries
                     .filter_map(|entry| entry.ok())
                     .filter(|entry| {
-                        entry
-                            .path()
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            == Some("pack")
+                        entry.path().extension().and_then(|ext| ext.to_str()) == Some("pack")
                     })
                     .count()
             })
@@ -1979,6 +2046,43 @@ mod tests {
     }
 
     #[test]
+    fn object_presence_checker_can_hold_a_closed_world_snapshot() {
+        let root = temp_root("sley-presence-checker-closed-world");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let object = EncodedObject::new(ObjectType::Blob, b"added after snapshot\n".to_vec());
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let mut checker = db.presence_checker();
+        assert!(
+            !checker
+                .contains_without_refresh(&oid)
+                .expect("test operation should succeed")
+        );
+
+        // A separate handle simulates an out-of-band writer whose loose-cache
+        // update is not shared with the checker. Closed-world mode deliberately
+        // holds the miss until the caller requests normal refresh semantics.
+        FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1)
+            .write_object(object)
+            .expect("test operation should succeed");
+        assert!(
+            !checker
+                .contains_without_refresh(&oid)
+                .expect("test operation should succeed")
+        );
+        assert!(
+            checker
+                .contains(&oid)
+                .expect("test operation should succeed")
+        );
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
     fn file_database_pack_registry_loads_indexes_lazily_and_refreshes_after_count_change() {
         let root = temp_root("sley-file-odb-pack-registry-refresh");
         let git_dir = root.join(".git");
@@ -2001,10 +2105,7 @@ mod tests {
         assert_eq!(first_registry.fingerprint.idx_count, 1);
         assert_eq!(first_registry.fingerprint.pack_count, 1);
         assert_eq!(first_registry.packs.len(), 1);
-        assert!(
-            first_registry.packs[0]
-                .index.read().is_none()
-        );
+        assert!(first_registry.packs[0].index.read().is_none());
         assert!(
             first_registry.packs[0]
                 .data
@@ -2019,10 +2120,7 @@ mod tests {
             db.contains(&first_oid)
                 .expect("test operation should succeed")
         );
-        assert!(
-            first_registry.packs[0]
-                .index.read().is_some()
-        );
+        assert!(first_registry.packs[0].index.read().is_some());
         assert!(
             first_registry.packs[0]
                 .data
@@ -2402,6 +2500,111 @@ mod tests {
     }
 
     #[test]
+    fn reachable_repack_reuses_exact_single_pack_bytes() {
+        let root = temp_root("sley-repack-reuse-exact-pack");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let graph = write_commit_graph(&mut db, b"exact pack reuse\n");
+        let commit_oid = graph[0].0;
+        let objects = graph
+            .iter()
+            .map(|(_oid, object)| object.clone())
+            .collect::<Vec<_>>();
+        let undeltified = PackFile::write_undeltified(&objects, format)
+            .expect("write deliberately undeltified source pack");
+        db.install_pack(&undeltified).expect("install source pack");
+        for (oid, _object) in &graph {
+            fs::remove_file(db.loose().object_path(oid).expect("loose path"))
+                .expect("remove duplicate loose object");
+        }
+
+        let result = repack_reachable_objects(&git_dir, format, &[commit_oid])
+            .expect("repack exact reachable set")
+            .expect("reachable objects exist");
+
+        assert_eq!(result.pack, undeltified.pack);
+        assert_eq!(result.idx, undeltified.index);
+        assert_eq!(result.object_count, graph.len());
+        assert!(result.obsolete_packs.is_empty());
+
+        fs::remove_dir_all(root).expect("remove test repository");
+    }
+
+    #[test]
+    fn reachable_repack_does_not_reuse_pack_with_unreachable_object() {
+        let root = temp_root("sley-repack-no-reuse-unreachable");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let graph = write_commit_graph(&mut db, b"reachable payload\n");
+        let commit_oid = graph[0].0;
+        let unreachable = EncodedObject::new(ObjectType::Blob, b"unreachable\n".to_vec());
+        let mut objects = graph
+            .iter()
+            .map(|(_oid, object)| object.clone())
+            .collect::<Vec<_>>();
+        objects.push(unreachable);
+        let source = PackFile::write_undeltified(&objects, format)
+            .expect("write source pack containing unreachable object");
+        db.install_pack(&source).expect("install source pack");
+        for (oid, _object) in &graph {
+            fs::remove_file(db.loose().object_path(oid).expect("loose path"))
+                .expect("remove duplicate loose object");
+        }
+
+        let result = repack_reachable_objects(&git_dir, format, &[commit_oid])
+            .expect("repack reachable subset")
+            .expect("reachable objects exist");
+
+        assert_eq!(result.object_count, graph.len());
+        assert_ne!(result.pack, source.pack);
+        assert_eq!(result.obsolete_packs.len(), 1);
+
+        fs::remove_dir_all(root).expect("remove test repository");
+    }
+
+    #[test]
+    fn reachable_repack_force_rewrite_bypasses_exact_pack_reuse() {
+        let root = temp_root("sley-repack-force-rewrite-exact-pack");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let graph = write_commit_graph(&mut db, b"forced rewrite\n");
+        let commit_oid = graph[0].0;
+        let mut objects = graph
+            .iter()
+            .map(|(_oid, object)| object.clone())
+            .collect::<Vec<_>>();
+        objects.reverse();
+        let source = PackFile::write_undeltified(&objects, format)
+            .expect("write source pack in reverse object order");
+        db.install_pack(&source).expect("install source pack");
+        for (oid, _object) in &graph {
+            fs::remove_file(db.loose().object_path(oid).expect("loose path"))
+                .expect("remove duplicate loose object");
+        }
+        let options = RepackOptions {
+            force_rewrite: true,
+            ..RepackOptions::default()
+        };
+
+        let result =
+            repack_reachable_objects_with_options(&git_dir, format, &[commit_oid], &options)
+                .expect("force rewrite reachable set")
+                .expect("reachable objects exist");
+
+        assert_eq!(result.object_count, graph.len());
+        assert_ne!(result.pack, source.pack);
+        assert_eq!(result.obsolete_packs.len(), 1);
+
+        fs::remove_dir_all(root).expect("remove test repository");
+    }
+
+    #[test]
     fn install_repack_result_writes_pack_without_pruning_by_default() {
         let root = temp_root("sley-repack-install-nodelete");
         let git_dir = root.join(".git");
@@ -2433,6 +2636,52 @@ mod tests {
             );
             assert_eq!(read_object_for_assert(&db, oid), *object);
         }
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn install_repack_bitmap_uses_retained_objects_and_writes_valid_index() {
+        let root = temp_root("sley-repack-install-bitmap-cache");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let graph = write_commit_graph(&mut db, b"bitmap cache\n");
+        let commit_oid = graph[0].0;
+
+        let result = repack_all_objects(&git_dir, format)
+            .expect("test operation should succeed")
+            .expect("repository has objects");
+        // Prove bitmap construction uses the objects retained by the repack
+        // result: the pre-repack loose database is no longer available as a
+        // fallback when the bitmap closure is walked.
+        fs::remove_dir_all(git_dir.join("objects")).expect("remove loose database");
+        fs::create_dir_all(git_dir.join("objects")).expect("recreate objects directory");
+        install_repack_result_with_bitmap(
+            &git_dir,
+            format,
+            &result,
+            false,
+            Some(&HashSet::from([commit_oid])),
+            None,
+        )
+        .expect("test operation should succeed");
+
+        let checksum = PackFile::parse(&result.pack, format)
+            .expect("repacked objects are valid")
+            .checksum;
+        let bitmap_path = git_dir
+            .join("objects")
+            .join("pack")
+            .join(format!("pack-{}.bitmap", checksum.to_hex()));
+        let bitmap = fs::read(bitmap_path).expect("bitmap was written");
+        let parsed = PackBitmapIndex::parse(&bitmap, format, result.object_count)
+            .expect("bitmap index is valid");
+        assert!(
+            !parsed.entries.is_empty(),
+            "the commit tip should receive a bitmap"
+        );
 
         fs::remove_dir_all(root).expect("test operation should succeed");
     }

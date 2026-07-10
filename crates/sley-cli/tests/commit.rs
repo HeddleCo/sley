@@ -1619,6 +1619,84 @@ fn commit_amend_matches_upstream_git_objects() {
 }
 
 #[test]
+fn commit_amend_with_pathspec_matches_upstream_git() {
+    let root = unique_temp_dir("commit-amend-pathspec");
+    let expected_root = root.join("expected");
+    let actual_root = root.join("actual");
+    for repo in [&expected_root, &actual_root] {
+        fs::create_dir_all(repo).expect("create repository");
+        run_success(
+            sley_testkit::oracle_git(),
+            repo,
+            &["init", "-q", "-b", "main"],
+        );
+        fs::write(repo.join("selected"), b"base\n").expect("write selected base");
+        fs::write(repo.join("other"), b"base\n").expect("write other base");
+        run_success(
+            sley_testkit::oracle_git(),
+            repo,
+            &["add", "selected", "other"],
+        );
+        let output = run_output_with_identity(
+            sley_testkit::oracle_git(),
+            repo,
+            &["commit", "-q", "-m", "base"],
+        );
+        assert!(output.status.success());
+
+        fs::write(repo.join("selected"), b"old selected\n").expect("write old selected");
+        fs::write(repo.join("other"), b"old other\n").expect("write old other");
+        run_success(
+            sley_testkit::oracle_git(),
+            repo,
+            &["add", "selected", "other"],
+        );
+        let output = run_output_with_identity(
+            sley_testkit::oracle_git(),
+            repo,
+            &["commit", "-q", "-m", "old"],
+        );
+        assert!(output.status.success());
+
+        fs::write(repo.join("selected"), b"amended selected\n").expect("amend selected");
+        fs::write(repo.join("other"), b"staged but excluded\n").expect("stage excluded path");
+        run_success(sley_testkit::oracle_git(), repo, &["add", "other"]);
+    }
+
+    let args = ["commit", "--amend", "-q", "-m", "amended", "selected"];
+    let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
+    assert!(
+        expected.status.success(),
+        "git amend failed: {}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &actual_root, &args);
+    assert!(
+        actual.status.success(),
+        "sley amend failed: {}",
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert_eq!(
+        cat_head(sley_testkit::oracle_git(), &actual_root),
+        cat_head(sley_testkit::oracle_git(), &expected_root),
+        "amended commit object differs"
+    );
+    let expected_index = run_output(
+        sley_testkit::oracle_git(),
+        &expected_root,
+        &["diff", "--cached", "--raw"],
+    );
+    let actual_index = run_output(
+        sley_testkit::oracle_git(),
+        &actual_root,
+        &["diff", "--cached", "--raw"],
+    );
+    assert_eq!(actual_index.stdout, expected_index.stdout);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn commit_fixup_matches_upstream_git_objects() {
     let root = unique_temp_dir("commit-fixup");
     fs::create_dir_all(&root).expect("create temp root");
@@ -1997,6 +2075,49 @@ fn commit_tree_file_messages_match_upstream_git() {
         let actual = run_output_with_identity(sley_testkit::sley_bin!(), &root, &args);
         assert_same_output(actual, expected, &args);
     };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn commit_tree_duplicate_parent_matches_upstream_git() {
+    let root = unique_temp_dir("commit-tree-duplicate-parent");
+    let expected_root = root.join("expected");
+    let actual_root = root.join("actual");
+    fs::create_dir_all(&expected_root).expect("create expected repo");
+    fs::create_dir_all(&actual_root).expect("create actual repo");
+
+    for repo in [&expected_root, &actual_root] {
+        run_success(
+            sley_testkit::oracle_git(),
+            repo,
+            &["init", "-q", "-b", "main"],
+        );
+    }
+    let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    let parent = run_output_with_identity(
+        sley_testkit::oracle_git(),
+        &expected_root,
+        &["commit-tree", empty_tree, "-mparent"],
+    );
+    assert!(parent.status.success());
+    let parent = String::from_utf8(parent.stdout)
+        .expect("parent oid utf8")
+        .trim()
+        .to_owned();
+
+    let args = [
+        "commit-tree",
+        empty_tree,
+        "-p",
+        parent.as_str(),
+        "-p",
+        parent.as_str(),
+        "-mchild",
+    ];
+    let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &actual_root, &args);
+    assert_same_output(actual, expected, &args);
+
     let _ = fs::remove_dir_all(&root);
 }
 

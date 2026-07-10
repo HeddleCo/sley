@@ -133,6 +133,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let mut intent_to_add = false;
     let mut sparse = false;
     let mut refresh = false;
+    let mut renormalize = false;
     let mut warn_embedded_repos = true;
     let mut chmod = None;
     let mut pathspec_from_file: Option<PathBuf> = None;
@@ -173,6 +174,8 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             "--no-ignore-missing" => ignore_missing = false,
             "--refresh" => refresh = true,
             "--no-refresh" => refresh = false,
+            "--renormalize" => renormalize = true,
+            "--no-renormalize" => renormalize = false,
             "-N" | "--intent-to-add" => intent_to_add = true,
             "--no-intent-to-add" => intent_to_add = false,
             "--chmod" => {
@@ -318,6 +321,28 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         sparse,
         refresh,
     )?;
+    if renormalize {
+        let tracked_paths =
+            resolve_add_renormalize_paths(&cwd, &worktree_root, &git_dir, format, &paths)?;
+        if dry_run {
+            let actions = tracked_paths
+                .into_iter()
+                .map(AddAction::Add)
+                .collect::<Vec<_>>();
+            print_add_actions(&worktree_root, &actions)?;
+            return Ok(());
+        }
+        let config = read_repo_config(&git_dir)?;
+        sley_worktree::renormalize_index_paths_filtered(
+            &worktree_root,
+            &git_dir,
+            format,
+            &tracked_paths,
+            &config,
+        )?;
+        commands::hooks::run_post_index_change_hook(false, false)?;
+        return Ok(());
+    }
     if refresh {
         refresh_index_after_add(&cwd, &worktree_root, &git_dir, format, &paths, true)?;
         return Ok(());
@@ -450,7 +475,14 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             }
         }
         if do_refresh {
-            refresh_index_after_add(&cwd, &worktree_root, &git_dir, format, &refresh_paths, false)?;
+            refresh_index_after_add(
+                &cwd,
+                &worktree_root,
+                &git_dir,
+                format,
+                &refresh_paths,
+                false,
+            )?;
         }
         if verbose {
             print_add_actions(&worktree_root, &actions)?;
@@ -595,7 +627,14 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         }
     }
     if do_refresh && !add_refresh_is_redundant(&worktree_root, &refresh_paths, &actions) {
-        refresh_index_after_add(&cwd, &worktree_root, &git_dir, format, &refresh_paths, false)?;
+        refresh_index_after_add(
+            &cwd,
+            &worktree_root,
+            &git_dir,
+            format,
+            &refresh_paths,
+            false,
+        )?;
     }
     if verbose {
         print_add_actions(&worktree_root, &actions)?;
@@ -810,7 +849,10 @@ fn refresh_index_after_add(
         let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
             if strict_pathspec {
                 for path in refresh_paths {
-                    eprintln!("fatal: pathspec '{}' did not match any files", path.to_string_lossy());
+                    eprintln!(
+                        "fatal: pathspec '{}' did not match any files",
+                        path.to_string_lossy()
+                    );
                 }
                 return Err(GitError::Exit(128));
             }
@@ -823,7 +865,10 @@ fn refresh_index_after_add(
                 continue;
             }
             if compiled.matches(entry.path.as_bytes()) {
-                selected.push(worktree_path_from_git_path(worktree_root, entry.path.as_bytes())?);
+                selected.push(worktree_path_from_git_path(
+                    worktree_root,
+                    entry.path.as_bytes(),
+                )?);
             }
         }
         if strict_pathspec && let Some(spec) = compiled.unmatched_includes().next() {
@@ -1186,6 +1231,38 @@ impl AddCompiledPathspecs {
     }
 }
 
+/// Resolve `git add --renormalize` exclusively against stage-0 index entries.
+/// Renormalization implies `-u`: tracked deletions remain selected for removal,
+/// while untracked filesystem matches are never introduced.
+fn resolve_add_renormalize_paths(
+    cwd: &Path,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    let mut compiled = AddCompiledPathspecs::parse(cwd, worktree_root, paths)?;
+    let index = sley_worktree::read_repository_index(git_dir, format)?;
+    let mut selected = Vec::new();
+    if let Some(index) = index {
+        for entry in index
+            .entries
+            .iter()
+            .filter(|entry| entry.stage() == sley_index::Stage::Normal)
+        {
+            let git_path = entry.path.as_bytes();
+            if compiled.matches(git_path) {
+                selected.push(worktree_path_from_git_path(worktree_root, git_path)?);
+            }
+        }
+    }
+    for spec in compiled.unmatched_includes() {
+        eprintln!("fatal: pathspec '{}' did not match any files", spec.display);
+        return Err(GitError::Exit(128));
+    }
+    Ok(selected)
+}
+
 fn add_pathspec_arg_for_matcher(worktree_root: &Path, path: &Path) -> Result<String> {
     if !path.is_absolute() {
         return Ok(path.to_string_lossy().into_owned());
@@ -1223,7 +1300,10 @@ fn normalize_add_pathspec_absolute_path_lexically(path: &Path) -> PathBuf {
     normalized
 }
 
-fn case_insensitive_existing_path_under_worktree(worktree_root: &Path, absolute: &Path) -> Option<PathBuf> {
+fn case_insensitive_existing_path_under_worktree(
+    worktree_root: &Path,
+    absolute: &Path,
+) -> Option<PathBuf> {
     if !absolute.exists() {
         return None;
     }
@@ -1319,8 +1399,27 @@ fn resolve_add_regular_actions(
     let mut seen = BTreeSet::new();
     let mut ignored_paths = BTreeSet::new();
     let _ignore_errors = options.ignore_errors;
+    // A pathspec is matched by an unchanged tracked file too. The status stream
+    // intentionally omits such files, so mark index matches independently
+    // without turning them into staging actions. This is what lets commands
+    // such as `git add --ignore-errors '*.txt'` succeed as a no-op.
+    let indexed_paths = add_all_index_paths(git_dir, format, reusable_index.as_ref())?;
+    for indexed_path in &indexed_paths {
+        let path_matches = compiled_pathspecs.matches(indexed_path);
+        if !path_matches {
+            continue;
+        }
+        if !compiled_pathspecs.have_include() {
+            for matched in &mut matched {
+                *matched = true;
+            }
+        } else {
+            for idx in compiled_pathspecs.matched_include_indexes() {
+                matched[idx] = true;
+            }
+        }
+    }
     if !options.force {
-        let indexed_paths = add_all_index_paths(git_dir, format, reusable_index.as_ref())?;
         for (idx, ignored_path) in collect_add_ignored_pathspec_matches(
             worktree_root,
             git_dir,

@@ -9,7 +9,7 @@
 //!   [`config::SubmoduleConfigSet`] of typed [`config::Submodule`] entries, plus
 //!   the `check_submodule_name` / `check_submodule_url` security checks and the
 //!   recurse-mode / update-strategy enums.
-//! - [`relative_url`] — the `.gitmodules`-url → concrete-url resolution
+//! - [`relative_url()`] — the `.gitmodules`-url → concrete-url resolution
 //!   (`remote.c::relative_url` + `submodule--helper.c::resolve_relative_url`).
 //!   `submodule init` / `sync` / `add` all route their relative-url math through
 //!   this one primitive so every git URL form (ssh, scp-style, file://, helper,

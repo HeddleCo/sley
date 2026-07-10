@@ -897,11 +897,7 @@ fn save_todo(ctx: &Ctx, todo: &TodoList, db: &FileObjectDatabase, reschedule: bo
     )?;
     if !reschedule && next > 0 {
         let line = serialize_item(ctx, &todo.items[next - 1], false, false, db);
-        let done_path = ctx.state_path("done");
-        let mut existing = fs::read(&done_path).unwrap_or_default();
-        existing.extend_from_slice(line.as_bytes());
-        existing.push(b'\n');
-        fs::write(done_path, existing)?;
+        seq::append_done_line(&ctx.git_dir, line.as_bytes())?;
     }
     Ok(())
 }
@@ -961,7 +957,12 @@ fn missing_commit_check_level(ctx: &Ctx) -> MissingCommitCheck {
 }
 
 fn rebase_config_value(ctx: &Ctx, section: &str, key: &str) -> Option<String> {
-    let config = read_repo_config(&ctx.git_dir).ok()?;
+    // A linked worktree's administrative gitdir contains HEAD/index/rebase
+    // state, while repository configuration remains in the common gitdir.
+    // Reading `<worktrees/name>/config` silently loses settings such as
+    // sequence.editor, causing an interactive rebase in a linked worktree to
+    // ignore its configured todo editor entirely.
+    let config = read_repo_config(&ctx.common_git_dir).ok()?;
     config.get(section, None, key).map(str::to_string)
 }
 
@@ -4252,6 +4253,10 @@ fn custom_rebase_strategy_needs_external_driver(strategy: &str) -> bool {
     !matches!(strategy, "ort" | "recursive" | "resolve")
 }
 
+fn is_unimplemented_git_core_merge_strategy(strategy: &str) -> bool {
+    matches!(strategy, "octopus" | "one-file" | "ours" | "subtree")
+}
+
 fn custom_strategy_args(
     opts: &MachineOpts,
     base: ObjectId,
@@ -4278,6 +4283,11 @@ fn run_custom_rebase_strategy(
     head: ObjectId,
     merge_head: ObjectId,
 ) -> Result<i32> {
+    if is_unimplemented_git_core_merge_strategy(strategy) {
+        return Err(GitError::Unsupported(format!(
+            "merge strategy '{strategy}' is a Git core helper without a native Sley implementation"
+        )));
+    }
     let status = std::process::Command::new(format!("git-merge-{strategy}"))
         .args(custom_strategy_args(opts, base, head, merge_head))
         .current_dir(&ctx.worktree_root)
@@ -5307,7 +5317,23 @@ fn stop_with_patch(
         .unwrap_or_default();
     fs::write(ctx.state_path("patch"), patch)?;
 
-    if !ctx.state_path("message").exists() {
+    if to_amend {
+        // An `edit` command has already created the rewritten commit.  Resume
+        // must amend that commit with its *current* message, not the original
+        // pre-rebase message.  The distinction is observable with options that
+        // transform the message while picking (notably `rebase --signoff`):
+        // saving `record.commit.message` here made the subsequent `--continue`
+        // silently discard the trailer.  Reading HEAD also preserves any
+        // editor-driven message change made by the commit step itself.
+        let head = head_commit_oid(&ctx.refs())?
+            .ok_or_else(|| GitError::Command("cannot read HEAD after edit".into()))?;
+        let head_record = read_rev_list_commit_record(db, ctx.format, head)?;
+        let mut message = head_record.commit.message;
+        if !message.ends_with(b"\n") {
+            message.push(b'\n');
+        }
+        fs::write(ctx.state_path("message"), message)?;
+    } else if !ctx.state_path("message").exists() {
         let mut message = record.commit.message.clone();
         if !message.ends_with(b"\n") {
             message.push(b'\n');
@@ -6730,4 +6756,27 @@ fn print_autostash_conflict_advice() {
 fn cleanup_autostash_and_state(ctx: &Ctx) {
     apply_autostash(ctx);
     seq::remove_merge_state(&ctx.git_dir);
+}
+
+#[cfg(test)]
+mod native_strategy_tests {
+    use super::{
+        custom_rebase_strategy_needs_external_driver, is_unimplemented_git_core_merge_strategy,
+    };
+
+    #[test]
+    fn git_core_merge_helpers_never_fall_through_to_path() {
+        for strategy in ["octopus", "one-file", "ours", "subtree"] {
+            assert!(custom_rebase_strategy_needs_external_driver(strategy));
+            assert!(is_unimplemented_git_core_merge_strategy(strategy));
+        }
+        for strategy in ["ort", "recursive", "resolve"] {
+            assert!(!custom_rebase_strategy_needs_external_driver(strategy));
+            assert!(!is_unimplemented_git_core_merge_strategy(strategy));
+        }
+        assert!(custom_rebase_strategy_needs_external_driver(
+            "custom-driver"
+        ));
+        assert!(!is_unimplemented_git_core_merge_strategy("custom-driver"));
+    }
 }

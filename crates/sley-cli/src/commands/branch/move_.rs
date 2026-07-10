@@ -3,7 +3,7 @@
 use super::config::{copy_branch_config, rename_branch_config};
 use super::delete::branch_checked_out_worktree_path;
 use super::operand::{
-    branch_resolve_local_branch_operand, validate_branch_creation_name, BranchOperandKind,
+    BranchOperandKind, branch_resolve_local_branch_operand, validate_branch_creation_name,
 };
 use crate::*;
 
@@ -195,7 +195,11 @@ pub(super) fn any_worktree_head_points_at(git_dir: &Path, refname: &str) -> Resu
     Ok(!worktree_head_paths(git_dir, refname)?.is_empty())
 }
 
-pub(super) fn update_all_worktree_heads(git_dir: &Path, old_ref: &str, new_ref: &str) -> Result<()> {
+pub(super) fn update_all_worktree_heads(
+    git_dir: &Path,
+    old_ref: &str,
+    new_ref: &str,
+) -> Result<()> {
     let mut failed = false;
     for head_path in worktree_head_paths(git_dir, old_ref)? {
         if head_path.with_file_name("HEAD.lock").exists() {
@@ -243,7 +247,10 @@ pub(super) fn worktree_head_paths(git_dir: &Path, refname: &str) -> Result<Vec<P
     Ok(heads)
 }
 
-pub(super) fn branch_reflog_committer_identity(store: &FileRefStore, branch: &str) -> Result<Vec<u8>> {
+pub(super) fn branch_reflog_committer_identity(
+    store: &FileRefStore,
+    branch: &str,
+) -> Result<Vec<u8>> {
     if env::var("GIT_COMMITTER_DATE").is_ok() {
         return commit_identity_from_env("COMMITTER");
     }

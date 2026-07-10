@@ -5,8 +5,8 @@
 //! permutations here before the full argv table lands post-W90.
 
 use super::list::{
-    branch_remote_or_all_mode_unchecked, print_branch_list, print_branch_list_matching,
-    print_branch_list_remote_or_all_flag, BranchListMode,
+    BranchListMode, branch_remote_or_all_mode_unchecked, print_branch_list,
+    print_branch_list_matching, print_branch_list_remote_or_all_flag,
 };
 use crate::*;
 

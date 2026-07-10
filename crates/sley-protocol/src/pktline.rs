@@ -299,7 +299,9 @@ pub fn parse_pkt_line_stream(mut input: &[u8]) -> Result<Vec<PktLineFrame>> {
     Ok(frames)
 }
 
-pub(crate) fn parse_pkt_line_frames_until_flush_from(mut input: &[u8]) -> Result<(Vec<PktLineFrame>, usize)> {
+pub(crate) fn parse_pkt_line_frames_until_flush_from(
+    mut input: &[u8],
+) -> Result<(Vec<PktLineFrame>, usize)> {
     let mut frames = Vec::new();
     let mut total = 0usize;
     loop {

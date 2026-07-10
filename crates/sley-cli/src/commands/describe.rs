@@ -80,7 +80,7 @@ pub(crate) fn describe_for_format(
         return Ok(Some(describe_tag_output_name(best, &options)));
     }
 
-    let search = describe_search(format, db, &options, &tags.by_commit, target)?;
+    let search = describe_search(git_dir, format, db, &options, &tags.by_commit, target)?;
     let Some((best, _traversed)) = search.found else {
         return Ok(None);
     };
@@ -233,6 +233,7 @@ pub(crate) fn cmd_describe(args: &[String]) -> Result<()> {
         let dirty_suffix = describe_dirty_suffix(git_dir, format, &options)?;
         let head = resolve_describe_commit(&repo, "HEAD")?;
         describe_one(
+            git_dir,
             format,
             db,
             &options,
@@ -247,7 +248,7 @@ pub(crate) fn cmd_describe(args: &[String]) -> Result<()> {
         for commit in &commits {
             match resolve_describe_target(&repo, commit)? {
                 DescribeTarget::Commit(target) => {
-                    describe_one(format, db, &options, abbrev, &tags, &target, None)?;
+                    describe_one(git_dir, format, db, &options, abbrev, &tags, &target, None)?;
                 }
                 DescribeTarget::Blob(blob) => {
                     describe_blob(git_dir, format, db, &options, abbrev, &tags, &blob)?;
@@ -612,6 +613,7 @@ struct PossibleTag<'a> {
 
 /// Describe a single target commit, printing the result (or an error per git).
 fn describe_one(
+    git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
     options: &DescribeOptions,
@@ -620,12 +622,22 @@ fn describe_one(
     target: &ObjectId,
     dirty_suffix: Option<&str>,
 ) -> Result<()> {
-    let text = describe_commit_text(format, db, options, abbrev, tags, target, dirty_suffix)?;
+    let text = describe_commit_text(
+        git_dir,
+        format,
+        db,
+        options,
+        abbrev,
+        tags,
+        target,
+        dirty_suffix,
+    )?;
     println!("{text}");
     Ok(())
 }
 
 fn describe_commit_text(
+    git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
     options: &DescribeOptions,
@@ -668,7 +680,7 @@ fn describe_commit_text(
         eprintln!("No exact match on refs or tags, searching to describe");
     }
 
-    let search = describe_search(format, db, options, &tags.by_commit, target)?;
+    let search = describe_search(git_dir, format, db, options, &tags.by_commit, target)?;
 
     let Some((best, traversed)) = search.found else {
         // No candidate tag was reachable from the target.
@@ -718,6 +730,7 @@ const MAX_FLAG_CANDIDATES: usize = 31;
 /// walk, including the `depth = seen_commits - 1` seeding, the per-commit depth
 /// increments, the early-exit, and the `finish_depth_computation` tail.
 fn describe_search<'a>(
+    git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
     options: &DescribeOptions,
@@ -732,11 +745,12 @@ fn describe_search<'a>(
     let mut queue: std::collections::BinaryHeap<DescribeQueueItem> =
         std::collections::BinaryHeap::new();
 
-    let target_date = describe_commit_date(db, format, target)?;
-    queue.push(DescribeQueueItem {
-        date: target_date,
-        oid: *target,
-    });
+    let mut metadata = sley_rev::CommitMetadataReader::new(git_dir, format, db);
+    queue.push(describe_queue_item(
+        &mut metadata,
+        target,
+        options.first_parent,
+    )?);
     seen.insert(*target);
 
     let effective_max = options.max_candidates.min(MAX_FLAG_CANDIDATES);
@@ -751,19 +765,16 @@ fn describe_search<'a>(
     let mut gave_up: Option<DescribeQueueItem> = None;
 
     while let Some(item) = queue.pop() {
-        let oid = item.oid;
         seen_commits += 1;
 
         // Stop collecting once the candidate budget (or the entire tag universe)
         // is exhausted; the winner's depth is finished separately below.
         if candidates.len() == effective_max || candidates.len() == names_size {
-            gave_up = Some(DescribeQueueItem {
-                date: item.date,
-                oid,
-            });
+            gave_up = Some(item);
             seen_commits -= 1;
             break;
         }
+        let oid = item.oid;
 
         if let Some(best) = tags.get(&oid) {
             if !describe_eligible(best, options) {
@@ -817,12 +828,14 @@ fn describe_search<'a>(
             }
         }
 
-        let parents = describe_commit_parents(db, format, &oid, options.first_parent)?;
-        for parent in parents {
+        for parent in item.parents {
             *flags.entry(parent).or_insert(0) |= commit_flags;
             if seen.insert(parent) {
-                let date = describe_commit_date(db, format, &parent)?;
-                queue.push(DescribeQueueItem { date, oid: parent });
+                queue.push(describe_queue_item(
+                    &mut metadata,
+                    &parent,
+                    options.first_parent,
+                )?);
             }
         }
     }
@@ -854,7 +867,12 @@ fn describe_search<'a>(
         queue.push(gave_up);
     }
     let extra = finish_depth_computation(
-        format, db, options, &mut queue, &mut flags, &mut seen, best_flag,
+        &mut metadata,
+        options,
+        &mut queue,
+        &mut flags,
+        &mut seen,
+        best_flag,
     )?;
     candidates[best_index].depth += extra;
 
@@ -879,8 +897,7 @@ struct DescribeSearchResult<'a> {
 /// not reachable from the winning tag still lies between the target and that
 /// tag and adds one to its depth. Returns the additional depth accumulated.
 fn finish_depth_computation(
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
+    metadata: &mut sley_rev::CommitMetadataReader<'_, FileObjectDatabase>,
     options: &DescribeOptions,
     queue: &mut std::collections::BinaryHeap<DescribeQueueItem>,
     flags: &mut HashMap<ObjectId, u32>,
@@ -907,8 +924,7 @@ fn finish_depth_computation(
             unflagged.remove(&oid);
             extra += 1;
         }
-        let parents = describe_commit_parents(db, format, &oid, options.first_parent)?;
-        for parent in parents {
+        for parent in item.parents {
             let flag_before = flags.get(&parent).copied().unwrap_or(0) & best_flag;
             let was_seen = seen.contains(&parent);
             if !was_seen {
@@ -917,8 +933,11 @@ fn finish_depth_computation(
             *flags.entry(parent).or_insert(0) |= commit_flags;
             let flag_after = flags.get(&parent).copied().unwrap_or(0) & best_flag;
             if !was_seen {
-                let date = describe_commit_date(db, format, &parent)?;
-                queue.push(DescribeQueueItem { date, oid: parent });
+                queue.push(describe_queue_item(
+                    metadata,
+                    &parent,
+                    options.first_parent,
+                )?);
                 if flag_after == 0 {
                     unflagged.insert(parent);
                 }
@@ -971,6 +990,23 @@ fn describe_no_candidate(
 struct DescribeQueueItem {
     date: i64,
     oid: ObjectId,
+    parents: Vec<ObjectId>,
+}
+
+fn describe_queue_item(
+    metadata: &mut sley_rev::CommitMetadataReader<'_, FileObjectDatabase>,
+    oid: &ObjectId,
+    first_parent: bool,
+) -> Result<DescribeQueueItem> {
+    let mut commit = metadata.get(oid)?;
+    if first_parent {
+        commit.parents.truncate(1);
+    }
+    Ok(DescribeQueueItem {
+        date: commit.commit_time,
+        oid: commit.oid,
+        parents: commit.parents,
+    })
 }
 
 impl PartialEq for DescribeQueueItem {
@@ -1118,7 +1154,16 @@ fn describe_blob(
         let object = db.read_object(&commit_oid)?;
         let commit = Commit::parse(format, &object.body)?;
         if let Some(path) = describe_find_blob_path(db, format, &commit.tree, blob)? {
-            let text = describe_commit_text(format, db, options, abbrev, tags, &commit_oid, None)?;
+            let text = describe_commit_text(
+                git_dir,
+                format,
+                db,
+                options,
+                abbrev,
+                tags,
+                &commit_oid,
+                None,
+            )?;
             println!("{text}:{path}");
             return Ok(());
         }

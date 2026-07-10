@@ -1,8 +1,8 @@
 //! Repository config read/write and remote name helpers.
 
 use crate::*;
-use std::path::{Path, PathBuf};
 use sley::plumbing::{sley_config, sley_refs};
+use std::path::{Path, PathBuf};
 
 pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
     // Single effective-config reader shared with the library crates: resolves
@@ -32,7 +32,11 @@ pub(crate) fn read_repo_config_on_disk(git_dir: &Path) -> Result<GitConfig> {
 /// [`read_repo_config`] — which reads only the repo's own `config` file — this
 /// layers the global `~/.gitconfig` and system files, as git does for settings
 /// like `branch.autosetuprebase` that are configured outside the cloned repo.
-pub(super) fn clone_effective_config_value(git_dir: &Path, section: &str, key: &str) -> Option<String> {
+pub(super) fn clone_effective_config_value(
+    git_dir: &Path,
+    section: &str,
+    key: &str,
+) -> Option<String> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir).ok()?;
     let context = sley_config::ConfigIncludeContext::new(
         Some(common_git_dir.clone()),

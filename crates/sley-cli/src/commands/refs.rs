@@ -1,11 +1,11 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
+use sley::plumbing::{sley_config, sley_formats::ReftableWriteOptions, sley_refs, sley_rev};
 use std::cell::RefCell;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use sley::plumbing::{sley_config, sley_refs, sley_rev};
 
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
@@ -1261,7 +1261,6 @@ fn reflog_expire_usage<T>() -> Result<T> {
     Err(GitError::Exit(129))
 }
 
-
 fn reflog_show_pathspecs_match(cwd: &Path, pathspecs: &[String]) -> bool {
     pathspecs.iter().any(|pathspec| cwd.join(pathspec).exists())
 }
@@ -1472,8 +1471,16 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
     }
     let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
+    let core_fsync = global_config_value("core.fsync")?;
+    let core_fsync_method = global_config_value("core.fsyncMethod")?;
     let store = FileRefStore::new(&git_dir, format)
-        .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?);
+        .with_reference_fsync_config(core_fsync.as_deref(), core_fsync_method.as_deref())
+        .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?)
+        .with_reftable_write_options(reftable_write_options_override()?)
+        // `update-ref` is a native ref transaction: its ref and reflog records
+        // share one reftable update index. Other command families still opt in
+        // independently while their combined-table parity is completed.
+        .with_reftable_combined_logs(true);
     if stdin {
         if delete || !positional.is_empty() {
             return Err(GitError::Command(
@@ -1654,6 +1661,12 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             let prefix = format!("could not lock ref {tx_name}: ");
             update_ref_lock_failure(&tx_name, message.trim_start_matches(&prefix))
         }
+        Err(GitError::InvalidFormat(message)) if message == "entry too large" => {
+            eprintln!(
+                "fatal: update_ref failed for ref '{tx_name}': reftable: transaction failure: entry too large"
+            );
+            Err(GitError::Exit(128))
+        }
         Err(err) => Err(err),
     }
 }
@@ -1667,6 +1680,26 @@ fn update_ref_usage() -> Result<()> {
 
 fn reftable_lock_timeout_override() -> Result<Option<u64>> {
     Ok(global_config_value("reftable.lockTimeout")?.and_then(|value| value.parse::<u64>().ok()))
+}
+
+fn reftable_write_options_override() -> Result<ReftableWriteOptions> {
+    let mut options = ReftableWriteOptions::default();
+    if let Some(value) = global_config_value("reftable.blockSize")?
+        && let Ok(block_size) = value.parse::<u32>()
+    {
+        options.block_size = block_size;
+    }
+    if let Some(value) = global_config_value("reftable.restartInterval")?
+        && let Ok(restart_interval) = value.parse::<u16>()
+    {
+        options.restart_interval = restart_interval;
+    }
+    if let Some(value) = global_config_value("reftable.indexObjects")?
+        && let Some(index_objects) = sley_config::parse_config_bool(&value)
+    {
+        options.index_objects = index_objects;
+    }
+    Ok(options)
 }
 
 /// The `reference-transaction` hook runner the file backend fires at each
@@ -4394,7 +4427,11 @@ fn update_ref_should_write_reflog(git_dir: &Path, name: &str, create_reflog: boo
         return Ok(update_ref_log_all_ref_updates_matches(name, &value));
     }
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
-    let Ok(config) = GitConfig::read(common_git_dir.join("config")) else {
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(sley_config::git_dir_for_include_context(&common_git_dir)),
+        sley_config::repo_current_branch_name(&common_git_dir),
+    );
+    let Ok(config) = sley_config::load_effective_config(&common_git_dir, &context) else {
         return Ok(false);
     };
     if let Some(value) = config.get("core", None, "logAllRefUpdates") {
@@ -4791,7 +4828,6 @@ pub(crate) fn cmd_show_ref(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
-
 
 fn show_ref_exists(store: &FileRefStore, name: &str) -> Result<bool> {
     store.raw_ref_exists(name)
@@ -5202,26 +5238,7 @@ fn cmd_refs_migrate(args: &[String]) -> Result<()> {
     }
 
     let source = FileRefStore::new(&git_dir, format);
-    let refs = source.list_all_refs()?;
-    let reflogs = if include_reflogs {
-        let mut names = source
-            .list_reflog_names()?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        for reference in &refs {
-            names.insert(reference.name.clone());
-        }
-        let mut reflogs = Vec::new();
-        for name in names {
-            let entries = source.read_reflog(&name)?;
-            if !entries.is_empty() {
-                reflogs.push((name, entries));
-            }
-        }
-        reflogs
-    } else {
-        Vec::new()
-    };
+    let sley_refs::RefSnapshot { refs, reflogs } = source.export_snapshot(include_reflogs)?;
 
     let migration_dir = create_ref_migration_dir(&common_git_dir)?;
     write_migrated_ref_store(&migration_dir, format, target_format, &refs, &reflogs)?;

@@ -33,7 +33,7 @@ pub struct TransportCapabilities {
     /// In-process `file://` upload-pack / receive-pack.
     pub local_fetch: bool,
     pub local_push: bool,
-    /// Credential-helper subprocess provider ([`CredentialHelperProvider`]).
+    /// Credential-helper subprocess provider (`CredentialHelperProvider`).
     pub credential_helper: bool,
     /// Thin-pack generation on push (delta bases omitted from pack body).
     pub thin_pack_push: bool,

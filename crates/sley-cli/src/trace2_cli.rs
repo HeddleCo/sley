@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-use sley::{GitConfig, Result};
 use crate::sley_config::{ConfigEntry, ConfigSection};
+use sley::{GitConfig, Result};
 use std::env;
 use std::sync::Mutex;
 

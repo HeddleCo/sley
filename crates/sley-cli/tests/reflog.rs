@@ -714,3 +714,29 @@ fn reflog_expire_unreachable_matches_upstream_git() {
     }
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn reflog_walk_selector_preserves_git_full_selector_display() {
+    let root = unique_temp_dir("reflog-selector-display");
+    fs::create_dir_all(&root).expect("create repo");
+    run_success(
+        sley_testkit::oracle_git(),
+        &root,
+        &["init", "-q", "-b", "main"],
+    );
+    run_success_with_identity_at(
+        &root,
+        &["commit", "--allow-empty", "-qm", "initial"],
+        "@1700000000 +0000",
+    );
+    for branch in ["root1/branch1", "root1/branch2"] {
+        run_success(sley_testkit::oracle_git(), &root, &["branch", branch]);
+    }
+
+    let args = ["log", "-g", "--branches=root*", "--format=%gd|%gD"];
+    let expected = run(sley_testkit::oracle_git(), &root, &args);
+    let actual = run(sley_testkit::sley_bin!(), &root, &args);
+    assert_same_output(actual, expected, &args);
+
+    let _ = fs::remove_dir_all(root);
+}

@@ -18,15 +18,15 @@
 //! reuse exactly like upstream.
 #![allow(clippy::expect_used)]
 
+use sley::plumbing::{sley_config, sley_core, sley_odb, sley_rev};
 use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::io::IsTerminal;
 use std::sync::Arc;
-use sley::plumbing::{sley_config, sley_core, sley_odb, sley_rev};
 
-use sley::{PackWriteOptions};
-use sley::plumbing::sley_pack::{PackInput, PackReverseIndex, pack_order_index_positions};
 use crate::*;
+use sley::PackWriteOptions;
+use sley::plumbing::sley_pack::{PackInput, PackReverseIndex, pack_order_index_positions};
 
 #[derive(Default)]
 struct PackObjectsOptions {
@@ -71,6 +71,9 @@ struct PackObjectsOptions {
     path_walk: bool,
     sparse: Option<bool>,
     thin: bool,
+    /// Effective `pack.writeReverseIndex` policy. Unlike repack, pack-objects
+    /// defaults this setting to false when it is not configured.
+    write_reverse_index: bool,
     write_bitmap_index: bool,
     name_hash_version: Option<i32>,
     max_pack_size: Option<u64>,
@@ -288,6 +291,9 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     let git_dir = crate::session::cli_git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
+    options.write_reverse_index = read_repo_config(&git_dir)?
+        .get_bool("pack", None, "writeReverseIndex")
+        .unwrap_or(false);
     let database = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     options.object_filter =
         std::mem::take(&mut options.object_filter).resolve(&git_dir, &database, format)?;
@@ -381,6 +387,7 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             &objects,
             &pack_write_options,
             options.index_version,
+            options.write_reverse_index,
             limit,
         )?;
         let stats_line =
@@ -445,8 +452,16 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     };
 
     let base_name = options.base_name.expect("checked above");
-    let positions = pack_order_index_positions(&result.entries);
-    let reverse_index = PackReverseIndex::write(format, &positions, &result.checksum)?;
+    let reverse_index = if options.write_reverse_index {
+        let positions = pack_order_index_positions(&result.entries);
+        Some(PackReverseIndex::write(
+            format,
+            &positions,
+            &result.checksum,
+        )?)
+    } else {
+        None
+    };
 
     // The writer always produces a v2 `.idx`; honour an explicit
     // `--index-version=1` by re-serialising the same entries in the v1 layout.
@@ -460,7 +475,9 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     // index that points at a missing or incomplete pack.
     let checksum = result.checksum.to_hex();
     fs::write(format!("{base_name}-{checksum}.pack"), &result.pack)?;
-    fs::write(format!("{base_name}-{checksum}.rev"), &reverse_index)?;
+    if let Some(reverse_index) = reverse_index {
+        fs::write(format!("{base_name}-{checksum}.rev"), reverse_index)?;
+    }
     fs::write(format!("{base_name}-{checksum}.idx"), &index_bytes)?;
     println!("{checksum}");
     let stats_line =
@@ -528,6 +545,7 @@ fn write_split_pack_files(
     objects: &[Arc<EncodedObject>],
     options: &PackWriteOptions,
     index_version: Option<u32>,
+    write_reverse_index: bool,
     limit: u64,
 ) -> Result<u32> {
     let mut total_delta_count = 0u32;
@@ -550,6 +568,7 @@ fn write_split_pack_files(
             written.entries,
             written.checksum,
             index_version,
+            write_reverse_index,
         )?;
     }
     Ok(total_delta_count)
@@ -582,9 +601,14 @@ fn write_pack_file_parts(
     entries: Vec<sley_pack::PackIndexEntry>,
     checksum: ObjectId,
     index_version: Option<u32>,
+    write_reverse_index: bool,
 ) -> Result<()> {
-    let positions = pack_order_index_positions(&entries);
-    let reverse_index = PackReverseIndex::write(format, &positions, &checksum)?;
+    let reverse_index = if write_reverse_index {
+        let positions = pack_order_index_positions(&entries);
+        Some(PackReverseIndex::write(format, &positions, &checksum)?)
+    } else {
+        None
+    };
     let index_bytes = if index_version == Some(1) {
         PackIndex::write_v1(format, &entries, &checksum)?
     } else {
@@ -592,7 +616,9 @@ fn write_pack_file_parts(
     };
     let checksum_hex = checksum.to_hex();
     fs::write(format!("{base_name}-{checksum_hex}.pack"), &pack)?;
-    fs::write(format!("{base_name}-{checksum_hex}.rev"), &reverse_index)?;
+    if let Some(reverse_index) = reverse_index {
+        fs::write(format!("{base_name}-{checksum_hex}.rev"), reverse_index)?;
+    }
     fs::write(format!("{base_name}-{checksum_hex}.idx"), &index_bytes)?;
     println!("{checksum_hex}");
     Ok(())
@@ -2713,8 +2739,16 @@ fn write_cruft_pack(
     let base_name = options.base_name.clone();
     let checksum_hex = written.checksum.to_hex();
 
-    let positions = pack_order_index_positions(&written.entries);
-    let reverse_index = PackReverseIndex::write(format, &positions, &written.checksum)?;
+    let reverse_index = if options.write_reverse_index {
+        let positions = pack_order_index_positions(&written.entries);
+        Some(PackReverseIndex::write(
+            format,
+            &positions,
+            &written.checksum,
+        )?)
+    } else {
+        None
+    };
     let mtimes_bytes = sley_pack::PackMtimes::write(format, &mtimes_table, &written.checksum)?;
 
     if options.stdout_mode {
@@ -2726,7 +2760,9 @@ fn write_cruft_pack(
 
     let base_name = base_name.expect("base name required without --stdout");
     fs::write(format!("{base_name}-{checksum_hex}.pack"), &written.pack)?;
-    fs::write(format!("{base_name}-{checksum_hex}.rev"), &reverse_index)?;
+    if let Some(reverse_index) = reverse_index {
+        fs::write(format!("{base_name}-{checksum_hex}.rev"), reverse_index)?;
+    }
     fs::write(format!("{base_name}-{checksum_hex}.mtimes"), &mtimes_bytes)?;
     fs::write(format!("{base_name}-{checksum_hex}.idx"), &written.index)?;
     println!("{checksum_hex}");

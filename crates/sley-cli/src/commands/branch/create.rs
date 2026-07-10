@@ -1,14 +1,14 @@
 //! Branch creation and tracking setup.
 
-use super::config::{validate_autosetuprebase, write_branch_repo_config, AutoRebase};
-use super::upstream::{
-    branch_tracking_ref_candidate, branch_upstream_remote_ref, resolve_branch_upstream,
-    ResolvedBranchUpstream,
-};
+use super::config::{AutoRebase, validate_autosetuprebase, write_branch_repo_config};
 use super::delete::force_update_branch;
-use super::list::{print_branch_list, BranchListMode};
+use super::list::{BranchListMode, print_branch_list};
 use super::operand::{
-    branch_resolve_local_branch_operand, validate_branch_creation_name, BranchOperandKind,
+    BranchOperandKind, branch_resolve_local_branch_operand, validate_branch_creation_name,
+};
+use super::upstream::{
+    ResolvedBranchUpstream, branch_tracking_ref_candidate, branch_upstream_remote_ref,
+    resolve_branch_upstream,
 };
 use crate::*;
 
@@ -421,7 +421,10 @@ pub(super) fn install_tracking_config(
     Ok(())
 }
 
-pub(super) fn branch_create_direct_upstream(store: &FileRefStore, start: Option<&String>) -> Result<String> {
+pub(super) fn branch_create_direct_upstream(
+    store: &FileRefStore,
+    start: Option<&String>,
+) -> Result<String> {
     match start.map(String::as_str) {
         None | Some("HEAD") => Ok(store.current_branch()?.unwrap_or_else(|| "HEAD".into())),
         Some(start) => Ok(start.to_string()),
@@ -571,7 +574,9 @@ pub(super) fn resolve_branch_start(
         // (e.g. `git branch topic v1.0`), not the tag object itself.
         let db = FileObjectDatabase::from_git_dir(git_dir, format);
         sley_rev::peel_to_commit(&db, format, &oid).map_err(|_| {
-            GitError::InvalidObject(format!("branch start '{start}' does not resolve to a commit"))
+            GitError::InvalidObject(format!(
+                "branch start '{start}' does not resolve to a commit"
+            ))
         })
     };
     match resolve_revision(git_dir, format, start) {
@@ -654,7 +659,11 @@ pub(super) fn create_branch_from_start_with_reflog(
     Ok(())
 }
 
-pub(super) fn branch_should_write_reflog(git_dir: &Path, name: &str, create_reflog: bool) -> Result<bool> {
+pub(super) fn branch_should_write_reflog(
+    git_dir: &Path,
+    name: &str,
+    create_reflog: bool,
+) -> Result<bool> {
     if create_reflog || branch_reflog_path(git_dir, name)?.exists() {
         return Ok(true);
     }
@@ -674,7 +683,10 @@ pub(super) fn branch_should_write_reflog(git_dir: &Path, name: &str, create_refl
     Ok(branch_log_all_ref_updates_matches(name, "true"))
 }
 
-pub(super) fn branch_create_reflog_message(store: &FileRefStore, start: Option<&String>) -> Result<Vec<u8>> {
+pub(super) fn branch_create_reflog_message(
+    store: &FileRefStore,
+    start: Option<&String>,
+) -> Result<Vec<u8>> {
     let display = match start {
         Some(start) => start.clone(),
         None => store.current_branch()?.unwrap_or_else(|| "HEAD".into()),
@@ -682,7 +694,10 @@ pub(super) fn branch_create_reflog_message(store: &FileRefStore, start: Option<&
     Ok(format!("branch: Created from {display}").into_bytes())
 }
 
-pub(super) fn branch_reset_reflog_message(store: &FileRefStore, start: Option<&String>) -> Result<Vec<u8>> {
+pub(super) fn branch_reset_reflog_message(
+    store: &FileRefStore,
+    start: Option<&String>,
+) -> Result<Vec<u8>> {
     let display = match start {
         Some(start) => start.clone(),
         None => store.current_branch()?.unwrap_or_else(|| "HEAD".into()),
@@ -707,5 +722,3 @@ pub(super) fn branch_log_all_ref_updates_matches(name: &str, value: &str) -> boo
         || name.starts_with("refs/remotes/")
         || name.starts_with("refs/notes/")
 }
-
-

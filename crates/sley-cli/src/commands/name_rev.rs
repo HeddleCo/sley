@@ -9,11 +9,11 @@
 //! real command's output and exit codes.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_rev};
+use sley::plumbing::sley_rev;
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::commands::cli_options::opt_bool;
 use crate::*;
-use sley_options::{parse_options, OptionName, OptionSpec, ParsedValue};
+use sley_options::{OptionName, OptionSpec, ParsedValue, parse_options};
 
 /// `MERGE_TRAVERSAL_WEIGHT` from upstream: crossing into a non-first parent is
 /// treated as a very long hop so first-parent ancestry is strongly preferred.
@@ -125,7 +125,8 @@ struct NameRevOptions {
     revs: Vec<String>,
 }
 
-const NAME_REV_USAGE_LINES: &[&str] = &["git name-rev [--tags] [--refs=<pattern>] [options] <commit>..."];
+const NAME_REV_USAGE_LINES: &[&str] =
+    &["git name-rev [--tags] [--refs=<pattern>] [options] <commit>..."];
 
 fn name_rev_option_specs() -> &'static [OptionSpec<'static>] {
     static SPECS: &[OptionSpec<'static>] = &[
@@ -141,7 +142,12 @@ fn name_rev_option_specs() -> &'static [OptionSpec<'static>] {
             sley_options::OptFlags::NONE,
             "only use tags",
         ),
-        opt_bool(None, Some("all"), sley_options::OptFlags::NONE, "list all commits"),
+        opt_bool(
+            None,
+            Some("all"),
+            sley_options::OptFlags::NONE,
+            "list all commits",
+        ),
         opt_bool(
             None,
             Some("annotate-stdin"),
@@ -227,10 +233,7 @@ pub(crate) fn cmd_name_rev(args: &[String]) -> Result<()> {
 }
 
 fn setup_name_rev_options(args: &[String]) -> Result<NameRevOptions> {
-    if args
-        .iter()
-        .any(|arg| arg == "-h" || arg == "--help")
-    {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         print_name_rev_help();
         return Err(GitError::Exit(129));
     }

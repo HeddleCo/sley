@@ -2,21 +2,22 @@
 
 use super::branch_options::{
     setup_branch_create_options, setup_branch_delete_options, setup_branch_format_list_options,
-    setup_branch_general_list_options, setup_branch_move_options, setup_branch_show_current_options,
-    setup_branch_upstream_options, setup_branch_verbose_list_options,
+    setup_branch_general_list_options, setup_branch_move_options,
+    setup_branch_show_current_options, setup_branch_upstream_options,
+    setup_branch_verbose_list_options,
 };
 use super::config::validate_autosetuprebase;
 use super::create::run_branch_create_options;
-use super::positional::dispatch_branch_positional_args;
 use super::delete::{
-    delete_merged_branches, delete_remote_tracking_branches, force_delete_branches,
-    BranchDeleteMode, BranchDeleteOptions,
+    BranchDeleteMode, BranchDeleteOptions, delete_merged_branches, delete_remote_tracking_branches,
+    force_delete_branches,
 };
 use super::list::{
-    print_branch_list, run_branch_format_list_options, run_branch_general_list_options,
-    run_branch_verbose_list_options, BranchListMode,
+    BranchListMode, print_branch_list, run_branch_format_list_options,
+    run_branch_general_list_options, run_branch_verbose_list_options,
 };
 use super::move_::run_branch_move_options;
+use super::positional::dispatch_branch_positional_args;
 use super::upstream::run_branch_upstream_options;
 use crate::*;
 

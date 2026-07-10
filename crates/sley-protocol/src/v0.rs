@@ -2,12 +2,11 @@ use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use std::io::{Read, Write};
 
 use crate::pktline::{
-    FetchHeadRecord, FetchRefUpdate, PktLineFrame, ProtocolVersion, RefSpec,
-    line_from_str, parse_oid_argument, parse_protocol_v2_line_text,
-    read_pkt_line_frames_until_flush, refspec_map_source, refspec_matches_source, trim_trailing_lf,
-    validate_capability_field, validate_fetch_head_description_field,
-    validate_fetch_head_line, validate_protocol_v2_token, validate_refspec_shape,
-    write_pkt_line_payload,
+    FetchHeadRecord, FetchRefUpdate, PktLineFrame, ProtocolVersion, RefSpec, line_from_str,
+    parse_oid_argument, parse_protocol_v2_line_text, read_pkt_line_frames_until_flush,
+    refspec_map_source, refspec_matches_source, trim_trailing_lf, validate_capability_field,
+    validate_fetch_head_description_field, validate_fetch_head_line, validate_protocol_v2_token,
+    validate_refspec_shape, write_pkt_line_payload,
 };
 
 use crate::v1::{encode_v1_version_frame, is_v1_version_payload, write_v1_version_line};
@@ -155,6 +154,7 @@ fn fetch_local_ref_name(name: &str) -> String {
 }
 
 pub fn plan_fetch_ref_updates(
+    format: ObjectFormat,
     refs: &[RefAdvertisement],
     refspecs: &[RefSpec],
     auto_follow_tags: bool,
@@ -191,13 +191,18 @@ pub fn plan_fetch_ref_updates(
         if refspec_is_excluded(&negative, src)? {
             continue;
         }
-        let Some(reference) = find_advertised_ref_by_name_abbrev(refs, src) else {
-            return Err(GitError::reference_not_found(format!("remote ref {src}")));
+        let exact_oid = ObjectId::from_hex(format, src).ok();
+        let (source, oid) = match (find_advertised_ref_by_name_abbrev(refs, src), exact_oid) {
+            (Some(reference), _) => (reference.name.clone(), reference.oid),
+            (None, Some(oid)) => (src.to_string(), oid),
+            (None, None) => {
+                return Err(GitError::reference_not_found(format!("remote ref {src}")));
+            }
         };
         updates.push(FetchRefUpdate {
-            src: reference.name.clone(),
+            src: source,
             dst: refspec.dst.as_deref().map(fetch_local_ref_name),
-            oid: reference.oid,
+            oid,
             not_for_merge: false,
             force: refspec.force,
         });
@@ -837,3 +842,33 @@ fn validate_dumb_http_alternate(value: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse_refspec;
+
+    #[test]
+    fn exact_oid_fetch_refspec_does_not_require_an_advertised_ref() -> Result<()> {
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )?;
+        let refspec = parse_refspec(&format!("{oid}:refs/heads/exact"))?;
+
+        let updates = plan_fetch_ref_updates(ObjectFormat::Sha1, &[], &[refspec], false)?;
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].src, oid.to_string());
+        assert_eq!(updates[0].dst.as_deref(), Some("refs/heads/exact"));
+        assert_eq!(updates[0].oid, oid);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_oid_fetch_refspec_uses_the_repository_object_format() -> Result<()> {
+        let sha1 = "1111111111111111111111111111111111111111";
+        let refspec = parse_refspec(&format!("{sha1}:refs/heads/exact"))?;
+        assert!(plan_fetch_ref_updates(ObjectFormat::Sha256, &[], &[refspec], false).is_err());
+        Ok(())
+    }
+}

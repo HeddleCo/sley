@@ -13,7 +13,7 @@ use sley_object::ObjectType;
 ///
 /// Mirrors git's `FOREACH_FSCK_MSG_ID` table: `FATAL`/`ERROR` map to
 /// [`Severity::Error`], `WARN` to [`Severity::Warn`], `INFO` to
-/// [`Severity::Info`] (rendered as a warning but distinct so `--strict` and
+/// [`DefaultSeverity::Info`] (rendered as a warning but distinct so `--strict` and
 /// `fsck.<id>` can promote it), and `IGNORE` to [`Severity::Ignore`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefaultSeverity {

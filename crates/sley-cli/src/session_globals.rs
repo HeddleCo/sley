@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
 
-use sley::{ObjectId, Result, ReferenceTarget as RefTarget};
+use sley::{ObjectId, ReferenceTarget as RefTarget, Result};
 use sley_pathspec::{PathspecAttributeCheck, PathspecAttributeState};
 
 use crate::session;

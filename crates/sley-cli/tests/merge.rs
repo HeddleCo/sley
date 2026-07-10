@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use filetime::FileTime;
+
 fn unique_temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -423,6 +425,11 @@ fn merge_conflict_matches_git() {
             .success(),
         "sley did not record MERGE_HEAD"
     );
+    assert_eq!(
+        git(&candidate, &["rev-parse", "--verify", "AUTO_MERGE"]).stdout,
+        git(&reference, &["rev-parse", "--verify", "AUTO_MERGE"]).stdout,
+        "AUTO_MERGE tree differs from git"
+    );
 
     fs::remove_dir_all(&root).ok();
 }
@@ -476,6 +483,12 @@ fn merge_abort_restores_pre_merge_state() {
             .status
             .success(),
         "MERGE_HEAD still present after abort"
+    );
+    assert!(
+        !git(&repo, &["rev-parse", "--verify", "AUTO_MERGE"])
+            .status
+            .success(),
+        "AUTO_MERGE still present after abort"
     );
     // Index is clean (no unmerged entries).
     assert!(
@@ -761,6 +774,121 @@ fn merge_rename_conflict_matches_git() {
         fs::read(candidate.join("new.txt")).expect("test operation should succeed"),
         fs::read(reference.join("new.txt")).expect("test operation should succeed"),
         "rename-conflict worktree content differs from git"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn merge_same_rename_conflict_keeps_common_ancestor_stage() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("merge-same-rename-conflict");
+    let reference = root.join("reference");
+    let candidate = root.join("candidate");
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            reference.to_str().expect("UTF-8 test repository path"),
+        ],
+    );
+    write_file(&reference, "old.txt", "1\n2\n3\n4\n5\n6\n7\n8\n");
+    git_ok(&reference, &["add", "."]);
+    git_ok(&reference, &["commit", "-qm", "base"]);
+
+    git_ok(&reference, &["checkout", "-q", "-b", "side"]);
+    git_ok(&reference, &["mv", "old.txt", "new.txt"]);
+    write_file(&reference, "new.txt", "1\n2\n3\nTHEIRS\n5\n6\n7\n8\n");
+    git_ok(&reference, &["add", "."]);
+    git_ok(&reference, &["commit", "-qm", "side rename"]);
+
+    git_ok(&reference, &["checkout", "-q", "main"]);
+    git_ok(&reference, &["mv", "old.txt", "new.txt"]);
+    write_file(&reference, "new.txt", "1\n2\n3\nOURS\n5\n6\n7\n8\n");
+    git_ok(&reference, &["add", "."]);
+    git_ok(&reference, &["commit", "-qm", "main rename"]);
+    copy_dir_all(&reference, &candidate);
+
+    let ref_out = git(&reference, &["merge", "side"]);
+    let rs_out = sley(&candidate, &["merge", "side"]);
+    assert_eq!(ref_out.status.code(), Some(1));
+    assert_eq!(rs_out.status.code(), Some(1));
+    let expected_stages = git(&reference, &["ls-files", "-u", "new.txt"]).stdout;
+    assert_eq!(expected_stages.split(|byte| *byte == b'\n').count() - 1, 3);
+    assert_eq!(
+        git(&candidate, &["ls-files", "-u", "new.txt"]).stdout,
+        expected_stages,
+        "same rename must relocate the base entry and retain stages 1/2/3"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn clean_directory_to_file_merge_preserves_unchanged_worktree_file() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("merge-df-unchanged-mtime");
+    let reference = root.join("reference");
+    let candidate = root.join("candidate");
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            reference.to_str().expect("UTF-8 test repository path"),
+        ],
+    );
+    fs::create_dir_all(reference.join("df")).expect("create directory fixture");
+    write_file(&reference, "df/file", "base\n");
+    write_file(&reference, "irrelevant", "keep\n");
+    git_ok(&reference, &["add", "."]);
+    git_ok(&reference, &["commit", "-qm", "base"]);
+
+    git_ok(&reference, &["checkout", "-q", "-b", "side"]);
+    git_ok(&reference, &["rm", "-qr", "df"]);
+    git_ok(&reference, &["commit", "-qm", "remove directory"]);
+
+    git_ok(&reference, &["checkout", "-q", "main"]);
+    git_ok(&reference, &["rm", "-qr", "df"]);
+    write_file(&reference, "df", "main file\n");
+    git_ok(&reference, &["add", "df"]);
+    git_ok(
+        &reference,
+        &["commit", "-qm", "replace directory with file"],
+    );
+    copy_dir_all(&reference, &candidate);
+
+    let old_mtime = FileTime::from_unix_time(1_700_000_000, 0);
+    filetime::set_file_mtime(reference.join("df"), old_mtime).expect("set reference mtime");
+    filetime::set_file_mtime(candidate.join("df"), old_mtime).expect("set candidate mtime");
+
+    let ref_out = git(&reference, &["merge", "side"]);
+    let rs_out = sley(&candidate, &["merge", "side"]);
+    assert!(ref_out.status.success());
+    assert!(
+        rs_out.status.success(),
+        "Sley merge failed: {}",
+        String::from_utf8_lossy(&rs_out.stderr)
+    );
+    assert_eq!(
+        fs::read(candidate.join("df")).expect("read merged path"),
+        b"main file\n"
+    );
+    assert_eq!(
+        FileTime::from_last_modification_time(
+            &fs::metadata(candidate.join("df")).expect("stat merged path"),
+        ),
+        old_mtime,
+        "an absent flattened child must not make D/F blocker cleanup unlink the surviving file"
     );
 
     fs::remove_dir_all(&root).ok();

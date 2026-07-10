@@ -612,6 +612,7 @@ fn render_line_log_diff(
                     colors,
                     word_diff: word_request.as_ref(),
                     line_indicators: diff_opts.line_indicators,
+                    suppress_blank_empty: false,
                     no_index_contents: None,
                     submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                     submodule_dirt: None,

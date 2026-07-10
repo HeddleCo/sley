@@ -967,6 +967,33 @@ fn status_pathspecs_match_upstream_git() {
 }
 
 #[test]
+fn status_without_pathspec_accepts_explicit_worktree_outside_cwd() {
+    let root = unique_temp_dir("status-explicit-worktree-outside-cwd");
+    let repository = root.join("repository");
+    let worktree = root.join("other-worktree");
+    fs::create_dir_all(&repository).expect("create repository fixture");
+    fs::create_dir_all(&worktree).expect("create explicit worktree fixture");
+    git(&repository, &["init", "-q", "-b", "main"]);
+    fs::write(worktree.join("untracked.txt"), b"untracked\n")
+        .expect("write explicit worktree fixture");
+
+    let run_status = |program: &str| {
+        Command::new(program)
+            .current_dir(&repository)
+            .env("GIT_DIR", repository.join(".git"))
+            .env("GIT_WORK_TREE", &worktree)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run explicit-worktree status: {err}"))
+    };
+    let expected = run_status(sley_testkit::oracle_git());
+    let actual = run_status(sley_testkit::sley_bin!());
+    assert_same_output(actual, expected, &["status", "--porcelain"]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn status_nested_cwd_paths_match_upstream_git() {
     let root = unique_temp_dir("status-nested-cwd");
     fs::create_dir_all(&root).expect("create temp repo");

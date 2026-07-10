@@ -684,12 +684,38 @@ pub(crate) fn render_log_raw_pretty(record: &sley_rev::CommitRecord, expand_tabs
     out.extend_from_slice(b"committer ");
     out.extend_from_slice(&record.commit.committer);
     out.extend_from_slice(b"\n\n");
-    for line in String::from_utf8_lossy(&record.commit.message).lines() {
+    render_log_raw_message(&record.commit.message, expand_tabs, &mut out);
+    out
+}
+
+fn render_log_raw_message(message: &[u8], expand_tabs: i32, out: &mut Vec<u8>) {
+    let mut lines = message.split(|byte| *byte == b'\n').peekable();
+    while let Some(line) = lines.next() {
+        // `str::lines`, used by the old implementation, omits the synthetic
+        // empty field after a final newline. Preserve that line structure while
+        // operating on bytes so `--format=raw` does not replace malformed
+        // commit bytes with UTF-8 replacement characters.
+        if line.is_empty() && lines.peek().is_none() && message.ends_with(b"\n") {
+            break;
+        }
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         out.extend_from_slice(b"    ");
-        out.extend_from_slice(&log_expand_tabs(line.as_bytes(), expand_tabs));
+        out.extend_from_slice(&log_expand_tabs(line, expand_tabs));
         out.push(b'\n');
     }
-    out
+}
+
+#[cfg(test)]
+mod raw_message_tests {
+    use super::render_log_raw_message;
+
+    #[test]
+    fn raw_message_preserves_malformed_utf8() {
+        let message = b"Th\xf8\x9d\x84\x9es\n";
+        let mut out = Vec::new();
+        render_log_raw_message(message, 0, &mut out);
+        assert_eq!(out, [b"    ".as_slice(), message].concat());
+    }
 }
 
 /// Display width of a message segment for tab-stop computation, mirroring
@@ -2177,7 +2203,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let db = crate::repository::open_object_database(&git_dir, format)?;
     let has_commit_grafts = !sley_rev::revlist::load_commit_grafts(&db, format).is_empty();
     let cwd = env::current_dir()?;
     let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
@@ -2657,7 +2683,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         let reflog_revisions = revision_options
             .positives
             .iter()
-            .filter_map(|tip| tip.source_name.clone())
+            .filter_map(|tip| {
+                tip.source_name
+                    .clone()
+                    .map(|source| (source, tip.from_ref_selector))
+            })
             .collect::<Vec<_>>();
         return log_walk_reflogs(
             &git_dir,
@@ -3523,6 +3553,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                             if msg.last() != Some(&b'\n') {
                                 msg.push(b'\n');
                             }
+                            msg.extend_from_slice(diff_opts.block_separator_for(record));
                             msg.extend_from_slice(&diff_block);
                         }
                     }
@@ -4039,10 +4070,15 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     log_diff.render(record, log_prefix_display_width(prefix), &mut diff_block)?;
                     if !diff_block.is_empty() {
                         let mut stdout = io::stdout();
-                        stdout.write_all(b"\n")?;
+                        let separator = diff_opts.block_separator_for(record);
                         if prefix.is_empty() {
+                            stdout.write_all(separator)?;
                             stdout.write_all(&diff_block)?;
                         } else {
+                            for line in separator.split_inclusive(|byte| *byte == b'\n') {
+                                stdout.write_all(prefix.as_bytes())?;
+                                stdout.write_all(line)?;
+                            }
                             let mut start = 0usize;
                             while start < diff_block.len() {
                                 let end = diff_block[start..]

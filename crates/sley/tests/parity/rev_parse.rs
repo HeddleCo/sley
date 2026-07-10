@@ -1,9 +1,7 @@
 //! `rev-parse` engine parity (ported from `sley-cli/tests/rev_parse.rs`).
 
 use sley::Repository;
-use sley_testkit::engine_parity::{
-    EngineOutput, EngineParityCase, git_bool_line, git_oid_line,
-};
+use sley_testkit::engine_parity::{EngineOutput, EngineParityCase, git_bool_line, git_oid_line};
 
 #[test]
 fn is_shallow_repository_matches_oracle() {

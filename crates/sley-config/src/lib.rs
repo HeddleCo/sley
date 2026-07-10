@@ -239,7 +239,7 @@ impl GitConfig {
     /// Section headers sit at column 0 as `[section]` or `[section "subsection"]`
     /// (subsections are quoted, with `"` and `\` backslash-escaped). Each entry is
     /// indented with a single tab and written as `key = value`, with the value
-    /// quoted/escaped exactly as git would (see [`quote_config_value`]) so the
+    /// quoted/escaped exactly as git would (see `quote_config_value`) so the
     /// result round-trips through [`GitConfig::parse`] and matches git's own output
     /// for the common cases. Bare boolean-true keys (value `None`) are written as
     /// just the key.

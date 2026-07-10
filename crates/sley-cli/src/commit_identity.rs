@@ -6,14 +6,13 @@ use std::path::PathBuf;
 use sley::{GitConfig, GitError, Result};
 
 use crate::argv_bytes_from_os;
-use crate::common_git_dir_for_git_dir;
 use crate::commands::remote::repo_current_branch_name;
+use crate::common_git_dir_for_git_dir;
 use crate::effective_config_parameters_env;
 use crate::global_config_value;
 use crate::session;
 use crate::sley_config;
 use sley_sequencer;
-
 
 pub(crate) fn commit_identity_from_env(role: &str) -> Result<Vec<u8>> {
     // git's identity precedence for the name/email of an author or committer:
@@ -59,7 +58,10 @@ pub(crate) fn commit_identity_from_env(role: &str) -> Result<Vec<u8>> {
 /// name+email resolution unchanged. Used by `git am
 /// --committer-date-is-author-date`, which keeps the environment committer
 /// name/email but substitutes the author date.
-pub(crate) fn commit_identity_from_env_with_date(role: &str, date_override: &str) -> Result<Vec<u8>> {
+pub(crate) fn commit_identity_from_env_with_date(
+    role: &str,
+    date_override: &str,
+) -> Result<Vec<u8>> {
     let env_name = env::var_os(format!("GIT_{role}_NAME")).map(argv_bytes_from_os);
     let env_email = env::var_os(format!("GIT_{role}_EMAIL")).map(argv_bytes_from_os);
     let mut config = if env_name.is_none() || env_email.is_none() {
@@ -309,7 +311,11 @@ pub(crate) fn commit_reflog_message(message: &[u8], amend: bool) -> Vec<u8> {
     commit_reflog_message_with_initial(message, amend, false)
 }
 
-pub(crate) fn commit_reflog_message_with_initial(message: &[u8], amend: bool, initial: bool) -> Vec<u8> {
+pub(crate) fn commit_reflog_message_with_initial(
+    message: &[u8],
+    amend: bool,
+    initial: bool,
+) -> Vec<u8> {
     let subject = String::from_utf8_lossy(message)
         .lines()
         .next()

@@ -512,10 +512,37 @@ fn read_tree_overlay(
     for tree_oid in tree_oids {
         for (path, value) in sley_diff_merge::flatten_tree(db, format, tree_oid)? {
             verify_read_tree_path(&path, value.0, path_rules)?;
-            merged.insert(path, value);
+            overlay_tree_leaf(&mut merged, path, value);
         }
     }
     Ok(leaves_to_stage0(merged))
+}
+
+/// Insert one leaf from a later tree into a non-merge `read-tree` overlay.
+///
+/// Git's overlay is recursive at the tree-entry level, not merely an exact-key
+/// map union.  A later file at `a` replaces every earlier `a/...` leaf, while a
+/// later `a/b` leaf replaces an earlier file at `a`.  Keeping both would create
+/// an impossible file/directory index pair (and was observable as the stray
+/// `b` entry in upstream t1008).
+fn overlay_tree_leaf(merged: &mut LeafMap, path: Vec<u8>, value: (u32, ObjectId)) {
+    for (position, byte) in path.iter().enumerate() {
+        if *byte == b'/' {
+            merged.remove(&path[..position]);
+        }
+    }
+
+    let mut descendant_prefix = path.clone();
+    descendant_prefix.push(b'/');
+    let descendants = merged
+        .range(descendant_prefix.clone()..)
+        .take_while(|(candidate, _)| candidate.starts_with(&descendant_prefix))
+        .map(|(candidate, _)| candidate.clone())
+        .collect::<Vec<_>>();
+    for descendant in descendants {
+        merged.remove(&descendant);
+    }
+    merged.insert(path, value);
 }
 
 /// Overlay a single tree (or up to three, last-wins) under `prefix` into the
@@ -1144,6 +1171,7 @@ pub(crate) fn checkout_two_way_engine(
 ) -> Result<()> {
     use sley_unpack_trees::{MergeFn, UnpackTreesOptions, check_updates, unpack_trees};
 
+    let previous_index = sley_worktree::read_repository_index(git_dir, format)?;
     let index = current_index_flat(git_dir, format)?;
 
     // git's `merge_working_tree`: `trees[0]` = the tree of the HEAD being left
@@ -1207,7 +1235,10 @@ pub(crate) fn checkout_two_way_engine(
             )
         })
         .collect();
-    write_paired_entries(git_dir, format, pairs)
+    match previous_index.as_ref() {
+        Some(previous) => write_paired_entries_for_checkout(git_dir, format, pairs, previous),
+        None => write_paired_entries(git_dir, format, pairs),
+    }
 }
 
 /// Reset both index and worktree to `commit`, using the recursive gitlink writer
@@ -1557,6 +1588,25 @@ fn write_paired_entries(
     format: ObjectFormat,
     pairs: Vec<(Vec<u8>, StagedEntry)>,
 ) -> Result<()> {
+    let index_entries = paired_index_entries(git_dir, format, pairs)?;
+    persist_index(git_dir, format, index_entries)
+}
+
+fn write_paired_entries_for_checkout(
+    git_dir: &Path,
+    format: ObjectFormat,
+    pairs: Vec<(Vec<u8>, StagedEntry)>,
+    previous: &Index,
+) -> Result<()> {
+    let index_entries = paired_index_entries(git_dir, format, pairs)?;
+    persist_index_with_checkout_extensions(git_dir, format, index_entries, previous)
+}
+
+fn paired_index_entries(
+    git_dir: &Path,
+    format: ObjectFormat,
+    pairs: Vec<(Vec<u8>, StagedEntry)>,
+) -> Result<Vec<IndexEntry>> {
     let skip_worktree_paths = read_skip_worktree_paths(git_dir, format)?;
     let mut index_entries = Vec::with_capacity(pairs.len());
     for (path, entry) in pairs {
@@ -1571,7 +1621,7 @@ fn write_paired_entries(
             .cmp(&right.path)
             .then_with(|| (left.flags & 0x3000).cmp(&(right.flags & 0x3000)))
     });
-    persist_index(git_dir, format, index_entries)
+    Ok(index_entries)
 }
 
 fn read_skip_worktree_paths(
@@ -1623,6 +1673,24 @@ fn make_index_entry(path: Vec<u8>, entry: StagedEntry) -> Result<IndexEntry> {
 /// stage bits in `flags`; the index v2/v3 writer accepts those (the higher bits
 /// of `flags`), so a fixed version 2 layout matches git's `ls-files --stage`.
 fn persist_index(git_dir: &Path, format: ObjectFormat, entries: Vec<IndexEntry>) -> Result<()> {
+    persist_index_inner(git_dir, format, entries, None)
+}
+
+fn persist_index_with_checkout_extensions(
+    git_dir: &Path,
+    format: ObjectFormat,
+    entries: Vec<IndexEntry>,
+    previous: &Index,
+) -> Result<()> {
+    persist_index_inner(git_dir, format, entries, Some(previous))
+}
+
+fn persist_index_inner(
+    git_dir: &Path,
+    format: ObjectFormat,
+    entries: Vec<IndexEntry>,
+    previous: Option<&Index>,
+) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut index = Index {
         version: 2,
@@ -1632,6 +1700,9 @@ fn persist_index(git_dir: &Path, format: ObjectFormat, entries: Vec<IndexEntry>)
     };
     index.upgrade_version_for_flags();
     sley_worktree::refresh_cache_tree(&mut index, &db);
+    if let Some(previous) = previous {
+        sley_worktree::preserve_checkout_index_extensions(previous, &mut index, format)?;
+    }
     sley_worktree::write_repository_index_ref(git_dir, format, &index)?;
     Ok(())
 }
@@ -2443,6 +2514,33 @@ fn path_to_git_bytes_lossy(path: &Path) -> Vec<u8> {
         .collect::<Vec<_>>()
         .join("/")
         .into_bytes()
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+
+    fn oid(byte: u8) -> ObjectId {
+        ObjectId::from_raw(ObjectFormat::Sha1, &[byte; 20]).expect("valid sha1 oid")
+    }
+
+    #[test]
+    fn later_overlay_leaf_replaces_file_directory_conflicts_in_both_directions() {
+        let mut leaves = LeafMap::from([
+            (b"a".to_vec(), (0o100644, oid(1))),
+            (b"b".to_vec(), (0o100644, oid(2))),
+            (b"c/one".to_vec(), (0o100644, oid(3))),
+            (b"c/two".to_vec(), (0o100644, oid(4))),
+        ]);
+
+        overlay_tree_leaf(&mut leaves, b"b/child".to_vec(), (0o100644, oid(5)));
+        overlay_tree_leaf(&mut leaves, b"c".to_vec(), (0o100644, oid(6)));
+
+        assert_eq!(
+            leaves.keys().cloned().collect::<Vec<_>>(),
+            vec![b"a".to_vec(), b"b/child".to_vec(), b"c".to_vec()]
+        );
+    }
 }
 
 #[cfg(test)]

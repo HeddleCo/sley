@@ -2167,6 +2167,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     let mut fsmonitor = false;
     let mut verbose = false;
     let mut again = false;
+    let mut replace = false;
     let mut refresh = false;
     let mut really_refresh = false;
     let mut refresh_ignore_missing = false;
@@ -2324,7 +2325,15 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                 allow_unmerged_refresh = false;
                 allow_no_input = true;
             }
-            "--replace" | "--no-replace" | "--no-force-untracked-cache" => allow_no_input = true,
+            "--replace" => {
+                replace = true;
+                allow_no_input = true;
+            }
+            "--no-replace" => {
+                replace = false;
+                allow_no_input = true;
+            }
+            "--no-force-untracked-cache" => allow_no_input = true,
             "--split-index" => {
                 split_index = Some(true);
                 allow_no_input = true;
@@ -2727,7 +2736,16 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             .into_iter()
             .map(|entry| entry.into_worktree_entry(format))
             .collect::<Result<Vec<_>>>()?;
-        sley_worktree::update_index_cacheinfo(&git_dir, format, &cacheinfo, add, verbose)?;
+        sley_worktree::update_index_cacheinfo_with_options(
+            &git_dir,
+            format,
+            &cacheinfo,
+            sley_worktree::UpdateIndexCacheInfoOptions {
+                add,
+                replace,
+                verbose,
+            },
+        )?;
     }
     if let Some(split_index) = split_index {
         if split_index {

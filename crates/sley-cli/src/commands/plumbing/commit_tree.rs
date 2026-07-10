@@ -1,7 +1,7 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
 use crate::*;
-use sley::plumbing::{sley_rev};
+use sley::plumbing::sley_rev;
 
 pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
     let mut tree = None;
@@ -87,7 +87,7 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
             sley_rev::peel_to_tree(&db_resolve, format, &tree_rev)?
         }
     };
-    let parents = parents
+    let resolved_parents = parents
         .iter()
         .map(|parent| match ObjectId::from_hex(format, parent) {
             Ok(oid) => Ok(oid),
@@ -97,6 +97,15 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
             }
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut parents = Vec::with_capacity(resolved_parents.len());
+    let mut seen_parents = HashSet::with_capacity(resolved_parents.len());
+    for parent in resolved_parents {
+        if seen_parents.insert(parent) {
+            parents.push(parent);
+        } else {
+            eprintln!("error: duplicate parent {parent} ignored");
+        }
+    }
     let message = if message_chunks.is_empty() {
         let mut message = Vec::new();
         io::stdin().read_to_end(&mut message)?;

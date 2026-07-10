@@ -564,9 +564,25 @@ impl CompiledPickaxe {
         matches!(self, CompiledPickaxe::Grep { .. })
     }
 
-    /// Count occurrences of a literal needle (lowercasing the haystack when the
-    /// needle was pre-lowercased for `-i`), capped at `limit` (0 = uncapped).
+    /// Count occurrences of a literal needle with locale-appropriate folding
+    /// for `-i`, capped at `limit` (0 = uncapped).
     fn count_literal(needle: &[u8], data: &[u8], ignore_case: bool, limit: usize) -> usize {
+        Self::count_literal_with_locale(
+            needle,
+            data,
+            ignore_case,
+            pickaxe_locale_uses_utf8(),
+            limit,
+        )
+    }
+
+    fn count_literal_with_locale(
+        needle: &[u8],
+        data: &[u8],
+        ignore_case: bool,
+        unicode_case_fold: bool,
+        limit: usize,
+    ) -> usize {
         if needle.is_empty() {
             return 0;
         }
@@ -575,7 +591,17 @@ impl CompiledPickaxe {
         while i + needle.len() <= data.len() {
             let window = &data[i..i + needle.len()];
             let matched = if ignore_case {
-                window.eq_ignore_ascii_case(needle)
+                if unicode_case_fold
+                    && let (Ok(window), Ok(needle)) =
+                        (std::str::from_utf8(window), std::str::from_utf8(needle))
+                {
+                    window
+                        .chars()
+                        .flat_map(char::to_lowercase)
+                        .eq(needle.chars().flat_map(char::to_lowercase))
+                } else {
+                    window.eq_ignore_ascii_case(needle)
+                }
             } else {
                 window == needle
             };
@@ -631,5 +657,43 @@ impl CompiledPickaxe {
             }
             CompiledPickaxe::FindObject { .. } => false,
         }
+    }
+}
+
+fn pickaxe_locale_uses_utf8() -> bool {
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .find_map(|key| std::env::var_os(key).filter(|value| !value.is_empty()));
+    let Some(locale) = locale else {
+        return false;
+    };
+    let locale = locale.to_string_lossy().to_ascii_lowercase();
+    locale.contains("utf-8") || locale.contains("utf8")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CompiledPickaxe;
+
+    #[test]
+    fn literal_pickaxe_unicode_casefold_depends_on_locale_mode() {
+        let needle = "TILRAUN: HALLÓ HEIMUR!".as_bytes();
+        let data = "TILRAUN: Halló Heimur!\n".as_bytes();
+        assert_eq!(
+            CompiledPickaxe::count_literal_with_locale(needle, data, true, true, 0),
+            1
+        );
+        assert_eq!(
+            CompiledPickaxe::count_literal_with_locale(needle, data, true, false, 0),
+            0
+        );
+    }
+
+    #[test]
+    fn literal_pickaxe_c_locale_keeps_ascii_icase() {
+        assert_eq!(
+            CompiledPickaxe::count_literal_with_locale(b"HELLO", b"hello\n", true, false, 0),
+            1
+        );
     }
 }

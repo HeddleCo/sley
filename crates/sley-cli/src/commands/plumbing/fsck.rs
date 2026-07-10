@@ -1,9 +1,11 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
 use crate::*;
-use sley::plumbing::{sley_core, sley_index, sley_object, sley_odb, sley_pack, sley_refs, sley_worktree};
+use sley::plumbing::{
+    sley_core, sley_index, sley_object, sley_odb, sley_pack, sley_refs, sley_worktree,
+};
 
-use super::commit_graph::{open_commit_graph_bytes, verify_commit_graph_bytes, OpenResult};
+use super::commit_graph::{OpenResult, open_commit_graph_bytes, verify_commit_graph_bytes};
 
 pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     let mut progress = true;
@@ -11,6 +13,7 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     let mut report_unreachable = false;
     let mut strict = false;
     let mut connectivity_only = false;
+    let mut write_lost_found = false;
     // `--references` (the default) runs the ref-store consistency check
     // (`refs verify`) alongside the object walk; `--no-references` skips it.
     let mut references = true;
@@ -39,7 +42,8 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
             // unconditional in this implementation, so accept and ignore them.
             "--references" => references = true,
             "--no-references" => references = false,
-            "--full" | "--no-full" | "--root" | "--cache" | "--no-cache" | "--lost-found" => {}
+            "--lost-found" => write_lost_found = true,
+            "--full" | "--no-full" | "--root" | "--cache" | "--no-cache" => {}
             value if value.starts_with("--") => {
                 return Err(GitError::Command(format!(
                     "fsck currently supports --no-progress and basic object connectivity; unsupported option {value}"
@@ -103,9 +107,12 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
         for spec in &explicit_oids {
             match ObjectId::from_hex(format, spec) {
                 Ok(oid) => resolved.push((oid.to_hex(), oid)),
-                Err(_) => {
-                    return Err(GitError::Command(format!("Invalid object name '{spec}'.")));
-                }
+                Err(_) => match resolve_revision(&git_dir, format, spec) {
+                    Ok(oid) => resolved.push((spec.clone(), oid)),
+                    Err(_) => {
+                        return Err(GitError::Command(format!("Invalid object name '{spec}'.")));
+                    }
+                },
             }
         }
         resolved
@@ -157,18 +164,16 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
         )?;
     }
 
-    // With explicit object-id roots, git checks only what is reachable from
-    // them — it does not enumerate every loose object (so a removed-but-
-    // unreferenced blob is not independently reported, and nothing is
-    // "dangling").
-    let mut object_ids = if explicit_oids.is_empty() {
+    // A valid explicit root replaces the default ref roots but still scans the
+    // object store, so objects outside that root's reach are reported as
+    // dangling (`git fsck main`). An invalid explicit root must not fall back
+    // to all heads or enumerate unrelated objects (`git fsck <zero-oid>`).
+    let scan_objects = explicit_oids.is_empty() || !roots.is_empty();
+    let mut object_ids = if scan_objects {
         repository_object_ids(&git_dir, format)?
     } else {
         Vec::new()
     };
-    if !explicit_oids.is_empty() {
-        report_dangling = false;
-    }
     // Mirror builtin/fsck.c `fsck_loose`: probe every loose object file before the
     // connectivity walk, reporting corrupt or mismatched ones at `error:` level on
     // stderr (with git's path-form spelling) and excluding them from the object set
@@ -177,7 +182,7 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     let mut bad_loose = HashSet::new();
     // The loose-object integrity scan enumerates the whole object store, which
     // git only does for a full fsck (no explicit roots).
-    if explicit_oids.is_empty() {
+    if scan_objects {
         for oid in db.loose().object_ids()? {
             let hex = oid.to_hex();
             let display_path = format!("{objects_dir_display}/{}/{}", &hex[..2], &hex[2..]);
@@ -196,12 +201,12 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
             }
         }
     }
-    let alternate_loose_errors = if explicit_oids.is_empty() {
+    let alternate_loose_errors = if scan_objects {
         fsck_alternate_loose_objects(&git_dir, format, &cwd)?
     } else {
         false
     };
-    let pack_errors = if explicit_oids.is_empty() {
+    let pack_errors = if scan_objects {
         fsck_pack_files(&git_dir, format, &cwd)?
     } else {
         false
@@ -220,6 +225,10 @@ pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
     if explicit_oids.is_empty() {
         index_error_bits |=
             fsck_index_roots(&db, format, &git_dir, name_objects, &mut roots, &bad_loose)?;
+    }
+
+    if write_lost_found {
+        sley_fsck::write_lost_found(&db, format, &git_dir, &roots, &object_ids)?;
     }
 
     if roots.is_empty() && progress {
@@ -429,6 +438,31 @@ fn fsck_pack_files(git_dir: &Path, format: ObjectFormat, cwd: &Path) -> Result<b
         let Ok(index) = sley_pack::PackIndex::parse(&index_bytes, format) else {
             continue;
         };
+        let rev_path = pack_path.with_extension("rev");
+        if let Ok(reverse_bytes) = fs::read(&rev_path) {
+            let validation =
+                sley_pack::PackReverseIndex::parse(&reverse_bytes, format, index.entries.len())
+                    .and_then(|reverse| {
+                        if reverse.pack_checksum == index.pack_checksum {
+                            Ok(reverse)
+                        } else {
+                            Err(GitError::InvalidFormat("invalid checksum".into()))
+                        }
+                    });
+            if let Err(err) = validation {
+                let display_rev = fsck_display_path(&rev_path, cwd);
+                let detail = match err {
+                    GitError::InvalidFormat(detail) => detail,
+                    other => other.to_string(),
+                };
+                if detail.starts_with("invalid rev-index position") {
+                    eprintln!("error: {detail} in {display_rev}");
+                } else {
+                    eprintln!("error: reverse-index file {display_rev} has {detail}");
+                }
+                failed = true;
+            }
+        }
         let trailer_offset = bytes.len() - trailer_len;
         for entry in index.entries {
             let Ok(offset) = usize::try_from(entry.offset) else {

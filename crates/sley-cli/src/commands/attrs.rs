@@ -1,14 +1,14 @@
 //! Attribute and ignore inspection commands (`check-attr`, `check-ignore`).
 
+use crate::sley_object;
+use sley::plumbing::{sley_core, sley_index, sley_rev, sley_worktree};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use crate::sley_object;
-use sley::plumbing::{sley_core, sley_index, sley_rev, sley_worktree};
 
-use sley::{GitError, Result};
 use sley::plumbing::sley_object::tree_entry_object_type;
+use sley::{GitError, Result};
 use sley_pathspec::normalize_ls_files_pathspec;
 
 use crate::{

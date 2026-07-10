@@ -27,26 +27,26 @@ use std::path::Path;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
 use std::thread::JoinHandle;
 
-use sley_config::GitConfig;
-use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use crate::install::{
     install_upload_pack_raw_promisor_response_from_reader,
     install_upload_pack_raw_response_from_reader,
     install_upload_pack_shallow_raw_promisor_response_from_reader,
     install_upload_pack_shallow_raw_response_from_reader,
 };
+use sley_config::GitConfig;
+use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::write_pkt_line_payload;
 use sley_protocol::{
-    GitService, ProtocolV2FetchShallowInfo, ReceivePackCommand, ReceivePackFeatures,
-    ReceivePackPushRequestOptions, RefAdvertisement, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackRequest, parse_receive_pack_features,
-    parse_upload_pack_features, read_receive_pack_report_status, read_ref_advertisement_set,
-    write_upload_pack_negotiation_request, write_upload_pack_request,
+    GitService, ProtocolV2FetchShallowInfo, ProtocolVersion, ReceivePackCommand,
+    ReceivePackFeatures, RefAdvertisement, UploadPackFeatures, UploadPackNegotiationRequest,
+    UploadPackRequest, parse_receive_pack_features, parse_upload_pack_features,
+    read_ref_advertisement_set, write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::FileRefStore;
 use sley_transport::{
-    RemoteTransport, RemoteUrl, SshCommandVariant, SshIpVersion, ssh_process_args_with_ip,
+    RemoteTransport, RemoteUrl, SshCommandVariant, SshIpVersion,
+    ssh_process_args_with_ip_and_command,
 };
 
 use crate::{PushOutcome, PushRequest};
@@ -55,6 +55,8 @@ use crate::{PushOutcome, PushRequest};
 pub struct SshTransportOptions {
     pub variant: Option<SshCommandVariant>,
     pub ip_version: Option<SshIpVersion>,
+    /// Wire protocol requested through OpenSSH's `SendEnv=GIT_PROTOCOL`.
+    pub protocol: Option<ProtocolVersion>,
 }
 
 pub fn ssh_transport_options_from_config(config: &GitConfig) -> SshTransportOptions {
@@ -63,6 +65,8 @@ pub fn ssh_transport_options_from_config(config: &GitConfig) -> SshTransportOpti
             .get("ssh", None, "variant")
             .and_then(ssh_variant_from_config_value),
         ip_version: None,
+        protocol: (config.get("protocol", None, "version") == Some("1"))
+            .then_some(ProtocolVersion::V1),
     }
 }
 
@@ -90,24 +94,41 @@ fn ssh_process_command_for_remote(
     remote: &RemoteUrl,
     service: GitService,
     options: SshTransportOptions,
+    service_command: Option<&str>,
 ) -> Result<ServiceProcessCommand> {
     if remote.transport == RemoteTransport::Ext {
         return ext_process_command_for_remote(remote, service);
     }
     let (program, mut args) = ssh_program_and_prefix_args()?;
     let variant = ssh_command_variant(&program, options.variant);
-    args.extend(ssh_process_args_with_ip(
+    let (protocol_args, protocol_env) = ssh_protocol_command_metadata(variant, options.protocol);
+    args.extend(protocol_args);
+    args.extend(ssh_process_args_with_ip_and_command(
         remote,
         service,
         variant,
         options.ip_version,
+        service_command,
     )?);
     Ok(ServiceProcessCommand {
         program,
         args,
-        env: Vec::new(),
+        env: protocol_env,
         git_request: None,
     })
+}
+
+fn ssh_protocol_command_metadata(
+    variant: SshCommandVariant,
+    protocol: Option<ProtocolVersion>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    if variant == SshCommandVariant::OpenSsh && protocol == Some(ProtocolVersion::V1) {
+        return (
+            vec!["-o".into(), "SendEnv=GIT_PROTOCOL".into()],
+            vec![("GIT_PROTOCOL".into(), "version=1".into())],
+        );
+    }
+    (Vec::new(), Vec::new())
 }
 
 struct ServiceProcessCommand {
@@ -409,8 +430,9 @@ fn spawn_service_process(
     service: GitService,
     keep_stdin: bool,
     options: SshTransportOptions,
+    service_command: Option<&str>,
 ) -> Result<(Child, Option<ChildStdin>, ChildStdout, StderrDrain)> {
-    let command = ssh_process_command_for_remote(remote, service, options)?;
+    let command = ssh_process_command_for_remote(remote, service, options, service_command)?;
     let mut process = ProcessCommand::new(&command.program);
     process
         .args(&command.args)
@@ -497,6 +519,7 @@ pub(crate) struct SshPushRequest<'a> {
     pub remote: &'a RemoteUrl,
     pub refspecs: &'a [String],
     pub force: bool,
+    pub command_options: SshTransportOptions,
 }
 
 pub(crate) struct SshPushCommandsRequest<'a> {
@@ -527,6 +550,7 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
         remote,
         refspecs,
         force,
+        command_options,
     } = request;
     if !matches!(
         remote.transport,
@@ -536,12 +560,8 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
             "SSH receive-pack requires an SSH remote".into(),
         ));
     }
-    let (mut child, stdin, mut stdout, stderr_drain) = spawn_service_process(
-        remote,
-        GitService::ReceivePack,
-        true,
-        SshTransportOptions::default(),
-    )?;
+    let (child, stdin, mut stdout, stderr_drain) =
+        spawn_service_process(remote, GitService::ReceivePack, true, command_options, None)?;
     let stdin =
         stdin.ok_or_else(|| GitError::Command("ssh receive-pack stdin was not piped".into()))?;
 
@@ -597,7 +617,12 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
     }
 
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    crate::push::reject_non_fast_forward_pushes(common_git_dir, &local_db, format, &command_forces)?;
+    crate::push::reject_non_fast_forward_pushes(
+        common_git_dir,
+        &local_db,
+        format,
+        &command_forces,
+    )?;
     Ok(SshPushPlan {
         commands,
         pack_objects: Vec::new(),
@@ -627,11 +652,12 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
             "SSH receive-pack requires an SSH remote".into(),
         ));
     }
-    let (mut child, stdin, mut stdout, stderr_drain) = spawn_service_process(
+    let (child, stdin, mut stdout, stderr_drain) = spawn_service_process(
         remote,
         GitService::ReceivePack,
         true,
         SshTransportOptions::default(),
+        None,
     )?;
     let stdin =
         stdin.ok_or_else(|| GitError::Command("ssh receive-pack stdin was not piped".into()))?;
@@ -679,7 +705,12 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
     }
 
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    crate::push::reject_non_fast_forward_pushes(common_git_dir, &local_db, format, &command_forces)?;
+    crate::push::reject_non_fast_forward_pushes(
+        common_git_dir,
+        &local_db,
+        format,
+        &command_forces,
+    )?;
     Ok(SshPushPlan {
         commands,
         pack_objects,
@@ -781,6 +812,7 @@ pub(crate) fn ls_remote_ssh(
         GitService::UploadPack,
         false,
         SshTransportOptions::default(),
+        None,
     )?;
     let set_result = read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout);
     let status = child.wait()?;
@@ -878,6 +910,8 @@ pub struct SshFetchPackRequest<'a> {
     /// SSH command-line shape (variant and `-4`/`-6`), usually derived by the
     /// caller from effective config and command-line flags.
     pub command_options: SshTransportOptions,
+    /// Explicit remote upload-pack command selected by the caller.
+    pub upload_pack_command: Option<&'a str>,
     /// Maximum raw pack bytes to accept from the remote (`fetch.maxInputSize` /
     /// `transfer.maxSize`). `None` means unlimited.
     pub max_input_size: Option<u64>,
@@ -913,6 +947,7 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
         GitService::UploadPack,
         true,
         request.command_options,
+        request.upload_pack_command,
     )?;
     let mut stdin =
         stdin.ok_or_else(|| GitError::Command("ssh upload-pack stdin was not piped".into()))?;
@@ -952,7 +987,12 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
                 request.max_input_size,
             )?;
         } else {
-            install_upload_pack_raw_response_from_reader(request.format, &mut stdout, &local_db, request.max_input_size)?;
+            install_upload_pack_raw_response_from_reader(
+                request.format,
+                &mut stdout,
+                &local_db,
+                request.max_input_size,
+            )?;
         }
         Vec::new()
     };
@@ -1004,6 +1044,17 @@ pub fn ssh_upload_pack_advertisements_with_options(
     format: ObjectFormat,
     options: SshTransportOptions,
 ) -> Result<(Vec<RefAdvertisement>, UploadPackFeatures)> {
+    ssh_upload_pack_advertisements_with_command(remote, format, options, None)
+}
+
+/// Read SSH upload-pack advertisements using an optional caller-selected
+/// service program while retaining the normal SSH command-shape options.
+pub fn ssh_upload_pack_advertisements_with_command(
+    remote: &RemoteUrl,
+    format: ObjectFormat,
+    options: SshTransportOptions,
+    upload_pack_command: Option<&str>,
+) -> Result<(Vec<RefAdvertisement>, UploadPackFeatures)> {
     if !matches!(
         remote.transport,
         RemoteTransport::Ssh | RemoteTransport::Ext
@@ -1012,8 +1063,13 @@ pub fn ssh_upload_pack_advertisements_with_options(
             "SSH upload-pack requires an SSH remote".into(),
         ));
     }
-    let (mut child, _stdin, mut stdout, stderr_drain) =
-        spawn_service_process(remote, GitService::UploadPack, false, options)?;
+    let (mut child, _stdin, mut stdout, stderr_drain) = spawn_service_process(
+        remote,
+        GitService::UploadPack,
+        false,
+        options,
+        upload_pack_command,
+    )?;
     let set_result = read_ref_advertisement_set(format, &mut stdout);
     let status = child.wait()?;
     let stderr = stderr_drain.finish();
@@ -1039,7 +1095,6 @@ pub fn ssh_upload_pack_advertisements_with_options(
         .unwrap_or_default();
     Ok((set.refs, features))
 }
-
 
 pub fn validate_ssh_fetch_options(
     filter: Option<&sley_odb::PackObjectFilter>,
@@ -1107,6 +1162,24 @@ fn ssh_remote_display(remote: &RemoteUrl) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_v1_uses_openssh_send_env_metadata() {
+        let (args, env) =
+            ssh_protocol_command_metadata(SshCommandVariant::OpenSsh, Some(ProtocolVersion::V1));
+        assert_eq!(args, ["-o", "SendEnv=GIT_PROTOCOL"]);
+        assert_eq!(env, [("GIT_PROTOCOL".into(), "version=1".into())]);
+
+        let (args, env) =
+            ssh_protocol_command_metadata(SshCommandVariant::Plink, Some(ProtocolVersion::V1));
+        assert!(args.is_empty());
+        assert!(env.is_empty());
+
+        let (args, env) =
+            ssh_protocol_command_metadata(SshCommandVariant::OpenSsh, Some(ProtocolVersion::V2));
+        assert!(args.is_empty());
+        assert!(env.is_empty());
+    }
 
     #[test]
     fn remote_ext_parser_keeps_percent_escaped_spaces_inside_arguments() {

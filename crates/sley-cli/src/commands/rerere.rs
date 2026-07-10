@@ -3,9 +3,9 @@
 
 use crate::commands::cli_options::opt_bool;
 use crate::*;
-use sley_options::{parse_options, OptionSpec};
-use std::time::{Duration, SystemTime};
 use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_worktree};
+use sley_options::{OptionSpec, parse_options};
+use std::time::{Duration, SystemTime};
 
 const RERERE_MARKER_SIZE: usize = 7;
 const RERERE_RESOLVED_DAYS: u64 = 60;
@@ -66,10 +66,7 @@ pub(crate) fn cmd_rerere(args: &[String]) -> Result<()> {
 }
 
 fn setup_rerere_options(args: &[String]) -> Result<RerereOptions> {
-    if args
-        .iter()
-        .any(|arg| arg == "-h" || arg == "--help")
-    {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         return rerere_usage_stdout();
     }
     let parsed = match parse_options(args, rerere_option_specs(), RERERE_USAGE) {
@@ -944,6 +941,7 @@ fn rerere_diff(git_dir: &Path, format: ObjectFormat) -> Result<()> {
             &diff_entry,
             DiffRenderOptions {
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                suppress_blank_empty: false,
                 binary: false,
                 anchors: &[],
                 allow_textconv: false,

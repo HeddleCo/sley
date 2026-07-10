@@ -2,8 +2,8 @@
 //! commands.
 
 use crate::*;
+use sley::plumbing::sley_config;
 use std::process::Stdio;
-use sley::plumbing::{sley_config};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GpgVerification {

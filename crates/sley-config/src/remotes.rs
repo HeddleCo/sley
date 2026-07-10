@@ -6,8 +6,8 @@
 //! `[branch]` back-references to add, drop, or rewrite. They deliberately do
 //! *not* read or write files, run argument parsing, or print anything — callers
 //! (e.g. the CLI) own I/O, argument handling, and the exact user-facing
-//! diagnostics, translating the structured [`RemoteEditError`] /
-//! [`SetUrlError`] outcomes returned here into their own messages and exit
+//! diagnostics, translating the structured [`crate::remotes::RemoteEditError`] /
+//! [`crate::remotes::SetUrlError`] outcomes returned here into their own messages and exit
 //! codes.
 //!
 //! Callers should persist edits with [`GitConfig::to_preserved_bytes`] when the

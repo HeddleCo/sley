@@ -26,6 +26,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut nul_terminated = false;
     let mut objects = false;
+    let mut objects_in_commit_order = false;
     let mut objects_edge = false;
     let mut object_filter = RevListObjectFilter::None;
     let mut filter_print_omitted = false;
@@ -236,6 +237,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             "--use-bitmap-index" => use_bitmap_index = true,
             "--test-bitmap" => test_bitmap = true,
             "--objects" => objects = true,
+            "--in-commit-order" => objects_in_commit_order = true,
             "--verify-objects" => verify_objects = true,
             "--objects-edge" => {
                 objects = true;
@@ -396,7 +398,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     // `%aN`/… always map; lower-case map only under the flag).
     let mailmap = commands::utility::Mailmap::load_default(&git_dir, format)?;
     let has_promisor_remote = crate::commands::plumbing::repo_has_promisor_remote(&config);
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format)
+    let db = crate::repository::open_object_database(&git_dir, format)?
         .with_promisor_remote_present(has_promisor_remote);
     let traversal_missing_action = if exclude_promisor_objects {
         RevListMissingAction::ExcludePromisor
@@ -662,6 +664,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         return rev_list_test_bitmap(&git_dir, &db, format, &include_commits, &exclude_tip_oids);
     }
 
+    let mut bitmap_fell_back_to_regular_walk = false;
     if use_bitmap_index {
         // Mirror upstream's want list: tag objects stand in for the commits
         // they were peeled from (the tag itself is part of the result), plus
@@ -737,19 +740,42 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             let objects_dir = sley_odb::repository_objects_dir(&git_dir);
             let _ = sley_odb::load_pack_bitmap(&objects_dir, format)?;
         }
-        if bitmap_eligible
-            && !want_roots.is_empty()
-            && rev_list_try_bitmap(&git_dir, &db, format, &query)?
-        {
-            return Ok(());
+        if bitmap_eligible && !want_roots.is_empty() {
+            if rev_list_try_bitmap(&git_dir, &db, format, &query)? {
+                return Ok(());
+            }
+            // `try_bitmap_*` returning -1 in git hands the invocation back to
+            // the ordinary revision walk. Remember that transition so the
+            // non-commit pending objects accepted specifically by
+            // `--use-bitmap-index` can be restored to ordinary-walk
+            // semantics below. Do not do this for a bitmap-ineligible query:
+            // its non-commit start remains a genuine error.
+            bitmap_fell_back_to_regular_walk = true;
         }
     }
     if !bitmap_object_tips.is_empty() {
-        // The bitmap path was not usable, and the regular walk cannot start
-        // from a non-commit tip.
-        return Err(GitError::Command(
-            "rev-list cannot start the walk from a non-commit object".into(),
-        ));
+        let ordinary_walk_can_ignore_tips = bitmap_fell_back_to_regular_walk
+            && !objects
+            && bitmap_object_tips.iter().all(|oid| {
+                db.read_object_header(oid)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|(object_type, _)| {
+                        matches!(object_type, ObjectType::Blob | ObjectType::Tree)
+                    })
+            });
+        if ordinary_walk_can_ignore_tips {
+            // setup_revisions() normally drops blob/tree pending objects when
+            // `--objects` is absent. We retained them only so a usable bitmap
+            // could start from them; once bitmap loading is rejected, clear
+            // the whole bitmap-only set atomically and continue with the
+            // already-built ordinary commit/tree starting sets.
+            bitmap_object_tips.clear();
+        } else {
+            return Err(GitError::Command(
+                "rev-list cannot start the walk from a non-commit object".into(),
+            ));
+        }
     }
     if filter_provided_objects && !provided_objects.is_empty() {
         // With --filter-provided-objects the directly-provided blobs lose
@@ -1162,21 +1188,22 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     } else {
         Vec::new()
     };
-    let (mut selected_objects, mut omitted_objects, mut missing_objects) = if objects {
-        rev_list_objects(
-            &db,
-            format,
-            &selected,
-            &provided_tree_roots,
-            &excluded,
-            &exclude_object_tips,
-            &object_filter,
-            filter_print_omitted,
-            traversal_missing_action,
-        )?
-    } else {
-        (Vec::new(), Vec::new(), Vec::new())
-    };
+    let (mut selected_objects, mut omitted_objects, mut missing_objects, object_origin_commits) =
+        if objects {
+            rev_list_objects(
+                &db,
+                format,
+                &selected,
+                &provided_tree_roots,
+                &excluded,
+                &exclude_object_tips,
+                &object_filter,
+                filter_print_omitted,
+                traversal_missing_action,
+            )?
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), HashMap::new())
+        };
     if !provided_objects.is_empty() {
         // A provided object is emitted once, as the provided entry.
         let provided_oids: HashSet<ObjectId> =
@@ -1298,6 +1325,23 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     {
         return Ok(());
     }
+    let mut commit_ordered_objects = HashMap::<ObjectId, Vec<RevListObject>>::new();
+    if objects_in_commit_order {
+        let mut trailing_objects = Vec::new();
+        for object in selected_objects.drain(..) {
+            if let Some(commit) = object_origin_commits.get(&object.oid) {
+                commit_ordered_objects
+                    .entry(*commit)
+                    .or_default()
+                    .push(object);
+            } else {
+                // Explicit tree roots are not introduced by a walked commit;
+                // retain their ordinary trailing-object position.
+                trailing_objects.push(object);
+            }
+        }
+        selected_objects = trailing_objects;
+    }
     let mut child_oids = HashMap::<ObjectId, Vec<ObjectId>>::new();
     if children {
         let selected_oids = selected
@@ -1312,63 +1356,96 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             }
         }
     }
+    if !quiet && reverse {
+        write_rev_list_boundary_records(
+            &boundary_records,
+            RevListBoundaryOptions {
+                pretty: &pretty,
+                abbrev_commit,
+                abbrev_len,
+                timestamp,
+                parents,
+                decorations: &decorations,
+                date_mode: &date_mode,
+                output_encoding: &output_encoding,
+                mailmap: &mailmap,
+                use_mailmap,
+            },
+        )?;
+    }
     if !quiet {
-        for record in selected {
-            if !rev_list_should_print_commit(record, &object_filter, &object_filter_tip_oids) {
-                continue;
-            }
-            if kept_object_oids.contains(&record.oid) {
-                continue;
-            }
-            let left_right_prefix = left_right_sides.get(&record.oid).copied().unwrap_or('>');
-            let output_prefix = rev_list_output_prefix(
-                cherry_mode,
-                patchsame_oids.contains(&record.oid),
-                left_right,
-                left_right_prefix,
-            );
-            match &pretty {
-                RevListPretty::Default
-                | RevListPretty::Compiled {
-                    commit_header: false,
-                    ..
-                } => {
-                    let oneline = matches!(
-                        pretty,
-                        RevListPretty::Compiled {
-                            commit_header: false,
-                            ..
-                        }
-                    );
-                    if timestamp {
-                        print!(
-                            "{} ",
-                            commit_identity_timestamp_i64(&record.commit.committer)?
+        for &record in &selected {
+            if rev_list_should_print_commit(record, &object_filter, &object_filter_tip_oids)
+                && !kept_object_oids.contains(&record.oid)
+            {
+                let left_right_prefix = left_right_sides.get(&record.oid).copied().unwrap_or('>');
+                let output_prefix = rev_list_output_prefix(
+                    cherry_mode,
+                    patchsame_oids.contains(&record.oid),
+                    left_right,
+                    left_right_prefix,
+                );
+                match &pretty {
+                    RevListPretty::Default
+                    | RevListPretty::Compiled {
+                        commit_header: false,
+                        ..
+                    } => {
+                        let oneline = matches!(
+                            pretty,
+                            RevListPretty::Compiled {
+                                commit_header: false,
+                                ..
+                            }
                         );
-                    }
-                    if let Some(prefix) = output_prefix {
-                        print!("{prefix}");
-                    }
-                    if oneline {
-                        let RevListPretty::Compiled { compiled, .. } = &pretty else {
-                            unreachable!("oneline requires compiled preset");
-                        };
-                        let format_context = LogFormatContext {
-                            abbrev_len: abbrev_commit.then_some(abbrev_len).flatten(),
-                            decorations: &decorations,
-                            marker: output_prefix.unwrap_or(left_right_prefix),
-                            dialect: LogFormatDialect::RevList,
-                            source: None,
-                            date_mode: &date_mode,
-                            source_oid: None,
-                            describe: None,
-                            signature: Some(&CliLogSignatureAdapter(&signature_ctx)),
-                            color: want_color,
-                            output_encoding: &output_encoding,
-                            mailmap: &CliMailmapAdapter(&mailmap),
-                            use_mailmap,
-                        };
-                        if children {
+                        if timestamp {
+                            print!(
+                                "{} ",
+                                commit_identity_timestamp_i64(&record.commit.committer)?
+                            );
+                        }
+                        if let Some(prefix) = output_prefix {
+                            print!("{prefix}");
+                        }
+                        if oneline {
+                            let RevListPretty::Compiled { compiled, .. } = &pretty else {
+                                unreachable!("oneline requires compiled preset");
+                            };
+                            let format_context = LogFormatContext {
+                                abbrev_len: abbrev_commit.then_some(abbrev_len).flatten(),
+                                decorations: &decorations,
+                                marker: output_prefix.unwrap_or(left_right_prefix),
+                                dialect: LogFormatDialect::RevList,
+                                source: None,
+                                date_mode: &date_mode,
+                                source_oid: None,
+                                describe: None,
+                                signature: Some(&CliLogSignatureAdapter(&signature_ctx)),
+                                color: want_color,
+                                output_encoding: &output_encoding,
+                                mailmap: &CliMailmapAdapter(&mailmap),
+                                use_mailmap,
+                            };
+                            if children {
+                                print!(
+                                    "{}",
+                                    format_rev_list_oid(&record.oid, abbrev_commit, abbrev_len)
+                                );
+                                if parents {
+                                    for parent in &record.parents {
+                                        print!(" {parent}");
+                                    }
+                                }
+                                if let Some(children) = child_oids.get(&record.oid) {
+                                    for child in children {
+                                        print!(" {child}");
+                                    }
+                                }
+                                print!(" {}", commit_subject(&record.commit.message));
+                            } else {
+                                print_log_format(record, compiled, format_context)?;
+                            }
+                        } else {
                             print!(
                                 "{}",
                                 format_rev_list_oid(&record.oid, abbrev_commit, abbrev_len)
@@ -1378,102 +1455,89 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                                     print!(" {parent}");
                                 }
                             }
-                            if let Some(children) = child_oids.get(&record.oid) {
+                            if children && let Some(children) = child_oids.get(&record.oid) {
                                 for child in children {
                                     print!(" {child}");
                                 }
                             }
-                            print!(" {}", commit_subject(&record.commit.message));
+                        }
+                        if nul_terminated {
+                            print!("\0");
                         } else {
-                            print_log_format(record, compiled, format_context)?;
+                            println!();
                         }
-                    } else {
-                        print!(
-                            "{}",
-                            format_rev_list_oid(&record.oid, abbrev_commit, abbrev_len)
-                        );
-                        if parents {
-                            for parent in &record.parents {
-                                print!(" {parent}");
-                            }
-                        }
-                        if children && let Some(children) = child_oids.get(&record.oid) {
-                            for child in children {
-                                print!(" {child}");
-                            }
+                        if header && !oneline {
+                            write_rev_list_header(record)?;
                         }
                     }
-                    if nul_terminated {
-                        print!("\0");
-                    } else {
-                        println!();
-                    }
-                    if header && !oneline {
-                        write_rev_list_header(record)?;
-                    }
-                }
-                RevListPretty::Short => write_rev_list_short(
-                    record,
-                    output_prefix,
-                    parents,
-                    abbrev_commit,
-                    abbrev_len,
-                    timestamp,
-                    &output_encoding,
-                )?,
-                RevListPretty::Raw => {
-                    write_rev_list_commit_header_line(
+                    RevListPretty::Short => write_rev_list_short(
                         record,
                         output_prefix,
                         parents,
                         abbrev_commit,
                         abbrev_len,
                         timestamp,
-                    )?;
-                    write_rev_list_raw_body(record)?;
-                }
-                RevListPretty::Compiled {
-                    compiled,
-                    commit_header: true,
-                } => {
-                    write_rev_list_commit_header_line(
-                        record,
-                        output_prefix,
-                        parents,
-                        abbrev_commit,
-                        abbrev_len,
-                        timestamp,
-                    )?;
-                    let emitted = print_log_format(
-                        record,
-                        compiled,
-                        LogFormatContext {
+                        &output_encoding,
+                    )?,
+                    RevListPretty::Raw => {
+                        write_rev_list_commit_header_line(
+                            record,
+                            output_prefix,
+                            parents,
+                            abbrev_commit,
                             abbrev_len,
-                            decorations: &decorations,
-                            marker: left_right_prefix,
-                            dialect: LogFormatDialect::RevList,
-                            source: None,
-                            date_mode: &date_mode,
-                            source_oid: None,
-                            describe: None,
-                            signature: Some(&CliLogSignatureAdapter(&signature_ctx)),
-                            color: want_color,
-                            output_encoding: &output_encoding,
-                            mailmap: &CliMailmapAdapter(&mailmap),
-                            use_mailmap,
-                        },
-                    )?;
-                    if emitted > 0 {
-                        println!();
+                            timestamp,
+                        )?;
+                        write_rev_list_raw_body(record)?;
                     }
+                    RevListPretty::Compiled {
+                        compiled,
+                        commit_header: true,
+                    } => {
+                        write_rev_list_commit_header_line(
+                            record,
+                            output_prefix,
+                            parents,
+                            abbrev_commit,
+                            abbrev_len,
+                            timestamp,
+                        )?;
+                        let emitted = print_log_format(
+                            record,
+                            compiled,
+                            LogFormatContext {
+                                abbrev_len,
+                                decorations: &decorations,
+                                marker: left_right_prefix,
+                                dialect: LogFormatDialect::RevList,
+                                source: None,
+                                date_mode: &date_mode,
+                                source_oid: None,
+                                describe: None,
+                                signature: Some(&CliLogSignatureAdapter(&signature_ctx)),
+                                color: want_color,
+                                output_encoding: &output_encoding,
+                                mailmap: &CliMailmapAdapter(&mailmap),
+                                use_mailmap,
+                            },
+                        )?;
+                        if emitted > 0 {
+                            println!();
+                        }
+                    }
+                }
+            }
+            if let Some(objects) = commit_ordered_objects.remove(&record.oid) {
+                for object in objects {
+                    write_rev_list_object_line(&object, object_names, nul_terminated)?;
                 }
             }
         }
     }
     if !quiet {
-        for record in boundary_records {
-            write_rev_list_boundary_record(
-                &record,
+        if !reverse {
+            write_rev_list_boundary_records(
+                &boundary_records,
                 RevListBoundaryOptions {
                     pretty: &pretty,
                     abbrev_commit,
@@ -1935,6 +1999,7 @@ fn rev_list_render_tree_to_tree_patch(
             entry,
             DiffRenderOptions {
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                suppress_blank_empty: false,
                 binary: false,
                 anchors: &[],
                 allow_textconv: false,
@@ -1997,6 +2062,7 @@ fn rev_list_boundary_records(
     Ok(out)
 }
 
+#[derive(Clone, Copy)]
 struct RevListBoundaryOptions<'a> {
     pretty: &'a RevListPretty,
     abbrev_commit: bool,
@@ -2008,6 +2074,16 @@ struct RevListBoundaryOptions<'a> {
     output_encoding: &'a str,
     mailmap: &'a commands::utility::Mailmap,
     use_mailmap: bool,
+}
+
+fn write_rev_list_boundary_records(
+    records: &[sley_rev::CommitRecord],
+    options: RevListBoundaryOptions<'_>,
+) -> Result<()> {
+    for record in records {
+        write_rev_list_boundary_record(record, options)?;
+    }
+    Ok(())
 }
 
 fn write_rev_list_boundary_record(
@@ -2723,7 +2799,12 @@ fn rev_list_objects(
     filter: &RevListObjectFilter,
     collect_omitted: bool,
     missing_action: RevListMissingAction,
-) -> Result<(Vec<RevListObject>, Vec<RevListObject>, Vec<RevListObject>)> {
+) -> Result<(
+    Vec<RevListObject>,
+    Vec<RevListObject>,
+    Vec<RevListObject>,
+    HashMap<ObjectId, ObjectId>,
+)> {
     let mut hidden = HashSet::new();
     for oid in excluded {
         let object = db.read_object(oid)?;
@@ -2752,6 +2833,7 @@ fn rev_list_objects(
         missing_action,
     };
     for record in records {
+        state.current_commit = Some(record.oid);
         rev_list_collect_tree_objects(
             &walk,
             &record.commit.tree,
@@ -2762,6 +2844,7 @@ fn rev_list_objects(
             0,
         )?;
     }
+    state.current_commit = None;
     for root in tree_roots {
         rev_list_collect_tree_objects(
             &walk,
@@ -2773,7 +2856,12 @@ fn rev_list_objects(
             0,
         )?;
     }
-    Ok((state.objects, state.omitted, state.missing))
+    Ok((
+        state.objects,
+        state.omitted,
+        state.missing,
+        state.origin_commits,
+    ))
 }
 
 struct RevListObjectWalk<'a> {
@@ -2794,6 +2882,8 @@ struct RevListObjectState {
     missing_oids: HashSet<ObjectId>,
     visited_tree_depths: HashMap<ObjectId, usize>,
     omitted_tree_contents: HashSet<ObjectId>,
+    current_commit: Option<ObjectId>,
+    origin_commits: HashMap<ObjectId, ObjectId>,
 }
 
 fn rev_list_mark_tree_objects(
@@ -2902,8 +2992,15 @@ fn rev_list_collect_tree_objects(
         if rev_list_excludes_promisor(walk) && walk.db.is_promised_object(&entry.oid) {
             continue;
         }
-        let entry_path = rev_list_join_object_path(&path, entry.name);
         let entry_type = tree_entry_object_type(entry.mode);
+        // A non-tree object is emitted under its first reachable path. Test
+        // that identity before materializing another path for it: histories
+        // whose successive root trees contain the same blobs otherwise allocate
+        // and immediately discard one `Vec` per duplicate entry.
+        if entry_type != ObjectType::Tree && state.emitted_oids.contains(&entry.oid) {
+            continue;
+        }
+        let entry_path = rev_list_join_object_path(&path, entry.name);
         if entry_type == ObjectType::Tree {
             rev_list_collect_tree_objects(
                 walk,
@@ -2915,9 +3012,6 @@ fn rev_list_collect_tree_objects(
                 depth + 1,
             )?;
         } else {
-            if state.emitted_oids.contains(&entry.oid) {
-                continue;
-            }
             let size = if entry_type == ObjectType::Blob
                 && (rev_list_filter_needs_blob_size(walk.filter)
                     || !matches!(
@@ -3007,6 +3101,9 @@ fn rev_list_record_filter_decision(
         .includes_object(object_type, oid, path, size, depth)?
     {
         if state.emitted_oids.insert(*oid) {
+            if let Some(commit) = state.current_commit {
+                state.origin_commits.insert(*oid, commit);
+            }
             state.objects.push(RevListObject {
                 oid: *oid,
                 name: path.to_vec(),

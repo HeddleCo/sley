@@ -10,6 +10,7 @@
 
 use sley_core::ObjectId;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// `todo_command_info` order matters: parsing tries commands in this order.
@@ -614,6 +615,20 @@ pub fn write_state_file(git_dir: &Path, name: &str, contents: &str) -> std::io::
     fs::write(state_path(git_dir, name), contents)
 }
 
+/// Append one completed instruction to `rebase-merge/done`.
+///
+/// The sequencer advances this file once per todo command.  Opening it in
+/// append mode avoids reading and rewriting the complete history for every
+/// step while preserving the exact line-oriented on-disk contract.
+pub fn append_done_line(git_dir: &Path, line: &[u8]) -> std::io::Result<()> {
+    let mut done = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state_path(git_dir, "done"))?;
+    done.write_all(line)?;
+    done.write_all(b"\n")
+}
+
 pub fn remove_merge_state(git_dir: &Path) {
     let _ = fs::remove_dir_all(merge_dir(git_dir));
 }
@@ -863,5 +878,19 @@ mod tests {
         assert_eq!(name, b"\xC1\xE9\xED \xF3\xFA");
         assert_eq!(email, b"a@example.com");
         assert_eq!(date, "@1 +0000");
+    }
+
+    #[test]
+    fn done_lines_append_without_rewriting_prior_commands() {
+        let root = std::env::temp_dir().join(format!("sley-sequencer-done-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(merge_dir(&root)).expect("create rebase state");
+        append_done_line(&root, b"pick 111 first").expect("append first done line");
+        append_done_line(&root, b"exec make test").expect("append second done line");
+        assert_eq!(
+            fs::read(state_path(&root, "done")).expect("read done state"),
+            b"pick 111 first\nexec make test\n"
+        );
+        fs::remove_dir_all(root).expect("remove rebase state");
     }
 }

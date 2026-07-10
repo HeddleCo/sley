@@ -1,7 +1,7 @@
 //! `write-tree` engine parity via [`Repository::write_tree`].
 
 use sley::{EntryKind, ObjectId, Repository, TreeEditor};
-use sley_testkit::engine_parity::{git_oid_line, EngineOutput, EngineParityCase};
+use sley_testkit::engine_parity::{EngineOutput, EngineParityCase, git_oid_line};
 
 fn empty_tree_oid(repo: &Repository) -> ObjectId {
     ObjectId::empty_tree(repo.object_format())

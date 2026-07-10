@@ -2751,6 +2751,40 @@ fn apply_one_patch(
         am_prepend_directory(&mut file_patches, dir);
     }
 
+    // `git am --reject` deliberately gives up the atomic semantics of the
+    // normal apply path: every hunk is tried, the ones that apply are written
+    // to the worktree, and every failed hunk is copied to `<path>.rej`.  The
+    // index is left untouched and the am session stops so the user can inspect
+    // or resolve the partial result.  Keep this ahead of the normal straight
+    // apply / 3-way decision; `--reject` and `--3way` are mutually exclusive in
+    // Git's apply machinery and a rejected hunk must never fall through to the
+    // 3-way backend.
+    if apply_opts.reject {
+        let (actions, rejects) = try_reject_apply(
+            common_git_dir,
+            worktree_root,
+            format,
+            &file_patches,
+            apply_opts,
+        )?;
+        apply_actions(git_dir, worktree_root, format, &actions)?;
+        write_am_rejects(worktree_root, &rejects)?;
+        if !rejects.is_empty() {
+            return Ok(ApplyResult::Conflict);
+        }
+        let new_oid = stage_and_commit(
+            git_dir,
+            common_git_dir,
+            worktree_root,
+            format,
+            patch,
+            &actions,
+            commit_opts,
+        )?;
+        record_rebase_rewrite(state_dir, format, number, &new_oid)?;
+        return Ok(ApplyResult::Committed);
+    }
+
     match try_straight_apply(
         common_git_dir,
         worktree_root,
@@ -2805,6 +2839,138 @@ fn apply_one_patch(
             Ok(ApplyResult::Conflict)
         }
     }
+}
+
+/// One reject file produced by the hunk-by-hunk `--reject` apply path.
+struct AmReject {
+    path: Vec<u8>,
+    contents: Vec<u8>,
+}
+
+/// Apply every textual hunk independently, retaining successful worktree
+/// changes and collecting the failed hunks for `.rej` materialisation.
+///
+/// This is intentionally an am-level adapter over the shared diff engine: the
+/// engine owns fragment placement and reject rendering, while am owns its
+/// worktree-only stop state (the index must remain at HEAD until `am
+/// --continue`).
+fn try_reject_apply(
+    common_git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    file_patches: &[sley_diff_merge::FilePatch],
+    apply_opts: &AmApplyOpts,
+) -> Result<(Vec<ApplyFileAction>, Vec<AmReject>)> {
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let mut actions = Vec::new();
+    let mut rejects = Vec::new();
+
+    for patch in file_patches {
+        let target = patch
+            .new_path
+            .clone()
+            .or_else(|| patch.old_path.clone())
+            .ok_or_else(|| GitError::InvalidFormat("patch missing target path".into()))?;
+        let old_path = patch.old_path.as_deref().unwrap_or(&target);
+        let base = if patch.is_new {
+            Vec::new()
+        } else if patch.old_mode == Some(0o160000) {
+            am_gitlink_preimage_from_patch(patch)
+        } else {
+            let rel = std::str::from_utf8(old_path)
+                .map_err(|_| GitError::InvalidFormat("non-utf8 patch path".into()))?;
+            fs::read(worktree_root.join(rel)).unwrap_or_default()
+        };
+
+        // Binary patches have no textual fragments to salvage.  A clean binary
+        // apply is still accepted under `--reject`; a failed one is represented
+        // as a normal apply failure because Git cannot create a textual reject
+        // hunk for it either.
+        if patch.is_binary {
+            match commands::plumbing::apply_binary_outcome(&db, format, patch, &base)? {
+                commands::plumbing::BinaryApply::Deletion => {
+                    if let Some(old) = &patch.old_path {
+                        actions.push(ApplyFileAction::Remove { path: old.clone() });
+                    }
+                }
+                commands::plumbing::BinaryApply::Content(content) => {
+                    actions.push(ApplyFileAction::Write {
+                        path: target,
+                        mode: patch.new_mode.or(patch.old_mode).unwrap_or(0o100644),
+                        content,
+                    });
+                    if patch.is_rename
+                        && let Some(old) = &patch.old_path
+                    {
+                        actions.push(ApplyFileAction::Remove { path: old.clone() });
+                    }
+                }
+            }
+            continue;
+        }
+
+        let fixed_patch;
+        let patch_to_apply = if apply_opts.whitespace_fix() {
+            fixed_patch = am_whitespace_fix_patch(patch);
+            &fixed_patch
+        } else {
+            patch
+        };
+        let result = sley_diff_merge::apply_file_patch_rejecting(
+            &base,
+            patch_to_apply,
+            &sley_diff_merge::ApplyFileOptions::default(),
+        );
+
+        if !result.rejected.is_empty() {
+            let mut contents = Vec::new();
+            contents.extend_from_slice(b"diff a/");
+            contents.extend_from_slice(&target);
+            contents.extend_from_slice(b" b/");
+            contents.extend_from_slice(&target);
+            contents.extend_from_slice(b"\t(rejected hunks)\n");
+            for &index in &result.rejected {
+                contents
+                    .extend_from_slice(&sley_diff_merge::render_reject_hunk(&patch.hunks[index]));
+            }
+            rejects.push(AmReject {
+                path: target.clone(),
+                contents,
+            });
+        }
+
+        if patch.is_delete && result.rejected.is_empty() {
+            if let Some(old) = &patch.old_path {
+                actions.push(ApplyFileAction::Remove { path: old.clone() });
+            }
+        } else {
+            actions.push(ApplyFileAction::Write {
+                path: target,
+                mode: patch.new_mode.or(patch.old_mode).unwrap_or(0o100644),
+                content: result.content,
+            });
+            if patch.is_rename
+                && let Some(old) = &patch.old_path
+            {
+                actions.push(ApplyFileAction::Remove { path: old.clone() });
+            }
+        }
+    }
+
+    Ok((actions, rejects))
+}
+
+fn write_am_rejects(worktree_root: &Path, rejects: &[AmReject]) -> Result<()> {
+    for reject in rejects {
+        let rel = std::str::from_utf8(&reject.path)
+            .map_err(|err| GitError::InvalidPath(err.to_string()))?;
+        let mut path = worktree_root.join(rel).into_os_string();
+        path.push(".rej");
+        let path = PathBuf::from(path);
+        let _ = fs::remove_file(&path);
+        fs::write(path, &reject.contents)?;
+    }
+    Ok(())
 }
 
 /// A single materialisation step computed from a patch (write or remove a file).
@@ -3898,7 +4064,14 @@ fn apply_three_way(
                 detect_renames: true,
                 rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
                 rename_limit: commands::merge_rebase::merge_rename_limit_config(),
-                directory_renames: commands::merge_rebase::directory_renames_config(),
+                // The apply/am 3-way backend uses Git's constructed-fake-
+                // ancestor merge path, which does not perform implicit
+                // directory renames (the upstream suite records positive
+                // directory-rename handling here as a known breakage).  File
+                // renames still participate normally; only the directory-level
+                // inference must be disabled so an unrelated x/a and x/b are
+                // not spuriously moved when the patch renames x/c to y/c.
+                directory_renames: sley_diff_merge::DirectoryRenames::False,
             },
             None,
             Some(&path_marker_size),
@@ -4514,6 +4687,21 @@ fn am_bytes_to_pathbuf(bytes: &[u8]) -> PathBuf {
     }
 }
 
+/// Relative `Path` → Git's slash-separated index bytes.
+fn am_pathbuf_to_bytes(path: &Path) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        if !bytes.is_empty() {
+            bytes.push(b'/');
+        }
+        bytes.extend_from_slice(name.as_encoded_bytes());
+    }
+    bytes
+}
+
 /// Path → (mode, oid) leaf map for a commit's tree (empty for an unborn HEAD).
 fn am_commit_leaf_map(
     db: &FileObjectDatabase,
@@ -4625,16 +4813,25 @@ fn am_clean_index(
     }
 
     // D/F precheck (git's `verify_clean_subdirectory`): refuse to restore a
-    // tracked file over a directory holding untracked content, and do so BEFORE
-    // touching the index or worktree so `am --abort` fails cleanly with the
-    // directory intact (t4151 "return failed exit status when it fails").
+    // tracked file over a directory holding unrelated untracked content, and do
+    // so BEFORE touching the index or worktree so `am --abort` fails cleanly
+    // with the directory intact (t4151 "return failed exit status when it
+    // fails"). Files created by the failed apply and already scheduled for
+    // removal are owned by this cleanup, however; they must not make `--skip`
+    // reject its own D/F conflict debris (t1015).
+    let cleanup_paths = remove_paths
+        .iter()
+        .map(|path| (*path).clone())
+        .collect::<std::collections::BTreeSet<_>>();
     let mut df_conflict = false;
     for path in &checkout_paths {
         let full = worktree_root.join(path);
         if full.is_dir()
-            && fs::read_dir(&full)
-                .map(|mut entries| entries.next().is_some())
-                .unwrap_or(false)
+            && am_subdirectory_has_unowned_entries(
+                &full,
+                &am_pathbuf_to_bytes(path),
+                &cleanup_paths,
+            )?
         {
             eprintln!(
                 "error: Updating '{}' would lose untracked files in it",
@@ -4688,6 +4885,36 @@ fn am_clean_index(
         )?;
     }
     Ok(())
+}
+
+/// Whether a D/F directory contains anything outside the failed apply's cleanup
+/// set. Empty directories and files explicitly scheduled for removal are safe;
+/// every other leaf is user-owned worktree state and must block replacement.
+fn am_subdirectory_has_unowned_entries(
+    directory: &Path,
+    git_path: &[u8],
+    cleanup_paths: &std::collections::BTreeSet<Vec<u8>>,
+) -> Result<bool> {
+    let mut stack = vec![(directory.to_path_buf(), git_path.to_vec())];
+    while let Some((fs_directory, git_directory)) = stack.pop() {
+        let entries = match fs::read_dir(&fs_directory) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let mut child_git_path = git_directory.clone();
+            child_git_path.push(b'/');
+            child_git_path.extend_from_slice(entry.file_name().as_encoded_bytes());
+            if entry.file_type()?.is_dir() {
+                stack.push((entry.path(), child_git_path));
+            } else if !cleanup_paths.contains(child_git_path.as_slice()) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// `git am --abort`: restore the branch to where the series started and drop

@@ -123,7 +123,11 @@ fn percent_hex_value(byte: u8) -> Option<u8> {
         _ => None,
     }
 }
-pub(super) fn local_remote_git_dir(config: &GitConfig, name: &str, git_dir: &Path) -> Result<PathBuf> {
+pub(super) fn local_remote_git_dir(
+    config: &GitConfig,
+    name: &str,
+    git_dir: &Path,
+) -> Result<PathBuf> {
     let url = remote_config_values(config, name, "url")
         .into_iter()
         .next()

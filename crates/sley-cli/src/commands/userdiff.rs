@@ -12,12 +12,12 @@
 
 use crate::*;
 pub(crate) use sley::plumbing::sley_diff_merge::format::CompiledFuncname;
+use sley::plumbing::{sley_config, sley_worktree};
 #[cfg(test)]
 use sley_grep::{Regex, RegexMode};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use sley::plumbing::{sley_config, sley_worktree};
 
 /// One row of the upstream builtin driver table.
 pub(crate) struct BuiltinDriver {
@@ -546,9 +546,15 @@ mod tests {
         let driver = BUILTIN_DRIVERS
             .iter()
             .find(|driver| driver.name == "java")
-            .unwrap();
-        let funcname =
-            CompiledFuncname::compile(driver.funcname.unwrap(), true, driver.icase).unwrap();
+            .expect("Java driver should be built in");
+        let funcname = CompiledFuncname::compile(
+            driver
+                .funcname
+                .expect("Java driver should define a funcname pattern"),
+            true,
+            driver.icase,
+        )
+        .expect("Java funcname pattern should compile");
         assert_eq!(
             funcname.match_line(b"\tpublic static void main(String RIGHT[])\n"),
             Some(b"public static void main(String RIGHT[])".to_vec())

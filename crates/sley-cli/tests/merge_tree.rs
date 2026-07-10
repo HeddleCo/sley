@@ -117,6 +117,15 @@ fn assert_same(dir: &Path, args: &[&str]) {
     );
 }
 
+fn assert_same_full(dir: &Path, args: &[&str]) -> Output {
+    let reference = git(dir, args);
+    let candidate = sley(dir, args);
+    assert_eq!(candidate.status.code(), reference.status.code());
+    assert_eq!(candidate.stdout, reference.stdout);
+    assert_eq!(candidate.stderr, reference.stderr);
+    candidate
+}
+
 /// base has `a.txt`; `feature` and the default branch each modify a *different*
 /// line of `a.txt` and add a distinct new file → a clean 3-way merge with a
 /// content auto-merge of `a.txt`.
@@ -465,6 +474,179 @@ fn legacy_trivial_merge_matches_git() {
     assert_same(
         &repo,
         &["--trivial-merge", &base_tree, &our_tree, &their_tree],
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn stacked_file_directory_and_modify_delete_matches_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("merge-tree-stacked-df-md");
+    let repo = root.join("repo");
+    git_ok(
+        root.as_path(),
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
+    write_file(&repo, "path", "base\nline\n");
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["commit", "-qm", "base"]);
+    git_ok(&repo, &["checkout", "-q", "-b", "directory-side"]);
+    git_ok(&repo, &["rm", "-q", "path"]);
+    write_file(&repo, "path/child", "child\n");
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["commit", "-qm", "replace file with directory"]);
+    let default = default_branch(&repo);
+    git_ok(&repo, &["checkout", "-q", &default]);
+    write_file(&repo, "path", "base\nmodified\n");
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["commit", "-qm", "modify file"]);
+
+    assert_same(&repo, &["-z", &default, "directory-side"]);
+    assert_same(
+        &repo,
+        &["--write-tree", "--name-only", &default, "directory-side"],
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn crossed_one_to_two_rename_graph_matches_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("merge-tree-crossed-renames");
+    let repo = root.join("repo");
+    git_ok(
+        root.as_path(),
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
+    write_file(&repo, "one", "one-1\none-2\none-3\none-4\none-5\n");
+    write_file(&repo, "two", "two-1\ntwo-2\ntwo-3\ntwo-4\ntwo-5\n");
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["commit", "-qm", "base"]);
+    git_ok(&repo, &["checkout", "-q", "-b", "side-a"]);
+    write_file(&repo, "one", "one-0\none-1\none-2\none-3\none-4\none-5\n");
+    write_file(&repo, "two", "two-0\ntwo-1\ntwo-2\ntwo-3\ntwo-4\ntwo-5\n");
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["mv", "one", "left"]);
+    git_ok(&repo, &["mv", "two", "right"]);
+    git_ok(&repo, &["commit", "-qm", "cross one way"]);
+    let default = default_branch(&repo);
+    git_ok(&repo, &["checkout", "-q", &default]);
+    git_ok(&repo, &["checkout", "-q", "-b", "side-b"]);
+    write_file(&repo, "one", "one-1\none-2\none-3\none-4\none-5\none-6\n");
+    write_file(&repo, "two", "two-1\ntwo-2\ntwo-3\ntwo-4\ntwo-5\ntwo-6\n");
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["mv", "one", "right"]);
+    git_ok(&repo, &["mv", "two", "left"]);
+    git_ok(&repo, &["commit", "-qm", "cross the other way"]);
+
+    assert_same(&repo, &["-z", "side-a", "side-b"]);
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn trivial_file_tree_transition_and_local_delete_match_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("merge-tree-trivial-shapes");
+    let repo = root.join("repo");
+    git_ok(
+        root.as_path(),
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
+    write_file(&repo, "path", "file\n");
+    write_file(&repo, "deleted-locally", "base\n");
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["commit", "-qm", "base"]);
+    let base = String::from_utf8_lossy(&git(&repo, &["rev-parse", "HEAD^{tree}"]).stdout)
+        .trim()
+        .to_string();
+    git_ok(&repo, &["checkout", "-q", "-b", "ours"]);
+    git_ok(&repo, &["rm", "-q", "deleted-locally"]);
+    git_ok(&repo, &["commit", "-qm", "delete locally"]);
+    let ours = String::from_utf8_lossy(&git(&repo, &["rev-parse", "HEAD^{tree}"]).stdout)
+        .trim()
+        .to_string();
+    git_ok(&repo, &["checkout", "-q", "-b", "theirs", "HEAD~1"]);
+    write_file(&repo, "deleted-locally", "changed remotely\n");
+    git_ok(&repo, &["rm", "-q", "path"]);
+    write_file(&repo, "path/child", "child\n");
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["commit", "-qm", "remote changes"]);
+    let theirs = String::from_utf8_lossy(&git(&repo, &["rev-parse", "HEAD^{tree}"]).stdout)
+        .trim()
+        .to_string();
+
+    assert_same(&repo, &[&base, &ours, &theirs]);
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn explicit_attribute_source_controls_real_merge() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("merge-tree-attr-source");
+    let repo = root.join("repo");
+    git_ok(
+        root.as_path(),
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
+    write_file(&repo, "file", "base\n");
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["commit", "-qm", "base"]);
+    git_ok(&repo, &["branch", "base"]);
+    git_ok(&repo, &["checkout", "-q", "-b", "left"]);
+    write_file(&repo, "file", "base\nleft\n");
+    git_ok(&repo, &["commit", "-qam", "left"]);
+    git_ok(&repo, &["checkout", "-q", "-b", "right", "base"]);
+    write_file(&repo, "file", "base\nright\n");
+    git_ok(&repo, &["commit", "-qam", "right"]);
+    git_ok(&repo, &["checkout", "-q", "-b", "attributes"]);
+    write_file(&repo, ".gitattributes", "file merge=union\n");
+    git_ok(&repo, &["add", ".gitattributes"]);
+    git_ok(&repo, &["commit", "-qm", "attributes"]);
+
+    let output = assert_same_full(
+        &repo,
+        &[
+            "--attr-source=attributes",
+            "merge-tree",
+            "--write-tree",
+            "--merge-base=base",
+            "--end-of-options",
+            "left",
+            "right",
+        ],
+    );
+    let tree = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(
+        git(&repo, &["cat-file", "-p", &format!("{tree}:file")]).stdout,
+        b"base\nleft\nright\n"
     );
 
     fs::remove_dir_all(&root).ok();

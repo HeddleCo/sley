@@ -262,6 +262,7 @@ fn rev_list_linear_history_matches_upstream_git() {
             vec!["rev-list", "--no-object-names", "HEAD"],
             vec!["rev-list", "--object-names", "--no-object-names", "HEAD"],
             vec!["rev-list", "--objects", "HEAD"],
+            vec!["rev-list", "--in-commit-order", "--objects", "HEAD"],
             vec![
                 "rev-list",
                 "--objects-edge-aggressive",
@@ -596,6 +597,13 @@ fn rev_list_linear_history_matches_upstream_git() {
                 base_to_head.as_str(),
             ],
             vec!["rev-list", "--boundary", "--parents", base_to_head.as_str()],
+            vec![
+                "rev-list",
+                "--boundary",
+                "--reverse",
+                "--parents",
+                base_to_head.as_str(),
+            ],
             vec!["rev-list", "--boundary", "--oneline", base_to_head.as_str()],
             vec![
                 "rev-list",
@@ -1105,6 +1113,31 @@ fn rev_list_ref_selector_modes_match_upstream_git() {
 }
 
 #[test]
+fn rev_list_all_includes_detached_head() {
+    let root = unique_temp_dir("rev-list-all-detached-head");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        commit_file(&root, "file", "one\n", "one");
+        commit_file(&root, "file", "two\n", "two");
+        git(&root, &["checkout", "--detach", "-q", "HEAD~1"]);
+        commit_file(&root, "detached", "three\n", "detached");
+
+        for args in [
+            vec!["rev-list", "--all"],
+            vec!["rev-list", "--count", "--all"],
+        ] {
+            assert_eq!(
+                sley(&root, &args),
+                git(&root, &args),
+                "rev-list output differed for {args:?}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn rev_list_symmetric_branch_range_count_matches_upstream_git() {
     let root = unique_temp_dir("rev-list-symmetric-branches");
     fs::create_dir_all(&root).expect("create temp repo");
@@ -1342,4 +1375,64 @@ fn assert_rev_list_date_order_merge_case(name: &str, side_timestamp: i64, main_t
 fn rev_list_date_order_merge_history_matches_upstream_git() {
     assert_rev_list_date_order_merge_case("rev-list-date-order-newer-side", 4000, 2000);
     assert_rev_list_date_order_merge_case("rev-list-date-order-older-side", 1500, 2000);
+}
+
+#[test]
+fn rev_list_corrupt_bitmap_falls_back_to_regular_walk() {
+    let root = unique_temp_dir("rev-list-corrupt-bitmap-fallback");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        commit_file(&root, "file", "base\n", "base");
+        commit_file(&root, "file", "second\n", "second");
+
+        // A non-commit ref is a pending-object root for the bitmap walk. The
+        // ordinary non-`--objects` walk ignores it, which is exactly the state
+        // that must be reconstructed after a corrupt bitmap is rejected.
+        let blob =
+            String::from_utf8(git(&root, &["rev-parse", "HEAD:file"])).expect("blob oid is utf8");
+        git(&root, &["update-ref", "refs/tags/blob-root", blob.trim()]);
+        git(
+            &root,
+            &["-c", "pack.writeBitmapHashCache=false", "repack", "-adb"],
+        );
+
+        let pack_dir = root.join(".git/objects/pack");
+        let bitmap_path = fs::read_dir(&pack_dir)
+            .expect("read pack directory")
+            .map(|entry| entry.expect("read pack entry").path())
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("bitmap"))
+            .expect("repack wrote a bitmap");
+        let mut bytes = fs::read(&bitmap_path).expect("read bitmap");
+        bytes.truncate(64);
+        fs::rename(&bitmap_path, bitmap_path.with_extension("bitmap.full"))
+            .expect("move read-only bitmap aside");
+        fs::write(&bitmap_path, bytes).expect("truncate bitmap");
+
+        let args = ["rev-list", "--use-bitmap-index", "--count", "--all"];
+        let expected = Command::new(sley_testkit::oracle_git())
+            .current_dir(&root)
+            .args(args)
+            .output()
+            .expect("run oracle rev-list");
+        let actual = Command::new(sley_testkit::sley_bin!())
+            .current_dir(&root)
+            .args(args)
+            .output()
+            .expect("run sley rev-list");
+
+        assert!(expected.status.success(), "oracle did not fall back");
+        assert!(
+            actual.status.success(),
+            "sley did not fall back:\n{}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        assert_eq!(actual.stdout, expected.stdout);
+        let stderr = String::from_utf8_lossy(&actual.stderr);
+        assert!(
+            stderr.contains("corrupt ewah bitmap"),
+            "missing bitmap corruption diagnostic: {stderr}"
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
 }

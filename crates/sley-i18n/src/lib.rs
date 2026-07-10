@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 use std::env;
-use std::fs;
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const GIT_SH_I18N: &str = r#"# Git-compatible shell i18n fallback helpers for Sley.
 TEXTDOMAIN=git
@@ -20,19 +20,50 @@ GIT_INTERNAL_GETTEXT_SH_SCHEME=fallthrough
 if test -n "$GIT_INTERNAL_GETTEXT_TEST_FALLBACKS"
 then
 	: no probing necessary
+elif type gettext.sh >/dev/null 2>&1
+then
+	GIT_INTERNAL_GETTEXT_SH_SCHEME=gnu
+elif test "$(gettext -h 2>&1)" = "-h"
+then
+	GIT_INTERNAL_GETTEXT_SH_SCHEME=gettext_without_eval_gettext
 fi
 export GIT_INTERNAL_GETTEXT_SH_SCHEME
 
-gettext () {
-	printf "%s" "$1"
-}
+case "$GIT_INTERNAL_GETTEXT_SH_SCHEME" in
+gnu)
+	. gettext.sh
+	;;
+gettext_without_eval_gettext)
+	eval_gettext () {
+		if test -z "${SLEY_BIN-}"
+		then
+			echo "fatal: SLEY_BIN is required by Sley's shell i18n helper" >&2
+			return 127
+		fi
+		gettext "$1" | (
+			export PATH $("$SLEY_BIN" sh-i18n--envsubst --variables "$1")
+			"$SLEY_BIN" sh-i18n--envsubst "$1"
+		)
+	}
+	;;
+*)
+	gettext () {
+		printf "%s" "$1"
+	}
 
-eval_gettext () {
-	printf "%s" "$1" | (
-		export PATH $(git sh-i18n--envsubst --variables "$1")
-		git sh-i18n--envsubst "$1"
-	)
-}
+	eval_gettext () {
+		if test -z "${SLEY_BIN-}"
+		then
+			echo "fatal: SLEY_BIN is required by Sley's shell i18n helper" >&2
+			return 127
+		fi
+		printf "%s" "$1" | (
+			export PATH $("$SLEY_BIN" sh-i18n--envsubst --variables "$1")
+			"$SLEY_BIN" sh-i18n--envsubst "$1"
+		)
+	}
+	;;
+esac
 
 gettextln () {
 	gettext "$1"
@@ -46,248 +77,310 @@ eval_gettextln () {
 "#;
 
 const GIT_SH_I18N_ENVSUBST: &str = r#"#!/bin/sh
-exec git sh-i18n--envsubst "$@"
+if test -z "${SLEY_BIN-}"
+then
+	echo "fatal: SLEY_BIN is required by Sley's shell i18n helper" >&2
+	exit 127
+fi
+exec "$SLEY_BIN" sh-i18n--envsubst "$@"
 "#;
 
-/// Git CGI/remote helpers that upstream expects under `GIT_EXEC_PATH` but that
-/// sley does not implement itself. Symlinked from the oracle/system git
-/// install when available so Apache `git-http-backend` and bundle-uri downloads
-/// via `git-remote-https` work under `GIT_TEST_INSTALLED`.
-const SYSTEM_GIT_EXEC_HELPERS: &[&str] = &[
-    "git-http-backend",
+const GIT_UPLOAD_PACK: &str = r#"#!/bin/sh
+if test -z "${SLEY_BIN-}"
+then
+	echo "fatal: SLEY_BIN is required by Sley's upload-pack adapter" >&2
+	exit 127
+fi
+exec "$SLEY_BIN" upload-pack "$@"
+"#;
+
+const GIT_RECEIVE_PACK: &str = r#"#!/bin/sh
+if test -z "${SLEY_BIN-}"
+then
+	echo "fatal: SLEY_BIN is required by Sley's receive-pack adapter" >&2
+	exit 127
+fi
+exec "$SLEY_BIN" receive-pack "$@"
+"#;
+
+// Keep this byte-for-byte invariant across launcher paths. Upstream waves may
+// invoke hardlinks to the same Sley binary concurrently, so embedding
+// `current_exe` would make one shared helper generation have multiple owners.
+const GIT_HTTP_BACKEND: &str = r#"#!/bin/sh
+if test -z "${SLEY_BIN-}"
+then
+	echo "fatal: SLEY_BIN is required by Sley's http-backend adapter" >&2
+	exit 127
+fi
+exec "$SLEY_BIN" http-backend "$@"
+"#;
+
+/// The manifest stored next to Sley's Git-compatible shell helpers.
+pub const HELPER_PROVENANCE_FILE: &str = ".sley-helper-provenance";
+
+const HELPER_PROVENANCE: &str = concat!(
+    "schema=1\n",
+    "owner=sley\n",
+    "crate=sley-i18n\n",
+    "version=",
+    env!("CARGO_PKG_VERSION"),
+    "\n",
+    "git-sh-i18n\tshell-library\n",
+    "git-sh-i18n--envsubst\tsley-cli-adapter\n",
+    "git-upload-pack\tsley-cli-adapter\n",
+    "git-receive-pack\tsley-cli-adapter\n",
+    "git-http-backend\tsley-cli-adapter\n",
+);
+
+/// Executables formerly borrowed from an upstream build or system Git.
+///
+/// These names are removed if found in the native-only helper directory. They
+/// are intentionally not materialized until Sley has implementations it owns.
+pub const UNIMPLEMENTED_NATIVE_HELPERS: &[&str] = &[
+    "git-http-fetch",
+    "git-http-push",
+    "git-remote-ftp",
+    "git-remote-ftps",
     "git-remote-http",
     "git-remote-https",
+    "git-upload-archive",
 ];
 
-/// Prefer the upstream git build for upload-pack when present: it advertises
-/// protocol v2 features (bundle-uri, fetch filter) that a stock install may omit.
-const PREFERRED_BUILD_EXEC_HELPERS: &[&str] = &["git-upload-pack"];
+/// How a materialized helper is implemented by Sley.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HelperImplementation {
+    /// A shell library sourced by Git's shell scripts.
+    ShellLibrary,
+    /// A shell adapter that dispatches to Sley's native CLI command.
+    SleyCliAdapter,
+}
 
+/// Provenance for one file Sley owns in its compatibility exec directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HelperProvenance {
+    pub name: &'static str,
+    pub implementation: HelperImplementation,
+    pub executable: bool,
+}
+
+const MATERIALIZED_HELPER_PROVENANCE: &[HelperProvenance] = &[
+    HelperProvenance {
+        name: "git-sh-i18n",
+        implementation: HelperImplementation::ShellLibrary,
+        executable: false,
+    },
+    HelperProvenance {
+        name: "git-sh-i18n--envsubst",
+        implementation: HelperImplementation::SleyCliAdapter,
+        executable: true,
+    },
+    HelperProvenance {
+        name: "git-upload-pack",
+        implementation: HelperImplementation::SleyCliAdapter,
+        executable: true,
+    },
+    HelperProvenance {
+        name: "git-receive-pack",
+        implementation: HelperImplementation::SleyCliAdapter,
+        executable: true,
+    },
+    HelperProvenance {
+        name: "git-http-backend",
+        implementation: HelperImplementation::SleyCliAdapter,
+        executable: true,
+    },
+];
+
+/// Returns the complete set of helpers Sley materializes under `GIT_EXEC_PATH`.
+///
+/// Each entry is implemented by Sley. In particular, transport and server
+/// helpers that are not native yet are absent rather than borrowed from Git.
+pub const fn materialized_helper_provenance() -> &'static [HelperProvenance] {
+    MATERIALIZED_HELPER_PROVENANCE
+}
+
+/// Materializes and verifies Sley's native compatibility helpers.
+///
+/// The returned path is stable for this crate version. Materialization is
+/// process-safe, including when multiple installed-Git launchers initialize
+/// the shared directory concurrently.
 pub fn materialize_git_i18n_helpers() -> io::Result<PathBuf> {
     let dir = env::temp_dir().join(format!(
-        "sley-git-compat-i18n-{}",
+        "sley-git-compat-i18n-native-v1-{}",
         env!("CARGO_PKG_VERSION")
     ));
-    fs::create_dir_all(&dir)?;
-    write_helper(dir.join("git-sh-i18n"), GIT_SH_I18N, 0o644)?;
-    write_helper(
-        dir.join("git-sh-i18n--envsubst"),
-        GIT_SH_I18N_ENVSUBST,
-        0o755,
-    )?;
-    link_system_git_exec_helpers(&dir)?;
+    materialize_git_i18n_helpers_in(&dir)?;
     Ok(dir)
 }
 
-fn link_system_git_exec_helpers(dir: &Path) -> io::Result<()> {
-    let system_exec_path = discover_system_git_exec_path();
-    let build_exec_path = discover_build_git_exec_path();
-    for name in PREFERRED_BUILD_EXEC_HELPERS {
-        let Some(source) = build_exec_path
-            .as_ref()
-            .map(|path| path.join(name))
-            .filter(|path| path.is_file())
-            .or_else(|| {
-                system_exec_path
-                    .as_ref()
-                    .map(|path| path.join(name))
-                    .filter(|path| path.is_file())
-            })
-        else {
-            continue;
-        };
-        link_exec_helper(dir, name, &source)?;
-    }
-    let Some(system_exec_path) = system_exec_path else {
-        return Ok(());
+fn materialize_git_i18n_helpers_in(dir: &Path) -> io::Result<()> {
+    let parent = dir.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let lock_path = env::temp_dir().join(format!(
+        ".sley-git-compat-i18n-native-v1-{}.materialize.lock",
+        env!("CARGO_PKG_VERSION")
+    ));
+    // An OS lock is released even if a materializing process exits abruptly.
+    // Its persistent, empty lock file lives beside (not inside) GIT_EXEC_PATH,
+    // so exact helper provenance and the stable exec path remain unchanged.
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    lock.lock()?;
+
+    let result = (|| {
+        fs::create_dir_all(dir)?;
+        write_helper(dir.join("git-sh-i18n"), GIT_SH_I18N, 0o644)?;
+        write_helper(
+            dir.join("git-sh-i18n--envsubst"),
+            GIT_SH_I18N_ENVSUBST,
+            0o755,
+        )?;
+        write_helper(dir.join("git-upload-pack"), GIT_UPLOAD_PACK, 0o755)?;
+        write_helper(dir.join("git-receive-pack"), GIT_RECEIVE_PACK, 0o755)?;
+        write_helper(dir.join("git-http-backend"), GIT_HTTP_BACKEND, 0o755)?;
+        for name in UNIMPLEMENTED_NATIVE_HELPERS {
+            remove_legacy_helper(&dir.join(name))?;
+        }
+        write_helper(dir.join(HELPER_PROVENANCE_FILE), HELPER_PROVENANCE, 0o644)?;
+        verify_materialized_git_i18n_helpers(dir)
+    })();
+    let unlock = lock.unlock();
+    result.and(unlock)
+}
+
+fn remove_legacy_helper(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
     };
-    for name in SYSTEM_GIT_EXEC_HELPERS {
-        let source = system_exec_path.join(name);
-        if !source.is_file() {
-            continue;
-        }
-        link_exec_helper(dir, name, &source)?;
+    if metadata.is_file() || metadata.file_type().is_symlink() {
+        return fs::remove_file(path);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("legacy helper path is not a file: {}", path.display()),
+    ))
+}
+
+/// Verifies that `dir` contains exactly the helpers declared as Sley-owned.
+///
+/// Verification rejects symlinks, modified helper contents, an invalid
+/// provenance manifest, and undeclared files. It is suitable for harnesses
+/// enforcing that `GIT_EXEC_PATH` contains no borrowed Git executables.
+pub fn verify_materialized_git_i18n_helpers(dir: &Path) -> io::Result<()> {
+    verify_regular_file_contents(&dir.join("git-sh-i18n"), GIT_SH_I18N.as_bytes())?;
+    verify_regular_file_contents(
+        &dir.join("git-sh-i18n--envsubst"),
+        GIT_SH_I18N_ENVSUBST.as_bytes(),
+    )?;
+    verify_regular_file_contents(&dir.join("git-upload-pack"), GIT_UPLOAD_PACK.as_bytes())?;
+    verify_regular_file_contents(&dir.join("git-receive-pack"), GIT_RECEIVE_PACK.as_bytes())?;
+    verify_regular_file_contents(&dir.join("git-http-backend"), GIT_HTTP_BACKEND.as_bytes())?;
+    verify_regular_file_contents(
+        &dir.join(HELPER_PROVENANCE_FILE),
+        HELPER_PROVENANCE.as_bytes(),
+    )?;
+
+    let expected: BTreeSet<OsString> = [
+        OsString::from("git-sh-i18n"),
+        OsString::from("git-sh-i18n--envsubst"),
+        OsString::from("git-upload-pack"),
+        OsString::from("git-receive-pack"),
+        OsString::from("git-http-backend"),
+        OsString::from(HELPER_PROVENANCE_FILE),
+    ]
+    .into_iter()
+    .collect();
+    let mut actual = BTreeSet::new();
+    for entry in fs::read_dir(dir)? {
+        actual.insert(entry?.file_name());
+    }
+    if actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("helper directory contains undeclared entries: {actual:?}"),
+        ));
     }
     Ok(())
 }
 
-#[cfg(unix)]
-fn link_exec_helper(dir: &Path, name: &str, source: &Path) -> io::Result<()> {
-    use std::os::unix::fs::symlink;
-    // Apache's CGI handler rejects a symlinked ScriptAlias target (AH00037
-    // "Symbolic link not allowed"), and upstream lib-httpd points /smart/ at
-    // ${GIT_EXEC_PATH}/git-http-backend — that helper must be a real file.
-    if name == "git-http-backend" {
-        return copy_exec_helper(dir, name, source);
+fn verify_regular_file_contents(path: &Path, expected: &[u8]) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("helper is not an owned regular file: {}", path.display()),
+        ));
     }
-    let dest = dir.join(name);
-    if dest.exists() {
-        if dest
-            .read_link()
-            .ok()
-            .filter(|target| target == source)
-            .is_some()
-        {
-            return Ok(());
-        }
-        fs::remove_file(&dest)?;
-    }
-    if let Err(err) = symlink(source, &dest) {
-        if err.kind() != io::ErrorKind::AlreadyExists {
-            return Err(err);
-        }
+    if fs::read(path)? != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "helper contents do not match Sley's copy: {}",
+                path.display()
+            ),
+        ));
     }
     Ok(())
-}
-
-/// Materialize `name` as a regular-file copy, replacing a stale symlink from
-/// an earlier shim build. Size equality is the freshness check so repeated
-/// sley invocations don't recopy on every run.
-fn copy_exec_helper(dir: &Path, name: &str, source: &Path) -> io::Result<()> {
-    let dest = dir.join(name);
-    if let Ok(metadata) = dest.symlink_metadata() {
-        if metadata.is_file()
-            && source
-                .metadata()
-                .map(|source_metadata| source_metadata.len() == metadata.len())
-                .unwrap_or(false)
-        {
-            return Ok(());
-        }
-        fs::remove_file(&dest)?;
-    }
-    fs::copy(source, &dest)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn link_exec_helper(dir: &Path, name: &str, source: &Path) -> io::Result<()> {
-    let dest = dir.join(name);
-    if dest.exists() {
-        if fs::canonicalize(&dest).ok().as_deref() == fs::canonicalize(source).ok().as_deref() {
-            return Ok(());
-        }
-        fs::remove_file(&dest)?;
-    }
-    fs::copy(source, &dest)?;
-    Ok(())
-}
-
-fn discover_build_git_exec_path() -> Option<PathBuf> {
-    for var in ["GIT_BUILD_DIR", "GIT_SRC_DIR"] {
-        if let Ok(path) = env::var(var)
-            && !path.is_empty()
-        {
-            let candidate = PathBuf::from(path);
-            if candidate.join("git-upload-pack").is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-fn discover_system_git_exec_path() -> Option<PathBuf> {
-    if let Ok(path) = env::var("GIT_TEST_EXEC_PATH")
-        && !path.is_empty()
-        && git_exec_helper_dir(Path::new(&path)).is_some()
-    {
-        return Some(PathBuf::from(path));
-    }
-    if let Ok(path) = env::var("SLEY_TEST_GIT")
-        && !path.is_empty()
-        && let Some(exec_path) = git_exec_path_from_program(&path)
-    {
-        return Some(exec_path);
-    }
-    if let Ok(path) = env::var("GIT_TEST_GIT")
-        && !path.is_empty()
-        && let Some(exec_path) = git_exec_path_from_program(&path)
-    {
-        return Some(exec_path);
-    }
-    let current_exe = env::current_exe().ok();
-    if let Some(path_var) = env::var_os("PATH") {
-        for dir in env::split_paths(&path_var) {
-            let candidate = dir.join("git");
-            if !is_executable_file(&candidate) {
-                continue;
-            }
-            if current_exe.as_ref().is_some_and(|exe| exe == &candidate) {
-                continue;
-            }
-            if let Some(exec_path) = git_exec_path_from_program(candidate.to_string_lossy().as_ref())
-            {
-                return Some(exec_path);
-            }
-        }
-    }
-    for candidate in [
-        "/opt/homebrew/opt/git/libexec/git-core",
-        "/usr/local/libexec/git-core",
-        "/usr/lib/git-core",
-        "/usr/libexec/git-core",
-    ] {
-        let path = PathBuf::from(candidate);
-        if git_exec_helper_dir(&path).is_some() {
-            return Some(path);
-        }
-    }
-    None
-}
-
-fn git_exec_helper_dir(path: &Path) -> Option<()> {
-    path.join("git-http-backend").is_file().then_some(())
-}
-
-/// Env sentinel set on the `git --exec-path` probe child. If the program we
-/// probe is itself a sley shim (upstream's `GIT_TEST_INSTALLED` bindir points
-/// `git` at sley), it must NOT re-run `materialize` — that would probe PATH,
-/// find the shim again, and recurse without bound (a fork bomb) while also
-/// symlinking the exec helpers to themselves. A probed sley sees this variable
-/// and refuses to answer, so we treat it as "not a system git" and move on.
-pub const EXEC_PATH_PROBE_ENV: &str = "SLEY_EXEC_PATH_PROBE";
-
-fn git_exec_path_from_program(program: &str) -> Option<PathBuf> {
-    let output = Command::new(program)
-        .arg("--exec-path")
-        .env(EXEC_PATH_PROBE_ENV, "1")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(trimmed))
-}
-
-#[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    fs::metadata(path)
-        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
-    fs::metadata(path).map(|meta| meta.is_file()).unwrap_or(false)
 }
 
 fn write_helper(path: PathBuf, contents: &str, mode: u32) -> io::Result<()> {
+    let is_symlink = fs::symlink_metadata(&path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false);
     let needs_write = match fs::read_to_string(&path) {
-        Ok(existing) => existing != contents,
+        Ok(existing) => is_symlink || existing != contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => true,
         Err(err) => return Err(err),
     };
     if needs_write {
-        fs::write(&path, contents)?;
+        write_helper_atomically(&path, contents, mode)?;
     }
     set_mode(&path, mode)
+}
+
+fn write_helper_atomically(path: &Path, contents: &str, mode: u32) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let parent = path
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."));
+    let temp = parent.join(format!(
+        ".sley-helper-write-{}-{sequence}",
+        std::process::id()
+    ));
+    fs::write(&temp, contents)?;
+    set_mode(&temp, mode)?;
+    if let Err(err) = fs::rename(&temp, path) {
+        // Windows does not replace an existing destination. Another Sley
+        // process may have won the race with the same immutable contents. The
+        // materialization lock makes replacement of an older generation safe.
+        if fs::read(path).ok().as_deref() == Some(contents.as_bytes()) {
+            let _ = fs::remove_file(&temp);
+        } else {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(remove_err) if remove_err.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    let _ = fs::remove_file(&temp);
+                    return Err(err);
+                }
+            }
+            if let Err(replace_err) = fs::rename(&temp, path) {
+                let _ = fs::remove_file(&temp);
+                return Err(replace_err);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -428,6 +521,38 @@ fn is_variable_continue(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+    // The parents of these tests both launch the current libtest executable.
+    // Serialize only those parents; child-marker branches return before taking
+    // this lock, so a parent can still wait for all of its children.
+    static SUBPROCESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> io::Result<Self> {
+            let sequence = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = env::temp_dir().join(format!(
+                "sley-i18n-test-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path)?;
+            Ok(Self(path))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn variables_are_unique_in_order() {
@@ -443,5 +568,375 @@ mod tests {
             Some(format!("<{name}>"))
         });
         assert_eq!(out, "a <one> <two> $three");
+    }
+
+    #[test]
+    fn materializes_only_declared_sley_owned_helpers() -> io::Result<()> {
+        let temp = TestDir::new("owned-only")?;
+        for name in UNIMPLEMENTED_NATIVE_HELPERS {
+            fs::write(temp.path().join(name), b"borrowed git executable")?;
+        }
+
+        materialize_git_i18n_helpers_in(temp.path())?;
+        verify_materialized_git_i18n_helpers(temp.path())?;
+        let shell_library = fs::read_to_string(temp.path().join("git-sh-i18n"))?;
+        let envsubst_adapter = fs::read_to_string(temp.path().join("git-sh-i18n--envsubst"))?;
+        let upload_pack_adapter = fs::read_to_string(temp.path().join("git-upload-pack"))?;
+        let receive_pack_adapter = fs::read_to_string(temp.path().join("git-receive-pack"))?;
+        let http_backend_adapter = fs::read_to_string(temp.path().join("git-http-backend"))?;
+        assert!(!shell_library.contains("$(git "));
+        assert!(!shell_library.contains("\n\tgit "));
+        assert!(!envsubst_adapter.contains("exec git "));
+        assert!(shell_library.contains("$SLEY_BIN"));
+        assert!(envsubst_adapter.contains("$SLEY_BIN"));
+        assert!(upload_pack_adapter.contains("exec \"$SLEY_BIN\" upload-pack"));
+        assert!(receive_pack_adapter.contains("exec \"$SLEY_BIN\" receive-pack"));
+        assert!(http_backend_adapter.contains("exec \"$SLEY_BIN\" http-backend"));
+        assert!(!http_backend_adapter.contains(env::current_exe()?.to_string_lossy().as_ref()));
+
+        assert_eq!(
+            materialized_helper_provenance(),
+            &[
+                HelperProvenance {
+                    name: "git-sh-i18n",
+                    implementation: HelperImplementation::ShellLibrary,
+                    executable: false,
+                },
+                HelperProvenance {
+                    name: "git-sh-i18n--envsubst",
+                    implementation: HelperImplementation::SleyCliAdapter,
+                    executable: true,
+                },
+                HelperProvenance {
+                    name: "git-upload-pack",
+                    implementation: HelperImplementation::SleyCliAdapter,
+                    executable: true,
+                },
+                HelperProvenance {
+                    name: "git-receive-pack",
+                    implementation: HelperImplementation::SleyCliAdapter,
+                    executable: true,
+                },
+                HelperProvenance {
+                    name: "git-http-backend",
+                    implementation: HelperImplementation::SleyCliAdapter,
+                    executable: true,
+                },
+            ]
+        );
+        for name in UNIMPLEMENTED_NATIVE_HELPERS {
+            assert!(!temp.path().join(name).exists(), "{name} must stay absent");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_helper_probes_gettext_and_preserves_forced_fallback() -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TestDir::new("gettext-probe")?;
+        let bin = temp.path().join("bin");
+        let helpers = temp.path().join("helpers");
+        fs::create_dir_all(&bin)?;
+        fs::create_dir_all(&helpers)?;
+        let gettext_sh = bin.join("gettext.sh");
+        fs::write(
+            &gettext_sh,
+            b"gettext () { printf 'gnu:%s' \"$1\"; }\neval_gettext () { gettext \"$1\"; }\n",
+        )?;
+        let mut permissions = fs::metadata(&gettext_sh)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&gettext_sh, permissions)?;
+        materialize_git_i18n_helpers_in(&helpers)?;
+        let helper = helpers.join("git-sh-i18n");
+        let path = env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+            .map_err(io::Error::other)?;
+
+        let probed = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(". \"$1\"; printf '%s\\n' \"$GIT_INTERNAL_GETTEXT_SH_SCHEME\"; gettext value")
+            .arg("sh")
+            .arg(&helper)
+            .env("PATH", &path)
+            .output()?;
+        assert!(probed.status.success());
+        assert_eq!(probed.stdout, b"gnu\ngnu:value");
+
+        let fallback = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("GIT_INTERNAL_GETTEXT_TEST_FALLBACKS=1; export GIT_INTERNAL_GETTEXT_TEST_FALLBACKS; . \"$1\"; printf '%s' \"$GIT_INTERNAL_GETTEXT_SH_SCHEME\"")
+            .arg("sh")
+            .arg(&helper)
+            .env("PATH", &path)
+            .output()?;
+        assert!(fallback.status.success());
+        assert_eq!(fallback.stdout, b"fallthrough");
+        Ok(())
+    }
+
+    #[test]
+    fn provenance_verification_rejects_undeclared_helpers() -> io::Result<()> {
+        let temp = TestDir::new("provenance")?;
+        materialize_git_i18n_helpers_in(temp.path())?;
+        fs::write(temp.path().join("git-http-fetch"), b"system git")?;
+        let error = verify_materialized_git_i18n_helpers(temp.path())
+            .expect_err("an undeclared executable must invalidate provenance");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_replaces_linked_helpers_with_owned_files() -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestDir::new("linked-helper")?;
+        let borrowed = temp.path().join("borrowed-git-sh-i18n");
+        let helper_dir = temp.path().join("exec");
+        fs::create_dir_all(&helper_dir)?;
+        fs::write(&borrowed, b"system Git helper")?;
+        symlink(&borrowed, helper_dir.join("git-sh-i18n"))?;
+        symlink(&borrowed, helper_dir.join("git-http-backend"))?;
+
+        materialize_git_i18n_helpers_in(&helper_dir)?;
+        verify_materialized_git_i18n_helpers(&helper_dir)?;
+        assert!(
+            !fs::symlink_metadata(helper_dir.join("git-sh-i18n"))?
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !fs::symlink_metadata(helper_dir.join("git-http-backend"))?
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(helper_dir.join("git-http-backend"))?,
+            GIT_HTTP_BACKEND
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_processes_materialize_one_invariant_helper_generation() -> io::Result<()> {
+        // Keep multiple executable identities while avoiding eight concurrent
+        // copies of the libtest harness. The workers still place eight actual
+        // materialization calls behind one cross-process start barrier.
+        const PROCESS_COUNT: usize = 2;
+        const WORKERS_PER_PROCESS: usize = 4;
+        const MATERIALIZER_COUNT: usize = PROCESS_COUNT * WORKERS_PER_PROCESS;
+        const CHILD_ENV: &str = "SLEY_I18N_CONCURRENT_CHILD";
+        const HELPER_DIR_ENV: &str = "SLEY_I18N_CONCURRENT_HELPER_DIR";
+        const START_ENV: &str = "SLEY_I18N_CONCURRENT_START";
+        const IDENTITY_DIR_ENV: &str = "SLEY_I18N_CONCURRENT_IDENTITY_DIR";
+
+        if let Some(index) = env::var_os(CHILD_ENV) {
+            let index = index.to_string_lossy().into_owned();
+            let helper_dir = PathBuf::from(env::var_os(HELPER_DIR_ENV).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing concurrent helper dir")
+            })?);
+            let start = PathBuf::from(env::var_os(START_ENV).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing concurrent start marker",
+                )
+            })?);
+            let identity_dir = PathBuf::from(env::var_os(IDENTITY_DIR_ENV).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing identity dir")
+            })?);
+            fs::write(
+                identity_dir.join(&index),
+                env::current_exe()?.to_string_lossy().as_bytes(),
+            )?;
+            let mut workers = Vec::new();
+            for worker in 0..WORKERS_PER_PROCESS {
+                let helper_dir = helper_dir.clone();
+                let start = start.clone();
+                let ready = identity_dir.join(format!("ready-{index}-{worker}"));
+                workers.push(std::thread::spawn(move || -> io::Result<()> {
+                    fs::write(ready, b"ready\n")?;
+                    for _ in 0..500 {
+                        if start.exists() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    if !start.exists() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "concurrent materialization start marker was not published",
+                        ));
+                    }
+                    for _ in 0..8 {
+                        materialize_git_i18n_helpers_in(&helper_dir)?;
+                        verify_materialized_git_i18n_helpers(&helper_dir)?;
+                    }
+                    Ok(())
+                }));
+            }
+            for worker in workers {
+                worker
+                    .join()
+                    .map_err(|_| io::Error::other("materializer worker panicked"))??;
+            }
+            return Ok(());
+        }
+
+        let _subprocess_guard = SUBPROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = TestDir::new("concurrent-processes")?;
+        let helper_dir = temp.path().join("helpers");
+        let launcher_dir = temp.path().join("launchers");
+        let identity_dir = temp.path().join("identities");
+        let start = temp.path().join("start");
+        fs::create_dir_all(&launcher_dir)?;
+        fs::create_dir_all(&identity_dir)?;
+
+        let current_exe = env::current_exe()?;
+        let mut children = Vec::new();
+        for index in 0..PROCESS_COUNT {
+            let mut launcher = launcher_dir.join(format!("materializer-{index}"));
+            if let Some(extension) = current_exe.extension() {
+                launcher.set_extension(extension);
+            }
+            if fs::hard_link(&current_exe, &launcher).is_err() {
+                fs::copy(&current_exe, &launcher)?;
+                set_mode(&launcher, 0o755)?;
+            }
+            let child = std::process::Command::new(&launcher)
+                .arg("--exact")
+                .arg("tests::concurrent_processes_materialize_one_invariant_helper_generation")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, index.to_string())
+                .env(HELPER_DIR_ENV, &helper_dir)
+                .env(START_ENV, &start)
+                .env(IDENTITY_DIR_ENV, &identity_dir)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()?;
+            children.push((index, child));
+        }
+        let mut ready_count = 0;
+        for _ in 0..500 {
+            ready_count = fs::read_dir(&identity_dir)?
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("ready-"))
+                .count();
+            if ready_count == MATERIALIZER_COUNT {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        fs::write(&start, b"go\n")?;
+
+        let mut failures = Vec::new();
+        for (index, child) in children {
+            let output = child.wait_with_output()?;
+            if !output.status.success() {
+                failures.push(format!(
+                    "materializer {index} failed with {}\nstdout:\n{}\nstderr:\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
+        if !failures.is_empty() {
+            return Err(io::Error::other(failures.join("\n")));
+        }
+        assert_eq!(
+            ready_count, MATERIALIZER_COUNT,
+            "every materializer must reach the cross-process barrier"
+        );
+
+        let identities = (0..PROCESS_COUNT)
+            .map(|index| fs::read_to_string(identity_dir.join(index.to_string())))
+            .collect::<io::Result<BTreeSet<_>>>()?;
+        assert_eq!(
+            identities.len(),
+            PROCESS_COUNT,
+            "the regression must exercise distinct executable identities"
+        );
+        verify_materialized_git_i18n_helpers(&helper_dir)?;
+        let http_backend = fs::read_to_string(helper_dir.join("git-http-backend"))?;
+        assert_eq!(http_backend, GIT_HTTP_BACKEND);
+        assert!(
+            identities
+                .iter()
+                .all(|identity| !http_backend.contains(identity)),
+            "the shared helper generation must not capture a launcher identity"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_ignores_hostile_git_environments() -> io::Result<()> {
+        const CHILD_ENV: &str = "SLEY_I18N_HOSTILE_ENV_CHILD";
+        const MARKER_ENV: &str = "SLEY_I18N_HOSTILE_GIT_MARKER";
+
+        if env::var_os(CHILD_ENV).is_some() {
+            let dir = materialize_git_i18n_helpers()?;
+            verify_materialized_git_i18n_helpers(&dir)?;
+            for name in UNIMPLEMENTED_NATIVE_HELPERS {
+                assert!(!dir.join(name).exists(), "{name} must not be borrowed");
+            }
+            return Ok(());
+        }
+
+        let _subprocess_guard = SUBPROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = TestDir::new("hostile-env")?;
+        let bin_dir = temp.path().join("bin");
+        let build_dir = temp.path().join("git-build");
+        let source_dir = temp.path().join("git-source");
+        let exec_dir = temp.path().join("git-exec");
+        let child_tmp = temp.path().join("tmp");
+        for dir in [&bin_dir, &build_dir, &source_dir, &exec_dir, &child_tmp] {
+            fs::create_dir_all(dir)?;
+        }
+
+        let marker = temp.path().join("git-was-probed");
+        let hostile_git = bin_dir.join("git");
+        fs::write(
+            &hostile_git,
+            format!("#!/bin/sh\nprintf probed > \"${{{MARKER_ENV}}}\"\nexit 97\n"),
+        )?;
+        set_mode(&hostile_git, 0o755)?;
+        for dir in [&build_dir, &source_dir, &exec_dir] {
+            for name in UNIMPLEMENTED_NATIVE_HELPERS {
+                let helper = dir.join(name);
+                fs::write(&helper, format!("hostile source: {}\n", helper.display()))?;
+                set_mode(&helper, 0o755)?;
+            }
+        }
+
+        let output = std::process::Command::new(env::current_exe()?)
+            .arg("--exact")
+            .arg("tests::materialization_ignores_hostile_git_environments")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env(MARKER_ENV, &marker)
+            .env("PATH", &bin_dir)
+            .env("GIT_BUILD_DIR", &build_dir)
+            .env("GIT_SRC_DIR", &source_dir)
+            .env("GIT_TEST_EXEC_PATH", &exec_dir)
+            .env("SLEY_TEST_GIT", &hostile_git)
+            .env("GIT_TEST_GIT", &hostile_git)
+            .env("TMPDIR", &child_tmp)
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "hostile-environment child failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        assert!(!marker.exists(), "the hostile Git executable was probed");
+        Ok(())
     }
 }

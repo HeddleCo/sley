@@ -11,21 +11,18 @@
 //! - `[alias "<name>"] command = <value>` — subsection, case-*sensitive* name.
 //!   An empty subsection (`alias..<key>`) is treated as the plain form.
 
+use crate::sley_config;
 use sley::plumbing::sley_config::ConfigIncludeContext;
+use sley::plumbing::sley_core;
 use sley::{GitConfig, GitError, Result};
 use std::env;
 use std::fs;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use crate::sley_config;
-use sley::plumbing::sley_core;
 
 use crate::commands::remote::repo_current_branch_name;
-use crate::{
-    common_git_dir_for_git_dir, injected_config_parameters,
-    worktree_root_for_git_dir,
-};
+use crate::{common_git_dir_for_git_dir, injected_config_parameters, worktree_root_for_git_dir};
 
 /// A safety backstop on alias-expansion iterations. git relies purely on its
 /// loop/recursion detection; this guards against a pathological config that

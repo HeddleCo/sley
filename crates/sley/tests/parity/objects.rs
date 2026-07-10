@@ -1,7 +1,7 @@
 //! Object read parity (commits, tags, blobs).
 
 use sley::{GitObjectType, Repository};
-use sley_testkit::engine_parity::{git_oid_line, git_size_line, EngineOutput, EngineParityCase};
+use sley_testkit::engine_parity::{EngineOutput, EngineParityCase, git_oid_line};
 
 #[test]
 fn read_commit_tree_matches_oracle() {
@@ -81,11 +81,9 @@ fn blob_read_matches_cat_file() {
             EngineOutput::stdout(bytes)
         },
         |fixture| {
-            let oid = String::from_utf8_lossy(
-                &fixture.oracle_ok(&["hash-object", "payload.txt"]),
-            )
-            .trim()
-            .to_string();
+            let oid = String::from_utf8_lossy(&fixture.oracle_ok(&["hash-object", "payload.txt"]))
+                .trim()
+                .to_string();
             fixture.oracle(&["cat-file", "-p", &oid])
         },
     );

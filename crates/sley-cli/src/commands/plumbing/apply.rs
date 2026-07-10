@@ -199,9 +199,28 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-    let format = repository_object_format(&git_dir)?;
+    // `git apply` is intentionally usable without repository discovery when it
+    // only reads or writes worktree paths. Keep repository state optional here
+    // rather than manufacturing a repository session: index/object operations
+    // still require a real repository, while a plain textual apply uses the
+    // current directory as its worktree root and SHA-1 for any patch OIDs.
+    let discovered_git_dir = crate::session::cli_git_dir_from(&cwd).ok();
+    if discovered_git_dir.is_none()
+        && (update_index || cached || three_way || intent_to_add || build_fake_ancestor.is_some())
+    {
+        return Err(GitError::repository_not_found("not a git repository"));
+    }
+    let git_dir = discovered_git_dir
+        .clone()
+        .unwrap_or_else(|| cwd.join(".git"));
+    let worktree_root = match discovered_git_dir.as_ref() {
+        Some(git_dir) => worktree_root_for_git_dir(git_dir)?,
+        None => cwd.clone(),
+    };
+    let format = match discovered_git_dir.as_ref() {
+        Some(git_dir) => repository_object_format(git_dir)?,
+        None => ObjectFormat::Sha1,
+    };
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     // git's `state->prefix`: the current directory relative to the work tree,
     // with a trailing slash (empty at the top level). Prepended to the names of
@@ -243,11 +262,30 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     } else {
         worktree_root.clone()
     };
-    let repo_config = read_repo_config(&git_dir)?;
+    let repo_config = match discovered_git_dir.as_ref() {
+        Some(git_dir) => read_repo_config(git_dir)?,
+        None => {
+            let context = sley_config::ConfigIncludeContext::new(None, None);
+            let mut config = sley_config::load_pre_dispatch_config(None, &context)
+                .map_err(report_config_setup_error)?;
+            let parameters = injected_config_parameters()?;
+            sley_config::append_injected_config_sections_with_includes(
+                &mut config,
+                &parameters,
+                &context,
+                &cwd,
+            )
+            .map_err(report_config_setup_error)?;
+            config
+        }
+    };
     let trust_filemode = repo_config
         .get_bool("core", None, "fileMode")
         .unwrap_or(true);
-    let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(&git_dir)?;
+    let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir_with_config(
+        &git_dir,
+        Some(&repo_config),
+    )?;
     // `apply.whitespace` config supplies the default whitespace action when the
     // command line did not give an explicit `--whitespace=`.
     if !ws_action_explicit

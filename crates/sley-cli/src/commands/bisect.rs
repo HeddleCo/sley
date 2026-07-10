@@ -72,6 +72,7 @@ struct BisectRepo {
     /// `None` in a bare repository (which implies `--no-checkout`).
     worktree_root: Option<PathBuf>,
     format: ObjectFormat,
+    db: FileObjectDatabase,
 }
 
 impl BisectRepo {
@@ -80,15 +81,17 @@ impl BisectRepo {
         let git_dir = crate::session::cli_git_dir_from(&cwd)?;
         let worktree_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?;
         let format = repository_object_format(&git_dir)?;
+        let db = crate::repository::open_object_database(&git_dir, format)?;
         Ok(Self {
             git_dir,
             worktree_root,
             format,
+            db,
         })
     }
 
     fn db(&self) -> FileObjectDatabase {
-        FileObjectDatabase::from_git_dir(&self.git_dir, self.format)
+        self.db.clone()
     }
 
     fn store(&self) -> FileRefStore {
@@ -1500,7 +1503,9 @@ fn bisect_pathspec(repo: &BisectRepo) -> Result<Option<sley_rev::Pathspec>> {
 /// the `approx_halfway` early exit, and the `filter_skipped` + `skip_away` skip
 /// machinery) lives in [`sley_rev::bisect`] — a shared primitive used both here
 /// and by `rev-list --bisect`.
-use sley::plumbing::sley_rev::bisect::{SkipFilter, do_find_bisection, estimate_bisect_steps, managed_skipped};
+use sley::plumbing::sley_rev::bisect::{
+    SkipFilter, do_find_bisection, estimate_bisect_steps, managed_skipped,
+};
 
 fn error_if_skipped_commits(
     repo: &BisectRepo,

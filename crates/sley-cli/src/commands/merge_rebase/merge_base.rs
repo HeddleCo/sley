@@ -183,10 +183,12 @@ pub(crate) fn merge_bases_default_many(
     let candidates = common.clone();
     let candidate_depths = candidates
         .iter()
-        .map(|candidate| Ok((
-            candidate.clone(),
-            sley_rev::ancestor_depths(git_dir, format, db, candidate)?,
-        )))
+        .map(|candidate| {
+            Ok((
+                candidate.clone(),
+                sley_rev::ancestor_depths(git_dir, format, db, candidate)?,
+            ))
+        })
         .collect::<Result<HashMap<_, _>>>()?;
     common.retain(|candidate| {
         !candidates.iter().any(|other| {
@@ -332,10 +334,12 @@ pub(crate) fn merge_base_fork_point(
     }
     let candidate_depths = candidates
         .iter()
-        .map(|candidate| Ok((
-            candidate.clone(),
-            sley_rev::ancestor_depths(git_dir, format, db, candidate)?,
-        )))
+        .map(|candidate| {
+            Ok((
+                candidate.clone(),
+                sley_rev::ancestor_depths(git_dir, format, db, candidate)?,
+            ))
+        })
         .collect::<Result<HashMap<_, _>>>()?;
     let all_candidates = candidates.clone();
     candidates.retain(|candidate| {

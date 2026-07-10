@@ -1,21 +1,17 @@
 //! Compiled log-format emission (`emit_compiled_log_format*`).
 
-use crate::{
-    CompiledLogFormat, DecorateSpec, DescribeSpec, FormatToken, LogFormatDialect,
-    parse_for_each_ref_trailer_options,
-};
+use crate::trailers::format_trailers_from_commit;
+use crate::{CompiledLogFormat, DecorateSpec, DescribeSpec, FormatToken, LogFormatDialect};
 use sley_config::GitConfig;
-use sley_core::{DateMode, GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{DateMode, GitError, ObjectId, Result};
 use sley_object::{Commit, ObjectType};
 use sley_odb::{FileObjectDatabase, ObjectReader};
 use sley_ref_filter::commit_identity_date;
-use sley_rev::revlist::commit_identity_timestamp;
-use sley_rev::{CommitMetadata, CommitRecord};
 use sley_refs::ReflogEntry;
+use sley_rev::revlist::commit_identity_timestamp;
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::Path;
-use crate::trailers::format_trailers_from_commit;
 
 struct EmptyMailmap;
 impl MailmapLookup for EmptyMailmap {
@@ -217,7 +213,10 @@ pub fn format_log_commit_header_oid(
     }
 }
 
-pub fn format_log_parent_oids(record: &sley_rev::CommitRecord, abbrev_len: Option<usize>) -> String {
+pub fn format_log_parent_oids(
+    record: &sley_rev::CommitRecord,
+    abbrev_len: Option<usize>,
+) -> String {
     record
         .parents
         .iter()
@@ -291,10 +290,7 @@ pub struct LogFormatContext<'a> {
 /// expanded bytes. Backs `git archive`'s `export-subst` (the same pretty-format
 /// placeholders as `git log --pretty=format:`). `fmt` is the text between
 /// `$Format:` and the closing `$`.
-pub fn format_subst_for_commit(
-    record: &sley_rev::CommitRecord,
-    fmt: &[u8],
-) -> Result<Vec<u8>> {
+pub fn format_subst_for_commit(record: &sley_rev::CommitRecord, fmt: &[u8]) -> Result<Vec<u8>> {
     let fmt = String::from_utf8_lossy(fmt);
     let compiled = CompiledLogFormat::compile(&fmt, LogFormatDialect::Log)?;
     let decorations = HashMap::new();
@@ -506,34 +502,29 @@ pub fn emit_log_one_token(
         match token {
             FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
             FormatToken::Percent => out.push(b'%'),
-            FormatToken::OidFull => write!(out, "{}", record.oid).map_err(io::Error::from)?,
+            FormatToken::OidFull => write!(out, "{}", record.oid)?,
             FormatToken::OidAbbrev => {
-                write!(out, "{}", format_log_oid(&record.oid, abbrev_len))
-                    .map_err(io::Error::from)?;
+                write!(out, "{}", format_log_oid(&record.oid, abbrev_len))?;
             }
-            FormatToken::TreeFull => {
-                write!(out, "{}", record.commit.tree).map_err(io::Error::from)?
-            }
+            FormatToken::TreeFull => write!(out, "{}", record.commit.tree)?,
             FormatToken::TreeAbbrev => {
-                write!(out, "{}", format_log_oid(&record.commit.tree, abbrev_len))
-                    .map_err(io::Error::from)?;
+                write!(out, "{}", format_log_oid(&record.commit.tree, abbrev_len))?;
             }
             FormatToken::ParentsFull => {
-                write!(out, "{}", format_log_parent_oids(record, None)).map_err(io::Error::from)?;
+                write!(out, "{}", format_log_parent_oids(record, None))?;
             }
             FormatToken::ParentsAbbrev => {
-                write!(out, "{}", format_log_parent_oids(record, abbrev_len))
-                    .map_err(io::Error::from)?;
+                write!(out, "{}", format_log_parent_oids(record, abbrev_len))?;
             }
             FormatToken::Marker => out.push(marker as u8),
             FormatToken::Subject => {
                 out.extend_from_slice(commit_subject_bytes(message));
             }
             FormatToken::SanitizedSubject => {
-                write!(out, "{}", log_sanitized_subject(message)).map_err(io::Error::from)?;
+                write!(out, "{}", log_sanitized_subject(message))?;
             }
             FormatToken::Encoding => {
-                write!(out, "{}", commit_encoding(&record.commit)).map_err(io::Error::from)?;
+                write!(out, "{}", commit_encoding(&record.commit))?;
             }
             FormatToken::NoteName if dialect == LogFormatDialect::Log => {}
             FormatToken::NoteName => out.extend_from_slice(b"%N"),
@@ -563,16 +554,14 @@ pub fn emit_log_one_token(
                     out,
                     "{}",
                     format_log_format_decorations(&record.oid, decorations, true)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::DecorationsBare => {
                 write!(
                     out,
                     "{}",
                     format_log_format_decorations(&record.oid, decorations, false)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::GRefname
             | FormatToken::GTrailers
@@ -591,13 +580,12 @@ pub fn emit_log_one_token(
             FormatToken::AuthorName => out.extend_from_slice(author_name.as_bytes()),
             FormatToken::AuthorEmail => out.extend_from_slice(author_email.as_bytes()),
             FormatToken::AuthorEmailLocal => {
-                write!(out, "{}", log_email_local_part(author_email)).map_err(io::Error::from)?;
+                write!(out, "{}", log_email_local_part(author_email))?;
             }
             FormatToken::AuthorNameMapped => out.extend_from_slice(mapped_author_name.as_bytes()),
             FormatToken::AuthorEmailMapped => out.extend_from_slice(mapped_author_email.as_bytes()),
             FormatToken::AuthorEmailLocalMapped => {
-                write!(out, "{}", log_email_local_part(&mapped_author_email))
-                    .map_err(io::Error::from)?;
+                write!(out, "{}", log_email_local_part(&mapped_author_email))?;
             }
             FormatToken::AuthorTimestamp => out.extend_from_slice(author_timestamp.as_bytes()),
             FormatToken::AuthorDate => {
@@ -605,54 +593,47 @@ pub fn emit_log_one_token(
                     out,
                     "{}",
                     commit_identity_date(&record.commit.author, date_mode)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::AuthorDateIso => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&record.commit.author, &DateMode::Iso)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::AuthorDateIsoStrict => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&record.commit.author, &DateMode::IsoStrict)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::AuthorDateShort => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&record.commit.author, &DateMode::Short)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::AuthorDateRfc2822 => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&record.commit.author, &DateMode::Rfc2822)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::AuthorDateHuman => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&record.commit.author, &DateMode::Human)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::CommitterName => out.extend_from_slice(committer_name.as_bytes()),
             FormatToken::CommitterEmail => out.extend_from_slice(committer_email.as_bytes()),
             FormatToken::CommitterEmailLocal => {
-                write!(out, "{}", log_email_local_part(committer_email))
-                    .map_err(io::Error::from)?;
+                write!(out, "{}", log_email_local_part(committer_email))?;
             }
             FormatToken::CommitterNameMapped => {
                 out.extend_from_slice(mapped_committer_name.as_bytes())
@@ -661,8 +642,7 @@ pub fn emit_log_one_token(
                 out.extend_from_slice(mapped_committer_email.as_bytes())
             }
             FormatToken::CommitterEmailLocalMapped => {
-                write!(out, "{}", log_email_local_part(&mapped_committer_email))
-                    .map_err(io::Error::from)?;
+                write!(out, "{}", log_email_local_part(&mapped_committer_email))?;
             }
             FormatToken::CommitterTimestamp => {
                 out.extend_from_slice(committer_timestamp.as_bytes())
@@ -672,56 +652,49 @@ pub fn emit_log_one_token(
                     out,
                     "{}",
                     commit_identity_date(&record.commit.committer, date_mode)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::CommitterDateIso => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&record.commit.committer, &DateMode::Iso)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::CommitterDateIsoStrict => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&record.commit.committer, &DateMode::IsoStrict)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::CommitterDateShort => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&record.commit.committer, &DateMode::Short)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::CommitterDateRfc2822 => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&record.commit.committer, &DateMode::Rfc2822)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::CommitterDateHuman => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&record.commit.committer, &DateMode::Human)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::Newline => out.push(b'\n'),
             FormatToken::HexByte(byte) => out.push(*byte),
             FormatToken::Trailers(opts) => {
                 let parsed = crate::parse_for_each_ref_trailer_options(opts)
                     .map_err(|_| GitError::Command("invalid %(trailers) options".into()))?;
-                let rendered =
-                    format_trailers_from_commit(message, &parsed);
+                let rendered = format_trailers_from_commit(message, &parsed);
                 out.extend_from_slice(&rendered);
             }
             FormatToken::Decorate(spec) => {
@@ -767,7 +740,9 @@ fn emit_log_signature_atom(
         FormatToken::GSignature => out.extend_from_slice(verification.signer.as_bytes()),
         FormatToken::GKey => out.extend_from_slice(verification.key.as_bytes()),
         FormatToken::GFingerprint => out.extend_from_slice(verification.fingerprint.as_bytes()),
-        FormatToken::GPassthrough => out.extend_from_slice(verification.primary_fingerprint.as_bytes()),
+        FormatToken::GPassthrough => {
+            out.extend_from_slice(verification.primary_fingerprint.as_bytes())
+        }
         _ => {}
     }
     Ok(())
@@ -1188,7 +1163,7 @@ pub fn emit_compiled_log_format_metadata_inner(
                 out.extend_from_slice(commit_subject_bytes(message));
             }
             FormatToken::SanitizedSubject if let Some(message) = message => {
-                write!(out, "{}", log_sanitized_subject(message)).map_err(io::Error::from)?;
+                write!(out, "{}", log_sanitized_subject(message))?;
             }
             FormatToken::GRefname => out.push(b'N'),
             FormatToken::GTrailers => out.extend_from_slice(b"undefined"),
@@ -1290,42 +1265,37 @@ pub fn emit_compiled_stash_format(
         match token {
             FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
             FormatToken::Percent => out.push(b'%'),
-            FormatToken::OidFull => write!(out, "{}", entry.new_oid).map_err(io::Error::from)?,
+            FormatToken::OidFull => write!(out, "{}", entry.new_oid)?,
             FormatToken::OidAbbrev => {
-                write!(out, "{}", format_log_oid(&entry.new_oid, abbrev_len))
-                    .map_err(io::Error::from)?;
+                write!(out, "{}", format_log_oid(&entry.new_oid, abbrev_len))?;
             }
-            FormatToken::TreeFull => write!(out, "{}", commit.tree).map_err(io::Error::from)?,
+            FormatToken::TreeFull => write!(out, "{}", commit.tree)?,
             FormatToken::TreeAbbrev => {
-                write!(out, "{}", format_log_oid(&commit.tree, abbrev_len))
-                    .map_err(io::Error::from)?;
+                write!(out, "{}", format_log_oid(&commit.tree, abbrev_len))?;
             }
             FormatToken::ParentsFull => {
                 write!(
                     out,
                     "{}",
                     format_metadata_parent_oids(&commit.parents, None)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::ParentsAbbrev => {
                 write!(
                     out,
                     "{}",
                     format_metadata_parent_oids(&commit.parents, abbrev_len)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::Marker => out.push(b'>'),
             FormatToken::Subject => {
-                write!(out, "{}", commit_subject(&commit.message)).map_err(io::Error::from)?;
+                write!(out, "{}", commit_subject(&commit.message))?;
             }
             FormatToken::SanitizedSubject => {
-                write!(out, "{}", log_sanitized_subject(&commit.message))
-                    .map_err(io::Error::from)?;
+                write!(out, "{}", log_sanitized_subject(&commit.message))?;
             }
             FormatToken::Encoding => {
-                write!(out, "{}", commit_encoding(commit)).map_err(io::Error::from)?;
+                write!(out, "{}", commit_encoding(commit))?;
             }
             FormatToken::NoteName => {}
             FormatToken::RevisionSource => out.extend_from_slice(b"%S"),
@@ -1361,52 +1331,46 @@ pub fn emit_compiled_stash_format(
                 out.extend_from_slice(author_email.as_bytes())
             }
             FormatToken::AuthorEmailLocal | FormatToken::AuthorEmailLocalMapped => {
-                write!(out, "{}", log_email_local_part(&author_email)).map_err(io::Error::from)?;
+                write!(out, "{}", log_email_local_part(&author_email))?;
             }
             FormatToken::AuthorTimestamp => out.extend_from_slice(author_timestamp.as_bytes()),
             FormatToken::AuthorDate => {
-                write!(out, "{}", commit_identity_date(&commit.author, date_mode))
-                    .map_err(io::Error::from)?;
+                write!(out, "{}", commit_identity_date(&commit.author, date_mode))?;
             }
             FormatToken::AuthorDateIso => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&commit.author, &DateMode::Iso)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::AuthorDateIsoStrict => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&commit.author, &DateMode::IsoStrict)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::AuthorDateShort => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&commit.author, &DateMode::Short)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::AuthorDateRfc2822 => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&commit.author, &DateMode::Rfc2822)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::AuthorDateHuman => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&commit.author, &DateMode::Human)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::CommitterName | FormatToken::CommitterNameMapped => {
                 out.extend_from_slice(committer_name.as_bytes())
@@ -1415,8 +1379,7 @@ pub fn emit_compiled_stash_format(
                 out.extend_from_slice(committer_email.as_bytes())
             }
             FormatToken::CommitterEmailLocal | FormatToken::CommitterEmailLocalMapped => {
-                write!(out, "{}", log_email_local_part(&committer_email))
-                    .map_err(io::Error::from)?;
+                write!(out, "{}", log_email_local_part(&committer_email))?;
             }
             FormatToken::CommitterTimestamp => {
                 out.extend_from_slice(committer_timestamp.as_bytes());
@@ -1426,56 +1389,49 @@ pub fn emit_compiled_stash_format(
                     out,
                     "{}",
                     commit_identity_date(&commit.committer, date_mode)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::CommitterDateIso => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&commit.committer, &DateMode::Iso)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::CommitterDateIsoStrict => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&commit.committer, &DateMode::IsoStrict)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::CommitterDateShort => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&commit.committer, &DateMode::Short)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::CommitterDateRfc2822 => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&commit.committer, &DateMode::Rfc2822)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::CommitterDateHuman => {
                 write!(
                     out,
                     "{}",
                     commit_identity_date(&commit.committer, &DateMode::Human)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::ReflogGd => {
                 write!(
                     out,
                     "{}",
                     stash_list_reflog_selector("stash", index, entry, date_mode, date_explicit)
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::ReflogGD => {
                 write!(
@@ -1488,8 +1444,7 @@ pub fn emit_compiled_stash_format(
                         date_mode,
                         date_explicit
                     )
-                )
-                .map_err(io::Error::from)?;
+                )?;
             }
             FormatToken::ReflogGn => out.extend_from_slice(reflog_name.as_bytes()),
             FormatToken::ReflogGe => out.extend_from_slice(reflog_email.as_bytes()),
@@ -1617,7 +1572,11 @@ pub fn encoding_for_name(name: &str) -> Option<&'static encoding_rs::Encoding> {
 
 /// Re-encode a commit message from its stored `encoding` header to the desired
 /// log output encoding, mirroring git's `repo_logmsg_reencode`.
-pub fn log_reencode_message<'a>(message: &'a [u8], from: &str, to: &str) -> std::borrow::Cow<'a, [u8]> {
+pub fn log_reencode_message<'a>(
+    message: &'a [u8],
+    from: &str,
+    to: &str,
+) -> std::borrow::Cow<'a, [u8]> {
     use std::borrow::Cow;
     if encoding_is_none(to) || from.trim().eq_ignore_ascii_case(to.trim()) {
         return Cow::Borrowed(message);
@@ -1717,4 +1676,3 @@ pub fn log_sanitized_subject(message: &[u8]) -> String {
     }
     out
 }
-

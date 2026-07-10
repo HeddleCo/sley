@@ -1,7 +1,9 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_diff_merge, sley_index, sley_object, sley_refs, sley_rev, sley_worktree};
+use sley::plumbing::{
+    sley_diff_merge, sley_index, sley_object, sley_refs, sley_rev, sley_worktree,
+};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -331,6 +333,7 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let config = read_repo_config(&git_dir).map_err(report_config_setup_error)?;
+    crate::repository::warn_graft_file_deprecated(&git_dir, &config);
     // Config-derived display defaults. The command line wins where it set a
     // value explicitly; otherwise `status.*` config supplies the default, as
     // upstream's wt-status initialization does.
@@ -1559,10 +1562,21 @@ impl StatusPathspec {
     fn new(cwd: &Path, worktree_root: &Path, path_args: &[String]) -> Result<Self> {
         let root = fs::canonicalize(worktree_root)?;
         let cwd = fs::canonicalize(cwd)?;
-        let relative = cwd.strip_prefix(&root).map_err(|_| {
-            GitError::InvalidPath(format!("path {} is outside worktree", cwd.display()))
-        })?;
-        let prefix = relative.to_string_lossy().replace('\\', "/").into_bytes();
+        // An explicit GIT_WORK_TREE may point away from the repository and the
+        // process cwd. With no pathspec, Git scans that whole worktree; it does
+        // not reject the command merely because the repository cwd is outside
+        // it. A pathspec still needs an in-worktree cwd so relative arguments
+        // have an unambiguous repository prefix.
+        let prefix = match cwd.strip_prefix(&root) {
+            Ok(relative) => relative.to_string_lossy().replace('\\', "/").into_bytes(),
+            Err(_) if path_args.is_empty() => Vec::new(),
+            Err(_) => {
+                return Err(GitError::InvalidPath(format!(
+                    "path {} is outside worktree",
+                    cwd.display()
+                )));
+            }
+        };
         let cwd_depth = path_component_count(&prefix);
         let mut filters = Vec::new();
         let magic = effective_pathspec_flags();

@@ -5,20 +5,19 @@
 //! behavior in one place while preserving command-specific parsing and errors.
 #![allow(clippy::expect_used)]
 
+use sley::plumbing::{sley_core, sley_odb, sley_rev};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use sley::plumbing::{sley_core, sley_rev};
 
 use sley::GitConfig;
-use sley::{ObjectFormat, Result};
 use sley::ObjectDatabase as FileObjectDatabase;
 use sley::RefStore as FileRefStore;
+use sley::{ObjectFormat, Result};
 
 use crate::{
-    common_git_dir_for_git_dir, read_repo_config, repository_abbrev,
-    repository_object_format, session, warn_ambiguous_refname_for_object_prefix,
-    worktree_root_for_git_dir,
+    common_git_dir_for_git_dir, read_repo_config, repository_abbrev, repository_object_format,
+    session, warn_ambiguous_refname_for_object_prefix, worktree_root_for_git_dir,
 };
 
 pub(crate) struct RepositoryContext {
@@ -50,8 +49,8 @@ impl RepositoryContext {
         let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
         let format = repository_object_format(&common_git_dir)?;
         let config = read_repo_config(&git_dir)?;
-        let objects = FileObjectDatabase::from_git_dir(&common_git_dir, format);
         let refs = FileRefStore::new(&git_dir, format);
+        let objects = open_object_database(&git_dir, format)?;
         Ok(Self {
             cwd,
             git_dir,
@@ -126,4 +125,68 @@ impl RepositoryContext {
     pub(crate) fn revision_resolver(&self) -> sley_rev::RevisionResolver<'_, FileObjectDatabase> {
         sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.objects)
     }
+}
+
+/// Open the repository object database with CLI-effective replacement reads.
+///
+/// The returned database applies replacement refs only to content/header
+/// reads. Object writes, enumeration, and raw storage queries remain keyed by
+/// the caller-provided object id. The policy is resolved here from the parsed
+/// global CLI session, effective config (including `-c`), and repository refs;
+/// the ODB itself does not inspect process state.
+pub(crate) fn open_object_database(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<FileObjectDatabase> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let config = read_repo_config(git_dir)?;
+    let refs = FileRefStore::new(git_dir, format);
+    let replace_objects = session::cli_session()
+        .map(|session| session.replace_objects())
+        .unwrap_or(true)
+        && config
+            .get_bool("core", None, "useReplaceRefs")
+            .unwrap_or(true);
+    let replacements = if replace_objects {
+        repository_object_replacements(&refs, format)?
+    } else {
+        sley_odb::ObjectReplacements::default()
+    };
+    Ok(FileObjectDatabase::from_git_dir(&common_git_dir, format).with_replacements(replacements))
+}
+
+pub(crate) fn warn_graft_file_deprecated(git_dir: &Path, config: &GitConfig) {
+    if config
+        .get_bool("advice", None, "graftFileDeprecated")
+        .unwrap_or(true)
+        && git_dir.join("info").join("grafts").exists()
+    {
+        eprintln!("hint: Support for <GIT_DIR>/info/grafts is deprecated");
+        eprintln!("hint: and will be removed in a future Git version.");
+        eprintln!("hint: ");
+        eprintln!("hint: Please use \"git replace --convert-graft-file\"");
+        eprintln!("hint: to convert the grafts into replace refs.");
+        eprintln!("hint: ");
+        eprintln!("hint: Turn this message off by running");
+        eprintln!("hint: \"git config set advice.graftFileDeprecated false\"");
+    }
+}
+
+fn repository_object_replacements(
+    refs: &FileRefStore,
+    format: ObjectFormat,
+) -> Result<sley_odb::ObjectReplacements> {
+    let mut replacements = Vec::new();
+    for reference in refs.list_refs()? {
+        let Some(source) = reference.name.strip_prefix("refs/replace/") else {
+            continue;
+        };
+        let Ok(source) = sley_core::ObjectId::from_hex(format, source) else {
+            continue;
+        };
+        if let sley::ReferenceTarget::Direct(target) = reference.target {
+            replacements.push((source, target));
+        }
+    }
+    Ok(sley_odb::ObjectReplacements::new(replacements))
 }

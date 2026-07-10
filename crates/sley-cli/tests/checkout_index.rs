@@ -325,6 +325,43 @@ fn checkout_index_prefix_matches_upstream_git() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[cfg(unix)]
+#[test]
+fn checkout_index_prefix_follows_symlinked_prefix_directory() {
+    use std::os::unix::fs::symlink;
+
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("checkout-index-prefix-symlink");
+    let (upstream, rust) = prepare_pair("prefix-symlink", &root);
+    for repo in [&upstream, &rust] {
+        fs::create_dir(repo.join("tmp1")).expect("create symlink target");
+        symlink("tmp1", repo.join("tmp")).expect("create prefix symlink");
+    }
+
+    let args = ["checkout-index", "--prefix=tmp/orary-", "-f", "-a"];
+    let expected = run(sley_testkit::oracle_git(), &upstream, &args);
+    let actual = run(SLEY, &rust, &args);
+    assert_same_output(actual, expected, &args);
+    for path in ["tmp1/orary-file.txt", "tmp1/orary-dir/nested.txt"] {
+        assert_eq!(
+            fs::read(rust.join(path)).expect("read sley prefixed output"),
+            fs::read(upstream.join(path)).expect("read git prefixed output"),
+            "prefixed file differed at {path}"
+        );
+    }
+    assert!(
+        fs::symlink_metadata(rust.join("tmp"))
+            .expect("stat prefix symlink")
+            .file_type()
+            .is_symlink(),
+        "checkout-index replaced the caller-provided prefix symlink"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn checkout_index_stdin_matches_upstream_git() {
     if !git_available() {

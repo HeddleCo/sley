@@ -18,8 +18,8 @@
 
 use crate::*;
 use sley::plumbing::sley_object::TreeEntries;
-use std::cell::{Ref, RefCell};
 use sley::plumbing::{sley_diff_merge, sley_rev, sley_worktree};
+use std::cell::{Ref, RefCell};
 
 /// How the per-object diff (for commits) is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +114,9 @@ struct ShowOptions {
     patch_with_extra: bool,
     /// Full 40/64-hex `index` lines in patches (`--full-index`).
     patch_full_index: bool,
+    /// Emit applicable binary patches. `--binary` also implies full index
+    /// lines and keeps the default patch body alongside stat/raw output.
+    patch_binary: bool,
     /// Explicit patch abbreviation width (`--abbrev=<n>` affects this too).
     patch_abbrev: Option<usize>,
     /// Rename detection toggle (on by default, `--no-renames` disables).
@@ -298,6 +301,7 @@ impl Default for ShowOptions {
             raw: false,
             patch_with_extra: false,
             patch_full_index: false,
+            patch_binary: false,
             patch_abbrev: None,
             detect_renames: true,
             renames_explicit: false,
@@ -429,7 +433,7 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
                 .unwrap_or(false),
         );
     }
-    show_warn_graft_file_deprecated(git_dir, config);
+    crate::repository::warn_graft_file_deprecated(git_dir, config);
 
     // Ref decorations feed the `commit`/oneline header and the `%d`/`%D`
     // placeholders. `git show` leaves them off unless `--decorate` is given, but a
@@ -574,23 +578,6 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
     stdout.flush()?;
     show_profile_mark(profile_enabled, "flush", profile_start, &mut profile_last);
     Ok(())
-}
-
-fn show_warn_graft_file_deprecated(git_dir: &Path, config: &GitConfig) {
-    if config
-        .get_bool("advice", None, "graftFileDeprecated")
-        .unwrap_or(true)
-        && git_dir.join("info").join("grafts").exists()
-    {
-        eprintln!("hint: Support for <GIT_DIR>/info/grafts is deprecated");
-        eprintln!("hint: and will be removed in a future Git version.");
-        eprintln!("hint: ");
-        eprintln!("hint: Please use \"git replace --convert-graft-file\"");
-        eprintln!("hint: to convert the grafts into replace refs.");
-        eprintln!("hint: ");
-        eprintln!("hint: Turn this message off by running");
-        eprintln!("hint: \"git config set advice.graftFileDeprecated false\"");
-    }
 }
 
 fn show_profile_enabled() -> bool {
@@ -1598,8 +1585,11 @@ fn write_commit_diff_patch(
             |_| false,
             |stdout, entry| {
                 let patch_options = DiffRenderOptions {
-                line_indicators: sley_diff_merge::render::LineIndicators::default(),
-                    binary: false,
+                    line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                    suppress_blank_empty: config
+                        .get_bool("diff", None, "suppressblankempty")
+                        .unwrap_or(false),
+                    binary: options.patch_binary,
                     anchors: &options.anchored,
                     allow_textconv: options.textconv != Some(false),
                     db,
@@ -1910,6 +1900,13 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
                 options.patch_abbrev = Some(parsed);
             }
             "--full-index" => options.patch_full_index = true,
+            "--binary" => {
+                options.patch_binary = true;
+                options.patch_full_index = true;
+                options.patch_with_extra = true;
+                options.restore_patch();
+            }
+            "--no-binary" => options.patch_binary = false,
             // --- date ------------------------------------------------------------
             "--date" => {
                 let value = iter

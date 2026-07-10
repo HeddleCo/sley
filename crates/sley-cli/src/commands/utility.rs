@@ -5,6 +5,29 @@ use sley::plumbing::{sley_config, sley_core, sley_worktree};
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
 
+/// Minimal native `imap-send` front end for the empty-message contract. The
+/// full IMAP transport is deliberately not delegated to an installed Git
+/// helper; empty input is rejected before any connection or repository setup.
+pub(crate) fn cmd_imap_send(args: &[String]) -> Result<()> {
+    for arg in args {
+        match arg.as_str() {
+            "-v" | "--verbose" => {}
+            _ => {
+                eprintln!("usage: git imap-send [-v] [-q] [--[no-]curl]");
+                return Err(GitError::Exit(129));
+            }
+        }
+    }
+    let mut input = Vec::new();
+    io::stdin().read_to_end(&mut input)?;
+    if input.is_empty() {
+        eprintln!("nothing to send");
+        return Err(GitError::Exit(1));
+    }
+    eprintln!("fatal: native imap-send transport is not yet implemented");
+    Err(GitError::Exit(1))
+}
+
 pub(crate) fn cmd_version(args: &[String]) -> Result<()> {
     // `git version` ignores positional arguments and prints the version line; the
     // only flag it acts on is `--build-options`, which appends a block of build

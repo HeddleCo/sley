@@ -1,20 +1,24 @@
 //! `git cat-file`: inspect objects and run the batch object-query protocol.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use sley::plumbing::{sley_index, sley_rev, sley_worktree};
 use std::fmt::Write as _;
 use std::io::{self, BufRead, BufWriter, Write};
 use std::path::Path;
-use sley::plumbing::{sley_index, sley_rev, sley_worktree};
+use std::sync::Arc;
 
-use sley::{GitError, ObjectFormat, ObjectId, Result};
-use sley::plumbing::sley_object::ObjectType;
-use sley::{ObjectDatabase as FileObjectDatabase};
-use sley::plumbing::sley_odb::{ObjectStorageInfo};
 use super::args::{GitArgCursor, LongOption, option_takes_no_value, switch_requires_value};
 use crate::*;
+use sley::ObjectDatabase as FileObjectDatabase;
+use sley::plumbing::sley_object::ObjectType;
+use sley::plumbing::sley_odb::ObjectStorageInfo;
+use sley::{GitError, ObjectFormat, ObjectId, Repository, Result};
 
-pub(crate) fn cmd_cat_file(args: &[String]) -> Result<()> {
-    CatFileInvocation::parse(args)?.execute()
+pub(crate) fn cmd_cat_file(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    CatFileInvocation::parse(args)?.execute(cli_session)
 }
 
 enum CatFileInvocation {
@@ -27,10 +31,10 @@ impl CatFileInvocation {
         CatFileOptions::parse(args)?.into_invocation()
     }
 
-    fn execute(self) -> Result<()> {
+    fn execute(self, cli_session: &crate::session::CliSession) -> Result<()> {
         match self {
-            Self::Object(request) => request.execute(),
-            Self::Batch(request) => request.execute(),
+            Self::Object(request) => request.execute(cli_session),
+            Self::Batch(request) => request.execute(cli_session),
         }
     }
 }
@@ -354,8 +358,8 @@ struct CatFileObjectRequest {
 }
 
 impl CatFileObjectRequest {
-    fn execute(self) -> Result<()> {
-        let view = RepositoryObjectView::discover()?;
+    fn execute(self, cli_session: &crate::session::CliSession) -> Result<()> {
+        let view = RepositoryObjectView::open(cli_session)?;
         let query = ObjectQuery {
             view: &view,
             name: &self.object_name,
@@ -410,18 +414,19 @@ struct RepositoryObjectView {
     git_dir: PathBuf,
     common_git_dir: PathBuf,
     format: ObjectFormat,
-    db: FileObjectDatabase,
+    db: Arc<FileObjectDatabase>,
     refs: FileRefStore,
 }
 
 impl RepositoryObjectView {
-    fn discover() -> Result<Self> {
-        let git_dir = crate::session::cli_git_dir()?;
-        let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-        let format = repository_object_format(&common_git_dir)?;
+    fn open(cli_session: &crate::session::CliSession) -> Result<Self> {
+        let repository = cli_session.open_repository()?;
+        let git_dir = repository.git_dir().to_path_buf();
+        let common_git_dir = repository.common_dir().to_path_buf();
+        let format = repository.object_format();
         Ok(Self {
-            db: FileObjectDatabase::from_git_dir(&common_git_dir, format),
-            refs: FileRefStore::new(&git_dir, format),
+            db: repository.objects(),
+            refs: repository.references(),
             git_dir,
             common_git_dir,
             format,
@@ -444,11 +449,11 @@ impl RepositoryObjectView {
     /// bad rev (`invalid object name`) apart from a good rev whose path is
     /// missing (`path ... does not exist`).
     fn peel_to_tree(&self, rev: &str) -> Result<ObjectId> {
-        sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db).peel_to_tree(rev)
+        sley_rev::RevisionResolver::new(&self.git_dir, self.format, self.db()).peel_to_tree(rev)
     }
 
     fn db(&self) -> &FileObjectDatabase {
-        &self.db
+        self.db.as_ref()
     }
 
     fn refs(&self) -> &FileRefStore {
@@ -457,22 +462,22 @@ impl RepositoryObjectView {
 
     fn resolve(&self, name: &str) -> Result<ObjectId> {
         warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, name);
-        sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db).resolve(name)
+        sley_rev::RevisionResolver::new(&self.git_dir, self.format, self.db()).resolve(name)
     }
 
     fn replacement_oid(&self, oid: &ObjectId) -> Result<ObjectId> {
-        apply_replace_object(&self.refs, oid)
+        self.db.replacement_oid(oid)
     }
 
     fn resolve_path(&self, rev: &str, path: &str) -> Result<sley_rev::ResolvedTreePath> {
         warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, rev);
-        sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db)
+        sley_rev::RevisionResolver::new(&self.git_dir, self.format, self.db())
             .resolve_path(rev, path)
     }
 
     fn resolve_path_follow_symlinks(&self, rev: &str, path: &str) -> sley_rev::SymlinkedTreePath {
         warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, rev);
-        sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.db)
+        sley_rev::RevisionResolver::new(&self.git_dir, self.format, self.db())
             .resolve_path_follow_symlinks(rev, path)
     }
 
@@ -733,9 +738,7 @@ impl ObjectQuery<'_> {
     /// Load the mailmap when `--use-mailmap` is in effect (else an empty one).
     fn cat_file_mailmap(&self) -> Result<commands::utility::Mailmap> {
         if self.use_mailmap {
-            let git_dir = crate::session::cli_git_dir()?;
-            let format = repository_object_format(&git_dir)?;
-            commands::utility::Mailmap::load_default(&git_dir, format)
+            commands::utility::Mailmap::load_default(self.view.git_dir(), self.view.format())
         } else {
             Ok(commands::utility::Mailmap::default())
         }
@@ -881,11 +884,12 @@ impl CatFileObjectsFilter {
 /// (1024-scaled). Returns `None` on overflow or a malformed value, exactly like the C helper
 /// that backs `blob:limit=<n>`.
 /// Load the mailmap for the batch path when `--use-mailmap` is set (else empty).
-fn batch_record_mailmap(use_mailmap: bool) -> Result<commands::utility::Mailmap> {
+fn batch_record_mailmap(
+    view: &RepositoryObjectView,
+    use_mailmap: bool,
+) -> Result<commands::utility::Mailmap> {
     if use_mailmap {
-        let git_dir = crate::session::cli_git_dir()?;
-        let format = repository_object_format(&git_dir)?;
-        commands::utility::Mailmap::load_default(&git_dir, format)
+        commands::utility::Mailmap::load_default(view.git_dir(), view.format())
     } else {
         Ok(commands::utility::Mailmap::default())
     }
@@ -987,12 +991,14 @@ fn parse_git_unsigned_base0(value: &str) -> Option<u64> {
 }
 
 impl CatFileBatchRequest {
-    fn execute(self) -> Result<()> {
+    fn execute(self, cli_session: &crate::session::CliSession) -> Result<()> {
         match self.mode {
-            CatFileBatchMode::Batch => self.run_batch(false),
-            CatFileBatchMode::BatchCheck => self.run_batch(true),
-            CatFileBatchMode::Command if self.batch_all_objects => self.run_batch(true),
-            CatFileBatchMode::Command => self.run_command(),
+            CatFileBatchMode::Batch => self.run_batch(cli_session, false),
+            CatFileBatchMode::BatchCheck => self.run_batch(cli_session, true),
+            CatFileBatchMode::Command if self.batch_all_objects => {
+                self.run_batch(cli_session, true)
+            }
+            CatFileBatchMode::Command => self.run_command(cli_session),
         }
     }
 
@@ -1000,14 +1006,12 @@ impl CatFileBatchRequest {
     /// upstream never rewrites those oids through the replace mechanism, so replace is honoured
     /// only for stdin-driven queries.
     fn apply_replace(&self, view: &RepositoryObjectView) -> Result<bool> {
-        if self.batch_all_objects {
-            return Ok(false);
-        }
-        replace_objects_active(view.refs())
+        let _ = view;
+        Ok(!self.batch_all_objects)
     }
 
-    fn run_batch(&self, check_only: bool) -> Result<()> {
-        let view = RepositoryObjectView::discover()?;
+    fn run_batch(&self, cli_session: &crate::session::CliSession, check_only: bool) -> Result<()> {
+        let view = RepositoryObjectView::open(cli_session)?;
         let apply_replace = self.apply_replace(&view)?;
         let batch_format = self.format.as_deref().map(CatFileBatchFormat::parse);
         let stdout = io::stdout();
@@ -1068,8 +1072,8 @@ impl CatFileBatchRequest {
         Ok(())
     }
 
-    fn run_command(&self) -> Result<()> {
-        let view = RepositoryObjectView::discover()?;
+    fn run_command(&self, cli_session: &crate::session::CliSession) -> Result<()> {
+        let view = RepositoryObjectView::open(cli_session)?;
         let apply_replace = self.apply_replace(&view)?;
         let batch_format = self.format.as_deref().map(CatFileBatchFormat::parse);
         let stdout = io::stdout();
@@ -1401,16 +1405,27 @@ fn print_cat_file_batch_record(
             stdout,
             &record,
             &query,
-            record.view.db().read_object_header(&read_oid),
+            if record.apply_replace {
+                record.view.db().read_object_header(&read_oid)
+            } else {
+                record
+                    .view
+                    .db()
+                    .read_object_header_without_replacement(&oid)
+            },
         )?
         else {
             return Ok(());
         };
         // `--use-mailmap`: `%(objectsize)` reflects the mailmapped commit/tag body.
         if record.use_mailmap && matches!(object_type, ObjectType::Commit | ObjectType::Tag) {
-            let mailmap = batch_record_mailmap(record.use_mailmap)?;
+            let mailmap = batch_record_mailmap(record.view, record.use_mailmap)?;
             if !mailmap.is_empty() {
-                let object = record.view.db().read_object(&read_oid)?;
+                let object = if record.apply_replace {
+                    record.view.db().read_object(&read_oid)?
+                } else {
+                    record.view.db().read_object_without_replacement(&oid)?
+                };
                 size = cat_file_apply_mailmap_body(&object.body, object.object_type, &mailmap).len()
                     as u64;
             }
@@ -1435,7 +1450,14 @@ fn print_cat_file_batch_record(
             stdout,
             &record,
             &query,
-            record.view.db().read_object_header(&read_oid),
+            if record.apply_replace {
+                record.view.db().read_object_header(&read_oid)
+            } else {
+                record
+                    .view
+                    .db()
+                    .read_object_header_without_replacement(&oid)
+            },
         )?
         else {
             return Ok(());
@@ -1444,7 +1466,11 @@ fn print_cat_file_batch_record(
             return print_cat_file_excluded(stdout, &record);
         }
     }
-    let object = match record.view.db().read_object(&read_oid) {
+    let object = match if record.apply_replace {
+        record.view.db().read_object(&read_oid)
+    } else {
+        record.view.db().read_object_without_replacement(&oid)
+    } {
         Ok(object) => object,
         // A structurally broken object (unknown type header) aborts the whole batch with
         // `fatal: invalid object type`, exactly like upstream's `die` inside object-file
@@ -1467,7 +1493,7 @@ fn print_cat_file_batch_record(
     let mailmapped_body = if record.use_mailmap
         && matches!(object.object_type, ObjectType::Commit | ObjectType::Tag)
     {
-        let mailmap = batch_record_mailmap(record.use_mailmap)?;
+        let mailmap = batch_record_mailmap(record.view, record.use_mailmap)?;
         (!mailmap.is_empty())
             .then(|| cat_file_apply_mailmap_body(&object.body, object.object_type, &mailmap))
     } else {

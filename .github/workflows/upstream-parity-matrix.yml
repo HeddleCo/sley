@@ -1,0 +1,215 @@
+name: Upstream Parity Platform Matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_version:
+        description: Oracle Git tag
+        default: v2.55.0
+      enforce:
+        description: Enforce 100% oracle-applicable correctness
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 6 * * 0'
+
+permissions:
+  contents: read
+
+env:
+  ORACLE_GIT_TAG: ${{ github.event.inputs.git_version || 'v2.55.0' }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unix:
+    name: ${{ matrix.os }} / ${{ matrix.hash }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+        hash: [sha1, sha256]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: upstream-matrix-${{ matrix.os }}
+
+      - name: Install Git build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcurl4-openssl-dev libexpat1-dev libpcre2-dev gettext
+
+      - name: Install Git build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install pcre2 gettext || true
+
+      - name: Build oracle Git and Sley
+        run: |
+          git clone --depth=1 --branch "$ORACLE_GIT_TAG" https://github.com/git/git /tmp/git-src
+          echo "${ORACLE_GIT_TAG#v}" > /tmp/git-src/version
+          jobs="$(command -v nproc >/dev/null && nproc || sysctl -n hw.ncpu)"
+          make -C /tmp/git-src -j"$jobs" prefix=/tmp/git-prefix USE_LIBPCRE2=1 NO_TCLTK=YesPlease install
+          cargo build --locked -p sley-cli --bin sley --release --features git-compat-i18n
+
+      - name: Validate local transport test environment
+        run: python3 crates/sley-testkit/scripts/preflight_upstream_environment.py --tmpdir /tmp
+
+      - name: Run isolated oracle and Sley cells
+        env:
+          GIT_SRC_DIR: /tmp/git-src
+          GIT_TEST_DEFAULT_HASH: ${{ matrix.hash }}
+          SLEY_DEFAULT_HASH: ${{ matrix.hash }}
+          SLEY_TESTS: curated
+          SLEY_UPSTREAM_WAVES: "8"
+          SLEY_TEST_TIMEOUT: "900"
+        run: |
+          root="matrix-artifacts/${{ matrix.os }}-${{ matrix.hash }}"
+          mkdir -p "$root"
+          SLEY_TEST_TARGET=oracle \
+          SLEY_ORACLE_BIN=/tmp/git-prefix/bin/git \
+          SLEY_REPORT="$root/oracle-report.txt" \
+          SLEY_SUMMARY="$root/oracle-summary.csv" \
+          SLEY_HISTORY="$root/oracle-history.csv" \
+          SLEY_TIMINGS="$root/oracle-timings.csv" \
+          SLEY_CELLS="$root/oracle-cells.csv" \
+          SLEY_DETAILS="$root/oracle-details.csv" \
+            crates/sley-testkit/scripts/run-upstream-tests-waves.sh || true
+          SLEY_TEST_TARGET=sley \
+          SLEY_BIN="$GITHUB_WORKSPACE/target/release/sley" \
+          SLEY_REPORT="$root/sley-report.txt" \
+          SLEY_SUMMARY="$root/sley-summary.csv" \
+          SLEY_HISTORY="$root/sley-history.csv" \
+          SLEY_TIMINGS="$root/sley-timings.csv" \
+          SLEY_CELLS="$root/sley-cells.csv" \
+          SLEY_DETAILS="$root/sley-details.csv" \
+          SLEY_ORACLE_CELLS="$root/oracle-cells.csv" \
+          SLEY_ORACLE_DETAILS="$root/oracle-details.csv" \
+          SLEY_COMPARISON="$root/comparison.csv" \
+          SLEY_COMPARISON_SUMMARY="$root/comparison-summary.csv" \
+            crates/sley-testkit/scripts/run-upstream-tests-waves.sh || true
+
+      - name: Report matrix correctness readiness
+        continue-on-error: true
+        run: |
+          root="matrix-artifacts/${{ matrix.os }}-${{ matrix.hash }}"
+          python3 crates/sley-testkit/scripts/check_upstream_correctness.py \
+            --oracle-details "$root/oracle-details.csv" \
+            --comparison-summary "$root/comparison-summary.csv" \
+            --expected-scripts 891
+
+      - name: Enforce release correctness
+        if: github.event_name == 'workflow_dispatch' && inputs.enforce
+        run: |
+          root="matrix-artifacts/${{ matrix.os }}-${{ matrix.hash }}"
+          python3 crates/sley-testkit/scripts/check_upstream_correctness.py \
+            --oracle-details "$root/oracle-details.csv" \
+            --comparison-summary "$root/comparison-summary.csv" \
+            --expected-scripts 891
+
+      - name: Archive matrix cell artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-${{ matrix.os }}-${{ matrix.hash }}
+          path: matrix-artifacts
+
+  windows:
+    name: windows-latest / ${{ matrix.hash }}
+    strategy:
+      fail-fast: false
+      matrix:
+        hash: [sha1, sha256]
+    runs-on: windows-latest
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: >-
+            base-devel
+            git
+            perl
+            gettext-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-curl
+            mingw-w64-x86_64-expat
+            mingw-w64-x86_64-pcre2
+            mingw-w64-x86_64-python
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: upstream-matrix-windows
+
+      - name: Build oracle Git and Sley
+        shell: msys2 {0}
+        run: |
+          git clone --depth=1 --branch "$ORACLE_GIT_TAG" https://github.com/git/git /tmp/git-src
+          echo "${ORACLE_GIT_TAG#v}" > /tmp/git-src/version
+          make -C /tmp/git-src -j"$(nproc)" prefix=/tmp/git-prefix USE_LIBPCRE2=1 NO_TCLTK=YesPlease install
+          cargo build --locked -p sley-cli --bin sley --release --features git-compat-i18n
+
+      - name: Validate local transport test environment
+        shell: msys2 {0}
+        run: python3 crates/sley-testkit/scripts/preflight_upstream_environment.py
+
+      - name: Run isolated oracle and Sley cells
+        shell: msys2 {0}
+        env:
+          GIT_SRC_DIR: /tmp/git-src
+          GIT_TEST_DEFAULT_HASH: ${{ matrix.hash }}
+          SLEY_DEFAULT_HASH: ${{ matrix.hash }}
+          SLEY_TESTS: curated
+          SLEY_UPSTREAM_WAVES: "8"
+          SLEY_TEST_TIMEOUT: "900"
+        run: |
+          root="matrix-artifacts/windows-${{ matrix.hash }}"
+          mkdir -p "$root"
+          SLEY_TEST_TARGET=oracle SLEY_ORACLE_BIN=/tmp/git-prefix/bin/git.exe \
+          SLEY_REPORT="$root/oracle-report.txt" SLEY_SUMMARY="$root/oracle-summary.csv" \
+          SLEY_HISTORY="$root/oracle-history.csv" SLEY_TIMINGS="$root/oracle-timings.csv" \
+          SLEY_CELLS="$root/oracle-cells.csv" SLEY_DETAILS="$root/oracle-details.csv" \
+            sh crates/sley-testkit/scripts/run-upstream-tests-waves.sh || true
+          SLEY_TEST_TARGET=sley SLEY_BIN="$(pwd)/target/release/sley.exe" \
+          SLEY_REPORT="$root/sley-report.txt" SLEY_SUMMARY="$root/sley-summary.csv" \
+          SLEY_HISTORY="$root/sley-history.csv" SLEY_TIMINGS="$root/sley-timings.csv" \
+          SLEY_CELLS="$root/sley-cells.csv" SLEY_DETAILS="$root/sley-details.csv" \
+          SLEY_ORACLE_CELLS="$root/oracle-cells.csv" \
+          SLEY_ORACLE_DETAILS="$root/oracle-details.csv" \
+          SLEY_COMPARISON="$root/comparison.csv" \
+          SLEY_COMPARISON_SUMMARY="$root/comparison-summary.csv" \
+            sh crates/sley-testkit/scripts/run-upstream-tests-waves.sh || true
+
+      - name: Report matrix correctness readiness
+        shell: msys2 {0}
+        continue-on-error: true
+        run: |
+          root="matrix-artifacts/windows-${{ matrix.hash }}"
+          python3 crates/sley-testkit/scripts/check_upstream_correctness.py \
+            --oracle-details "$root/oracle-details.csv" \
+            --comparison-summary "$root/comparison-summary.csv" \
+            --expected-scripts 891
+
+      - name: Enforce release correctness
+        if: github.event_name == 'workflow_dispatch' && inputs.enforce
+        shell: msys2 {0}
+        run: |
+          root="matrix-artifacts/windows-${{ matrix.hash }}"
+          python3 crates/sley-testkit/scripts/check_upstream_correctness.py \
+            --oracle-details "$root/oracle-details.csv" \
+            --comparison-summary "$root/comparison-summary.csv" \
+            --expected-scripts 891
+
+      - name: Archive matrix cell artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-windows-${{ matrix.hash }}
+          path: matrix-artifacts

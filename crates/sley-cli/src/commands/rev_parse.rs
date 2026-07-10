@@ -486,7 +486,7 @@ fn rev_parse_render_range(
         sley_rev::RevisionRange::Symmetric { left, right } => {
             let left_oid = rev_parse_resolve_commitish(git_dir, format, &left)?;
             let right_oid = rev_parse_resolve_commitish(git_dir, format, &right)?;
-            let db = FileObjectDatabase::from_git_dir(git_dir, format);
+            let db = crate::repository::open_object_database(git_dir, format)?;
             let left_commit = sley_rev::peel_to_commit(&db, format, &left_oid)?;
             let right_commit = sley_rev::peel_to_commit(&db, format, &right_oid)?;
             let bases = sley_rev::merge_bases(git_dir, format, &db, &left_commit, &right_commit)?;
@@ -586,7 +586,7 @@ fn rev_parse_render_parent_expansion(
 }
 
 fn rev_parse_parent_oids(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<Vec<ObjectId>> {
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let db = crate::repository::open_object_database(git_dir, format)?;
     let base = rev_parse_resolve_commitish(git_dir, format, rev)?;
     let commit_oid = sley_rev::peel_to_commit(&db, format, &base)?;
     let object = db.read_object(&commit_oid)?;
@@ -602,7 +602,8 @@ fn rev_parse_resolve_commitish(
     // Ref-first resolution: a ref named like a short hex prefix (a range
     // endpoint such as `added...HEAD`) must resolve to the ref, with the
     // commit-ish disambiguation narrowing only a genuine bare prefix.
-    sley_rev::resolve_revision_commitish(git_dir, format, rev)
+    let db = crate::repository::open_object_database(git_dir, format)?;
+    sley_rev::resolve_revision_commitish_with_reader(git_dir, format, &db, rev)
 }
 
 fn rev_parse_split_range(rev: &str) -> Option<(&str, &str, bool)> {
@@ -983,7 +984,9 @@ fn rev_parse_prefixed_path(cwd: &Path, git_dir: &Path, path: &str) -> Result<Opt
 }
 
 fn rev_parse_tree_contains(git_dir: &Path, format: ObjectFormat, base: &str, path: &str) -> bool {
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let Ok(db) = crate::repository::open_object_database(git_dir, format) else {
+        return false;
+    };
     sley_rev::resolve_rev_path(git_dir, format, &db, base, path).is_ok()
 }
 

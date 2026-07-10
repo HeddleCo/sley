@@ -198,6 +198,9 @@ pub struct HunkRenderOptions<'a, 'h> {
     pub word_diff: Option<&'a mut dyn HunkWordDiff>,
     /// Hunk body line indicators (` `, `-`, `+` by default).
     pub line_indicators: LineIndicators,
+    /// `diff.suppressBlankEmpty`: omit the context indicator on a context line
+    /// whose body is empty (the terminating LF is still emitted).
+    pub suppress_blank_empty: bool,
     /// `--ws-error-highlight` configuration: when set and colors are on, the
     /// renderer paints whitespace errors on the selected line kinds with
     /// `colors.whitespace` (git's `emit_line_ws_markup`). `None` disables it.
@@ -306,6 +309,7 @@ impl Default for HunkRenderOptions<'_, '_> {
             colors: None,
             word_diff: None,
             line_indicators: LineIndicators::default(),
+            suppress_blank_empty: false,
             ws_error: None,
             ws_ignore: WsIgnore::default(),
             algorithm: DiffAlgorithm::Myers,
@@ -2271,6 +2275,9 @@ fn render_one_hunk(
             LineKind::Delete => options.line_indicators.old,
             LineKind::Insert => options.line_indicators.new,
         };
+        let emit_prefix = !(options.suppress_blank_empty
+            && line.kind == LineKind::Context
+            && line.content == b"\n");
         match options.colors {
             Some(colors) => {
                 // Whitespace-error highlighting applies to the selected line
@@ -2287,9 +2294,17 @@ fn render_one_hunk(
                     .and_then(|styles| styles.get(start + offset))
                     .copied()
                     .filter(|style| style.moved);
-                write_patch_line_colored(out, prefix, line.content, colors, ws_rule, moved);
+                write_patch_line_colored(
+                    out,
+                    prefix,
+                    emit_prefix,
+                    line.content,
+                    colors,
+                    ws_rule,
+                    moved,
+                );
             }
-            None => write_patch_line(out, prefix, line.content),
+            None => write_patch_line(out, prefix, emit_prefix, line.content),
         }
     }
 }
@@ -2328,8 +2343,10 @@ fn hunk_section_heading(
 /// Write a single diff line with its `prefix` marker, appending the
 /// `\ No newline at end of file` note when the source line lacks a trailing
 /// LF.
-fn write_patch_line(out: &mut Vec<u8>, prefix: u8, line: &[u8]) {
-    out.push(prefix);
+fn write_patch_line(out: &mut Vec<u8>, prefix: u8, emit_prefix: bool, line: &[u8]) {
+    if emit_prefix {
+        out.push(prefix);
+    }
     out.extend_from_slice(line);
     if !line.ends_with(b"\n") {
         out.extend_from_slice(b"\n\\ No newline at end of file\n");
@@ -2351,6 +2368,7 @@ fn write_patch_line(out: &mut Vec<u8>, prefix: u8, line: &[u8]) {
 fn write_patch_line_colored(
     out: &mut Vec<u8>,
     prefix: u8,
+    emit_prefix: bool,
     line: &[u8],
     colors: RenderColors<'_>,
     ws_rule: Option<crate::ws::WsRule>,
@@ -2377,7 +2395,9 @@ fn write_patch_line_colored(
     if let Some(rule) = ws_rule {
         if rule == 0 {
             out.extend_from_slice(color.as_bytes());
-            out.push(prefix);
+            if emit_prefix {
+                out.push(prefix);
+            }
             out.extend_from_slice(body);
             out.extend_from_slice(colors.reset.as_bytes());
             out.push(b'\n');
@@ -2392,7 +2412,9 @@ fn write_patch_line_colored(
         // Sign in the line color, then the body through ws_check_emit (no
         // trailing newline in `body`, so the emit's own LF handling is inert).
         out.extend_from_slice(color.as_bytes());
-        out.push(prefix);
+        if emit_prefix {
+            out.push(prefix);
+        }
         out.extend_from_slice(colors.reset.as_bytes());
         let emit_colors = crate::ws::WsEmitColors {
             set: color,
@@ -2417,7 +2439,9 @@ fn write_patch_line_colored(
 
     if prefix == b'+' {
         out.extend_from_slice(color.as_bytes());
-        out.push(prefix);
+        if emit_prefix {
+            out.push(prefix);
+        }
         out.extend_from_slice(colors.reset.as_bytes());
         if !body.is_empty() {
             out.extend_from_slice(color.as_bytes());
@@ -2426,7 +2450,9 @@ fn write_patch_line_colored(
         }
     } else {
         out.extend_from_slice(color.as_bytes());
-        out.push(prefix);
+        if emit_prefix {
+            out.push(prefix);
+        }
         out.extend_from_slice(body);
         out.extend_from_slice(colors.reset.as_bytes());
     }
@@ -2525,8 +2551,8 @@ impl Default for CombinedRenderOptions {
 /// `show_hunks || mode_differs`).
 ///
 /// Mirrors `show_patch_diff`'s body half: build the `sline` array, fold each
-/// parent into it via [`combine_one_parent`], run [`make_hunks`], then
-/// [`dump_sline`].
+/// parent into it via `combine_one_parent`, run `make_hunks`, then
+/// `dump_sline`.
 pub fn render_combined(out: &mut Vec<u8>, result: &[u8], parents: &[&[u8]]) -> bool {
     render_combined_with(out, result, parents, &CombinedRenderOptions::default())
 }
@@ -3281,6 +3307,19 @@ mod tests {
     fn pure_insertion_into_empty() {
         let out = render_plain(None, Some(b"x\ny\n"));
         assert_eq!(out, b"@@ -0,0 +1,2 @@\n+x\n+y\n".to_vec());
+    }
+
+    #[test]
+    fn suppress_blank_empty_omits_only_empty_context_indicator() {
+        let old = b"\nx\n";
+        let new = b"\ny\n";
+        let mut out = Vec::new();
+        let mut options = HunkRenderOptions {
+            suppress_blank_empty: true,
+            ..Default::default()
+        };
+        render_hunks(&mut out, Some(old), Some(new), &mut options);
+        assert_eq!(out, b"@@ -1,2 +1,2 @@\n\n-x\n+y\n");
     }
 
     #[test]

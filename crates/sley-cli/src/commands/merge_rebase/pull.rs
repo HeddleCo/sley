@@ -1,5 +1,7 @@
 use super::*;
-use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_remote, sley_rev, sley_worktree};
+use sley::plumbing::{
+    sley_core, sley_diff_merge, sley_index, sley_remote, sley_rev, sley_worktree,
+};
 
 pub(crate) fn read_commit_tree(
     db: &FileObjectDatabase,
@@ -567,47 +569,6 @@ fn pull_remote_tracking_ref(config: &GitConfig, remote: &str, remote_ref: &str) 
     None
 }
 
-fn print_fetch_status(
-    source: &str,
-    updates: &[FetchRefUpdate],
-    old_oids: &HashMap<String, ObjectId>,
-) {
-    let mut displayed = false;
-    for update in updates {
-        let src_short = update
-            .src
-            .strip_prefix("refs/heads/")
-            .unwrap_or(update.src.as_str());
-        let Some(dst) = update.dst.as_ref() else {
-            if !displayed {
-                eprintln!("From {source}");
-                displayed = true;
-            }
-            eprintln!(" * branch            {src_short:11}-> FETCH_HEAD");
-            continue;
-        };
-        if old_oids.get(dst) == Some(&update.oid) {
-            continue;
-        }
-        if !displayed {
-            eprintln!("From {source}");
-            displayed = true;
-        }
-        let dst_short = dst.strip_prefix("refs/remotes/").unwrap_or(dst.as_str());
-        let old_short = old_oids
-            .get(dst)
-            .map(format_log_abbrev_oid)
-            .unwrap_or_else(|| "0000000".to_string());
-        eprintln!(
-            "   {}..{}  {:11} -> {}",
-            old_short,
-            format_log_abbrev_oid(&update.oid),
-            src_short,
-            dst_short
-        );
-    }
-}
-
 fn pull_fetch(
     git_dir: &Path,
     format: ObjectFormat,
@@ -615,76 +576,30 @@ fn pull_fetch(
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<FetchOutcome> {
+    if let Some(outcome) = crate::commands::remote::fetch_with_remote_helper(
+        git_dir,
+        format,
+        remote,
+        refspecs,
+        options.clone(),
+    )? {
+        return Ok(outcome);
+    }
     if let Ok(input) = fs::read(remote)
         && let Ok(bundle) = Bundle::parse(&input, format)
     {
         fetch_bundle(git_dir, format, remote, refspecs, &bundle, options)?;
         return Ok(FetchOutcome::default());
     }
-    if fetch_source_is_ssh(remote)? {
-        fetch_ssh_repository(git_dir, format, remote, refspecs, options)?;
-        Ok(FetchOutcome::default())
+    if fetch_source_is_http(remote)? {
+        fetch_http_repository_with_outcome(git_dir, format, remote, refspecs, options)
+    } else if fetch_source_is_ssh(remote)? {
+        fetch_ssh_repository_with_outcome(git_dir, format, remote, refspecs, options)
+    } else if fetch_source_is_git(remote)? {
+        fetch_git_repository_with_outcome(git_dir, format, remote, refspecs, options)
     } else {
-        let config = read_repo_config(git_dir)?;
-        let remote_git_dir = ls_remote_git_dir(remote)?;
-        let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
-        let fetch_source = sley_remote::FetchSource::Local {
-            git_dir: remote_git_dir,
-            common_git_dir: remote_common_git_dir,
-        };
-        let store = FileRefStore::new(git_dir, format);
-        let mut old_oids = HashMap::new();
-        if !options.merge_srcs.is_empty() {
-            for update_dst in store.list_refs()? {
-                if let Some((oid, _)) = resolve_for_each_ref_target(&store, &update_dst)? {
-                    old_oids.insert(update_dst.name, oid);
-                }
-            }
-        }
-        let quiet = options.quiet;
-        let outcome = run_fetch_with_outcome(
-            git_dir,
-            format,
-            &config,
-            remote,
-            &fetch_source,
-            refspecs,
-            options,
-        )?;
-        if !quiet {
-            print_fetch_status(remote, &outcome.ref_updates, &old_oids);
-        }
-        Ok(outcome)
+        fetch_local_repository_with_outcome(git_dir, format, remote, refspecs, options, &[])
     }
-}
-
-fn run_fetch_with_outcome(
-    git_dir: &Path,
-    format: ObjectFormat,
-    config: &GitConfig,
-    source: &str,
-    fetch_source: &sley_remote::FetchSource,
-    refspecs: &[String],
-    options: FetchOptions,
-) -> Result<FetchOutcome> {
-    let mut credentials = sley_remote::CredentialHelperProvider::new(Some(config));
-    let mut progress = StdoutProgress;
-    sley_remote::fetch(
-        sley_remote::FetchRequest {
-            git_dir,
-            format,
-            config,
-            remote_name: source,
-            source: fetch_source,
-            refspecs,
-            options: &options,
-        },
-        sley_remote::FetchServices {
-            credentials: &mut credentials,
-            progress: &mut progress,
-            ref_hook: None,
-        },
-    )
 }
 
 fn pull_checkout_into_void(
@@ -1000,6 +915,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         deepen_since: None,
         deepen_not: Vec::new(),
         ssh_options: None,
+        upload_pack_command: None,
         atomic: false,
         negotiation_restrict: None,
         negotiation_include: None,

@@ -64,6 +64,14 @@ pub struct ApplySparseResult {
     /// matching git's data-loss-avoiding behavior. The caller surfaces these as
     /// git's "The following paths are not up to date …" warning. Sorted by path.
     pub not_up_to_date: Vec<Vec<u8>>,
+    /// Paths with non-zero-stage index entries. Sparse application deliberately
+    /// leaves these entries and their worktree files alone; the CLI renders
+    /// Git's corresponding "paths are unmerged" warning. Sorted and unique.
+    pub unmerged: Vec<Vec<u8>>,
+    /// Out-of-cone tracked directory prefixes that could not be removed because
+    /// they still contained non-ignored untracked files. Paths include a trailing
+    /// slash, matching Git's sparse-directory spelling.
+    pub untracked_sparse_directories: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +98,14 @@ pub struct CacheInfoEntry {
     pub oid: ObjectId,
     pub path: Vec<u8>,
     pub stage: u16,
+}
+
+/// Options for applying `update-index --cacheinfo` records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateIndexCacheInfoOptions {
+    pub add: bool,
+    pub replace: bool,
+    pub verbose: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1089,6 +1105,10 @@ pub struct RemoveOptions {
     pub force: bool,
     pub dry_run: bool,
     pub ignore_unmatch: bool,
+    /// `git rm --sparse`: permit pathspecs to select skip-worktree entries and
+    /// expand a collapsed sparse-directory entry when leaf selection requires
+    /// it. Without this opt-in, out-of-cone matches are rejected.
+    pub sparse: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

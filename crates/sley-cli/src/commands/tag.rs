@@ -1640,6 +1640,79 @@ struct TagListOptions<'a> {
     no_merged: &'a [ObjectId],
 }
 
+/// Whether rendering this format needs the referenced object's body. Keep the
+/// no-object set deliberately narrow: every unclassified/raw atom falls back
+/// to the full path, preserving compatibility as the format language grows.
+fn tag_format_needs_object(format: &ForEachRefFormat) -> bool {
+    format.segments().iter().any(|segment| match segment {
+        ForEachRefFormatSegment::Literal(_) => false,
+        ForEachRefFormatSegment::Atom(ForEachRefAtom::Color(_)) => false,
+        ForEachRefFormatSegment::Atom(ForEachRefAtom::RefName { .. }) => false,
+        ForEachRefFormatSegment::Atom(ForEachRefAtom::ObjectName {
+            peeled: false,
+            abbrev: None,
+        }) => false,
+        ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw(value)) => {
+            !(matches!(value.as_str(), "then" | "else" | "end")
+                || value.starts_with("if:")
+                || value.starts_with("align:"))
+        }
+        ForEachRefFormatSegment::Atom(_) => true,
+    })
+}
+
+fn tag_format_needs_object_candidates(format: &ForEachRefFormat) -> bool {
+    format.segments().iter().any(|segment| match segment {
+        ForEachRefFormatSegment::Atom(ForEachRefAtom::ObjectName {
+            abbrev: Some(_), ..
+        }) => true,
+        ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw(value)) => {
+            matches!(value.as_str(), "objectname:short" | "*objectname:short")
+        }
+        _ => false,
+    })
+}
+
+fn tag_format_needs_ref_names(format: &ForEachRefFormat) -> bool {
+    format.segments().iter().any(|segment| match segment {
+        ForEachRefFormatSegment::Atom(ForEachRefAtom::RefName {
+            format: ForEachRefNameFormat::Short,
+            ..
+        }) => true,
+        ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw(value)) => matches!(
+            value.as_str(),
+            "refname:short" | "symref:short" | "upstream:short" | "push:short"
+        ),
+        _ => false,
+    })
+}
+
+fn tag_format_needs_mailmap(format: &ForEachRefFormat) -> bool {
+    format.segments().iter().any(|segment| {
+        matches!(segment, ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw(value)) if value.contains("mailmap"))
+    })
+}
+
+fn tag_format_needs_peeled_object(format: &ForEachRefFormat) -> bool {
+    format.segments().iter().any(|segment| match segment {
+        ForEachRefFormatSegment::Atom(ForEachRefAtom::ObjectName { peeled: true, .. })
+        | ForEachRefFormatSegment::Atom(ForEachRefAtom::Identity { peeled: true, .. })
+        | ForEachRefFormatSegment::Atom(ForEachRefAtom::ContentsLines { peeled: true, .. }) => true,
+        ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw(value)) => value.starts_with('*'),
+        _ => false,
+    })
+}
+
+fn tag_format_needs_disk_size(format: &ForEachRefFormat) -> bool {
+    format.segments().iter().any(|segment| {
+        matches!(
+            segment,
+            ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw(value))
+                if matches!(value.as_str(), "objectsize:disk" | "*objectsize:disk")
+        )
+    })
+}
+
 /// Resolve the version-sort prerelease/suffix list from config, mirroring
 /// git's versioncmp.c: `versionsort.suffix` overrides the older
 /// `versionsort.prereleaseSuffix`; when both are present a warning is emitted
@@ -2141,7 +2214,15 @@ fn print_tag_list(
     store: &FileRefStore,
     options: TagListOptions<'_>,
 ) -> Result<()> {
-    let db = (options.format_spec.is_some()
+    // Parse once up front so rendering can derive the same lazy atom
+    // dependencies as Git's ref-filter. A refname-only format must not turn a
+    // ref listing into one object read per tag.
+    let parsed_format = options
+        .format_spec
+        .map(ForEachRefFormat::parse)
+        .transpose()?;
+    let format_needs_object = parsed_format.as_ref().is_some_and(tag_format_needs_object);
+    let db = (parsed_format.is_some()
         || options.annotation_lines.is_some()
         || !options.points_at.is_empty()
         || !options.contains.is_empty()
@@ -2166,8 +2247,35 @@ fn print_tag_list(
     )?;
     let contains_target_set = options.contains.iter().copied().collect::<HashSet<_>>();
     let no_contains_target_set = options.no_contains.iter().copied().collect::<HashSet<_>>();
+    // Tags frequently share a target (and distinct annotated tags frequently
+    // peel to the same commit). Ref-filter asks the same ancestry question for
+    // every such ref, so memoize both stages for this invocation instead of
+    // walking a long history once per tag name.
+    let mut filter_tip_cache = HashMap::new();
+    let tag_refs = store.list_refs_with_prefix("refs/tags/")?;
+    let contains_match_cache = if contains_target_set.is_empty()
+        && no_contains_target_set.is_empty()
+    {
+        HashMap::new()
+    } else {
+        let db = db
+            .as_ref()
+            .expect("contains listing creates object database");
+        let reachability = reachability
+            .as_mut()
+            .expect("contains listing creates reachability context");
+        let mut tips = HashSet::new();
+        for reference in &tag_refs {
+            if let RefTarget::Direct(oid) = &reference.target
+                && let Some(tip) = tag_filter_tip(db, format, oid, &mut filter_tip_cache)
+            {
+                tips.insert(tip);
+            }
+        }
+        reachability.target_matches(tips, &contains_target_set, &no_contains_target_set, false)?
+    };
     let mut entries = Vec::new();
-    for reference in store.list_refs_with_prefix("refs/tags/")? {
+    for reference in tag_refs {
         if let Some(name) = reference.name.strip_prefix("refs/tags/")
             && (options.patterns.is_empty()
                 || options.patterns.iter().any(|pattern| {
@@ -2176,18 +2284,20 @@ fn print_tag_list(
             && tag_points_at(&db, format, &reference.target, options.points_at)?
             && tag_contains(
                 &db,
-                reachability.as_mut(),
                 format,
                 &reference.target,
                 &contains_target_set,
                 &no_contains_target_set,
-            )?
+                &mut filter_tip_cache,
+                &contains_match_cache,
+            )
             && tag_merged(
                 &db,
                 format,
                 &reference.target,
                 &merged_reachable,
                 &no_merged_reachable,
+                &mut filter_tip_cache,
             )?
         {
             entries.push(TagListEntry {
@@ -2211,31 +2321,74 @@ fn print_tag_list(
         options.prereleases,
         options.ignore_case,
     );
-    if let Some(format_spec) = options.format_spec {
-        let format_spec = ForEachRefFormat::parse(format_spec)?;
+    if let Some(format_spec) = parsed_format.as_ref() {
         let db = db.as_ref().expect("format listing creates object database");
-        let objectname_abbrev = repository_abbrev(git_dir, format)?;
-        let objectname_candidates = cat_file_all_object_ids(git_dir, format)?;
+        let needs_object_candidates = tag_format_needs_object_candidates(format_spec);
+        let objectname_abbrev = needs_object_candidates
+            .then(|| repository_abbrev(git_dir, format))
+            .transpose()?
+            .flatten();
+        let objectname_candidates = if needs_object_candidates {
+            cat_file_all_object_ids(git_dir, format)?
+        } else {
+            Vec::new()
+        };
         let deltabase = zero_oid(format)?;
-        let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
-        let ref_names: std::collections::HashSet<String> = store
-            .list_refs()?
-            .into_iter()
-            .map(|reference| reference.name)
-            .collect();
-        let warn_ambiguous_refs = read_repo_config(git_dir)?
-            .get_bool("core", None, "warnambiguousrefs")
-            .unwrap_or(true);
+        let mailmap = if tag_format_needs_mailmap(format_spec) {
+            commands::utility::Mailmap::load_default(git_dir, format)?
+        } else {
+            commands::utility::Mailmap::default()
+        };
+        let needs_ref_names = tag_format_needs_ref_names(format_spec);
+        let ref_names: std::collections::HashSet<String> = if needs_ref_names {
+            store
+                .list_refs()?
+                .into_iter()
+                .map(|reference| reference.name)
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let warn_ambiguous_refs = if needs_ref_names {
+            read_repo_config(git_dir)?
+                .get_bool("core", None, "warnambiguousrefs")
+                .unwrap_or(true)
+        } else {
+            true
+        };
+        let needs_peeled_object = tag_format_needs_peeled_object(format_spec);
+        let needs_disk_size = tag_format_needs_disk_size(format_spec);
         let mut stdout = io::stdout();
         for entry in entries {
             let Some((oid, symref)) = resolve_for_each_ref_target(store, &entry.reference)? else {
                 continue;
             };
-            let object = db.read_object(&oid)?;
-            let contents = for_each_ref_contents(format, &object)?;
-            let peeled_object =
-                tag_format_peeled_object(git_dir, db, format, &oid, contents.as_ref())?;
-            let object_disk_size = for_each_ref_loose_object_disk_size(git_dir, &oid)?;
+            let object = if format_needs_object {
+                Some(db.read_object(&oid)?)
+            } else {
+                None
+            };
+            let contents = object
+                .as_ref()
+                .map(|object| for_each_ref_contents(format, object))
+                .transpose()?
+                .flatten();
+            let peeled_object = if needs_peeled_object {
+                tag_format_peeled_object(git_dir, db, format, &oid, contents.as_ref())?
+            } else {
+                None
+            };
+            let object_disk_size = if needs_disk_size {
+                for_each_ref_loose_object_disk_size(git_dir, &oid)?
+            } else {
+                None
+            };
+            let object_type = object
+                .as_ref()
+                .map_or(ObjectType::Blob, |object| object.object_type);
+            let object_body = object
+                .as_ref()
+                .map_or(&[][..], |object| object.body.as_slice());
             let format_context = ForEachRefFormatContext {
                 git_dir,
                 db,
@@ -2243,9 +2396,9 @@ fn print_tag_list(
                 refname: &entry.reference.name,
                 oid: &oid,
                 deltabase: &deltabase,
-                object_type: object.object_type,
-                object_body: &object.body,
-                object_size: object.body.len(),
+                object_type,
+                object_body,
+                object_size: object_body.len(),
                 object_disk_size,
                 color: options.color,
                 quote: ForEachRefQuoteMode::None,
@@ -2267,7 +2420,7 @@ fn print_tag_list(
                 warn_ambiguous_refs,
             };
             let mut line = Vec::new();
-            print_for_each_ref_format(&mut line, &format_spec, &format_context)?;
+            print_for_each_ref_format(&mut line, format_spec, &format_context)?;
             if !options.omit_empty || !line.is_empty() {
                 stdout.write_all(&line)?;
                 stdout.write_all(b"\n")?;
@@ -2276,8 +2429,17 @@ fn print_tag_list(
         stdout.flush()?;
     } else if let Some(lines) = options.annotation_lines {
         let db = db.as_ref().expect("tag -n listing creates object database");
+        // Many lightweight tags commonly share one commit. Cache by resolved
+        // OID so one `tag -n` invocation reads/decompresses that object once.
+        let mut message_cache: HashMap<ObjectId, Option<Vec<u8>>> = HashMap::new();
         for entry in entries {
-            let message = tag_list_annotation_message(db, format, store, &entry.reference)?;
+            let message = tag_list_annotation_message(
+                db,
+                format,
+                store,
+                &entry.reference,
+                &mut message_cache,
+            )?;
             write_tag_list_annotation(&mut io::stdout(), &entry.name, message.as_deref(), lines)?;
         }
     } else if options.column != TagListColumn::None {
@@ -2468,13 +2630,19 @@ fn tag_list_annotation_message(
     format: ObjectFormat,
     store: &FileRefStore,
     reference: &sley_refs::Ref,
+    cache: &mut HashMap<ObjectId, Option<Vec<u8>>>,
 ) -> Result<Option<Vec<u8>>> {
     let Some((oid, _)) = resolve_for_each_ref_target(store, reference)? else {
         return Ok(None);
     };
+    if let Some(message) = cache.get(&oid) {
+        return Ok(message.clone());
+    }
     let object = db.read_object(&oid)?;
-    Ok(for_each_ref_contents(format, &object)?
-        .map(|contents| tag_message_without_signature(&contents.message).to_vec()))
+    let message = for_each_ref_contents(format, &object)?
+        .map(|contents| tag_message_without_signature(&contents.message).to_vec());
+    cache.insert(oid, message.clone());
+    Ok(message)
 }
 
 fn write_tag_list_annotation(
@@ -3270,29 +3438,28 @@ fn tag_version_refname_cmp(
 
 fn tag_contains(
     db: &Option<FileObjectDatabase>,
-    reachability: Option<&mut sley_rev::CommitReachability<'_, FileObjectDatabase>>,
     format: ObjectFormat,
     target: &RefTarget,
     contains: &HashSet<ObjectId>,
     no_contains: &HashSet<ObjectId>,
-) -> Result<bool> {
+    filter_tip_cache: &mut HashMap<ObjectId, Option<ObjectId>>,
+    match_cache: &HashMap<ObjectId, sley_rev::ReachabilityTargetMatch>,
+) -> bool {
     if contains.is_empty() && no_contains.is_empty() {
-        return Ok(true);
+        return true;
     }
     let RefTarget::Direct(oid) = target else {
-        return Ok(false);
+        return false;
     };
     let Some(db) = db else {
-        return Ok(false);
+        return false;
     };
-    let Some(reachability) = reachability else {
-        return Ok(false);
+    let Some(tip) = tag_filter_tip(db, format, oid, filter_tip_cache) else {
+        return false;
     };
-    let Ok(tip) = sley_rev::peel_to_commit(db, format, oid) else {
-        return Ok(false);
-    };
-    let target_match = reachability.target_match(&tip, contains, no_contains, false)?;
-    Ok(target_match.reached_required && !target_match.reached_excluded)
+    match_cache
+        .get(&tip)
+        .is_some_and(|matched| matched.reached_required && !matched.reached_excluded)
 }
 
 fn tag_merged(
@@ -3301,6 +3468,7 @@ fn tag_merged(
     target: &RefTarget,
     merged_reachable: &HashSet<ObjectId>,
     no_merged_reachable: &HashSet<ObjectId>,
+    filter_tip_cache: &mut HashMap<ObjectId, Option<ObjectId>>,
 ) -> Result<bool> {
     if merged_reachable.is_empty() && no_merged_reachable.is_empty() {
         return Ok(true);
@@ -3311,12 +3479,29 @@ fn tag_merged(
     let RefTarget::Direct(oid) = target else {
         return Ok(false);
     };
-    let Ok(tip) = sley_rev::peel_to_commit(db, format, oid) else {
+    let Some(tip) = tag_filter_tip(db, format, oid, filter_tip_cache) else {
         return Ok(false);
     };
     let merged_match = merged_reachable.is_empty() || merged_reachable.contains(&tip);
     let no_merged_match = no_merged_reachable.contains(&tip);
     Ok(merged_match && !no_merged_match)
+}
+
+fn tag_filter_tip(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+    cache: &mut HashMap<ObjectId, Option<ObjectId>>,
+) -> Option<ObjectId> {
+    if let Some(tip) = cache.get(oid) {
+        return *tip;
+    }
+    // Ref-filter silently drops a tag whose terminal object is not a commit;
+    // cache that negative result as well so aliases of a blob/tree do not
+    // repeat object reads.
+    let tip = sley_rev::peel_to_commit(db, format, oid).ok();
+    cache.insert(*oid, tip);
+    tip
 }
 
 fn tag_merged_reachable_set(
@@ -3370,7 +3555,11 @@ fn tag_points_at(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::expand_tag_bundle;
+    use super::{
+        ForEachRefFormat, expand_tag_bundle, tag_format_needs_disk_size, tag_format_needs_mailmap,
+        tag_format_needs_object, tag_format_needs_object_candidates,
+        tag_format_needs_peeled_object, tag_format_needs_ref_names,
+    };
 
     #[test]
     fn expands_value_terminated_boolean_bundles() {
@@ -3411,5 +3600,53 @@ mod tests {
         assert_eq!(expand_tag_bundle("--sort"), None);
         assert_eq!(expand_tag_bundle("-mhi"), None);
         assert_eq!(expand_tag_bundle("-n5"), None);
+    }
+
+    #[test]
+    fn format_dependency_analysis_keeps_ref_only_rendering_lazy() {
+        for spec in [
+            "%(refname)",
+            "%(objectname)",
+            "%(color:red)%(refname:short)",
+            "%(if:equals=refs/tags/main)%(refname)%(then)yes%(end)",
+        ] {
+            let format = ForEachRefFormat::parse(spec).expect("valid format");
+            assert!(!tag_format_needs_object(&format), "{spec}");
+        }
+
+        for spec in [
+            "%(objecttype)",
+            "%(contents:subject)",
+            "%(trailers)",
+            "%(*objectname)",
+        ] {
+            let format = ForEachRefFormat::parse(spec).expect("valid format");
+            assert!(tag_format_needs_object(&format), "{spec}");
+        }
+    }
+
+    #[test]
+    fn format_dependency_analysis_requests_only_specialized_metadata() {
+        let abbreviated = ForEachRefFormat::parse("%(objectname:short)").expect("valid format");
+        assert!(tag_format_needs_object_candidates(&abbreviated));
+
+        let short_ref = ForEachRefFormat::parse("%(refname:short)").expect("valid format");
+        assert!(tag_format_needs_ref_names(&short_ref));
+
+        let mailmap = ForEachRefFormat::parse("%(authoremail:mailmap)").expect("valid format");
+        assert!(tag_format_needs_mailmap(&mailmap));
+
+        let peeled = ForEachRefFormat::parse("%(*objectname)").expect("valid format");
+        assert!(tag_format_needs_peeled_object(&peeled));
+
+        let disk = ForEachRefFormat::parse("%(objectsize:disk)").expect("valid format");
+        assert!(tag_format_needs_disk_size(&disk));
+
+        let plain = ForEachRefFormat::parse("%(refname)").expect("valid format");
+        assert!(!tag_format_needs_object_candidates(&plain));
+        assert!(!tag_format_needs_ref_names(&plain));
+        assert!(!tag_format_needs_mailmap(&plain));
+        assert!(!tag_format_needs_peeled_object(&plain));
+        assert!(!tag_format_needs_disk_size(&plain));
     }
 }

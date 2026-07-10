@@ -3,8 +3,8 @@
 
 use crate::*;
 use sley::plumbing::sley_diff_merge::range::{PatchRef, assign_patch_series};
+use sley::plumbing::sley_rev;
 use sley_notes::{NotesRef, read_note_bytes};
-use sley::plumbing::{sley_rev};
 
 const DEFAULT_CREATION_FACTOR: i32 = 60;
 
@@ -561,6 +561,7 @@ fn build_patch_text(
             entry,
             DiffRenderOptions {
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                suppress_blank_empty: false,
                 binary: false,
                 anchors: &[],
                 allow_textconv: false,

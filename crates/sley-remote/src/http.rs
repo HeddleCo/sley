@@ -12,6 +12,7 @@
 //! [`read_service_discovery_response`]), and the RPC POST response goes straight
 //! to the packfile/report (no re-advertised refs to skip).
 
+use std::io::Read;
 use std::path::Path;
 
 use crate::install::{
@@ -29,27 +30,27 @@ use sley_core::{
 };
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
-    encode_protocol_v2_command_options, parse_protocol_v2_fetch_features,
-    parse_upload_pack_features, protocol_v2_object_format, read_protocol_v2_fetch_response,
-    read_protocol_v2_fetch_sideband_all_response,
+    GitService, ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchRequest,
+    ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRequest,
+    ProtocolVersion, RefAdvertisement, RefAdvertisementSet, TransportHandshake, UploadPackFeatures,
+    UploadPackNegotiationRequest, UploadPackRequest, encode_protocol_v2_command_options,
+    parse_protocol_v2_fetch_features, parse_upload_pack_features, protocol_v2_object_format,
+    read_protocol_v2_fetch_response, read_protocol_v2_fetch_sideband_all_response,
     read_protocol_v2_ls_refs_response_as_ref_advertisement_set,
     smart_http_advertisement_content_type, smart_http_rpc_request_content_type,
     smart_http_rpc_result_content_type, validate_protocol_v2_fetch_command_request,
     validate_protocol_v2_ls_refs_command_request, write_protocol_v2_command_request,
-    write_upload_pack_negotiation_request, write_upload_pack_request, GitService,
-    ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchRequest,
-    ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRequest,
-    ProtocolVersion, RefAdvertisement, RefAdvertisementSet, TransportHandshake, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackRequest,
+    write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_transport::{
-    encode_git_protocol_header, git_credential_basic_authorization, http_smart_info_refs_url,
-    http_smart_rpc_url, parse_remote_url, read_service_discovery_response, GitProtocolHeader,
-    HttpClient, HttpResponse, RemoteTransport, RemoteUrl, ServiceDiscoveryPayload, UreqHttpClient,
+    GitProtocolHeader, HttpClient, HttpResponse, RemoteTransport, RemoteUrl,
+    ServiceDiscoveryPayload, ServiceDiscoveryResponse, UreqHttpClient, encode_git_protocol_header,
+    git_credential_basic_authorization, http_smart_info_refs_url, http_smart_rpc_url,
+    parse_remote_url, read_service_discovery_response,
 };
 
-use crate::credentials::{credential_request_for_url, http_url_credential};
 use crate::CredentialProvider;
+use crate::credentials::{credential_request_for_url, http_url_credential};
 
 /// Whether an already-resolved remote `url` uses HTTP(S) transport.
 ///
@@ -234,7 +235,7 @@ pub fn http_advertised_refs(
     format: ObjectFormat,
     mut response: HttpResponse,
 ) -> Result<RefAdvertisementSet> {
-    let discovery = read_service_discovery_response(format, &mut response.body)?;
+    let discovery = read_http_service_discovery_response(format, &mut response.body)?;
     match discovery.payload {
         ServiceDiscoveryPayload::AdvertisedRefs(set) => Ok(set),
         ServiceDiscoveryPayload::ProtocolV2(_) => Err(GitError::Unsupported(
@@ -316,6 +317,7 @@ fn protocol_v2_fetch_command_request(
     Ok(command)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn protocol_v2_fetch_request_from_upload_pack_semantics(
     wants: Vec<ObjectId>,
     haves: Vec<ObjectId>,
@@ -381,14 +383,12 @@ fn upload_pack_request_capabilities(deepen: Option<u32>, filter: bool) -> Vec<Ca
     // The v0 upload-pack response reader demuxes a side-band-64k stream, so the
     // request must negotiate it; otherwise the server streams a bare packfile
     // and the reader mis-parses the leading `PACK` signature as a pkt-line
-    // length ("invalid pkt-line length byte 0x50"). ofs-delta matches git's
-    // default fetch capabilities.
+    // length ("invalid pkt-line length byte 0x50"). Capabilities not available
+    // in this request type are omitted rather than being requested without an
+    // advertisement; in particular, Sley's server does not advertise
+    // `ofs-delta` yet.
     capabilities.push(Capability {
         name: "side-band-64k".into(),
-        value: None,
-    });
-    capabilities.push(Capability {
-        name: "ofs-delta".into(),
         value: None,
     });
     if deepen.is_some() {
@@ -458,7 +458,7 @@ pub fn http_service_advertisements(
     })?;
     http_check_status(&response, &url)?;
     http_validate_content_type(&response, &smart_http_advertisement_content_type(service)?)?;
-    let discovery = read_service_discovery_response(format, &mut response.body)?;
+    let discovery = read_http_service_discovery_response(format, &mut response.body)?;
     match discovery.payload {
         ServiceDiscoveryPayload::AdvertisedRefs(set) => Ok(HttpServiceAdvertisements {
             set,
@@ -477,6 +477,51 @@ pub fn http_service_advertisements(
             Ok(HttpServiceAdvertisements {
                 set,
                 handshake: Some(handshake),
+            })
+        }
+    }
+}
+
+fn read_http_service_discovery_response(
+    format: ObjectFormat,
+    reader: &mut impl Read,
+) -> Result<ServiceDiscoveryResponse> {
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    let first = read_service_discovery_response(format, &mut bytes.as_slice());
+    let alternate = match format {
+        ObjectFormat::Sha1 => ObjectFormat::Sha256,
+        ObjectFormat::Sha256 => ObjectFormat::Sha1,
+    };
+    match first {
+        Ok(discovery) => Ok(discovery),
+        Err(original) => {
+            let retry = read_service_discovery_response(alternate, &mut bytes.as_slice());
+            match retry {
+                Ok(discovery) if discovery_advertises_object_format(&discovery, alternate) => {
+                    Ok(discovery)
+                }
+                _ => Err(original),
+            }
+        }
+    }
+}
+
+fn discovery_advertises_object_format(
+    discovery: &ServiceDiscoveryResponse,
+    format: ObjectFormat,
+) -> bool {
+    match &discovery.payload {
+        ServiceDiscoveryPayload::AdvertisedRefs(set) => set.refs.first().is_some_and(|reference| {
+            reference.capabilities.iter().any(|capability| {
+                capability.name == "object-format"
+                    && capability.value.as_deref() == Some(format.name())
+            })
+        }),
+        ServiceDiscoveryPayload::ProtocolV2(handshake) => {
+            handshake.capabilities.iter().any(|capability| {
+                capability.name == "object-format"
+                    && capability.value.as_deref() == Some(format.name())
             })
         }
     }
@@ -850,10 +895,82 @@ fn request_haves(
 mod tests {
     use super::*;
     use sley_protocol::{
-        read_protocol_v2_fetch_response, write_protocol_v2_fetch_response,
-        write_protocol_v2_ls_refs_response, ProtocolV2FetchResponseSection,
-        ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRecord, ProtocolVersion, RefAdvertisement,
+        ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRecord,
+        ProtocolVersion, RefAdvertisement, read_protocol_v2_fetch_response,
+        write_protocol_v2_fetch_response, write_protocol_v2_ls_refs_response,
     };
+
+    #[test]
+    fn protocol_v1_header_is_sent_for_upload_and_receive_discovery() {
+        let config = GitConfig::parse(b"[protocol]\n\tversion = 1\n").expect("config");
+        assert_eq!(
+            http_git_protocol_header_value_for_service(Some(&config), GitService::UploadPack)
+                .expect("upload-pack header")
+                .as_deref(),
+            Some("version=1")
+        );
+        assert_eq!(
+            http_git_protocol_header_value_for_service(Some(&config), GitService::ReceivePack)
+                .expect("receive-pack header")
+                .as_deref(),
+            Some("version=1")
+        );
+
+        let config = GitConfig::parse(b"[protocol]\n\tversion = 2\n").expect("config");
+        assert_eq!(
+            http_git_protocol_header_value_for_service(Some(&config), GitService::ReceivePack)
+                .expect("receive-pack fallback"),
+            None
+        );
+    }
+
+    #[test]
+    fn v1_upload_request_omits_unadvertised_ofs_delta() {
+        let capabilities = upload_pack_request_capabilities(None, false);
+        assert!(
+            capabilities
+                .iter()
+                .any(|capability| capability.name == "side-band-64k")
+        );
+        assert!(
+            capabilities
+                .iter()
+                .all(|capability| capability.name != "ofs-delta")
+        );
+    }
+
+    #[test]
+    fn v1_discovery_adopts_explicit_sha256_object_format() {
+        let response = ServiceDiscoveryResponse {
+            announcement: sley_transport::ServiceAnnouncement {
+                service: GitService::UploadPack,
+            },
+            payload: ServiceDiscoveryPayload::AdvertisedRefs(RefAdvertisementSet {
+                protocol: ProtocolVersion::V1,
+                refs: vec![RefAdvertisement {
+                    oid: ObjectId::null(ObjectFormat::Sha256),
+                    name: "capabilities^{}".into(),
+                    capabilities: vec![Capability {
+                        name: "object-format".into(),
+                        value: Some("sha256".into()),
+                    }],
+                }],
+                shallow: Vec::new(),
+            }),
+        };
+        let mut encoded = Vec::new();
+        sley_transport::write_service_discovery_response(&mut encoded, &response)
+            .expect("discovery response");
+
+        let parsed =
+            read_http_service_discovery_response(ObjectFormat::Sha1, &mut encoded.as_slice())
+                .expect("adaptive discovery");
+        let ServiceDiscoveryPayload::AdvertisedRefs(set) = parsed.payload else {
+            panic!("expected advertised refs");
+        };
+        assert_eq!(set.protocol, ProtocolVersion::V1);
+        assert_eq!(set.refs[0].oid.format(), ObjectFormat::Sha256);
+    }
 
     fn sample_v2_handshake() -> TransportHandshake {
         TransportHandshake {

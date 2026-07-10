@@ -1,41 +1,29 @@
 use flate2::Compression;
-use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::{Decompress, FlushDecompress};
-use parking_lot::RwLock;
-use std::sync::Mutex;
 use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
-use sley_formats::{Bundle, BundleReference};
-use sley_object::{
-    Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object,
-    tree_entry_object_type,
-};
+use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, tree_entry_object_type};
 use sley_pack::{
-    MultiPackIndex, MultiPackIndexOidLookup, PackBitmapIndex, PackBitmapWriter, PackFile,
-    PackIndex, PackIndexByteSource, PackIndexEntry, PackIndexViewData, PackInput,
-    PackReverseIndex, PackStreamIndexBuild, PackWrite, PackWriteOptions, PackWriteSummary,
+    MultiPackIndex, PackBitmapIndex, PackBitmapWriter, PackFile, PackIndex, PackIndexEntry,
+    PackIndexViewData, PackInput, PackWrite, PackWriteOptions, PackWriteSummary,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::{env, fs};
 
 use crate::{
-    grafted_parents, implied_empty_tree_object, unique_temp_path, with_missing_object_context,
-    ObjectReader, ObjectWriter,
+    ObjectReader, ObjectWriter, grafted_parents, unique_temp_path, with_missing_object_context,
 };
 
 use crate::install::{
-    PackInstallResult, RawPackInstallOptions, RawPackInstaller, RawPackInstallResult,
-    ReachablePackFile, ReachablePackWriteSummary, REACHABLE_PACK_STREAMING_MIN_OBJECTS,
-    write_pack_component, write_promisor_pack_sidecar,
+    PackInstallResult, REACHABLE_PACK_STREAMING_MIN_OBJECTS, RawPackInstallOptions,
+    RawPackInstallResult, RawPackInstaller, ReachablePackFile, ReachablePackWriteSummary,
 };
+use crate::loose::{LooseObjectStore, collect_loose_object_ids};
 use crate::pack::FileObjectDatabase;
 use crate::registry::{read_incremental_midx_chain, repository_objects_dir};
-use crate::loose::{LooseObjectStore, collect_loose_object_ids};
-use crate::repack::pack_index_entries_match_writer;
 
 pub fn collect_reachable_object_ids<R, I>(
     reader: &R,
@@ -573,6 +561,9 @@ where
     PackFile::write_packed_with_known_ids(&inputs, format).map(Some)
 }
 
+// Keep the public call shape aligned with the unfiltered installer while the
+// two filter inputs remain independent policy knobs.
+#[allow(clippy::too_many_arguments)]
 pub fn build_and_install_reachable_pack_filtered<R, I>(
     source: &R,
     destination: &FileObjectDatabase,
@@ -979,7 +970,10 @@ pub(crate) fn loose_object_ids(objects_dir: &Path, format: ObjectFormat) -> Resu
     Ok(oids)
 }
 
-pub(crate) fn loose_object_id_set(objects_dir: &Path, format: ObjectFormat) -> Result<HashSet<ObjectId>> {
+pub(crate) fn loose_object_id_set(
+    objects_dir: &Path,
+    format: ObjectFormat,
+) -> Result<HashSet<ObjectId>> {
     let mut oids = HashSet::new();
     collect_loose_object_ids(objects_dir, format, &mut oids)?;
     Ok(oids)
@@ -1531,6 +1525,19 @@ pub struct BitmapPseudoMergePartition {
     pub sample_rate: f64,
 }
 
+/// Optional extensions for a reachability bitmap write. The hash cache is in
+/// oid-sorted index order (pack index or MIDX OIDL order), independent of the
+/// bitmap's pack-order bit numbering.
+#[derive(Debug, Clone, Default)]
+pub struct ReachabilityBitmapOptions {
+    pub write_lookup_table: bool,
+    pub name_hash_cache: Option<Vec<u32>>,
+    /// Limit commit selection to the ancestry visible from `preferred_tips`.
+    /// Used for `multi-pack-index --refs-snapshot`, where the snapshot replaces
+    /// the live ref universe rather than merely influencing selection.
+    pub restrict_to_tips: bool,
+}
+
 /// Bit accessors over a `Vec<u64>` bitset using git's bitmap convention:
 /// bit `i` lives in word `i / 64` at bit `i % 64` (LSB-first within a word).
 fn bitset_get(words: &[u64], position: u32) -> bool {
@@ -1608,7 +1615,7 @@ fn bitmap_next_commit_index(idx: u32) -> u32 {
 /// `pack_checksum`, mirroring upstream pack-bitmap-write.c:
 ///
 /// * commit selection walks the pack's commits in committer-date-descending
-///   order through [`bitmap_next_commit_index`]'s spacing schedule, preferring
+///   order through `bitmap_next_commit_index`'s spacing schedule, preferring
 ///   `preferred_tips` (ref tips — upstream's `NEEDS_BITMAP`) and merge commits
 ///   inside each window;
 /// * each selected commit stores its full reachability closure (commits, trees,
@@ -1635,12 +1642,109 @@ pub fn build_pack_bitmap(
         .collect();
     build_reachability_bitmap(
         db,
+        BitmapObjectTypes::Database(db),
         format,
         pack_checksum,
         &bit_order,
         preferred_tips,
         pseudo_merge_groups,
+        &ReachabilityBitmapOptions::default(),
     )
+}
+
+/// Compute the bitmap name-hash cache in pack-index (oid-sorted) order.
+/// Commits and unnamed root trees retain Git's zero sentinel; named tree/blob
+/// objects receive the v1 pack-name hash of the first path encountered while
+/// walking packed commit trees.
+pub(crate) fn build_pack_name_hash_cache<R: ObjectReader>(
+    db: &R,
+    format: ObjectFormat,
+    index_entries: &[PackIndexEntry],
+    known_object_types: &HashMap<ObjectId, ObjectType>,
+) -> Result<Vec<u32>> {
+    let packed: HashSet<ObjectId> = index_entries.iter().map(|entry| entry.oid).collect();
+    let mut by_oid = HashMap::new();
+    let mut seen_trees = HashSet::new();
+    for entry in index_entries {
+        // The repack walk already established every packed object's type.
+        // Consulting that map avoids inflating every tree and blob merely to
+        // discover that only commits can introduce root trees here.
+        match known_object_types.get(&entry.oid) {
+            Some(ObjectType::Commit) => {}
+            Some(ObjectType::Tree | ObjectType::Blob | ObjectType::Tag) => continue,
+            None => {
+                return Err(GitError::InvalidFormat(format!(
+                    "repack bitmap type cache is missing packed object {}",
+                    entry.oid
+                )));
+            }
+        }
+        let object = db.read_object(&entry.oid)?;
+        let commit = Commit::parse_ref(format, &object.body)?;
+        collect_tree_name_hashes(
+            db,
+            format,
+            &commit.tree,
+            &[],
+            &packed,
+            &mut seen_trees,
+            &mut by_oid,
+        )?;
+    }
+    let mut sorted: Vec<&PackIndexEntry> = index_entries.iter().collect();
+    sorted.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
+    Ok(sorted
+        .into_iter()
+        .map(|entry| by_oid.get(&entry.oid).copied().unwrap_or(0))
+        .collect())
+}
+
+fn collect_tree_name_hashes<R: ObjectReader>(
+    db: &R,
+    format: ObjectFormat,
+    tree: &ObjectId,
+    prefix: &[u8],
+    packed: &HashSet<ObjectId>,
+    seen_trees: &mut HashSet<ObjectId>,
+    by_oid: &mut HashMap<ObjectId, u32>,
+) -> Result<()> {
+    if !seen_trees.insert(*tree) {
+        return Ok(());
+    }
+    let object = db.read_object(tree)?;
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
+        if entry.is_gitlink() {
+            continue;
+        }
+        let mut path =
+            Vec::with_capacity(prefix.len() + usize::from(!prefix.is_empty()) + entry.name.len());
+        path.extend_from_slice(prefix);
+        if !prefix.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(entry.name);
+        if packed.contains(&entry.oid) {
+            by_oid
+                .entry(entry.oid)
+                .or_insert_with(|| pack_name_hash(&path));
+        }
+        if entry.is_tree() {
+            collect_tree_name_hashes(db, format, &entry.oid, &path, packed, seen_trees, by_oid)?;
+        }
+    }
+    Ok(())
+}
+
+fn pack_name_hash(name: &[u8]) -> u32 {
+    let mut hash = 0u32;
+    for &byte in name {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        hash = (hash >> 2).wrapping_add(u32::from(byte) << 24);
+    }
+    hash
 }
 
 /// [`build_pack_bitmap`]'s multi-pack sibling: builds the serialised
@@ -1657,6 +1761,29 @@ pub fn build_midx_bitmap(
     preferred_tips: &HashSet<ObjectId>,
     pseudo_merge_groups: &[BitmapPseudoMergeGroup],
 ) -> Result<Option<Vec<u8>>> {
+    build_midx_bitmap_with_options(
+        db,
+        format,
+        midx_entries,
+        midx_checksum,
+        preferred_pack,
+        preferred_tips,
+        pseudo_merge_groups,
+        &ReachabilityBitmapOptions::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_midx_bitmap_with_options(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    midx_entries: &[sley_pack::MultiPackIndexEntry],
+    midx_checksum: &ObjectId,
+    preferred_pack: u32,
+    preferred_tips: &HashSet<ObjectId>,
+    pseudo_merge_groups: &[BitmapPseudoMergeGroup],
+    options: &ReachabilityBitmapOptions,
+) -> Result<Option<Vec<u8>>> {
     let mut pseudo: Vec<usize> = (0..midx_entries.len()).collect();
     pseudo.sort_by_key(|&slot| {
         let entry = &midx_entries[slot];
@@ -1672,12 +1799,52 @@ pub fn build_midx_bitmap(
         .collect();
     build_reachability_bitmap(
         db,
+        BitmapObjectTypes::Database(db),
         format,
         midx_checksum,
         &bit_order,
         preferred_tips,
         pseudo_merge_groups,
+        options,
     )
+}
+
+/// Repack fast path for bitmap construction. The repack walk has already read
+/// every object which was fed to the pack writer, so retaining those shared
+/// object handles until installation avoids reopening the new ODB and decoding
+/// the same commits and trees a second time.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_pack_bitmap_with_cached_objects<R: ObjectReader>(
+    db: &R,
+    format: ObjectFormat,
+    index_entries: &[PackIndexEntry],
+    pack_checksum: &ObjectId,
+    preferred_tips: &HashSet<ObjectId>,
+    pseudo_merge_groups: &[BitmapPseudoMergeGroup],
+    known_object_types: &HashMap<ObjectId, ObjectType>,
+    options: &ReachabilityBitmapOptions,
+) -> Result<Option<Vec<u8>>> {
+    let mut by_offset: Vec<usize> = (0..index_entries.len()).collect();
+    by_offset.sort_by_key(|&slot| index_entries[slot].offset);
+    let bit_order: Vec<ObjectId> = by_offset
+        .into_iter()
+        .map(|slot| index_entries[slot].oid)
+        .collect();
+    build_reachability_bitmap(
+        db,
+        BitmapObjectTypes::Cached(known_object_types),
+        format,
+        pack_checksum,
+        &bit_order,
+        preferred_tips,
+        pseudo_merge_groups,
+        options,
+    )
+}
+
+enum BitmapObjectTypes<'a> {
+    Database(&'a FileObjectDatabase),
+    Cached(&'a HashMap<ObjectId, ObjectType>),
 }
 
 /// Upstream `bitmap_builder_init`'s `num_maximal` counter (pack-bitmap-write.c):
@@ -1688,7 +1855,7 @@ pub fn build_midx_bitmap(
 /// did not carry). Only the count is needed (for the trace2 data event), so no
 /// reverse-edge bookkeeping is kept.
 fn bitmap_num_maximal_commits(
-    db: &FileObjectDatabase,
+    db: &impl ObjectReader,
     format: ObjectFormat,
     selected: &[ObjectId],
 ) -> Result<usize> {
@@ -1783,13 +1950,16 @@ fn bitmap_num_maximal_commits(
 /// Shared write half: `bit_order` lists every covered object's oid in bit
 /// order (pack order for a single pack, pseudo-pack order for a midx);
 /// `checksum` fills the BITM checksum field (pack checksum / midx checksum).
-fn build_reachability_bitmap(
-    db: &FileObjectDatabase,
+#[allow(clippy::too_many_arguments)]
+fn build_reachability_bitmap<R: ObjectReader>(
+    db: &R,
+    object_types_source: BitmapObjectTypes<'_>,
     format: ObjectFormat,
     checksum: &ObjectId,
     bit_order: &[ObjectId],
     preferred_tips: &HashSet<ObjectId>,
     pseudo_merge_groups: &[BitmapPseudoMergeGroup],
+    options: &ReachabilityBitmapOptions,
 ) -> Result<Option<Vec<u8>>> {
     if bit_order.is_empty() || bit_order.len() > u32::MAX as usize {
         return Ok(None);
@@ -1812,7 +1982,6 @@ fn build_reachability_bitmap(
     for (pack_pos, oid) in bit_order.iter().enumerate() {
         oid_to_pack.insert(*oid, pack_pos as u32);
     }
-
     // Object types in bit order; commits also collect (date, parent count).
     let mut object_types = Vec::with_capacity(object_count);
     struct IndexedCommit {
@@ -1826,9 +1995,18 @@ fn build_reachability_bitmap(
     for (pack_pos, oid) in bit_order.iter().enumerate() {
         // Type via the header fast path: blobs (the bulk of most packs) never
         // need their bodies inflated here.
-        let object_type = match db.read_object_header(oid)? {
-            Some((object_type, _)) => object_type,
-            None => db.read_object(oid)?.object_type,
+        let object_type = match &object_types_source {
+            BitmapObjectTypes::Database(database) => match database.read_object_header(oid)? {
+                Some((object_type, _)) => object_type,
+                None => db.read_object(oid)?.object_type,
+            },
+            BitmapObjectTypes::Cached(object_types) => {
+                object_types.get(oid).copied().ok_or_else(|| {
+                    GitError::InvalidFormat(format!(
+                        "repack bitmap cache is missing packed object {oid}"
+                    ))
+                })?
+            }
         };
         object_types.push(object_type);
         if object_type == ObjectType::Commit {
@@ -1842,6 +2020,10 @@ fn build_reachability_bitmap(
                 parent_count: grafted_parents(db, oid, commit.parents).len(),
             });
         }
+    }
+    if options.restrict_to_tips {
+        let visible = bitmap_visible_commits(db, format, preferred_tips)?;
+        indexed_commits.retain(|commit| visible.contains(&commit.oid));
     }
 
     // Selection: date-descending, then the spacing schedule.
@@ -1908,7 +2090,11 @@ fn build_reachability_bitmap(
         memo.insert(commit.oid, Arc::new(acc));
     }
 
-    let mut writer = PackBitmapWriter::new(format, *checksum, &object_types)?;
+    let mut writer = PackBitmapWriter::new(format, *checksum, &object_types)?
+        .with_lookup_table(options.write_lookup_table);
+    if let Some(cache) = &options.name_hash_cache {
+        writer = writer.with_name_hash_cache(cache.clone())?;
+    }
     for commit in &selected {
         let words = match memo.get(&commit.oid) {
             Some(words) => words,
@@ -1997,6 +2183,24 @@ fn build_reachability_bitmap(
     writer.write().map(Some)
 }
 
+fn bitmap_visible_commits(
+    db: &impl ObjectReader,
+    format: ObjectFormat,
+    tips: &HashSet<ObjectId>,
+) -> Result<HashSet<ObjectId>> {
+    let mut visible = HashSet::new();
+    let mut pending: Vec<ObjectId> = tips.iter().copied().collect();
+    while let Some(oid) = pending.pop() {
+        if !visible.insert(oid) {
+            continue;
+        }
+        let object = db.read_object(&oid)?;
+        let commit = Commit::parse_ref(format, &object.body)?;
+        pending.extend(grafted_parents(db, &oid, commit.parents));
+    }
+    Ok(visible)
+}
+
 fn bitmap_pseudo_merge_group_size(
     max_merges: usize,
     decay: f64,
@@ -2015,7 +2219,7 @@ fn bitmap_pseudo_merge_group_size(
 
 fn bitmap_add_pseudo_merge(
     writer: &mut PackBitmapWriter,
-    db: &FileObjectDatabase,
+    db: &impl ObjectReader,
     format: ObjectFormat,
     commits: &[(ObjectId, u32)],
     oid_to_pack: &HashMap<ObjectId, u32>,
@@ -2216,10 +2420,26 @@ pub fn load_pack_bitmap(
         }
     }
     bitmap_paths.sort();
+    let has_extra_bitmap = bitmap_paths.len() > 1;
     for bitmap_path in bitmap_paths {
         match load_pack_bitmap_file(&bitmap_path, format) {
-            Ok(Some(bitmap)) => return Ok(Some(bitmap)),
-            Ok(None) | Err(_) => continue,
+            Ok(Some(bitmap)) => {
+                sley_core::trace2::data("bitmap", "message", "opened bitmap");
+                if has_extra_bitmap {
+                    sley_core::trace2::data("bitmap", "message", "ignoring extra bitmap");
+                }
+                return Ok(Some(bitmap));
+            }
+            Ok(None) => continue,
+            Err(err) => {
+                let message = err.to_string();
+                if message.contains("EWAH") {
+                    eprintln!("error: corrupt ewah bitmap: {message}");
+                } else {
+                    eprintln!("error: corrupted bitmap index: {message}");
+                }
+                continue;
+            }
         }
     }
     Ok(None)
@@ -2753,5 +2973,21 @@ impl BitmapFillWalk<'_> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bitmap_name_hash_tests {
+    use super::pack_name_hash;
+
+    #[test]
+    fn v1_name_hash_matches_upstream_stability_vectors() {
+        assert_eq!(pack_name_hash(b"first"), 2_582_249_472);
+        assert_eq!(pack_name_hash(b"second"), 2_289_942_528);
+        assert_eq!(pack_name_hash(b"third"), 2_300_837_888);
+        assert_eq!(
+            pack_name_hash(b"a/one-long-enough-for-collisions"),
+            2_544_516_325
+        );
     }
 }

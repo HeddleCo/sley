@@ -1,7 +1,7 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
 use crate::*;
-use sley::plumbing::{sley_config};
+use sley::plumbing::sley_config;
 
 fn init_repo_is_implicitly_bare(cwd: &Path) -> Result<bool> {
     // Determine the effective git directory git would inspect.
@@ -178,6 +178,16 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
     }
 
     let cwd = env::current_dir()?;
+    let object_dir = env::var_os("GIT_OBJECT_DIRECTORY")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        });
     let init_config_git_dir =
         init_config_git_dir_for_lookup(&cwd, &path, bare, separate_git_dir.as_deref())?;
 
@@ -368,6 +378,7 @@ pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) 
         worktree,
         git_dir_override,
         core_worktree,
+        object_dir,
         object_format,
         object_format_explicit,
         bare,
@@ -659,4 +670,3 @@ fn init_config_bool(
     init_config_value(key, global_config, config_git_dir)
         .map(|value| value.as_deref().and_then(parse_config_bool))
 }
-

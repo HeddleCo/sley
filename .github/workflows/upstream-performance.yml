@@ -1,0 +1,108 @@
+name: Upstream Performance Certification
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Paired trial profile
+        type: choice
+        options: [certification, nightly]
+        default: certification
+      hash:
+        description: Repository object hash
+        type: choice
+        options: [sha1, sha256]
+        default: sha1
+      git_version:
+        description: Oracle Git tag
+        default: v2.55.0
+  schedule:
+    - cron: '0 4 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-performance-reference-linux
+  cancel-in-progress: false
+
+env:
+  ORACLE_GIT_TAG: ${{ github.event.inputs.git_version || 'v2.55.0' }}
+  PERF_MODE: ${{ github.event.inputs.mode || 'nightly' }}
+  PERF_HASH: ${{ github.event.inputs.hash || 'sha1' }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  certify:
+    # This label is intentionally dedicated: hosted runners are too variable
+    # for blocking p95/p99 and 5% regression gates.
+    runs-on: [self-hosted, linux, x64, sley-performance]
+    timeout-minutes: 480
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sley-reference-performance-linux
+
+      - name: Cache oracle Git build
+        id: git-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/git-src
+          key: perf-git-${{ env.ORACLE_GIT_TAG }}-linux-v1
+
+      - name: Fetch oracle Git
+        if: steps.git-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf /tmp/git-src
+          git clone --depth=1 --branch "$ORACLE_GIT_TAG" https://github.com/git/git /tmp/git-src
+
+      - name: Build and install oracle Git
+        run: |
+          echo "${ORACLE_GIT_TAG#v}" > /tmp/git-src/version
+          make -C /tmp/git-src -j"$(nproc)" prefix=/tmp/git-prefix USE_LIBPCRE2=1 NO_TCLTK=YesPlease install
+          test "$(/tmp/git-prefix/bin/git version)" = "git version ${ORACLE_GIT_TAG#v}"
+
+      - name: Build release binaries
+        run: |
+          cargo build --locked -p sley-cli --bin sley --release --features git-compat-i18n
+          cargo build --locked -p sley-bench --bin sley-human-harness --release
+
+      - name: Validate local transport test environment
+        run: python3 crates/sley-testkit/scripts/preflight_upstream_environment.py --tmpdir /tmp
+
+      - name: Paired upstream suite certification
+        run: |
+          python3 crates/sley-testkit/scripts/run_paired_upstream_timings.py \
+            --mode "$PERF_MODE" \
+            --hash "$PERF_HASH" \
+            --output-dir "perf-artifacts/upstream-$PERF_HASH" \
+            --oracle-bin /tmp/git-prefix/bin/git \
+            --sley-bin target/release/sley \
+            --git-src-dir /tmp/git-src \
+            --waves 8 \
+            --fail-on-gate
+
+      - name: Common-command benchmark certification
+        run: |
+          python3 scripts/bench-human-common.py \
+            --skip-build \
+            --git-bin /tmp/git-prefix/bin/git \
+            --cache-dir /tmp/sley-human-common-repos \
+            --out-dir perf-artifacts/human-common \
+            --warmup 3 \
+            --repeat 15 \
+            --memory-runs 3
+          python3 scripts/check-human-common-performance.py \
+            perf-artifacts/human-common/timing-summary.csv
+
+      - name: Archive certification artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-performance-${{ env.PERF_MODE }}-${{ env.PERF_HASH }}
+          path: perf-artifacts

@@ -4,18 +4,17 @@
 use sley::plumbing::{sley_config, sley_core, sley_index, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
+use crate::commands::cli_options::{cli_usage_error, last_tri_state_bool, opt_bool, opt_str};
 use crate::*;
-use crate::commands::cli_options::{
-    cli_usage_error, last_tri_state_bool, opt_bool, opt_str,
-};
 use regex::Regex;
-use sley_options::{OptFlags, OptionName, parse_options, ParsedValue};
+use sley::PackWriteOptions;
+use sley::plumbing::sley_formats::ReftableWriteOptions;
 use sley::plumbing::sley_object::EncodedObject;
 use sley::plumbing::sley_odb::{ObjectReader, ObjectWriter};
-use sley::PackWriteOptions;
 use sley::plumbing::sley_pack::{
     PackBitmapWriter, PackInput, PackReverseIndex, pack_order_index_positions,
 };
+use sley_options::{OptFlags, OptionName, ParsedValue, parse_options};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -24,8 +23,14 @@ struct IndexPackOptions {
     verbose: bool,
     output: Option<PathBuf>,
     keep: bool,
-    rev_index: bool,
+    /// Explicit `--[no-]rev-index`; when absent, `pack.writeReverseIndex`
+    /// decides whether to write the sidecar (and defaults to false for
+    /// index-pack, matching upstream).
+    rev_index: Option<bool>,
     verify: bool,
+    /// Internal statistics-only verification used by verify-pack and pack
+    /// depth diagnostics (`index-pack --verify-stat-only <pack>`).
+    verify_stat_only: bool,
     stdin: bool,
     fix_thin: bool,
     pack_file: Option<PathBuf>,
@@ -36,6 +41,9 @@ struct IndexPackOptions {
     /// content findings. The optional `=<msg-id>=<severity>...` suffix carries
     /// severity overrides (e.g. `missingEmail=ignore`).
     fsck: bool,
+    /// `--strict` additionally rejects duplicate object ids in the incoming
+    /// pack. Ordinary index-pack accepts and indexes every duplicate copy.
+    strict: bool,
     /// Raw `<msg-id>=<severity>` override tokens from `--strict=`/`--fsck-objects=`.
     fsck_overrides: Vec<String>,
     /// `--object-format=<algo>`: the hash algorithm. Lets `index-pack <pack>`
@@ -83,7 +91,7 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
             .expect("stdin index-pack requires a repository");
         let common_git_dir = common_git_dir.clone();
         let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-        let install = if options.verbose || options.fsck {
+        let install = if options.verbose || options.fsck || options.fix_thin {
             let mut pack = Vec::new();
             io::stdin().read_to_end(&mut pack)?;
             // `index-pack -v` reports two phases on stderr: receiving the pack and
@@ -94,6 +102,10 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
                 let count = u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]);
                 eprintln!("Receiving objects: 100% ({count}/{count}), done.");
                 eprintln!("Resolving deltas: 100% ({count}/{count}), done.");
+                sley_core::trace2::region("progress", "index-pack");
+            }
+            if options.strict && pack_has_duplicate_objects(&pack, format)? {
+                return Err(GitError::Exit(1));
             }
             if options.fsck {
                 let exit = fsck_pack_objects(&pack, format, &options.fsck_overrides)?;
@@ -102,7 +114,11 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
                 }
             }
             let mut reader = pack.as_slice();
-            db.install_raw_pack_from_reader(&mut reader)?
+            if options.fix_thin {
+                db.install_raw_pack_from_reader_with_external_bases(&mut reader)?
+            } else {
+                db.install_raw_pack_from_reader(&mut reader)?
+            }
         } else {
             let stdin = io::stdin();
             let mut stdin = stdin.lock();
@@ -112,18 +128,26 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
             let keep_path = install.pack_path.with_extension("keep");
             fs::write(keep_path, b"")?;
         }
-        if options.rev_index {
-            let rev_path = install.pack_path.with_extension("rev");
-            let _ = fs::write(rev_path, b"");
+        if effective_index_pack_reverse_index(&options, repo.as_ref().map(|(dir, _)| dir))? {
+            let index = PackIndex::parse(&fs::read(&install.index_path)?, format)?;
+            write_reverse_index_for_entries(
+                &install.pack_path.with_extension("rev"),
+                format,
+                &index.entries,
+                &index.pack_checksum,
+            )?;
         }
         println!("pack\t{}", install.pack_name.trim_start_matches("pack-"));
         return Ok(());
     }
 
-    let Some(pack_file) = options.pack_file else {
+    let Some(pack_file) = options.pack_file.clone() else {
         return index_pack_usage();
     };
     let pack = fs::read(&pack_file)?;
+    if options.verify_stat_only {
+        return verify_pack_one(format, &pack_file, false, true);
+    }
     // `--max-input-size`: refuse a pack larger than the cap, mirroring
     // index-pack.c's `pack exceeds maximum allowed size` die.
     if let Some(limit) = options.max_input_size
@@ -152,7 +176,24 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(exit));
         }
     }
+    let write_reverse_index =
+        effective_index_pack_reverse_index(&options, repo.as_ref().map(|(dir, _)| dir))?;
     if options.verify {
+        if write_reverse_index {
+            let rev_path = pack_file.with_extension("rev");
+            let reverse = fs::read(&rev_path).map_err(|err| {
+                GitError::InvalidFormat(format!(
+                    "reverse-index validation error for {}: {err}",
+                    rev_path.display()
+                ))
+            })?;
+            PackReverseIndex::parse(&reverse, format, indexed.entries.len()).map_err(|err| {
+                GitError::InvalidFormat(format!(
+                    "reverse-index validation error for {}: {err}",
+                    rev_path.display()
+                ))
+            })?;
+        }
         return Ok(());
     }
     let index_path = options
@@ -169,8 +210,13 @@ pub(crate) fn cmd_index_pack(args: &[String]) -> Result<()> {
     if options.keep {
         fs::write(pack_file.with_extension("keep"), b"")?;
     }
-    if options.rev_index {
-        let _ = fs::write(pack_file.with_extension("rev"), b"");
+    if write_reverse_index {
+        write_reverse_index_for_entries(
+            &index_path.with_extension("rev"),
+            format,
+            &indexed.entries,
+            &indexed.checksum,
+        )?;
     }
     if options.verbose {
         eprintln!(
@@ -190,13 +236,15 @@ fn setup_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
         verbose: false,
         output: None,
         keep: false,
-        rev_index: true,
+        rev_index: None,
         verify: false,
+        verify_stat_only: false,
         stdin: false,
         fix_thin: false,
         pack_file: None,
         index_version: None,
         fsck: false,
+        strict: false,
         fsck_overrides: Vec::new(),
         object_format: None,
         max_input_size: None,
@@ -221,9 +269,11 @@ fn setup_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
                 options.keep = true;
             }
             (_, Some("rev-index")) => {
-                options.rev_index = !matches!(option.name, OptionName::NegatedLong("rev-index"));
+                options.rev_index =
+                    Some(!matches!(option.name, OptionName::NegatedLong("rev-index")));
             }
             (_, Some("verify")) => options.verify = true,
+            (_, Some("verify-stat-only")) => options.verify_stat_only = true,
             (_, Some("index-version")) => {
                 if let ParsedValue::Str(spec) = &option.value {
                     let version_part = spec.split(',').next().unwrap_or(spec);
@@ -239,6 +289,7 @@ fn setup_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
             }
             (_, Some("strict")) | (_, Some("fsck-objects")) => {
                 options.fsck = true;
+                options.strict |= option.long == Some("strict");
                 if let ParsedValue::Str(spec) = &option.value {
                     for token in spec.split(',') {
                         if !token.is_empty() {
@@ -254,11 +305,10 @@ fn setup_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
             }
             (_, Some("max-input-size")) => {
                 if let ParsedValue::Str(spec) = &option.value {
-                    options.max_input_size = Some(
-                        spec.parse().map_err(|_| {
+                    options.max_input_size =
+                        Some(spec.parse().map_err(|_| {
                             GitError::Command(format!("bad max-input-size '{spec}'"))
-                        })?,
-                    );
+                        })?);
                 }
             }
             _ => {}
@@ -276,12 +326,56 @@ fn setup_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
     Ok(options)
 }
 
-const INDEX_PACK_USAGE: &[&str] = &["git index-pack [-v] [-o <index-file>] [--keep | --keep=<msg>] [--[no-]rev-index] [--verify] [--strict[=<msg-id>=<severity>...]] [--fsck-objects[=<msg-id>=<severity>...]] (<pack-file> | --stdin [--fix-thin] [<pack-file>])"];
+fn pack_has_duplicate_objects(pack: &[u8], format: ObjectFormat) -> Result<bool> {
+    let parsed = PackFile::parse(pack, format)?;
+    let mut seen = HashSet::with_capacity(parsed.entries.len());
+    Ok(parsed
+        .entries
+        .iter()
+        .any(|entry| !seen.insert(entry.entry.oid)))
+}
+
+fn effective_index_pack_reverse_index(
+    options: &IndexPackOptions,
+    common_git_dir: Option<&PathBuf>,
+) -> Result<bool> {
+    if let Some(explicit) = options.rev_index {
+        return Ok(explicit);
+    }
+    let Some(common_git_dir) = common_git_dir else {
+        return Ok(false);
+    };
+    Ok(read_repo_config(common_git_dir)?
+        .get_bool("pack", None, "writeReverseIndex")
+        .unwrap_or(false))
+}
+
+fn write_reverse_index_for_entries(
+    path: &Path,
+    format: ObjectFormat,
+    entries: &[sley_pack::PackIndexEntry],
+    pack_checksum: &ObjectId,
+) -> Result<()> {
+    let positions = pack_order_index_positions(entries);
+    let bytes = PackReverseIndex::write(format, &positions, pack_checksum)?;
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+const INDEX_PACK_USAGE: &[&str] = &[
+    "git index-pack [-v] [-o <index-file>] [--keep | --keep=<msg>] [--[no-]rev-index] [--verify] [--strict[=<msg-id>=<severity>...]] [--fsck-objects[=<msg-id>=<severity>...]] (<pack-file> | --stdin [--fix-thin] [<pack-file>])",
+];
 
 fn index_pack_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
     static SPECS: &[sley_options::OptionSpec<'static>] = &[
         opt_bool(Some('v'), None, OptFlags::NONEG, "verbose"),
-        opt_str(Some('o'), None, "<index-file>", OptFlags::NONE, "write index to <index-file>"),
+        opt_str(
+            Some('o'),
+            None,
+            "<index-file>",
+            OptFlags::NONE,
+            "write index to <index-file>",
+        ),
         opt_bool(None, Some("stdin"), OptFlags::NONEG, "read from stdin"),
         opt_bool(None, Some("fix-thin"), OptFlags::NONEG, "fix thin pack"),
         opt_str(
@@ -291,8 +385,19 @@ fn index_pack_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
             OptFlags::OPTARG.union(OptFlags::NONEG),
             "create .keep file",
         ),
-        opt_bool(None, Some("rev-index"), OptFlags::NONE, "generate reverse index"),
+        opt_bool(
+            None,
+            Some("rev-index"),
+            OptFlags::NONE,
+            "generate reverse index",
+        ),
         opt_bool(None, Some("verify"), OptFlags::NONEG, "verify pack"),
+        opt_bool(
+            None,
+            Some("verify-stat-only"),
+            OptFlags::HIDDEN.union(OptFlags::NONEG),
+            "show pack statistics only",
+        ),
         opt_str(
             None,
             Some("index-version"),
@@ -328,7 +433,13 @@ fn index_pack_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
             OptFlags::NONEG,
             "maximum input size",
         ),
-        opt_str(None, Some("threads"), "<n>", OptFlags::OPTARG.union(OptFlags::HIDDEN), ""),
+        opt_str(
+            None,
+            Some("threads"),
+            "<n>",
+            OptFlags::OPTARG.union(OptFlags::HIDDEN),
+            "",
+        ),
         opt_str(
             None,
             Some("pack_header"),
@@ -637,7 +748,12 @@ const VERIFY_PACK_USAGE: &[&str] =
 fn verify_pack_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
     static SPECS: &[sley_options::OptionSpec<'static>] = &[
         opt_bool(Some('v'), Some("verbose"), OptFlags::NONE, "verbose"),
-        opt_bool(Some('s'), Some("stat-only"), OptFlags::NONE, "show statistics only"),
+        opt_bool(
+            Some('s'),
+            Some("stat-only"),
+            OptFlags::NONE,
+            "show statistics only",
+        ),
         opt_str(
             None,
             Some("object-format"),
@@ -1203,6 +1319,88 @@ fn reflog_traversal_roots(
     Ok(roots)
 }
 
+/// Update dumb-transport metadata from the object types already established by
+/// an all-into-one repack. Lightweight tags and ordinary refs need no object
+/// body read. If any ref points outside the result or at an annotated tag, the
+/// caller falls back to the generic update-server-info path, which performs the
+/// full peel through the ODB.
+fn repack_try_update_server_info_from_result(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    result: &sley_odb::RepackResult,
+) -> Result<bool> {
+    let store = FileRefStore::new(common_git_dir, format);
+    let refs = store.list_refs()?;
+    let mut info_refs = Vec::with_capacity(refs.len() * (format.hex_len() + 32));
+    for reference in refs {
+        let oid = match &reference.target {
+            RefTarget::Direct(oid) => *oid,
+            RefTarget::Symbolic(_) => {
+                let Some(oid) = resolve_ref_to_oid(&store, &reference.name)? else {
+                    continue;
+                };
+                oid
+            }
+        };
+        match result.cached_object_type(&oid) {
+            Some(ObjectType::Tag) | None => return Ok(false),
+            Some(ObjectType::Commit | ObjectType::Tree | ObjectType::Blob) => {}
+        }
+        info_refs.extend_from_slice(oid.to_hex().as_bytes());
+        info_refs.push(b'\t');
+        info_refs.extend_from_slice(reference.name.as_bytes());
+        info_refs.push(b'\n');
+    }
+
+    let info_dir = common_git_dir.join("info");
+    fs::create_dir_all(&info_dir)?;
+    repack_write_server_info_file(&info_dir.join("refs"), &info_refs)?;
+
+    let objects_dir = repository_objects_dir(common_git_dir);
+    let objects_info_dir = objects_dir.join("info");
+    fs::create_dir_all(&objects_info_dir)?;
+    let pack_dir = objects_dir.join("pack");
+    let mut packs = Vec::new();
+    if pack_dir.exists() {
+        for entry in fs::read_dir(&pack_dir)? {
+            let path = entry?.path();
+            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("pack") {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(hash) = name
+                .strip_prefix("pack-")
+                .and_then(|name| name.strip_suffix(".pack"))
+            else {
+                continue;
+            };
+            if ObjectId::from_hex(format, hash).is_ok() && path.with_extension("idx").is_file() {
+                packs.push(name.to_string());
+            }
+        }
+    }
+    packs.sort();
+    let mut info_packs = Vec::with_capacity(packs.len() * (format.hex_len() + 9));
+    for name in packs {
+        info_packs.extend_from_slice(b"P ");
+        info_packs.extend_from_slice(name.as_bytes());
+        info_packs.push(b'\n');
+    }
+    info_packs.push(b'\n');
+    repack_write_server_info_file(&objects_info_dir.join("packs"), &info_packs)?;
+    Ok(true)
+}
+
+fn repack_write_server_info_file(path: &Path, content: &[u8]) -> Result<()> {
+    if fs::read(path).is_ok_and(|existing| existing == content) {
+        return Ok(());
+    }
+    fs::write(path, content)?;
+    Ok(())
+}
+
 pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
     let mut prune = false;
     let mut quiet = false;
@@ -1213,6 +1411,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
     let mut write_midx = false;
     let mut keep_packs: Vec<String> = Vec::new();
     let mut pack_kept_objects = false;
+    let mut force_rewrite = false;
     let mut update_server_info: Option<bool> = None;
     let mut cruft = false;
     let mut cruft_expiration: Option<Option<u32>> = None;
@@ -1272,8 +1471,9 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
                 keep_packs.push(strip_pack_suffix(&value["--keep-pack=".len()..]));
             }
             "--no-cruft" => cruft = false,
+            "-f" | "-F" => force_rewrite = true,
             // Accepted no-ops.
-            "-f" | "-F" | "--progress" | "--no-progress" | "--no-pack-kept-objects" => {}
+            "--progress" | "--no-progress" | "--no-pack-kept-objects" => {}
             value
                 if value.starts_with("--window")
                     || value.starts_with("--depth")
@@ -1305,6 +1505,15 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
     });
     let has_promisor_packs = pack_dir_has_promisor_packs(&common_git_dir)?;
     let config_write_bitmaps = config.get_bool("repack", None, "writeBitmaps");
+    let write_reverse_index = config
+        .get_bool("pack", None, "writeReverseIndex")
+        .unwrap_or(true);
+    let write_bitmap_lookup_table = config
+        .get_bool("pack", None, "writeBitmapLookupTable")
+        .unwrap_or(false);
+    let write_bitmap_hash_cache = config
+        .get_bool("pack", None, "writeBitmapHashCache")
+        .unwrap_or(true);
     let auto_bare_bitmaps = write_bitmaps.is_none()
         && config_write_bitmaps.is_none()
         && all
@@ -1381,6 +1590,7 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
         let keep_pack_stems: HashSet<String> = keep_packs.iter().cloned().collect();
         let options = sley_odb::RepackOptions {
             local,
+            force_rewrite,
             pack_kept_objects: include_kept_objects,
             keep_pack_stems,
         };
@@ -1388,7 +1598,8 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
     } else {
         sley_odb::repack_loose_objects(&common_git_dir, format)?
     };
-    if let Some(result) = result {
+    let mut loose_prune_complete = false;
+    if let Some(result) = result.as_ref() {
         let (bitmap_tips, bitmap_pseudo_merge_groups) = if write_bitmaps {
             let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
             (
@@ -1398,16 +1609,23 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
         } else {
             (None, None)
         };
-        sley_odb::install_repack_result_with_bitmap(
+        if write_bitmaps && write_bitmap_lookup_table {
+            sley_core::trace2::region("pack-bitmap-write", "writing_lookup_table");
+        }
+        sley_odb::install_repack_result_with_bitmap_options(
             &common_git_dir,
             format,
-            &result,
-            prune,
+            result,
+            sley_odb::RepackInstallOptions::new(prune)
+                .with_reverse_index(write_reverse_index)
+                .with_bitmap_extensions(write_bitmap_lookup_table, write_bitmap_hash_cache),
             bitmap_tips.as_ref(),
             bitmap_pseudo_merge_groups.as_deref(),
         )?;
+        loose_prune_complete =
+            result.loose_object_prune_outcome() == sley_odb::LooseObjectPruneOutcome::Complete;
     }
-    if prune {
+    if prune && !loose_prune_complete {
         prune_packed_loose_objects(&common_git_dir, format, false)?;
         if all && has_promisor_packs {
             trace2_perf_data("loosen_unused_packed_objects/loosened", "0");
@@ -1424,7 +1642,15 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
         cmd_multi_pack_index_write(&midx_args)?;
     }
     if update_server_info {
-        crate::commands::refs::cmd_update_server_info(&[])?;
+        let updated_from_result = match result.as_ref() {
+            Some(result) => {
+                repack_try_update_server_info_from_result(&common_git_dir, format, result)?
+            }
+            None => false,
+        };
+        if !updated_from_result {
+            crate::commands::refs::cmd_update_server_info(&[])?;
+        }
     }
     let _ = quiet;
     Ok(())
@@ -1607,6 +1833,7 @@ fn cmd_repack_cruft(
     let keep_pack_stems: HashSet<String> = keep_packs.iter().cloned().collect();
     let options = sley_odb::RepackOptions {
         local: false,
+        force_rewrite: false,
         pack_kept_objects,
         keep_pack_stems,
     };
@@ -1949,7 +2176,8 @@ fn gc_run_locked(
         // prune_expire=="now" with cruft (no expire-to): immediate drop via -a.
         trace_gc_repack(&["repack", "-d", "-l", "-a"]);
         let repack_options = sley_odb::RepackOptions {
-            local: false,
+            local: true,
+            force_rewrite: false,
             pack_kept_objects: false,
             keep_pack_stems,
         };
@@ -2003,7 +2231,8 @@ fn gc_run_locked(
         }
         trace_gc_repack(&trace_args);
         let repack_options = sley_odb::RepackOptions {
-            local: false,
+            local: true,
+            force_rewrite: false,
             pack_kept_objects: false,
             keep_pack_stems,
         };
@@ -2057,7 +2286,8 @@ fn gc_run_locked(
             )?;
         } else {
             let repack_options = sley_odb::RepackOptions {
-                local: false,
+                local: true,
+                force_rewrite: false,
                 pack_kept_objects: false,
                 keep_pack_stems,
             };
@@ -2175,7 +2405,12 @@ const GC_USAGE: &[&str] = &["git gc [<options>]"];
 
 fn gc_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
     static SPECS: &[sley_options::OptionSpec<'static>] = &[
-        opt_bool(Some('q'), Some("quiet"), OptFlags::NONE, "suppress progress reporting"),
+        opt_bool(
+            Some('q'),
+            Some("quiet"),
+            OptFlags::NONE,
+            "suppress progress reporting",
+        ),
         opt_str(
             None,
             Some("prune"),
@@ -2183,11 +2418,31 @@ fn gc_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
             OptFlags::OPTARG.union(OptFlags::NONE),
             "prune unreferenced objects",
         ),
-        opt_bool(None, Some("cruft"), OptFlags::NONE, "pack unreferenced objects separately"),
-        opt_bool(None, Some("aggressive"), OptFlags::NONE, "be more thorough (increased runtime)"),
+        opt_bool(
+            None,
+            Some("cruft"),
+            OptFlags::NONE,
+            "pack unreferenced objects separately",
+        ),
+        opt_bool(
+            None,
+            Some("aggressive"),
+            OptFlags::NONE,
+            "be more thorough (increased runtime)",
+        ),
         opt_bool(None, Some("auto"), OptFlags::NONE, "enable auto-gc mode"),
-        opt_bool(None, Some("detach"), OptFlags::NONE, "perform garbage collection in the background"),
-        opt_bool(None, Some("force"), OptFlags::NONE, "force running gc even if there may be another gc running"),
+        opt_bool(
+            None,
+            Some("detach"),
+            OptFlags::NONE,
+            "perform garbage collection in the background",
+        ),
+        opt_bool(
+            None,
+            Some("force"),
+            OptFlags::NONE,
+            "force running gc even if there may be another gc running",
+        ),
         opt_bool(
             None,
             Some("keep-largest-pack"),
@@ -4353,16 +4608,22 @@ pub(crate) fn cmd_pack_refs(args: &[String]) -> Result<()> {
     let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let store = FileRefStore::new(&git_dir, format)
+    let core_fsync = global_config_value("core.fsync")?;
+    let core_fsync_method = global_config_value("core.fsyncMethod")?;
+    let mut store = FileRefStore::new(&git_dir, format)
+        .with_reference_fsync_config(core_fsync.as_deref(), core_fsync_method.as_deref())
         .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?);
     if store.uses_reftable()? {
-        validate_reftable_write_options(&git_dir)?;
+        store = store.with_reftable_write_options(reftable_write_options(&common_git_dir)?);
         if options.auto && store.reftable_table_count()? <= 2 {
             return Ok(());
         }
         store.compact_reftable_stack().map_err(|err| {
             if matches!(err, GitError::Io(ref message) if message.contains("File exists")) {
                 eprintln!("error: unable to compact stack: data is locked");
+                GitError::Exit(1)
+            } else if matches!(err, GitError::InvalidFormat(ref message) if message == "entry too large") {
+                eprintln!("error: unable to compact stack: entry too large");
                 GitError::Exit(1)
             } else {
                 err
@@ -4390,25 +4651,31 @@ pub(crate) fn cmd_pack_refs(args: &[String]) -> Result<()> {
 /// git's `reftable_be_config`: validate the reftable writer options that the
 /// backend reads at init. An out-of-bounds `reftable.blockSize` /
 /// `reftable.restartInterval` is fatal before any work is done.
-fn validate_reftable_write_options(git_dir: &Path) -> Result<()> {
-    let Ok(config) = read_repo_config(git_dir) else {
-        return Ok(());
-    };
+fn reftable_write_options(git_dir: &Path) -> Result<ReftableWriteOptions> {
+    let config = read_repo_config(git_dir)?;
+    let mut options = ReftableWriteOptions::default();
     if let Some(value) = config.get("reftable", None, "blockSize")
         && let Some(block_size) = parse_reftable_config_ulong(value)
-        && block_size > 16_777_215
     {
-        eprintln!("fatal: reftable block size cannot exceed 16MB");
-        return Err(GitError::Exit(128));
+        if block_size > 16_777_215 {
+            eprintln!("fatal: reftable block size cannot exceed 16MB");
+            return Err(GitError::Exit(128));
+        }
+        options.block_size = block_size as u32;
     }
     if let Some(value) = config.get("reftable", None, "restartInterval")
         && let Some(restart_interval) = parse_reftable_config_ulong(value)
-        && restart_interval > 65_535
     {
-        eprintln!("fatal: reftable block size cannot exceed 65535");
-        return Err(GitError::Exit(128));
+        if restart_interval > 65_535 {
+            eprintln!("fatal: reftable block size cannot exceed 65535");
+            return Err(GitError::Exit(128));
+        }
+        options.restart_interval = restart_interval as u16;
     }
-    Ok(())
+    if let Some(index_objects) = config.get_bool("reftable", None, "indexObjects") {
+        options.index_objects = index_objects;
+    }
+    Ok(options)
 }
 
 /// Parse a config value as git's `git_config_ulong` does for the cases the
@@ -4429,8 +4696,8 @@ fn setup_pack_refs_options(args: &[String]) -> Result<PackRefsOptions> {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         return pack_refs_help();
     }
-    let parsed = parse_options(args, pack_refs_option_specs(), &PACK_REFS_USAGE)
-        .map_err(cli_usage_error)?;
+    let parsed =
+        parse_options(args, pack_refs_option_specs(), &PACK_REFS_USAGE).map_err(cli_usage_error)?;
     if !parsed.positionals.is_empty() {
         return pack_refs_usage();
     }
@@ -4464,13 +4731,24 @@ fn setup_pack_refs_options(args: &[String]) -> Result<PackRefsOptions> {
     })
 }
 
-const PACK_REFS_USAGE: &[&str] = &["git pack-refs [--all] [--no-prune] [--auto] [--include <pattern>] [--exclude <pattern>]"];
+const PACK_REFS_USAGE: &[&str] =
+    &["git pack-refs [--all] [--no-prune] [--auto] [--include <pattern>] [--exclude <pattern>]"];
 
 fn pack_refs_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
     static SPECS: &[sley_options::OptionSpec<'static>] = &[
         opt_bool(None, Some("all"), OptFlags::NONE, "pack everything"),
-        opt_bool(None, Some("prune"), OptFlags::NONE, "prune loose refs (default)"),
-        opt_bool(None, Some("auto"), OptFlags::NONE, "auto-pack refs as needed"),
+        opt_bool(
+            None,
+            Some("prune"),
+            OptFlags::NONE,
+            "prune loose refs (default)",
+        ),
+        opt_bool(
+            None,
+            Some("auto"),
+            OptFlags::NONE,
+            "auto-pack refs as needed",
+        ),
         opt_str(
             None,
             Some("include"),
@@ -5194,7 +5472,8 @@ fn setup_prune_options(args: &[String]) -> Result<PruneOptions> {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         return prune_help();
     }
-    let parsed = parse_options(args, prune_option_specs(), &PRUNE_USAGE).map_err(cli_usage_error)?;
+    let parsed =
+        parse_options(args, prune_option_specs(), &PRUNE_USAGE).map_err(cli_usage_error)?;
     let mut expire = i64::MAX;
     for option in &parsed.options {
         if option.long != Some("expire") {
@@ -5948,6 +6227,13 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
+    let config = read_repo_config(&git_dir)?;
+    let write_bitmap_lookup_table = config
+        .get_bool("pack", None, "writeBitmapLookupTable")
+        .unwrap_or(false);
+    let write_bitmap_hash_cache = config
+        .get_bool("pack", None, "writeBitmapHashCache")
+        .unwrap_or(true);
     let mut object_dir: Option<PathBuf> = None;
     let mut stdin_packs = false;
     let mut write_bitmap = false;
@@ -6232,23 +6518,20 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     // unlike repack's warn-and-continue.
     let bitmap = if write_bitmap {
         let db = FileObjectDatabase::new(object_dir.clone(), format);
-        let mut tips = repack_preferred_bitmap_tips(&git_dir, &db, format)?;
+        let tips = midx_bitmap_tips(&git_dir, &db, format, refs_snapshot.as_deref())?;
         let pseudo_merge_groups = repack_pseudo_merge_groups(&git_dir, &db, format)?;
-        if let Some(snapshot) = &refs_snapshot {
-            // Snapshot lines are "<oid>" (plain tip) or "+<oid>" (preferred
-            // tip, upstream's NEEDS_BITMAP). Only the preferred ones
-            // influence selection here.
-            for line in fs::read_to_string(snapshot)?.lines() {
-                if let Some(hex) = line.strip_prefix('+')
-                    && let Ok(oid) = ObjectId::from_hex(format, hex)
-                    && let Ok(commit) = sley_rev::peel_to_commit(&db, format, &oid)
-                {
-                    tips.insert(commit);
-                }
-            }
-        }
         let preferred_pack = preferred_pack.unwrap_or(0);
-        match sley_odb::build_midx_bitmap(
+        let name_hash_cache = if write_bitmap_hash_cache {
+            Some(midx_bitmap_name_hash_cache(
+                &pack_dir,
+                &pack_names,
+                &objects,
+                format,
+            )?)
+        } else {
+            None
+        };
+        match sley_odb::build_midx_bitmap_with_options(
             &db,
             format,
             &objects,
@@ -6256,6 +6539,11 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
             preferred_pack,
             &tips,
             &pseudo_merge_groups,
+            &sley_odb::ReachabilityBitmapOptions {
+                write_lookup_table: write_bitmap_lookup_table,
+                name_hash_cache,
+                restrict_to_tips: refs_snapshot.is_some(),
+            },
         )? {
             Some(bitmap) => Some(bitmap),
             None => {
@@ -6309,12 +6597,54 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     }
 
     if let Some(bitmap) = bitmap {
+        if write_bitmap_lookup_table {
+            sley_core::trace2::region("pack-bitmap-write", "writing_lookup_table");
+        }
         let bitmap_path = pack_dir.join(&bitmap_name);
         let temp_path = bitmap_path.with_extension("bitmap.tmp");
         fs::write(&temp_path, &bitmap)?;
         fs::rename(&temp_path, &bitmap_path)?;
     }
     Ok(())
+}
+
+fn midx_bitmap_name_hash_cache(
+    pack_dir: &Path,
+    pack_names: &[String],
+    objects: &[MultiPackIndexEntry],
+    format: ObjectFormat,
+) -> Result<Vec<u32>> {
+    let mut by_oid = HashMap::new();
+    for pack_name in pack_names {
+        let index_path = pack_dir.join(pack_name);
+        let bitmap_path = index_path.with_extension("bitmap");
+        let Ok(index_bytes) = fs::read(&index_path) else {
+            continue;
+        };
+        let Ok(index) = PackIndex::parse_without_checksum(&index_bytes, format) else {
+            continue;
+        };
+        let Ok(bitmap_bytes) = fs::read(bitmap_path) else {
+            continue;
+        };
+        let Ok(bitmap) =
+            sley_pack::PackBitmapIndex::parse(&bitmap_bytes, format, index.entries.len())
+        else {
+            continue;
+        };
+        let Some(cache) = bitmap.name_hash_cache else {
+            continue;
+        };
+        let mut entries = index.entries;
+        entries.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
+        for (entry, hash) in entries.into_iter().zip(cache) {
+            by_oid.entry(entry.oid).or_insert(hash);
+        }
+    }
+    Ok(objects
+        .iter()
+        .map(|entry| by_oid.get(&entry.oid).copied().unwrap_or(0))
+        .collect())
 }
 
 struct MidxWriteIncremental<'a> {
@@ -6574,18 +6904,8 @@ fn write_midx_layer_bytes(
 
     let bitmap = if write_bitmap {
         let db = FileObjectDatabase::new(object_dir.to_path_buf(), format);
-        let mut tips = repack_preferred_bitmap_tips(git_dir, &db, format)?;
+        let tips = midx_bitmap_tips(git_dir, &db, format, refs_snapshot)?;
         let pseudo_merge_groups = repack_pseudo_merge_groups(git_dir, &db, format)?;
-        if let Some(snapshot) = refs_snapshot {
-            for line in fs::read_to_string(snapshot)?.lines() {
-                if let Some(hex) = line.strip_prefix('+')
-                    && let Ok(oid) = ObjectId::from_hex(format, hex)
-                    && let Ok(commit) = sley_rev::peel_to_commit(&db, format, &oid)
-                {
-                    tips.insert(commit);
-                }
-            }
-        }
         match sley_odb::build_midx_bitmap(
             &db,
             format,
@@ -6632,6 +6952,32 @@ fn write_midx_layer_bytes(
         bitmap,
         rev,
     })
+}
+
+/// Resolve the exact tip universe for a MIDX bitmap write. A refs snapshot is
+/// a replacement for the live ref store, not an additive preference list:
+/// plain and `+`-prefixed rows both name visible tips (`+` additionally marks
+/// a preferred tip upstream, which sley's selection set already models).
+fn midx_bitmap_tips(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    refs_snapshot: Option<&Path>,
+) -> Result<HashSet<ObjectId>> {
+    let Some(snapshot) = refs_snapshot else {
+        return repack_preferred_bitmap_tips(git_dir, db, format);
+    };
+    let mut tips = HashSet::new();
+    for line in fs::read_to_string(snapshot)?.lines() {
+        let hex = line.strip_prefix('+').unwrap_or(line).trim();
+        if hex.is_empty() {
+            continue;
+        }
+        let oid = ObjectId::from_hex(format, hex)?;
+        let commit = sley_rev::peel_to_commit(db, format, &oid)?;
+        tips.insert(commit);
+    }
+    Ok(tips)
 }
 
 fn write_empty_midx_bitmap(
@@ -6799,7 +7145,11 @@ fn migrate_single_midx_to_incremental(
 
 fn remove_incremental_midx_dir(pack_dir: &Path) -> Result<()> {
     let midx_dir = incremental_midx_dir(pack_dir);
+    let preserve_empty_dir = midx_dir.exists();
     match fs::remove_dir_all(&midx_dir) {
+        Ok(()) if preserve_empty_dir => {
+            fs::create_dir_all(&midx_dir).map_err(|err| GitError::Io(err.to_string()))
+        }
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(GitError::Io(err.to_string())),

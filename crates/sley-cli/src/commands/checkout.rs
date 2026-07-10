@@ -453,6 +453,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 }
                 None => {
                     let config = read_repo_config(&git_dir)?;
+                    let db = crate::repository::open_object_database(&git_dir, format)?;
                     let conflict_style = conflict_style.unwrap_or_else(|| {
                         match checkout_config.get("merge", None, "conflictstyle") {
                             Some("diff3") | Some("zdiff3") => {
@@ -461,11 +462,12 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                             _ => sley_worktree::CheckoutConflictStyle::Merge,
                         }
                     });
-                    let result = sley_worktree::checkout_index_paths(
+                    let result = sley_worktree::checkout_index_paths_with_database(
                         worktree_root,
                         &git_dir,
                         format,
                         &resolved_paths,
+                        &db,
                         sley_worktree::CheckoutIndexPathOptions {
                             force,
                             merge: path_merge || conflict_implies_merge,
@@ -1054,7 +1056,12 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
             return Err(err);
         }
-    } else if recurse_submodules || (branch_update_rollback.is_some() && !force) {
+    // Creating a branch at the commit already checked out does not need a
+    // two-way unpack. Avoiding that index rebuild is observable: Git preserves
+    // optional extensions such as UNTR across `checkout -b new HEAD`.
+    } else if recurse_submodules
+        || (branch_update_rollback.is_some() && !force && branch_target != Some(checkout_old_head))
+    {
         let from = checkout_reflog_from.clone();
         let target = branch_target.ok_or_else(|| GitError::reference_not_found("branch"))?;
         if let Err(err) = checkout_twoway_dirty(
@@ -1238,7 +1245,11 @@ fn checkout_worktree_is_current(worktree: &Path, current: &Path) -> bool {
 
 fn checkout_direct_head(store: &FileRefStore) -> Result<Option<ObjectId>> {
     Ok(match store.read_ref("HEAD")? {
-        Some(RefTarget::Direct(oid)) => Some(oid),
+        // A null direct HEAD is invalid/unborn state, not a detached commit.
+        // In particular it must not enter the previous-detached-HEAD warning
+        // walk after a successful branch switch: there is no commit object to
+        // describe or test for reachability.
+        Some(RefTarget::Direct(oid)) if !oid.is_null() => Some(oid),
         _ => None,
     })
 }
@@ -2307,12 +2318,7 @@ fn checkout_merge_autostash_branch_switch(
             true,
         )?;
     } else {
-        sley_worktree::reset_index_and_worktree_to_commit(
-            worktree_root,
-            git_dir,
-            format,
-            &head,
-        )?;
+        sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &head)?;
     }
     // Retry the switch WITHOUT clobbering untracked files. The autostash above
     // only removed *tracked* local modifications; if the switch still fails now,
@@ -2331,8 +2337,7 @@ fn checkout_merge_autostash_branch_switch(
         let _ = commands::stash::apply_stash_commit_quietly(&stash_oid);
         return Err(err);
     }
-    let applied =
-        commands::stash::apply_stash_commit_quietly(&stash_oid).unwrap_or(false);
+    let applied = commands::stash::apply_stash_commit_quietly(&stash_oid).unwrap_or(false);
     if applied {
         if !quiet {
             eprintln!("Applied autostash.");
@@ -2660,8 +2665,7 @@ fn restore_run_patch(
             }
         }
     };
-    let cfg =
-        commands::add_interactive::resolve_patch_config(git_dir, context, interhunk, true)?;
+    let cfg = commands::add_interactive::resolve_patch_config(git_dir, context, interhunk, true)?;
     let stdin = io::stdin();
     let mut handle = stdin.lock();
     commands::add_patch::run_add_patch(mode, &pathspecs, revision.as_deref(), &mut handle, cfg)

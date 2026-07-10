@@ -6,13 +6,13 @@ use sley::plumbing::{sley_config, sley_core, sley_diff_merge, sley_rev, sley_wor
 // works because a submodule can access its ancestor module's items (including
 // private ones), so every helper, type, and re-export visible at the crate root
 // is in scope here without re-listing it.
-use crate::*;
 use crate::commands::merge_rebase::three_way_merge_trees_styled;
+use crate::*;
 
 #[path = "stash_options.rs"]
 mod stash_options;
+use sley::plumbing::sley_object::{TreeEntries, tree_entry_cmp};
 use stash_options::{setup_stash_apply_options, setup_stash_list_options};
-use sley::plumbing::sley_object::{tree_entry_cmp, TreeEntries};
 use std::io::Write;
 use std::process::{Command, Stdio};
 #[derive(Debug)]
@@ -357,7 +357,6 @@ fn cmd_stash_branch(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-
 fn stash_apply_parse_combined_quiet(value: &str, command: &str) -> Result<()> {
     for byte in value.as_bytes()[2..].iter().copied() {
         if byte != b'q' {
@@ -558,7 +557,11 @@ enum StashApplyOutcome {
 fn stash_apply_conflict_style(git_dir: &Path) -> sley_diff_merge::ConflictStyle {
     crate::read_repo_config(git_dir)
         .ok()
-        .and_then(|config| config.get("merge", None, "conflictstyle").map(str::to_string))
+        .and_then(|config| {
+            config
+                .get("merge", None, "conflictstyle")
+                .map(str::to_string)
+        })
         .map(|value| match value.as_str() {
             "diff3" | "zdiff3" => sley_diff_merge::ConflictStyle::Diff3,
             _ => sley_diff_merge::ConflictStyle::Merge,
@@ -1689,9 +1692,7 @@ fn stash_reverse_apply_selected_patch(patch: &[u8]) -> Result<()> {
             .write_all(patch)
             .map_err(|err| GitError::Io(err.to_string()))?;
     }
-    let status = child
-        .wait()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+    let status = child.wait().map_err(|err| GitError::Io(err.to_string()))?;
     if !status.success() {
         return Err(GitError::Exit(status.code().unwrap_or(1)));
     }
@@ -2550,7 +2551,10 @@ fn remove_stashed_untracked_path(worktree_root: &Path, path: &[u8]) -> Result<()
     };
     if metadata.file_type().is_dir() {
         if path.join(".git").exists() {
-            eprintln!("Ignoring path {}/", stash_untracked_display_path(worktree_root, &path));
+            eprintln!(
+                "Ignoring path {}/",
+                stash_untracked_display_path(worktree_root, &path)
+            );
             return Ok(());
         }
         match fs::remove_dir(&path) {
@@ -3270,8 +3274,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     if !untracked_option_seen {
-        include_untracked =
-            stash_show_include_untracked_config_default(&git_dir, &common_git_dir)?;
+        include_untracked = stash_show_include_untracked_config_default(&git_dir, &common_git_dir)?;
     }
     let store = FileRefStore::new(&common_git_dir, format);
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -3449,7 +3452,8 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 }
                 for entry in &entries {
                     let options = DiffRenderOptions {
-                line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                        line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                        suppress_blank_empty: false,
                         binary: false,
                         anchors: &[],
                         allow_textconv: false,
@@ -3616,7 +3620,6 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
-
 
 fn stash_list_option_takes_no_value_error(option: &str) -> Result<()> {
     eprintln!("error: option `{option}' takes no value");
@@ -3926,7 +3929,8 @@ fn write_stash_list_patch(
     .min(format.hex_len());
     for entry in &entries {
         let options = DiffRenderOptions {
-                line_indicators: sley_diff_merge::render::LineIndicators::default(),
+            line_indicators: sley_diff_merge::render::LineIndicators::default(),
+            suppress_blank_empty: false,
             binary: false,
             anchors: &[],
             allow_textconv: false,

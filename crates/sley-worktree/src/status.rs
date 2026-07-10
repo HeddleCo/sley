@@ -1912,6 +1912,75 @@ pub(crate) enum TrackedOnlyPrecheckOutcome {
     Slow,
 }
 
+/// Per-worker cache for the directory-prefix safety check used by tracked
+/// status prechecks.
+///
+/// Index paths are sorted, so thousands of entries commonly share a few
+/// hundred parent directories. Remembering the direct file type of those
+/// directories avoids repeating the same `symlink_metadata` calls for every
+/// file while preserving the rule that a symlink in any parent makes the path
+/// a deletion from Git's point of view.
+#[derive(Debug, Default)]
+pub(crate) struct StatusSymlinkParentCache {
+    directories: HashMap<Vec<u8>, bool>,
+}
+
+impl StatusSymlinkParentCache {
+    pub(crate) fn has_symlink_parent(
+        &mut self,
+        worktree_root: &Path,
+        git_path: &[u8],
+    ) -> Result<bool> {
+        let Some(slash) = git_path.iter().rposition(|byte| *byte == b'/') else {
+            return Ok(false);
+        };
+        let parent = &git_path[..slash];
+        let mut prefix_end = 0usize;
+        loop {
+            let component_end = parent[prefix_end..]
+                .iter()
+                .position(|byte| *byte == b'/')
+                .map_or(parent.len(), |relative| prefix_end + relative);
+            let prefix = &parent[..component_end];
+            if let Some(is_symlink) = self.directories.get(prefix) {
+                if *is_symlink {
+                    return Ok(true);
+                }
+            } else {
+                let mut absolute = worktree_root.to_path_buf();
+                push_repo_path(&mut absolute, prefix)?;
+                let metadata = match fs::symlink_metadata(&absolute) {
+                    Ok(metadata) => metadata,
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        return Ok(false);
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+                let is_symlink = metadata.file_type().is_symlink();
+                self.directories.insert(prefix.to_vec(), is_symlink);
+                if is_symlink {
+                    return Ok(true);
+                }
+            }
+            if component_end == parent.len() {
+                break;
+            }
+            prefix_end = component_end + 1;
+        }
+        Ok(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_directory_count(&self) -> usize {
+        self.directories.len()
+    }
+}
+
 pub(crate) fn short_status_tracked_only_head_matches_index_parallel(
     worktree_root: &Path,
     git_dir: &Path,
@@ -2452,6 +2521,7 @@ pub(crate) fn tracked_only_non_clean_prechecks_parallel(
     if worker_count == 1 {
         let mut prechecks = Vec::new();
         let mut absolute = PathBuf::new();
+        let mut symlink_parents = StatusSymlinkParentCache::default();
         for (idx, entry) in index.entries.iter().enumerate() {
             if entry.stage() != Stage::Normal {
                 continue;
@@ -2462,6 +2532,7 @@ pub(crate) fn tracked_only_non_clean_prechecks_parallel(
                 stat_cache,
                 sparse_checkout_active,
                 &mut absolute,
+                &mut symlink_parents,
             )? {
                 TrackedOnlyPrecheckOutcome::Clean => {}
                 TrackedOnlyPrecheckOutcome::Deleted => {
@@ -2488,6 +2559,7 @@ pub(crate) fn tracked_only_non_clean_prechecks_parallel(
                 move || -> Result<Vec<TrackedOnlyPrecheck>> {
                     let mut prechecks = Vec::new();
                     let mut absolute = PathBuf::new();
+                    let mut symlink_parents = StatusSymlinkParentCache::default();
                     loop {
                         let chunk_idx = next_chunk.fetch_add(1, Ordering::Relaxed);
                         let Some(range) = chunk_ranges.get(chunk_idx) else {
@@ -2504,6 +2576,7 @@ pub(crate) fn tracked_only_non_clean_prechecks_parallel(
                                 stat_cache,
                                 sparse_checkout_active,
                                 &mut absolute,
+                                &mut symlink_parents,
                             )? {
                                 TrackedOnlyPrecheckOutcome::Clean => {}
                                 TrackedOnlyPrecheckOutcome::Deleted => {
@@ -2545,6 +2618,7 @@ pub(crate) fn tracked_only_borrowed_non_clean_prechecks_parallel(
     if worker_count == 1 {
         let mut prechecks = Vec::new();
         let mut absolute = PathBuf::new();
+        let mut symlink_parents = StatusSymlinkParentCache::default();
         for (idx, entry) in index.entries.iter().enumerate() {
             if entry.stage() != Stage::Normal {
                 continue;
@@ -2555,6 +2629,7 @@ pub(crate) fn tracked_only_borrowed_non_clean_prechecks_parallel(
                 stat_cache,
                 sparse_checkout_active,
                 &mut absolute,
+                &mut symlink_parents,
             )? {
                 TrackedOnlyPrecheckOutcome::Clean => {}
                 TrackedOnlyPrecheckOutcome::Deleted => {
@@ -2581,6 +2656,7 @@ pub(crate) fn tracked_only_borrowed_non_clean_prechecks_parallel(
                 move || -> Result<Vec<TrackedOnlyPrecheck>> {
                     let mut prechecks = Vec::new();
                     let mut absolute = PathBuf::new();
+                    let mut symlink_parents = StatusSymlinkParentCache::default();
                     loop {
                         let chunk_idx = next_chunk.fetch_add(1, Ordering::Relaxed);
                         let Some(range) = chunk_ranges.get(chunk_idx) else {
@@ -2597,6 +2673,7 @@ pub(crate) fn tracked_only_borrowed_non_clean_prechecks_parallel(
                                 stat_cache,
                                 sparse_checkout_active,
                                 &mut absolute,
+                                &mut symlink_parents,
                             )? {
                                 TrackedOnlyPrecheckOutcome::Clean => {}
                                 TrackedOnlyPrecheckOutcome::Deleted => {
@@ -2629,6 +2706,7 @@ pub(crate) fn tracked_only_stat_precheck(
     stat_cache: &IndexStatCache,
     sparse_checkout_active: bool,
     absolute: &mut PathBuf,
+    symlink_parents: &mut StatusSymlinkParentCache,
 ) -> Result<TrackedOnlyPrecheckOutcome> {
     // Skip-worktree handling mirrors git's clear_skip_worktree_from_present_files:
     // when core.sparseCheckout is DISABLED the bit is honored literally, so the
@@ -2643,7 +2721,7 @@ pub(crate) fn tracked_only_stat_precheck(
         return Ok(TrackedOnlyPrecheckOutcome::Slow);
     }
     let git_path = index_entry.path.as_bytes();
-    if crate::index_io::git_path_has_symlink_parent(worktree_root, git_path)? {
+    if symlink_parents.has_symlink_parent(worktree_root, git_path)? {
         return Ok(TrackedOnlyPrecheckOutcome::Deleted);
     }
     set_worktree_path_from_repo_path(worktree_root, git_path, absolute)?;
@@ -2683,6 +2761,7 @@ pub(crate) fn tracked_only_borrowed_stat_precheck(
     stat_cache: &IndexStatCache,
     sparse_checkout_active: bool,
     absolute: &mut PathBuf,
+    symlink_parents: &mut StatusSymlinkParentCache,
 ) -> Result<TrackedOnlyPrecheckOutcome> {
     // See tracked_only_stat_precheck: when core.sparseCheckout is disabled the
     // skip-worktree bit is honored literally (worktree side always clean); when
@@ -2694,7 +2773,7 @@ pub(crate) fn tracked_only_borrowed_stat_precheck(
     if sley_index::is_gitlink(index_entry.mode) {
         return Ok(TrackedOnlyPrecheckOutcome::Slow);
     }
-    if crate::index_io::git_path_has_symlink_parent(worktree_root, index_entry.path)? {
+    if symlink_parents.has_symlink_parent(worktree_root, index_entry.path)? {
         return Ok(TrackedOnlyPrecheckOutcome::Deleted);
     }
     set_worktree_path_from_repo_path(worktree_root, index_entry.path, absolute)?;
@@ -2787,5 +2866,50 @@ pub(crate) fn status_sort_category(entry: &ShortStatusEntry) -> u8 {
         (b'?', b'?') => 1,
         (b'!', b'!') => 2,
         _ => 0,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn symlink_parent_cache_reuses_directories_and_detects_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "sley-status-parent-cache-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("regular/nested")).expect("create regular directories");
+        let mut cache = StatusSymlinkParentCache::default();
+        assert!(
+            !cache
+                .has_symlink_parent(&root, b"regular/nested/one")
+                .expect("check regular path")
+        );
+        assert_eq!(cache.cached_directory_count(), 2);
+        assert!(
+            !cache
+                .has_symlink_parent(&root, b"regular/nested/two")
+                .expect("check sibling path")
+        );
+        assert_eq!(
+            cache.cached_directory_count(),
+            2,
+            "a sibling path must reuse both cached parent directories"
+        );
+
+        fs::create_dir_all(root.join("target")).expect("create symlink target");
+        symlink("target", root.join("linked")).expect("create directory symlink");
+        assert!(
+            cache
+                .has_symlink_parent(&root, b"linked/child")
+                .expect("check symlink parent")
+        );
+
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 }

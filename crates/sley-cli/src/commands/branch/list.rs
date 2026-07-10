@@ -91,7 +91,10 @@ pub(super) enum BranchListMode {
     All,
 }
 
-pub(super) fn branch_refs_for_mode(store: &FileRefStore, mode: BranchListMode) -> Result<Vec<sley_refs::Ref>> {
+pub(super) fn branch_refs_for_mode(
+    store: &FileRefStore,
+    mode: BranchListMode,
+) -> Result<Vec<sley_refs::Ref>> {
     match mode {
         BranchListMode::Local => store.list_refs_with_prefix("refs/heads/"),
         BranchListMode::Remote => store.list_refs_with_prefix("refs/remotes/"),
@@ -884,7 +887,11 @@ pub(super) fn print_branch_list_matching_push_sorted(
     )
 }
 
-pub(super) fn branch_list_patterns_match(patterns: &[String], name: &str, ignore_case: bool) -> bool {
+pub(super) fn branch_list_patterns_match(
+    patterns: &[String],
+    name: &str,
+    ignore_case: bool,
+) -> bool {
     patterns.is_empty()
         || patterns.iter().any(|pattern| {
             if ignore_case {
@@ -965,10 +972,7 @@ pub(super) fn branch_remote_or_all_mode_unchecked(flag: &str) -> BranchListMode 
     branch_remote_or_all_mode(flag).expect("flag is -r/--remotes/-a/--all")
 }
 
-pub(super) fn print_branch_list_remote_or_all_flag(
-    store: &FileRefStore,
-    flag: &str,
-) -> Result<()> {
+pub(super) fn print_branch_list_remote_or_all_flag(store: &FileRefStore, flag: &str) -> Result<()> {
     print_branch_list(store, branch_remote_or_all_mode_unchecked(flag))
 }
 
@@ -1630,7 +1634,10 @@ pub(super) fn print_branch_list_filtered_upstream_sorted_with_color(
     print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
 }
 
-pub(super) fn branch_ref_upstream_sort_key(config: &GitConfig, reference: &sley_refs::Ref) -> String {
+pub(super) fn branch_ref_upstream_sort_key(
+    config: &GitConfig,
+    reference: &sley_refs::Ref,
+) -> String {
     for_each_ref_upstream(config, &reference.name)
         .map(|upstream| upstream.refname)
         .unwrap_or_default()
@@ -1936,7 +1943,11 @@ pub(super) fn remote_symbolic_ref_is_dangling(
     }
 }
 
-pub(super) fn remote_branch_display(reference: &sley_refs::Ref, name: &str, mode: BranchListMode) -> String {
+pub(super) fn remote_branch_display(
+    reference: &sley_refs::Ref,
+    name: &str,
+    mode: BranchListMode,
+) -> String {
     let display = if matches!(mode, BranchListMode::All) {
         format!("remotes/{name}")
     } else {
@@ -2183,7 +2194,10 @@ pub(super) struct BranchVerboseRow {
     upstream_track: Option<ForEachRefTrack>,
 }
 
-pub(super) fn branch_verbose_display_name(name: &str, mode: BranchListMode) -> Option<(String, String)> {
+pub(super) fn branch_verbose_display_name(
+    name: &str,
+    mode: BranchListMode,
+) -> Option<(String, String)> {
     if matches!(mode, BranchListMode::Local | BranchListMode::All)
         && let Some(name) = name.strip_prefix("refs/heads/")
     {

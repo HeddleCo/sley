@@ -39,7 +39,11 @@ impl PackFile {
         Self::parse_with_base(bytes, format, external_base)
     }
 
-    pub(crate) fn parse_with_base<F>(bytes: &[u8], format: ObjectFormat, mut external_base: F) -> Result<Self>
+    pub(crate) fn parse_with_base<F>(
+        bytes: &[u8],
+        format: ObjectFormat,
+        mut external_base: F,
+    ) -> Result<Self>
     where
         F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
     {
@@ -343,13 +347,13 @@ impl PackFile {
 /// Delta resolution within a pack walks a chain of base objects by offset; the
 /// same base is the parent of many deltas, so without a cache the entire chain
 /// is re-inflated and re-applied on every read. Implementors let
-/// [`read_object_at_with_cache`] reuse a warm base instead.
+/// [`read_object_at_with_cache_arc`] reuse a warm base instead.
 ///
 /// Correctness contract: a given `offset` within a given pack's bytes always
 /// decodes to exactly one object, so caching by offset can never serve the wrong
 /// object **provided the same cache is only ever used with one pack's bytes**.
 /// Callers must therefore scope a cache to a single pack (e.g. key it by pack
-/// path). The default [`read_object_at`] uses a no-op cache and is unaffected.
+/// path). The default [`read_object_at_arc`] uses a no-op cache and is unaffected.
 pub trait PackDeltaCache {
     /// Return the decoded object whose entry begins at `offset`, if cached.
     fn get(&self, offset: u64) -> Option<Arc<EncodedObject>>;
@@ -357,7 +361,7 @@ pub trait PackDeltaCache {
     fn insert(&self, offset: u64, object: Arc<EncodedObject>);
 }
 
-/// A [`PackDeltaCache`] that stores nothing; used by [`read_object_at`] to keep
+/// A [`PackDeltaCache`] that stores nothing; used by [`read_object_at_arc`] to keep
 /// the original, allocation-free behavior for callers that do not opt in.
 pub(crate) struct NoopDeltaCache;
 
@@ -396,11 +400,18 @@ thread_local! {
 /// number of *compressed* bytes consumed (so callers stepping through a pack can
 /// advance to the next entry). Byte-for-byte equivalent to
 /// `ZlibDecoder::read_to_end` + `total_in`.
-pub(crate) fn inflate_into(compressed: &[u8], out: &mut Vec<u8>, size_hint: usize) -> Result<usize> {
+pub(crate) fn inflate_into(
+    compressed: &[u8],
+    out: &mut Vec<u8>,
+    size_hint: usize,
+) -> Result<usize> {
     INFLATE.with(|cell| {
         let mut decompress = cell.borrow_mut();
         decompress.reset(true);
-        out.reserve(inflate::bounded_inflate_reserve(size_hint, compressed.len()));
+        out.reserve(inflate::bounded_inflate_reserve(
+            size_hint,
+            compressed.len(),
+        ));
         let mut input = compressed;
         let mut consumed_total = 0usize;
         loop {
@@ -865,7 +876,11 @@ pub(crate) fn parse_entry_header(bytes: &[u8], offset: &mut usize) -> Result<Ent
     Ok(EntryHeader { kind, size })
 }
 
-pub(crate) fn parse_ofs_delta_base_offset(bytes: &[u8], offset: &mut usize, entry_offset: u64) -> Result<u64> {
+pub(crate) fn parse_ofs_delta_base_offset(
+    bytes: &[u8],
+    offset: &mut usize,
+    entry_offset: u64,
+) -> Result<u64> {
     let mut byte = next_byte(bytes, offset)?;
     let mut relative = u64::from(byte & 0x7f);
     while byte & 0x80 != 0 {

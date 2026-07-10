@@ -108,8 +108,8 @@ pub fn apply_standard_git_identity_env(command: &mut Command) -> &mut Command {
 /// * otherwise `"git"` (the PATH git).
 ///
 /// On first call this also runs a one-time version guard (see
-/// [`assert_oracle_git_version`]): if the resolved oracle is not on the
-/// [`REQUIRED_ORACLE_GIT_SERIES`] series it panics with an actionable message,
+/// `assert_oracle_git_version`): if the resolved oracle is not on the
+/// `REQUIRED_ORACLE_GIT_SERIES` series it panics with an actionable message,
 /// converting the silent-skew failure mode (comparing against the wrong git and
 /// getting dozens of bogus diffs) into a single, self-explaining error.
 ///
@@ -5561,7 +5561,7 @@ pub mod engine_parity;
 /// git via the `GIT_TEST_INSTALLED` environment variable, which must point at a
 /// directory containing a working `git` executable. This module drives
 /// `scripts/run-upstream-tests.sh`, which builds such a directory whose `git`
-/// is a shim around the sley binary, runs a configurable subset of upstream
+/// launches the Sley binary directly, runs a configurable subset of upstream
 /// scripts against it, and aggregates the results. Running the upstream suite is
 /// the ultimate parity oracle.
 ///
@@ -5641,7 +5641,7 @@ pub mod upstream {
         /// Friendly command name (e.g. `config`) when the script is one of the
         /// foundational subset; otherwise falls back to the script basename.
         pub command: String,
-        /// `PASS`, `FAIL`, or `TIMEOUT`.
+        /// `PASS`, `SKIP`, `FAIL`, `ABORT`, or `TIMEOUT`.
         pub result: String,
         /// Count of TAP `ok` assertions.
         pub ok: u32,
@@ -5829,7 +5829,7 @@ pub mod upstream {
             let Some(result) = fields.next() else {
                 continue;
             };
-            if !matches!(result, "PASS" | "FAIL" | "TIMEOUT") {
+            if !matches!(result, "PASS" | "SKIP" | "FAIL" | "ABORT" | "TIMEOUT") {
                 continue;
             }
             let ok = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -6871,11 +6871,13 @@ SCRIPT                       RESULT      OK  FAIL  DETAIL
 -------------------------------------------------------------------------
 t1300-config.sh              FAIL       131   367  rc=1 (1..498)
 t3103-ls-tree-misc.sh        TIMEOUT      1     9  exceeded 120s
+t0002-gitfile.sh             ABORT        1     0  incomplete TAP
+t0003-attributes.sh          SKIP         0     0  1..0 # SKIP
 t9999-custom.sh              PASS       10     0  1..10
 not-a-row should be ignored
 ";
         let results = parse_results(stdout);
-        assert_eq!(results.len(), 3);
+        assert_eq!(results.len(), 5);
 
         let cfg = &results[0];
         assert_eq!(cfg.script, "t1300-config.sh");
@@ -6887,7 +6889,10 @@ not-a-row should be ignored
         assert_eq!(cfg.pass_rate(), 26); // 131*100/498
 
         // A non-foundational script falls back to its basename for `command`.
-        let custom = &results[2];
+        assert_eq!(results[2].result, "ABORT");
+        assert_eq!(results[3].result, "SKIP");
+
+        let custom = &results[4];
         assert_eq!(custom.command, "t9999-custom.sh");
         assert_eq!(custom.pass_rate(), 100);
     }

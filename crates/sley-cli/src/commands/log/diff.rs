@@ -434,6 +434,10 @@ impl LogDiffContext<'_> {
                         colors: None,
                         word_diff: word_request.as_ref(),
                         line_indicators: opts.line_indicators,
+                        suppress_blank_empty: self
+                            .config
+                            .get_bool("diff", None, "suppressblankempty")
+                            .unwrap_or(false),
                         no_index_contents: None,
                         submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                         submodule_dirt: None,

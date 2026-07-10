@@ -2847,6 +2847,31 @@ fn diff_two_tree_uses_committed_content_not_dirty_worktree() {
 }
 
 #[test]
+fn diff_outside_repository_implicitly_uses_no_index() {
+    let root = unique_temp_dir("diff-implicit-no-index-outside-repository");
+    fs::create_dir_all(&root).expect("create non-repository root");
+    fs::write(root.join("one"), b"one\n").expect("write old side");
+    fs::write(root.join("two"), b"two\n").expect("write new side");
+
+    let run = |program: &str| {
+        Command::new(program)
+            .current_dir(&root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .args(["diff", "one", "two"])
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {program}: {err}"))
+    };
+    let oracle = run(sley_testkit::oracle_git());
+    let actual = run(sley_testkit::sley_bin!());
+    assert_eq!(actual.status.code(), oracle.status.code());
+    assert_eq!(actual.stdout, oracle.stdout);
+    assert_eq!(actual.stderr, oracle.stderr);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn diff_no_index_rejects_stdin_directory_without_reading_stdin() {
     let root = unique_temp_dir("diff-no-index-stdin-directory");
     fs::create_dir_all(root.join("a")).expect("create directory side");

@@ -1,7 +1,7 @@
 //! `cat-file` engine parity (ported from `sley-cli/tests/cat_file.rs`).
 
 use sley::{GitObjectType, Repository};
-use sley_testkit::engine_parity::{git_size_line, EngineOutput, EngineParityCase};
+use sley_testkit::engine_parity::{EngineOutput, EngineParityCase, git_size_line};
 
 #[test]
 fn blob_type_matches_oracle() {
@@ -27,11 +27,9 @@ fn blob_type_matches_oracle() {
             EngineOutput::stdout(stdout)
         },
         |fixture| {
-            let oid = String::from_utf8_lossy(
-                &fixture.oracle_ok(&["hash-object", "hello.txt"]),
-            )
-            .trim()
-            .to_string();
+            let oid = String::from_utf8_lossy(&fixture.oracle_ok(&["hash-object", "hello.txt"]))
+                .trim()
+                .to_string();
             fixture.oracle(&["cat-file", "-t", &oid])
         },
     );
@@ -59,11 +57,9 @@ fn blob_pretty_matches_oracle() {
             EngineOutput::stdout(object.body.to_vec())
         },
         |fixture| {
-            let oid = String::from_utf8_lossy(
-                &fixture.oracle_ok(&["hash-object", "hello.txt"]),
-            )
-            .trim()
-            .to_string();
+            let oid = String::from_utf8_lossy(&fixture.oracle_ok(&["hash-object", "hello.txt"]))
+                .trim()
+                .to_string();
             fixture.oracle(&["cat-file", "-p", &oid])
         },
     );
@@ -132,11 +128,9 @@ fn blob_size_matches_oracle() {
             EngineOutput::stdout(git_size_line(size))
         },
         |fixture| {
-            let oid = String::from_utf8_lossy(
-                &fixture.oracle_ok(&["hash-object", "hello.txt"]),
-            )
-            .trim()
-            .to_string();
+            let oid = String::from_utf8_lossy(&fixture.oracle_ok(&["hash-object", "hello.txt"]))
+                .trim()
+                .to_string();
             fixture.oracle(&["cat-file", "-s", &oid])
         },
     );
@@ -361,11 +355,9 @@ fn empty_blob_type_matches_oracle() {
             EngineOutput::stdout(stdout)
         },
         |fixture| {
-            let oid = String::from_utf8_lossy(
-                &fixture.oracle_ok(&["hash-object", "empty.bin"]),
-            )
-            .trim()
-            .to_string();
+            let oid = String::from_utf8_lossy(&fixture.oracle_ok(&["hash-object", "empty.bin"]))
+                .trim()
+                .to_string();
             fixture.oracle(&["cat-file", "-t", &oid])
         },
     );
@@ -413,11 +405,9 @@ fn blob_exists_is_empty_stdout_like_oracle() {
             EngineOutput::stdout(Vec::new())
         },
         |fixture| {
-            let oid = String::from_utf8_lossy(
-                &fixture.oracle_ok(&["hash-object", "hello.txt"]),
-            )
-            .trim()
-            .to_string();
+            let oid = String::from_utf8_lossy(&fixture.oracle_ok(&["hash-object", "hello.txt"]))
+                .trim()
+                .to_string();
             fixture.oracle(&["cat-file", "-e", &oid])
         },
     );

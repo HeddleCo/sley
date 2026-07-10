@@ -1,29 +1,20 @@
 #!/usr/bin/env bash
-# Extract the SLEY_TESTS list from .github/workflows/upstream-parity.yml.
-# Prints one t-file per line (comments and YAML folding stripped).
+# Backward-compatible entry point for listing the curated upstream test surface.
 #
-# Usage:
-#   scripts/extract-sley-tests-from-workflow.sh
-#   scripts/extract-sley-tests-from-workflow.sh | wc -l
-#   SLEY_TESTS="$(scripts/extract-sley-tests-from-workflow.sh | tr '\n' ' ')"
+# The source of truth is now crates/sley-testkit/upstream-manifest.tsv; the
+# workflow intentionally says only `SLEY_TESTS: curated`.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORKFLOW="${ROOT}/.github/workflows/upstream-parity.yml"
+RUNNER="${ROOT}/crates/sley-testkit/scripts/run-upstream-tests.sh"
 
-if [[ ! -f "${WORKFLOW}" ]]; then
-  echo "workflow not found: ${WORKFLOW}" >&2
-  exit 1
+if [[ -z "${SLEY_UPSTREAM_T:-}" && -z "${GIT_SRC_DIR:-}" ]]; then
+  if [[ -f /tmp/git-src/t/test-lib.sh ]]; then
+    export GIT_SRC_DIR=/tmp/git-src
+  else
+    echo "set GIT_SRC_DIR or SLEY_UPSTREAM_T to a Git v2.55.0 source checkout" >&2
+    exit 1
+  fi
 fi
 
-awk '
-  /^          SLEY_TESTS: >-$/ { in_block = 1; next }
-  in_block && /^          [A-Z_]+:/ { exit }
-  in_block && /^            t[0-9]/ {
-    line = $0
-    sub(/^            /, "", line)
-    sub(/#.*$/, "", line)
-    gsub(/[[:space:]]+$/, "", line)
-    if (line != "") print line
-  }
-' "${WORKFLOW}"
+exec sh "${RUNNER}" --list-curated

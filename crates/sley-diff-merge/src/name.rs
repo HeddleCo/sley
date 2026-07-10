@@ -144,10 +144,8 @@ fn find_name_gnu(line: &[u8], p_value: usize, root: &[u8]) -> Option<Vec<u8>> {
     let mut cp = 0usize;
     let mut pv = p_value;
     while pv > 0 {
-        match name[cp..].iter().position(|&b| b == b'/') {
-            Some(rel) => cp += rel + 1,
-            None => return None,
-        }
+        let rel = name[cp..].iter().position(|&b| b == b'/')?;
+        cp += rel + 1;
         pv -= 1;
     }
     let mut result = Vec::with_capacity(root.len() + name.len() - cp);

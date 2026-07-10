@@ -165,6 +165,14 @@ fn commit_during_resolved_merge_matches_upstream_git() {
         !rust.join(".git/MERGE_MSG").is_file(),
         "Sley MERGE_MSG should be removed"
     );
+    assert!(
+        !upstream.join(".git/AUTO_MERGE").is_file(),
+        "upstream AUTO_MERGE should be removed"
+    );
+    assert!(
+        !rust.join(".git/AUTO_MERGE").is_file(),
+        "Sley AUTO_MERGE should be removed"
+    );
     assert_eq!(
         run_output(
             sley_testkit::oracle_git(),

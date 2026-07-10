@@ -169,7 +169,7 @@ impl RefChange {
         })
     }
 
-    /// Convert into the plumbing [`RefUpdate`] used by [`FileRefStore::transaction`].
+    /// Convert into the plumbing [`RefUpdate`] used by `FileRefStore::transaction`.
     pub fn into_update(self) -> RefUpdate {
         RefUpdate {
             name: self.name.into(),

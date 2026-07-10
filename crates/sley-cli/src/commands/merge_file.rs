@@ -18,7 +18,7 @@
 //! detection and region boundaries stay consistent across every flag.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_diff_merge};
+use sley::plumbing::sley_diff_merge;
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
 

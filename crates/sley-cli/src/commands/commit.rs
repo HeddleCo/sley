@@ -900,11 +900,6 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             );
             return Err(GitError::Exit(128));
         }
-        if amend {
-            return Err(GitError::Unsupported(
-                "commit pathspecs with --amend are not implemented".into(),
-            ));
-        }
     }
     if unified_context.is_some() && !interactive && !patch {
         eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
@@ -1451,17 +1446,28 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     }
     if !pathspec_args.is_empty() {
         let (head, tree_map) = partial_head_tree.expect("partial commit precomputed HEAD tree");
+        let parents = if amend {
+            amended_commit
+                .as_ref()
+                .map(|commit| commit.parents.clone())
+                .unwrap_or_default()
+        } else {
+            head.iter().copied().collect()
+        };
         return commit_partial_paths(
             &git_dir,
             format,
             &pathspec_args,
             head,
+            parents,
             tree_map,
             author,
             committer,
             message,
             commit_encoding_header,
             quiet,
+            amend,
+            no_post_rewrite,
         );
     }
     let precomputed_index_tree = if !allow_empty && !amend && fixup_reword_tree.is_none() {
@@ -1521,8 +1527,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         None
     };
     let initial_commit = !amend
-        && commands::merge_rebase::head_commit_oid(&FileRefStore::new(&git_dir, format))?
-            .is_none();
+        && commands::merge_rebase::head_commit_oid(&FileRefStore::new(&git_dir, format))?.is_none();
     let options = sley_sequencer::CommitIndexOptions {
         author,
         committer,
@@ -1847,17 +1852,20 @@ fn conclude_replay_via_commit(
         _ => "HEAD".to_string(),
     };
     let old_oid = head.unwrap_or_else(|| ObjectId::null(format));
+    let reflog = refs
+        .should_write_reflog_for_update(&target_ref, false)?
+        .then(|| ReflogEntry {
+            old_oid,
+            new_oid,
+            committer,
+            message: commit_reflog_message_with_initial(&message, false, head.is_none()),
+        });
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
         name: target_ref,
         expected: head.map(RefTarget::Direct),
         new: RefTarget::Direct(new_oid),
-        reflog: Some(ReflogEntry {
-            old_oid,
-            new_oid,
-            committer,
-            message: commit_reflog_message_with_initial(&message, false, head.is_none()),
-        }),
+        reflog,
     });
     tx.commit()?;
     sley_sequencer::replay::post_commit_cleanup(git_dir);
@@ -1879,12 +1887,15 @@ fn commit_partial_paths(
     format: ObjectFormat,
     paths: &[String],
     head: Option<ObjectId>,
+    parents: Vec<ObjectId>,
     mut tree_map: BTreeMap<Vec<u8>, (u32, ObjectId)>,
     author: Vec<u8>,
     committer: Vec<u8>,
     message: Vec<u8>,
     encoding: Option<Vec<u8>>,
     quiet: bool,
+    amend: bool,
+    no_post_rewrite: bool,
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let refs = FileRefStore::new(git_dir, format);
@@ -1913,7 +1924,7 @@ fn commit_partial_paths(
         &mut FileObjectDatabase::from_git_dir(git_dir, format),
         sley_sequencer::CommitCreate {
             tree,
-            parents: head.iter().copied().collect(),
+            parents,
             author,
             committer: committer.clone(),
             message: message.clone(),
@@ -1926,17 +1937,20 @@ fn commit_partial_paths(
         _ => "HEAD".to_string(),
     };
     let old_oid = head.unwrap_or_else(|| ObjectId::null(format));
+    let reflog = refs
+        .should_write_reflog_for_update(&target_ref, false)?
+        .then(|| ReflogEntry {
+            old_oid,
+            new_oid,
+            committer,
+            message: commit_reflog_message_with_initial(&message, amend, head.is_none()),
+        });
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
         name: target_ref,
         expected: head.map(RefTarget::Direct),
         new: RefTarget::Direct(new_oid),
-        reflog: Some(ReflogEntry {
-            old_oid,
-            new_oid,
-            committer,
-            message: commit_reflog_message_with_initial(&message, false, head.is_none()),
-        }),
+        reflog,
     });
     tx.commit()?;
     sley_worktree::refresh_repository_cache_tree(git_dir, format, &db)?;
@@ -1946,6 +1960,19 @@ fn commit_partial_paths(
         println!("{new_oid}");
     }
     commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
+    if amend
+        && !no_post_rewrite
+        && let Some(old_oid) = head
+    {
+        commands::hooks::run_hook(
+            "post-rewrite",
+            commands::hooks::HookRun {
+                args: vec!["amend".to_string()],
+                stdin: Some(format!("{old_oid} {new_oid}\n").into_bytes()),
+                ..commands::hooks::HookRun::default()
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -2157,7 +2184,13 @@ fn remove_commit_state_files(git_dir: &Path) {
     if let Some(format) = format {
         commands::merge_rebase::apply_merge_autostash(git_dir, format);
     }
-    for name in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG"] {
+    for name in [
+        "MERGE_HEAD",
+        "MERGE_MSG",
+        "MERGE_MODE",
+        "AUTO_MERGE",
+        "SQUASH_MSG",
+    ] {
         let _ = fs::remove_file(git_dir.join(name));
     }
 }
@@ -3038,6 +3071,7 @@ fn append_commit_diff_index_patch(
             &entry,
             DiffRenderOptions {
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                suppress_blank_empty: false,
                 binary: false,
                 anchors: &[],
                 allow_textconv: true,

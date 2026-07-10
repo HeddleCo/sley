@@ -1,24 +1,23 @@
 //! Checkout/reset ref updates and worktree resolution.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
 use std::path::Path;
+use std::path::PathBuf;
 
-use sley::{GitError, ObjectFormat, ObjectId, Result, ReferenceTarget as RefTarget};
 use sley::plumbing::sley_object::{Commit, ObjectType};
 use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
-use sley::plumbing::sley_refs::{FileRefStore, ReflogEntry, RefUpdate, branch_ref_name};
+use sley::plumbing::sley_refs::{FileRefStore, RefUpdate, ReflogEntry, branch_ref_name};
+use sley::{GitError, ObjectFormat, ObjectId, ReferenceTarget as RefTarget, Result};
 
 use crate::commands::remote::read_repo_config;
+use crate::commit_subject_bytes;
 use crate::format_log_abbrev_oid;
 use crate::log_output_encoding;
 use crate::log_reencode_message;
-use crate::commit_subject_bytes;
 use crate::revision::resolve_revision;
 use crate::setup;
 use crate::sley_rev;
 use crate::sley_worktree;
-
 
 pub(crate) fn update_reset_head_ref(
     git_dir: &Path,
@@ -241,7 +240,6 @@ pub(crate) fn resolve_checkout_merge_base_start_oid(
         }
     }
 }
-
 
 pub(crate) fn require_work_tree(git_dir: &Path) -> Result<PathBuf> {
     if let Some(result) = setup::setup_git_directory() {

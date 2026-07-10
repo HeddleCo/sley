@@ -5,11 +5,11 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use sley::{GitConfig, GitError, Index, ObjectFormat, ObjectId, Result};
 use sley::plumbing::sley_config::{ConfigEntry, ConfigSection};
 use sley::plumbing::sley_object::{ObjectType, Tag};
 use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
 use sley::plumbing::sley_refs::{FileRefStore, resolve_ref_peeled, validate_symref_name};
+use sley::{GitConfig, GitError, Index, ObjectFormat, ObjectId, Result};
 
 use crate::collect_short_status;
 use crate::collect_short_status_with_options;

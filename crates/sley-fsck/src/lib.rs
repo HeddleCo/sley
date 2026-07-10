@@ -1,8 +1,10 @@
 use sley_config::GitConfig;
-use sley_core::{ObjectFormat, ObjectId};
+use sley_core::{ObjectFormat, ObjectId, Result};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
 use sley_odb::ObjectReader;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 mod connectivity;
 pub mod content;
@@ -87,6 +89,47 @@ pub struct FsckReport {
     pub issues: Vec<FsckIssue>,
     /// Accumulated git exit-code bits (see `ERROR_*`).
     pub error_bits: i32,
+}
+
+/// Files materialized by [`write_lost_found`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LostFoundOutcome {
+    pub written_paths: Vec<PathBuf>,
+}
+
+/// Discover and materialize dangling tips under `<git-dir>/lost-found`,
+/// matching `git fsck --lost-found`.
+///
+/// Commit, tree, and tag files contain their object id plus a newline. Blob
+/// files contain the exact blob body, which makes the recovered payload useful
+/// without a second object-database lookup.
+pub fn write_lost_found<R: ObjectReader>(
+    reader: &R,
+    format: ObjectFormat,
+    git_dir: &Path,
+    roots: &[ObjectId],
+    object_ids: &[ObjectId],
+) -> Result<LostFoundOutcome> {
+    let mut outcome = LostFoundOutcome::default();
+    for (oid, object_type, _) in dangling_objects(reader, format, roots, object_ids) {
+        let class = if object_type == ObjectType::Commit {
+            "commit"
+        } else {
+            "other"
+        };
+        let path = git_dir.join("lost-found").join(class).join(oid.to_hex());
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if object_type == ObjectType::Blob {
+            let object = reader.read_object(&oid)?;
+            fs::write(&path, &object.body)?;
+        } else {
+            fs::write(&path, format!("{oid}\n"))?;
+        }
+        outcome.written_paths.push(path);
+    }
+    Ok(outcome)
 }
 
 impl FsckReport {
@@ -861,6 +904,23 @@ fn dangling_notices<R>(
 where
     R: ObjectReader,
 {
+    dangling_objects(reader, format, roots, object_ids)
+        .into_iter()
+        .map(|(oid, object_type, _)| FsckNotice {
+            message: format!("dangling {} {}", object_type.as_str(), oid),
+        })
+        .collect()
+}
+
+fn dangling_objects<R>(
+    reader: &R,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    object_ids: &[ObjectId],
+) -> Vec<(ObjectId, ObjectType, Vec<ObjectLink>)>
+where
+    R: ObjectReader,
+{
     let unreachable = unreachable_objects(reader, format, roots, object_ids);
     let unreachable_ids = unreachable
         .iter()
@@ -875,9 +935,6 @@ where
     unreachable
         .into_iter()
         .filter(|(oid, _, _)| !referenced_by_unreachable.contains(oid))
-        .map(|(oid, object_type, _)| FsckNotice {
-            message: format!("dangling {} {}", object_type.as_str(), oid),
-        })
         .collect()
 }
 
@@ -1048,6 +1105,71 @@ mod tests {
                 message: format!("dangling blob {blob}")
             }]
         );
+    }
+
+    #[test]
+    fn write_lost_found_recovers_blob_body_and_commit_oid() {
+        let format = ObjectFormat::Sha1;
+        let db = ObjectDatabase::new(format);
+        let standalone_blob = db
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"recover me\n".to_vec(),
+            ))
+            .expect("test operation should succeed");
+        let tree = db
+            .write_object(EncodedObject::new(
+                ObjectType::Tree,
+                Tree {
+                    entries: Vec::new(),
+                }
+                .write(),
+            ))
+            .expect("test operation should succeed");
+        let commit = db
+            .write_object(EncodedObject::new(
+                ObjectType::Commit,
+                Commit {
+                    tree,
+                    parents: Vec::new(),
+                    author: b"A <a@example.invalid> 0 +0000".to_vec(),
+                    committer: b"A <a@example.invalid> 0 +0000".to_vec(),
+                    encoding: None,
+                    message: b"lost\n".to_vec(),
+                }
+                .write(),
+            ))
+            .expect("test operation should succeed");
+        let git_dir = std::env::temp_dir().join(format!(
+            "sley-fsck-lost-found-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should follow unix epoch")
+                .as_nanos()
+        ));
+
+        let outcome =
+            write_lost_found(&db, format, &git_dir, &[], &[standalone_blob, tree, commit])
+                .expect("lost-found write should succeed");
+
+        assert_eq!(outcome.written_paths.len(), 2);
+        assert_eq!(
+            fs::read(
+                git_dir
+                    .join("lost-found/other")
+                    .join(standalone_blob.to_hex())
+            )
+            .expect("blob recovery should exist"),
+            b"recover me\n"
+        );
+        assert_eq!(
+            fs::read(git_dir.join("lost-found/commit").join(commit.to_hex()))
+                .expect("commit recovery should exist"),
+            format!("{commit}\n").into_bytes()
+        );
+
+        let _ = fs::remove_dir_all(git_dir);
     }
 
     #[test]

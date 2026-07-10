@@ -693,6 +693,29 @@ where
                 self.setup.options.negatives.push(commit);
             }
         }
+        // `--all` is wider than `refs/*`: revision.c enumerates the main ref
+        // namespace and then calls `refs_head_ref`, so a detached HEAD remains
+        // a pending tip even though no branch names it. Run HEAD through the
+        // same selector/exclusion state as ordinary refs; duplicate symbolic
+        // HEADs are harmless because the walk deduplicates object ids.
+        let (include_head, exclude_head) = ref_selection("HEAD", &self.ref_selectors, &hidden_refs);
+        if (include_head || exclude_head)
+            && let Some(oid) = sley_refs::resolve_ref_peeled(&store, "HEAD")?
+        {
+            if include_head {
+                self.setup.options.positives.push(RevisionTip {
+                    oid,
+                    rev: "HEAD".to_string(),
+                    source_name: Some("HEAD".to_string()),
+                    from_ref_selector: true,
+                });
+            }
+            if exclude_head
+                && let Ok(commit) = peel_to_commit(self.ctx.reader, self.ctx.format, &oid)
+            {
+                self.setup.options.negatives.push(commit);
+            }
+        }
         Ok(())
     }
 }

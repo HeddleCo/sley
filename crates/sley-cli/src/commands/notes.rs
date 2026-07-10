@@ -5,8 +5,9 @@ use crate::*;
 use sley::plumbing::sley_diff_merge::{ConflictStyle, MergeBlobOptions, merge_blobs};
 use sley_notes::{
     NotesCommitIdentity, NotesMergeConflict, NotesMergeOutcome, NotesMergeStrategy, NotesRef,
-    finalize_notes_merge, list_notes, merge_notes, notes_ref_expected, read_note,
-    read_note_from_tree, remove_note, resolve_notes_ref_with_config, upsert_note, write_notes,
+    UpsertNoteOptions, finalize_notes_merge, list_notes, merge_notes, notes_ref_expected,
+    read_note, read_note_from_tree, remove_note, remove_note_for, resolve_notes_ref_with_config,
+    upsert_note, upsert_note_for_with_options, write_notes,
 };
 
 pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
@@ -752,14 +753,12 @@ fn write_note_or_remove(
     if body.is_empty() && !allow_empty {
         eprintln!("Removing note for object {spec}");
         if had_existing {
-            let mut notes = list_notes(git_dir, format, store, &handle)?;
-            remove_note(&mut notes, target);
-            write_notes(
+            remove_note_for(
                 git_dir,
                 format,
                 store,
                 &handle,
-                &notes,
+                target,
                 &format!("Notes removed by 'git notes {verb}'"),
                 &notes_commit_identity()?,
                 notes_ref_expected(store, &handle)?,
@@ -769,18 +768,21 @@ fn write_note_or_remove(
     }
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let blob = db.write_object(EncodedObject::new(ObjectType::Blob, body))?;
-    let mut notes = list_notes(git_dir, format, store, &handle)?;
-    upsert_note(&mut notes, target, blob);
-    write_notes(
+    upsert_note_for_with_options(
         git_dir,
         format,
         store,
         &handle,
-        &notes,
+        target,
+        blob,
         &format!("Notes added by 'git notes {verb}'"),
         &notes_commit_identity()?,
         notes_ref_expected(store, &handle)?,
-    )
+        UpsertNoteOptions {
+            commit_if_unchanged: true,
+        },
+    )?;
+    Ok(())
 }
 
 /// `git notes edit [<object>]`: replace the note for `<object>` with the result

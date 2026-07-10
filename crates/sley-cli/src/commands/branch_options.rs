@@ -1,19 +1,19 @@
 #![allow(clippy::expect_used)]
 use super::{
-    branch_ahead_behind_sort_value, branch_contains_eq_value, branch_date_sort_value,
-    branch_merged_eq_value, branch_no_contains_eq_value, branch_no_merged_eq_value,
-    branch_objectname_sort_value, branch_objectsize_sort_value, branch_objecttype_sort_value,
-    branch_push_sort_value, branch_upstream_sort_value,
-    branch_version_sort_value, BranchColumnStyle, BranchCreateOptions, BranchDeleteMode,
-    BranchDeleteOptions, BranchFormatListOptions, BranchGeneralListOptions, BranchListFilters,
-    BranchListMode, BranchMoveKind, BranchMoveOptions, BranchSort, BranchTrackMode,
-    BranchUpstreamAction, BranchUpstreamOptions, BranchVerboseListOptions,
+    BranchColumnStyle, BranchCreateOptions, BranchDeleteMode, BranchDeleteOptions,
+    BranchFormatListOptions, BranchGeneralListOptions, BranchListFilters, BranchListMode,
+    BranchMoveKind, BranchMoveOptions, BranchSort, BranchTrackMode, BranchUpstreamAction,
+    BranchUpstreamOptions, BranchVerboseListOptions, branch_ahead_behind_sort_value,
+    branch_contains_eq_value, branch_date_sort_value, branch_merged_eq_value,
+    branch_no_contains_eq_value, branch_no_merged_eq_value, branch_objectname_sort_value,
+    branch_objectsize_sort_value, branch_objecttype_sort_value, branch_push_sort_value,
+    branch_upstream_sort_value, branch_version_sort_value,
 };
 use crate::commands::cli_options::{last_tri_state_bool, opt_bool, opt_str, option_bool};
 use crate::*;
 use sley_options::{
-    parse_options, CallbackValue, OptFlags, OptValue, OptionName, OptionSpec, Parsed,
-    ParsedValue, UsageError,
+    CallbackValue, OptFlags, OptValue, OptionName, OptionSpec, Parsed, ParsedValue, UsageError,
+    parse_options,
 };
 
 const BRANCH_USAGE_LINES: [&str; 8] = [
@@ -256,12 +256,7 @@ fn branch_option_specs() -> &'static [OptionSpec<'static>] {
             OptFlags::NONE,
             "copy a branch, even if target exists",
         ),
-        opt_bool(
-            Some('l'),
-            Some("list"),
-            OptFlags::NONE,
-            "list branch names",
-        ),
+        opt_bool(Some('l'), Some("list"), OptFlags::NONE, "list branch names"),
         opt_bool(
             None,
             Some("show-current"),
@@ -623,12 +618,7 @@ fn branch_verbose_list_option_specs() -> &'static [OptionSpec<'static>] {
             OptFlags::NONE,
             "show hash and subject, give twice for upstream branch",
         ),
-        opt_bool(
-            Some('l'),
-            Some("list"),
-            OptFlags::NONE,
-            "list branch names",
-        ),
+        opt_bool(Some('l'), Some("list"), OptFlags::NONE, "list branch names"),
         opt_bool(
             None,
             Some("no-delete"),

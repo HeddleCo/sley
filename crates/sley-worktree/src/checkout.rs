@@ -107,6 +107,7 @@ pub fn checkout_branch(
     };
     let current_head = resolve_head_commit_oid(git_dir, format)?;
     let files = if current_head == Some(target) {
+        reapply_active_sparse_checkout(worktree_root, git_dir, format)?;
         0
     } else {
         checkout_commit_to_index_and_worktree(worktree_root, git_dir, format, &target)?
@@ -188,6 +189,7 @@ pub fn checkout_branch_filtered(
     };
     let current_head = resolve_head_commit_oid(git_dir, format)?;
     let files = if current_head == Some(target) {
+        reapply_active_sparse_checkout(worktree_root, git_dir, format)?;
         0
     } else {
         checkout_commit_to_index_and_worktree_filtered(
@@ -215,6 +217,22 @@ pub fn checkout_branch_filtered(
         oid: target,
         files,
     })
+}
+
+/// Reconcile an already-current branch with newly enabled or changed sparse
+/// checkout rules. A normal same-HEAD checkout remains a no-op; sparse checkout
+/// is the exception because `git checkout <current-branch>` is also the legacy
+/// command that applies `.git/info/sparse-checkout` to the index and worktree.
+fn reapply_active_sparse_checkout(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    let Some((sparse, mode)) = active_sparse_checkout(git_dir)? else {
+        return Ok(());
+    };
+    apply_sparse_checkout_with_mode(worktree_root, git_dir, format, &sparse, mode)?;
+    Ok(())
 }
 
 /// Like [`checkout_detached`], but runs the smudge-side content filters (see
@@ -718,7 +736,7 @@ pub(crate) fn materialize_tree_entry_with_optional_smudge(
     entry: &TrackedEntry,
     smudge_config: Option<&GitConfig>,
     attributes: Option<&AttributeMatcher>,
-    mut delayed: Option<&mut DelayedCheckoutQueue>,
+    delayed: Option<&mut DelayedCheckoutQueue>,
 ) -> Result<IndexEntry> {
     // A symlink (mode 120000) is written as a *symlink* whose target is the raw,
     // unfiltered blob bytes — git treats symlink content as an opaque path, so no
@@ -750,7 +768,7 @@ pub(crate) fn materialize_tree_entry_with_optional_smudge(
     )? {
         SmudgeFilterResult::Content(body) => body,
         SmudgeFilterResult::Delayed { process } => {
-            if let Some(queue) = delayed.as_deref_mut() {
+            if let Some(queue) = delayed {
                 queue.enqueue(process, path, entry);
                 return Ok(unmaterialized_index_entry(path, entry));
             }
@@ -1001,6 +1019,24 @@ pub fn checkout_index_paths(
     paths: &[PathBuf],
     options: CheckoutIndexPathOptions<'_>,
 ) -> Result<RestoreResult> {
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    checkout_index_paths_with_database(worktree_root, git_dir, format, paths, &db, options)
+}
+
+/// Restore index paths using an explicitly configured object database.
+///
+/// Embedders use this variant when object content reads carry repository
+/// policy such as replacement refs. Index parsing/writing remains keyed by
+/// the raw object ids stored in the index; only blob content reads use `db`.
+pub fn checkout_index_paths_with_database(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    db: &FileObjectDatabase,
+    options: CheckoutIndexPathOptions<'_>,
+) -> Result<RestoreResult> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -1012,7 +1048,6 @@ pub fn checkout_index_paths(
         checkout_unmerge_resolve_undo_paths(worktree_root, &mut index, format, paths)?;
     }
     let stat_cache = IndexStatCache::from_index(&index, &index_path);
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let selected = checkout_selected_index_paths(worktree_root, &index, paths)?;
 
     if options.stage.is_none() && !options.merge && !options.force {
@@ -1075,7 +1110,7 @@ pub fn checkout_index_paths(
                     worktree_root,
                     git_dir,
                     format,
-                    &db,
+                    db,
                     &index.entries[position],
                     options.smudge_config,
                     Some(&stat_cache),
@@ -1090,7 +1125,7 @@ pub fn checkout_index_paths(
             if options.merge {
                 checkout_merge_unmerged_path(
                     worktree_root,
-                    &db,
+                    db,
                     &index,
                     &positions,
                     options.conflict_style,
@@ -1108,7 +1143,7 @@ pub fn checkout_index_paths(
                 worktree_root,
                 git_dir,
                 format,
-                &db,
+                db,
                 &index.entries[position],
                 options.smudge_config,
                 Some(&stat_cache),
@@ -1785,6 +1820,10 @@ pub fn reset_index_and_worktree_to_commit(
     let commit = read_commit(&db, format, commit_oid)?;
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
+    let sparse = active_sparse_checkout(git_dir)?;
+    let sparse_matcher = sparse
+        .as_ref()
+        .map(|(spec, mode)| SparseMatcher::new(spec, *mode));
     refuse_if_current_working_directory_becomes_file(worktree_root, &target_entries)?;
     let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
     let attributes = build_tree_attribute_matcher(worktree_root, &db, format, &commit.tree)?;
@@ -1804,16 +1843,32 @@ pub fn reset_index_and_worktree_to_commit(
     let mut index_entries = Vec::new();
     let mut delayed_checkout = DelayedCheckoutQueue::default();
     for (path, entry) in &target_entries {
-        index_entries.push(materialize_tree_entry_with_optional_smudge(
-            &db,
-            format,
-            worktree_root,
-            path,
-            entry,
-            Some(&config),
-            Some(&attributes),
-            Some(&mut delayed_checkout),
-        )?);
+        if sparse_matcher
+            .as_ref()
+            .is_some_and(|matcher| !matcher.includes_file(path))
+        {
+            // `reset --hard` still runs through unpack-trees' sparse-checkout
+            // filter. Out-of-cone paths remain represented in the index, but
+            // are not materialized in the worktree and carry CE_SKIP_WORKTREE.
+            // Rebuilding every target path unconditionally made a sparse-index
+            // reset appear as a mass deletion to status after those files were
+            // removed again by the next sparse-aware command.
+            remove_worktree_file(worktree_root, path)?;
+            let mut skipped = restored_head_index_entry(worktree_root, &db, path, entry)?;
+            skipped.set_skip_worktree(true);
+            index_entries.push(skipped);
+        } else {
+            index_entries.push(materialize_tree_entry_with_optional_smudge(
+                &db,
+                format,
+                worktree_root,
+                path,
+                entry,
+                Some(&config),
+                Some(&attributes),
+                Some(&mut delayed_checkout),
+            )?);
+        }
     }
     let mut delayed_updates = finish_delayed_checkout(worktree_root, delayed_checkout)?;
     for entry in &mut index_entries {
@@ -1829,6 +1884,16 @@ pub fn reset_index_and_worktree_to_commit(
         extensions,
         checksum: None,
     };
+    // `sdir` describes the old entry table. Rebuild it only after the new full
+    // target index has been classified; carrying the marker across a rebuild
+    // produces an invalid "full entries + sparse extension" hybrid.
+    index.clear_sparse_extension()?;
+    normalize_index_version_for_extended_flags(&mut index);
+    if let (Some((spec, _)), Some(matcher)) = (sparse.as_ref(), sparse_matcher.as_ref())
+        && spec.sparse_index
+    {
+        collapse_to_sparse_index(&mut index, matcher, &db, format)?;
+    }
     refresh_cache_tree(&mut index, &db);
     write_repository_index_ref(git_dir, format, &index)?;
     Ok(RestoreResult {
@@ -2192,21 +2257,38 @@ pub fn reset_index_to_commit(
     // git's `reset --mixed` preserves the skip-worktree bit on entries that survive
     // the reset (t7102 "--mixed preserves skip-worktree"): carry it forward from the
     // pre-reset index keyed by path, so reconstructed entries keep CE_SKIP_WORKTREE.
+    let sparse = active_sparse_checkout(git_dir)?;
+    let sparse_matcher = sparse
+        .as_ref()
+        .map(|(spec, mode)| SparseMatcher::new(spec, *mode));
     let index_path = repository_index_path(git_dir);
     let prior_skip_worktree: BTreeSet<Vec<u8>> = match fs::read(&index_path) {
-        Ok(bytes) => Index::parse(&bytes, format)?
-            .entries
-            .iter()
-            .filter(|entry| entry.is_skip_worktree())
-            .map(|entry| entry.path.as_bytes().to_vec())
-            .collect(),
+        Ok(bytes) => {
+            let mut prior = Index::parse(&bytes, format)?;
+            // A sparse-directory entry records only `folder/`; mixed reset
+            // preserves skip-worktree per leaf. Expand first so every path
+            // beneath the directory contributes its previous bit.
+            if prior.entries.iter().any(IndexEntry::is_sparse_dir) {
+                expand_sparse_index(&mut prior, &db, format)?;
+            }
+            prior
+                .entries
+                .iter()
+                .filter(|entry| entry.is_skip_worktree())
+                .map(|entry| entry.path.as_bytes().to_vec())
+                .collect()
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
         Err(err) => return Err(err.into()),
     };
     let mut index_entries = Vec::new();
     for (path, entry) in &target_entries {
         let mut restored = restored_head_index_entry(worktree_root, &db, path, entry)?;
-        if prior_skip_worktree.contains(path) {
+        if prior_skip_worktree.contains(path)
+            || sparse_matcher
+                .as_ref()
+                .is_some_and(|matcher| !matcher.includes_file(path))
+        {
             restored.set_skip_worktree(true);
         }
         index_entries.push(restored);
@@ -2218,7 +2300,13 @@ pub fn reset_index_to_commit(
         extensions: preserved_index_extensions(git_dir, format)?,
         checksum: None,
     };
-    index.upgrade_version_for_flags();
+    index.clear_sparse_extension()?;
+    normalize_index_version_for_extended_flags(&mut index);
+    if let (Some((spec, _)), Some(matcher)) = (sparse.as_ref(), sparse_matcher.as_ref())
+        && spec.sparse_index
+    {
+        collapse_to_sparse_index(&mut index, matcher, &db, format)?;
+    }
     refresh_cache_tree(&mut index, &db);
     write_repository_index_ref(git_dir, format, &index)?;
     Ok(RestoreResult {
@@ -2385,6 +2473,8 @@ pub fn apply_sparse_checkout_with_mode(
             materialized: Vec::new(),
             skipped: Vec::new(),
             not_up_to_date: Vec::new(),
+            unmerged: Vec::new(),
+            untracked_sparse_directories: Vec::new(),
         });
     };
     let matcher = SparseMatcher::new(sparse, mode);
@@ -2399,9 +2489,11 @@ pub fn apply_sparse_checkout_with_mode(
     let mut materialized = Vec::new();
     let mut skipped = Vec::new();
     let mut not_up_to_date = Vec::new();
+    let mut unmerged = Vec::new();
     for entry in &mut index.entries {
         // Never touch conflicted entries.
         if index_entry_stage(entry) != 0 {
+            unmerged.push(entry.path.as_bytes().to_vec());
             continue;
         }
         if matcher.includes_file(entry.path.as_bytes()) {
@@ -2435,6 +2527,13 @@ pub fn apply_sparse_checkout_with_mode(
         }
     }
     not_up_to_date.sort();
+    unmerged.sort();
+    unmerged.dedup();
+    let untracked_sparse_directories = if matches!(mode, SparseCheckoutMode::Cone) {
+        clean_tracked_sparse_directories(worktree_root, &index)?
+    } else {
+        Vec::new()
+    };
     normalize_index_version_for_extended_flags(&mut index);
     // When a sparse index was requested (cone mode + index.sparse), collapse the
     // fully-out-of-cone directories into single sparse-directory entries and
@@ -2450,7 +2549,101 @@ pub fn apply_sparse_checkout_with_mode(
         materialized,
         skipped,
         not_up_to_date,
+        unmerged,
+        untracked_sparse_directories,
     })
+}
+
+/// Removes the shallowest tracked directories that are wholly marked
+/// skip-worktree. Ignored leftovers are removed with such a directory, while a
+/// non-ignored untracked file preserves the directory and is reported to the
+/// caller. This mirrors sparse-checkout's temporary sparse-index cleanup pass.
+fn clean_tracked_sparse_directories(worktree_root: &Path, index: &Index) -> Result<Vec<Vec<u8>>> {
+    let mut directory_blocked = BTreeMap::<Vec<u8>, bool>::new();
+    for entry in &index.entries {
+        if index_entry_stage(entry) != 0 {
+            continue;
+        }
+        let path = entry.path.as_bytes();
+        let blocks_cleanup = !entry.is_skip_worktree() || sley_index::is_gitlink(entry.mode);
+        let mut start = 0usize;
+        while let Some(relative) = path
+            .get(start..)
+            .and_then(|suffix| suffix.iter().position(|byte| *byte == b'/'))
+        {
+            let end = start + relative;
+            let blocked = directory_blocked.entry(path[..end].to_vec()).or_default();
+            *blocked |= blocks_cleanup;
+            start = end + 1;
+        }
+    }
+
+    let all_candidates: Vec<Vec<u8>> = directory_blocked
+        .iter()
+        .filter(|(_, blocked)| !**blocked)
+        .map(|(directory, _)| directory.clone())
+        .collect();
+    let mut candidates: Vec<Vec<u8>> = all_candidates
+        .iter()
+        .filter(|directory| {
+            !all_candidates.iter().any(|other| {
+                other != *directory
+                    && directory
+                        .strip_prefix(other.as_slice())
+                        .is_some_and(|rest| rest.first() == Some(&b'/'))
+            })
+        })
+        .cloned()
+        .collect();
+    candidates.sort();
+
+    let mut preserved = Vec::new();
+    for directory in candidates {
+        let absolute = worktree_path(worktree_root, &directory)?;
+        if !absolute.is_dir() {
+            continue;
+        }
+        let mut stack = vec![(absolute.clone(), directory.clone())];
+        let mut has_untracked = false;
+        while let Some((current, git_prefix)) = stack.pop() {
+            for item in fs::read_dir(&current)? {
+                let item = item?;
+                let mut git_path = git_prefix.clone();
+                git_path.push(b'/');
+                git_path.extend_from_slice(&os_path_component_bytes(&item.file_name()));
+                let file_type = item.file_type()?;
+                if file_type.is_dir() {
+                    stack.push((item.path(), git_path));
+                } else if !path_matches_standard_ignore(worktree_root, &git_path, false)? {
+                    has_untracked = true;
+                    break;
+                }
+            }
+            if has_untracked {
+                break;
+            }
+        }
+        if has_untracked {
+            let mut sparse_name = directory;
+            sparse_name.push(b'/');
+            preserved.push(sparse_name);
+        } else {
+            fs::remove_dir_all(absolute)?;
+        }
+    }
+    Ok(preserved)
+}
+
+fn os_path_component_bytes(component: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        component.as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        component.to_string_lossy().replace('\\', "/").into_bytes()
+    }
 }
 
 /// Expands every sparse-directory entry in `index` back into the full set of

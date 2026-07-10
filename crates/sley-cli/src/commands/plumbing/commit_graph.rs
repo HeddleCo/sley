@@ -2,7 +2,9 @@
 #![allow(clippy::expect_used)]
 
 use crate::*;
-use sley::plumbing::{sley_config, sley_core, sley_diff_merge, sley_formats, sley_odb, sley_pack, sley_rev};
+use sley::plumbing::{
+    sley_config, sley_core, sley_diff_merge, sley_formats, sley_odb, sley_pack, sley_rev,
+};
 
 const COMMIT_GRAPH_USAGE: &str = "\
 usage: git commit-graph verify [--object-dir <dir>] [--shallow] [--[no-]progress]

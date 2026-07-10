@@ -1,9 +1,11 @@
 //! Merge, rebase, pull, cherry-pick, revert, and merge-base commands.
 
 use crate::commands::remote::{
-    FetchRecurseSubmodules, FetchSubmoduleRequest, StdoutProgress, changed_gitlinks_for_fetch,
-    fetch_bundle, fetch_populated_submodules_after_superproject, fetch_ref_snapshot,
-    fetch_source_is_ssh, fetch_ssh_repository, ls_remote_git_dir, resolve_fetch_recurse_submodules,
+    FetchRecurseSubmodules, FetchSubmoduleRequest, changed_gitlinks_for_fetch, fetch_bundle,
+    fetch_git_repository_with_outcome, fetch_http_repository_with_outcome,
+    fetch_local_repository_with_outcome, fetch_populated_submodules_after_superproject,
+    fetch_ref_snapshot, fetch_source_is_git, fetch_source_is_http, fetch_source_is_ssh,
+    fetch_ssh_repository_with_outcome, resolve_fetch_recurse_submodules,
 };
 use crate::*;
 use sley::plumbing::sley_remote::FetchOptions;
@@ -32,8 +34,10 @@ pub(crate) use merge_util::{
     merge_remove_worktree_file, merge_worktree_content, merge_write_worktree_file,
     three_way_merge_trees, three_way_merge_trees_inner_with_info,
     three_way_merge_trees_inner_with_info_opts_and_path_favor,
-    three_way_merge_trees_inner_with_info_opts_and_path_resolvers, three_way_merge_trees_styled,
-    three_way_merge_trees_with_favor, virtual_ancestor_entry_map, worktree_file_matches_ours,
+    three_way_merge_trees_inner_with_info_opts_and_path_resolvers,
+    three_way_merge_trees_outcome_with_info_opts_and_path_resolvers, three_way_merge_trees_styled,
+    three_way_merge_trees_styled_with_strategy_options, three_way_merge_trees_with_favor,
+    virtual_ancestor_entry_map, worktree_file_matches_ours,
 };
 pub(crate) use pull::{
     cmd_pull, fetch_head_merge_record, read_commit_tree, resolve_fetch_head_revision,

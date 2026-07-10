@@ -1,34 +1,17 @@
-use flate2::Compression;
-use flate2::read::ZlibDecoder;
-use flate2::write::ZlibEncoder;
-use flate2::{Decompress, FlushDecompress};
-use parking_lot::RwLock;
-use std::sync::Mutex;
 use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 use sley_formats::{Bundle, BundleReference};
-use sley_object::{
-    Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object,
-    tree_entry_object_type,
-};
+use sley_object::{EncodedObject, ObjectType};
 use sley_pack::{
-    MultiPackIndex, MultiPackIndexOidLookup, PackBitmapIndex, PackBitmapWriter, PackFile,
-    PackIndex, PackIndexByteSource, PackIndexEntry, PackIndexViewData, PackInput,
-    PackReverseIndex, PackStreamIndexBuild, PackWrite, PackWriteOptions, PackWriteSummary,
+    PackFile, PackIndex, PackInput, PackStreamIndexBuild, PackWrite, PackWriteOptions,
 };
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::{env, fs};
 
-use crate::{
-    grafted_parents, implied_empty_tree_object, unique_temp_path, with_missing_object_context,
-    ObjectReader, ObjectWriter,
-};
+use crate::{ObjectReader, ObjectWriter, unique_temp_path};
 
 use crate::pack::{FileObjectDatabase, ObjectDatabase};
-use crate::loose::LooseObjectStore;
 use crate::repack::pack_index_entries_match_writer;
 
 pub struct BundleUnbundleResult {
@@ -691,7 +674,7 @@ impl FileObjectDatabase {
 
     /// Install a pack that was produced in this process by [`PackFile::write_packed`].
     ///
-    /// Unlike [`Self::install_raw_pack_with_options`], this does not re-inflate
+    /// Unlike [`Self::install_raw_pack_from_reader_with_options`], this does not re-inflate
     /// every pack entry to rebuild the index. It validates the generated pack
     /// trailer and generated index against the writer's object ids, CRCs, and
     /// offsets, then writes those bytes directly. Use the raw installer for
@@ -780,6 +763,41 @@ impl FileObjectDatabase {
         R: Read,
     {
         self.install_raw_pack_from_reader_with_options(reader, RawPackInstallOptions::default())
+    }
+
+    /// Install a pack whose ref-deltas may use objects already available from
+    /// this database (including alternates) as bases.
+    pub fn install_raw_pack_from_reader_with_external_bases<R>(
+        &self,
+        reader: &mut R,
+    ) -> Result<PackInstallResult>
+    where
+        R: Read,
+    {
+        let mut pack = Vec::new();
+        reader.read_to_end(&mut pack)?;
+        let built = PackIndex::write_v2_for_pack_with_base(&pack, self.format, |oid| {
+            match self.read_object(oid) {
+                Ok(object) => Ok(Some((*object).clone())),
+                Err(GitError::NotFound(_)) => Ok(None),
+                Err(err) => Err(err),
+            }
+        })?;
+        let pack_dir = self.objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir)?;
+        let temp_pack_path = unique_temp_path(&pack_dir);
+        fs::write(&temp_pack_path, &pack)?;
+        let result = self.install_pack_file_from_temp(
+            &temp_pack_path,
+            built.pack_checksum,
+            &built.index,
+            built.entries.iter().map(|entry| entry.oid).collect(),
+            RawPackInstallOptions::default(),
+        );
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_pack_path);
+        }
+        result
     }
 
     pub fn begin_raw_pack_install(
@@ -877,7 +895,6 @@ impl FileObjectDatabase {
         }
         result
     }
-
 }
 
 pub(crate) fn write_pack_component(path: &Path, bytes: &[u8]) -> Result<()> {

@@ -887,7 +887,10 @@ fn run_add_patch_with_result(
     }
     let diff_text = String::from_utf8_lossy(&diff).into_owned();
     let mut files = parse_diff(&diff_text);
-    if matches!(mode, PatchMode::CheckoutNothead | PatchMode::WorktreeNothead) {
+    if matches!(
+        mode,
+        PatchMode::CheckoutNothead | PatchMode::WorktreeNothead
+    ) {
         files = files.iter().map(reverse_file_diff).collect();
     }
     if matches!(mode, PatchMode::Add | PatchMode::Reset) {

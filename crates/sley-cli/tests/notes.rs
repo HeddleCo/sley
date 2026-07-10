@@ -194,6 +194,14 @@ fn notes_add_show_list_match_git() {
             &["notes", "add", "-m", "first note", "HEAD"],
         );
         assert_notes_object_match(&expected, &actual, "refs/notes/commits");
+        // A forced overwrite with identical bytes still creates a new notes
+        // commit in Git; keep that parent advance byte-identical too.
+        assert_notes_match(
+            &expected,
+            &actual,
+            &["notes", "add", "-f", "-m", "replaced", "HEAD"],
+        );
+        assert_notes_object_match(&expected, &actual, "refs/notes/commits");
         assert_notes_match(&expected, &actual, &["notes", "show", "HEAD"]);
         // Default object is HEAD.
         assert_notes_match(&expected, &actual, &["notes", "show"]);

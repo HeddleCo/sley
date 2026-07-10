@@ -1,18 +1,15 @@
 //! `init` engine parity.
 
-use sley::{ObjectFormat, Repository};
 use sley::plumbing::sley_formats::RepositoryLayout;
+use sley::{ObjectFormat, Repository};
 use sley_testkit::engine_parity::{
-    git_bool_line, git_config_line, git_path_line, git_symbolic_ref_line, EngineOutput,
-    EngineParityCase,
+    EngineOutput, EngineParityCase, git_bool_line, git_config_line, git_path_line,
+    git_symbolic_ref_line,
 };
 
 fn head_symbolic_ref(repo: &Repository) -> EngineOutput {
     let head = repo.head().expect("head");
-    let target = head
-        .symbolic_target
-        .expect("symbolic HEAD")
-        .to_string();
+    let target = head.symbolic_target.expect("symbolic HEAD").to_string();
     EngineOutput::stdout(git_symbolic_ref_line(&target))
 }
 
@@ -121,13 +118,8 @@ fn bare_init_topic_branch_matches_oracle() {
         |_| {},
         |fixture| {
             let bare = fixture.path().join("topic.git");
-            RepositoryLayout::init_at_with_initial_branch(
-                &bare,
-                ObjectFormat::Sha1,
-                true,
-                "topic",
-            )
-            .expect("init bare");
+            RepositoryLayout::init_at_with_initial_branch(&bare, ObjectFormat::Sha1, true, "topic")
+                .expect("init bare");
             let repo = Repository::open(&bare).expect("open bare");
             head_symbolic_ref(&repo)
         },
@@ -147,9 +139,7 @@ fn bare_init_is_bare_repository_matches_oracle() {
             Repository::init_bare(&bare).expect("init bare");
             let repo = Repository::open(&bare).expect("open bare");
             let config = repo.config().expect("config");
-            let is_bare = config
-                .get_bool("core", None, "bare")
-                .unwrap_or(false);
+            let is_bare = config.get_bool("core", None, "bare").unwrap_or(false);
             EngineOutput::stdout(git_bool_line(is_bare))
         },
         |fixture| {
@@ -209,7 +199,10 @@ fn bare_init_core_bare_true_matches_oracle() {
         },
         |fixture| {
             fixture.oracle_ok(&["init", "-q", "--bare", "bare.git", "-b", "main"]);
-            fixture.oracle_in(&fixture.path().join("bare.git"), &["config", "--get", "core.bare"])
+            fixture.oracle_in(
+                &fixture.path().join("bare.git"),
+                &["config", "--get", "core.bare"],
+            )
         },
     );
 }
@@ -222,9 +215,11 @@ fn init_repositoryformatversion_matches_oracle() {
             Repository::init(fixture.path()).expect("init");
             let repo = Repository::discover(fixture.path()).expect("discover");
             let config = repo.config().expect("config");
-            EngineOutput::stdout(git_config_line(
-                config.get("core", None, "repositoryformatversion"),
-            ))
+            EngineOutput::stdout(git_config_line(config.get(
+                "core",
+                None,
+                "repositoryformatversion",
+            )))
         },
         |fixture| {
             fixture.oracle_ok(&["init", "-q", "-b", "main"]);

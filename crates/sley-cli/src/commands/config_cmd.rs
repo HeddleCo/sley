@@ -1010,8 +1010,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 .filter(|entry| entry.matches(&key.section, key.subsection.as_deref(), &key.key))
             {
                 let meta = ConfigValueMeta::of(entry);
-                let Some(value) = format_config_entry_value(entry, value_type, &name)?
-                else {
+                let Some(value) = format_config_entry_value(entry, value_type, &name)? else {
                     continue;
                 };
                 selected = Some((meta, value));
@@ -1148,8 +1147,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             let mut stdout = io::stdout();
             let mut wrote = false;
             for entry in values {
-                let Some(formatted) = format_config_entry_value(entry, value_type, &name)?
-                else {
+                let Some(formatted) = format_config_entry_value(entry, value_type, &name)? else {
                     continue;
                 };
                 wrote = true;
@@ -2882,8 +2880,7 @@ fn config_subcommand_get(
         {
             continue;
         }
-        let Some(value) = format_config_entry_value(entry, value_type, &name)?
-        else {
+        let Some(value) = format_config_entry_value(entry, value_type, &name)? else {
             continue;
         };
         matches.push(ConfigGetMatch {

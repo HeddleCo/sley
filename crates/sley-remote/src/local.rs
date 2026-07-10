@@ -28,25 +28,27 @@ use sley_odb::{
 use sley_protocol::{
     PKT_LINE_MAX_PAYLOAD_LEN, PktLineFrame, ProtocolV2FetchAcknowledgment, ProtocolV2FetchFeatures,
     ProtocolV2FetchRequest, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
-    ProtocolV2LsRefsFeatures, ProtocolV2LsRefsRecord, ProtocolV2LsRefsRef, ProtocolV2LsRefsRequest,
-    ProtocolVersion, ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures,
-    ReceivePackPushRequest, ReceivePackPushRequestHeader, ReceivePackReportStatus,
-    ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement, SideBandChannel, SideBandPacket,
-    TransportHandshake, UploadPackFeatures, UploadPackNegotiationRequest,
-    UploadPackPackfileResponse, UploadPackRawPackfileResponse, UploadPackRequest,
-    apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
-    classify_protocol_v2_command_request, encode_protocol_v2_fetch_capability,
-    encode_protocol_v2_ls_refs_capability, encode_receive_pack_features,
-    encode_upload_pack_features, read_protocol_v2_command_request,
+    ProtocolV2FetchWantedRef, ProtocolV2LsRefsFeatures, ProtocolV2LsRefsRecord,
+    ProtocolV2LsRefsRef, ProtocolV2LsRefsRequest, ProtocolVersion, ReceivePackCommand,
+    ReceivePackCommandStatus, ReceivePackFeatures, ReceivePackPushRequest,
+    ReceivePackPushRequestHeader, ReceivePackReportStatus, ReceivePackRequest,
+    ReceivePackUnpackStatus, RefAdvertisement, SideBandChannel, SideBandPacket, TransportHandshake,
+    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackPackfileResponse,
+    UploadPackRawPackfileResponse, UploadPackRequest, apply_receive_pack_push_request,
+    build_upload_pack_raw_packfile_response, classify_protocol_v2_command_request,
+    encode_protocol_v2_fetch_capability, encode_protocol_v2_ls_refs_capability,
+    encode_receive_pack_features, encode_upload_pack_features, read_protocol_v2_command_request,
     read_upload_pack_negotiation_request, read_upload_pack_request,
     validate_receive_pack_push_request_features, write_pkt_line_frame, write_pkt_line_payload,
-    write_protocol_v2_advertisement, write_protocol_v2_fetch_response,
-    write_protocol_v2_ls_refs_response, write_upload_pack_negotiation_request,
-    write_upload_pack_request,
+    write_protocol_v2_advertisement, write_protocol_v2_fetch_request,
+    write_protocol_v2_fetch_response, write_protocol_v2_ls_refs_response,
+    write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::{
     DeleteRef, FileRefStore, Ref, RefDeletePrecondition, RefPrecondition, RefTarget, ReflogEntry,
 };
+
+use crate::install::install_protocol_v2_fetch_response_from_reader;
 
 /// The all-zero object id for `format`, used for the synthetic
 /// `capabilities^{}` advertisement when a repository has no refs.
@@ -1070,9 +1072,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
 
     let request = UploadPackRequest {
         wants,
-        filter: filter
-            .as_ref()
-            .and_then(upload_pack_filter_protocol_spec),
+        filter: filter.as_ref().and_then(upload_pack_filter_protocol_spec),
         // The `shallow` capability accompanies a deepen request on the wire
         // (mirrors the SSH path); a plain fetch keeps its existing wire form.
         capabilities: deepen
@@ -1200,6 +1200,129 @@ pub fn install_fetch_pack_via_local_upload_pack(
         .unwrap_or_default())
 }
 
+/// Inputs for one in-process protocol-v2 fetch using `want-ref`.
+pub(crate) struct LocalProtocolV2FetchRequest<'a> {
+    pub git_dir: &'a Path,
+    pub remote_git_dir: &'a Path,
+    pub format: ObjectFormat,
+    pub wants: Vec<ObjectId>,
+    pub want_refs: Vec<String>,
+    pub haves: Option<Vec<ObjectId>>,
+}
+
+/// Structured result of an in-process protocol-v2 `want-ref` fetch.
+#[derive(Debug, Default)]
+pub(crate) struct LocalProtocolV2FetchOutcome {
+    pub wanted_refs: Vec<ProtocolV2FetchWantedRef>,
+    pub shallow_info: Vec<ProtocolV2FetchShallowInfo>,
+}
+
+/// Round-trip a normal, non-shallow local fetch through protocol v2 so a
+/// ref-in-want capable server resolves ref names at request time rather than
+/// relying on the earlier `ls-refs` snapshot.
+pub(crate) fn install_fetch_pack_via_local_protocol_v2(
+    input: LocalProtocolV2FetchRequest<'_>,
+) -> Result<LocalProtocolV2FetchOutcome> {
+    if input.wants.is_empty() && input.want_refs.is_empty() {
+        return Ok(LocalProtocolV2FetchOutcome::default());
+    }
+
+    let config = sley_config::read_repo_config(input.remote_git_dir, None).unwrap_or_default();
+    let handshake = TransportHandshake {
+        protocol: ProtocolVersion::V2,
+        capabilities: upload_pack_v2_capabilities(input.format, &config)?,
+    };
+    let haves = input
+        .haves
+        .map(Ok)
+        .unwrap_or_else(|| local_have_oids(input.git_dir, input.format))?;
+    let local_db = FileObjectDatabase::from_git_dir(input.git_dir, input.format);
+    let remote_db = FileObjectDatabase::from_git_dir(input.remote_git_dir, input.format);
+    let negotiation_rounds = protocol_v2_negotiation_rounds(&local_db, &remote_db, &haves)?;
+    let fetch = ProtocolV2FetchRequest {
+        wants: input.wants,
+        want_refs: input.want_refs,
+        haves,
+        thin_pack: true,
+        include_tag: true,
+        ofs_delta: true,
+        done: true,
+        wait_for_done: true,
+        ..ProtocolV2FetchRequest::default()
+    };
+
+    // Exercise the same request codec and feature validation as a network
+    // transport. Besides guarding the in-process boundary, the write emits the
+    // exact `want`/`want-ref` packet trace expected from a v2 client.
+    let mut request_bytes = Vec::new();
+    write_protocol_v2_fetch_request(&mut request_bytes, &fetch)?;
+    let command = read_protocol_v2_command_request(&mut request_bytes.as_slice())?;
+    let decoded = match classify_protocol_v2_command_request(&handshake, input.format, &command)? {
+        sley_protocol::ProtocolV2Command::Fetch(fetch) => fetch,
+        _ => {
+            return Err(GitError::InvalidFormat(
+                "local protocol-v2 fetch decoded as a non-fetch command".into(),
+            ));
+        }
+    };
+
+    let mut sections = local_fetch_v2_sections(input.remote_git_dir, input.format, &decoded)?;
+    // If every resolved want is already local, the pack builder has nothing to
+    // send. Keep the wanted-refs mapping but omit an empty packfile section.
+    sections.retain(|section| {
+        !matches!(section, ProtocolV2FetchResponseSection::Packfile(lines) if lines.is_empty())
+    });
+    let mut response_bytes = Vec::new();
+    write_protocol_v2_fetch_response(&mut response_bytes, &sections)?;
+
+    let (header, _) = install_protocol_v2_fetch_response_from_reader(
+        input.format,
+        &mut response_bytes.as_slice(),
+        false,
+        &local_db,
+        None,
+    )?;
+    let mut outcome = LocalProtocolV2FetchOutcome::default();
+    for section in header.sections {
+        match section {
+            ProtocolV2FetchResponseSection::WantedRefs(wanted) => {
+                outcome.wanted_refs.extend(wanted);
+            }
+            ProtocolV2FetchResponseSection::ShallowInfo(shallow) => {
+                outcome.shallow_info.extend(shallow);
+            }
+            _ => {}
+        }
+    }
+    sley_core::trace2::data("negotiation_v2", "total_rounds", negotiation_rounds);
+    Ok(outcome)
+}
+
+fn protocol_v2_negotiation_rounds(
+    local_db: &FileObjectDatabase,
+    remote_db: &FileObjectDatabase,
+    haves: &[ObjectId],
+) -> Result<usize> {
+    let mut missing_commits = 0usize;
+    for oid in haves {
+        if !remote_db.contains(oid)? && local_db.read_object(oid)?.object_type == ObjectType::Commit
+        {
+            missing_commits += 1;
+        }
+    }
+    // Git's consecutive negotiator starts with sixteen commits and doubles
+    // the next batch. Count the request/response rounds needed before a common
+    // commit can be reached; the final batch is the round carrying `done`.
+    let mut rounds = 1usize;
+    let mut batch = 16usize;
+    while missing_commits > batch {
+        missing_commits -= batch;
+        batch = batch.saturating_mul(2);
+        rounds += 1;
+    }
+    Ok(rounds)
+}
+
 fn local_upload_pack_client_wants_v2(git_dir: &Path) -> bool {
     sley_config::read_repo_config(git_dir, None)
         .ok()
@@ -1256,7 +1379,9 @@ fn trace_local_upload_pack_v2_capabilities(remote_git_dir: &Path, format: Object
     sley_protocol::trace_packet_read_payload(b"0000");
 }
 
-pub(crate) fn upload_pack_filter_protocol_spec(filter: &sley_odb::PackObjectFilter) -> Option<String> {
+pub(crate) fn upload_pack_filter_protocol_spec(
+    filter: &sley_odb::PackObjectFilter,
+) -> Option<String> {
     match filter {
         sley_odb::PackObjectFilter::BlobNone => Some("blob:none".to_string()),
         sley_odb::PackObjectFilter::BlobLimit(limit) => Some(format!("blob:limit={limit}")),
@@ -1635,8 +1760,9 @@ fn local_fetch_v2_sections(
     // client uses these `shallow` lines to detect a shallow source — in
     // particular `git clone --reject-shallow` dies when they are present. The
     // section must precede the packfile section per gitprotocol-v2.
-    let request_is_deepening =
-        request.deepen.is_some() || request.deepen_since.is_some() || !request.deepen_not.is_empty();
+    let request_is_deepening = request.deepen.is_some()
+        || request.deepen_since.is_some()
+        || !request.deepen_not.is_empty();
     if !request_is_deepening {
         let server_shallow = crate::shallow::read_shallow(git_dir, format)?;
         if !server_shallow.is_empty() {
@@ -1805,6 +1931,58 @@ mod tests {
                 .iter()
                 .any(|capability| capability.name == "no-thin")
         );
+    }
+
+    #[test]
+    fn protocol_v2_local_fetch_resolves_want_ref_and_installs_tip() {
+        let root = unique_local_test_dir("protocol-v2-want-ref");
+        let remote_git = root.join("remote.git");
+        let client_git = root.join("client.git");
+        for git_dir in [&remote_git, &client_git] {
+            fs::create_dir_all(git_dir.join("objects")).expect("test repository objects");
+            fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+                .expect("test repository HEAD");
+        }
+        fs::create_dir_all(remote_git.join("refs/heads")).expect("test repository refs");
+        fs::write(
+            remote_git.join("config"),
+            b"[uploadpack]\n\tallowRefInWant = true\n",
+        )
+        .expect("test repository config");
+
+        let format = ObjectFormat::Sha1;
+        let remote_db = FileObjectDatabase::from_git_dir(&remote_git, format);
+        let blob_oid = write_test_object(
+            &remote_db,
+            &EncodedObject::new(ObjectType::Blob, b"wanted\n".to_vec()),
+        );
+        let tree_oid = write_test_object(&remote_db, &test_tree(&[(0o100644, b"file", blob_oid)]));
+        let commit_oid = write_test_object(&remote_db, &test_commit(tree_oid, &[], b"tip\n"));
+        fs::write(
+            remote_git.join("refs/heads/main"),
+            format!("{commit_oid}\n"),
+        )
+        .expect("test repository main ref");
+
+        let outcome = install_fetch_pack_via_local_protocol_v2(LocalProtocolV2FetchRequest {
+            git_dir: &client_git,
+            remote_git_dir: &remote_git,
+            format,
+            wants: Vec::new(),
+            want_refs: vec!["refs/heads/main".into()],
+            haves: Some(Vec::new()),
+        })
+        .expect("protocol-v2 want-ref fetch");
+
+        assert_eq!(outcome.wanted_refs.len(), 1);
+        assert_eq!(outcome.wanted_refs[0].name, "refs/heads/main");
+        assert_eq!(outcome.wanted_refs[0].oid, commit_oid);
+        assert!(
+            FileObjectDatabase::from_git_dir(&client_git, format)
+                .contains(&commit_oid)
+                .expect("client object lookup")
+        );
+        fs::remove_dir_all(root).expect("remove test repositories");
     }
 
     #[test]

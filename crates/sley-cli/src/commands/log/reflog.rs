@@ -12,7 +12,7 @@ pub(super) struct ReflogWalkOptions<'a> {
 pub(super) fn log_walk_reflogs(
     git_dir: &Path,
     format: ObjectFormat,
-    revisions: &[String],
+    revisions: &[(String, bool)],
     opts: ReflogWalkOptions<'_>,
 ) -> Result<()> {
     let store = FileRefStore::new(git_dir, format);
@@ -66,7 +66,7 @@ pub(super) fn log_walk_reflogs(
                         db: &mut db,
                         format,
                         display_reference: &target.display_reference,
-                        full_reference: &target.reference,
+                        full_reference: &target.full_display_reference,
                         date_mode: opts.date_mode,
                         decorations: &decorations,
                         mailmap: &mailmap,
@@ -107,6 +107,7 @@ pub(super) fn log_walk_reflogs(
 struct ReflogWalkTarget {
     reference: String,
     display_reference: String,
+    full_display_reference: String,
     date_selector: bool,
     /// The numeric `@{N}` selector: the walk starts at reflog entry `N`
     /// (`HEAD@{1}` skips the most-recent entry and starts one older). Zero for a
@@ -115,11 +116,22 @@ struct ReflogWalkTarget {
 }
 
 impl ReflogWalkTarget {
-    fn new(revision: Option<&String>) -> Result<Self> {
-        let original = revision.map(String::as_str);
+    fn new(revision: Option<&(String, bool)>) -> Result<Self> {
+        let original = revision.map(|(revision, _)| revision.as_str());
         let reference = reflog_reference_name(original)?;
+        let display_reference = reflog_walk_display_reference(&reference);
+        // `%gD` normally preserves the full spelling supplied by the caller,
+        // while `%gd` shortens a branch name. A pseudo-ref selector such as
+        // `--branches=root*` does not have an explicit full spelling: Git feeds
+        // the namespace-trimmed branch name to the reflog walk for both atoms.
+        let full_display_reference = if revision.is_some_and(|(_, from_selector)| *from_selector) {
+            display_reference.clone()
+        } else {
+            reference.clone()
+        };
         Ok(Self {
-            display_reference: reflog_walk_display_reference(&reference),
+            display_reference,
+            full_display_reference,
             reference,
             date_selector: original.is_some_and(reflog_revision_uses_date_selector),
             start_offset: original.map(reflog_revision_start_offset).unwrap_or(0),

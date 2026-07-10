@@ -1,202 +1,223 @@
+use crate::sley_config;
 use crate::{
     common_git_dir_for_git_dir, global_config_value, injected_config_parameters,
     report_config_setup_error,
 };
-use crate::sley_config;
 use sley::plumbing::sley_config::ConfigIncludeContext;
 use sley::{GitError, Result};
-use sley_options::{OptFlags, OptValue, OptionSpec, completion_helper_options};
+use sley_options::{
+    CommandFlags, CommandRegistry, CommandSpec, OptFlags, OptValue, OptionSpec,
+    completion_helper_options,
+};
 use std::collections::BTreeSet;
 use std::env;
 use std::path::Path;
 use std::process::Command;
 
-pub(crate) const BUILTIN_COMMANDS: &[&str] = &[
-    "add",
-    "am",
-    "annotate",
-    "apply",
-    "archive",
-    "bisect",
-    "blame",
-    "branch",
-    "bugreport",
-    "bundle",
-    "cat-file",
-    "check-attr",
-    "check-ignore",
-    "check-mailmap",
-    "check-ref-format",
-    "checkout",
-    "checkout-index",
-    "cherry-pick",
-    "clean",
-    "clone",
-    "commit",
-    "commit-graph",
-    "commit-tree",
-    "config",
-    "count-objects",
-    "credential",
-    "credential-cache",
-    "credential-cache--daemon",
-    "credential-store",
-    "daemon",
-    "describe",
-    "diagnose",
-    "diff",
-    "diff-files",
-    "diff-index",
-    "diff-tree",
-    "difftool",
-    "fast-export",
-    "fast-import",
-    "fetch",
-    "fetch-pack",
-    "filter-branch",
-    "fmt-merge-msg",
-    "for-each-ref",
-    "for-each-repo",
-    "format-patch",
-    "format-rev",
-    "fsck",
-    "gc",
-    "get-tar-commit-id",
-    "grep",
-    "hash-object",
-    "help",
-    "hook",
-    "index-pack",
-    "init",
-    "interpret-trailers",
-    "last-modified",
-    "log",
-    "ls-files",
-    "ls-remote",
-    "ls-tree",
-    "maintenance",
-    "merge",
-    "merge-base",
-    "merge-file",
-    "merge-index",
-    "merge-recursive",
-    "merge-tree",
-    "mergetool",
-    "mktag",
-    "mktree",
-    "multi-pack-index",
-    "mv",
-    "name-rev",
-    "notes",
-    "pack-objects",
-    "pack-redundant",
-    "pack-refs",
-    "patch-id",
-    "prune",
-    "prune-packed",
-    "pull",
-    "push",
-    "range-diff",
-    "read-tree",
-    "rebase",
-    "receive-pack",
-    "reflog",
-    "refs",
-    "remote",
-    "repack",
-    "replace",
-    "replay",
-    "repo",
-    "rerere",
-    "reset",
-    "restore",
-    "rev-list",
-    "rev-parse",
-    "revert",
-    "rm",
-    "send-pack",
+// Native dispatch and Git's own builtin classification are deliberately
+// separate. Some commands implemented in-process by Sley are shell/perl
+// commands in Git, while some Git builtins are reserved until their native
+// Sley implementation lands.
+const NATIVE: CommandFlags = CommandFlags::from_bits(1 << 0);
+const MAIN_PORCELAIN: CommandFlags = CommandFlags::from_bits(1 << 1);
+const PARSEOPT_HELPER: CommandFlags = CommandFlags::from_bits(1 << 2);
+const RESERVED_CORE_HELPER: CommandFlags = CommandFlags::from_bits(1 << 3);
+const GIT_BUILTIN: CommandFlags = CommandFlags::from_bits(1 << 4);
+const USAGE_HELP: CommandFlags = CommandFlags::from_bits(1 << 5);
+const BUILTIN: CommandFlags = NATIVE.union(GIT_BUILTIN);
+const BUILTIN_MAIN: CommandFlags = BUILTIN.union(MAIN_PORCELAIN);
+const BUILTIN_PARSEOPT: CommandFlags = BUILTIN.union(PARSEOPT_HELPER);
+const BUILTIN_MAIN_PARSEOPT: CommandFlags = BUILTIN_MAIN.union(PARSEOPT_HELPER);
+const NATIVE_MAIN: CommandFlags = NATIVE.union(MAIN_PORCELAIN);
+const GIT_BUILTIN_RESERVED: CommandFlags = GIT_BUILTIN.union(RESERVED_CORE_HELPER);
+const HELP_RESERVED: CommandFlags = USAGE_HELP.union(RESERVED_CORE_HELPER);
+const MAIN_RESERVED: CommandFlags = MAIN_PORCELAIN.union(RESERVED_CORE_HELPER);
+
+static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
+    CommandSpec::new("add", BUILTIN_MAIN),
+    CommandSpec::new("am", BUILTIN_MAIN),
+    CommandSpec::new("annotate", BUILTIN),
+    CommandSpec::new("apply", BUILTIN),
+    CommandSpec::new("archimport", RESERVED_CORE_HELPER),
+    CommandSpec::new("archive", BUILTIN),
+    CommandSpec::new("backfill", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("bisect", BUILTIN_MAIN),
+    CommandSpec::new("blame", BUILTIN),
+    CommandSpec::new("branch", BUILTIN_MAIN),
+    CommandSpec::new("bugreport", BUILTIN),
+    CommandSpec::new("bundle", BUILTIN),
+    CommandSpec::new("cat-file", BUILTIN),
+    CommandSpec::new("check-attr", BUILTIN),
+    CommandSpec::new("check-ignore", BUILTIN),
+    CommandSpec::new("check-mailmap", BUILTIN),
+    CommandSpec::new("check-ref-format", BUILTIN),
+    CommandSpec::new("checkout", BUILTIN_MAIN_PARSEOPT),
+    CommandSpec::new("checkout--worker", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("checkout-index", BUILTIN),
+    CommandSpec::new("cherry", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("cherry-pick", BUILTIN_MAIN),
+    CommandSpec::new("clean", BUILTIN_MAIN),
+    CommandSpec::new("clone", BUILTIN_MAIN_PARSEOPT),
+    CommandSpec::new("column", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("commit", BUILTIN_MAIN),
+    CommandSpec::new("commit-graph", BUILTIN),
+    CommandSpec::new("commit-tree", BUILTIN),
+    CommandSpec::new("config", BUILTIN_PARSEOPT),
+    CommandSpec::new("count-objects", BUILTIN),
+    CommandSpec::new("credential", BUILTIN),
+    CommandSpec::new("credential-cache", BUILTIN),
+    CommandSpec::new("credential-cache--daemon", BUILTIN),
+    CommandSpec::new("credential-store", BUILTIN),
+    CommandSpec::new("cvsexportcommit", RESERVED_CORE_HELPER),
+    CommandSpec::new("cvsimport", RESERVED_CORE_HELPER),
+    CommandSpec::new("cvsserver", RESERVED_CORE_HELPER),
+    CommandSpec::new("daemon", NATIVE),
+    CommandSpec::new("describe", BUILTIN_MAIN),
+    CommandSpec::new("diagnose", BUILTIN),
+    CommandSpec::new("diff", BUILTIN_MAIN),
+    CommandSpec::new("diff-files", BUILTIN),
+    CommandSpec::new("diff-index", BUILTIN),
+    CommandSpec::new("diff-pairs", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("diff-tree", BUILTIN),
+    CommandSpec::new("difftool", BUILTIN),
+    CommandSpec::new("difftool--helper", RESERVED_CORE_HELPER),
+    CommandSpec::new("fast-export", BUILTIN),
+    CommandSpec::new("fast-import", BUILTIN),
+    CommandSpec::new("fetch", BUILTIN_MAIN),
+    CommandSpec::new("fetch-pack", BUILTIN),
+    CommandSpec::new("filter-branch", NATIVE),
+    CommandSpec::new("fmt-merge-msg", BUILTIN),
+    CommandSpec::new("for-each-ref", BUILTIN),
+    CommandSpec::new("for-each-repo", BUILTIN),
+    CommandSpec::new("format-patch", BUILTIN_MAIN),
+    CommandSpec::new("format-rev", BUILTIN),
+    CommandSpec::new("fsck", BUILTIN),
+    CommandSpec::new("fsck-objects", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("fsmonitor--daemon", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("gc", BUILTIN),
+    CommandSpec::new("get-tar-commit-id", BUILTIN),
+    CommandSpec::new("gitk", MAIN_RESERVED),
+    CommandSpec::new("grep", BUILTIN_MAIN),
+    CommandSpec::new("hash-object", BUILTIN),
+    CommandSpec::new("help", BUILTIN_PARSEOPT),
+    CommandSpec::new("history", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("hook", BUILTIN),
+    CommandSpec::new("http-backend", NATIVE),
+    CommandSpec::new("http-fetch", RESERVED_CORE_HELPER),
+    CommandSpec::new("http-push", RESERVED_CORE_HELPER),
+    CommandSpec::new("imap-send", NATIVE.union(USAGE_HELP)),
+    CommandSpec::new("index-pack", BUILTIN),
+    CommandSpec::new("init", BUILTIN),
+    CommandSpec::new("init-db", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("instaweb", HELP_RESERVED),
+    CommandSpec::new("interpret-trailers", BUILTIN),
+    CommandSpec::new("last-modified", BUILTIN),
+    CommandSpec::new("log", BUILTIN_MAIN),
+    CommandSpec::new("ls-files", BUILTIN),
+    CommandSpec::new("ls-remote", BUILTIN_PARSEOPT),
+    CommandSpec::new("ls-tree", BUILTIN),
+    CommandSpec::new("mailinfo", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("mailsplit", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("maintenance", BUILTIN),
+    CommandSpec::new("merge", BUILTIN_MAIN),
+    CommandSpec::new("merge-base", BUILTIN),
+    CommandSpec::new("merge-file", BUILTIN),
+    CommandSpec::new("merge-index", BUILTIN),
+    CommandSpec::new("merge-octopus", RESERVED_CORE_HELPER),
+    CommandSpec::new("merge-one-file", RESERVED_CORE_HELPER),
+    CommandSpec::new("merge-ours", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("merge-recursive", BUILTIN),
+    CommandSpec::new("merge-recursive-ours", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("merge-recursive-theirs", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("merge-resolve", RESERVED_CORE_HELPER),
+    CommandSpec::new("merge-subtree", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("merge-tree", BUILTIN),
+    CommandSpec::new("mergetool", NATIVE_MAIN),
+    CommandSpec::new("mktag", BUILTIN),
+    CommandSpec::new("mktree", BUILTIN),
+    CommandSpec::new("multi-pack-index", BUILTIN),
+    CommandSpec::new("mv", BUILTIN_MAIN),
+    CommandSpec::new("name-rev", BUILTIN),
+    CommandSpec::new("notes", BUILTIN_PARSEOPT),
+    CommandSpec::new("p4", RESERVED_CORE_HELPER),
+    CommandSpec::new("pack-objects", BUILTIN),
+    CommandSpec::new("pack-redundant", BUILTIN),
+    CommandSpec::new("pack-refs", BUILTIN),
+    CommandSpec::new("patch-id", BUILTIN),
+    CommandSpec::new("pickaxe", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("prune", BUILTIN),
+    CommandSpec::new("prune-packed", BUILTIN),
+    CommandSpec::new("pull", BUILTIN_MAIN),
+    CommandSpec::new("push", BUILTIN_MAIN),
+    CommandSpec::new("quiltimport", HELP_RESERVED),
+    CommandSpec::new("range-diff", BUILTIN),
+    CommandSpec::new("read-tree", BUILTIN),
+    CommandSpec::new("rebase", BUILTIN_MAIN),
+    CommandSpec::new("receive-pack", BUILTIN),
+    CommandSpec::new("reflog", BUILTIN),
+    CommandSpec::new("refs", BUILTIN),
+    CommandSpec::new("remote", BUILTIN_PARSEOPT),
+    CommandSpec::new("remote-ext", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("remote-fd", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("remote-ftp", RESERVED_CORE_HELPER),
+    CommandSpec::new("remote-ftps", RESERVED_CORE_HELPER),
+    CommandSpec::new("remote-http", NATIVE),
+    CommandSpec::new("remote-https", RESERVED_CORE_HELPER),
+    CommandSpec::new("repack", BUILTIN),
+    CommandSpec::new("replace", BUILTIN),
+    CommandSpec::new("replay", BUILTIN),
+    CommandSpec::new("repo", BUILTIN),
+    CommandSpec::new("request-pull", HELP_RESERVED),
+    CommandSpec::new("rerere", BUILTIN),
+    CommandSpec::new("reset", BUILTIN_MAIN),
+    CommandSpec::new("restore", BUILTIN_MAIN),
+    CommandSpec::new("rev-list", BUILTIN),
+    CommandSpec::new("rev-parse", BUILTIN),
+    CommandSpec::new("revert", BUILTIN_MAIN),
+    CommandSpec::new("rm", BUILTIN_MAIN),
+    CommandSpec::new("send-email", RESERVED_CORE_HELPER),
+    CommandSpec::new("send-pack", BUILTIN),
     #[cfg(feature = "git-compat-i18n")]
-    "sh-i18n--envsubst",
-    "shortlog",
-    "show",
-    "show-branch",
-    "show-index",
-    "show-ref",
-    "sparse-checkout",
-    "stash",
-    "status",
-    "stripspace",
-    "submodule",
-    "switch",
-    "symbolic-ref",
-    "tag",
-    "testkit",
-    "unpack-file",
-    "unpack-objects",
-    "update-index",
-    "update-ref",
-    "update-server-info",
-    "upload-pack",
-    "var",
-    "verify-commit",
-    "verify-pack",
-    "verify-tag",
-    "version",
-    "whatchanged",
-    "worktree",
-    "write-tree",
-];
-
-const MAIN_PORCELAIN_COMMANDS: &[&str] = &[
-    "add",
-    "am",
-    "bisect",
-    "branch",
-    "checkout",
-    "cherry",
-    "cherry-pick",
-    "clean",
-    "clone",
-    "commit",
-    "describe",
-    "diff",
-    "fetch",
-    "format-patch",
-    "gitk",
-    "grep",
-    "log",
-    "merge",
-    "mergetool",
-    "mv",
-    "pull",
-    "push",
-    "rebase",
-    "reset",
-    "restore",
-    "revert",
-    "rm",
-    "shortlog",
-    "show",
-    "sparse-checkout",
-    "stash",
-    "status",
-    "submodule",
-    "switch",
-    "tag",
-    "worktree",
-];
-
-const PARSEOPT_HELPER_COMMANDS: &[&str] = &[
-    "checkout",
-    "clone",
-    "config",
-    "help",
-    "ls-remote",
-    "notes",
-    "remote",
-    "symbolic-ref",
-    "version",
-];
+    CommandSpec::new("sh-i18n--envsubst", NATIVE),
+    #[cfg(not(feature = "git-compat-i18n"))]
+    CommandSpec::new("sh-i18n--envsubst", RESERVED_CORE_HELPER),
+    CommandSpec::new("shell", RESERVED_CORE_HELPER),
+    CommandSpec::new("shortlog", BUILTIN_MAIN),
+    CommandSpec::new("show", BUILTIN_MAIN),
+    CommandSpec::new("show-branch", BUILTIN),
+    CommandSpec::new("show-index", BUILTIN),
+    CommandSpec::new("show-ref", BUILTIN),
+    CommandSpec::new("sparse-checkout", BUILTIN_MAIN),
+    CommandSpec::new("stage", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("stash", BUILTIN_MAIN),
+    CommandSpec::new("status", BUILTIN_MAIN),
+    CommandSpec::new("stripspace", BUILTIN),
+    CommandSpec::new("submodule", NATIVE_MAIN),
+    CommandSpec::new("submodule--helper", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("svn", RESERVED_CORE_HELPER),
+    CommandSpec::new("switch", BUILTIN_MAIN),
+    CommandSpec::new("symbolic-ref", BUILTIN_PARSEOPT),
+    CommandSpec::new("tag", BUILTIN_MAIN),
+    CommandSpec::new("testkit", NATIVE),
+    CommandSpec::new("unpack-file", BUILTIN),
+    CommandSpec::new("unpack-objects", BUILTIN),
+    CommandSpec::new("update-index", BUILTIN),
+    CommandSpec::new("update-ref", BUILTIN),
+    CommandSpec::new("update-server-info", BUILTIN),
+    CommandSpec::new("upload-archive", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("upload-archive--writer", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("upload-pack", BUILTIN),
+    CommandSpec::new("url-parse", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("var", BUILTIN),
+    CommandSpec::new("verify-commit", BUILTIN),
+    CommandSpec::new("verify-pack", BUILTIN),
+    CommandSpec::new("verify-tag", BUILTIN),
+    CommandSpec::new("version", BUILTIN_PARSEOPT),
+    CommandSpec::new("web--browse", RESERVED_CORE_HELPER),
+    CommandSpec::new("whatchanged", BUILTIN),
+    CommandSpec::new("worktree", BUILTIN_MAIN),
+    CommandSpec::new("write-tree", BUILTIN),
+]);
 
 const GUIDE_PAGES: &[(&str, &str)] = &[
     ("core-tutorial", "A Git core tutorial for developers"),
@@ -354,7 +375,23 @@ const CONFIG_ALL_VARIABLES: &[&str] = &[
 ];
 
 pub(crate) fn is_builtin_command(command: &str) -> bool {
-    matches!(command, "-v" | "--version") || BUILTIN_COMMANDS.binary_search(&command).is_ok()
+    matches!(command, "-v" | "--version") || COMMAND_REGISTRY.contains_with(command, NATIVE)
+}
+
+pub(crate) fn is_main_command(command: &str) -> bool {
+    !matches!(command, "gitk" | "testkit") && COMMAND_REGISTRY.find(command).is_some()
+}
+
+pub(crate) fn supports_usage_help(command: &str) -> bool {
+    COMMAND_REGISTRY.find(command).is_some_and(|command| {
+        command
+            .flags
+            .intersects(NATIVE.union(GIT_BUILTIN).union(USAGE_HELP))
+    })
+}
+
+pub(crate) fn is_reserved_git_core_helper(command: &str) -> bool {
+    COMMAND_REGISTRY.contains_with(command, RESERVED_CORE_HELPER)
 }
 
 pub(crate) fn has_command_specific_help(command: &str) -> bool {
@@ -567,17 +604,20 @@ pub(crate) fn print_common_help() {
 }
 
 pub(crate) fn print_builtin_commands() {
-    for command in BUILTIN_COMMANDS {
-        if *command == "submodule" {
-            continue;
-        }
+    for command in COMMAND_REGISTRY.names_with(GIT_BUILTIN) {
         println!("{command}");
     }
 }
 
 pub(crate) fn print_list_cmds(groups: &str) -> Result<()> {
     if groups == "parseopt" {
-        println!("{}", PARSEOPT_HELPER_COMMANDS.join(" "));
+        println!(
+            "{}",
+            COMMAND_REGISTRY
+                .names_with(PARSEOPT_HELPER)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         return Ok(());
     }
 
@@ -585,13 +625,22 @@ pub(crate) fn print_list_cmds(groups: &str) -> Result<()> {
     for group in groups.split(',') {
         match group {
             "builtins" => {
-                commands.extend(BUILTIN_COMMANDS.iter().map(|command| (*command).to_string()));
+                commands.extend(COMMAND_REGISTRY.names_with(GIT_BUILTIN).map(str::to_string));
             }
-            "main" | "mainporcelain" | "list-mainporcelain" => {
+            "main" => {
                 commands.extend(
-                    MAIN_PORCELAIN_COMMANDS
+                    COMMAND_REGISTRY
+                        .entries()
                         .iter()
-                        .map(|command| (*command).to_string()),
+                        .filter(|command| is_main_command(command.name))
+                        .map(|command| command.name.to_string()),
+                );
+            }
+            "mainporcelain" | "list-mainporcelain" => {
+                commands.extend(
+                    COMMAND_REGISTRY
+                        .names_with(MAIN_PORCELAIN)
+                        .map(str::to_string),
                 );
             }
             "list-guide" => {
@@ -639,6 +688,7 @@ pub(crate) fn print_completion_helper(args: &[String]) -> bool {
         "config set" => Some(CONFIG_SET_COMPLETION_HELPER),
         "help" => Some(HELP_COMPLETION_HELPER),
         "ls-remote" => Some(LS_REMOTE_COMPLETION_HELPER),
+        "merge-tree" => Some(MERGE_TREE_COMPLETION_HELPER),
         "notes edit" => Some(NOTES_EDIT_COMPLETION_HELPER),
         "reflog" => Some(REFLOG_COMPLETION_HELPER),
         "remote" => Some(REMOTE_COMPLETION_HELPER),
@@ -685,20 +735,20 @@ fn version_completion_helper() -> String {
 
 const CHECKOUT_COMPLETION_HELPER: &str = "--guess --overlay --auto-advance --quiet --recurse-submodules --progress --merge --conflict= --detach --track --orphan= --ignore-other-worktrees --ours --theirs --patch --unified= --inter-hunk-context= --ignore-skip-worktree-bits --pathspec-from-file= --pathspec-file-nul --no-guess -- --no-overlay --no-auto-advance --no-quiet --no-recurse-submodules --no-progress --no-merge --no-conflict --no-detach --no-track --no-orphan --no-ignore-other-worktrees --no-patch --no-ignore-skip-worktree-bits --no-pathspec-from-file --no-pathspec-file-nul";
 
+const MERGE_TREE_COMPLETION_HELPER: &str = "--write-tree --trivial-merge --messages --quiet --name-only --allow-unrelated-histories --stdin --merge-base= --strategy-option= --no-messages -- --no-merge-base --no-strategy-option";
+
 const CLONE_COMPLETION_HELPER: &str = "--verbose --quiet --progress --reject-shallow --no-checkout --bare --mirror --local --no-hardlinks --shared --recurse-submodules --jobs= --template= --reference= --reference-if-able= --dissociate --origin= --branch= --revision= --upload-pack= --depth= --shallow-since= --shallow-exclude= --single-branch --tags --shallow-submodules --separate-git-dir= --ref-format= --config= --server-option= --ipv4 --ipv6 --filter= --also-filter-submodules --remote-submodules --sparse --bundle-uri= --checkout --hardlinks -- --no-verbose --no-quiet --no-progress --no-reject-shallow --no-bare --no-mirror --no-local --no-shared --no-recurse-submodules --no-recursive --no-jobs --no-template --no-reference --no-reference-if-able --no-dissociate --no-origin --no-branch --no-revision --no-upload-pack --no-depth --no-shallow-since --no-shallow-exclude --no-single-branch --no-tags --no-shallow-submodules --no-separate-git-dir --no-ref-format --no-config --no-server-option --no-filter --no-also-filter-submodules --no-remote-submodules --no-sparse --no-bundle-uri";
 
 const CLONE_COMPLETION_HELPER_ALL: &str = "--verbose --quiet --progress --reject-shallow --no-checkout --bare --naked --mirror --local --no-hardlinks --shared --recurse-submodules --recursive --jobs= --template= --reference= --reference-if-able= --dissociate --origin= --branch= --revision= --upload-pack= --depth= --shallow-since= --shallow-exclude= --single-branch --tags --shallow-submodules --separate-git-dir= --ref-format= --config= --server-option= --ipv4 --ipv6 --filter= --also-filter-submodules --remote-submodules --sparse --bundle-uri= --checkout --hardlinks -- --no-verbose --no-quiet --no-progress --no-reject-shallow --no-bare --no-naked --no-mirror --no-local --no-shared --no-recurse-submodules --no-recursive --no-jobs --no-template --no-reference --no-reference-if-able --no-dissociate --no-origin --no-branch --no-revision --no-upload-pack --no-depth --no-shallow-since --no-shallow-exclude --no-single-branch --no-tags --no-shallow-submodules --no-separate-git-dir --no-ref-format --no-config --no-server-option --no-filter --no-also-filter-submodules --no-remote-submodules --no-sparse --no-bundle-uri";
 
-const CONFIG_COMPLETION_HELPER: &str =
-    "list get set unset rename-section remove-section edit";
+const CONFIG_COMPLETION_HELPER: &str = "list get set unset rename-section remove-section edit";
 const CONFIG_GET_COMPLETION_HELPER: &str = "--global --system --local --worktree --file= --blob= --all --regexp --value= --fixed-value --url= --null --name-only --show-origin --show-scope --show-names --type= --bool --int --bool-or-int --bool-or-str --path --expiry-date --includes --default= --no-global -- --no-system --no-local --no-worktree --no-file --no-blob --no-all --no-regexp --no-value --no-fixed-value --no-url --no-null --no-name-only --no-show-origin --no-show-scope --no-show-names --no-type --no-includes --no-default";
 const CONFIG_SET_COMPLETION_HELPER: &str = "--global --system --local --worktree --file= --blob= --type= --bool --int --bool-or-int --bool-or-str --path --expiry-date --all --value= --fixed-value --comment= --append --no-global -- --no-system --no-local --no-worktree --no-file --no-blob --no-type --no-all --no-value --no-fixed-value --no-comment --no-append";
 const HELP_COMPLETION_HELPER: &str = "--all --external-commands --aliases --man --web --info --verbose --guides --user-interfaces --developer-interfaces --config --no-external-commands -- --no-aliases --no-man --no-web --no-info --no-verbose";
 const LS_REMOTE_COMPLETION_HELPER: &str = "--quiet --upload-pack= --tags --branches --refs --get-url --sort= --symref --server-option= --no-quiet -- --no-upload-pack --no-tags --no-branches --no-refs --no-get-url --no-sort --no-symref --no-server-option";
 const NOTES_EDIT_COMPLETION_HELPER: &str = "--message= --file= --reedit-message= --reuse-message= --edit --allow-empty --separator --stripspace --no-edit -- --no-allow-empty --no-separator --no-stripspace";
 const REFLOG_COMPLETION_HELPER: &str = "show list exists write delete drop expire";
-const REMOTE_COMPLETION_HELPER: &str =
-    "--verbose add rename remove set-head set-branches get-url set-url show prune update --no-verbose";
+const REMOTE_COMPLETION_HELPER: &str = "--verbose add rename remove set-head set-branches get-url set-url show prune update --no-verbose";
 const SEND_EMAIL_COMPLETION_HELPER: &str = "--cover-from-description= --cover-letter --validate --full-index --not --all --no-prefix --src-prefix= --dst-prefix= --notes";
 const SYMBOLIC_REF_COMPLETION_HELPER: &str =
     "--quiet --delete --short --recurse --no-quiet -- --no-delete --no-short --no-recurse";
@@ -1272,5 +1322,74 @@ impl HelpFormat {
             "info" => HelpFormat::Info,
             _ => HelpFormat::Man,
         }
+    }
+}
+
+#[cfg(test)]
+mod command_registry_tests {
+    use super::*;
+
+    #[test]
+    fn registry_is_sorted_and_categories_have_expected_shape() {
+        assert!(COMMAND_REGISTRY.is_sorted_unique());
+        assert_eq!(
+            COMMAND_REGISTRY.names_with(NATIVE).count(),
+            if cfg!(feature = "git-compat-i18n") {
+                135
+            } else {
+                134
+            }
+        );
+        assert_eq!(COMMAND_REGISTRY.names_with(GIT_BUILTIN).count(), 149);
+        assert_eq!(
+            COMMAND_REGISTRY
+                .entries()
+                .iter()
+                .filter(|command| is_main_command(command.name))
+                .count(),
+            178
+        );
+        assert_eq!(COMMAND_REGISTRY.names_with(MAIN_PORCELAIN).count(), 35);
+        assert!(
+            COMMAND_REGISTRY
+                .entries_with(PARSEOPT_HELPER)
+                .all(|command| command.flags.contains(NATIVE))
+        );
+        assert!(
+            COMMAND_REGISTRY
+                .entries()
+                .iter()
+                .all(|command| { command.flags.intersects(NATIVE.union(RESERVED_CORE_HELPER)) })
+        );
+        assert!(COMMAND_REGISTRY.contains_with("daemon", NATIVE));
+        assert!(!COMMAND_REGISTRY.contains_with("daemon", GIT_BUILTIN));
+        assert!(COMMAND_REGISTRY.contains_with("backfill", GIT_BUILTIN));
+        assert!(!COMMAND_REGISTRY.contains_with("backfill", NATIVE));
+    }
+
+    #[test]
+    fn parseopt_helper_order_matches_git_protocol_output() {
+        assert_eq!(
+            COMMAND_REGISTRY
+                .names_with(PARSEOPT_HELPER)
+                .collect::<Vec<_>>()
+                .join(" "),
+            "checkout clone config help ls-remote notes remote symbolic-ref version"
+        );
+    }
+
+    #[test]
+    fn main_only_commands_do_not_become_builtin() {
+        assert!(!is_builtin_command("cherry"));
+        assert!(!is_builtin_command("gitk"));
+        assert!(is_reserved_git_core_helper("cherry"));
+        assert!(is_reserved_git_core_helper("gitk"));
+        assert!(is_builtin_command("checkout"));
+        assert!(is_builtin_command("version"));
+        assert!(is_builtin_command("-v"));
+        assert!(is_builtin_command("--version"));
+        assert!(is_reserved_git_core_helper("remote-https"));
+        assert!(is_reserved_git_core_helper("request-pull"));
+        assert!(!is_reserved_git_core_helper("lfs"));
     }
 }

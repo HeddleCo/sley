@@ -171,6 +171,8 @@ pub(crate) struct DiffRenderOptions<'a> {
     pub(crate) word_diff: Option<&'a WordDiffRequest<'a>>,
     /// Hunk body line indicators (` `, `-`, `+` by default).
     pub(crate) line_indicators: sley_diff_merge::render::LineIndicators,
+    /// Omit the leading context marker on an otherwise-empty context line.
+    pub(crate) suppress_blank_empty: bool,
     /// Preloaded file contents for `diff --no-index` (old, new), bypassing
     /// the object database / worktree reads.
     pub(crate) no_index_contents: Option<(Option<&'a [u8]>, Option<&'a [u8]>)>,
@@ -586,6 +588,7 @@ pub(crate) fn render_tree_to_tree_patch(
                 colors: None,
                 word_diff: None,
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                suppress_blank_empty: false,
                 no_index_contents: None,
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,
@@ -967,12 +970,14 @@ pub(crate) fn write_diff_patch_entry(
             &format!(
                 "index {}..{}{}",
                 diff_patch_oid(
+                    options.db,
                     entry.old_oid.as_ref(),
                     old_content.as_deref(),
                     options.format,
                     options.abbrev,
                 ),
                 diff_patch_oid(
+                    options.db,
                     entry.new_oid.as_ref(),
                     new_content.as_deref(),
                     options.format,
@@ -1075,6 +1080,7 @@ pub(crate) fn write_diff_patch_entry(
             .as_mut()
             .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),
         line_indicators: options.line_indicators,
+        suppress_blank_empty: options.suppress_blank_empty,
         ws_error,
         color_moved: colors
             .and(options.color_moved)
@@ -1169,12 +1175,14 @@ fn write_diff_binary_patch_entry(
         stdout,
         "index {}..{}{}",
         diff_patch_oid(
+            options.db,
             entry.old_oid.as_ref(),
             old_content.as_deref(),
             options.format,
             index_abbrev,
         ),
         diff_patch_oid(
+            options.db,
             entry.new_oid.as_ref(),
             new_content.as_deref(),
             options.format,
@@ -1302,6 +1310,7 @@ fn diff_patch_prefixed_path_bytes(prefix: &str, path: &[u8]) -> Vec<u8> {
 }
 
 fn diff_patch_oid(
+    db: &FileObjectDatabase,
     oid: Option<&ObjectId>,
     content: Option<&[u8]>,
     format: ObjectFormat,
@@ -1314,7 +1323,22 @@ fn diff_patch_oid(
         })
         .map(|oid| oid.to_hex())
         .unwrap_or_else(|| "0".repeat(format.hex_len()));
-    hex[..abbrev.min(hex.len())].to_string()
+    let mut width = abbrev.min(hex.len());
+    // Patch index lines use `find_unique_abbrev`, not a blind prefix slice.
+    // Only repository-backed OIDs participate: a no-index/worktree content
+    // hash may not exist in the ODB and therefore has no repository collision
+    // set to extend against.
+    if let Some(oid) = oid.filter(|oid| !oid.is_null()) {
+        while width < hex.len()
+            && matches!(
+                db.resolve_prefix(&hex[..width]),
+                Ok(sley_odb::ObjectPrefixResolution::Ambiguous(_))
+            )
+        {
+            width += 1;
+        }
+    }
+    hex[..width].to_string()
 }
 
 fn diff_patch_mode_suffix(entry: &sley_diff_merge::NameStatusEntry) -> String {
@@ -2545,6 +2569,7 @@ fn write_submodule_inline_diff(
                     colors: options.colors,
                     word_diff: None,
                     line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                    suppress_blank_empty: false,
                     no_index_contents: None,
                     submodule_format: commands::diff_options::SubmoduleDiffFormat::Diff,
                     submodule_dirt: Some(&submodule_dirt),
@@ -2593,6 +2618,7 @@ fn write_submodule_inline_diff(
                 colors: options.colors,
                 word_diff: None,
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                suppress_blank_empty: false,
                 no_index_contents: None,
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Diff,
                 submodule_dirt: Some(&nested_dirt),

@@ -1015,7 +1015,11 @@ pub(crate) fn compressed_payload(body: &[u8], compression_level: u32) -> Result<
     write_compressed_payload(&mut out, body, compression_level)?;
     Ok(out)
 }
-pub(crate) fn write_compressed_payload(out: &mut Vec<u8>, body: &[u8], compression_level: u32) -> Result<()> {
+pub(crate) fn write_compressed_payload(
+    out: &mut Vec<u8>,
+    body: &[u8],
+    compression_level: u32,
+) -> Result<()> {
     let mut compressor = Compress::new(Compression::new(compression_level.min(9)), true);
     out.reserve(zlib_compress_bound(body.len()));
     let status = compressor
@@ -1103,6 +1107,7 @@ pub struct PackBitmapWriter {
     blob_positions: Vec<u32>,
     tag_positions: Vec<u32>,
     name_hash_cache: Option<Vec<u32>>,
+    write_lookup_table: bool,
     selected: Vec<SelectedCommit>,
     pseudo_merges: Vec<PackBitmapPseudoMerge>,
 }
@@ -1167,6 +1172,7 @@ impl PackBitmapWriter {
             blob_positions,
             tag_positions,
             name_hash_cache: None,
+            write_lookup_table: false,
             selected: Vec::new(),
             pseudo_merges: Vec::new(),
         })
@@ -1187,6 +1193,13 @@ impl PackBitmapWriter {
         }
         self.name_hash_cache = Some(cache);
         Ok(self)
+    }
+
+    /// Enable the commit lookup-table extension. Each row is derived from the
+    /// selected commit entries when the bitmap is serialised.
+    pub fn with_lookup_table(mut self, enabled: bool) -> Self {
+        self.write_lookup_table = enabled;
+        self
     }
 
     /// Registers a selected commit and the pack positions reachable from it.
@@ -1309,6 +1322,9 @@ impl PackBitmapWriter {
         if !self.pseudo_merges.is_empty() {
             options |= PackBitmapIndex::OPTION_PSEUDO_MERGES;
         }
+        if self.write_lookup_table {
+            options |= PackBitmapIndex::OPTION_LOOKUP_TABLE;
+        }
 
         // The index checksum is only known once the body is serialised; the
         // dedicated `write` path fills it in. `build` reports a placeholder of
@@ -1329,6 +1345,7 @@ impl PackBitmapWriter {
             },
             entries,
             pseudo_merges: self.pseudo_merges.clone(),
+            lookup_table: self.write_lookup_table,
             name_hash_cache: self.name_hash_cache.clone(),
         })
     }
@@ -1365,8 +1382,13 @@ impl PackBitmapIndex {
         if !self.pseudo_merges.is_empty() {
             options |= Self::OPTION_PSEUDO_MERGES;
         }
-        let known_options =
-            Self::OPTION_FULL_DAG | Self::OPTION_HASH_CACHE | Self::OPTION_PSEUDO_MERGES;
+        if self.lookup_table {
+            options |= Self::OPTION_LOOKUP_TABLE;
+        }
+        let known_options = Self::OPTION_FULL_DAG
+            | Self::OPTION_HASH_CACHE
+            | Self::OPTION_LOOKUP_TABLE
+            | Self::OPTION_PSEUDO_MERGES;
         if options & !known_options != 0 {
             return Err(GitError::Unsupported(format!(
                 "bitmap index options {:#06x}",
@@ -1415,12 +1437,14 @@ impl PackBitmapIndex {
         self.type_bitmaps.blobs.append_bytes(&mut out);
         self.type_bitmaps.tags.append_bytes(&mut out);
 
+        let mut entry_offsets = Vec::with_capacity(self.entries.len());
         for (idx, entry) in self.entries.iter().enumerate() {
             if entry.xor_offset as usize > idx {
                 return Err(GitError::InvalidFormat(
                     "bitmap index entry has invalid XOR offset".into(),
                 ));
             }
+            entry_offsets.push(out.len() as u64);
             out.extend_from_slice(&entry.object_position.to_be_bytes());
             out.push(entry.xor_offset);
             out.push(entry.flags);
@@ -1429,6 +1453,10 @@ impl PackBitmapIndex {
 
         if !self.pseudo_merges.is_empty() {
             append_bitmap_pseudo_merges(&mut out, &self.pseudo_merges)?;
+        }
+
+        if self.lookup_table {
+            append_bitmap_lookup_table(&mut out, &self.entries, &entry_offsets)?;
         }
 
         if let Some(cache) = &self.name_hash_cache {
@@ -1441,6 +1469,41 @@ impl PackBitmapIndex {
         out.extend_from_slice(checksum.as_bytes());
         Ok(out)
     }
+}
+
+fn append_bitmap_lookup_table(
+    out: &mut Vec<u8>,
+    entries: &[PackBitmapEntry],
+    entry_offsets: &[u64],
+) -> Result<()> {
+    if entries.len() != entry_offsets.len() {
+        return Err(GitError::InvalidFormat(
+            "bitmap lookup table offset count mismatch".into(),
+        ));
+    }
+    let mut table: Vec<usize> = (0..entries.len()).collect();
+    table.sort_by_key(|&index| entries[index].object_position);
+    let mut inverse = vec![0u32; entries.len()];
+    for (row, &entry_index) in table.iter().enumerate() {
+        inverse[entry_index] = row as u32;
+    }
+    for &entry_index in &table {
+        let entry = &entries[entry_index];
+        let xor_row = if entry.xor_offset == 0 {
+            u32::MAX
+        } else {
+            let base = entry_index
+                .checked_sub(entry.xor_offset as usize)
+                .ok_or_else(|| {
+                    GitError::InvalidFormat("bitmap lookup table XOR base underflow".into())
+                })?;
+            inverse[base]
+        };
+        out.extend_from_slice(&entry.object_position.to_be_bytes());
+        out.extend_from_slice(&entry_offsets[entry_index].to_be_bytes());
+        out.extend_from_slice(&xor_row.to_be_bytes());
+    }
+    Ok(())
 }
 
 pub(crate) fn append_bitmap_pseudo_merges(

@@ -328,6 +328,34 @@ fn shortlog_max_count_and_range_matches_git() {
 }
 
 #[test]
+fn shortlog_revision_ref_selectors_match_git() {
+    if !git_available() {
+        return;
+    }
+    let repo = build_repo("shortlog-ref-selectors");
+    git_ok(&repo, &["branch", "topic", "HEAD~2"]);
+    git_ok(&repo, &["tag", "v-topic", "HEAD~1"]);
+    git_ok(
+        &repo,
+        &["update-ref", "refs/remotes/origin/topic", "HEAD~3"],
+    );
+
+    let cases: &[&[&str]] = &[
+        &["--branches"],
+        &["--branches=topic"],
+        &["--glob=refs/heads/*"],
+        &["--glob=refs/heads/topic", "main"],
+        &["--tags"],
+        &["--tags=v-topic"],
+        &["--remotes"],
+        &["--remotes=origin"],
+    ];
+    for case in cases {
+        assert_same(&repo, case);
+    }
+}
+
+#[test]
 fn shortlog_wrap_matches_git() {
     if !git_available() {
         return;

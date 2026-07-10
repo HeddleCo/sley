@@ -2896,6 +2896,36 @@ mod tests {
     }
 
     #[test]
+    fn unicode_icase_matches_literals_fixed_strings_and_classes() {
+        assert!(contains(
+            "TILRAUN: Halló Heimur!".as_bytes(),
+            "HALLÓ".as_bytes(),
+            true
+        ));
+
+        let bre = Regex::compile("HALLÓ", RegexMode::Bre, true, false).expect("compile BRE");
+        assert!(bre.find_from("Halló".as_bytes(), 0).is_some());
+
+        let pcre = Regex::compile("[Æ]\0Ð", RegexMode::Pcre, true, false).expect("compile PCRE");
+        assert_eq!(pcre.find_from("æ\0ð".as_bytes(), 0), Some((0, 5)));
+    }
+
+    #[test]
+    fn pcre_utf8_atoms_quantify_and_report_full_byte_spans() {
+        let repeated = Regex::compile("ó+", RegexMode::Pcre, false, false).expect("compile");
+        assert_eq!(repeated.find_from("xóó".as_bytes(), 0), Some((1, 5)));
+
+        let dot = Regex::compile("ll.", RegexMode::Pcre, false, false).expect("compile");
+        assert_eq!(dot.find_from("Halló".as_bytes(), 0), Some((2, 6)));
+    }
+
+    #[test]
+    fn unicode_icase_preserves_invalid_utf8_subject_bytes() {
+        let pcre = Regex::compile("Æ", RegexMode::Pcre, true, false).expect("compile");
+        assert_eq!(pcre.find_from(b"\x80\n\xc3\xa6", 0), Some((2, 4)));
+    }
+
+    #[test]
     fn wildmatch_crosses_slash() {
         assert!(grep_test_pathspec(b"*.txt").matches_path(b"sub/c.txt"));
         assert!(grep_test_pathspec(b"sub/*").matches_path(b"sub/c.txt"));

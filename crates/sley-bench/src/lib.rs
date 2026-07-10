@@ -430,6 +430,18 @@ pub fn run_git(cwd: &Path, args: &[&str], stdin: &[u8]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{nanos}-{}",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,20 +464,6 @@ mod tests {
             }
         }
         let elapsed_ns = start.elapsed().as_nanos();
-        println!(
-            "odb_resolve_prefix/100000: {resolved} prefixes in {elapsed_ns} ns"
-        );
+        println!("odb_resolve_prefix/100000: {resolved} prefixes in {elapsed_ns} ns");
     }
-}
-
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!(
-        "{prefix}-{}-{nanos}-{}",
-        std::process::id(),
-        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ))
 }

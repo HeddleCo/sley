@@ -9,14 +9,14 @@
 //! is a drop-in replacement.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_worktree};
+use sley::plumbing::sley_worktree;
 // Pull shared plumbing (RepositoryContext, ObjectReader, Index/IndexEntry,
 // GitError/Result, std::* re-exports, …) from the crate root.
 // A submodule can see its ancestors' items, so the glob keeps this file in step
 // with whatever the root exposes without re-listing each name.
 use crate::commands::cli_options::{last_tri_state_bool, opt_bool, opt_str};
 use crate::*;
-use sley_options::{parse_options, OptionSpec, ParsedValue};
+use sley_options::{OptionSpec, ParsedValue, parse_options};
 
 /// Which index stage to copy out. Real `git` defaults to stage 0; `--stage=<n>`
 /// selects a single conflict stage and `--stage=all` (handled separately) is not
@@ -63,8 +63,7 @@ impl Default for CheckoutIndexOptions {
     }
 }
 
-const CHECKOUT_INDEX_USAGE_LINES: &[&str] =
-    &["git checkout-index [<options>] [--] [<file>...]"];
+const CHECKOUT_INDEX_USAGE_LINES: &[&str] = &["git checkout-index [<options>] [--] [<file>...]"];
 
 fn checkout_index_option_specs() -> &'static [OptionSpec<'static>] {
     static SPECS: &[OptionSpec<'static>] = &[
@@ -166,10 +165,7 @@ fn checkout_index_entry_skip_worktree(entry: &IndexEntry) -> bool {
 }
 
 fn setup_checkout_index_options(args: &[String]) -> Result<CheckoutIndexOptions> {
-    if args
-        .iter()
-        .any(|arg| arg == "-h" || arg == "--help")
-    {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         return Err(checkout_index_help());
     }
     let parsed = match parse_options(
@@ -191,7 +187,10 @@ fn setup_checkout_index_options(args: &[String]) -> Result<CheckoutIndexOptions>
     options.force = parsed.last_bool("force", false);
     options.quiet = parsed.last_bool("quiet", false);
     options.update_stat = parsed.last_bool("index", false);
-    options.nul = parsed.options.iter().any(|option| option.short == Some('z'));
+    options.nul = parsed
+        .options
+        .iter()
+        .any(|option| option.short == Some('z'));
     options.stdin = parsed.last_bool("stdin", false);
     options.ignore_skip_worktree_bits = parsed.last_bool("ignore-skip-worktree-bits", false);
     let mut create = true;
@@ -630,7 +629,13 @@ fn checkout_one_index_entry(
     }
 
     if let Some(parent) = dest.parent() {
-        checkout_index_ensure_parent_dirs(parent, context.options.force)?;
+        let protected_prefix_parent =
+            checkout_index_prefix_parent(context.worktree_root, &context.options.prefix)?;
+        checkout_index_ensure_parent_dirs(
+            parent,
+            context.options.force,
+            protected_prefix_parent.as_deref(),
+        )?;
     }
 
     // Mode 0o120000 is a symlink; everything else is a regular file (executable
@@ -746,12 +751,41 @@ fn write_checkout_regular_file(dest: &Path, body: &[u8], mode: u32) -> Result<()
     Ok(())
 }
 
-fn checkout_index_ensure_parent_dirs(path: &Path, force: bool) -> Result<()> {
+/// Return the directory portion that belongs wholly to `--prefix`.
+///
+/// Existing symlinks in this portion are followed by Git: the prefix names an
+/// output location supplied by the caller, rather than an index path being
+/// materialized.  A symlink introduced only after concatenating an index path
+/// is still replaced under `--force`.
+fn checkout_index_prefix_parent(worktree_root: &Path, prefix: &str) -> Result<Option<PathBuf>> {
+    let Some(slash) = prefix.as_bytes().iter().rposition(|byte| *byte == b'/') else {
+        return Ok(None);
+    };
+    let directory = &prefix.as_bytes()[..slash];
+    if directory.is_empty() {
+        return Ok(None);
+    }
+    let directory =
+        std::str::from_utf8(directory).map_err(|err| GitError::InvalidPath(err.to_string()))?;
+    Ok(Some(worktree_root.join(directory)))
+}
+
+fn checkout_index_ensure_parent_dirs(
+    path: &Path,
+    force: bool,
+    protected_prefix_parent: Option<&Path>,
+) -> Result<()> {
     if path.as_os_str().is_empty() {
         return Ok(());
     }
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        if metadata.file_type().is_symlink()
+            && protected_prefix_parent.is_some_and(|prefix| prefix.starts_with(path))
+            && fs::metadata(path).is_ok_and(|target| target.is_dir())
+        {
             return Ok(());
         }
         if !force {
@@ -761,7 +795,7 @@ fn checkout_index_ensure_parent_dirs(path: &Path, force: bool) -> Result<()> {
         checkout_index_remove_existing_path(path)?;
     }
     if let Some(parent) = path.parent() {
-        checkout_index_ensure_parent_dirs(parent, force)?;
+        checkout_index_ensure_parent_dirs(parent, force, protected_prefix_parent)?;
     }
     match fs::create_dir(path) {
         Ok(()) => Ok(()),

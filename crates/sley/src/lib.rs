@@ -1,4 +1,4 @@
-//! `git` — the ergonomic facade over the sley engine.
+//! `sley` — the embeddable facade over Sley's native Git-equivalent engine.
 //!
 //! Downstream code that wants a "just open a repository and read things" entry
 //! point should reach for [`Repository`] rather than wiring the plumbing crates
@@ -8,7 +8,7 @@
 //! underlying plumbing objects ([`sley_odb::FileObjectDatabase`],
 //! [`sley_refs::FileRefStore`], [`sley_config::GitConfig`]) on demand.
 //!
-//! **Heddle / embedder surface** (feature `remote`, on by default):
+//! **Embedder surface** (feature `remote`, on by default):
 //!
 //! * [`Repository::config_snapshot`] — full git config with `include` /
 //!   `includeIf` / `hasconfig:` resolution.
@@ -66,7 +66,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeBuilder};
-use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter, install_reachable_pack};
+use sley_odb::{
+    FileObjectDatabase, ObjectReader, ObjectReplacements, ObjectWriter, install_reachable_pack,
+};
 use sley_refs::{FileRefStore, RefTarget};
 use sley_rev::ResolvedTreePath;
 use sley_sequencer::create_annotated_tag;
@@ -83,8 +85,8 @@ pub mod notes {
 pub mod plumbing {
     pub use sley_config;
     pub use sley_core;
-    pub use sley_diff_merge::format;
     pub use sley_diff_merge;
+    pub use sley_diff_merge::format;
     pub use sley_formats;
     pub use sley_grep;
     pub use sley_index;
@@ -136,6 +138,10 @@ pub use config_edit::{
     ConfigValue, RemoteConfig, RemoteConfigRefusal, RemoteConfigRemove, RemoteConfigSet,
     RemoteConfigSnapshot, RemoteConfigSource, RemoteConfigValue, WorktreeConfig,
 };
+pub use hooks::{
+    HookEnvironment, HookRun, KNOWN_HOOKS, cmd_hook, hook_exists, run_hook, run_hook_l,
+    run_post_index_change_hook, run_reference_transaction_hook_at, run_traditional_hook_at,
+};
 pub use index_io::{IndexError, IndexWriteError, IndexWriteOptions, IndexWriteResult};
 pub use objects::{BlobFetchOptions, BlobStore, LoadedObject};
 pub use pack_plan::{
@@ -147,10 +153,6 @@ pub use refs::{
     RefDeleteExpected, RefUpdateOptions, ReflogMessage,
 };
 pub use rev_graph::{ReachableCommit, ReachableCommitOptions, RevGraph};
-pub use hooks::{
-    HookEnvironment, HookRun, KNOWN_HOOKS, cmd_hook, hook_exists, run_hook, run_hook_l,
-    run_post_index_change_hook, run_reference_transaction_hook_at, run_traditional_hook_at,
-};
 pub use status_plan::{
     OwnedStatusRow, StatusCacheKey, StatusCode, StatusPlan, StatusPlanBuilder, StatusRow,
 };
@@ -320,6 +322,7 @@ pub struct OpenOptions {
     exact_path: bool,
     bare: bool,
     respect_environment: bool,
+    replace_objects: bool,
 }
 
 impl OpenOptions {
@@ -328,6 +331,7 @@ impl OpenOptions {
             exact_path: false,
             bare: false,
             respect_environment: false,
+            replace_objects: true,
         }
     }
 
@@ -353,6 +357,14 @@ impl OpenOptions {
         self
     }
 
+    /// Upper gate for replacement-object reads. `true` still consults the
+    /// repository's `core.useReplaceRefs` setting; `false` disables
+    /// replacements unconditionally.
+    pub fn replace_objects(mut self, replace_objects: bool) -> Self {
+        self.replace_objects = replace_objects;
+        self
+    }
+
     pub fn is_exact_path(self) -> bool {
         self.exact_path
     }
@@ -363,6 +375,10 @@ impl OpenOptions {
 
     pub fn respects_environment(self) -> bool {
         self.respect_environment
+    }
+
+    pub fn uses_replace_objects(self) -> bool {
+        self.replace_objects
     }
 }
 
@@ -409,6 +425,26 @@ impl PartialEq for Repository {
 
 impl Eq for Repository {}
 
+fn repository_object_replacements(
+    common_dir: &Path,
+    format: ObjectFormat,
+) -> Result<ObjectReplacements> {
+    let refs = FileRefStore::new(common_dir, format);
+    let mut replacements = Vec::new();
+    for reference in refs.list_refs()? {
+        let Some(source) = reference.name.strip_prefix("refs/replace/") else {
+            continue;
+        };
+        let Ok(source) = ObjectId::from_hex(format, source) else {
+            continue;
+        };
+        if let RefTarget::Direct(target) = reference.target {
+            replacements.push((source, target));
+        }
+    }
+    Ok(ObjectReplacements::new(replacements))
+}
+
 impl Repository {
     /// Open the repository whose git directory is exactly `git_dir`.
     ///
@@ -426,7 +462,7 @@ impl Repository {
                 git_dir.display()
             )));
         }
-        Self::from_git_dir(git_dir, None)
+        Self::from_git_dir(git_dir, None, true)
     }
 
     /// Open a repository with explicit discovery, bare-worktree, and
@@ -451,7 +487,7 @@ impl Repository {
                 git_dir.display()
             )));
         }
-        let repo = Self::from_git_dir(git_dir, work_tree_override)?;
+        let repo = Self::from_git_dir(git_dir, work_tree_override, options.replace_objects)?;
         if options.bare && repo.workdir().is_some() {
             return Err(GitError::InvalidFormat(format!(
                 "repository is not bare: {}",
@@ -478,7 +514,7 @@ impl Repository {
     /// file, or a bare repository at an ancestor).
     pub fn discover(path: impl AsRef<Path>) -> Result<Self> {
         let git_dir = discover_git_dir(path.as_ref())?;
-        Self::from_git_dir(git_dir, None)
+        Self::from_git_dir(git_dir, None, true)
     }
 
     /// Initialize a new non-bare repository rooted at `path` (creating its
@@ -502,13 +538,28 @@ impl Repository {
         bare: bool,
     ) -> Result<Self> {
         let layout = sley_formats::RepositoryLayout::init_at(path, format, bare)?;
-        Self::from_git_dir(layout.git_dir, None)
+        Self::from_git_dir(layout.git_dir, None, true)
     }
 
-    fn from_git_dir(git_dir: PathBuf, work_tree_override: Option<PathBuf>) -> Result<Self> {
+    fn from_git_dir(
+        git_dir: PathBuf,
+        work_tree_override: Option<PathBuf>,
+        replace_objects: bool,
+    ) -> Result<Self> {
         let common_dir = sley_odb::repository_common_dir(&git_dir);
         let format = read_object_format(&common_dir)?;
-        let objects = Arc::new(FileObjectDatabase::from_git_dir(&common_dir, format));
+        let use_replace_refs = replace_objects
+            && sley_config::read_repo_config(&git_dir, None)?
+                .get_bool("core", None, "useReplaceRefs")
+                .unwrap_or(true);
+        let replacements = if use_replace_refs {
+            repository_object_replacements(&common_dir, format)?
+        } else {
+            ObjectReplacements::default()
+        };
+        let objects = Arc::new(
+            FileObjectDatabase::from_git_dir(&common_dir, format).with_replacements(replacements),
+        );
         Ok(Self {
             git_dir,
             common_dir,
@@ -883,7 +934,7 @@ impl Repository {
     /// Copy objects reachable from `roots` out of `other` into this repository.
     ///
     /// Uses a pack-based transfer ([`sley_odb::build_reachable_pack`] on the
-    /// source, [`sley_odb::install_raw_pack`] on the destination) for
+    /// source, `sley_odb::install_raw_pack` on the destination) for
     /// performance. Semantics:
     ///
     /// * Only *objects* are copied; refs in `other` are not updated here.
@@ -1305,6 +1356,67 @@ mod tests {
         let reopened = Repository::open(temp.path().join(".git")).expect("open");
         assert_eq!(reopened.git_dir(), repo.git_dir());
         assert_eq!(reopened.object_format(), ObjectFormat::Sha1);
+    }
+
+    #[test]
+    fn open_options_and_config_gate_replacement_reads() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        let original = repo
+            .objects_mut()
+            .write_object(EncodedObject::new(ObjectType::Blob, b"original".to_vec()))
+            .expect("write original");
+        let replacement = repo
+            .objects_mut()
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"replacement".to_vec(),
+            ))
+            .expect("write replacement");
+        let replace_dir = repo.git_dir().join("refs").join("replace");
+        fs::create_dir_all(&replace_dir).expect("create replace refs");
+        fs::write(
+            replace_dir.join(original.to_hex()),
+            format!("{replacement}\n"),
+        )
+        .expect("write replace ref");
+
+        let replacing = Repository::open(repo.git_dir()).expect("open with replacements");
+        assert_eq!(
+            replacing
+                .objects()
+                .read_object(&original)
+                .expect("replacement read")
+                .body,
+            b"replacement"
+        );
+        let disabled = Repository::open_with(
+            repo.git_dir(),
+            OpenOptions::new().exact_path(true).replace_objects(false),
+        )
+        .expect("open with replacements disabled");
+        assert_eq!(
+            disabled
+                .objects()
+                .read_object(&original)
+                .expect("raw read")
+                .body,
+            b"original"
+        );
+
+        let config_path = repo.git_dir().join("config");
+        let mut config = fs::read(&config_path).expect("read config");
+        config.extend_from_slice(b"\n[core]\n\tuseReplaceRefs = false\n");
+        fs::write(config_path, config).expect("disable replacements in config");
+        let config_disabled = Repository::open(repo.git_dir()).expect("open config-disabled");
+        assert_eq!(
+            config_disabled
+                .objects()
+                .read_object(&original)
+                .expect("config-disabled read")
+                .body,
+            b"original"
+        );
     }
 
     #[test]

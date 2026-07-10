@@ -22,9 +22,9 @@ use std::sync::Arc;
 // the crate-root scope in via `use super::*` and is re-exported below so every
 // `sley_pack::X` path (public API and intra-crate) resolves unchanged.
 // This is a pure code move: no function body was altered.
-pub mod inflate;
 mod delta;
 mod index;
+pub mod inflate;
 mod read;
 mod stream;
 mod write;
@@ -202,14 +202,14 @@ fn validate_position_permutation(positions: &[u32]) -> Result<()> {
     for position in positions {
         let idx = *position as usize;
         if idx >= positions.len() {
-            return Err(GitError::InvalidFormat(
-                "reverse index position points past object table".into(),
-            ));
+            return Err(GitError::InvalidFormat(format!(
+                "invalid rev-index position {position}"
+            )));
         }
         if seen[idx] {
-            return Err(GitError::InvalidFormat(
-                "reverse index position is duplicated".into(),
-            ));
+            return Err(GitError::InvalidFormat(format!(
+                "invalid rev-index position {position}"
+            )));
         }
         seen[idx] = true;
     }
@@ -993,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn pack_index_writer_rejects_duplicate_object_ids() {
+    fn pack_index_writer_preserves_duplicate_object_ids() {
         let oid = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"same\n")
             .expect("test operation should succeed");
         let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
@@ -1010,7 +1010,13 @@ mod tests {
                 offset: 24,
             },
         ];
-        assert!(PackIndex::write_v2(ObjectFormat::Sha1, &entries, &pack_checksum).is_err());
+        let index = PackIndex::write_v2(ObjectFormat::Sha1, &entries, &pack_checksum)
+            .expect("duplicate objects are valid in a pack index");
+        let parsed = PackIndex::parse(&index, ObjectFormat::Sha1)
+            .expect("duplicate-object pack index should parse");
+        assert_eq!(parsed.entries.len(), 2);
+        assert!(parsed.entries.iter().all(|entry| entry.oid == oid));
+        assert!(parsed.find(&oid).is_some());
     }
 
     #[test]
@@ -1239,7 +1245,31 @@ mod tests {
             .expect("test operation should succeed");
         let last = reverse_index.len() - 1;
         reverse_index[last] ^= 1;
-        assert!(PackReverseIndex::parse(&reverse_index, ObjectFormat::Sha1, 1).is_err());
+        assert!(matches!(
+            PackReverseIndex::parse(&reverse_index, ObjectFormat::Sha1, 1),
+            Err(GitError::InvalidFormat(message)) if message == "invalid checksum"
+        ));
+    }
+
+    #[test]
+    fn classifies_pack_reverse_index_corruption_for_fsck() {
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
+        let valid = PackReverseIndex::write(ObjectFormat::Sha1, &[0], &pack_checksum)
+            .expect("test operation should succeed");
+        for (offset, value, expected) in [
+            (1, 7, "unknown signature"),
+            (7, 2, "unsupported version 2"),
+            (11, 3, "unsupported hash id 3"),
+            (14, 7, "invalid rev-index position 1792"),
+        ] {
+            let mut corrupt = valid.clone();
+            corrupt[offset] = value;
+            assert!(matches!(
+                PackReverseIndex::parse(&corrupt, ObjectFormat::Sha1, 1),
+                Err(GitError::InvalidFormat(message)) if message == expected
+            ));
+        }
     }
 
     #[test]
@@ -3287,6 +3317,27 @@ mod tests {
                 .expect("test operation should succeed"),
             vec![1, 2]
         );
+    }
+
+    #[test]
+    fn pack_bitmap_writer_roundtrips_lookup_table() {
+        let object_types = [ObjectType::Commit, ObjectType::Commit, ObjectType::Tree];
+        let mut writer =
+            PackBitmapWriter::new(ObjectFormat::Sha1, pack_checksum_sha1(), &object_types)
+                .expect("test operation should succeed")
+                .with_lookup_table(true);
+        writer
+            .add_commit(0, 1, &[2])
+            .expect("test operation should succeed");
+        writer
+            .add_commit(1, 0, &[2])
+            .expect("test operation should succeed");
+        let bytes = writer.write().expect("test operation should succeed");
+        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, 3)
+            .expect("test operation should succeed");
+        assert!(parsed.lookup_table);
+        assert_ne!(parsed.options & PackBitmapIndex::OPTION_LOOKUP_TABLE, 0);
+        assert_eq!(parsed.entries.len(), 2);
     }
 
     #[test]

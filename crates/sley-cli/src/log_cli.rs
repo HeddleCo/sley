@@ -2,18 +2,18 @@
 
 use crate::commands;
 use crate::{
-    has_unescaped_trailing_dollar, sley_core, sley_diff_merge, sley_pretty, sley_rev,
     CompiledLogFormat, GitConfig, GitError, LogFormatContext, ObjectFormat, ObjectId, ReflogEntry,
     Result, StashFormatContext, emit_compiled_log_format, emit_compiled_stash_format,
-    log_reencode_message,
+    has_unescaped_trailing_dollar, log_reencode_message, sley_core, sley_diff_merge, sley_pretty,
+    sley_rev,
 };
-use sley_grep;
 use sley::ReferenceTarget as RefTarget;
 use sley::plumbing::sley_core::DateMode;
 use sley::plumbing::sley_object::{Commit, ObjectType};
 use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
 use sley::plumbing::sley_refs::FileRefStore;
 use sley::plumbing::sley_rev::CommitRecord;
+use sley_grep;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
@@ -931,7 +931,6 @@ pub(crate) fn log_grep_filters_match(
     };
     matched != invert
 }
-
 
 // W31: CLI adapters for sley-pretty log format traits.
 pub(crate) struct CliMailmapAdapter<'a>(pub(crate) &'a commands::utility::Mailmap);

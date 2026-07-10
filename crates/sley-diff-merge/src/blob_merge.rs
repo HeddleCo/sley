@@ -1,8 +1,8 @@
 //! Three-way blob merge (diff3 conflict markers).
 
 use crate::line_diff::{
-    canonicalize_line, myers_diff_lines, myers_diff_lines_ws, split_lines, DiffAlgorithm,
-    DiffLine, DiffOp, WsIgnore,
+    DiffAlgorithm, DiffLine, DiffOp, WsIgnore, canonicalize_line, myers_diff_lines,
+    myers_diff_lines_ws, split_lines,
 };
 
 /// Whether to favour one side wholesale for textual conflicts (`-Xours` /
@@ -29,6 +29,10 @@ pub enum ConflictStyle {
     /// `diff3` style: also include the common-ancestor section between `ours`
     /// and the `=======` divider, delimited by `|||||||`.
     Diff3,
+    /// `zdiff3` style: include the common-ancestor section like [`Self::Diff3`],
+    /// but hoist lines shared at the beginning and end of both sides out of the
+    /// conflict block. This is git's zealous diff3 rendering.
+    ZDiff3,
 }
 
 /// Labels and style controlling [`merge_blobs`] conflict markers.
@@ -422,19 +426,44 @@ impl<'a> MergeWriter<'a> {
             self.emit_section(theirs);
             return;
         }
+
+        // zdiff3 keeps the diff3 ancestor section, but moves context common to
+        // both sides at either edge outside the conflict markers. The base
+        // section deliberately remains the whole base region; that is how xdiff
+        // retains the useful ancestor context while shrinking only the side
+        // sections.
+        let (prefix, suffix) = if self.options.style == ConflictStyle::ZDiff3 {
+            let prefix = common_prefix_len(ours, theirs);
+            let suffix = common_suffix_len(ours, theirs, prefix);
+            (prefix, suffix)
+        } else {
+            (0, 0)
+        };
+        if prefix != 0 {
+            self.emit_section(&ours[..prefix]);
+        }
+        let ours_inner = &ours[prefix..ours.len() - suffix];
+        let theirs_inner = &theirs[prefix..theirs.len() - suffix];
+
         self.conflicted = true;
         self.write_marker(b'<', self.options.ours_label);
-        self.emit_section(ours);
-        if self.options.style == ConflictStyle::Diff3 {
+        self.emit_section(ours_inner);
+        if matches!(
+            self.options.style,
+            ConflictStyle::Diff3 | ConflictStyle::ZDiff3
+        ) {
             self.ensure_newline();
             self.write_marker(b'|', self.options.base_label);
             self.emit_section(base);
         }
         self.ensure_newline();
         self.write_divider();
-        self.emit_section(theirs);
+        self.emit_section(theirs_inner);
         self.ensure_newline();
         self.write_marker(b'>', self.options.theirs_label);
+        if suffix != 0 {
+            self.emit_section(&ours[ours.len() - suffix..]);
+        }
     }
 
     /// Emit a conflict with git's zealous refinement applied. The default
@@ -449,8 +478,10 @@ impl<'a> MergeWriter<'a> {
         base: &[DiffLine<'_>],
         theirs: &[DiffLine<'_>],
     ) {
-        if self.options.style == ConflictStyle::Diff3
-            || self.options.favor != MergeFavor::None
+        if matches!(
+            self.options.style,
+            ConflictStyle::Diff3 | ConflictStyle::ZDiff3
+        ) || self.options.favor != MergeFavor::None
             || ours.is_empty()
             || theirs.is_empty()
         {
@@ -508,4 +539,20 @@ impl<'a> MergeWriter<'a> {
             conflicted: self.conflicted,
         }
     }
+}
+
+fn common_prefix_len(a: &[DiffLine<'_>], b: &[DiffLine<'_>]) -> usize {
+    a.iter()
+        .zip(b)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn common_suffix_len(a: &[DiffLine<'_>], b: &[DiffLine<'_>], prefix: usize) -> usize {
+    let max = a.len().min(b.len()).saturating_sub(prefix);
+    let mut len = 0;
+    while len < max && a[a.len() - 1 - len] == b[b.len() - 1 - len] {
+        len += 1;
+    }
+    len
 }

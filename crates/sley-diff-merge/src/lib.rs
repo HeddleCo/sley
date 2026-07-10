@@ -1,31 +1,31 @@
 //! Git diff and merge engine.
 
-mod line_diff;
 mod blob_merge;
-mod name_status;
-mod patch;
+pub mod format;
+mod line_diff;
 mod merge_trees;
 mod name;
-pub mod format;
+mod name_status;
+mod patch;
 pub mod range;
 pub mod render;
 pub mod ws;
 
 pub use sley_core::BString;
 
-pub use line_diff::*;
 pub use blob_merge::*;
+pub use format::*;
+pub use line_diff::*;
+pub use merge_trees::*;
 pub use name_status::*;
 pub use patch::*;
-pub use merge_trees::*;
-pub use format::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::name_status::{
-        changed_tree_entries, collect_full_tree_pair, diff_name_status_maps,
-        diff_name_status_maps_with_renames, read_blob_bytes, TREE_ENTRY_MODE,
+        TREE_ENTRY_MODE, changed_tree_entries, collect_full_tree_pair, diff_name_status_maps,
+        diff_name_status_maps_with_renames, read_blob_bytes,
     };
     use crate::patch::{parse_leading_usize, split_blob_lines};
     use sley_core::{ObjectFormat, ObjectId};
@@ -279,7 +279,7 @@ mod tests {
                 detect_copies: false,
                 find_copies_harder: false,
                 rename_empty: true,
-            
+
                 ..Default::default()
             },
         )
@@ -512,6 +512,24 @@ mod tests {
         assert_eq!(
             result.content,
             b"a\n<<<<<<< ours\nOURS\n||||||| base\nb\n=======\nTHEIRS\n>>>>>>> theirs\nc\n"
+                .to_vec(),
+        );
+    }
+
+    #[test]
+    fn merge_zdiff3_hoists_shared_side_context() {
+        let base = b"a\nold\nz\n";
+        let ours = b"a\nshared\nOURS\ntail\nz\n";
+        let theirs = b"a\nshared\nTHEIRS\ntail\nz\n";
+        let options = MergeBlobOptions {
+            style: ConflictStyle::ZDiff3,
+            ..merge_opts()
+        };
+        let result = merge_blobs(base, ours, theirs, &options);
+        assert!(result.conflicted);
+        assert_eq!(
+            result.content,
+            b"a\nshared\n<<<<<<< ours\nOURS\n||||||| base\nold\n=======\nTHEIRS\n>>>>>>> theirs\ntail\nz\n"
                 .to_vec(),
         );
     }
@@ -1253,17 +1271,15 @@ new mode 100755
         let right = write_tree(&mut db, &[(b"b.txt", 0o100644, new)]);
 
         let opts = DiffNameStatusOptions {
-                detect_renames: true,
-                detect_copies: false,
-                find_copies_harder: false,
-                rename_empty: true,
+            detect_renames: true,
+            detect_copies: false,
+            find_copies_harder: false,
+            rename_empty: true,
             detect_inexact: true,
             rename_threshold: DEFAULT_RENAME_THRESHOLD,
             copy_threshold: DEFAULT_RENAME_THRESHOLD,
             rename_limit: 0,
-        
-                ..Default::default()
-            };
+        };
         let diff = diff_name_status_trees_with_options_and_diagnostics(
             &db,
             ObjectFormat::Sha1,
@@ -1354,17 +1370,15 @@ new mode 100755
         );
 
         let rename_options = DiffNameStatusOptions {
-                detect_renames: true,
-                detect_copies: false,
-                find_copies_harder: false,
-                rename_empty: true,
+            detect_renames: true,
+            detect_copies: false,
+            find_copies_harder: false,
+            rename_empty: true,
             detect_inexact: true,
             rename_threshold: DEFAULT_RENAME_THRESHOLD,
             copy_threshold: DEFAULT_RENAME_THRESHOLD,
             rename_limit: 0,
-        
-                ..Default::default()
-            };
+        };
         let no_op_renames = diff_name_status_trees_with_options_and_diagnostics(
             &db,
             ObjectFormat::Sha1,
@@ -1411,17 +1425,15 @@ new mode 100755
         let right = write_tree(&mut db, &[(b"b.txt", 0o100644, new)]);
 
         let opts = DiffNameStatusOptions {
-                detect_renames: true,
-                detect_copies: false,
-                find_copies_harder: false,
-                rename_empty: true,
+            detect_renames: true,
+            detect_copies: false,
+            find_copies_harder: false,
+            rename_empty: true,
             detect_inexact: true,
             rename_threshold: 60,
             copy_threshold: 60,
             rename_limit: 0,
-        
-                ..Default::default()
-            };
+        };
         let diff = diff_name_status_trees_with_options_and_diagnostics(
             &db,
             ObjectFormat::Sha1,
@@ -1476,16 +1488,14 @@ new mode 100755
 
         for inexact in [false, true] {
             let opts = DiffNameStatusOptions {
-                    detect_renames: true,
-                    detect_copies: false,
-                    find_copies_harder: false,
-                    rename_empty: true,
+                detect_renames: true,
+                detect_copies: false,
+                find_copies_harder: false,
+                rename_empty: true,
                 detect_inexact: inexact,
                 rename_threshold: DEFAULT_RENAME_THRESHOLD,
                 copy_threshold: DEFAULT_RENAME_THRESHOLD,
                 rename_limit: 0,
-            
-                ..Default::default()
             };
             let diff = diff_name_status_trees_with_options_and_diagnostics(
                 &db,
@@ -1495,7 +1505,7 @@ new mode 100755
                 opts,
             )
             .expect("test operation should succeed");
-        let entries = diff.entries;
+            let entries = diff.entries;
             assert_eq!(entries.len(), 1, "inexact={inexact}: {entries:?}");
             assert_eq!(entries[0].status, NameStatus::Renamed(100));
             assert_eq!(
@@ -1527,17 +1537,15 @@ new mode 100755
         );
 
         let opts = DiffNameStatusOptions {
-                detect_renames: true,
-                detect_copies: true,
-                find_copies_harder: true,
-                rename_empty: true,
+            detect_renames: true,
+            detect_copies: true,
+            find_copies_harder: true,
+            rename_empty: true,
             detect_inexact: true,
             rename_threshold: DEFAULT_RENAME_THRESHOLD,
             copy_threshold: DEFAULT_RENAME_THRESHOLD,
             rename_limit: 0,
-        
-                ..Default::default()
-            };
+        };
         let diff = diff_name_status_trees_with_options_and_diagnostics(
             &db,
             ObjectFormat::Sha1,
@@ -1561,6 +1569,54 @@ new mode 100755
         assert!(
             entries.iter().all(|e| e.status != NameStatus::Deleted),
             "copy must not delete the source: {entries:?}"
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn copy_detection_keeps_deleted_source_for_copy_then_rename() {
+        let root = temp_root();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false)
+            .expect("test operation should succeed");
+        let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
+        let contents = write_blob(&mut db, b"same contents\n");
+        let left = write_tree(
+            &mut db,
+            &[
+                // Same OID but a different file type: diffcore must not steal
+                // a symlink destination for this regular-file source.
+                (b"decoy", 0o100644, contents.clone()),
+                (b"source", 0o120000, contents.clone()),
+            ],
+        );
+        let right = write_tree(
+            &mut db,
+            &[
+                (b"destination-a", 0o120000, contents.clone()),
+                (b"destination-z", 0o120000, contents),
+            ],
+        );
+        let entries = diff_name_status_trees_with_options(
+            &db,
+            ObjectFormat::Sha1,
+            &left,
+            &right,
+            DiffNameStatusOptions {
+                detect_renames: true,
+                detect_copies: true,
+                rename_empty: true,
+                ..Default::default()
+            },
+        )
+        .expect("test operation should succeed");
+
+        assert_eq!(
+            status_lines(&entries),
+            vec![
+                "D\tdecoy",
+                "C100\tsource\tdestination-a",
+                "R100\tsource\tdestination-z",
+            ]
         );
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
@@ -1601,17 +1657,15 @@ new mode 100755
         );
 
         let opts_for = |rename_limit| DiffNameStatusOptions {
-                detect_renames: true,
-                detect_copies: true,
-                find_copies_harder: true,
-                rename_empty: true,
+            detect_renames: true,
+            detect_copies: true,
+            find_copies_harder: true,
+            rename_empty: true,
             detect_inexact: true,
             rename_threshold: DEFAULT_RENAME_THRESHOLD,
             copy_threshold: DEFAULT_RENAME_THRESHOLD,
             rename_limit,
-        
-                ..Default::default()
-            };
+        };
 
         // Over limit: 2 × 1 = 2 > 1² ⇒ copy detection skipped, copy.txt is Added.
         let over = diff_name_status_trees_with_options_and_diagnostics(
@@ -2419,7 +2473,7 @@ new mode 100755
                 detect_copies: false,
                 find_copies_harder: false,
                 rename_empty: true,
-            
+
                 ..Default::default()
             },
         )
@@ -2477,7 +2531,7 @@ new mode 100755
                 detect_copies: false,
                 find_copies_harder: false,
                 rename_empty: true,
-            
+
                 ..Default::default()
             },
         )
@@ -2529,7 +2583,7 @@ new mode 100755
                 detect_copies: false,
                 find_copies_harder: false,
                 rename_empty: true,
-            
+
                 ..Default::default()
             },
         )
@@ -2590,7 +2644,7 @@ new mode 100755
                 detect_copies: false,
                 find_copies_harder: false,
                 rename_empty: true,
-            
+
                 ..Default::default()
             },
         )
@@ -2748,17 +2802,15 @@ new mode 100755
         );
 
         let options = DiffNameStatusOptions {
-                detect_renames: true,
-                detect_copies: false,
-                find_copies_harder: false,
-                rename_empty: true,
+            detect_renames: true,
+            detect_copies: false,
+            find_copies_harder: false,
+            rename_empty: true,
             detect_inexact: true,
             rename_threshold: DEFAULT_RENAME_THRESHOLD,
             copy_threshold: DEFAULT_RENAME_THRESHOLD,
             rename_limit: 0,
-        
-                ..Default::default()
-            };
+        };
 
         // Reference: full flatten + same detection.
         let (full_left, full_right) =
@@ -2827,7 +2879,7 @@ new mode 100755
 
     #[test]
     fn bounded_inflate_reserve_caps_attacker_declared_size() {
-        use sley_pack::inflate::{bounded_inflate_reserve, MAX_INFLATE_RESERVE};
+        use sley_pack::inflate::{MAX_INFLATE_RESERVE, bounded_inflate_reserve};
         assert_eq!(bounded_inflate_reserve(u64::MAX as usize, 10), 10 * 1032);
         assert_eq!(
             bounded_inflate_reserve(usize::MAX, usize::MAX),
@@ -2858,7 +2910,9 @@ new mode 100755
                 "delta bomb (declared={declared}) panicked/aborted instead of erroring cleanly"
             );
             assert!(
-                join_result.expect("parse thread should not panic on a delta bomb").is_none(),
+                join_result
+                    .expect("parse thread should not panic on a delta bomb")
+                    .is_none(),
                 "delta bomb (declared={declared}) should be rejected as invalid"
             );
         }

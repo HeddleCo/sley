@@ -5,7 +5,7 @@ use super::create::{
     branch_create_reflog_message, branch_reset_reflog_message, branch_should_write_reflog,
     resolve_branch_start,
 };
-use super::operand::{branch_resolve_local_branch_operand, BranchOperandKind};
+use super::operand::{BranchOperandKind, branch_resolve_local_branch_operand};
 use crate::*;
 
 pub(super) struct BranchDeleteOptions {

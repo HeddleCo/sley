@@ -2,9 +2,9 @@
 
 use std::path::PathBuf;
 
+use sley::plumbing::sley_worktree::{UpdateIndexOptions, update_index_paths};
 use sley::{Index, Repository};
-use sley::plumbing::sley_worktree::{update_index_paths, UpdateIndexOptions};
-use sley_testkit::engine_parity::{format_index_stage_lines, EngineOutput};
+use sley_testkit::engine_parity::{EngineOutput, format_index_stage_lines};
 
 /// Run `update_index_paths` for `paths` and return the resulting staged index.
 pub fn run_update_index(

@@ -452,9 +452,15 @@ mod tests {
     fn cursor_plain_args() {
         let line = b"refs/heads/a deadbeef";
         let mut c = ArgCursor::new(line, Terminator::Newline);
-        assert_eq!(c.parse_refname().unwrap().as_deref(), Some("refs/heads/a"));
+        assert_eq!(
+            c.parse_refname()
+                .expect("plain refname should parse")
+                .as_deref(),
+            Some("refs/heads/a")
+        );
         assert!(matches!(
-            c.parse_next_oid("update", "refs/heads/a", true).unwrap(),
+            c.parse_next_oid("update", "refs/heads/a", true)
+                .expect("plain object ID should parse"),
             NextOid::Value(v) if v == "deadbeef"
         ));
         assert!(c.finish("update", "refs/heads/a").is_ok());
@@ -464,8 +470,10 @@ mod tests {
     fn cursor_extra_input_detected() {
         let line = b"refs/heads/a aaa bbb";
         let mut c = ArgCursor::new(line, Terminator::Newline);
-        let _ = c.parse_refname().unwrap();
-        let _ = c.parse_next_oid("create", "refs/heads/a", false).unwrap();
+        let _ = c.parse_refname().expect("plain refname should parse");
+        let _ = c
+            .parse_next_oid("create", "refs/heads/a", false)
+            .expect("plain object ID should parse");
         // create takes one oid; the remaining " bbb" is extra input.
         assert!(c.finish("create", "refs/heads/a").is_err());
     }
@@ -475,7 +483,9 @@ mod tests {
         let line = br#""refs/heads/with space" deadbeef"#;
         let mut c = ArgCursor::new(line, Terminator::Newline);
         assert_eq!(
-            c.parse_refname().unwrap().as_deref(),
+            c.parse_refname()
+                .expect("quoted refname should parse")
+                .as_deref(),
             Some("refs/heads/with space")
         );
     }

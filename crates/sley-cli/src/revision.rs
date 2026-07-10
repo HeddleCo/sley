@@ -2,9 +2,9 @@
 
 use std::path::Path;
 
-use sley::{ObjectFormat, ObjectId, Result};
 use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectPrefixResolution};
 use sley::plumbing::sley_refs::FileRefStore;
+use sley::{ObjectFormat, ObjectId, Result};
 
 use crate::sley_rev;
 
@@ -16,9 +16,14 @@ pub(crate) fn rev_parse_symbolic_full_name(
     sley_rev::resolve_revision_symbolic_full_name(git_dir, format, rev)
 }
 
-pub(crate) fn resolve_revision(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<ObjectId> {
+pub(crate) fn resolve_revision(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+) -> Result<ObjectId> {
     warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
-    sley_rev::resolve_revision(git_dir, format, rev)
+    let db = crate::repository::open_object_database(git_dir, format)?;
+    sley_rev::RevisionResolver::new(git_dir, format, &db).resolve(rev)
 }
 
 pub(crate) fn resolve_revision_commitish(
@@ -36,7 +41,8 @@ pub(crate) fn resolve_revision_commitish(
         )?
         .into_result(rev);
     }
-    sley_rev::resolve_revision(git_dir, format, rev)
+    let db = crate::repository::open_object_database(git_dir, format)?;
+    sley_rev::RevisionResolver::new(git_dir, format, &db).resolve(rev)
 }
 
 pub(crate) fn resolve_revision_treeish(
@@ -54,7 +60,8 @@ pub(crate) fn resolve_revision_treeish(
         )?
         .into_result(rev);
     }
-    sley_rev::resolve_revision(git_dir, format, rev)
+    let db = crate::repository::open_object_database(git_dir, format)?;
+    sley_rev::RevisionResolver::new(git_dir, format, &db).resolve(rev)
 }
 
 fn is_short_hex_object_prefix(format: ObjectFormat, rev: &str) -> bool {

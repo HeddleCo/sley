@@ -7,7 +7,7 @@
 //! single source of truth for what a `.gitmodules` entry means.
 //!
 //! Porting notes (git `submodule-config.c`):
-//! - [`parse_config`] is the per-key dispatch; we drive it over a parsed
+//! - `parse_config` is the per-key dispatch; we drive it over a parsed
 //!   [`GitConfig`] rather than git's streaming `git_config_from_mem` callback,
 //!   but the per-key semantics (last-one-wins vs. first-one-wins, validation,
 //!   value normalization) match faithfully.

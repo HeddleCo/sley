@@ -287,7 +287,6 @@ impl FastExporter {
                     self.export_blob(tip.oid)?;
                 }
                 ObjectType::Tree => {}
-                _ => {}
             }
         }
         Ok(())

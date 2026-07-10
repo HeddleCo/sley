@@ -1,15 +1,17 @@
 //! Fetch command, transport, and submodule recursion.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use super::FetchRecurseSubmodules;
 use super::clone::{normalize_clone_filter, parse_clone_depth, register_promisor_remote};
-use super::config::{clone_effective_config_value, read_repo_config, remote_exists, remote_names, write_repo_config};
+use super::config::{
+    clone_effective_config_value, read_repo_config, remote_exists, remote_names, write_repo_config,
+};
 use super::pack::{
     configured_legacy_protocol, configured_protocol_version, prettify_refname,
-    trace_configured_local_protocol_version, trace2_local_transfer_negotiation,
-    trace_protocol_v2_ls_refs_request, unique_abbrev,
+    trace_configured_local_protocol_version, trace_protocol_v2_ls_refs_request,
+    trace2_local_transfer_negotiation, unique_abbrev,
 };
 use super::resolve::{local_remote_git_dir, ls_remote_git_dir};
-use super::FetchRecurseSubmodules;
 use crate::commands::config_cmd::{
     ConfigKey, SimpleConfigRegex, config_set_value, parse_config_key,
 };
@@ -95,6 +97,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         deepen_since: None,
         deepen_not: Vec::new(),
         ssh_options: None,
+        upload_pack_command: None,
         atomic: false,
         negotiation_restrict: None,
         negotiation_include: None,
@@ -391,6 +394,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                 .map(rewrite_empty_source_refspec),
         );
     }
+    options.upload_pack_command = upload_pack_command.clone();
     let cwd = env::current_dir()?;
     let git_dir = crate::session::cli_git_dir_from(&cwd)?;
     let format = repository_object_format(&git_dir)?;
@@ -614,7 +618,11 @@ fn fetch_multiple_remotes(req: FetchMultipleRequest<'_>) -> Result<()> {
         let mut remote_options = req.options.clone();
         remote_options.append = true;
         if !req.filter_option_explicit {
-            sley_remote::apply_configured_partial_clone_filter(req.config, &remote, &mut remote_options);
+            sley_remote::apply_configured_partial_clone_filter(
+                req.config,
+                &remote,
+                &mut remote_options,
+            );
         }
         if req.refspecs.is_empty() && !req.prefetch {
             remote_options.merge_srcs =
@@ -1562,6 +1570,12 @@ fn fetch_one_source_with_outcome(
     options: FetchOptions,
     server_options: &[String],
 ) -> Result<sley_remote::FetchOutcome> {
+    if let Some(outcome) =
+        super::helper::fetch_with_remote_helper(git_dir, format, source, refspecs, options.clone())?
+    {
+        maybe_write_fetch_commit_graph(git_dir, &options)?;
+        return Ok(outcome);
+    }
     if let Some((bundle_source, bundle)) = fetch_bundle_source(git_dir, format, source)? {
         // Bundle fetches have no shallow support, so a `--depth` is warned-and-
         // ignored here, matching the local-clone behavior.
@@ -1799,7 +1813,7 @@ pub(crate) fn fetch_local_repository(
     fetch_local_repository_with_outcome(git_dir, format, source, refspecs, options, &[]).map(|_| ())
 }
 
-pub(super) fn fetch_local_repository_with_outcome(
+pub(crate) fn fetch_local_repository_with_outcome(
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
@@ -2124,7 +2138,7 @@ pub(crate) fn fetch_ssh_repository(
     fetch_ssh_repository_with_outcome(git_dir, format, source, refspecs, options).map(|_| ())
 }
 
-pub(super) fn fetch_ssh_repository_with_outcome(
+pub(crate) fn fetch_ssh_repository_with_outcome(
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
@@ -2156,7 +2170,7 @@ pub(crate) fn fetch_git_repository(
     fetch_git_repository_with_outcome(git_dir, format, source, refspecs, options).map(|_| ())
 }
 
-pub(super) fn fetch_git_repository_with_outcome(
+pub(crate) fn fetch_git_repository_with_outcome(
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
@@ -2189,7 +2203,7 @@ pub(super) fn fetch_git_repository_with_outcome(
 // build the right variant; URL/repo resolution, output formatting, and exit codes
 // stay here.
 
-pub(super) fn fetch_source_is_http(source: &str) -> Result<bool> {
+pub(crate) fn fetch_source_is_http(source: &str) -> Result<bool> {
     sley_remote::remote_url_is_http(&ls_remote_resolved_url(source)?)
 }
 
@@ -2206,7 +2220,7 @@ pub(super) fn fetch_http_repository(
     fetch_http_repository_with_outcome(git_dir, format, source, refspecs, options).map(|_| ())
 }
 
-pub(super) fn fetch_http_repository_with_outcome(
+pub(crate) fn fetch_http_repository_with_outcome(
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,

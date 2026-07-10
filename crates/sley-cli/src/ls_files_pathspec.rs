@@ -160,7 +160,11 @@ impl LsFilesPathspec {
     }
 }
 
-pub(crate) fn normalize_absolute_cli_pathspec(root: &Path, cwd: &Path, arg: &str) -> Result<String> {
+pub(crate) fn normalize_absolute_cli_pathspec(
+    root: &Path,
+    cwd: &Path,
+    arg: &str,
+) -> Result<String> {
     let path = Path::new(arg);
     if !path.is_absolute() {
         return Ok(arg.to_string());

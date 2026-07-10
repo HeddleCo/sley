@@ -40,14 +40,9 @@ pub fn resolve_path_from_cwd(cwd: &Path, value: &Path) -> PathBuf {
 }
 
 /// Discover or open a repository honoring process environment variables.
-pub(crate) fn resolve_repository(
-    path: &Path,
-    exact_path: bool,
-) -> Result<EnvResolvedRepository> {
+pub(crate) fn resolve_repository(path: &Path, exact_path: bool) -> Result<EnvResolvedRepository> {
     let cwd = env::current_dir().map_err(|err| GitError::Io(err.to_string()))?;
-    let relative_start = if path.as_os_str().is_empty() {
-        None
-    } else if path.is_absolute() {
+    let relative_start = if path.as_os_str().is_empty() || path.is_absolute() {
         None
     } else {
         Some(cwd.join(path))
@@ -57,7 +52,9 @@ pub(crate) fn resolve_repository(
     } else if path.is_absolute() {
         path
     } else {
-        relative_start.as_ref().expect("relative path prepared above")
+        relative_start
+            .as_ref()
+            .expect("relative path prepared above")
     };
 
     let git_dir = if let Some(git_dir) = environment_git_dir() {

@@ -151,6 +151,9 @@ pub struct FetchOptions {
     /// such as clone (`-4`/`-6`). When absent, fetch derives SSH options from
     /// the effective repository config.
     pub ssh_options: Option<crate::ssh::SshTransportOptions>,
+    /// Explicit SSH upload-pack program (`--upload-pack` / `--exec`). `None`
+    /// uses the protocol's `git-upload-pack` service name.
+    pub upload_pack_command: Option<String>,
     /// `--atomic`: apply every remote-tracking ref update (and prune deletion)
     /// in a single reference transaction so a single rejected update aborts the
     /// whole fetch and leaves `FETCH_HEAD` empty. The default is non-atomic:
@@ -371,8 +374,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         FetchSource::Http(remote) => {
             let http_batch = crate::http::HttpOperationBatch::new();
             let client = http_batch.client();
-            let git_protocol =
-                crate::http::http_git_protocol_header_value(Some(request.config))?;
+            let git_protocol = crate::http::http_git_protocol_header_value(Some(request.config))?;
             let discovered = crate::http::http_service_advertisements(
                 client,
                 remote,
@@ -477,10 +479,11 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 .ssh_options
                 .unwrap_or_else(|| crate::ssh::ssh_transport_options_from_config(request.config));
             let (advertisements, features) =
-                crate::ssh::ssh_upload_pack_advertisements_with_options(
+                crate::ssh::ssh_upload_pack_advertisements_with_command(
                     remote,
                     request.format,
                     ssh_options,
+                    options.upload_pack_command.as_deref(),
                 )?;
             outcome.head_symref = head_symref_from_features(&features.symrefs);
             let (mut updates, opportunistic_dsts) = plan_and_adjust_updates(FetchPlanInput {
@@ -521,6 +524,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     deepen: options.depth,
                     promisor: promisor_remote,
                     command_options: ssh_options,
+                    upload_pack_command: options.upload_pack_command.as_deref(),
                     max_input_size,
                 },
             )?;
@@ -551,12 +555,35 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         } => {
             let protocol_v2 =
                 *protocol_v2 || request.config.get("protocol", None, "version") == Some("2");
-            let discovered = crate::git::git_upload_pack_advertisements_with_protocol(
-                remote,
-                request.format,
-                protocol_v2,
-                Some(request.config),
-            )?;
+            let exact_oid_only = parsed_refspecs.iter().any(|refspec| !refspec.negative)
+                && parsed_refspecs.iter().all(|refspec| {
+                    refspec.negative
+                        || (!refspec.pattern
+                            && refspec.src.as_deref().is_some_and(|source| {
+                                ObjectId::from_hex(request.format, source).is_ok()
+                            }))
+                });
+            let discovered = if protocol_v2 && exact_oid_only && !options.auto_follow_tags {
+                // Protocol v2 permits an exact-OID fetch to start directly with
+                // `command=fetch`; no `ls-refs` command is needed. The fetch
+                // connection below still validates the server handshake and
+                // object format before sending the want.
+                crate::git::GitUploadPackAdvertisements {
+                    refs: Vec::new(),
+                    features: sley_protocol::UploadPackFeatures {
+                        object_format: Some(request.format),
+                        ..sley_protocol::UploadPackFeatures::default()
+                    },
+                    protocol_v2: true,
+                }
+            } else {
+                crate::git::git_upload_pack_advertisements_with_protocol(
+                    remote,
+                    request.format,
+                    protocol_v2,
+                    Some(request.config),
+                )?
+            };
             let advertisements = discovered.refs;
             let features = discovered.features;
             outcome.head_symref = head_symref_from_features(&features.symrefs);
@@ -704,6 +731,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             };
             let primary_heads = {
                 let primary = plan_fetch_ref_updates(
+                    request.format,
                     &advertisements,
                     &parsed_refspecs,
                     options.auto_follow_tags,
@@ -811,7 +839,57 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             } else {
                 updates.iter().map(|update| update.oid).collect()
             };
-            let shallow_info = if starts.is_empty() && deepen_plan.is_none() {
+            let use_ref_in_want = deepen_plan.is_none()
+                && !promisor_remote
+                && options.filter.is_none()
+                && !options.refetch
+                && request.config.get("protocol", None, "version") == Some("2")
+                && sley_config::read_repo_config(remote_git_dir, None)
+                    .ok()
+                    .and_then(|config| config.get_bool("uploadpack", None, "allowrefinwant"))
+                    .unwrap_or(false);
+            let mut seen_want_refs = HashSet::new();
+            let want_refs: Vec<String> = if use_ref_in_want {
+                updates
+                    .iter()
+                    .filter(|update| update.src.starts_with("refs/"))
+                    .filter(|update| seen_want_refs.insert(update.src.clone()))
+                    .map(|update| update.src.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let has_exact_oid_want = use_ref_in_want
+                && updates
+                    .iter()
+                    .any(|update| ObjectId::from_hex(request.format, &update.src).is_ok());
+            let shallow_info = if !want_refs.is_empty() || has_exact_oid_want {
+                let mut seen_exact_wants = HashSet::new();
+                let exact_wants = updates
+                    .iter()
+                    .filter(|update| ObjectId::from_hex(request.format, &update.src).is_ok())
+                    .filter(|update| seen_exact_wants.insert(update.oid))
+                    .map(|update| update.oid)
+                    .collect();
+                let ref_in_want = crate::local::install_fetch_pack_via_local_protocol_v2(
+                    crate::local::LocalProtocolV2FetchRequest {
+                        git_dir: request.git_dir,
+                        remote_git_dir,
+                        format: request.format,
+                        wants: exact_wants,
+                        want_refs,
+                        haves: negotiation_haves.clone(),
+                    },
+                )?;
+                for wanted in ref_in_want.wanted_refs {
+                    for update in &mut updates {
+                        if update.src == wanted.name {
+                            update.oid = wanted.oid;
+                        }
+                    }
+                }
+                ref_in_want.shallow_info
+            } else if starts.is_empty() && deepen_plan.is_none() {
                 if !updates.is_empty() {
                     sley_protocol::trace_packet_write_payload(b"0000");
                 }
@@ -871,7 +949,157 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
     Ok(outcome)
 }
 
-fn scheme_for_fetch_source(source: &FetchSource) -> &'static str {
+/// Final ref bookkeeping for objects installed by a remote helper's `import`
+/// stream. The helper owns object transfer; this engine operation deliberately
+/// shares Git-compatible refspec planning, FETCH_HEAD, pruning, and reference
+/// transactions with [`fetch`].
+pub struct RemoteHelperFetchRequest<'a> {
+    pub git_dir: &'a Path,
+    pub format: ObjectFormat,
+    pub config: &'a GitConfig,
+    pub remote_name: &'a str,
+    pub advertisements: &'a [RefAdvertisement],
+    pub head_symref: Option<String>,
+    pub refspecs: &'a [String],
+    pub options: &'a FetchOptions,
+}
+
+pub fn finalize_remote_helper_fetch(
+    request: RemoteHelperFetchRequest<'_>,
+    services: FetchServices<'_>,
+) -> Result<FetchOutcome> {
+    let ref_hook = services.ref_hook;
+    let mut options = request.options.clone();
+    apply_configured_remote_tag_option(request.config, request.remote_name, &mut options);
+    apply_configured_fetch_prune_option(request.config, request.remote_name, &mut options);
+    let configured_refspecs = if request.refspecs.is_empty() {
+        remote_config_values(request.config, request.remote_name, "fetch")
+    } else {
+        Vec::new()
+    };
+    let configured_refspecs_empty = configured_refspecs.is_empty();
+    let has_merge_config = request.refspecs.is_empty() && !options.merge_srcs.is_empty();
+    let default_head_fetch =
+        request.refspecs.is_empty() && configured_refspecs_empty && !has_merge_config;
+    let configured_remote_fetch = request.refspecs.is_empty() && !configured_refspecs_empty;
+    let fetch_head_source = fetch_head_source_description(request.config, request.remote_name);
+    let prune_refspecs =
+        prune_refspecs_for_source(&configured_refspecs, request.refspecs, options.prune_tags);
+    let mut effective_refspecs = fetch_refspecs_for_source(
+        configured_refspecs,
+        request.refspecs,
+        options.fetch_all_tags,
+    );
+    if options.prune_tags
+        && request.refspecs.is_empty()
+        && !effective_refspecs
+            .iter()
+            .any(|refspec| refspec == "refs/tags/*:refs/tags/*")
+    {
+        effective_refspecs.push("refs/tags/*:refs/tags/*".to_string());
+    }
+    if has_merge_config {
+        if configured_refspecs_empty && request.refspecs.is_empty() {
+            effective_refspecs.retain(|spec| spec != "HEAD");
+        }
+        let configured_parsed = effective_refspecs
+            .iter()
+            .map(|refspec| parse_refspec(refspec))
+            .collect::<Result<Vec<_>>>()?;
+        for merge_src in &options.merge_srcs {
+            let covered = configured_parsed.iter().any(|refspec| {
+                refspec
+                    .src
+                    .as_deref()
+                    .is_some_and(|src| refspec_source_covers(refspec, src, merge_src))
+            });
+            if !covered {
+                effective_refspecs.push(merge_src.clone());
+            }
+        }
+    }
+    let mut parsed_refspecs = effective_refspecs
+        .iter()
+        .map(|refspec| parse_refspec(refspec))
+        .collect::<Result<Vec<_>>>()?;
+    if options.force {
+        for refspec in &mut parsed_refspecs {
+            refspec.force = true;
+        }
+    }
+    if options.refmap.is_some() && request.refspecs.is_empty() {
+        return Err(GitError::Command(
+            "--refmap option is only meaningful with command-line refspec(s)".into(),
+        ));
+    }
+    let tracking_refspec_strings = if request.refspecs.is_empty() {
+        Vec::new()
+    } else {
+        options.refmap.clone().unwrap_or_else(|| {
+            configured_refspecs_for_tracking(request.config, request.remote_name)
+        })
+    };
+    let tracking_refspecs = tracking_refspec_strings
+        .iter()
+        .map(|refspec| parse_refspec(refspec))
+        .collect::<Result<Vec<_>>>()?;
+    let parsed_prune_refspecs = prune_refspecs
+        .iter()
+        .map(|refspec| parse_refspec(refspec))
+        .collect::<Result<Vec<_>>>()?;
+
+    let store = FileRefStore::new(request.git_dir, request.format);
+    let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
+    let (mut updates, opportunistic_dsts) = plan_and_adjust_updates(FetchPlanInput {
+        advertisements: request.advertisements,
+        refspecs: &parsed_refspecs,
+        options: &options,
+        store: &store,
+        reachable: Some((&local_db, request.advertisements)),
+        local_db: Some(&local_db),
+        deepen_excluded: None,
+        format: request.format,
+        configured_remote_fetch,
+        has_merge_config,
+        tracking_refspecs: &tracking_refspecs,
+    })?;
+    let mut outcome = FetchOutcome {
+        head_symref: request.head_symref,
+        ..FetchOutcome::default()
+    };
+    finalize_fetch(
+        FetchFinalize {
+            git_dir: request.git_dir,
+            format: request.format,
+            store: &store,
+            options: &options,
+            fetch_head_source: &fetch_head_source,
+            default_head_fetch,
+            log_all_ref_updates: fetch_log_all_ref_updates(request.config),
+            ref_hook,
+            opportunistic_dsts: &opportunistic_dsts,
+        },
+        &mut updates,
+        &mut outcome,
+    )?;
+    if options.prune && !parsed_prune_refspecs.is_empty() {
+        outcome.pruned = prune_refs_from_advertisements(
+            PruneRefsInput {
+                config: request.config,
+                store: &store,
+                remote: request.remote_name,
+                advertisements: request.advertisements,
+                refspecs: &parsed_prune_refspecs,
+                dry_run: options.dry_run,
+                quiet: options.quiet,
+            },
+            services.progress,
+        )?;
+    }
+    Ok(outcome)
+}
+
+fn scheme_for_fetch_source(source: &FetchSource) -> &str {
     match source {
         FetchSource::Http(remote) => crate::protocol::transport_scheme_for_remote(remote),
         FetchSource::Ssh(remote) => crate::protocol::transport_scheme_for_remote(remote),
@@ -936,10 +1164,7 @@ fn shallow_boundary_for_request(
     format: ObjectFormat,
     options: &FetchOptions,
 ) -> Result<Vec<ObjectId>> {
-    if options.depth.is_none()
-        && options.deepen_since.is_none()
-        && options.deepen_not.is_empty()
-    {
+    if options.depth.is_none() && options.deepen_since.is_none() && options.deepen_not.is_empty() {
         return Ok(Vec::new());
     }
     crate::shallow::read_shallow(git_dir, format)
@@ -1016,8 +1241,12 @@ fn plan_and_adjust_updates(
     } else {
         visible_advertisements.as_slice()
     };
-    let mut updates =
-        plan_fetch_ref_updates(planning_advertisements, refspecs, options.auto_follow_tags)?;
+    let mut updates = plan_fetch_ref_updates(
+        format,
+        planning_advertisements,
+        refspecs,
+        options.auto_follow_tags,
+    )?;
     if options.fetch_all_tags {
         mark_tag_refspec_updates_not_for_merge(&mut updates);
     } else {
@@ -1270,6 +1499,7 @@ fn finalize_fetch(
         return Ok(());
     }
     downgrade_non_commit_for_merge(git_dir, format, updates);
+    drop_redundant_symref_alias_updates(store, updates)?;
     validate_fetch_ref_updates(git_dir, format, store, options.update_head_ok, updates)?;
     if options.atomic {
         // Atomic fetch (`do_fetch`/`store_updated_refs` with a transaction): a
@@ -1320,15 +1550,58 @@ fn finalize_fetch(
         )?;
         outcome.wrote_fetch_head = true;
     }
+    let (rejected, rejection) =
+        non_atomic_non_fast_forward_rejections(git_dir, format, store, updates)?;
+    let accepted = updates
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !rejected.contains(index))
+        .map(|(_, update)| update.clone())
+        .collect::<Vec<_>>();
     apply_fetch_ref_updates(
         store,
         format,
         fetch_head_source,
         log_all_ref_updates,
-        updates,
+        &accepted,
         ref_hook,
     )?;
+    if let Some(reason) = rejection {
+        return Err(GitError::Command(reason));
+    }
     outcome.ref_updates = std::mem::take(updates);
+    Ok(())
+}
+
+/// A wildcard fetch can map both a symbolic alias and its target, for example
+/// `refs/remotes/origin/HEAD` and `refs/remotes/origin/main`. Updating the target
+/// already updates what the alias resolves to; replacing the alias with a direct
+/// ref would destroy the remote HEAD relationship. Drop only the redundant alias
+/// entry when the same plan updates its target to the identical object id.
+fn drop_redundant_symref_alias_updates(
+    store: &FileRefStore,
+    updates: &mut Vec<FetchRefUpdate>,
+) -> Result<()> {
+    let target_updates = updates
+        .iter()
+        .filter_map(|update| update.dst.clone().map(|dst| (dst, update.oid)))
+        .collect::<Vec<_>>();
+    let mut keep = Vec::with_capacity(updates.len());
+    for update in updates.drain(..) {
+        let redundant = match update.dst.as_deref() {
+            Some(dst) => match store.read_ref(dst)? {
+                Some(RefTarget::Symbolic(target)) => target_updates
+                    .iter()
+                    .any(|(candidate, oid)| candidate == &target && *oid == update.oid),
+                _ => false,
+            },
+            None => false,
+        };
+        if !redundant {
+            keep.push(update);
+        }
+    }
+    *updates = keep;
     Ok(())
 }
 
@@ -1397,6 +1670,46 @@ fn atomic_non_fast_forward_rejection(
         }
     }
     Ok(None)
+}
+
+/// Find non-forced, non-fast-forward ref updates for a non-atomic fetch. Git
+/// still records the advertised tips in `FETCH_HEAD` and applies unrelated
+/// accepted updates, but leaves each rejected destination untouched and exits
+/// unsuccessfully. Return both the rejected indices and the first diagnostic.
+fn non_atomic_non_fast_forward_rejections(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    updates: &[FetchRefUpdate],
+) -> Result<(HashSet<usize>, Option<String>)> {
+    let mut rejected = HashSet::new();
+    let mut reason = None;
+    let mut db: Option<FileObjectDatabase> = None;
+    for (index, update) in updates.iter().enumerate() {
+        let Some(dst) = update.dst.as_deref() else {
+            continue;
+        };
+        if update.force || dst.starts_with("refs/tags/") {
+            continue;
+        }
+        let Some(RefTarget::Direct(old)) = store.read_ref(dst)? else {
+            continue;
+        };
+        if old == update.oid {
+            continue;
+        }
+        let db = db.get_or_insert_with(|| FileObjectDatabase::from_git_dir(git_dir, format));
+        if !crate::push::is_fast_forward(git_dir, db, format, &old, &update.oid)? {
+            rejected.insert(index);
+            reason.get_or_insert_with(|| {
+                format!(
+                    "! [rejected]        {} -> {}  (non-fast-forward)",
+                    update.src, dst
+                )
+            });
+        }
+    }
+    Ok((rejected, reason))
 }
 
 fn apply_fetch_ref_updates(
@@ -1581,9 +1894,8 @@ fn reject_shallow_clone_fetch(
     // (depth, deepen-since, or deepen-not) and only dies on a shallow source when
     // no deepen was requested (the shallow lines are then attributed to the remote
     // being shallow, not to our own depth request). Mirror that gate here.
-    let deepening = options.depth.is_some()
-        || options.deepen_since.is_some()
-        || !options.deepen_not.is_empty();
+    let deepening =
+        options.depth.is_some() || options.deepen_since.is_some() || !options.deepen_not.is_empty();
     if options.reject_shallow && options.cloning && !deepening && !shallow_info.is_empty() {
         eprintln!("fatal: source repository is shallow, reject to clone.");
         return Err(GitError::Exit(128));
@@ -1598,6 +1910,16 @@ fn custom_negotiation_haves(
     remote: &str,
     options: &FetchOptions,
 ) -> Result<Option<Vec<ObjectId>>> {
+    // The noop negotiator is an explicit request to advertise no local commits.
+    // Preserve `Some(empty)` here: `None` means "use the transport's default
+    // local haves", so collapsing the two would silently turn noop back into the
+    // ordinary negotiator on every transport.
+    if config
+        .get("fetch", None, "negotiationalgorithm")
+        .is_some_and(|value| value.eq_ignore_ascii_case("noop"))
+    {
+        return Ok(Some(Vec::new()));
+    }
     let restrict = match &options.negotiation_restrict {
         Some(values) => values.clone(),
         None => configured_negotiation_values(config, remote, "negotiationrestrict"),
@@ -1692,7 +2014,10 @@ fn resolve_negotiation_have_value(
 }
 
 fn has_glob(value: &str) -> bool {
-    value.as_bytes().iter().any(|byte| matches!(byte, b'*' | b'?'))
+    value
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b'*' | b'?'))
 }
 
 fn is_full_hex_oid(format: ObjectFormat, value: &str) -> bool {
@@ -2357,10 +2682,139 @@ mod tests {
             deepen_since: None,
             deepen_not: Vec::new(),
             ssh_options: None,
+            upload_pack_command: None,
             atomic: false,
             negotiation_restrict: None,
             negotiation_include: None,
         }
+    }
+
+    #[test]
+    fn noop_negotiator_selects_an_explicit_empty_have_set() {
+        let local = temp_repo("noop-negotiator");
+        let config = GitConfig::parse(b"[fetch]\n\tnegotiationAlgorithm = noop\n")
+            .expect("config should parse");
+        assert_eq!(
+            custom_negotiation_haves(
+                &local,
+                ObjectFormat::Sha1,
+                &config,
+                "origin",
+                &default_options(),
+            )
+            .expect("negotiation haves"),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn non_atomic_fetch_rejects_non_fast_forward_and_force_updates_it() {
+        let remote = temp_repo("remote-non-fast-forward");
+        let local = temp_repo("local-non-fast-forward");
+        let remote_tip = commit_on(&remote, "main", "remote tip");
+        let local_tip = commit_on(&local, "side", "local side");
+        let source = FetchSource::Local {
+            git_dir: remote.clone(),
+            common_git_dir: remote.clone(),
+        };
+        let refspecs = vec!["refs/heads/main:refs/heads/side".to_string()];
+        let mut options = default_options();
+        options.update_head_ok = true;
+        let mut credentials = NoCredentials;
+        let mut progress = SilentProgress;
+
+        let error = fetch(
+            FetchRequest {
+                git_dir: &local,
+                format: ObjectFormat::Sha1,
+                config: &GitConfig::default(),
+                remote_name: ".",
+                source: &source,
+                refspecs: &refspecs,
+                options: &options,
+            },
+            FetchServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+                ref_hook: None,
+            },
+        )
+        .expect_err("divergent update must fail");
+        assert!(error.to_string().contains("non-fast-forward"));
+        let refs = FileRefStore::new(&local, ObjectFormat::Sha1);
+        assert_eq!(
+            refs.read_ref("refs/heads/side").expect("read side"),
+            Some(RefTarget::Direct(local_tip))
+        );
+
+        options.force = true;
+        fetch(
+            FetchRequest {
+                git_dir: &local,
+                format: ObjectFormat::Sha1,
+                config: &GitConfig::default(),
+                remote_name: ".",
+                source: &source,
+                refspecs: &refspecs,
+                options: &options,
+            },
+            FetchServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+                ref_hook: None,
+            },
+        )
+        .expect("forced fetch should update");
+        assert_eq!(
+            refs.read_ref("refs/heads/side").expect("read forced side"),
+            Some(RefTarget::Direct(remote_tip))
+        );
+    }
+
+    #[test]
+    fn redundant_symbolic_destination_is_preserved_when_target_is_updated() {
+        let local = temp_repo("symref-alias");
+        let tip = commit_on(&local, "main", "tip");
+        let refs = FileRefStore::new(&local, ObjectFormat::Sha1);
+        let mut tx = refs.transaction();
+        tx.update(RefUpdate {
+            name: "refs/remotes/origin/main".into(),
+            expected: None,
+            new: RefTarget::Direct(tip),
+            reflog: None,
+        });
+        tx.update(RefUpdate {
+            name: "refs/remotes/origin/HEAD".into(),
+            expected: None,
+            new: RefTarget::Symbolic("refs/remotes/origin/main".into()),
+            reflog: None,
+        });
+        tx.commit().expect("remote refs");
+        let mut updates = vec![
+            FetchRefUpdate {
+                src: "refs/remotes/origin/HEAD".into(),
+                dst: Some("refs/remotes/origin/HEAD".into()),
+                oid: tip,
+                not_for_merge: false,
+                force: false,
+            },
+            FetchRefUpdate {
+                src: "refs/remotes/origin/main".into(),
+                dst: Some("refs/remotes/origin/main".into()),
+                oid: tip,
+                not_for_merge: false,
+                force: false,
+            },
+        ];
+
+        drop_redundant_symref_alias_updates(&refs, &mut updates).expect("dedupe alias");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].dst.as_deref(), Some("refs/remotes/origin/main"));
+        assert_eq!(
+            refs.read_ref("refs/remotes/origin/HEAD")
+                .expect("read symref"),
+            Some(RefTarget::Symbolic("refs/remotes/origin/main".into()))
+        );
     }
 
     #[test]
@@ -2629,9 +3083,7 @@ mod tests {
 
     #[test]
     fn fetch_max_input_size_prefers_fetch_over_transfer() {
-        let cfg = config_from_ini(
-            "[fetch]\n\tmaxInputSize = 64\n[transfer]\n\tmaxSize = 1k\n",
-        );
+        let cfg = config_from_ini("[fetch]\n\tmaxInputSize = 64\n[transfer]\n\tmaxSize = 1k\n");
         assert_eq!(fetch_max_input_size(&cfg), Some(64));
     }
 

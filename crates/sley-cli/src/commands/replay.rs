@@ -11,6 +11,7 @@
 use crate::commands::merge_rebase::{
     MergePathResult, MergeTreeMap, commit_tree_oid, head_commit_oid,
     merge_refuse_if_current_working_directory_becomes_file, three_way_merge_trees_styled,
+    three_way_merge_trees_styled_with_strategy_options,
 };
 use crate::*;
 use sley_sequencer::replay::{self, ReplayAction, ReplayOpts, TodoItem};
@@ -1487,13 +1488,13 @@ fn do_pick_commit(
                 Some(parent) => tree_map_of_commit(ctx, &db, parent)?,
                 None => MergeTreeMap::new(),
             };
-            let theirs =
-                sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree).map_err(print_fatal_error)?;
+            let theirs = sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree)
+                .map_err(print_fatal_error)?;
             (base, theirs, label.clone(), parent_label.clone())
         }
         ReplayAction::Revert => {
-            let base =
-                sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree).map_err(print_fatal_error)?;
+            let base = sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree)
+                .map_err(print_fatal_error)?;
             let theirs = match &parent {
                 Some(parent) => tree_map_of_commit(ctx, &db, parent)?,
                 None => MergeTreeMap::new(),
@@ -1501,13 +1502,15 @@ fn do_pick_commit(
             (base, theirs, parent_label.clone(), label.clone())
         }
     };
-    let ours_map = sley_diff_merge::flatten_tree(&db, ctx.format, &index_tree).map_err(print_fatal_error)?;
+    let ours_map =
+        sley_diff_merge::flatten_tree(&db, ctx.format, &index_tree).map_err(print_fatal_error)?;
 
     let style = match config_value(&ctx.git_dir, "merge", "conflictstyle").as_deref() {
-        Some("diff3") | Some("zdiff3") => sley_diff_merge::ConflictStyle::Diff3,
+        Some("diff3") => sley_diff_merge::ConflictStyle::Diff3,
+        Some("zdiff3") => sley_diff_merge::ConflictStyle::ZDiff3,
         _ => sley_diff_merge::ConflictStyle::Merge,
     };
-    let (results, conflicts) = three_way_merge_trees_styled(
+    let (results, conflicts) = three_way_merge_trees_styled_with_strategy_options(
         &db,
         ctx.format,
         &base_map,
@@ -1517,6 +1520,7 @@ fn do_pick_commit(
         &theirs_label,
         &ancestor_label,
         style,
+        &opts.strategy_options,
     )
     .map_err(print_fatal_error)?;
 

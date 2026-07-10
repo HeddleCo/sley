@@ -2,34 +2,20 @@ use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::{Decompress, FlushDecompress};
-use parking_lot::RwLock;
-use std::sync::Mutex;
 use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
-use sley_formats::{Bundle, BundleReference};
-use sley_object::{
-    Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object,
-    tree_entry_object_type,
-};
-use sley_pack::{
-    MultiPackIndex, MultiPackIndexOidLookup, PackBitmapIndex, PackBitmapWriter, PackFile,
-    PackIndex, PackIndexByteSource, PackIndexEntry, PackIndexViewData, PackInput,
-    PackReverseIndex, PackStreamIndexBuild, PackWrite, PackWriteOptions, PackWriteSummary,
-};
-use std::collections::{HashMap, HashSet};
+use sley_object::{EncodedObject, ObjectType, parse_framed_object};
+use std::collections::HashSet;
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::{env, fs};
+use std::sync::Arc;
+use std::sync::Mutex;
 
-use crate::{
-    grafted_parents, implied_empty_tree_object, unique_temp_path, with_missing_object_context,
-    ObjectReader, ObjectWriter,
-};
+use crate::{ObjectReader, ObjectWriter, unique_temp_path};
 
-use crate::registry::repository_objects_dir;
-use crate::reachability::{loose_object_id_set, loose_object_ids};
 use crate::pack::verify_reads_enabled;
+use crate::reachability::{loose_object_id_set, loose_object_ids};
+use crate::registry::repository_objects_dir;
 
 pub(crate) fn collect_loose_object_ids(
     objects_dir: &Path,
@@ -427,7 +413,7 @@ impl LooseObjectStore {
     /// parse the file at `oid`'s loose path, then re-hash its content against the
     /// path-derived oid. `display_path` appears verbatim in the `error:`-level
     /// diagnostics — the path-form messages of `read_loose_object` ("unable to
-    /// unpack header of <path>"), unlike the oid-form messages of the normal read
+    /// unpack header of `<path>`"), unlike the oid-form messages of the normal read
     /// path. Returns `Ok(None)` when no loose file exists for `oid`.
     pub fn verify_object(
         &self,

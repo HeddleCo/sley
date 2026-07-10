@@ -6,11 +6,11 @@
 //! (`objects-local.txt`) into virtual files, optionally adding the raw `.git`
 //! metadata for `--mode=all`, and write them as a zip of the empty tree.
 
+use sley::plumbing::{sley_config, sley_core};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use sley::plumbing::{sley_config, sley_core};
 
 use sley_archive::{ArchiveExtraEntry, ArchiveExtras, ZipArchiveOptions};
 

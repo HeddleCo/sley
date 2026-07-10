@@ -2,6 +2,113 @@ pub mod validators;
 
 use std::fmt;
 
+/// Opaque category and behavior flags attached to a declarative command.
+///
+/// Consumers define the meaning of individual bits. This keeps the registry
+/// generic while allowing a command to belong to multiple categories.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommandFlags(u32);
+
+impl CommandFlags {
+    pub const NONE: Self = Self(0);
+
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl std::ops::BitOr for CommandFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        self.union(rhs)
+    }
+}
+
+/// Declarative metadata for one command name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandSpec<'a> {
+    pub name: &'a str,
+    pub flags: CommandFlags,
+}
+
+impl<'a> CommandSpec<'a> {
+    pub const fn new(name: &'a str, flags: CommandFlags) -> Self {
+        Self { name, flags }
+    }
+}
+
+/// An ordered registry of declarative command metadata.
+///
+/// Registry iteration preserves declaration order and lookup uses binary
+/// search. Declarations must therefore be sorted by name and unique; static
+/// registries should assert [`Self::is_sorted_unique`] in a focused test.
+#[derive(Clone, Copy, Debug)]
+pub struct CommandRegistry<'a> {
+    commands: &'a [CommandSpec<'a>],
+}
+
+impl<'a> CommandRegistry<'a> {
+    pub const fn new(commands: &'a [CommandSpec<'a>]) -> Self {
+        Self { commands }
+    }
+
+    pub const fn entries(&self) -> &'a [CommandSpec<'a>] {
+        self.commands
+    }
+
+    pub fn find(&self, name: &str) -> Option<&'a CommandSpec<'a>> {
+        self.commands
+            .binary_search_by(|command| command.name.cmp(name))
+            .ok()
+            .map(|index| &self.commands[index])
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.find(name).is_some()
+    }
+
+    pub fn contains_with(&self, name: &str, required: CommandFlags) -> bool {
+        self.find(name)
+            .is_some_and(|command| command.flags.contains(required))
+    }
+
+    pub fn entries_with(
+        &self,
+        required: CommandFlags,
+    ) -> impl Iterator<Item = &'a CommandSpec<'a>> + '_ {
+        self.commands
+            .iter()
+            .filter(move |command| command.flags.contains(required))
+    }
+
+    pub fn names_with(&self, required: CommandFlags) -> impl Iterator<Item = &'a str> + '_ {
+        self.entries_with(required).map(|command| command.name)
+    }
+
+    pub fn is_sorted_unique(&self) -> bool {
+        self.commands
+            .windows(2)
+            .all(|pair| pair[0].name < pair[1].name)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct OptionSpec<'a> {
     pub short: Option<char>,
@@ -724,6 +831,47 @@ fn parse_magnitude(raw: &str) -> Result<i64, NumberError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn command_registry_preserves_order_and_filters_combined_flags() {
+        const BUILTIN: CommandFlags = CommandFlags::from_bits(1 << 0);
+        const MAIN: CommandFlags = CommandFlags::from_bits(1 << 1);
+        let specs = [
+            CommandSpec::new("add", BUILTIN.union(MAIN)),
+            CommandSpec::new("cat-file", BUILTIN),
+            CommandSpec::new("gitk", MAIN),
+        ];
+        let registry = CommandRegistry::new(&specs);
+
+        assert!(registry.is_sorted_unique());
+        assert!(registry.contains("cat-file"));
+        assert!(!registry.contains("missing"));
+        assert!(registry.contains_with("add", BUILTIN.union(MAIN)));
+        assert!(!registry.contains_with("gitk", BUILTIN));
+        assert_eq!(
+            registry.names_with(BUILTIN).collect::<Vec<_>>(),
+            ["add", "cat-file"]
+        );
+        assert_eq!(
+            registry.names_with(MAIN).collect::<Vec<_>>(),
+            ["add", "gitk"]
+        );
+    }
+
+    #[test]
+    fn command_registry_reports_duplicate_or_unsorted_declarations() {
+        let duplicate = [
+            CommandSpec::new("add", CommandFlags::NONE),
+            CommandSpec::new("add", CommandFlags::NONE),
+        ];
+        let unsorted = [
+            CommandSpec::new("status", CommandFlags::NONE),
+            CommandSpec::new("add", CommandFlags::NONE),
+        ];
+
+        assert!(!CommandRegistry::new(&duplicate).is_sorted_unique());
+        assert!(!CommandRegistry::new(&unsorted).is_sorted_unique());
+    }
+
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
     }
@@ -994,10 +1142,12 @@ mod tests {
         ];
         let argv = args(&["-h", "origin"]);
         let parsed = parse(&argv, &specs).expect("parse");
-        assert!(parsed
-            .options
-            .iter()
-            .any(|option| matches!(option.short, Some('h'))));
+        assert!(
+            parsed
+                .options
+                .iter()
+                .any(|option| matches!(option.short, Some('h')))
+        );
         assert_eq!(parsed.positionals, ["origin"]);
     }
 

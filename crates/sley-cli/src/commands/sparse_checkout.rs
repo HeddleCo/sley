@@ -229,11 +229,20 @@ fn cmd_sparse_set(args: &[String]) -> Result<()> {
     };
     // Resolve a subdirectory prefix into the directory arguments (cone) or
     // reject a non-cone invocation from a subdir, before any validation.
-    let patterns = sanitize_set_paths(&ctx, &parsed.patterns, cone_mode, parsed.skip_checks)?;
+    let patterns = sanitize_set_paths(
+        &ctx,
+        &parsed.patterns,
+        cone_mode,
+        parsed.skip_checks || parsed.from_stdin,
+    )?;
     // Validate and serialize the new pattern file before mutating any state, so a
     // rejected pattern (e.g. a leading slash in cone mode) leaves the config and
     // pattern file untouched.
-    let content = build_pattern_content(cone_mode, &patterns, parsed.skip_checks)?;
+    let content = build_pattern_content(
+        cone_mode,
+        &patterns,
+        parsed.skip_checks || parsed.from_stdin,
+    )?;
     enable_sparse_checkout(&ctx, cone_mode)?;
     apply_sparse_index_flag(&ctx, parsed.sparse_index)?;
     write_sparse_file(&ctx, &content)?;
@@ -253,7 +262,12 @@ fn cmd_sparse_add(args: &[String]) -> Result<()> {
     let cone_mode = sparse_cone_enabled(&ctx)?;
     // Resolve a subdir prefix into the directory arguments (cone) or reject the
     // non-cone-from-subdir case, exactly like `set`.
-    let new_patterns = sanitize_set_paths(&ctx, &parsed.patterns, cone_mode, parsed.skip_checks)?;
+    let new_patterns = sanitize_set_paths(
+        &ctx,
+        &parsed.patterns,
+        cone_mode,
+        parsed.skip_checks || parsed.from_stdin,
+    )?;
     let existing = read_sparse_patterns(&ctx)?.unwrap_or_default();
     // Build (and validate) the merged pattern file before writing anything.
     let content = if cone_mode {
@@ -265,7 +279,10 @@ fn cmd_sparse_add(args: &[String]) -> Result<()> {
         // the new directories, then regenerate.
         let mut dirs = cone_list_entries(&existing);
         for pattern in &new_patterns {
-            dirs.push(validate_cone_dir(pattern, parsed.skip_checks)?);
+            dirs.push(validate_cone_dir(
+                pattern,
+                parsed.skip_checks || parsed.from_stdin,
+            )?);
         }
         build_cone_file(&dirs)
     } else {
@@ -324,13 +341,18 @@ fn cmd_sparse_disable(args: &[String]) -> Result<()> {
         patterns: vec![b"/**".to_vec()],
         sparse_index: false,
     };
-    apply_sparse_checkout_with_mode(
+    let result = apply_sparse_checkout_with_mode(
         &ctx.worktree_root,
         &ctx.git_dir,
         ctx.format,
         &full,
         SparseCheckoutMode::Full,
     )?;
+    warn_sparse_paths(
+        &result.not_up_to_date,
+        &result.unmerged,
+        &result.untracked_sparse_directories,
+    );
     // Mirror upstream: turn every sparse knob off in the per-worktree config but
     // leave the pattern file on disk for a later re-init. Upstream also enables
     // the worktree-config extension here even when the worktree was never sparse,
@@ -528,6 +550,21 @@ fn cmd_sparse_clean(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
+    let index_path = sley_worktree::repository_index_path(&ctx.git_dir);
+    if index_path.exists() {
+        let index = Index::parse(&fs::read(&index_path)?, ctx.format)?;
+        if index
+            .entries
+            .iter()
+            .any(|entry| entry.stage() != sley_index::Stage::Normal)
+        {
+            eprintln!(
+                "fatal: failed to convert index to a sparse index; resolve merge conflicts and try again"
+            );
+            return Err(GitError::Exit(128));
+        }
+    }
+
     let patterns = read_sparse_patterns(&ctx)?.unwrap_or_default();
     let sparse_dirs = sparse_directories(&ctx, &patterns)?;
 
@@ -542,6 +579,9 @@ fn cmd_sparse_clean(args: &[String]) -> Result<()> {
             // Report every file inside the directory rather than the directory.
             for file in list_files_recursive(&abs)? {
                 let mut rel = dir.clone();
+                if !rel.is_empty() && !rel.ends_with(b"/") {
+                    rel.push(b'/');
+                }
                 rel.extend_from_slice(&file);
                 writeln!(out, "{msg_prefix} {}", String::from_utf8_lossy(&rel))?;
             }
@@ -580,6 +620,11 @@ fn sparse_directories(ctx: &SparseContext, patterns: &[Vec<u8>]) -> Result<Vec<V
         return Ok(Vec::new());
     }
     let bytes = fs::read(&index_path)?;
+    let mut index = Index::parse(&bytes, ctx.format)?;
+    if index.entries.iter().any(IndexEntry::is_sparse_dir) {
+        let odb = FileObjectDatabase::from_git_dir(&ctx.git_dir, ctx.format);
+        sley_worktree::expand_sparse_index(&mut index, &odb, ctx.format)?;
+    }
     let sparse = SparseCheckout {
         patterns: patterns.to_vec(),
         sparse_index: false,
@@ -591,10 +636,21 @@ fn sparse_directories(ctx: &SparseContext, patterns: &[Vec<u8>]) -> Result<Vec<V
     // We approximate git's cache-tree collapse by grouping paths by their
     // top-most out-of-cone directory prefix.
     let mut dir_state: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
-    Index::for_each_path(&bytes, ctx.format, |path| {
-        let in_cone = path_in_sparse_checkout(path, &sparse, SparseCheckoutMode::Cone);
+    for entry in &index.entries {
+        if entry.stage() != sley_index::Stage::Normal {
+            return Ok(Vec::new());
+        }
+        let path = entry.path.as_bytes();
+        let worktree_file_exists = ctx
+            .worktree_root
+            .join(bytes_to_os_path(path))
+            .symlink_metadata()
+            .is_ok();
+        let blocks_collapse = path_in_sparse_checkout(path, &sparse, SparseCheckoutMode::Cone)
+            || !entry.is_skip_worktree()
+            || worktree_file_exists;
         // Record, for each ancestor directory of this path, whether any in-cone
-        // file lives beneath it.
+        // or explicitly present tracked file lives beneath it.
         let mut start = 0usize;
         while let Some(rel) = path
             .get(start..)
@@ -603,11 +659,10 @@ fn sparse_directories(ctx: &SparseContext, patterns: &[Vec<u8>]) -> Result<Vec<V
             let end = start + rel;
             let dir = path[..end].to_vec();
             let entry = dir_state.entry(dir).or_insert(false);
-            *entry = *entry || in_cone;
+            *entry = *entry || blocks_collapse;
             start = end + 1;
         }
-        Ok(())
-    })?;
+    }
 
     // A directory is a sparse (collapsible) directory when it has no in-cone
     // descendant. The shallowest such directory subsumes deeper ones, so keep
@@ -669,6 +724,7 @@ struct SetLikeArgs {
     cone: ConeFlag,
     sparse_index: SparseIndexFlag,
     skip_checks: bool,
+    from_stdin: bool,
     patterns: Vec<Vec<u8>>,
 }
 
@@ -709,7 +765,15 @@ fn parse_set_like(args: &[String], help: &str, allow_cone: bool) -> Result<SetLi
             .split(|byte| *byte == b'\n')
             .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
             .filter(|line| !line.is_empty())
-            .map(<[u8]>::to_vec)
+            .map(|line| {
+                if line.first() == Some(&b'"') {
+                    let mut decoded = Vec::new();
+                    if unquote_c_style(line, &mut decoded).is_some() {
+                        return decoded;
+                    }
+                }
+                line.to_vec()
+            })
             .collect()
     } else {
         positionals
@@ -718,6 +782,7 @@ fn parse_set_like(args: &[String], help: &str, allow_cone: bool) -> Result<SetLi
         cone,
         sparse_index,
         skip_checks,
+        from_stdin: read_stdin,
         patterns,
     })
 }
@@ -1072,7 +1137,14 @@ pub(crate) fn cone_patterns_are_valid(patterns: &[Vec<u8>], warn: bool) -> bool 
                 return false;
             }
             let dir = &pattern[..pattern.len() - 1];
-            if parent.iter().any(|seen| seen == dir) {
+            // A recursive literal `*` directory immediately below a parent
+            // guard parses to the same cone-pattern slot as that guard in Git's
+            // pattern hashmap. Treat it as repeated instead of translating the
+            // malformed file back to a directory name.
+            let repeated_guard = dir
+                .strip_suffix(b"/\\*")
+                .is_some_and(|guarded_parent| parent.iter().any(|seen| seen == guarded_parent));
+            if repeated_guard || parent.iter().any(|seen| seen == dir) {
                 if warn {
                     eprintln!(
                         "warning: your sparse-checkout file may have issues: pattern '{}' is repeated",
@@ -1417,7 +1489,11 @@ fn apply_current_sparse(ctx: &SparseContext) -> Result<()> {
         &sparse,
         mode,
     )?;
-    warn_not_up_to_date(&result.not_up_to_date);
+    warn_sparse_paths(
+        &result.not_up_to_date,
+        &result.unmerged,
+        &result.untracked_sparse_directories,
+    );
     Ok(())
 }
 
@@ -1425,22 +1501,48 @@ fn apply_current_sparse(ctx: &SparseContext) -> Result<()> {
 /// worktree file was not up to date. Byte-for-byte identical to upstream,
 /// including the leading-tab list, the trailing blank line, and the follow-up
 /// "After fixing …" sentence. No-op when there is nothing to warn about.
-fn warn_not_up_to_date(paths: &[Vec<u8>]) {
-    if paths.is_empty() {
+fn warn_sparse_paths(
+    not_up_to_date: &[Vec<u8>],
+    unmerged: &[Vec<u8>],
+    untracked_directories: &[Vec<u8>],
+) {
+    if not_up_to_date.is_empty() && unmerged.is_empty() && untracked_directories.is_empty() {
         return;
     }
-    let mut message =
-        b"warning: The following paths are not up to date and were left despite sparse patterns:\n"
-            .to_vec();
+    let mut message = Vec::new();
+    if !not_up_to_date.is_empty() {
+        message.extend_from_slice(
+            b"warning: The following paths are not up to date and were left despite sparse patterns:\n",
+        );
+        append_warning_paths(&mut message, not_up_to_date);
+    }
+    if !unmerged.is_empty() {
+        message.extend_from_slice(
+            b"warning: The following paths are unmerged and were left despite sparse patterns:\n",
+        );
+        append_warning_paths(&mut message, unmerged);
+    }
+    if !not_up_to_date.is_empty() || !unmerged.is_empty() {
+        message.extend_from_slice(
+            b"\nAfter fixing the above paths, you may want to run `git sparse-checkout reapply`.\n",
+        );
+    }
+    for directory in untracked_directories {
+        message.extend_from_slice(b"warning: directory '");
+        message.extend_from_slice(directory);
+        message.extend_from_slice(
+            b"' contains untracked files, but is not in the sparse-checkout cone\n",
+        );
+    }
+    let _ = io::stderr().write_all(&message);
+}
+
+fn append_warning_paths(message: &mut Vec<u8>, paths: &[Vec<u8>]) {
     for path in paths {
         message.push(b'\t');
         message.extend_from_slice(path);
         message.push(b'\n');
     }
-    message.extend_from_slice(
-        b"\nAfter fixing the above paths, you may want to run `git sparse-checkout reapply`.\n",
-    );
-    let _ = io::stderr().write_all(&message);
 }
 
 // --------------------------------------------------------------------------

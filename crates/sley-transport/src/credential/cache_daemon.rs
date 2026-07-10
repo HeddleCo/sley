@@ -13,8 +13,8 @@ use super::unix_socket::unix_stream_listen;
 
 use super::url::credential_match;
 use super::{
-    credential_clear_secrets, credential_has_capability, credential_read,
-    credential_set_all_capabilities, CredentialOpType, GitCredential, TIME_MAX,
+    CredentialOpType, GitCredential, TIME_MAX, credential_clear_secrets, credential_has_capability,
+    credential_read, credential_set_all_capabilities,
 };
 
 pub(crate) struct CacheEntry {
@@ -80,16 +80,16 @@ fn init_socket_directory(socket_path: &str) -> Result<PathBuf> {
         ));
     };
     if parent.exists() {
-        if let Ok(meta) = std::fs::metadata(parent) {
-            if meta.permissions().mode() & 0o077 != 0 {
-                return Err(GitError::Command(format!(
-                    "The permissions on your socket directory are too loose; other\n\
-                     users may be able to read your cached credentials. Consider running:\n\
-                     \n\
-                     \tchmod 0700 {}",
-                    parent.display()
-                )));
-            }
+        if let Ok(meta) = std::fs::metadata(parent)
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            return Err(GitError::Command(format!(
+                "The permissions on your socket directory are too loose; other\n\
+                 users may be able to read your cached credentials. Consider running:\n\
+                 \n\
+                 \tchmod 0700 {}",
+                parent.display()
+            )));
         }
     } else {
         if let Some(grandparent) = parent.parent() {
@@ -123,20 +123,28 @@ fn unlink_socket(socket_file: &Path) {
 
 #[cfg(unix)]
 fn serve_cache(socket_file: &Path, _debug: bool) -> Result<()> {
+    use std::sync::mpsc;
     use std::thread;
-    use std::time::{Duration, Instant};
 
     let _socket_cleanup = SocketCleanup { socket_file };
-    let listener =
-        unix_stream_listen(socket_file).map_err(|err| GitError::Io(err.to_string()))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|err| GitError::Io(err.to_string()))?;
+    let listener = unix_stream_listen(socket_file).map_err(|err| GitError::Io(err.to_string()))?;
     {
         let mut out = io::stdout().lock();
         writeln!(out, "ok").map_err(|err| GitError::Io(err.to_string()))?;
         out.flush().map_err(|err| GitError::Io(err.to_string()))?;
     }
+    // UnixListener has no portable accept timeout. Keep accept blocking on a
+    // dedicated thread and use the channel timeout to service expirations.
+    // This mirrors Git's poll(2) loop without unsafe platform calls and avoids
+    // adding up to 50ms of latency to every credential-cache request.
+    let (sender, clients) = mpsc::channel();
+    thread::spawn(move || {
+        for client in listener.incoming() {
+            if sender.send(client).is_err() {
+                break;
+            }
+        }
+    });
     let mut entries: Vec<CacheEntry> = Vec::new();
     let mut wait_for_entry_until = 0_i64;
     loop {
@@ -144,23 +152,12 @@ fn serve_cache(socket_file: &Path, _debug: bool) -> Result<()> {
         if wakeup == 0 {
             break;
         }
-        let deadline = Instant::now() + Duration::from_secs(wakeup as u64);
-        loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    serve_one_client(stream, socket_file, &mut entries)?;
-                    break;
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(err) => {
-                    eprintln!("warning: accept failed: {err}");
-                    break;
-                }
+        match clients.recv_timeout(Duration::from_secs(wakeup as u64)) {
+            Ok(Ok(stream)) => serve_one_client(stream, socket_file, &mut entries)?,
+            Ok(Err(err)) => eprintln!("warning: accept failed: {err}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(GitError::Io("credential cache listener stopped".into()));
             }
         }
     }
@@ -333,7 +330,7 @@ fn lookup_credential<'a>(
 }
 
 #[cfg(unix)]
-fn remove_credential(entries: &mut Vec<CacheEntry>, credential: &GitCredential, match_password: bool) {
+fn remove_credential(entries: &mut [CacheEntry], credential: &GitCredential, match_password: bool) {
     let current = now();
     for entry in entries.iter_mut() {
         if credential_match(credential, &entry.item, match_password) {

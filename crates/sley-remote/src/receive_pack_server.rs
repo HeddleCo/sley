@@ -1,25 +1,24 @@
 //! Full receive-pack server: hooks, proc-receive, ref updates, and status reports.
 
-use std::collections::HashSet;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, Result};
-use sley_odb::{repository_common_dir, FileObjectDatabase};
+use sley_odb::{FileObjectDatabase, repository_common_dir};
 use sley_protocol::{
-    validate_receive_pack_push_request_features, write_receive_pack_report_status,
-    write_receive_pack_report_status_v2, write_sideband_packet, ReceivePackCommand,
-    ReceivePackCommandStatus, ReceivePackCommandStatusV2, ReceivePackCommandStatusV2Options,
-    ReceivePackPushRequest, ReceivePackPushRequestHeader, ReceivePackReportStatus,
-    ReceivePackReportStatusV2, ReceivePackUnpackStatus, SideBandChannel, SideBandPacket,
+    ReceivePackCommand, ReceivePackCommandStatus, ReceivePackCommandStatusV2,
+    ReceivePackCommandStatusV2Options, ReceivePackPushRequest, ReceivePackPushRequestHeader,
+    ReceivePackReportStatus, ReceivePackReportStatusV2, ReceivePackUnpackStatus, SideBandChannel,
+    SideBandPacket, validate_receive_pack_push_request_features, write_receive_pack_report_status,
+    write_receive_pack_report_status_v2, write_sideband_packet,
 };
 use sley_refs::FileRefStore;
 
 use crate::local::{apply_receive_pack_ref_transaction, receive_pack_features};
 use crate::proc_receive::{
-    apply_proc_receive_hook_failure, mark_proc_receive_commands, parse_proc_receive_refs,
-    run_proc_receive_hook, ProcReceiveHookInput, ReceivePackCommandState,
+    ProcReceiveHookInput, ReceivePackCommandState, apply_proc_receive_hook_failure,
+    mark_proc_receive_commands, parse_proc_receive_refs, run_proc_receive_hook,
 };
 use crate::push::stage_local_push_quarantine;
 use crate::receive_hooks::{
@@ -181,13 +180,13 @@ pub fn serve_receive_pack(
         apply_proc_receive_hook_failure(&mut command_states, use_atomic, output.hook_failed);
     }
 
-    if unpack_error.is_none() {
-        if let Err(err) = apply_command_updates(request.git_dir, request.format, &command_states) {
-            let message = err.to_string();
-            for state in &mut command_states {
-                if state.error_string.is_none() && !state.defer_ref_update() {
-                    state.error_string = Some(message.clone());
-                }
+    if unpack_error.is_none()
+        && let Err(err) = apply_command_updates(request.git_dir, request.format, &command_states)
+    {
+        let message = err.to_string();
+        for state in &mut command_states {
+            if state.error_string.is_none() && !state.defer_ref_update() {
+                state.error_string = Some(message.clone());
             }
         }
     }
@@ -262,10 +261,7 @@ pub fn receive_pack_server_report_v1(report: &ReceivePackServerReport) -> Receiv
 }
 
 /// Write hook stderr captured during receive-pack as sideband-64k progress packets.
-pub fn write_receive_pack_sideband_stderr(
-    writer: &mut impl Write,
-    stderr: &[u8],
-) -> Result<()> {
+pub fn write_receive_pack_sideband_stderr(writer: &mut impl Write, stderr: &[u8]) -> Result<()> {
     if stderr.is_empty() {
         return Ok(());
     }

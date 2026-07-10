@@ -18,47 +18,32 @@
 //! * **`refresh_read_cache`** clears every shared map so the next read sees packs installed
 //!   out-of-band; callers must not hold a cache guard across it.
 
-use flate2::Compression;
-use flate2::read::ZlibDecoder;
-use flate2::write::ZlibEncoder;
-use flate2::{Decompress, FlushDecompress};
 use parking_lot::RwLock;
-use std::sync::Mutex;
 use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
-use sley_formats::{Bundle, BundleReference};
-use sley_object::{
-    Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object,
-    tree_entry_object_type,
-};
+use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
 use sley_pack::{
-    MultiPackIndex, MultiPackIndexOidLookup, PackBitmapIndex, PackBitmapWriter, PackFile,
-    PackIndex, PackIndexByteSource, PackIndexEntry, PackIndexViewData, PackInput,
-    PackReverseIndex, PackStreamIndexBuild, PackWrite, PackWriteOptions, PackWriteSummary,
+    MultiPackIndex, MultiPackIndexOidLookup, PackIndex, PackIndexByteSource, PackIndexViewData,
+    PackReverseIndex,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 use std::{env, fs};
 
-use crate::{
-    grafted_parents, implied_empty_tree_object, unique_temp_path, with_missing_object_context,
-    ObjectReader, ObjectWriter,
-};
+use crate::{ObjectReader, ObjectWriter, implied_empty_tree_object};
 
 use crate::install::{ObjectPrefixResolution, ObjectStorageInfo};
-use crate::reachability::{loose_object_ids, loose_object_id_set, zero_oid, pack_entry_delta_base, scan_pack_index_offsets, scan_pack_offsets_without_index, remove_file_if_exists, PackDeltaBase, PackIndexOffsetInfo};
-use crate::loose::{LooseObjectStore, collect_loose_fanout_object_ids, collect_loose_object_ids, present_loose_fanouts};
+use crate::loose::LooseObjectStore;
+use crate::reachability::{
+    PackDeltaBase, PackIndexOffsetInfo, pack_entry_delta_base, scan_pack_index_offsets,
+    scan_pack_offsets_without_index, zero_oid,
+};
 use crate::registry::{
-    PackRegistryCache, PackDirFingerprint, PackLookup, PackRegistrySnapshot, RegisteredPack, alternate_object_dirs,
-    collect_incremental_midx_object_ids, collect_incremental_midx_prefix_matches,
-    collect_loose_object_ids_with_prefix, collect_multi_pack_index_prefix_matches,
-    collect_pack_index_prefix_matches, collect_packed_object_ids, collect_packed_object_ids_with_prefix,
-    lower_bound_pack_index_entries, object_id_floor_for_hex_prefix, pack_index_fanout_range,
-    object_ids_in_objects_dir, object_ids_with_prefix_in_objects_dir,
-    read_incremental_midx_chain, repository_common_dir, repository_objects_dir,
-    same_registered_pack_set, scan_pack_registry, validate_object_id_prefix, ObjectPresenceChecker,
+    ObjectPresenceChecker, PackLookup, PackRegistryCache, PackRegistrySnapshot,
+    alternate_object_dirs, object_ids_in_objects_dir, object_ids_with_prefix_in_objects_dir,
+    read_incremental_midx_chain, repository_objects_dir, same_registered_pack_set,
+    scan_pack_registry, validate_object_id_prefix,
 };
 
 pub struct ObjectDatabase {
@@ -511,12 +496,65 @@ pub(crate) type PackIndexCache = Arc<RwLock<HashMap<PathBuf, Arc<PackIndexViewDa
 
 /// Optional `.rev` reverse indexes keyed by `.idx` path, shared across cloned
 /// handles. A cached `None` means no usable reverse index was found.
-pub(crate) type PackReverseIndexCache = Arc<RwLock<HashMap<PathBuf, Option<Arc<PackReverseIndex>>>>>;
+pub(crate) type PackReverseIndexCache =
+    Arc<RwLock<HashMap<PathBuf, Option<Arc<PackReverseIndex>>>>>;
 
 /// Parsed multi-pack-index files keyed by path, shared across cloned handles.
 /// Caches the MIDX parse so object lookups in repositories with a MIDX avoid
 /// reparsing the same fanout/object tables for every read.
 pub(crate) type MultiPackIndexCache = Arc<RwLock<HashMap<PathBuf, Arc<MultiPackIndex>>>>;
+
+/// Explicit replacement-object policy injected by repository setup.
+///
+/// The map is deliberately independent of refs/config/environment: embedders
+/// decide whether replacement refs are enabled and pass the already-resolved
+/// old-to-new object ids into the ODB.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectReplacements {
+    replacements: HashMap<ObjectId, ObjectId>,
+}
+
+impl ObjectReplacements {
+    pub fn new(replacements: impl IntoIterator<Item = (ObjectId, ObjectId)>) -> Self {
+        Self {
+            replacements: replacements.into_iter().collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.replacements.is_empty()
+    }
+
+    /// Follow a replacement chain, rejecting cycles or chains beyond Git's
+    /// five-link recursion guard.
+    pub fn resolve(&self, oid: &ObjectId) -> Result<ObjectId> {
+        let mut current = *oid;
+        let mut seen = HashSet::new();
+        for _ in 0..5 {
+            if !seen.insert(current) {
+                return Err(GitError::InvalidObject(format!(
+                    "replace depth too high for object {oid}"
+                )));
+            }
+            let Some(next) = self.replacements.get(&current) else {
+                return Ok(current);
+            };
+            // `git replace --graft` may materialize an unchanged commit and
+            // consequently write an identity replace ref. Git treats that as
+            // a terminal no-op rather than replacement recursion.
+            if *next == current {
+                return Ok(current);
+            }
+            current = *next;
+        }
+        if self.replacements.contains_key(&current) {
+            return Err(GitError::InvalidObject(format!(
+                "replace depth too high for object {oid}"
+            )));
+        }
+        Ok(current)
+    }
+}
 
 /// Raw multi-pack-index OID lookup tables keyed by path, shared across cloned
 /// handles. These avoid hashing and materializing every MIDX object when a
@@ -555,6 +593,7 @@ pub struct FileObjectDatabase {
     /// [`ObjectReader::is_shallow_graft`] query. `$GIT_DIR` is taken to be
     /// the parent of `objects_dir`, matching the standard layout.
     pub(crate) shallow_grafts: Arc<std::sync::OnceLock<HashSet<ObjectId>>>,
+    pub(crate) replacements: Arc<ObjectReplacements>,
 }
 
 fn read_shallow_grafts(shallow_file: &Path, format: ObjectFormat) -> HashSet<ObjectId> {
@@ -597,10 +636,14 @@ impl FileObjectDatabase {
             promisor_objects: Arc::new(OnceLock::new()),
             promisor_remote_present: false,
             shallow_grafts: Arc::new(std::sync::OnceLock::new()),
+            replacements: Arc::new(ObjectReplacements::default()),
         }
     }
 
-    pub(crate) fn without_alternates(objects_dir: impl Into<PathBuf>, format: ObjectFormat) -> Self {
+    pub(crate) fn without_alternates(
+        objects_dir: impl Into<PathBuf>,
+        format: ObjectFormat,
+    ) -> Self {
         let objects_dir = objects_dir.into();
         Self {
             loose: LooseObjectStore::new(objects_dir.clone(), format),
@@ -619,11 +662,41 @@ impl FileObjectDatabase {
             promisor_objects: Arc::new(OnceLock::new()),
             promisor_remote_present: false,
             shallow_grafts: Arc::new(std::sync::OnceLock::new()),
+            replacements: Arc::new(ObjectReplacements::default()),
         }
     }
 
     pub fn from_git_dir(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Self {
         Self::new(repository_objects_dir(git_dir), format)
+    }
+
+    /// Attach an explicit replacement map. Object enumeration/storage queries
+    /// remain raw; object content and header reads dereference the map.
+    pub fn with_replacements(mut self, replacements: ObjectReplacements) -> Self {
+        self.replacements = Arc::new(replacements);
+        self
+    }
+
+    pub fn replacements(&self) -> &ObjectReplacements {
+        &self.replacements
+    }
+
+    pub fn replacement_oid(&self, oid: &ObjectId) -> Result<ObjectId> {
+        self.replacements.resolve(oid)
+    }
+
+    /// Read object contents without consulting the injected replacement map.
+    /// Used by raw enumeration surfaces such as `cat-file --batch-all-objects`.
+    pub fn read_object_without_replacement(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
+        self.read_object_raw(oid)
+    }
+
+    /// Read an object header without consulting the injected replacement map.
+    pub fn read_object_header_without_replacement(
+        &self,
+        oid: &ObjectId,
+    ) -> Result<Option<(ObjectType, u64)>> {
+        self.read_object_header_raw(oid)
     }
 
     /// Declare whether the owning repository has a promisor remote configured.
@@ -641,7 +714,7 @@ impl FileObjectDatabase {
 
     /// Drop cached pack registries, indexes, and decoded objects so the next read
     /// sees packs/objects installed after this handle was created (e.g. after
-    /// `fetch` or `install_pack`). Long-lived [`Repository`] sessions call this
+    /// `fetch` or `install_pack`). Long-lived `Repository` sessions call this
     /// via the owning repository's `refresh_objects` hook.
     pub fn refresh_read_cache(&self) {
         if let Ok(mut cache) = self.pack_registry.lock() {
@@ -742,16 +815,13 @@ impl FileObjectDatabase {
     pub fn object_ids_with_prefix(&self, prefix: &str) -> Result<Vec<ObjectId>> {
         validate_object_id_prefix(self.format, prefix)?;
         let prefix_bytes = prefix.as_bytes();
-        let mut matches = object_ids_with_prefix_in_objects_dir(
-            &self.objects_dir,
-            self.format,
-            prefix_bytes,
-        )?
-        .into_iter()
-        .collect::<HashSet<_>>();
+        let mut matches =
+            object_ids_with_prefix_in_objects_dir(&self.objects_dir, self.format, prefix_bytes)?
+                .into_iter()
+                .collect::<HashSet<_>>();
         for alternate in &self.alternates {
-            for oid in Self::without_alternates(alternate, self.format)
-                .object_ids_with_prefix(prefix)?
+            for oid in
+                Self::without_alternates(alternate, self.format).object_ids_with_prefix(prefix)?
             {
                 matches.insert(oid);
             }
@@ -771,6 +841,11 @@ impl FileObjectDatabase {
     /// stays cheap on huge blobs and deep delta chains. It does not populate the
     /// decoded-object cache (nothing is decoded).
     pub fn read_object_header(&self, oid: &ObjectId) -> Result<Option<(ObjectType, u64)>> {
+        let read_oid = self.replacements.resolve(oid)?;
+        self.read_object_header_raw(&read_oid)
+    }
+
+    fn read_object_header_raw(&self, oid: &ObjectId) -> Result<Option<(ObjectType, u64)>> {
         if implied_empty_tree_object(self.format, oid).is_some() {
             return Ok(Some((ObjectType::Tree, 0)));
         }
@@ -790,7 +865,7 @@ impl FileObjectDatabase {
             // on every header read — the sley#26 super-linear cat-file --batch-check.
             let type_cache = pack_lookup.header_type_cache(self);
             let resolve_ref_base = |base: &ObjectId| {
-                self.read_object_header(base)
+                self.read_object_header_raw(base)
                     .map(|header| header.map(|(t, _)| t))
             };
             let header = match &type_cache {
@@ -815,7 +890,7 @@ impl FileObjectDatabase {
         }
         for alternate in &self.alternates {
             if let Some(header) =
-                Self::without_alternates(alternate, self.format).read_object_header(oid)?
+                Self::without_alternates(alternate, self.format).read_object_header_raw(oid)?
             {
                 return Ok(Some(header));
             }
@@ -866,7 +941,7 @@ impl FileObjectDatabase {
         // reuses the decoded-object cache. No cache lock is held across the decode,
         // so the recursive resolver re-entry (which may re-enter read_object) is
         // safe.
-        let resolve_ref_base = |base: &ObjectId| self.read_object(base).map(Some);
+        let resolve_ref_base = |base: &ObjectId| self.read_object_raw(base).map(Some);
         let resolve_ofs_base =
             |base_offset| self.read_ofs_delta_base_from_other_sources(pack_lookup, base_offset);
         let object = match &delta_adapter {
@@ -930,12 +1005,13 @@ impl FileObjectDatabase {
     /// otherwise read into the heap. On a poisoned lock it falls back to loading
     /// without caching, preserving correctness.
     pub(crate) fn cached_pack_bytes(&self, pack_path: &Path) -> Result<Arc<PackData>> {
-        if let Some(bytes) = self.pack_bytes.read().get(pack_path)
-        {
+        if let Some(bytes) = self.pack_bytes.read().get(pack_path) {
             return Ok(Arc::clone(bytes));
         }
         let bytes = Arc::new(load_pack_data(pack_path)?);
-        self.pack_bytes.write().insert(pack_path.to_path_buf(), Arc::clone(&bytes));
+        self.pack_bytes
+            .write()
+            .insert(pack_path.to_path_buf(), Arc::clone(&bytes));
         Ok(bytes)
     }
 
@@ -943,8 +1019,7 @@ impl FileObjectDatabase {
     /// database handle. On a poisoned lock it falls back to parsing without
     /// caching, preserving correctness.
     pub(crate) fn cached_pack_index(&self, index_path: &Path) -> Result<Arc<PackIndexViewData>> {
-        if let Some(index) = self.pack_indexes.read().get(index_path)
-        {
+        if let Some(index) = self.pack_indexes.read().get(index_path) {
             return Ok(Arc::clone(index));
         }
         let index_bytes = load_pack_index_data(index_path)?;
@@ -952,7 +1027,9 @@ impl FileObjectDatabase {
             index_bytes,
             self.format,
         )?);
-        self.pack_indexes.write().insert(index_path.to_path_buf(), Arc::clone(&index));
+        self.pack_indexes
+            .write()
+            .insert(index_path.to_path_buf(), Arc::clone(&index));
         Ok(index)
     }
 
@@ -963,23 +1040,22 @@ impl FileObjectDatabase {
         index_path: &Path,
         index: &PackIndexViewData,
     ) -> Result<Option<Arc<PackReverseIndex>>> {
-        if let Some(cached) = self.pack_reverse_indexes.read().get(index_path)
-        {
+        if let Some(cached) = self.pack_reverse_indexes.read().get(index_path) {
             return Ok(cached.as_ref().map(Arc::clone));
         }
         let rev_path = index_path.with_extension("rev");
         let reverse = if rev_path.exists() {
             let bytes = fs::read(&rev_path)?;
             match PackReverseIndex::parse(&bytes, self.format, index.count) {
-                Ok(parsed) if parsed.pack_checksum == index.pack_checksum => {
-                    Some(Arc::new(parsed))
-                }
+                Ok(parsed) if parsed.pack_checksum == index.pack_checksum => Some(Arc::new(parsed)),
                 _ => None,
             }
         } else {
             None
         };
-        self.pack_reverse_indexes.write().insert(index_path.to_path_buf(), reverse.as_ref().map(Arc::clone));
+        self.pack_reverse_indexes
+            .write()
+            .insert(index_path.to_path_buf(), reverse.as_ref().map(Arc::clone));
         Ok(reverse)
     }
 
@@ -1014,16 +1090,20 @@ impl FileObjectDatabase {
             }
             Err(err) => return Err(err),
         };
-        self.multi_pack_oid_lookups.write().insert(midx_path.to_path_buf(), Arc::clone(&midx));
+        self.multi_pack_oid_lookups
+            .write()
+            .insert(midx_path.to_path_buf(), Arc::clone(&midx));
         Ok(Some(midx))
     }
 
-    pub(crate) fn cached_multi_pack_index(&self, midx_path: &Path) -> Result<Option<Arc<MultiPackIndex>>> {
+    pub(crate) fn cached_multi_pack_index(
+        &self,
+        midx_path: &Path,
+    ) -> Result<Option<Arc<MultiPackIndex>>> {
         if !midx_path.exists() {
             return Ok(None);
         }
-        if let Some(midx) = self.multi_pack_indexes.read().get(midx_path)
-        {
+        if let Some(midx) = self.multi_pack_indexes.read().get(midx_path) {
             return Ok(Some(Arc::clone(midx)));
         }
         let bytes = load_multi_pack_index_lookup_data(midx_path)?;
@@ -1047,7 +1127,9 @@ impl FileObjectDatabase {
             }
             Err(err) => return Err(err),
         };
-        self.multi_pack_indexes.write().insert(midx_path.to_path_buf(), Arc::clone(&midx));
+        self.multi_pack_indexes
+            .write()
+            .insert(midx_path.to_path_buf(), Arc::clone(&midx));
         Ok(Some(midx))
     }
 
@@ -1260,7 +1342,10 @@ impl FileObjectDatabase {
         self.find_in_pack_registry(refreshed, oid)
     }
 
-    pub(crate) fn packed_object_storage_info(&self, oid: &ObjectId) -> Result<Option<ObjectStorageInfo>> {
+    pub(crate) fn packed_object_storage_info(
+        &self,
+        oid: &ObjectId,
+    ) -> Result<Option<ObjectStorageInfo>> {
         let Some(pack_lookup) = self.find_pack_containing(oid)? else {
             return Ok(None);
         };
@@ -1436,9 +1521,14 @@ impl FileObjectDatabase {
         Ok(None)
     }
 
-    pub(crate) fn cached_loaded_multi_pack_index_oid_lookup(&self) -> Option<Arc<MultiPackIndexOidLookup>> {
+    pub(crate) fn cached_loaded_multi_pack_index_oid_lookup(
+        &self,
+    ) -> Option<Arc<MultiPackIndexOidLookup>> {
         let midx_path = self.objects_dir.join("pack").join("multi-pack-index");
-        self.multi_pack_oid_lookups.read().get(&midx_path).map(Arc::clone)
+        self.multi_pack_oid_lookups
+            .read()
+            .get(&midx_path)
+            .map(Arc::clone)
     }
 
     /// The pack registry for `pack_dir` *only if already scanned and cached* —
@@ -1499,6 +1589,13 @@ impl ObjectReader for FileObjectDatabase {
     }
 
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
+        let read_oid = self.replacements.resolve(oid)?;
+        self.read_object_raw(&read_oid)
+    }
+}
+
+impl FileObjectDatabase {
+    fn read_object_raw(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
         if let Some(object) = implied_empty_tree_object(self.format, oid) {
             return Ok(object);
         }
@@ -1531,7 +1628,7 @@ impl ObjectReader for FileObjectDatabase {
                     }
                     for alternate in &self.alternates {
                         if let Ok(object) =
-                            Self::without_alternates(alternate, self.format).read_object(oid)
+                            Self::without_alternates(alternate, self.format).read_object_raw(oid)
                         {
                             return Ok(object);
                         }
@@ -1549,7 +1646,7 @@ impl ObjectReader for FileObjectDatabase {
             return Ok(object);
         }
         for alternate in &self.alternates {
-            match Self::without_alternates(alternate, self.format).read_object(oid) {
+            match Self::without_alternates(alternate, self.format).read_object_raw(oid) {
                 Ok(object) => return Ok(object),
                 Err(GitError::NotFound(_)) => {}
                 Err(err) => return Err(err),
@@ -1638,7 +1735,10 @@ pub(crate) fn freshen_file_mtime(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-pub(crate) fn promisor_pack_object_ids(objects_dir: &Path, format: ObjectFormat) -> Result<HashSet<ObjectId>> {
+pub(crate) fn promisor_pack_object_ids(
+    objects_dir: &Path,
+    format: ObjectFormat,
+) -> Result<HashSet<ObjectId>> {
     let pack_dir = objects_dir.join("pack");
     let mut oids = HashSet::new();
     if !pack_dir.exists() {

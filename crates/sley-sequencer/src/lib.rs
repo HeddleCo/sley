@@ -252,7 +252,7 @@ fn commit_tree_with_amend_with_odb(
     let old_oid = parent.unwrap_or(zero_oid(format)?);
     let reflog = refs
         .should_write_reflog_for_update(&updated_ref, false)?
-        .then(|| ReflogEntry {
+        .then_some(ReflogEntry {
             old_oid,
             new_oid: oid,
             committer: options.committer,

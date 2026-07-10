@@ -7,8 +7,7 @@ use sley_core::Result;
 use sley_transport::{
     GitCredential, RemoteTransport, RemoteUrl,
     credential::{
-        credential_approve, credential_fill as transport_credential_fill, credential_fill_simple,
-        credential_reject,
+        credential_approve, credential_fill as transport_credential_fill, credential_reject,
     },
 };
 
@@ -118,7 +117,7 @@ mod credential_dispatch_parity_tests {
 
     use sley_config::GitConfig;
     use sley_transport::GitCredential;
-    use sley_transport::credential::{credential_fill_simple, credential_helper_command};
+    use sley_transport::credential::credential_helper_command;
 
     use super::credential_fill;
 
@@ -219,10 +218,6 @@ mod credential_dispatch_parity_tests {
                 && rendered.contains("get"),
             "expected `credential-myhelper --opt val get` dispatch, got {rendered:?}"
         );
-    }
-
-    fn command_program(cmd: &std::process::Command) -> String {
-        cmd.get_program().to_string_lossy().into_owned()
     }
 
     fn command_argv(cmd: &std::process::Command) -> Vec<String> {

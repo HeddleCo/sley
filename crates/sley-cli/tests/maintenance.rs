@@ -175,6 +175,70 @@ fn apply_check_succeeds_for_clean_patch() {
 }
 
 #[test]
+fn apply_plain_patch_outside_repository_matches_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("apply-outside-repository");
+    let reference = root.join("reference");
+    let candidate = root.join("candidate");
+    fs::create_dir_all(&reference).expect("create reference directory");
+    fs::create_dir_all(&candidate).expect("create candidate directory");
+    write_file(&reference, "nums", "one\ntwo\nthree\nfour\n");
+    write_file(&candidate, "nums", "one\ntwo\nthree\nfour\n");
+    let patch = root.join("change.patch");
+    fs::write(
+        &patch,
+        b"diff --git a/nums b/nums\n--- a/nums\n+++ b/nums\n@@ -2,3 +2,4 @@ one\n two\n three\n four\n+five\n",
+    )
+    .expect("write patch");
+    let patch = patch.to_str().expect("utf8 patch path");
+
+    let expected = git(&reference, &["apply", patch]);
+    let actual = sley(&candidate, &["apply", patch]);
+    assert_eq!(actual.status.code(), expected.status.code());
+    assert_eq!(actual.stdout, expected.stdout);
+    assert_eq!(actual.stderr, expected.stderr);
+    assert_eq!(
+        fs::read(candidate.join("nums")).expect("read candidate"),
+        fs::read(reference.join("nums")).expect("read reference")
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn empty_imap_send_and_remote_http_usage_match_git_outside_repository() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("outside-repository-helper-errors");
+    let global_config = root.join("global-config");
+    fs::write(
+        &global_config,
+        b"[imap]\n\thost = imaps://localhost\n\tfolder = Drafts\n",
+    )
+    .expect("write isolated global config");
+    let run = |program: &str, args: &[&str]| {
+        Command::new(program)
+            .current_dir(&root)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &global_config)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+    };
+    for args in [&["imap-send", "-v"][..], &["remote-http"][..]] {
+        let expected = run(sley_testkit::oracle_git(), args);
+        let actual = run(sley_testkit::sley_bin!(), args);
+        assert_eq!(actual.status.code(), expected.status.code(), "{args:?}");
+        assert_eq!(actual.stdout, expected.stdout, "{args:?}");
+        assert_eq!(actual.stderr, expected.stderr, "{args:?}");
+    }
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn apply_creates_new_file_like_git() {
     if !git_available() {
         return;

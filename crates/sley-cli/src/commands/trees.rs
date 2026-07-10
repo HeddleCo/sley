@@ -1,11 +1,11 @@
 //! Tree-construction plumbing commands.
 
+use sley::plumbing::sley_worktree;
 use std::env;
-use sley::plumbing::{sley_worktree};
 
 use sley::{GitError, Result};
 
-use crate::{repository_object_format};
+use crate::repository_object_format;
 
 pub(crate) fn cmd_write_tree(args: &[String]) -> Result<()> {
     let mut missing_ok = false;

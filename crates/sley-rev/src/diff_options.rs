@@ -4,7 +4,10 @@
 use sley_config::GitConfig;
 use sley_core::{GitError, Result};
 use sley_diff_merge::format::WordDiffMode;
-use sley_options::{CallbackValue, OptFlags, OptValue, OptionSpec, ParsedOption, ParsedValue, UsageError, parse_options};
+use sley_options::{
+    CallbackValue, OptFlags, OptValue, OptionSpec, ParsedOption, ParsedValue, UsageError,
+    parse_options,
+};
 use std::collections::HashSet;
 include!("diff_options_support.rs");
 
@@ -1017,11 +1020,13 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
                 }
             }
         }
-        (_, Some("stat-width" | "stat-name-width" | "stat-graph-width" | "stat-count")) => {
+        (
+            _,
+            Some(long @ ("stat-width" | "stat-name-width" | "stat-graph-width" | "stat-count")),
+        ) => {
             options
                 .output_format
                 .bitop(DiffOutputFormat::DIFFSTAT, DiffOutputFormat::NO_OUTPUT);
-            let long = option.long.expect("matched stat option has long name");
             let value = format!("--{long}={}", str_value(option));
             diff_stat_parse_width_option(&value, &mut options.stat_widths)?;
             if let Some(count) = diff_stat_count_option(&value)? {
@@ -1197,10 +1202,14 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
                 options.word_diff_regex = Some(value.to_string());
             }
         }
-        (_, Some("output-indicator-new" | "output-indicator-old" | "output-indicator-context")) => {
-            let long = option
-                .long
-                .expect("matched output-indicator option has long name");
+        (
+            _,
+            Some(
+                long @ ("output-indicator-new"
+                | "output-indicator-old"
+                | "output-indicator-context"),
+            ),
+        ) => {
             log_validate_output_indicator(long, str_value(option))?;
             options.diff_output_indicator_control = true;
         }
@@ -1246,10 +1255,7 @@ fn apply_diff_option(options: &mut DiffOptions, option: &ParsedOption<'_>) -> Re
         (_, Some("color-moved")) => {
             options.color_moved = Some(match optional_arg(option) {
                 None => Some(sley_diff_merge::render::ColorMovedMode::Zebra),
-                Some(value) => {
-                    let mode = parse_color_moved_mode(value)?;
-                    mode
-                }
+                Some(value) => parse_color_moved_mode(value)?,
             });
             if let Some(value) = optional_arg(option) {
                 log_validate_color_moved(value)?;

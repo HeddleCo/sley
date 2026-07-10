@@ -2,17 +2,17 @@ use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use std::io::{Read, Write};
 
 use crate::pktline::{
-    PktLineFrame, ProtocolVersion, line, line_from_str, parse_oid_argument, parse_protocol_v2_line_text,
-    read_pkt_line_frame, read_pkt_line_frames_until_flush, read_pkt_line_frames_until_response_end,
-    trim_trailing_lf, validate_capability_name, validate_protocol_v2_line,
-    validate_protocol_v2_token, write_pkt_line_frame, write_pkt_line_payload,
+    PktLineFrame, ProtocolVersion, line, line_from_str, parse_oid_argument,
+    parse_protocol_v2_line_text, read_pkt_line_frame, read_pkt_line_frames_until_flush,
+    read_pkt_line_frames_until_response_end, trim_trailing_lf, validate_capability_name,
+    validate_protocol_v2_line, validate_protocol_v2_token, write_pkt_line_frame,
+    write_pkt_line_payload,
 };
 use crate::sideband::{
-    SideBandChannel, SideBandDemux, SideBandPacket, encode_sideband_packet, parse_and_demux_sideband_packets, parse_sideband_packet, write_sideband_payload,
+    SideBandChannel, SideBandDemux, SideBandPacket, encode_sideband_packet,
+    parse_and_demux_sideband_packets, parse_sideband_packet, write_sideband_payload,
 };
-use crate::v0::{
-    RefAdvertisement, RefAdvertisementSet, TransportHandshake,
-};
+use crate::v0::{RefAdvertisement, RefAdvertisementSet, TransportHandshake};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolV2CommandRequest {
@@ -913,9 +913,7 @@ fn skip_leading_protocol_v2_advertisement_if_present(
             let packet = parse_sideband_packet(payload)?;
             let demuxed = match packet.channel {
                 SideBandChannel::Data => PktLineFrame::Data(packet.data),
-                SideBandChannel::Progress => {
-                    read_protocol_v2_fetch_metadata_frame(reader, true)?
-                }
+                SideBandChannel::Progress => read_protocol_v2_fetch_metadata_frame(reader, true)?,
                 SideBandChannel::Fatal => {
                     let message = String::from_utf8_lossy(&packet.data).into_owned();
                     return Err(GitError::InvalidFormat(format!(
@@ -2587,4 +2585,3 @@ pub(crate) fn parse_u64_argument(label: &str, value: &str, prefix: &str) -> Resu
         .parse::<u64>()
         .map_err(|err| GitError::InvalidFormat(err.to_string()))
 }
-

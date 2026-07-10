@@ -4,7 +4,7 @@
 #[path = "ls_remote_options.rs"]
 mod ls_remote_options;
 use ls_remote_options::setup_ls_remote_options;
-use sley::plumbing::{sley_config};
+use sley::plumbing::sley_config;
 
 use super::config::{read_repo_config, remote_exists};
 use super::fetch::{
@@ -12,8 +12,9 @@ use super::fetch::{
     ls_remote_resolved_url, repo_config_with_transport_policy, transport_policy_config_for_cwd,
 };
 use super::pack::{
-    configured_legacy_protocol, configured_protocol_version, trace_configured_local_protocol_version,
-    trace_protocol_v2_ls_refs_request, trace_protocol_v2_upload_pack_capabilities,
+    configured_legacy_protocol, configured_protocol_version,
+    trace_configured_local_protocol_version, trace_protocol_v2_ls_refs_request,
+    trace_protocol_v2_upload_pack_capabilities,
 };
 use super::resolve::ls_remote_git_dir;
 use crate::commands::config_cmd::{
@@ -505,8 +506,6 @@ fn ls_remote_upload_pack_command_records(
     }
     Ok(records)
 }
-
-
 
 fn validate_ls_remote_sort_context(sort: Option<LsRemoteSort>) -> Result<Option<PathBuf>> {
     if !matches!(

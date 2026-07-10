@@ -3,29 +3,29 @@
 
 use crate::commands;
 use crate::{
-    parse_refspec, remote_exists, remote_names, repository_objects_dir, resolve_revision,
-    sley_rev, worktree_root_for_git_dir, write_object_id_hex, GitConfig, GitError, ObjectFormat,
-    ObjectId, RefTarget, Result,
+    GitConfig, GitError, ObjectFormat, ObjectId, RefTarget, Result, parse_refspec, remote_exists,
+    remote_names, repository_objects_dir, resolve_revision, sley_rev, worktree_root_for_git_dir,
+    write_object_id_hex,
 };
-use sley::plumbing::sley_odb::ObjectReader;
 use sley::plumbing::sley_core::DateMode;
 use sley::plumbing::sley_object::{Commit, EncodedObject, ObjectType, Tag};
 use sley::plumbing::sley_odb::FileObjectDatabase;
+use sley::plumbing::sley_odb::ObjectReader;
 use sley::plumbing::sley_refs::{self, FileRefStore};
 use sley_protocol::refspec_map_source;
 use sley_ref_filter::{
-    for_each_ref_abbrev_oid, for_each_ref_copy_subject, for_each_ref_identity_date,
-    for_each_ref_identity_email, for_each_ref_identity_name, for_each_ref_identity_timestamp,
-    for_each_ref_lstrip_name, for_each_ref_message_parts, for_each_ref_rstrip_name,
-    for_each_ref_sanitize_subject, for_each_ref_short_name, for_each_ref_track_short,
-    parse_for_each_ref_abbrev_width, parse_for_each_ref_contents_lines_count,
+    ForEachRefAtom, ForEachRefAtomIdentityPart, ForEachRefAtomIdentityRole, ForEachRefEmailMode,
+    ForEachRefFormat, ForEachRefFormatSegment, ForEachRefNameFormat, ForEachRefNameSource,
+    ForEachRefQuoteMode, ForEachRefStripDirection, ForEachRefTrack, for_each_ref_abbrev_oid,
+    for_each_ref_copy_subject, for_each_ref_identity_date, for_each_ref_identity_email,
+    for_each_ref_identity_name, for_each_ref_identity_timestamp, for_each_ref_lstrip_name,
+    for_each_ref_message_parts, for_each_ref_rstrip_name, for_each_ref_sanitize_subject,
+    for_each_ref_short_name, for_each_ref_track_short, parse_for_each_ref_abbrev_width,
+    parse_for_each_ref_contents_lines_count, parse_for_each_ref_hex_color,
     parse_for_each_ref_strip_count, write_for_each_ref_format, write_for_each_ref_identity,
     write_for_each_ref_identity_date_mode, write_for_each_ref_identity_date_raw,
     write_for_each_ref_identity_email_mode, write_for_each_ref_identity_name,
-    write_for_each_ref_track, ForEachRefAtom,
-    ForEachRefAtomIdentityPart, ForEachRefAtomIdentityRole, ForEachRefEmailMode,
-    ForEachRefFormat, ForEachRefFormatSegment, ForEachRefNameFormat, ForEachRefNameSource,
-    ForEachRefQuoteMode, ForEachRefStripDirection, ForEachRefTrack,
+    write_for_each_ref_track,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -61,7 +61,9 @@ pub(crate) enum ForEachRefIdentityPart {
     Email,
 }
 
-pub(crate) fn parse_for_each_ref_identity_sort(value: &str) -> Option<(ForEachRefIdentitySortField, bool)> {
+pub(crate) fn parse_for_each_ref_identity_sort(
+    value: &str,
+) -> Option<(ForEachRefIdentitySortField, bool)> {
     let (value, descending) = value
         .strip_prefix('-')
         .map(|value| (value, true))
@@ -367,7 +369,10 @@ pub(crate) fn resolve_for_each_ref_target(
     Ok(None)
 }
 
-pub(crate) fn for_each_ref_loose_object_disk_size(git_dir: &Path, oid: &ObjectId) -> Result<Option<u64>> {
+pub(crate) fn for_each_ref_loose_object_disk_size(
+    git_dir: &Path,
+    oid: &ObjectId,
+) -> Result<Option<u64>> {
     let hex = oid.to_hex();
     if hex.len() < 2 {
         return Ok(None);
@@ -514,7 +519,10 @@ pub(crate) struct ForEachRefPushRemote {
     expose_name: bool,
 }
 
-pub(crate) fn for_each_ref_upstream(config: &GitConfig, refname: &str) -> Option<ForEachRefUpstream> {
+pub(crate) fn for_each_ref_upstream(
+    config: &GitConfig,
+    refname: &str,
+) -> Option<ForEachRefUpstream> {
     let branch = refname.strip_prefix("refs/heads/")?;
     let remote = config.get("branch", Some(branch), "remote")?;
     let merge = config.get("branch", Some(branch), "merge")?;
@@ -594,7 +602,10 @@ pub(crate) fn for_each_ref_push(config: &GitConfig, refname: &str) -> Option<For
     })
 }
 
-pub(crate) fn for_each_ref_push_remote(config: &GitConfig, branch: &str) -> Option<ForEachRefPushRemote> {
+pub(crate) fn for_each_ref_push_remote(
+    config: &GitConfig,
+    branch: &str,
+) -> Option<ForEachRefPushRemote> {
     if let Some(remote) = config.get("branch", Some(branch), "pushRemote") {
         return Some(ForEachRefPushRemote {
             name: remote.to_string(),
@@ -637,7 +648,11 @@ pub(crate) fn remote_display_name(remote: ForEachRefPushRemote) -> String {
     }
 }
 
-pub(crate) fn map_remote_tracking_ref(config: &GitConfig, remote: &str, remote_ref: &str) -> Option<String> {
+pub(crate) fn map_remote_tracking_ref(
+    config: &GitConfig,
+    remote: &str,
+    remote_ref: &str,
+) -> Option<String> {
     let fetch = config.get("remote", Some(remote), "fetch")?;
     map_remote_fetch_refspec(fetch, remote_ref)
 }
@@ -912,6 +927,15 @@ pub(crate) fn print_for_each_ref_format(
     stdout: &mut impl Write,
     format_spec: &ForEachRefFormat,
     context: &ForEachRefFormatContext<'_>,
+) -> Result<()> {
+    print_for_each_ref_format_with_is_bases(stdout, format_spec, context, &HashMap::new())
+}
+
+pub(crate) fn print_for_each_ref_format_with_is_bases(
+    stdout: &mut impl Write,
+    format_spec: &ForEachRefFormat,
+    context: &ForEachRefFormatContext<'_>,
+    is_base_refs: &HashMap<String, String>,
 ) -> Result<()> {
     let reset_color_at_eol = context.color && format_spec.ends_with_unreset_color();
     write_for_each_ref_format(
@@ -1538,6 +1562,13 @@ pub(crate) fn print_for_each_ref_format(
                     } else if let Some(result) = for_each_ref_try_date_atom(stdout, other, context)
                     {
                         result?;
+                    } else if let Some(target) = other.strip_prefix("is-base:") {
+                        if is_base_refs
+                            .get(target)
+                            .is_some_and(|refname| refname == context.refname)
+                        {
+                            write!(stdout, "({target})")?;
+                        }
                     } else if let Some(rev) = other.strip_prefix("ahead-behind:") {
                         let target = resolve_revision(context.git_dir, context.format, rev)?;
                         if let Some(track) = for_each_ref_ahead_behind_with_diagnostic(
@@ -1935,8 +1966,7 @@ pub(crate) fn for_each_ref_try_trailers_atom(
             let parts = for_each_ref_message_parts(message);
             let sig_len = parts.signature.len();
             let trailer_src = &parts.bare[..parts.bare.len().saturating_sub(sig_len)];
-            let rendered =
-                sley_pretty::format_trailers_from_commit(trailer_src, &options);
+            let rendered = sley_pretty::format_trailers_from_commit(trailer_src, &options);
             stdout.write_all(&rendered)?;
         }
         Ok(())
@@ -2164,6 +2194,11 @@ pub(crate) fn for_each_ref_color_escape(value: &str) -> Result<String> {
     let tokens = value.split_whitespace().collect::<Vec<_>>();
     if tokens.is_empty() {
         return Err(GitError::Command("empty for-each-ref color".into()));
+    }
+    if tokens.len() == 1
+        && let Some((red, green, blue)) = parse_for_each_ref_hex_color(tokens[0])
+    {
+        return Ok(format!("\x1b[38;2;{red};{green};{blue}m"));
     }
     let mut attributes = Vec::new();
     let mut foreground = None;
