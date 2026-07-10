@@ -208,7 +208,10 @@ impl Default for DiffTreeOptions {
     }
 }
 
-pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_diff_tree(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     // `diff-tree -s --pretty=tformat:%s <commit>` — the no-diff subject-only
     // form the sequencer suite uses; print the subject and stop.
     {
@@ -556,7 +559,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
         }
     }
     options.ignore_regexes = crate::compile_ignore_matching_regexes(&ignore_regex_patterns)?;
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let git_dir = repo.git_dir();
     let format = repo.format();
     let db = repo.objects();

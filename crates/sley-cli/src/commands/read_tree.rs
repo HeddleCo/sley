@@ -30,9 +30,6 @@
 use crate::*;
 use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_rev, sley_worktree};
 
-/// A flat map from a repository-relative path to a tree leaf's `(mode, oid)`.
-type LeafMap = BTreeMap<Vec<u8>, (u32, ObjectId)>;
-
 /// Which top-level operation `read-tree` should perform. These mirror git's
 /// `--reset` / `--prefix` / `-m` switches, which are mutually exclusive.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,23 +66,12 @@ struct ReadTreeArgs {
     trees: Vec<String>,
 }
 
-/// A single resolved index entry destined for stage 0/1/2/3.
-#[derive(Debug, Clone)]
-struct StagedEntry {
-    mode: u32,
-    oid: ObjectId,
-    stage: u8,
-    /// git's `ce_stat_data` for this entry: carried forward from the source
-    /// index on a kept entry, or filled from the post-write `lstat` after a
-    /// `-u` worktree apply. `None` serializes as an all-zero stat (a fresh /
-    /// not-yet-refreshed entry, which `diff-files` treats as racily clean).
-    stat: Option<sley_unpack_trees::StatInfo>,
-}
+type StagedEntry = sley_worktree::ReadTreeEntry;
 
-pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_read_tree(cli_session: &session::CliSession, args: &[String]) -> Result<()> {
     let parsed = parse_read_tree_args(args)?;
 
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let git_dir = repo.git_dir();
     let format = repo.format();
     let db = repo.objects();
@@ -97,7 +83,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
 
     // `--empty` (and the deprecated no-argument spelling) just clears the index.
     if parsed.empty {
-        write_paired_entries(git_dir, format, Vec::new())?;
+        sley_worktree::persist_read_tree_entries(git_dir, format, Vec::new())?;
         return Ok(());
     }
 
@@ -124,9 +110,13 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
 
     match &parsed.mode {
         ReadTreeMode::Read => {
-            let entries = read_tree_overlay(db, format, repo.config(), &tree_oids)?;
+            let entries = plan_read_tree_entries(
+                &repo,
+                &tree_oids,
+                sley_worktree::ReadTreeTransitionMode::Overlay,
+            )?;
             if !parsed.dry_run {
-                write_paired_entries(git_dir, format, entries)?;
+                sley_worktree::persist_read_tree_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
                     apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
                 }
@@ -136,7 +126,11 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             // `--reset` accepts up to three trees but only the resulting union
             // matters; higher-stage entries are simply dropped (we never create
             // them here). With `-u` the worktree is updated to match.
-            let mut entries = read_tree_overlay(db, format, repo.config(), &tree_oids)?;
+            let mut entries = plan_read_tree_entries(
+                &repo,
+                &tree_oids,
+                sley_worktree::ReadTreeTransitionMode::Overlay,
+            )?;
             if apply_worktree {
                 let worktree_root = worktree_root_for_git_dir(git_dir)?;
                 let reset_result = reset_worktree_to_entries(
@@ -171,15 +165,18 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                 reset_result?;
             }
             if !parsed.dry_run {
-                write_paired_entries(git_dir, format, entries)?;
+                sley_worktree::persist_read_tree_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
                     apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
                 }
             }
         }
         ReadTreeMode::Prefix(prefix) => {
-            let mut entries =
-                read_tree_prefix(git_dir, format, db, repo.config(), &tree_oids, prefix)?;
+            let mut entries = plan_read_tree_entries(
+                &repo,
+                &tree_oids,
+                sley_worktree::ReadTreeTransitionMode::Prefix(prefix.clone()),
+            )?;
             if apply_worktree {
                 let worktree_root = worktree_root_for_git_dir(git_dir)?;
                 update_worktree_for_entries(
@@ -194,7 +191,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                 )?;
             }
             if !parsed.dry_run {
-                write_paired_entries(git_dir, format, entries)?;
+                sley_worktree::persist_read_tree_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
                     apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
                 }
@@ -216,7 +213,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                 recurse_submodules,
             )?;
             if !parsed.dry_run {
-                write_paired_entries(git_dir, format, entries)?;
+                sley_worktree::persist_read_tree_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
                     apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
                 }
@@ -225,6 +222,43 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
     }
 
     Ok(())
+}
+
+struct CliReadTreeDiagnostics;
+
+impl sley_worktree::ReadTreeDiagnostics for CliReadTreeDiagnostics {
+    fn invalid_path(&mut self, path: &[u8]) {
+        eprintln!("error: invalid path '{}'", String::from_utf8_lossy(path));
+    }
+}
+
+fn plan_read_tree_entries(
+    repo: &RepositoryContext,
+    tree_oids: &[ObjectId],
+    mode: sley_worktree::ReadTreeTransitionMode,
+) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
+    let mut diagnostics = CliReadTreeDiagnostics;
+    Ok(
+        map_read_tree_transition_result(sley_worktree::plan_read_tree_transition(
+            repo.git_dir(),
+            repo.format(),
+            repo.objects(),
+            repo.config(),
+            sley_worktree::ReadTreeTransitionOptions { mode, tree_oids },
+            &mut diagnostics,
+        ))?
+        .entries,
+    )
+}
+
+fn map_read_tree_transition_result<T>(
+    result: sley_worktree::ReadTreeTransitionResult<T>,
+) -> Result<T> {
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(sley_worktree::ReadTreeTransitionError::InvalidPath(_)) => Err(GitError::Exit(128)),
+        Err(sley_worktree::ReadTreeTransitionError::Engine(error)) => Err(error),
+    }
 }
 
 fn apply_read_tree_sparse_checkout(
@@ -489,315 +523,6 @@ fn read_tree_check_cache_tree() -> bool {
         std::env::var("GIT_TEST_CHECK_CACHE_TREE").as_deref(),
         Ok("false" | "0")
     )
-}
-
-/// Convert a leaf map to sorted stage-0 `(path, entry)` pairs.
-fn leaves_to_stage0(leaves: LeafMap) -> Vec<(Vec<u8>, StagedEntry)> {
-    leaves
-        .into_iter()
-        .map(|(path, (mode, oid))| (path, stage0(mode, oid)))
-        .collect()
-}
-
-/// Overlay the listed trees into a single stage-0 index, with later trees
-/// winning on path collisions (git's non-merge multi-tree read).
-fn read_tree_overlay(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    config: &GitConfig,
-    tree_oids: &[ObjectId],
-) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
-    let path_rules = ReadTreePathRules::from_config(config);
-    let mut merged: LeafMap = BTreeMap::new();
-    for tree_oid in tree_oids {
-        for (path, value) in sley_diff_merge::flatten_tree(db, format, tree_oid)? {
-            verify_read_tree_path(&path, value.0, path_rules)?;
-            overlay_tree_leaf(&mut merged, path, value);
-        }
-    }
-    Ok(leaves_to_stage0(merged))
-}
-
-/// Insert one leaf from a later tree into a non-merge `read-tree` overlay.
-///
-/// Git's overlay is recursive at the tree-entry level, not merely an exact-key
-/// map union.  A later file at `a` replaces every earlier `a/...` leaf, while a
-/// later `a/b` leaf replaces an earlier file at `a`.  Keeping both would create
-/// an impossible file/directory index pair (and was observable as the stray
-/// `b` entry in upstream t1008).
-fn overlay_tree_leaf(merged: &mut LeafMap, path: Vec<u8>, value: (u32, ObjectId)) {
-    for (position, byte) in path.iter().enumerate() {
-        if *byte == b'/' {
-            merged.remove(&path[..position]);
-        }
-    }
-
-    let mut descendant_prefix = path.clone();
-    descendant_prefix.push(b'/');
-    let descendants = merged
-        .range(descendant_prefix.clone()..)
-        .take_while(|(candidate, _)| candidate.starts_with(&descendant_prefix))
-        .map(|(candidate, _)| candidate.clone())
-        .collect::<Vec<_>>();
-    for descendant in descendants {
-        merged.remove(&descendant);
-    }
-    merged.insert(path, value);
-}
-
-/// Overlay a single tree (or up to three, last-wins) under `prefix` into the
-/// *current* index (stage 0), keeping every existing entry; on an exact path
-/// collision the new tree wins.
-fn read_tree_prefix(
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
-    config: &GitConfig,
-    tree_oids: &[ObjectId],
-    prefix: &[u8],
-) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
-    let path_rules = ReadTreePathRules::from_config(config);
-    let mut merged: LeafMap = current_index_stage0(git_dir, format)?;
-
-    // `prefix` is normalized to end in `/`; the root prefix is the sentinel
-    // "/", which means "no path prefix".
-    let real_prefix: &[u8] = if prefix == b"/" { b"" } else { prefix };
-
-    for tree_oid in tree_oids {
-        for (path, value) in sley_diff_merge::flatten_tree(db, format, tree_oid)? {
-            let mut full = real_prefix.to_vec();
-            full.extend_from_slice(&path);
-            verify_read_tree_path(&full, value.0, path_rules)?;
-            merged.insert(full, value);
-        }
-    }
-
-    Ok(leaves_to_stage0(merged))
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ReadTreePathRules {
-    protect_hfs: bool,
-    protect_ntfs: bool,
-}
-
-impl ReadTreePathRules {
-    fn from_config(config: &GitConfig) -> Self {
-        Self {
-            protect_hfs: config.get_bool("core", None, "protectHFS").unwrap_or(false),
-            protect_ntfs: config
-                .get_bool("core", None, "protectNTFS")
-                .unwrap_or(false),
-        }
-    }
-}
-
-/// git's `verify_path()` check for tree entries read into the index. It rejects
-/// paths that would address `.git` (or its HFS/NTFS aliases), `.`/`..`, or an
-/// embedded NUL before any index/worktree mutation.
-fn verify_read_tree_path(path: &[u8], mode: u32, rules: ReadTreePathRules) -> Result<()> {
-    if path.is_empty() || path.contains(&0) {
-        return invalid_read_tree_path(path);
-    }
-
-    for component in path.split(|&byte| byte == b'/') {
-        if component.is_empty() || component == b"." || component == b".." {
-            return invalid_read_tree_path(path);
-        }
-        if component.eq_ignore_ascii_case(b".git") {
-            return invalid_read_tree_path(path);
-        }
-        if rules.protect_hfs && is_hfs_dotgit(component) {
-            return invalid_read_tree_path(path);
-        }
-        if rules.protect_ntfs && is_ntfs_dotgit(component) {
-            return invalid_read_tree_path(path);
-        }
-        if mode == 0o120000 {
-            if rules.protect_hfs && is_hfs_dotgitmodules(component) {
-                return invalid_read_tree_path(path);
-            }
-            if rules.protect_ntfs && is_ntfs_dotgitmodules(component) {
-                return invalid_read_tree_path(path);
-            }
-            if component.eq_ignore_ascii_case(b".gitmodules") {
-                return invalid_read_tree_path(path);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn invalid_read_tree_path(path: &[u8]) -> Result<()> {
-    eprintln!("error: invalid path '{}'", String::from_utf8_lossy(path));
-    Err(GitError::Exit(128))
-}
-
-fn is_hfs_dotgit(name: &[u8]) -> bool {
-    strip_hfs_ignorable(name).eq_ignore_ascii_case(b".git")
-}
-
-fn is_hfs_dotgitmodules(name: &[u8]) -> bool {
-    strip_hfs_ignorable(name).eq_ignore_ascii_case(b".gitmodules")
-}
-
-fn is_ntfs_dotgit(name: &[u8]) -> bool {
-    for segment in name.split(|&byte| byte == b'\\') {
-        let stream_name = segment
-            .iter()
-            .position(|&byte| byte == b':')
-            .map_or(segment, |colon| &segment[..colon]);
-        let mut end = stream_name.len();
-        while end > 0 && (stream_name[end - 1] == b'.' || stream_name[end - 1] == b' ') {
-            end -= 1;
-        }
-        let trimmed = &stream_name[..end];
-        if trimmed.eq_ignore_ascii_case(b".git") || trimmed.eq_ignore_ascii_case(b"git~1") {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_ntfs_dotgitmodules(name: &[u8]) -> bool {
-    is_ntfs_dot_name(name, b".gitmodules", b"gitmodules", b"gi7eba")
-}
-
-fn is_ntfs_dot_name(name: &[u8], long: &[u8], short_base: &[u8], fallback: &[u8]) -> bool {
-    for segment in name.split(|&byte| byte == b'\\') {
-        let stream_name = segment
-            .iter()
-            .position(|&byte| byte == b':')
-            .map_or(segment, |colon| &segment[..colon]);
-        let mut end = stream_name.len();
-        while end > 0 && (stream_name[end - 1] == b'.' || stream_name[end - 1] == b' ') {
-            end -= 1;
-        }
-        let trimmed = &stream_name[..end];
-        if trimmed.eq_ignore_ascii_case(long) {
-            return true;
-        }
-        if short_base.len() >= 6
-            && trimmed.len() == 8
-            && trimmed[..6].eq_ignore_ascii_case(&short_base[..6])
-            && trimmed[6] == b'~'
-            && matches!(trimmed[7], b'1'..=b'4')
-        {
-            return true;
-        }
-        if trimmed.len() == 8 && trimmed[..fallback.len()].eq_ignore_ascii_case(fallback) {
-            let mut saw_tilde = false;
-            let mut ok = true;
-            for byte in trimmed.iter().take(8).skip(fallback.len()) {
-                if saw_tilde {
-                    ok &= byte.is_ascii_digit();
-                } else if *byte == b'~' {
-                    saw_tilde = true;
-                } else {
-                    ok = false;
-                }
-            }
-            if ok && saw_tilde {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn strip_hfs_ignorable(name: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(name) else {
-        return name.to_vec();
-    };
-    text.chars()
-        .filter(|ch| !is_hfs_ignorable(*ch))
-        .collect::<String>()
-        .into_bytes()
-}
-
-fn is_hfs_ignorable(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x200c | 0x200d | 0x200e | 0x200f | 0x202a..=0x202e | 0x206a..=0x206f
-        | 0xfeff | 0x00ad | 0x034f | 0x115f | 0x1160 | 0x17b4 | 0x17b5 | 0x2060..=0x2064
-    )
-}
-
-/// Read the current on-disk index's stage-0 entries into a path -> (mode, oid)
-/// map (used as the base for `--prefix` and the merge "current" side). A missing
-/// index yields an empty map.
-fn current_index_stage0(git_dir: &Path, format: ObjectFormat) -> Result<LeafMap> {
-    let mut out = BTreeMap::new();
-    if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
-        for entry in index.entries {
-            if entry_stage(&entry) == 0 {
-                out.insert(entry.path.into_bytes(), (entry.mode, entry.oid));
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// git's `ce_stat_data` for a parsed on-disk index entry: the cached `lstat`
-/// fields the merge must carry forward so a kept entry stays `diff-files`-clean.
-fn stat_info_from_index_entry(entry: &IndexEntry) -> sley_unpack_trees::StatInfo {
-    sley_unpack_trees::StatInfo {
-        ctime_seconds: entry.ctime_seconds,
-        ctime_nanoseconds: entry.ctime_nanoseconds,
-        mtime_seconds: entry.mtime_seconds,
-        mtime_nanoseconds: entry.mtime_nanoseconds,
-        dev: entry.dev,
-        ino: entry.ino,
-        uid: entry.uid,
-        gid: entry.gid,
-        size: entry.size,
-    }
-}
-
-/// Read the current on-disk index's stage-0 entries into the engine's
-/// [`sley_unpack_trees::FlatIndex`] — path → `(mode, oid, cached stat)` — so a
-/// `read-tree -m` carries each kept entry's `lstat` info forward. A missing
-/// index yields an empty map.
-fn current_index_flat(
-    git_dir: &Path,
-    format: ObjectFormat,
-) -> Result<sley_unpack_trees::FlatIndex> {
-    let mut out = sley_unpack_trees::FlatIndex::new();
-    if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
-        for entry in &index.entries {
-            if entry_stage(entry) == 0 {
-                out.insert(
-                    entry.path.as_bytes().to_vec(),
-                    (
-                        entry.mode,
-                        entry.oid,
-                        Some(stat_info_from_index_entry(entry)),
-                    ),
-                );
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// Extract the merge stage (0-3) encoded in bits 12-13 of an index entry's
-/// `flags` field.
-fn entry_stage(entry: &IndexEntry) -> u8 {
-    ((entry.flags >> 12) & 0x3) as u8
-}
-
-/// The set of every path present in the current index, across all stages. Used
-/// to tell which merge-result entries are newly added (and so subject to the
-/// "would be overwritten" untracked-file check under `-u`).
-fn original_index_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet<Vec<u8>>> {
-    let mut out = BTreeSet::new();
-    if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
-        for entry in index.entries {
-            out.insert(entry.path.into_bytes());
-        }
-    }
-    Ok(out)
 }
 
 /// Which command's porcelain error strings the engine's safety checks should
@@ -1172,7 +897,7 @@ pub(crate) fn checkout_two_way_engine(
     use sley_unpack_trees::{MergeFn, UnpackTreesOptions, check_updates, unpack_trees};
 
     let previous_index = sley_worktree::read_repository_index(git_dir, format)?;
-    let index = current_index_flat(git_dir, format)?;
+    let index = sley_worktree::read_current_unpack_index(git_dir, format)?;
 
     // git's `merge_working_tree`: `trees[0]` = the tree of the HEAD being left
     // (empty when HEAD is unborn), `trees[1]` = the tree being checked out.
@@ -1202,7 +927,7 @@ pub(crate) fn checkout_two_way_engine(
         git_dir: git_dir.to_path_buf(),
         db,
         format,
-        original_paths: original_index_paths(git_dir, format)?,
+        original_paths: sley_worktree::read_current_index_paths(git_dir, format)?,
         porcelain,
         recurse_submodules,
         force_overwrite_tracked: overwrite_untracked,
@@ -1236,8 +961,10 @@ pub(crate) fn checkout_two_way_engine(
         })
         .collect();
     match previous_index.as_ref() {
-        Some(previous) => write_paired_entries_for_checkout(git_dir, format, pairs, previous),
-        None => write_paired_entries(git_dir, format, pairs),
+        Some(previous) => {
+            sley_worktree::persist_checkout_read_tree_entries(git_dir, format, pairs, previous)
+        }
+        None => sley_worktree::persist_read_tree_entries(git_dir, format, pairs),
     }
 }
 
@@ -1254,7 +981,16 @@ pub(crate) fn reset_index_and_worktree_to_commit(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let config = read_repo_config(git_dir).unwrap_or_default();
     let tree = commands::merge_rebase::commit_tree_oid(&db, format, commit)?;
-    let mut entries = read_tree_overlay(&db, format, &config, &[tree])?;
+    let mut diagnostics = CliReadTreeDiagnostics;
+    let mut entries = map_read_tree_transition_result(sley_worktree::plan_read_tree_transition(
+        git_dir,
+        format,
+        &db,
+        &config,
+        sley_worktree::ReadTreeTransitionOptions::overlay(&[tree]),
+        &mut diagnostics,
+    ))?
+    .entries;
     reset_worktree_to_entries(
         worktree_root,
         git_dir,
@@ -1265,7 +1001,7 @@ pub(crate) fn reset_index_and_worktree_to_commit(
         &mut entries,
         recurse_submodules,
     )?;
-    write_paired_entries(git_dir, format, entries)
+    sley_worktree::persist_read_tree_entries(git_dir, format, entries)
 }
 
 /// Perform git's trivial fast-forward / two-way / three-way merge of the listed
@@ -1308,16 +1044,18 @@ fn merge_trees(
         }
     };
 
-    let index = current_index_flat(git_dir, format)?;
-    let path_rules = ReadTreePathRules::from_config(config);
+    let index = sley_worktree::read_current_unpack_index(git_dir, format)?;
+    let mut diagnostics = CliReadTreeDiagnostics;
     let trees: Vec<sley_unpack_trees::FlatTree> = tree_oids
         .iter()
         .map(|oid| {
-            let tree = sley_diff_merge::flatten_tree(db, format, oid)?;
-            for (path, (mode, _)) in &tree {
-                verify_read_tree_path(path, *mode, path_rules)?;
-            }
-            Ok(tree)
+            map_read_tree_transition_result(sley_worktree::flatten_validated_read_tree_source(
+                db,
+                format,
+                config,
+                oid,
+                &mut diagnostics,
+            ))
         })
         .collect::<Result<_>>()?;
 
@@ -1354,7 +1092,7 @@ fn merge_trees(
         git_dir: git_dir.to_path_buf(),
         db,
         format,
-        original_paths: original_index_paths(git_dir, format)?,
+        original_paths: sley_worktree::read_current_index_paths(git_dir, format)?,
         porcelain: UnpackPorcelain::ReadTree,
         recurse_submodules,
         force_overwrite_tracked: false,
@@ -1497,18 +1235,6 @@ fn submodule_has_dirty_index(sub_root: &Path) -> bool {
     }
 }
 
-/// Construct a stage-0 [`StagedEntry`] with no cached stat (the overlay /
-/// `--prefix` paths build the index purely from tree contents, so no worktree
-/// stat is available; git's `read-tree` without `-m` writes a zeroed stat too).
-fn stage0(mode: u32, oid: ObjectId) -> StagedEntry {
-    StagedEntry {
-        mode,
-        oid,
-        stage: 0,
-        stat: None,
-    }
-}
-
 /// Abort with git's "not uptodate" error when the working-tree copy of `path`
 /// disagrees with the index entry the merge is about to replace/remove.
 ///
@@ -1582,131 +1308,6 @@ fn safe_worktree_path(root: &Path, path: &[u8]) -> Option<PathBuf> {
     Some(root.join(relative))
 }
 
-/// Build and persist the on-disk index from sorted `(path, entry)` pairs.
-fn write_paired_entries(
-    git_dir: &Path,
-    format: ObjectFormat,
-    pairs: Vec<(Vec<u8>, StagedEntry)>,
-) -> Result<()> {
-    let index_entries = paired_index_entries(git_dir, format, pairs)?;
-    persist_index(git_dir, format, index_entries)
-}
-
-fn write_paired_entries_for_checkout(
-    git_dir: &Path,
-    format: ObjectFormat,
-    pairs: Vec<(Vec<u8>, StagedEntry)>,
-    previous: &Index,
-) -> Result<()> {
-    let index_entries = paired_index_entries(git_dir, format, pairs)?;
-    persist_index_with_checkout_extensions(git_dir, format, index_entries, previous)
-}
-
-fn paired_index_entries(
-    git_dir: &Path,
-    format: ObjectFormat,
-    pairs: Vec<(Vec<u8>, StagedEntry)>,
-) -> Result<Vec<IndexEntry>> {
-    let skip_worktree_paths = read_skip_worktree_paths(git_dir, format)?;
-    let mut index_entries = Vec::with_capacity(pairs.len());
-    for (path, entry) in pairs {
-        let mut index_entry = make_index_entry(path, entry)?;
-        if skip_worktree_paths.contains(index_entry.path.as_bytes()) {
-            index_entry.set_skip_worktree(true);
-        }
-        index_entries.push(index_entry);
-    }
-    index_entries.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| (left.flags & 0x3000).cmp(&(right.flags & 0x3000)))
-    });
-    Ok(index_entries)
-}
-
-fn read_skip_worktree_paths(
-    git_dir: &Path,
-    format: ObjectFormat,
-) -> Result<std::collections::BTreeSet<Vec<u8>>> {
-    Ok(sley_worktree::read_repository_index(git_dir, format)?
-        .map(|index| {
-            index
-                .entries
-                .into_iter()
-                .filter(|entry| entry.is_skip_worktree())
-                .map(|entry| entry.path.into_bytes())
-                .collect()
-        })
-        .unwrap_or_default())
-}
-
-/// Convert a `(path, StagedEntry)` into a writable [`IndexEntry`], encoding the
-/// stage into bits 12-13 of `flags` and the path length into the low 12 bits.
-///
-/// When the entry carries cached stat info (a kept entry, or one refreshed by
-/// the `-u` apply), it is written into the entry's `ce_stat_data` fields so a
-/// follow-up `diff-files` reports the correct clean/dirty verdict; otherwise
-/// the stat fields stay zeroed (git's all-zero "needs refresh" state).
-fn make_index_entry(path: Vec<u8>, entry: StagedEntry) -> Result<IndexEntry> {
-    let name_len = path.len().min(0x0fff) as u16;
-    let stage_bits = ((entry.stage as u16) & 0x3) << 12;
-    let stat = entry.stat.unwrap_or_default();
-    Ok(IndexEntry {
-        ctime_seconds: stat.ctime_seconds,
-        ctime_nanoseconds: stat.ctime_nanoseconds,
-        mtime_seconds: stat.mtime_seconds,
-        mtime_nanoseconds: stat.mtime_nanoseconds,
-        dev: stat.dev,
-        ino: stat.ino,
-        mode: entry.mode,
-        uid: stat.uid,
-        gid: stat.gid,
-        size: stat.size,
-        oid: entry.oid,
-        flags: name_len | stage_bits,
-        flags_extended: 0,
-        path: BString::from(path),
-    })
-}
-
-/// Serialize `entries` into the repository index file. Stage > 0 entries set the
-/// stage bits in `flags`; the index v2/v3 writer accepts those (the higher bits
-/// of `flags`), so a fixed version 2 layout matches git's `ls-files --stage`.
-fn persist_index(git_dir: &Path, format: ObjectFormat, entries: Vec<IndexEntry>) -> Result<()> {
-    persist_index_inner(git_dir, format, entries, None)
-}
-
-fn persist_index_with_checkout_extensions(
-    git_dir: &Path,
-    format: ObjectFormat,
-    entries: Vec<IndexEntry>,
-    previous: &Index,
-) -> Result<()> {
-    persist_index_inner(git_dir, format, entries, Some(previous))
-}
-
-fn persist_index_inner(
-    git_dir: &Path,
-    format: ObjectFormat,
-    entries: Vec<IndexEntry>,
-    previous: Option<&Index>,
-) -> Result<()> {
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let mut index = Index {
-        version: 2,
-        entries,
-        extensions: Vec::new(),
-        checksum: None,
-    };
-    index.upgrade_version_for_flags();
-    sley_worktree::refresh_cache_tree(&mut index, &db);
-    if let Some(previous) = previous {
-        sley_worktree::preserve_checkout_index_extensions(previous, &mut index, format)?;
-    }
-    sley_worktree::write_repository_index_ref(git_dir, format, &index)?;
-    Ok(())
-}
-
 /// Materialize newly-introduced blobs into the working tree (used by
 /// `--prefix -u`): only stage-0 paths whose `(mode, oid)` differ from the prior
 /// index entry are written, so unrelated locally-modified files the prefix read
@@ -1723,7 +1324,7 @@ fn update_worktree_for_entries(
     entries: &mut [(Vec<u8>, StagedEntry)],
     recurse_submodules: bool,
 ) -> Result<()> {
-    let original = current_index_stage0(git_dir, format)?;
+    let original = sley_worktree::read_current_index_stage_zero(git_dir, format)?;
     let mut written: BTreeMap<Vec<u8>, Option<sley_unpack_trees::StatInfo>> = BTreeMap::new();
     // Borrow-split: pick write order from a read-only view, then mutate by path.
     let plan: Vec<(Vec<u8>, u32, ObjectId)> = worktree_write_order(entries)
@@ -2514,33 +2115,6 @@ fn path_to_git_bytes_lossy(path: &Path) -> Vec<u8> {
         .collect::<Vec<_>>()
         .join("/")
         .into_bytes()
-}
-
-#[cfg(test)]
-mod overlay_tests {
-    use super::*;
-
-    fn oid(byte: u8) -> ObjectId {
-        ObjectId::from_raw(ObjectFormat::Sha1, &[byte; 20]).expect("valid sha1 oid")
-    }
-
-    #[test]
-    fn later_overlay_leaf_replaces_file_directory_conflicts_in_both_directions() {
-        let mut leaves = LeafMap::from([
-            (b"a".to_vec(), (0o100644, oid(1))),
-            (b"b".to_vec(), (0o100644, oid(2))),
-            (b"c/one".to_vec(), (0o100644, oid(3))),
-            (b"c/two".to_vec(), (0o100644, oid(4))),
-        ]);
-
-        overlay_tree_leaf(&mut leaves, b"b/child".to_vec(), (0o100644, oid(5)));
-        overlay_tree_leaf(&mut leaves, b"c".to_vec(), (0o100644, oid(6)));
-
-        assert_eq!(
-            leaves.keys().cloned().collect::<Vec<_>>(),
-            vec![b"a".to_vec(), b"b/child".to_vec(), b"c".to_vec()]
-        );
-    }
 }
 
 #[cfg(test)]

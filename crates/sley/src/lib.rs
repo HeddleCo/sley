@@ -58,6 +58,7 @@ mod refs;
 mod remote_edit;
 mod rev_graph;
 mod status_plan;
+mod tags;
 
 #[cfg(feature = "remote")]
 pub mod remote;
@@ -155,6 +156,10 @@ pub use refs::{
 pub use rev_graph::{ReachableCommit, ReachableCommitOptions, RevGraph};
 pub use status_plan::{
     OwnedStatusRow, StatusCacheKey, StatusCode, StatusPlan, StatusPlanBuilder, StatusRow,
+};
+pub use tags::{
+    TagQueryEntry, TagQueryError, TagQueryOptions, TagQueryOutcome, TagQueryResult,
+    TagQueryRevisionKind,
 };
 
 /// A resolved reference: its full name plus the target it points at.
@@ -323,6 +328,7 @@ pub struct OpenOptions {
     bare: bool,
     respect_environment: bool,
     replace_objects: bool,
+    effective_use_replace_refs: Option<bool>,
 }
 
 impl OpenOptions {
@@ -332,6 +338,7 @@ impl OpenOptions {
             bare: false,
             respect_environment: false,
             replace_objects: true,
+            effective_use_replace_refs: None,
         }
     }
 
@@ -362,6 +369,17 @@ impl OpenOptions {
     /// replacements unconditionally.
     pub fn replace_objects(mut self, replace_objects: bool) -> Self {
         self.replace_objects = replace_objects;
+        self
+    }
+
+    /// Supply an already-resolved effective `core.useReplaceRefs` value.
+    ///
+    /// The default reads repository configuration during open. CLI wrappers or
+    /// embedders which layer injected configuration separately can provide the
+    /// final value here without making the repository facade depend on their
+    /// process-global configuration mechanism.
+    pub fn effective_use_replace_refs(mut self, use_replace_refs: bool) -> Self {
+        self.effective_use_replace_refs = Some(use_replace_refs);
         self
     }
 
@@ -462,7 +480,7 @@ impl Repository {
                 git_dir.display()
             )));
         }
-        Self::from_git_dir(git_dir, None, true)
+        Self::from_git_dir(git_dir, None, true, None)
     }
 
     /// Open a repository with explicit discovery, bare-worktree, and
@@ -487,7 +505,12 @@ impl Repository {
                 git_dir.display()
             )));
         }
-        let repo = Self::from_git_dir(git_dir, work_tree_override, options.replace_objects)?;
+        let repo = Self::from_git_dir(
+            git_dir,
+            work_tree_override,
+            options.replace_objects,
+            options.effective_use_replace_refs,
+        )?;
         if options.bare && repo.workdir().is_some() {
             return Err(GitError::InvalidFormat(format!(
                 "repository is not bare: {}",
@@ -514,7 +537,7 @@ impl Repository {
     /// file, or a bare repository at an ancestor).
     pub fn discover(path: impl AsRef<Path>) -> Result<Self> {
         let git_dir = discover_git_dir(path.as_ref())?;
-        Self::from_git_dir(git_dir, None, true)
+        Self::from_git_dir(git_dir, None, true, None)
     }
 
     /// Initialize a new non-bare repository rooted at `path` (creating its
@@ -538,20 +561,24 @@ impl Repository {
         bare: bool,
     ) -> Result<Self> {
         let layout = sley_formats::RepositoryLayout::init_at(path, format, bare)?;
-        Self::from_git_dir(layout.git_dir, None, true)
+        Self::from_git_dir(layout.git_dir, None, true, None)
     }
 
     fn from_git_dir(
         git_dir: PathBuf,
         work_tree_override: Option<PathBuf>,
         replace_objects: bool,
+        effective_use_replace_refs: Option<bool>,
     ) -> Result<Self> {
         let common_dir = sley_odb::repository_common_dir(&git_dir);
         let format = read_object_format(&common_dir)?;
-        let use_replace_refs = replace_objects
-            && sley_config::read_repo_config(&git_dir, None)?
+        let configured_use_replace_refs = match effective_use_replace_refs {
+            Some(value) => value,
+            None => sley_config::read_repo_config(&git_dir, None)?
                 .get_bool("core", None, "useReplaceRefs")
-                .unwrap_or(true);
+                .unwrap_or(true),
+        };
+        let use_replace_refs = replace_objects && configured_use_replace_refs;
         let replacements = if use_replace_refs {
             repository_object_replacements(&common_dir, format)?
         } else {
@@ -904,7 +931,12 @@ impl Repository {
     /// branch/tag names, abbreviated or full object ids, `HEAD~2`, `<rev>:<path>`,
     /// `@{u}`, etc.) to a concrete [`ObjectId`].
     pub fn rev_parse(&self, spec: &str) -> Result<ObjectId> {
-        sley_rev::resolve_revision(&self.git_dir, self.format, spec)
+        sley_rev::resolve_revision_with_reader(
+            &self.git_dir,
+            self.format,
+            self.object_database(),
+            spec,
+        )
     }
 
     /// Resolve `<rev>:<path>` to the tree entry it names within `<rev>`'s tree.
@@ -1416,6 +1448,22 @@ mod tests {
                 .expect("config-disabled read")
                 .body,
             b"original"
+        );
+
+        let injected_enabled = Repository::open_with(
+            repo.git_dir(),
+            OpenOptions::new()
+                .exact_path(true)
+                .effective_use_replace_refs(true),
+        )
+        .expect("open with resolved replacement policy");
+        assert_eq!(
+            injected_enabled
+                .object_database()
+                .read_object(&original)
+                .expect("resolved-policy replacement read")
+                .body,
+            b"replacement"
         );
     }
 

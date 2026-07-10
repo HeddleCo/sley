@@ -8,7 +8,8 @@
 //! `author-script` quoting rules. The drive loop (merging trees, committing,
 //! editors) lives with the CLI porcelain.
 
-use sley_core::ObjectId;
+use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_odb::{FileObjectDatabase, ObjectPrefixResolution};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -124,7 +125,7 @@ impl TodoCommand {
 
 /// One parsed instruction-sheet entry. `raw` preserves the exact line bytes
 /// (without the newline) so `save_todo` / `done` writes stay byte-faithful.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebaseTodoItem {
     pub command: TodoCommand,
     pub flags: u8,
@@ -633,6 +634,374 @@ pub fn remove_merge_state(git_dir: &Path) {
     let _ = fs::remove_dir_all(merge_dir(git_dir));
 }
 
+/// Repository-level state for an interactive rebase merge backend.
+///
+/// This is the typed counterpart of Git's line- and marker-oriented
+/// `rebase-merge` directory.  Porcelain decides which options to select; the
+/// sequencer owns their durable representation so embedders can start and
+/// resume the same operation without reproducing CLI-specific file wiring.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebaseState {
+    pub quiet: bool,
+    pub verbose: bool,
+    pub signoff: bool,
+    pub allow_ff: bool,
+    pub drop_redundant_commits: bool,
+    pub keep_redundant_commits: bool,
+    pub reschedule_failed_exec: bool,
+    pub committer_date_is_author_date: bool,
+    pub ignore_date: bool,
+    pub gpg_sign: Option<String>,
+    pub no_gpg_sign: bool,
+    pub strategy: Option<String>,
+    pub strategy_opts: Vec<String>,
+    pub rerere_autoupdate: Option<bool>,
+    pub head_name: Option<String>,
+    pub onto: ObjectId,
+    pub orig_head: ObjectId,
+    pub squash_onto: Option<ObjectId>,
+}
+
+/// Persist a rebase merge-backend state using Git's on-disk contract.
+pub fn write_rebase_state(git_dir: &Path, state: &RebaseState) -> Result<()> {
+    let dir = merge_dir(git_dir);
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join("interactive"), b"")?;
+    let head_name = state.head_name.as_deref().unwrap_or("detached HEAD");
+    fs::write(dir.join("head-name"), format!("{head_name}\n"))?;
+    fs::write(dir.join("onto"), format!("{}\n", state.onto))?;
+    fs::write(dir.join("orig-head"), format!("{}\n", state.orig_head))?;
+    if let Some(squash_onto) = state.squash_onto {
+        fs::write(dir.join("squash-onto"), format!("{squash_onto}\n"))?;
+    }
+    if state.quiet {
+        fs::write(dir.join("quiet"), b"")?;
+    }
+    if state.verbose {
+        fs::write(dir.join("verbose"), b"")?;
+    }
+    if state.signoff {
+        fs::write(dir.join("signoff"), b"--signoff\n")?;
+    }
+    if state.drop_redundant_commits {
+        fs::write(dir.join("drop_redundant_commits"), b"")?;
+    }
+    if state.keep_redundant_commits {
+        fs::write(dir.join("keep_redundant_commits"), b"")?;
+    }
+    fs::write(
+        dir.join(if state.reschedule_failed_exec {
+            "reschedule-failed-exec"
+        } else {
+            "no-reschedule-failed-exec"
+        }),
+        b"",
+    )?;
+    if state.committer_date_is_author_date {
+        fs::write(dir.join("cdate_is_adate"), b"")?;
+    }
+    if state.ignore_date {
+        fs::write(dir.join("ignore_date"), b"")?;
+    }
+    if let Some(key) = &state.gpg_sign {
+        let value = if key.is_empty() {
+            "-S".to_string()
+        } else {
+            format!("-S{key}")
+        };
+        fs::write(dir.join("gpg_sign_opt"), format!("{value}\n"))?;
+    }
+    if state.no_gpg_sign {
+        fs::write(dir.join("no_gpg_sign"), b"")?;
+    }
+    if let Some(strategy) = &state.strategy {
+        fs::write(dir.join("strategy"), format!("{strategy}\n"))?;
+    }
+    if !state.strategy_opts.is_empty() {
+        fs::write(
+            dir.join("strategy_opts"),
+            format!("{}\n", sq_quote_argv(&state.strategy_opts)),
+        )?;
+    }
+    match state.rerere_autoupdate {
+        Some(true) => fs::write(
+            dir.join("allow_rerere_autoupdate"),
+            b"--rerere-autoupdate\n",
+        )?,
+        Some(false) => fs::write(
+            dir.join("allow_rerere_autoupdate"),
+            b"--no-rerere-autoupdate\n",
+        )?,
+        None => {}
+    }
+    Ok(())
+}
+
+/// Load a rebase merge-backend state written by Sley or Git.
+pub fn read_rebase_state(git_dir: &Path, format: ObjectFormat) -> Result<RebaseState> {
+    let head_name = read_state_line(git_dir, "head-name")
+        .ok_or_else(|| GitError::not_found("rebase-merge/head-name"))?;
+    let onto_raw =
+        read_state_line(git_dir, "onto").ok_or_else(|| GitError::not_found("rebase-merge/onto"))?;
+    let onto = ObjectId::from_hex(format, onto_raw.trim())
+        .map_err(|_| GitError::InvalidObject("invalid onto value during rebase".into()))?;
+    let orig_raw = read_state_line(git_dir, "orig-head")
+        .ok_or_else(|| GitError::not_found("rebase-merge/orig-head"))?;
+    let orig_head = ObjectId::from_hex(format, orig_raw.trim())
+        .map_err(|_| GitError::InvalidObject("invalid orig-head value during rebase".into()))?;
+    let squash_onto = match read_state_line(git_dir, "squash-onto") {
+        Some(raw) => Some(ObjectId::from_hex(format, raw.trim()).map_err(|_| {
+            GitError::InvalidObject("invalid squash-onto value during rebase".into())
+        })?),
+        None => None,
+    };
+    let exists = |name: &str| state_path(git_dir, name).exists();
+    let signoff = exists("signoff");
+    let gpg_sign = read_state_line(git_dir, "gpg_sign_opt")
+        .and_then(|value| value.strip_prefix("-S").map(str::to_string));
+    let strategy = read_state_line(git_dir, "strategy");
+    let strategy_opts = fs::read_to_string(state_path(git_dir, "strategy_opts"))
+        .map(|text| parse_strategy_opts(&text))
+        .unwrap_or_default();
+    let rerere_autoupdate = match read_state_line(git_dir, "allow_rerere_autoupdate") {
+        Some(line) if line.contains("--no-rerere-autoupdate") => Some(false),
+        Some(line) if line.contains("--rerere-autoupdate") => Some(true),
+        _ => None,
+    };
+    Ok(RebaseState {
+        quiet: exists("quiet"),
+        verbose: exists("verbose"),
+        signoff,
+        allow_ff: !signoff,
+        drop_redundant_commits: exists("drop_redundant_commits"),
+        keep_redundant_commits: exists("keep_redundant_commits"),
+        reschedule_failed_exec: exists("reschedule-failed-exec"),
+        committer_date_is_author_date: exists("cdate_is_adate"),
+        ignore_date: exists("ignore_date"),
+        gpg_sign,
+        no_gpg_sign: exists("no_gpg_sign"),
+        strategy,
+        strategy_opts,
+        rerere_autoupdate,
+        head_name: head_name.starts_with("refs/").then_some(head_name),
+        onto,
+        orig_head,
+        squash_onto,
+    })
+}
+
+fn sq_quote_argv(args: &[String]) -> String {
+    let mut out = Vec::new();
+    for arg in args {
+        out.push(b' ');
+        out.extend_from_slice(&sq_quote_bytes(arg.as_bytes()));
+    }
+    String::from_utf8(out).expect("quoting UTF-8 arguments preserves UTF-8")
+}
+
+fn parse_strategy_opts(text: &str) -> Vec<String> {
+    if !text.trim_start().starts_with('\'') {
+        return text.lines().map(str::to_string).collect();
+    }
+    let bytes = text.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        if bytes[index] != b'\'' {
+            let start = index;
+            while bytes
+                .get(index)
+                .is_some_and(|byte| !byte.is_ascii_whitespace())
+            {
+                index += 1;
+            }
+            tokens.push(String::from_utf8_lossy(&bytes[start..index]).into_owned());
+            continue;
+        }
+
+        let mut token = Vec::new();
+        let mut source = index;
+        loop {
+            source += 1;
+            let Some(&byte) = bytes.get(source) else {
+                break;
+            };
+            if byte != b'\'' {
+                token.push(byte);
+                continue;
+            }
+            source += 1;
+            if bytes.get(source) == Some(&b'\\')
+                && bytes.get(source + 2) == Some(&b'\'')
+                && matches!(bytes.get(source + 1), Some(b'\'' | b'!'))
+            {
+                token.push(bytes[source + 1]);
+                source += 2;
+                continue;
+            }
+            break;
+        }
+        index = source;
+        tokens.push(String::from_utf8_lossy(&token).into_owned());
+    }
+    tokens
+}
+
+/// Object-id and command abbreviation policy for rendering a todo list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TodoRenderOptions {
+    /// Render full object names when absent, or unique names no shorter than
+    /// this width when present.
+    pub minimum_abbrev: Option<usize>,
+    /// Use one-letter command nicks where Git permits them.
+    pub abbreviate_commands: bool,
+}
+
+/// Count executable instructions, excluding comments and blank lines.
+pub fn count_commands(items: &[RebaseTodoItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| item.command != TodoCommand::Comment)
+        .count()
+}
+
+/// Find the shortest unambiguous object name at least `minimum` characters
+/// wide using the repository's object database.
+pub fn unique_abbrev(db: &FileObjectDatabase, oid: &ObjectId, minimum: usize) -> String {
+    let hex = oid.to_hex();
+    let mut width = minimum.min(hex.len());
+    while width < hex.len() {
+        match db.resolve_prefix(&hex[..width]) {
+            Ok(ObjectPrefixResolution::Ambiguous(_)) => width += 1,
+            _ => break,
+        }
+    }
+    hex[..width].to_string()
+}
+
+/// Render one rebase instruction according to repository abbreviation policy.
+pub fn render_todo_item(
+    db: &FileObjectDatabase,
+    item: &RebaseTodoItem,
+    options: TodoRenderOptions,
+) -> String {
+    let oid_text = item.oid.as_ref().map(|oid| match options.minimum_abbrev {
+        Some(width) => unique_abbrev(db, oid, width),
+        None => oid.to_hex(),
+    });
+    let mut text = todo_item_to_string(item, oid_text.as_deref());
+    if options.abbreviate_commands
+        && item.command != TodoCommand::Comment
+        && let Some(nick) = item.command.nick()
+        && let Some(rest) = text.strip_prefix(item.command.as_str())
+    {
+        text = format!("{nick}{rest}");
+    }
+    text
+}
+
+/// Render a complete line-oriented rebase instruction sheet.
+pub fn render_todo_list(
+    db: &FileObjectDatabase,
+    items: &[RebaseTodoItem],
+    options: TodoRenderOptions,
+) -> String {
+    let mut out = String::new();
+    for item in items {
+        out.push_str(&render_todo_item(db, item, options));
+        out.push('\n');
+    }
+    out
+}
+
+/// Durable progress counters and instructions for a running rebase.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebaseTodoList {
+    pub items: Vec<RebaseTodoItem>,
+    /// Index of the instruction currently being executed.
+    pub current: usize,
+    /// Number of executable instructions already recorded in `done`.
+    pub done_nr: usize,
+    /// `done_nr` plus the remaining executable instructions.
+    pub total_nr: usize,
+}
+
+/// Result of loading an instruction sheet. Invalid user-edited todo files are
+/// data, not I/O failures, so porcelain can render Git-compatible advice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoadTodoListOutcome {
+    Ready(RebaseTodoList),
+    Invalid { messages: TodoParseMessages },
+}
+
+/// Load the active todo list, account for completed commands, and update the
+/// persisted `end` counter.
+pub fn load_rebase_todo_list(
+    git_dir: &Path,
+    comment_char: char,
+    resolve: &mut dyn FnMut(&str) -> TodoOidLookup,
+) -> Result<LoadTodoListOutcome> {
+    let text = fs::read_to_string(state_path(git_dir, "git-rebase-todo"))?;
+    let done_exists = state_path(git_dir, "done").exists();
+    let (items, messages) = parse_todo_buffer(&text, done_exists, comment_char, resolve);
+    if !messages.is_empty() {
+        return Ok(LoadTodoListOutcome::Invalid { messages });
+    }
+    let done_nr = fs::read_to_string(state_path(git_dir, "done"))
+        .map(|text| {
+            let (done_items, _) = parse_todo_buffer(&text, true, comment_char, resolve);
+            count_commands(&done_items)
+        })
+        .unwrap_or(0);
+    let total_nr = done_nr + count_commands(&items);
+    fs::write(state_path(git_dir, "end"), format!("{total_nr}\n"))?;
+    Ok(LoadTodoListOutcome::Ready(RebaseTodoList {
+        items,
+        current: 0,
+        done_nr,
+        total_nr,
+    }))
+}
+
+/// Advance (or reschedule) the active instruction and persist both the todo
+/// tail and completed command using full object names.
+pub fn save_rebase_todo_list(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    todo: &RebaseTodoList,
+    reschedule: bool,
+) -> Result<()> {
+    let next = if reschedule {
+        todo.current
+    } else {
+        todo.current + 1
+    };
+    let tail = if next <= todo.items.len() {
+        &todo.items[next..]
+    } else {
+        &[]
+    };
+    let options = TodoRenderOptions {
+        minimum_abbrev: None,
+        abbreviate_commands: false,
+    };
+    fs::write(
+        state_path(git_dir, "git-rebase-todo"),
+        render_todo_list(db, tail, options),
+    )?;
+    if !reschedule && next > 0 {
+        let line = render_todo_item(db, &todo.items[next - 1], options);
+        append_done_line(git_dir, line.as_bytes())?;
+    }
+    Ok(())
+}
+
 /// `sq_quote_buf`: wrap in single quotes, escaping embedded quotes and bangs
 /// (`'` becomes `'\''`).
 fn sq_quote_bytes(value: &[u8]) -> Vec<u8> {
@@ -892,5 +1261,165 @@ mod tests {
             b"pick 111 first\nexec make test\n"
         );
         fs::remove_dir_all(root).expect("remove rebase state");
+    }
+
+    #[test]
+    fn rebase_state_round_trips_git_files_and_quoted_strategy_options() {
+        let root = tempfile::tempdir().expect("create temporary repository");
+        let onto = oid("1111111111111111111111111111111111111111");
+        let orig_head = oid("2222222222222222222222222222222222222222");
+        let squash_onto = oid("3333333333333333333333333333333333333333");
+        let state = RebaseState {
+            quiet: true,
+            verbose: true,
+            signoff: true,
+            allow_ff: false,
+            drop_redundant_commits: true,
+            keep_redundant_commits: true,
+            reschedule_failed_exec: true,
+            committer_date_is_author_date: true,
+            ignore_date: true,
+            gpg_sign: Some(String::new()),
+            no_gpg_sign: true,
+            strategy: Some("ort".to_string()),
+            strategy_opts: vec![
+                "ours".to_string(),
+                "has space".to_string(),
+                "it's!".to_string(),
+                String::new(),
+            ],
+            rerere_autoupdate: Some(false),
+            head_name: Some("refs/heads/topic".to_string()),
+            onto,
+            orig_head,
+            squash_onto: Some(squash_onto),
+        };
+
+        write_rebase_state(root.path(), &state).expect("write rebase state");
+        assert_eq!(
+            fs::read_to_string(state_path(root.path(), "strategy_opts"))
+                .expect("read strategy options"),
+            " 'ours' 'has space' 'it'\\''s'\\!'\u{27} ''\n"
+        );
+        assert_eq!(
+            fs::read_to_string(state_path(root.path(), "head-name")).expect("read head-name"),
+            "refs/heads/topic\n"
+        );
+        assert_eq!(
+            read_rebase_state(root.path(), ObjectFormat::Sha1).expect("read rebase state"),
+            state
+        );
+    }
+
+    #[test]
+    fn rebase_state_reads_legacy_line_oriented_strategy_options() {
+        let root = tempfile::tempdir().expect("create temporary repository");
+        fs::create_dir_all(merge_dir(root.path())).expect("create rebase state");
+        fs::write(state_path(root.path(), "head-name"), "detached HEAD\n").expect("write head");
+        fs::write(
+            state_path(root.path(), "onto"),
+            "1111111111111111111111111111111111111111\n",
+        )
+        .expect("write onto");
+        fs::write(
+            state_path(root.path(), "orig-head"),
+            "2222222222222222222222222222222222222222\n",
+        )
+        .expect("write orig-head");
+        fs::write(state_path(root.path(), "strategy_opts"), "ours\npatience\n")
+            .expect("write legacy strategy options");
+
+        let state =
+            read_rebase_state(root.path(), ObjectFormat::Sha1).expect("read legacy rebase state");
+        assert_eq!(state.head_name, None);
+        assert_eq!(state.strategy_opts, ["ours", "patience"]);
+        assert!(state.allow_ff);
+    }
+
+    #[test]
+    fn todo_render_policy_is_owned_by_the_sequencer() {
+        let root = tempfile::tempdir().expect("create temporary repository");
+        fs::create_dir_all(root.path().join("objects")).expect("create object store");
+        let db = FileObjectDatabase::from_git_dir(root.path(), ObjectFormat::Sha1);
+        let item = RebaseTodoItem {
+            command: TodoCommand::Pick,
+            flags: 0,
+            oid: Some(oid("21b83cd2e8f4d6d8d9615779ebaa801ba891eb04")),
+            arg: "subject".to_string(),
+            raw: String::new(),
+        };
+        assert_eq!(
+            render_todo_list(
+                &db,
+                &[item],
+                TodoRenderOptions {
+                    minimum_abbrev: Some(7),
+                    abbreviate_commands: true,
+                },
+            ),
+            "p 21b83cd subject\n"
+        );
+    }
+
+    #[test]
+    fn todo_list_load_and_advance_own_progress_files() {
+        let root = tempfile::tempdir().expect("create temporary repository");
+        fs::create_dir_all(merge_dir(root.path())).expect("create rebase state");
+        fs::create_dir_all(root.path().join("objects")).expect("create object store");
+        fs::write(
+            state_path(root.path(), "git-rebase-todo"),
+            "pick 21b83cd subject\nexec make test\n",
+        )
+        .expect("write todo");
+        fs::write(state_path(root.path(), "done"), "pick 21b83cd prior\n").expect("write done");
+
+        let mut resolve = resolver;
+        let LoadTodoListOutcome::Ready(todo) =
+            load_rebase_todo_list(root.path(), '#', &mut resolve).expect("load todo")
+        else {
+            panic!("expected valid todo list");
+        };
+        assert_eq!(todo.done_nr, 1);
+        assert_eq!(todo.total_nr, 3);
+        assert_eq!(
+            fs::read_to_string(state_path(root.path(), "end")).expect("read end"),
+            "3\n"
+        );
+
+        let db = FileObjectDatabase::from_git_dir(root.path(), ObjectFormat::Sha1);
+        save_rebase_todo_list(root.path(), &db, &todo, false).expect("advance todo");
+        assert_eq!(
+            fs::read_to_string(state_path(root.path(), "git-rebase-todo"))
+                .expect("read advanced todo"),
+            "exec make test\n"
+        );
+        assert_eq!(
+            fs::read_to_string(state_path(root.path(), "done")).expect("read advanced done"),
+            "pick 21b83cd prior\npick 21b83cd2e8f4d6d8d9615779ebaa801ba891eb04 subject\n"
+        );
+    }
+
+    #[test]
+    fn invalid_todo_is_a_typed_outcome_and_does_not_advance_state() {
+        let root = tempfile::tempdir().expect("create temporary repository");
+        fs::create_dir_all(merge_dir(root.path())).expect("create rebase state");
+        fs::write(
+            state_path(root.path(), "git-rebase-todo"),
+            "pick not-an-object subject\n",
+        )
+        .expect("write todo");
+        let mut resolve = resolver;
+        let outcome = load_rebase_todo_list(root.path(), '#', &mut resolve).expect("load todo");
+        let LoadTodoListOutcome::Invalid { messages } = outcome else {
+            panic!("expected invalid todo list");
+        };
+        assert_eq!(
+            messages,
+            [
+                "error: could not parse 'not-an-object'",
+                "error: invalid line 1: pick not-an-object subject",
+            ]
+        );
+        assert!(!state_path(root.path(), "end").exists());
     }
 }

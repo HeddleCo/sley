@@ -20,6 +20,10 @@ sley-odb.workspace = true
 sley-pathspec.workspace = true
 sley-refs.workspace = true
 sley-rev.workspace = true
+sley-unpack-trees.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3"

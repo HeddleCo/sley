@@ -1,0 +1,147 @@
+//! Architectural regression guards for the CLI-to-engine migration.
+//!
+//! These tests deliberately inspect source rather than runtime behavior. They
+//! turn the intended dependency direction into a gate: commands which already
+//! receive an explicit invocation session may not rediscover process-global
+//! state, and command implementations may not increase their direct storage
+//! wiring while operations move into the engine crates.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const MAX_DIRECT_ODB_OPENINGS: usize = 204;
+const MAX_DIRECT_REF_STORE_OPENINGS: usize = 204;
+const MAX_REPOSITORY_CONTEXT_DISCOVERIES: usize = 14;
+const MAX_COMPAT_SESSION_READS: usize = 13;
+const MAX_COMPAT_GIT_DIR_DISCOVERIES: usize = 70;
+
+const EXPLICIT_SESSION_COMMANDS: &[&str] = &[
+    "cat_file.rs",
+    "describe.rs",
+    "diff_files.rs",
+    "diff_tree.rs",
+    "format_patch.rs",
+    "format_rev.rs",
+    "hash_object.rs",
+    "last_modified.rs",
+    "mktag.rs",
+    "name_rev.rs",
+    "range_diff.rs",
+    "read_tree.rs",
+    "show.rs",
+    "tag.rs",
+    "verify_commit.rs",
+    "verify_tag.rs",
+];
+
+#[test]
+fn direct_engine_wiring_does_not_grow() {
+    let source = cli_source();
+    assert_budget(
+        &source,
+        "FileObjectDatabase::from_git_dir",
+        MAX_DIRECT_ODB_OPENINGS,
+        "open repositories through CliSession/sley::Repository or a typed engine operation",
+    );
+    assert_budget(
+        &source,
+        "FileRefStore::new",
+        MAX_DIRECT_REF_STORE_OPENINGS,
+        "reuse the repository facade or move the operation into the owning engine",
+    );
+    assert_budget(
+        &source,
+        "RepositoryContext::discover",
+        MAX_REPOSITORY_CONTEXT_DISCOVERIES,
+        "receive the invocation repository explicitly",
+    );
+    assert_budget(
+        &source,
+        "cli_session()",
+        MAX_COMPAT_SESSION_READS,
+        "thread CliSession through dispatch instead of reading the compatibility slot",
+    );
+    assert_budget(
+        &source,
+        "cli_git_dir()",
+        MAX_COMPAT_GIT_DIR_DISCOVERIES,
+        "resolve the invocation repository from the explicit CliSession",
+    );
+}
+
+#[test]
+fn explicitly_migrated_commands_do_not_rediscover_invocation_state() {
+    let commands = manifest_dir().join("src").join("commands");
+    for command in EXPLICIT_SESSION_COMMANDS {
+        let path = commands.join(command);
+        let source = fs::read_to_string(&path).expect("read migrated command source");
+        for forbidden in [
+            "cli_session()",
+            "RepositoryContext::discover",
+            "cli_git_dir()",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{} reintroduced `{forbidden}`; use its explicit CliSession/repository instead",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn repository_context_wraps_the_public_repository_facade() {
+    let path = manifest_dir().join("src").join("repository.rs");
+    let source = fs::read_to_string(&path).expect("read repository context source");
+    let context = source
+        .split_once("pub(crate) struct RepositoryContext {")
+        .and_then(|(_, tail)| tail.split_once("\n}"))
+        .map(|(body, _)| body)
+        .expect("find RepositoryContext fields");
+    assert!(
+        context.contains("repository: Repository"),
+        "RepositoryContext must delegate repository ownership to sley::Repository"
+    );
+    for duplicate in ["git_dir: PathBuf", "format: ObjectFormat", "objects:"] {
+        assert!(
+            !context.contains(duplicate),
+            "RepositoryContext reintroduced duplicate `{duplicate}` repository wiring"
+        );
+    }
+}
+
+fn assert_budget(source: &str, needle: &str, maximum: usize, guidance: &str) {
+    let actual = source.match_indices(needle).count();
+    assert!(
+        actual <= maximum,
+        "CLI architecture budget for `{needle}` grew from {maximum} to {actual}; {guidance}"
+    );
+}
+
+fn cli_source() -> String {
+    let mut files = Vec::new();
+    collect_rust_files(&manifest_dir().join("src"), &mut files);
+    files.sort();
+    let mut source = String::new();
+    for path in files {
+        source.push_str(&fs::read_to_string(path).expect("read CLI source"));
+        source.push('\n');
+    }
+    source
+}
+
+fn collect_rust_files(directory: &Path, files: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(directory).expect("read CLI source directory") {
+        let entry = entry.expect("read CLI source entry");
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_files(&path, files);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path);
+        }
+    }
+}
+
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}

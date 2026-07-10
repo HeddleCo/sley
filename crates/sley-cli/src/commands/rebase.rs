@@ -496,172 +496,13 @@ fn rebase_process_filter_metadata(
     Some(metadata)
 }
 
-/// Machine flags persisted in the state dir (`write_basic_state` +
-/// `read_populate_opts`).
-struct MachineOpts {
-    quiet: bool,
-    verbose: bool,
-    signoff: bool,
-    allow_ff: bool,
-    drop_redundant_commits: bool,
-    keep_redundant_commits: bool,
-    reschedule_failed_exec: bool,
-    committer_date_is_author_date: bool,
-    ignore_date: bool,
-    gpg_sign: Option<String>,
-    no_gpg_sign: bool,
-    strategy: Option<String>,
-    strategy_opts: Vec<String>,
-    rerere_autoupdate: Option<bool>,
-    head_name: Option<String>,
-    onto: ObjectId,
-    orig_head: ObjectId,
-    squash_onto: Option<ObjectId>,
-}
-
-fn write_basic_state(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
-    let dir = seq::merge_dir(&ctx.git_dir);
-    fs::create_dir_all(&dir)?;
-    fs::write(dir.join("interactive"), b"")?;
-    let head_name = opts
-        .head_name
-        .clone()
-        .unwrap_or_else(|| "detached HEAD".to_string());
-    fs::write(dir.join("head-name"), format!("{head_name}\n"))?;
-    fs::write(dir.join("onto"), format!("{}\n", opts.onto))?;
-    fs::write(dir.join("orig-head"), format!("{}\n", opts.orig_head))?;
-    if let Some(squash_onto) = opts.squash_onto {
-        fs::write(dir.join("squash-onto"), format!("{squash_onto}\n"))?;
-    }
-    if opts.quiet {
-        fs::write(dir.join("quiet"), b"")?;
-    }
-    if opts.verbose {
-        fs::write(dir.join("verbose"), b"")?;
-    }
-    if opts.signoff {
-        fs::write(dir.join("signoff"), b"--signoff\n")?;
-    }
-    if opts.drop_redundant_commits {
-        fs::write(dir.join("drop_redundant_commits"), b"")?;
-    }
-    if opts.keep_redundant_commits {
-        fs::write(dir.join("keep_redundant_commits"), b"")?;
-    }
-    if opts.reschedule_failed_exec {
-        fs::write(dir.join("reschedule-failed-exec"), b"")?;
-    } else {
-        fs::write(dir.join("no-reschedule-failed-exec"), b"")?;
-    }
-    if opts.committer_date_is_author_date {
-        fs::write(dir.join("cdate_is_adate"), b"")?;
-    }
-    if opts.ignore_date {
-        fs::write(dir.join("ignore_date"), b"")?;
-    }
-    if let Some(key) = &opts.gpg_sign {
-        let opt = if key.is_empty() {
-            "-S".to_string()
-        } else {
-            format!("-S{key}")
-        };
-        fs::write(dir.join("gpg_sign_opt"), format!("{opt}\n"))?;
-    }
-    if opts.no_gpg_sign {
-        fs::write(dir.join("no_gpg_sign"), b"")?;
-    }
-    if let Some(strategy) = &opts.strategy {
-        fs::write(dir.join("strategy"), format!("{strategy}\n"))?;
-    }
-    if !opts.strategy_opts.is_empty() {
-        fs::write(
-            dir.join("strategy_opts"),
-            rebase_sq_quote_argv(&opts.strategy_opts) + "\n",
-        )?;
-    }
-    match opts.rerere_autoupdate {
-        Some(true) => fs::write(
-            dir.join("allow_rerere_autoupdate"),
-            b"--rerere-autoupdate\n",
-        )?,
-        Some(false) => fs::write(
-            dir.join("allow_rerere_autoupdate"),
-            b"--no-rerere-autoupdate\n",
-        )?,
-        None => {}
-    }
-    Ok(())
-}
-
-fn read_basic_state(ctx: &Ctx) -> Result<MachineOpts> {
-    let head_name = seq::read_state_line(&ctx.git_dir, "head-name")
-        .ok_or_else(|| GitError::not_found("rebase-merge/head-name"))?;
-    let onto_raw = seq::read_state_line(&ctx.git_dir, "onto")
-        .ok_or_else(|| GitError::not_found("rebase-merge/onto"))?;
-    let onto = ObjectId::from_hex(ctx.format, onto_raw.trim())
-        .map_err(|_| GitError::InvalidObject("invalid onto value during rebase".into()))?;
-    let orig_raw = seq::read_state_line(&ctx.git_dir, "orig-head")
-        .ok_or_else(|| GitError::not_found("rebase-merge/orig-head"))?;
-    let orig_head = ObjectId::from_hex(ctx.format, orig_raw.trim())
-        .map_err(|_| GitError::InvalidObject("invalid orig-head value during rebase".into()))?;
-    let squash_onto = match seq::read_state_line(&ctx.git_dir, "squash-onto") {
-        Some(raw) => Some(ObjectId::from_hex(ctx.format, raw.trim()).map_err(|_| {
-            GitError::InvalidObject("invalid squash-onto value during rebase".into())
-        })?),
-        None => None,
-    };
-    let exists = |name: &str| ctx.state_path(name).exists();
-    let signoff = exists("signoff");
-    let gpg_sign = seq::read_state_line(&ctx.git_dir, "gpg_sign_opt")
-        .and_then(|value| value.strip_prefix("-S").map(str::to_string));
-    let strategy = seq::read_state_line(&ctx.git_dir, "strategy");
-    let strategy_opts = fs::read_to_string(ctx.state_path("strategy_opts"))
-        .map(|text| read_strategy_opts_state(&text))
-        .unwrap_or_default();
-    let rerere_autoupdate = match seq::read_state_line(&ctx.git_dir, "allow_rerere_autoupdate") {
-        Some(line) if line.contains("--no-rerere-autoupdate") => Some(false),
-        Some(line) if line.contains("--rerere-autoupdate") => Some(true),
-        _ => None,
-    };
-    Ok(MachineOpts {
-        quiet: exists("quiet"),
-        verbose: exists("verbose"),
-        signoff,
-        allow_ff: !signoff,
-        drop_redundant_commits: exists("drop_redundant_commits"),
-        keep_redundant_commits: exists("keep_redundant_commits"),
-        reschedule_failed_exec: exists("reschedule-failed-exec"),
-        committer_date_is_author_date: exists("cdate_is_adate"),
-        ignore_date: exists("ignore_date"),
-        gpg_sign,
-        no_gpg_sign: exists("no_gpg_sign"),
-        strategy,
-        strategy_opts,
-        rerere_autoupdate,
-        head_name: if head_name.starts_with("refs/") {
-            Some(head_name)
-        } else {
-            None
-        },
-        onto,
-        orig_head,
-        squash_onto,
-    })
-}
+type MachineOpts = seq::RebaseState;
 
 // ---------------------------------------------------------------------------
 // Todo list plumbing
 // ---------------------------------------------------------------------------
 
-struct TodoList {
-    items: Vec<RebaseTodoItem>,
-    /// Index of the item currently being executed.
-    current: usize,
-    /// Count of executed commands (the `msgnum` counter).
-    done_nr: usize,
-    /// `done_nr` + remaining real commands (the `end` counter).
-    total_nr: usize,
-}
+type TodoList = seq::RebaseTodoList;
 
 fn make_resolver<'a>(
     ctx: &'a Ctx,
@@ -684,120 +525,13 @@ fn make_resolver<'a>(
     }
 }
 
-fn rebase_sq_quote_argv(args: &[String]) -> String {
-    let mut out = String::new();
-    for arg in args {
-        out.push(' ');
-        out.push_str(&sley_config::sq_quote(arg));
-    }
-    out
-}
-
-fn read_strategy_opts_state(text: &str) -> Vec<String> {
-    if text.trim_start().starts_with('\'') {
-        rebase_sq_dequote_to_vec(text)
-    } else {
-        text.lines().map(str::to_string).collect()
-    }
-}
-
-fn rebase_sq_dequote_to_vec(input: &str) -> Vec<String> {
-    let bytes = input.as_bytes();
-    let n = bytes.len();
-    let mut tokens = Vec::new();
-    let mut i = 0;
-    loop {
-        while i < n && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= n {
-            break;
-        }
-        if bytes[i] != b'\'' {
-            let start = i;
-            while i < n && !bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            tokens.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
-            continue;
-        }
-
-        let mut token = Vec::new();
-        let mut src = i;
-        loop {
-            src += 1;
-            if src >= n {
-                break;
-            }
-            let c = bytes[src];
-            if c != b'\'' {
-                token.push(c);
-                continue;
-            }
-            src += 1;
-            if src >= n {
-                break;
-            }
-            if bytes[src] == b'\\'
-                && src + 2 < n
-                && (bytes[src + 1] == b'\'' || bytes[src + 1] == b'!')
-                && bytes[src + 2] == b'\''
-            {
-                token.push(bytes[src + 1]);
-                src += 2;
-                continue;
-            }
-            break;
-        }
-        i = src;
-        tokens.push(String::from_utf8_lossy(&token).into_owned());
-    }
-    tokens
-}
-
-fn count_commands(items: &[RebaseTodoItem]) -> usize {
-    items
-        .iter()
-        .filter(|item| item.command != TodoCommand::Comment)
-        .count()
-}
-
-fn serialize_item(
-    ctx: &Ctx,
-    item: &RebaseTodoItem,
-    short: bool,
-    abbreviate: bool,
-    db: &FileObjectDatabase,
-) -> String {
-    let oid_text = item.oid.as_ref().map(|oid| {
-        if short {
-            if abbreviate {
-                find_unique_abbrev_hex_with_width(db, oid, 7)
-            } else {
-                find_unique_abbrev_hex(ctx, db, oid)
-            }
-        } else {
-            oid.to_hex()
-        }
-    });
-    let mut text = seq::todo_item_to_string(item, oid_text.as_deref());
-    if abbreviate
-        && item.command != TodoCommand::Comment
-        && let Some(nick) = item.command.nick()
-        && let Some(rest) = text.strip_prefix(item.command.as_str())
-    {
-        text = format!("{nick}{rest}");
-    }
-    text
-}
-
 fn find_unique_abbrev_hex(ctx: &Ctx, db: &FileObjectDatabase, oid: &ObjectId) -> String {
     let hex = oid.to_hex();
     let configured = repository_abbrev(&ctx.git_dir, ctx.format)
         .ok()
         .flatten()
         .unwrap_or(hex.len());
-    find_unique_abbrev_hex_with_width(db, oid, configured.min(hex.len()))
+    seq::unique_abbrev(db, oid, configured.min(hex.len()))
 }
 
 /// `merge.conflictStyle` for a rebase pick's 3-way merge (honouring `-c`
@@ -817,35 +551,21 @@ fn rebase_merge_conflict_style() -> sley_diff_merge::ConflictStyle {
         .unwrap_or(sley_diff_merge::ConflictStyle::Merge)
 }
 
-fn find_unique_abbrev_hex_with_width(
-    db: &FileObjectDatabase,
-    oid: &ObjectId,
-    width: usize,
-) -> String {
-    let hex = oid.to_hex();
-    let mut width = width.min(hex.len());
-    while width < hex.len() {
-        match db.resolve_prefix(&hex[..width]) {
-            Ok(sley_odb::ObjectPrefixResolution::Ambiguous(_)) => width += 1,
-            _ => break,
+fn todo_render_options(ctx: &Ctx, short: bool, abbreviate: bool) -> seq::TodoRenderOptions {
+    let minimum_abbrev = short.then(|| {
+        if abbreviate {
+            7
+        } else {
+            repository_abbrev(&ctx.git_dir, ctx.format)
+                .ok()
+                .flatten()
+                .unwrap_or(ctx.format.hex_len())
         }
+    });
+    seq::TodoRenderOptions {
+        minimum_abbrev,
+        abbreviate_commands: abbreviate,
     }
-    hex[..width].to_string()
-}
-
-fn todo_to_text(
-    ctx: &Ctx,
-    items: &[RebaseTodoItem],
-    short: bool,
-    abbreviate: bool,
-    db: &FileObjectDatabase,
-) -> String {
-    let mut out = String::new();
-    for item in items {
-        out.push_str(&serialize_item(ctx, item, short, abbreviate, db));
-        out.push('\n');
-    }
-    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -861,13 +581,13 @@ fn write_todo_file(
 ) -> Result<()> {
     let abbreviate =
         help && rebase_config_bool(ctx, "rebase", "abbreviateCommands").unwrap_or(false);
-    let mut buf = todo_to_text(ctx, items, short, abbreviate, db);
+    let mut buf = seq::render_todo_list(db, items, todo_render_options(ctx, short, abbreviate));
     if help {
         let comment = comment_char(&ctx.git_dir) as char;
         let check_error = missing_commit_check_level(ctx) == MissingCommitCheck::Error;
         seq::append_todo_help(
             &mut buf,
-            count_commands(items),
+            seq::count_commands(items),
             shortrevisions,
             shortonto,
             comment,
@@ -881,64 +601,25 @@ fn write_todo_file(
 /// `save_todo`: persist the not-yet-executed tail, append the current item to
 /// `done`.
 fn save_todo(ctx: &Ctx, todo: &TodoList, db: &FileObjectDatabase, reschedule: bool) -> Result<()> {
-    let next = if reschedule {
-        todo.current
-    } else {
-        todo.current + 1
-    };
-    let tail = if next <= todo.items.len() {
-        &todo.items[next..]
-    } else {
-        &[]
-    };
-    fs::write(
-        ctx.state_path("git-rebase-todo"),
-        todo_to_text(ctx, tail, false, false, db),
-    )?;
-    if !reschedule && next > 0 {
-        let line = serialize_item(ctx, &todo.items[next - 1], false, false, db);
-        seq::append_done_line(&ctx.git_dir, line.as_bytes())?;
-    }
-    Ok(())
+    seq::save_rebase_todo_list(&ctx.git_dir, db, todo, reschedule)
 }
 
 fn read_populate_todo(ctx: &Ctx, db: &FileObjectDatabase) -> Result<TodoList> {
-    let text = fs::read_to_string(ctx.state_path("git-rebase-todo"))?;
-    let done_exists = ctx.state_path("done").exists();
     let mut resolver = make_resolver(ctx, db);
-    let (items, messages) = seq::parse_todo_buffer(
-        &text,
-        done_exists,
+    match seq::load_rebase_todo_list(
+        &ctx.git_dir,
         comment_char(&ctx.git_dir) as char,
         &mut resolver,
-    );
-    if !messages.is_empty() {
-        for message in &messages {
-            eprintln!("{message}");
+    )? {
+        seq::LoadTodoListOutcome::Ready(todo) => Ok(todo),
+        seq::LoadTodoListOutcome::Invalid { messages } => {
+            for message in messages {
+                eprintln!("{message}");
+            }
+            eprintln!("error: please fix this using 'git rebase --edit-todo'.");
+            Err(GitError::Exit(1))
         }
-        eprintln!("error: please fix this using 'git rebase --edit-todo'.");
-        return Err(GitError::Exit(1));
     }
-    let done_nr = fs::read_to_string(ctx.state_path("done"))
-        .map(|text| {
-            let mut resolver = make_resolver(ctx, db);
-            let (done_items, _) = seq::parse_todo_buffer(
-                &text,
-                true,
-                comment_char(&ctx.git_dir) as char,
-                &mut resolver,
-            );
-            count_commands(&done_items)
-        })
-        .unwrap_or(0);
-    let total_nr = done_nr + count_commands(&items);
-    fs::write(ctx.state_path("end"), format!("{total_nr}\n"))?;
-    Ok(TodoList {
-        items,
-        current: 0,
-        done_nr,
-        total_nr,
-    })
 }
 
 #[derive(PartialEq, Eq)]
@@ -1653,7 +1334,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             .collect::<Result<Vec<_>>>()?
     };
 
-    write_basic_state(ctx, &opts)?;
+    seq::write_rebase_state(&ctx.git_dir, &opts)?;
     let _ = fs::remove_file(ctx.git_dir.join("REBASE_HEAD"));
 
     if items.is_empty() {
@@ -1685,7 +1366,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         write_rebase_update_refs_state(ctx, &items)?;
     }
 
-    if count_commands(&items) == 0 {
+    if seq::count_commands(&items) == 0 {
         apply_autostash(ctx);
         seq::remove_merge_state(&ctx.git_dir);
         eprintln!("error: nothing to do");
@@ -3449,7 +3130,11 @@ fn complete_action(
             skipped += 1;
         }
         if skipped > 0 {
-            let done_text = todo_to_text(ctx, &todo.items[..skipped], false, false, db);
+            let done_text = seq::render_todo_list(
+                db,
+                &todo.items[..skipped],
+                todo_render_options(ctx, false, false),
+            );
             fs::write(ctx.state_path("done"), done_text)?;
             if todo
                 .items
@@ -3475,7 +3160,7 @@ fn complete_action(
     }
 
     write_todo_file(ctx, &todo_path, &todo.items, false, false, None, None, db)?;
-    todo.total_nr = todo.done_nr + count_commands(&todo.items);
+    todo.total_nr = todo.done_nr + seq::count_commands(&todo.items);
     fs::write(ctx.state_path("end"), format!("{}\n", todo.total_nr))?;
 
     checkout_onto_base(ctx, &opts, onto_name, &base)?;
@@ -3851,7 +3536,10 @@ fn reschedule_current(
 ) -> Result<()> {
     eprintln!("hint: Could not execute the todo command");
     eprintln!("hint: ");
-    eprintln!("hint:     {}", serialize_item(ctx, item, false, false, db));
+    eprintln!(
+        "hint:     {}",
+        seq::render_todo_item(db, item, todo_render_options(ctx, false, false))
+    );
     eprintln!("hint: ");
     eprintln!("hint: It has been rescheduled; To edit the command before continuing, please");
     eprintln!("hint: edit the todo list first:");
@@ -3867,11 +3555,15 @@ fn reschedule_current(
 
 fn reread_todo_if_changed(ctx: &Ctx, db: &FileObjectDatabase, todo: &mut TodoList) -> Result<()> {
     let on_disk = fs::read_to_string(ctx.state_path("git-rebase-todo")).unwrap_or_default();
-    let expected = todo_to_text(ctx, &todo.items[todo.current + 1..], false, false, db);
+    let expected = seq::render_todo_list(
+        db,
+        &todo.items[todo.current + 1..],
+        todo_render_options(ctx, false, false),
+    );
     if on_disk != expected {
         let mut reloaded = read_populate_todo(ctx, db)?;
         reloaded.done_nr = todo.done_nr;
-        reloaded.total_nr = reloaded.done_nr + count_commands(&reloaded.items);
+        reloaded.total_nr = reloaded.done_nr + seq::count_commands(&reloaded.items);
         // current will be incremented by the caller loop; compensate.
         *todo = reloaded;
         todo.current = usize::MAX; // sentinel: wraps to 0 on increment
@@ -6283,7 +5975,7 @@ fn cleanup_rewritten_refs(ctx: &Ctx) {
 
 fn rebase_continue(ctx: &Ctx) -> Result<()> {
     let db = ctx.db();
-    let opts = read_basic_state(ctx)?;
+    let opts = seq::read_rebase_state(&ctx.git_dir, ctx.format)?;
 
     // Unstaged changes gate.
     let status = crate::collect_short_status(&ctx.worktree_root, &ctx.git_dir, ctx.format)?;
@@ -6478,7 +6170,7 @@ fn next_is_fixup_first(todo: &TodoList) -> bool {
 
 fn rebase_skip(ctx: &Ctx) -> Result<()> {
     let db = ctx.db();
-    let opts = read_basic_state(ctx)?;
+    let opts = seq::read_rebase_state(&ctx.git_dir, ctx.format)?;
     let refs = ctx.refs();
     let head =
         head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
@@ -6497,7 +6189,7 @@ fn rebase_skip(ctx: &Ctx) -> Result<()> {
 }
 
 fn rebase_abort(ctx: &Ctx) -> Result<()> {
-    let opts = read_basic_state(ctx)?;
+    let opts = seq::read_rebase_state(&ctx.git_dir, ctx.format)?;
     let db = ctx.db();
     let target = sley_rev::peel_to_commit(&db, ctx.format, &opts.orig_head)?;
     reset_index_and_worktree_to_commit_for_rebase(ctx, &target)?;
@@ -6636,10 +6328,10 @@ fn rebase_edit_todo(ctx: &Ctx) -> Result<()> {
                 comment_char(&ctx.git_dir) as char,
                 &mut resolver,
             );
-            count_commands(&done_items)
+            seq::count_commands(&done_items)
         })
         .unwrap_or(0);
-    let total_nr = done_nr + count_commands(&new_items);
+    let total_nr = done_nr + seq::count_commands(&new_items);
     fs::write(ctx.state_path("end"), format!("{total_nr}\n"))?;
     Ok(())
 }

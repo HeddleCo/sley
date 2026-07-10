@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod install;
 mod loose;
+mod midx;
 mod pack;
 mod reachability;
 mod registry;
@@ -17,6 +18,7 @@ mod repack;
 
 pub use install::*;
 pub use loose::*;
+pub use midx::*;
 pub use pack::*;
 pub use reachability::*;
 pub use registry::*;

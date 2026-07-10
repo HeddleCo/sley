@@ -80,8 +80,12 @@ pub use git::{
 
 mod helper;
 pub use helper::{
-    RemoteHelperCapabilities, RemoteHelperRef, RemoteHelperRefValue, RemoteHelperSession,
-    RemoteHelperSpec, imported_remote_helper_advertisements, resolve_remote_helper,
+    RemoteHelperCapabilities, RemoteHelperEvent, RemoteHelperEventSink, RemoteHelperExportRequest,
+    RemoteHelperFetchOperation, RemoteHelperFetchServices, RemoteHelperPlumbing,
+    RemoteHelperPushError, RemoteHelperPushOperation, RemoteHelperPushOptions,
+    RemoteHelperPushOutcome, RemoteHelperPushServices, RemoteHelperRef, RemoteHelperRefValue,
+    RemoteHelperSession, RemoteHelperSpec, fetch_via_remote_helper,
+    imported_remote_helper_advertisements, push_via_remote_helper, resolve_remote_helper,
     rewrite_remote_helper_import_stream,
 };
 

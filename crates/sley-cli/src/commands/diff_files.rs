@@ -169,9 +169,12 @@ impl Default for DiffFilesOptions {
     }
 }
 
-pub(crate) fn cmd_diff_files(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_diff_files(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = parse_diff_files_args(args)?;
-    run_diff_files(options)
+    run_diff_files(cli_session, options)
 }
 
 /// Parse `diff-files` arguments. Output-mode and rename/copy flags share their
@@ -502,7 +505,7 @@ fn parse_diff_files_context(value: &str) -> Result<usize> {
 }
 
 /// Run the index-vs-worktree diff and render it according to `options`.
-fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
+fn run_diff_files(cli_session: &crate::session::CliSession, o: DiffFilesOptions) -> Result<()> {
     // Combined-diff output (`-c`/`--cc`) requires unmerged index stages, which
     // this index-vs-worktree path does not reconstruct; reject it rather than
     // print a non-combined diff that upstream git would never emit here.
@@ -520,7 +523,7 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
             "diff reverse output is not supported for this output mode".into(),
         ));
     }
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();

@@ -7,7 +7,7 @@ use super::fetch::{
     StdoutProgress, check_transport_allowed_url, repo_config_with_transport_policy,
 };
 use crate::*;
-use sley::plumbing::sley_remote::{FetchOptions, RemoteHelperRefValue};
+use sley::plumbing::sley_remote::FetchOptions;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -30,55 +30,24 @@ pub(crate) fn fetch_with_remote_helper(
         GitError::Exit(128)
     })?;
     trace_remote_helper(&spec);
-    let mut session = sley_remote::RemoteHelperSession::start(spec.clone(), git_dir, format)?;
-    let capabilities = session.capabilities().clone();
-    let refs = session.list()?;
-    if capabilities.refspecs.is_empty() {
-        eprintln!("warning: this remote helper should implement refspec capability");
-    }
-    let import_refs = refs
-        .iter()
-        .filter_map(|reference| {
-            (!matches!(reference.value, RemoteHelperRefValue::Symbolic(_)))
-                .then(|| reference.name.clone())
-        })
-        .collect::<Vec<_>>();
-    let source_refs_before_import = if capabilities.refspecs.is_empty() {
-        Vec::new()
-    } else {
-        let store = FileRefStore::new(git_dir, format);
-        import_refs
-            .iter()
-            .map(|name| store.read_ref(name).map(|target| (name.clone(), target)))
-            .collect::<Result<Vec<_>>>()?
-    };
-    let stream = match session.import(&import_refs) {
-        Ok(stream) => stream,
-        Err(error) => {
-            eprintln!("error: error while running fast-import");
-            return Err(error);
-        }
-    };
-    let stream = sley_remote::rewrite_remote_helper_import_stream(&stream, &capabilities.refspecs)?;
-    run_native_fast_import(git_dir, &stream)?;
-    let (advertisements, head_symref) =
-        sley_remote::imported_remote_helper_advertisements(git_dir, format, &capabilities, &refs)?;
-    restore_helper_import_source_refs(git_dir, format, &source_refs_before_import)?;
     let ref_hook = crate::commands::refs::ReferenceTransactionHookRunner::new(git_dir);
     let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress;
-    sley_remote::finalize_remote_helper_fetch(
-        sley_remote::RemoteHelperFetchRequest {
+    let mut plumbing = NativeRemoteHelperPlumbing;
+    let mut events = CliRemoteHelperEvents;
+    sley_remote::fetch_via_remote_helper(
+        sley_remote::RemoteHelperFetchOperation {
             git_dir,
             format,
             config: &config,
             remote_name: source,
-            advertisements: &advertisements,
-            head_symref,
+            spec: &spec,
             refspecs,
             options: &options,
         },
-        sley_remote::FetchServices {
+        sley_remote::RemoteHelperFetchServices {
+            plumbing: &mut plumbing,
+            events: &mut events,
             credentials: &mut credentials,
             progress: &mut progress,
             ref_hook: Some(&ref_hook),
@@ -87,18 +56,13 @@ pub(crate) fn fetch_with_remote_helper(
     .map(Some)
 }
 
-pub(super) struct RemoteHelperPushOptions {
-    pub force: bool,
-    pub quiet: bool,
-    pub dry_run: bool,
-}
-
 pub(super) fn push_with_remote_helper(
     git_dir: &Path,
     format: ObjectFormat,
     remote: &str,
     refspecs: &[String],
-    options: RemoteHelperPushOptions,
+    options: sley_remote::RemoteHelperPushOptions,
+    quiet: bool,
 ) -> Result<Option<()>> {
     let config = super::config::read_repo_config(git_dir)?;
     let Some(spec) = sley_remote::resolve_remote_helper(&config, remote) else {
@@ -109,134 +73,96 @@ pub(super) fn push_with_remote_helper(
         GitError::Exit(128)
     })?;
     trace_remote_helper(&spec);
-    let mut session = sley_remote::RemoteHelperSession::start(spec.clone(), git_dir, format)?;
-    let capabilities = session.capabilities().clone();
-    let _remote_refs = session.list()?;
-    if capabilities.refspecs.is_empty() {
-        eprintln!("fatal: remote-helper doesn't support push; refspec needed");
-        return Err(GitError::Exit(128));
-    }
-    // Git v2.55's import/export helper path still treats a marks-free export as
-    // unsupported (t5801 records this as its one known breakage). Preserve the
-    // oracle behavior instead of reporting a fixed TODO and making the script
-    // itself fail with "known breakage vanished".
-    if capabilities.import_marks.is_none() && capabilities.export_marks.is_none() {
-        eprintln!("fatal: remote-helper export requires marks");
-        return Err(GitError::Exit(128));
-    }
-    if options.dry_run {
-        return Ok(Some(()));
-    }
-    if options.force {
-        let _ = session.set_option("force", "true")?;
-    }
-    let refspecs = expand_helper_push_refspecs(git_dir, format, refspecs)?;
-    let marks_snapshot = snapshot_marks(capabilities.export_marks.as_deref())?;
-    let stream = run_native_fast_export(git_dir, format, &capabilities, &refspecs)?;
-    let response = match session.export(&stream) {
-        Ok(response) => response,
-        Err(error) => {
-            restore_marks(marks_snapshot)?;
-            return Err(error);
+    let mut plumbing = NativeRemoteHelperPlumbing;
+    let mut events = CliRemoteHelperEvents;
+    let operation = sley_remote::push_via_remote_helper(
+        sley_remote::RemoteHelperPushOperation {
+            git_dir,
+            format,
+            config: &config,
+            remote_name: remote,
+            spec: &spec,
+            refspecs,
+            options,
+        },
+        sley_remote::RemoteHelperPushServices {
+            plumbing: &mut plumbing,
+            events: &mut events,
+        },
+    );
+    let outcome = match operation {
+        Ok(outcome) => outcome,
+        Err(
+            error @ (sley_remote::RemoteHelperPushError::RefspecRequired
+            | sley_remote::RemoteHelperPushError::MarksRequired),
+        ) => {
+            eprintln!("fatal: {error}");
+            return Err(GitError::Exit(128));
         }
+        Err(sley_remote::RemoteHelperPushError::Engine(error)) => return Err(error),
     };
-    let mut failed = false;
-    let mut successful = Vec::new();
-    for line in response {
-        if let Some(reference) = line.strip_prefix("ok ") {
-            successful.push(reference.to_string());
-        } else if let Some(rest) = line.strip_prefix("error ") {
-            failed = true;
-            eprintln!("error: remote helper rejected {rest}");
-        }
-    }
-    if failed {
-        return Err(GitError::Exit(1));
-    }
-    update_helper_push_tracking_refs(
-        git_dir,
-        format,
-        &config,
-        remote,
-        &capabilities,
-        &refspecs,
-        &successful,
-    )?;
-    if !options.quiet {
+    if !quiet && !outcome.dry_run {
         eprintln!("To {}", spec.url.as_deref().unwrap_or(remote));
     }
     Ok(Some(()))
 }
 
-fn expand_helper_push_refspecs(
-    git_dir: &Path,
-    format: ObjectFormat,
-    refspecs: &[String],
-) -> Result<Vec<String>> {
-    let store = FileRefStore::new(git_dir, format);
-    let refs = store.list_refs()?;
-    let mut expanded = Vec::new();
-    for raw in refspecs {
-        let force = raw.starts_with('+');
-        let normalized = sley_remote::normalize_push_refspec(raw);
-        let body = normalized.strip_prefix('+').unwrap_or(&normalized);
-        let (src, dst) = body.split_once(':').unwrap_or((body, body));
-        let (Some((src_prefix, src_suffix)), Some((dst_prefix, dst_suffix))) =
-            (src.split_once('*'), dst.split_once('*'))
-        else {
-            expanded.push(normalized);
-            continue;
-        };
-        for reference in &refs {
-            let Some(stem) = reference
-                .name
-                .strip_prefix(src_prefix)
-                .and_then(|rest| rest.strip_suffix(src_suffix))
-            else {
-                continue;
-            };
-            let mapped = format!(
-                "{}{}:{}{}{}",
-                if force { "+" } else { "" },
-                reference.name,
-                dst_prefix,
-                stem,
-                dst_suffix
-            );
-            expanded.push(mapped);
-        }
+struct NativeRemoteHelperPlumbing;
+
+impl sley_remote::RemoteHelperPlumbing for NativeRemoteHelperPlumbing {
+    fn fast_import(&mut self, git_dir: &Path, stream: &[u8]) -> Result<()> {
+        run_native_fast_import(git_dir, stream)
     }
-    Ok(expanded)
+
+    fn fast_export(
+        &mut self,
+        request: sley_remote::RemoteHelperExportRequest<'_>,
+    ) -> Result<Vec<u8>> {
+        run_native_fast_export(request)
+    }
 }
 
-fn run_native_fast_export(
-    git_dir: &Path,
-    format: ObjectFormat,
-    capabilities: &sley_remote::RemoteHelperCapabilities,
-    refspecs: &[String],
-) -> Result<Vec<u8>> {
+struct CliRemoteHelperEvents;
+
+impl sley_remote::RemoteHelperEventSink for CliRemoteHelperEvents {
+    fn event(&mut self, event: sley_remote::RemoteHelperEvent) {
+        match event {
+            sley_remote::RemoteHelperEvent::MissingRefspecCapability => {
+                eprintln!("warning: this remote helper should implement refspec capability");
+            }
+            sley_remote::RemoteHelperEvent::FastImportFailed => {
+                eprintln!("error: error while running fast-import");
+            }
+            sley_remote::RemoteHelperEvent::PushRejected(rest) => {
+                eprintln!("error: remote helper rejected {rest}");
+            }
+        }
+    }
+}
+
+fn run_native_fast_export(request: sley_remote::RemoteHelperExportRequest<'_>) -> Result<Vec<u8>> {
     let executable = native_sley_executable()?;
     let mut command = Command::new(&executable);
     command
         .arg("fast-export")
         .arg("--use-done-feature")
-        .arg(if capabilities.signed_tags {
+        .arg(if request.signed_tags {
             "--signed-tags=verbatim"
         } else {
             "--signed-tags=warn-strip"
         })
-        .env("GIT_DIR", git_dir)
+        .env("GIT_DIR", request.git_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    if let Some(path) = capabilities.import_marks.as_deref() {
+    if let Some(path) = request.import_marks {
         command.arg(format!("--import-marks-if-exists={path}"));
     }
-    if let Some(path) = capabilities.export_marks.as_deref() {
+    if let Some(path) = request.export_marks {
         command.arg(format!("--export-marks={path}"));
     }
-    let store = FileRefStore::new(git_dir, format);
+    let store = FileRefStore::new(request.git_dir, request.format);
     let mut has_source = false;
-    for refspec in refspecs {
+    for refspec in request.refspecs {
         let body = refspec.strip_prefix('+').unwrap_or(refspec);
         let source = body.split_once(':').map_or(body, |(source, _)| source);
         let destination = body
@@ -255,7 +181,7 @@ fn run_native_fast_export(
             has_source = true;
         }
     }
-    if !has_source && refspecs.is_empty() {
+    if !has_source && request.refspecs.is_empty() {
         return Err(GitError::Command(
             "remote-helper push has no refspecs".into(),
         ));
@@ -271,136 +197,6 @@ fn run_native_fast_export(
     } else {
         Err(GitError::Exit(output.status.code().unwrap_or(1)))
     }
-}
-
-struct MarksSnapshot {
-    path: PathBuf,
-    contents: Option<Vec<u8>>,
-}
-
-fn snapshot_marks(path: Option<&str>) -> Result<Option<MarksSnapshot>> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    let path = PathBuf::from(path);
-    let contents = match std::fs::read(&path) {
-        Ok(contents) => Some(contents),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    Ok(Some(MarksSnapshot { path, contents }))
-}
-
-fn restore_marks(snapshot: Option<MarksSnapshot>) -> Result<()> {
-    let Some(snapshot) = snapshot else {
-        return Ok(());
-    };
-    match snapshot.contents {
-        Some(contents) => std::fs::write(snapshot.path, contents)?,
-        None => match std::fs::remove_file(snapshot.path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        },
-    }
-    Ok(())
-}
-
-fn update_helper_push_tracking_refs(
-    git_dir: &Path,
-    format: ObjectFormat,
-    config: &GitConfig,
-    remote: &str,
-    capabilities: &sley_remote::RemoteHelperCapabilities,
-    refspecs: &[String],
-    successful: &[String],
-) -> Result<()> {
-    let store = FileRefStore::new(git_dir, format);
-    let private_mappings = capabilities
-        .refspecs
-        .iter()
-        .map(|spec| sley_protocol::parse_refspec(spec))
-        .collect::<Result<Vec<_>>>()?;
-    let tracking_mappings = config
-        .get_all("remote", Some(remote), "fetch")
-        .into_iter()
-        .flatten()
-        .map(sley_protocol::parse_refspec)
-        .collect::<Result<Vec<_>>>()?;
-    for refspec in refspecs {
-        let normalized = sley_remote::normalize_push_refspec(refspec);
-        let body = normalized.strip_prefix('+').unwrap_or(&normalized);
-        let (source, destination) = body.split_once(':').unwrap_or((body, body));
-        if !successful.iter().any(|name| name == destination) {
-            continue;
-        }
-        let oid = if source.is_empty() {
-            None
-        } else {
-            sley_refs::resolve_ref_peeled(&store, source)?
-        };
-        let mut destinations = Vec::new();
-        if !capabilities.no_private_update {
-            for mapping in &private_mappings {
-                if let Some(name) = sley_protocol::refspec_map_source(mapping, destination)? {
-                    destinations.push(name);
-                }
-            }
-        }
-        for mapping in &tracking_mappings {
-            if let Some(name) = sley_protocol::refspec_map_source(mapping, destination)? {
-                destinations.push(name);
-            }
-        }
-        destinations.sort();
-        destinations.dedup();
-        for name in destinations {
-            match oid {
-                Some(oid) => {
-                    let mut transaction = store.transaction();
-                    transaction.update(sley_refs::RefUpdate {
-                        name,
-                        expected: None,
-                        new: RefTarget::Direct(oid),
-                        reflog: None,
-                    });
-                    transaction.commit()?;
-                }
-                None if store.read_ref(&name)?.is_some() => {
-                    store.delete_ref(&name)?;
-                }
-                None => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-fn restore_helper_import_source_refs(
-    git_dir: &Path,
-    format: ObjectFormat,
-    refs: &[(String, Option<RefTarget>)],
-) -> Result<()> {
-    let store = FileRefStore::new(git_dir, format);
-    for (name, previous) in refs {
-        match previous {
-            Some(target) => {
-                let mut transaction = store.transaction();
-                transaction.update(sley_refs::RefUpdate {
-                    name: name.clone(),
-                    expected: None,
-                    new: target.clone(),
-                    reflog: None,
-                });
-                transaction.commit()?;
-            }
-            None if store.read_ref(name)?.is_some() => {
-                store.delete_ref(name)?;
-            }
-            None => {}
-        }
-    }
-    Ok(())
 }
 
 fn run_native_fast_import(git_dir: &Path, stream: &[u8]) -> Result<()> {

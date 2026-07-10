@@ -43,6 +43,7 @@ mod ignore;
 mod index;
 mod index_io;
 mod move_remove;
+mod read_tree;
 mod status;
 mod types_admin;
 
@@ -56,6 +57,7 @@ pub use ignore::*;
 pub use index::*;
 pub use index_io::{StatCleanFilterValidator, fill_index_entry_stat_cache};
 pub use move_remove::*;
+pub use read_tree::*;
 pub use status::*;
 pub use types_admin::*;
 

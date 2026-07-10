@@ -44,12 +44,13 @@ fn expand_tag_bundle(arg: &str) -> Option<Vec<String>> {
     None
 }
 
-pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
-    let git_dir = crate::session::cli_git_dir()?;
-    let format = repository_object_format(&git_dir)?;
-    let store = FileRefStore::new(&git_dir, format);
+pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    let repo = cli_session.open_repository()?;
+    let git_dir = repo.git_dir().to_path_buf();
+    let format = repo.object_format();
+    let store = repo.references();
     if args.is_empty() {
-        return print_default_tag_list(&git_dir, format, &store);
+        return print_default_tag_list(&repo, &store);
     }
 
     let mut annotated = false;
@@ -570,7 +571,7 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
         && !edit
         && !edit_disabled
     {
-        return print_default_tag_list(&git_dir, format, &store);
+        return print_default_tag_list(&repo, &store);
     }
     // A ref-filter (`--contains`/`--no-contains`/`--points-at`/`--merged`/
     // `--no-merged`) or `-n` is "only allowed in list mode": when an explicit
@@ -645,26 +646,6 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
         } else {
             TagListColumn::None
         };
-        let points_at = points_at
-            .iter()
-            .map(|rev| resolve_tag_points_at_filter(&git_dir, format, rev))
-            .collect::<Result<Vec<_>>>()?;
-        let contains = contains
-            .iter()
-            .map(|rev| resolve_tag_contains_filter(&git_dir, format, rev))
-            .collect::<Result<Vec<_>>>()?;
-        let no_contains = no_contains
-            .iter()
-            .map(|rev| resolve_tag_contains_filter(&git_dir, format, rev))
-            .collect::<Result<Vec<_>>>()?;
-        let merged = merged
-            .iter()
-            .map(|rev| resolve_tag_merged_filter(&git_dir, format, rev))
-            .collect::<Result<Vec<_>>>()?;
-        let no_merged = no_merged
-            .iter()
-            .map(|rev| resolve_tag_merged_filter(&git_dir, format, rev))
-            .collect::<Result<Vec<_>>>()?;
         let prereleases = if sorts.iter().any(|sort| {
             matches!(
                 sort,
@@ -676,8 +657,7 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
             Vec::new()
         };
         print_tag_list(
-            &git_dir,
-            format,
+            &repo,
             &store,
             TagListOptions {
                 patterns: &positional,
@@ -823,14 +803,9 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn print_default_tag_list(
-    git_dir: &Path,
-    format: ObjectFormat,
-    store: &FileRefStore,
-) -> Result<()> {
+fn print_default_tag_list(repo: &sley::Repository, store: &FileRefStore) -> Result<()> {
     print_tag_list(
-        git_dir,
-        format,
+        repo,
         store,
         TagListOptions {
             patterns: &[],
@@ -971,76 +946,35 @@ fn resolve_tag_target(git_dir: &Path, format: ObjectFormat, target: &str) -> Res
     }
 }
 
-fn resolve_tag_points_at_filter(
-    git_dir: &Path,
-    format: ObjectFormat,
-    rev: &str,
-) -> Result<ObjectId> {
-    match resolve_revision(git_dir, format, rev) {
-        Ok(oid) => Ok(oid),
-        Err(GitError::NotFound(_) | GitError::InvalidFormat(_) | GitError::InvalidPath(_)) => {
-            eprintln!("error: malformed object name '{rev}'");
-            Err(GitError::Exit(129))
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn resolve_tag_contains_filter(
-    git_dir: &Path,
-    format: ObjectFormat,
-    rev: &str,
-) -> Result<ObjectId> {
-    let oid = match resolve_revision(git_dir, format, rev) {
-        Ok(oid) => oid,
-        Err(GitError::NotFound(_) | GitError::InvalidFormat(_) | GitError::InvalidPath(_)) => {
-            eprintln!("error: malformed object name {rev}");
-            return Err(GitError::Exit(129));
-        }
-        Err(err) => return Err(err),
-    };
-    // `--contains`/`--no-contains` need a commit-ish: git peels tags to a commit
-    // and rejects a tree/blob with `error: object <oid> is a tree, not a commit`
-    // / `error: no such commit <name>` (exit 129).
-    peel_to_commit_for_filter(git_dir, format, oid, rev)
-}
-
-/// Peel `oid` (following tag chains) to a commit for a list-filter that requires
-/// a commit-ish (`--contains`/`--merged`). On a non-commit terminal object, emit
-/// git's two-line diagnostic and exit 129.
-fn peel_to_commit_for_filter(
-    git_dir: &Path,
-    format: ObjectFormat,
-    oid: ObjectId,
-    name: &str,
-) -> Result<ObjectId> {
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let mut current = oid;
-    loop {
-        let object = db.read_object(&current)?;
-        match object.object_type {
-            ObjectType::Commit => return Ok(current),
-            ObjectType::Tag => {
-                let parsed = Tag::parse(format, &object.body)?;
-                current = parsed.object;
+fn render_tag_query_error(err: sley::TagQueryError) -> GitError {
+    match err {
+        sley::TagQueryError::MalformedRevision { kind, spec } => match kind {
+            sley::TagQueryRevisionKind::PointsAt => {
+                eprintln!("error: malformed object name '{spec}'");
+                GitError::Exit(129)
             }
-            other => {
-                eprintln!("error: object {oid} is a {}, not a commit", other.as_str());
-                eprintln!("error: no such commit {name}");
-                return Err(GitError::Exit(129));
+            sley::TagQueryRevisionKind::Contains => {
+                eprintln!("error: malformed object name {spec}");
+                GitError::Exit(129)
             }
+            sley::TagQueryRevisionKind::Merged => {
+                eprintln!("fatal: malformed object name {spec}");
+                GitError::Exit(128)
+            }
+        },
+        sley::TagQueryError::NotACommit {
+            oid,
+            object_type,
+            spec,
+        } => {
+            eprintln!(
+                "error: object {oid} is a {}, not a commit",
+                object_type.as_str()
+            );
+            eprintln!("error: no such commit {spec}");
+            GitError::Exit(129)
         }
-    }
-}
-
-fn resolve_tag_merged_filter(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<ObjectId> {
-    match resolve_revision(git_dir, format, rev) {
-        Ok(oid) => Ok(oid),
-        Err(GitError::NotFound(_) | GitError::InvalidFormat(_) | GitError::InvalidPath(_)) => {
-            eprintln!("fatal: malformed object name {rev}");
-            Err(GitError::Exit(128))
-        }
-        Err(err) => Err(err),
+        sley::TagQueryError::Source(err) => err,
     }
 }
 
@@ -1633,11 +1567,11 @@ struct TagListOptions<'a> {
     omit_empty: bool,
     color: bool,
     column: TagListColumn,
-    points_at: &'a [ObjectId],
-    contains: &'a [ObjectId],
-    no_contains: &'a [ObjectId],
-    merged: &'a [ObjectId],
-    no_merged: &'a [ObjectId],
+    points_at: &'a [String],
+    contains: &'a [String],
+    no_contains: &'a [String],
+    merged: &'a [String],
+    no_merged: &'a [String],
 }
 
 /// Whether rendering this format needs the referenced object's body. Keep the
@@ -2209,11 +2143,12 @@ impl TagListSort {
 }
 
 fn print_tag_list(
-    git_dir: &Path,
-    format: ObjectFormat,
+    repo: &sley::Repository,
     store: &FileRefStore,
     options: TagListOptions<'_>,
 ) -> Result<()> {
+    let git_dir = repo.git_dir();
+    let format = repo.object_format();
     // Parse once up front so rendering can derive the same lazy atom
     // dependencies as Git's ref-filter. A refname-only format must not turn a
     // ref listing into one object read per tag.
@@ -2224,89 +2159,31 @@ fn print_tag_list(
     let format_needs_object = parsed_format.as_ref().is_some_and(tag_format_needs_object);
     let db = (parsed_format.is_some()
         || options.annotation_lines.is_some()
-        || !options.points_at.is_empty()
-        || !options.contains.is_empty()
-        || !options.no_contains.is_empty()
-        || !options.merged.is_empty()
-        || !options.no_merged.is_empty()
         || options
             .sorts
             .iter()
             .any(|sort| sort.needs_object_metadata()))
-    .then(|| FileObjectDatabase::from_git_dir(git_dir, format));
-    let mut reachability = db
-        .as_ref()
-        .map(|db| sley_rev::CommitReachability::new(git_dir, format, db));
-    let merged_reachable =
-        tag_merged_reachable_set(db.as_ref(), reachability.as_mut(), format, options.merged)?;
-    let no_merged_reachable = tag_merged_reachable_set(
-        db.as_ref(),
-        reachability.as_mut(),
-        format,
-        options.no_merged,
-    )?;
-    let contains_target_set = options.contains.iter().copied().collect::<HashSet<_>>();
-    let no_contains_target_set = options.no_contains.iter().copied().collect::<HashSet<_>>();
-    // Tags frequently share a target (and distinct annotated tags frequently
-    // peel to the same commit). Ref-filter asks the same ancestry question for
-    // every such ref, so memoize both stages for this invocation instead of
-    // walking a long history once per tag name.
-    let mut filter_tip_cache = HashMap::new();
-    let tag_refs = store.list_refs_with_prefix("refs/tags/")?;
-    let contains_match_cache = if contains_target_set.is_empty()
-        && no_contains_target_set.is_empty()
-    {
-        HashMap::new()
-    } else {
-        let db = db
-            .as_ref()
-            .expect("contains listing creates object database");
-        let reachability = reachability
-            .as_mut()
-            .expect("contains listing creates reachability context");
-        let mut tips = HashSet::new();
-        for reference in &tag_refs {
-            if let RefTarget::Direct(oid) = &reference.target
-                && let Some(tip) = tag_filter_tip(db, format, oid, &mut filter_tip_cache)
-            {
-                tips.insert(tip);
-            }
-        }
-        reachability.target_matches(tips, &contains_target_set, &no_contains_target_set, false)?
-    };
-    let mut entries = Vec::new();
-    for reference in tag_refs {
-        if let Some(name) = reference.name.strip_prefix("refs/tags/")
-            && (options.patterns.is_empty()
-                || options.patterns.iter().any(|pattern| {
-                    refname_pattern_matches_case(pattern, name, options.ignore_case)
-                }))
-            && tag_points_at(&db, format, &reference.target, options.points_at)?
-            && tag_contains(
-                &db,
-                format,
-                &reference.target,
-                &contains_target_set,
-                &no_contains_target_set,
-                &mut filter_tip_cache,
-                &contains_match_cache,
-            )
-            && tag_merged(
-                &db,
-                format,
-                &reference.target,
-                &merged_reachable,
-                &no_merged_reachable,
-                &mut filter_tip_cache,
-            )?
-        {
-            entries.push(TagListEntry {
-                name: name.to_string(),
-                reference,
-                object_metadata: None,
-            });
-        }
-    }
+    .then(|| repo.objects_mut());
+    let query = repo
+        .query_tags(sley::TagQueryOptions {
+            patterns: options.patterns.to_vec(),
+            ignore_case: options.ignore_case,
+            points_at: options.points_at.to_vec(),
+            contains: options.contains.to_vec(),
+            no_contains: options.no_contains.to_vec(),
+            merged: options.merged.to_vec(),
+            no_merged: options.no_merged.to_vec(),
+        })
+        .map_err(render_tag_query_error)?;
+    let mut entries = query
+        .entries
+        .into_iter()
+        .map(|entry| TagListEntry {
+            name: entry.name,
+            reference: entry.reference,
+            object_metadata: None,
+        })
+        .collect::<Vec<_>>();
     populate_tag_sort_metadata(
         db.as_ref(),
         git_dir,
@@ -3434,122 +3311,6 @@ fn tag_version_refname_cmp(
     } else {
         version_sort_cmp(left, right, prereleases)
     }
-}
-
-fn tag_contains(
-    db: &Option<FileObjectDatabase>,
-    format: ObjectFormat,
-    target: &RefTarget,
-    contains: &HashSet<ObjectId>,
-    no_contains: &HashSet<ObjectId>,
-    filter_tip_cache: &mut HashMap<ObjectId, Option<ObjectId>>,
-    match_cache: &HashMap<ObjectId, sley_rev::ReachabilityTargetMatch>,
-) -> bool {
-    if contains.is_empty() && no_contains.is_empty() {
-        return true;
-    }
-    let RefTarget::Direct(oid) = target else {
-        return false;
-    };
-    let Some(db) = db else {
-        return false;
-    };
-    let Some(tip) = tag_filter_tip(db, format, oid, filter_tip_cache) else {
-        return false;
-    };
-    match_cache
-        .get(&tip)
-        .is_some_and(|matched| matched.reached_required && !matched.reached_excluded)
-}
-
-fn tag_merged(
-    db: &Option<FileObjectDatabase>,
-    format: ObjectFormat,
-    target: &RefTarget,
-    merged_reachable: &HashSet<ObjectId>,
-    no_merged_reachable: &HashSet<ObjectId>,
-    filter_tip_cache: &mut HashMap<ObjectId, Option<ObjectId>>,
-) -> Result<bool> {
-    if merged_reachable.is_empty() && no_merged_reachable.is_empty() {
-        return Ok(true);
-    };
-    let Some(db) = db else {
-        return Ok(false);
-    };
-    let RefTarget::Direct(oid) = target else {
-        return Ok(false);
-    };
-    let Some(tip) = tag_filter_tip(db, format, oid, filter_tip_cache) else {
-        return Ok(false);
-    };
-    let merged_match = merged_reachable.is_empty() || merged_reachable.contains(&tip);
-    let no_merged_match = no_merged_reachable.contains(&tip);
-    Ok(merged_match && !no_merged_match)
-}
-
-fn tag_filter_tip(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    oid: &ObjectId,
-    cache: &mut HashMap<ObjectId, Option<ObjectId>>,
-) -> Option<ObjectId> {
-    if let Some(tip) = cache.get(oid) {
-        return *tip;
-    }
-    // Ref-filter silently drops a tag whose terminal object is not a commit;
-    // cache that negative result as well so aliases of a blob/tree do not
-    // repeat object reads.
-    let tip = sley_rev::peel_to_commit(db, format, oid).ok();
-    cache.insert(*oid, tip);
-    tip
-}
-
-fn tag_merged_reachable_set(
-    db: Option<&FileObjectDatabase>,
-    reachability: Option<&mut sley_rev::CommitReachability<'_, FileObjectDatabase>>,
-    format: ObjectFormat,
-    filters: &[ObjectId],
-) -> Result<HashSet<ObjectId>> {
-    if filters.is_empty() {
-        return Ok(HashSet::new());
-    }
-    let Some(db) = db else {
-        return Ok(HashSet::new());
-    };
-    let Some(reachability) = reachability else {
-        return Ok(HashSet::new());
-    };
-    let commits = filters
-        .iter()
-        .map(|oid| sley_rev::peel_to_commit(db, format, oid))
-        .collect::<Result<Vec<_>>>()?;
-    reachability.reachable_oids(commits, false)
-}
-
-fn tag_points_at(
-    db: &Option<FileObjectDatabase>,
-    format: ObjectFormat,
-    target: &RefTarget,
-    points_at: &[ObjectId],
-) -> Result<bool> {
-    if points_at.is_empty() {
-        return Ok(true);
-    }
-    let RefTarget::Direct(oid) = target else {
-        return Ok(false);
-    };
-    if points_at.iter().any(|point| point == oid) {
-        return Ok(true);
-    }
-    let Some(db) = db else {
-        return Ok(false);
-    };
-    let object = db.read_object(oid)?;
-    if object.object_type != ObjectType::Tag {
-        return Ok(false);
-    }
-    let parsed = Tag::parse(format, &object.body)?;
-    Ok(points_at.iter().any(|point| point == &parsed.object))
 }
 
 #[cfg(test)]

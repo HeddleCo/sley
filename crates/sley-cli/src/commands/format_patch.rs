@@ -294,16 +294,7 @@ struct FormatPatchOptions {
     setup_args: Vec<String>,
 }
 
-struct FormatPatchSelection {
-    commits: Vec<sley_rev::CommitRecord>,
-    pathspecs: Vec<String>,
-}
-
-#[derive(Clone)]
-struct BaseInfo {
-    base: ObjectId,
-    prerequisites: Vec<Vec<u8>>,
-}
+type BaseInfo = sley_rev::format_patch::FormatPatchBaseInfo;
 
 /// Tracks `format-patch` notes display state. This is deliberately local rather
 /// than reusing `log.rs`'s private display helper so the parity fix stays in this
@@ -468,10 +459,85 @@ struct ResolvedFormat {
     zero_commit: bool,
 }
 
-pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
+struct CliFormatPatchRevisionResolver<'a> {
+    repo: &'a RepositoryContext,
+}
+
+impl sley_rev::format_patch::FormatPatchRevisionResolver for CliFormatPatchRevisionResolver<'_> {
+    fn resolve_revision(&mut self, revision: &str) -> Result<ObjectId> {
+        self.repo.resolve_revision(revision)
+    }
+}
+
+struct CliFormatPatchPatchIds<'a> {
+    objects: &'a FileObjectDatabase,
+    format: ObjectFormat,
+}
+
+impl sley_rev::format_patch::FormatPatchPatchId for CliFormatPatchPatchIds<'_> {
+    fn patch_id(
+        &mut self,
+        record: &sley_rev::CommitRecord,
+        stable: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        if record.parents.len() > 1 {
+            return Ok(None);
+        }
+        let parent_tree = match record.parents.first() {
+            Some(parent) => {
+                let object = self.objects.read_object(parent)?;
+                Commit::parse_ref(self.format, &object.body)?.tree
+            }
+            None => ObjectId::empty_tree(self.format),
+        };
+        let diff =
+            render_tree_to_tree_patch(self.objects, self.format, &parent_tree, &record.commit.tree)
+                .unwrap_or_default();
+        Ok(if stable {
+            commands::patch_id::stable_patch_id_for_diff(&diff, self.format)
+        } else {
+            commands::patch_id::patch_id_for_diff(&diff, self.format)
+        })
+    }
+}
+
+struct CliFormatPatchCommitFilter {
+    matcher: sley_grep::GrepMatcher,
+    all_match: bool,
+    invert: bool,
+}
+
+impl sley_rev::format_patch::FormatPatchCommitFilter for CliFormatPatchCommitFilter {
+    fn retain(&mut self, record: &sley_rev::CommitRecord) -> bool {
+        let matched = if self.all_match {
+            self.matcher.matches_all(&record.commit.message)
+        } else {
+            self.matcher.matches_any(&record.commit.message)
+        };
+        matched != self.invert
+    }
+}
+
+fn format_patch_plan_error(error: sley_rev::format_patch::FormatPatchPlanError) -> GitError {
+    match error {
+        sley_rev::format_patch::FormatPatchPlanError::UnsupportedSetupArgument { argument } => {
+            GitError::Command(format!("unsupported format-patch option {argument}"))
+        }
+        sley_rev::format_patch::FormatPatchPlanError::BaseNotAncestor { .. } => {
+            eprintln!("fatal: base commit should be the ancestor of revision list");
+            GitError::Exit(128)
+        }
+        sley_rev::format_patch::FormatPatchPlanError::Engine(error) => error,
+    }
+}
+
+pub(crate) fn cmd_format_patch(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut options = parse_format_patch_args(args)?;
 
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
@@ -502,25 +568,93 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
         options.dst_prefix.clear();
     }
     options.mboxrd |= config.get_bool("format", None, "mboxrd").unwrap_or(false);
-    options.relative_prefix = resolve_format_patch_relative_prefix(&repo, &options, config)?;
-    let options = options;
 
+    let grep_kind = log_grep_pattern_kind_from_config(
+        config,
+        options.grep_pattern_kind,
+        options.grep_pattern_kind_explicit,
+    );
+    let matcher = compile_log_message_grep_matcher(
+        &options.grep_patterns,
+        grep_kind,
+        options.grep_ignore_case,
+    )?;
+    let mut commit_filter = matcher.map(|matcher| CliFormatPatchCommitFilter {
+        matcher,
+        all_match: options.grep_all_match,
+        invert: options.grep_invert,
+    });
+    let plan_options = sley_rev::format_patch::FormatPatchPlanOptions {
+        setup_args: options.setup_args.clone(),
+        count: options.count,
+        root: options.root,
+        ignore_if_in_upstream: options.ignore_if_in_upstream,
+        base: match &options.base {
+            BaseMode::Config => sley_rev::format_patch::FormatPatchBaseMode::Config,
+            BaseMode::None => sley_rev::format_patch::FormatPatchBaseMode::None,
+            BaseMode::Commit(revision) => {
+                sley_rev::format_patch::FormatPatchBaseMode::Commit(revision.clone())
+            }
+            BaseMode::Auto => sley_rev::format_patch::FormatPatchBaseMode::Auto,
+        },
+        relative: match &options.relative_mode {
+            RelativeMode::Config => sley_rev::format_patch::FormatPatchRelativeMode::Config,
+            RelativeMode::Off => sley_rev::format_patch::FormatPatchRelativeMode::Off,
+            RelativeMode::On(path) => {
+                sley_rev::format_patch::FormatPatchRelativeMode::On(path.clone())
+            }
+        },
+    };
+    let relative_needs_worktree = matches!(options.relative_mode, RelativeMode::On(None))
+        || (matches!(options.relative_mode, RelativeMode::Config)
+            && config.get_bool("diff", None, "relative").unwrap_or(false));
+    let worktree_root = if relative_needs_worktree {
+        Some(repo.worktree_root()?)
+    } else {
+        repo.worktree_root().ok()
+    };
+    let mut revisions = CliFormatPatchRevisionResolver { repo: &repo };
+    let mut patch_ids = CliFormatPatchPatchIds {
+        objects: db,
+        format,
+    };
+    let plan = sley_rev::format_patch::plan_format_patch_series(
+        sley_rev::format_patch::FormatPatchPlanRequest {
+            git_dir,
+            worktree_root,
+            cwd,
+            format,
+            objects: db,
+            refs: repo.refs(),
+            config,
+            options: &plan_options,
+        },
+        sley_rev::format_patch::FormatPatchPlanServices {
+            revisions: &mut revisions,
+            patch_ids: &mut patch_ids,
+            commit_filter: commit_filter
+                .as_mut()
+                .map(|filter| filter as &mut dyn sley_rev::format_patch::FormatPatchCommitFilter),
+        },
+    )
+    .map_err(format_patch_plan_error)?;
+    options.relative_prefix = plan.relative_prefix.clone();
+    let options = options;
     let resolved = resolve_format(&options, config)?;
 
-    let selection = select_commits(&repo, &options)?;
-    let commits = selection.commits;
-    let diff_pathspec = if selection.pathspecs.is_empty() {
+    let commits = plan.commits;
+    let diff_pathspec = if plan.pathspecs.is_empty() {
         None
     } else {
         Some(DiffPathspec::new(
             cwd,
             repo.worktree_root()?,
-            &selection.pathspecs,
+            &plan.pathspecs,
         )?)
     };
 
     let count = commits.len();
-    let range_diff_setup_args = format_patch_setup_args(&options);
+    let range_diff_setup_args = plan.revision_args;
     // A cover letter forces `[PATCH n/m]` numbering (the cover is `0/m`), so it
     // also flips a single-patch run from the bare `[PATCH]` to `[PATCH 1/1]`.
     // git emits no cover (and no patches) when the range is empty.
@@ -555,13 +689,13 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     };
     let abbrev = patch_index_abbrev(git_dir, format, &options)?;
     let notes_refs = resolve_format_patch_notes(git_dir, format, &options, config)?;
-    let base_info = resolve_base_info(&repo, &options, config, &commits)?;
+    let base_info = plan.base;
     let range_diff = match options.range_diff.as_deref() {
         Some(previous) => Some(commands::range_diff::render_format_patch_range_diff(
             &repo,
             previous,
             &range_diff_setup_args,
-            &selection.pathspecs,
+            &plan.pathspecs,
             &notes_refs,
         )?),
         None => None,
@@ -1178,6 +1312,25 @@ fn cover_branch_name(
         Some(RefTarget::Symbolic(name)) => Ok(name.strip_prefix("refs/heads/").map(str::to_string)),
         _ => Ok(None),
     }
+}
+
+/// Whether a lone porcelain revision is the excluded side of the implicit
+/// `<revision>..HEAD` range. Cover-description branch inference needs this
+/// presentation-level distinction in addition to the engine plan.
+fn format_patch_bare_exclude(options: &FormatPatchOptions) -> Option<&str> {
+    if options.count.is_some() || options.root {
+        return None;
+    }
+    let revision_end = options
+        .setup_args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(options.setup_args.len());
+    if revision_end != 1 {
+        return None;
+    }
+    let revision = options.setup_args[0].as_str();
+    (!revision.starts_with('^') && !revision.contains("..")).then_some(revision)
 }
 
 /// Split a description into `(first_paragraph_joined_with_spaces, remainder)`.
@@ -3356,391 +3509,6 @@ fn first_parent_diff_entries(
     };
     let entries = apply_format_patch_relative(entries, options);
     apply_diff_order_file(entries, options.order_file.as_deref())
-}
-
-/// Select the commits to format, newest-to-oldest from the walk then reversed to
-/// git's oldest-first output order, with merge commits dropped (format-patch is
-/// `--no-merges` by default).
-fn select_commits(
-    repo: &RepositoryContext,
-    options: &FormatPatchOptions,
-) -> Result<FormatPatchSelection> {
-    let format = repo.format();
-    let db = repo.objects();
-    let setup_args = format_patch_setup_args(options);
-    if let Some(rev) = format_patch_bare_exclude(options) {
-        let oid = repo
-            .resolve_revision(rev)
-            .map_err(|_| sley_rev::ambiguous_argument_error(rev))?;
-        sley_rev::peel_to_commit(db, format, &oid)
-            .map_err(|_| sley_rev::ambiguous_argument_error(rev))?;
-    }
-    let setup = sley_rev::setup_revisions(
-        &setup_args,
-        &sley_rev::RevisionSetupContext {
-            git_dir: repo.git_dir(),
-            worktree_root: repo.worktree_root().ok(),
-            cwd: repo.cwd(),
-            format,
-            reader: db,
-            config: Some(repo.config()),
-        },
-    )?;
-    if let Some(leftover) = setup.leftovers.first() {
-        return Err(GitError::Command(format!(
-            "unsupported format-patch option {leftover}"
-        )));
-    }
-    let revision_options = setup.options;
-    let starts = revision_options
-        .positives
-        .iter()
-        .map(|tip| sley_rev::peel_to_commit(db, format, &tip.oid))
-        .collect::<Result<Vec<_>>>()?;
-
-    let mut excluded = HashSet::new();
-    let mut excluded_records = Vec::new();
-    for oid in revision_options.negatives {
-        for record in rev_list_walk_commits(db, format, [oid], false)? {
-            excluded.insert(record.oid);
-            excluded_records.push(record);
-        }
-    }
-
-    let walked = rev_list_walk_commits(db, format, starts, false)?;
-    let upstream_patch_ids = if options.ignore_if_in_upstream {
-        let mut ids = HashSet::new();
-        for record in &excluded_records {
-            if record.parents.len() > 1 {
-                continue;
-            }
-            let parent_tree = match record.parents.first() {
-                Some(parent) => commit_tree_oid(db, format, parent)?,
-                None => ObjectId::empty_tree(format),
-            };
-            if record.commit.tree == parent_tree {
-                continue;
-            }
-            if let Some(id) = format_patch_commit_patch_id(db, format, record)? {
-                ids.insert(id);
-            }
-        }
-        ids
-    } else {
-        HashSet::new()
-    };
-
-    // `walked` is a breadth-first traversal, which is NOT git's output order.
-    // format-patch is `git rev-list` reversed with merges dropped, so we must
-    // first reorder the reachable set into rev-list's committer-date order
-    // (the same `rev_list_date_order` the `rev-list` command uses) before
-    // dropping merges and reversing — otherwise a branchy range emits patches
-    // in the wrong sequence (and numbers them accordingly).
-    let reachable: Vec<&sley_rev::CommitRecord> = walked
-        .iter()
-        .filter(|record| !excluded.contains(&record.oid))
-        .collect();
-    let ordered = rev_list_date_order(reachable)?;
-    // Keep non-merge commits in rev-list (newest-first) order.
-    let mut selected: Vec<sley_rev::CommitRecord> = ordered
-        .into_iter()
-        .filter(|record| record.parents.len() <= 1)
-        .cloned()
-        .collect();
-    let grep_kind = log_grep_pattern_kind_from_config(
-        repo.config(),
-        options.grep_pattern_kind,
-        options.grep_pattern_kind_explicit,
-    );
-    if let Some(matcher) = compile_log_message_grep_matcher(
-        &options.grep_patterns,
-        grep_kind,
-        options.grep_ignore_case,
-    )? {
-        selected.retain(|record| {
-            let matched = if options.grep_all_match {
-                matcher.matches_all(&record.commit.message)
-            } else {
-                matcher.matches_any(&record.commit.message)
-            };
-            matched != options.grep_invert
-        });
-    }
-    if !setup.pathspecs.is_empty() {
-        let pathspec = sley_rev::Pathspec::parse(
-            setup.pathspecs.iter().map(|spec| spec.as_bytes()),
-            sley_rev::PathspecMatchMagic::default(),
-        )
-        .map_err(|err| GitError::Command(format!("bad pathspec: {err:?}")))?;
-        selected = sley_rev::simplify_history(
-            db,
-            format,
-            selected,
-            &pathspec,
-            sley_rev::SimplifyOptions {
-                full_history: false,
-                first_parent: false,
-                ..Default::default()
-            },
-        )?;
-    }
-
-    // `-<n>` keeps the n newest of those before reversing to oldest-first.
-    if let Some(count) = options.count {
-        selected.truncate(count);
-    }
-    if !upstream_patch_ids.is_empty() {
-        let mut kept = Vec::with_capacity(selected.len());
-        for record in selected {
-            let parent_tree = match record.parents.first() {
-                Some(parent) => commit_tree_oid(db, format, parent)?,
-                None => ObjectId::empty_tree(format),
-            };
-            if record.commit.tree != parent_tree
-                && let Some(id) = format_patch_commit_patch_id(db, format, &record)?
-                && upstream_patch_ids.contains(&id)
-            {
-                continue;
-            }
-            kept.push(record);
-        }
-        selected = kept;
-    }
-    selected.reverse();
-    Ok(FormatPatchSelection {
-        commits: selected,
-        pathspecs: setup.pathspecs,
-    })
-}
-
-fn format_patch_setup_args(options: &FormatPatchOptions) -> Vec<String> {
-    let mut args = options.setup_args.clone();
-    if let Some(rev) = format_patch_bare_exclude(options) {
-        args[0] = "HEAD".to_string();
-        args.insert(1, format!("^{rev}"));
-        return args;
-    }
-    let dashdash = args.iter().position(|arg| arg == "--");
-    let rev_end = dashdash.unwrap_or(args.len());
-    if rev_end == 0 {
-        args.insert(0, "HEAD".to_string());
-    }
-    args
-}
-
-fn format_patch_bare_exclude(options: &FormatPatchOptions) -> Option<&str> {
-    if options.count.is_some() {
-        return None;
-    }
-    // `--root` treats a lone revision as a range (`<rev>` and its ancestors)
-    // rather than the `<rev>..HEAD` since-form, so never derive a `^<rev>`.
-    if options.root {
-        return None;
-    }
-    let args = &options.setup_args;
-    let dashdash = args.iter().position(|arg| arg == "--");
-    let rev_end = dashdash.unwrap_or(args.len());
-    if rev_end != 1 {
-        return None;
-    }
-    let rev = args[0].as_str();
-    (!rev.starts_with('^') && !rev.contains("..")).then_some(rev)
-}
-
-fn format_patch_commit_patch_id(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    record: &sley_rev::CommitRecord,
-) -> Result<Option<Vec<u8>>> {
-    if record.parents.len() > 1 {
-        return Ok(None);
-    }
-    let parent_tree = match record.parents.first() {
-        Some(parent) => commit_tree_oid(db, format, parent)?,
-        None => ObjectId::empty_tree(format),
-    };
-    let diff = render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree)
-        .unwrap_or_default();
-    Ok(commands::patch_id::patch_id_for_diff(&diff, format))
-}
-
-fn resolve_base_info(
-    repo: &RepositoryContext,
-    options: &FormatPatchOptions,
-    config: &GitConfig,
-    commits: &[sley_rev::CommitRecord],
-) -> Result<Option<BaseInfo>> {
-    if commits.is_empty() {
-        return Ok(None);
-    }
-    let format = repo.format();
-    let db = repo.objects();
-    let base_oid = match &options.base {
-        BaseMode::None => return Ok(None),
-        BaseMode::Commit(rev) => Some(resolve_base_commit(repo, rev)?),
-        BaseMode::Auto => resolve_upstream_base(repo, config)?,
-        BaseMode::Config => match config.get("format", None, "useAutoBase") {
-            Some(value) if value.eq_ignore_ascii_case("true") => {
-                resolve_upstream_base(repo, config)?
-            }
-            Some(value) if value.eq_ignore_ascii_case("whenAble") => {
-                resolve_upstream_base(repo, config)?
-            }
-            _ => None,
-        },
-    };
-    let Some(base_oid) = base_oid else {
-        return Ok(None);
-    };
-    validate_base_commit(db, format, &base_oid, commits)?;
-    let prerequisites = prerequisite_patch_ids(db, format, &base_oid, commits)?;
-    Ok(Some(BaseInfo {
-        base: base_oid,
-        prerequisites,
-    }))
-}
-
-fn resolve_base_commit(repo: &RepositoryContext, rev: &str) -> Result<ObjectId> {
-    let oid = repo
-        .resolve_revision(rev)
-        .map_err(|_| sley_rev::ambiguous_argument_error(rev))?;
-    sley_rev::peel_to_commit(repo.objects(), repo.format(), &oid)
-        .map_err(|_| sley_rev::ambiguous_argument_error(rev))
-}
-
-fn resolve_upstream_base(repo: &RepositoryContext, config: &GitConfig) -> Result<Option<ObjectId>> {
-    let Some(branch) = current_branch_name(repo)? else {
-        return Ok(None);
-    };
-    let Some(merge) = config.get("branch", Some(&branch), "merge") else {
-        return Ok(None);
-    };
-    let remote = config.get("branch", Some(&branch), "remote").unwrap_or(".");
-    let rev = if remote == "." {
-        merge.to_string()
-    } else {
-        let short = merge.strip_prefix("refs/heads/").unwrap_or(merge);
-        format!("refs/remotes/{remote}/{short}")
-    };
-    resolve_base_commit(repo, &rev).map(Some)
-}
-
-fn current_branch_name(repo: &RepositoryContext) -> Result<Option<String>> {
-    match repo.refs().read_ref("HEAD")? {
-        Some(RefTarget::Symbolic(name)) => Ok(name.strip_prefix("refs/heads/").map(str::to_string)),
-        _ => Ok(None),
-    }
-}
-
-fn validate_base_commit(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    base: &ObjectId,
-    commits: &[sley_rev::CommitRecord],
-) -> Result<()> {
-    if commits.iter().any(|record| &record.oid == base) {
-        eprintln!("fatal: base commit should be the ancestor of revision list");
-        return Err(GitError::Exit(128));
-    }
-    let tips = commits.iter().map(|record| record.oid).collect::<Vec<_>>();
-    let reachable = rev_list_walk_commits(db, format, tips, false)?;
-    if !reachable.iter().any(|record| &record.oid == base) {
-        eprintln!("fatal: base commit should be the ancestor of revision list");
-        return Err(GitError::Exit(128));
-    }
-    Ok(())
-}
-
-fn prerequisite_patch_ids(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    base: &ObjectId,
-    commits: &[sley_rev::CommitRecord],
-) -> Result<Vec<Vec<u8>>> {
-    let Some(oldest_parent) = commits[0].parents.first() else {
-        return Ok(Vec::new());
-    };
-    let selected: HashSet<ObjectId> = commits.iter().map(|record| record.oid).collect();
-    let mut chain = Vec::new();
-    let mut cursor = *oldest_parent;
-    while &cursor != base {
-        if selected.contains(&cursor) {
-            break;
-        }
-        let record = read_commit_record_for_format_patch(db, format, cursor)?;
-        let Some(parent) = record.parents.first().copied() else {
-            break;
-        };
-        chain.push(record);
-        cursor = parent;
-    }
-    chain.reverse();
-    let mut ids = Vec::new();
-    for record in &chain {
-        let parent_tree = match record.parents.first() {
-            Some(parent) => commit_tree_oid(db, format, parent)?,
-            None => ObjectId::empty_tree(format),
-        };
-        let diff = render_tree_to_tree_patch(db, format, &parent_tree, &record.commit.tree)
-            .unwrap_or_default();
-        if let Some(id) = commands::patch_id::stable_patch_id_for_diff(&diff, format) {
-            ids.push(id);
-        }
-    }
-    Ok(ids)
-}
-
-fn read_commit_record_for_format_patch(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    oid: ObjectId,
-) -> Result<sley_rev::CommitRecord> {
-    let object = db.read_object(&oid)?;
-    let commit: Commit = Commit::parse_ref(format, &object.body)?.into();
-    Ok(sley_rev::CommitRecord {
-        oid,
-        parents: commit.parents.clone(),
-        commit,
-    })
-}
-
-fn resolve_format_patch_relative_prefix(
-    repo: &RepositoryContext,
-    options: &FormatPatchOptions,
-    config: &GitConfig,
-) -> Result<Option<Vec<u8>>> {
-    match &options.relative_mode {
-        RelativeMode::Off => Ok(None),
-        RelativeMode::On(Some(path)) => Ok(normalize_relative_prefix(path)),
-        RelativeMode::On(None) => cwd_relative_prefix(repo),
-        RelativeMode::Config => {
-            if config.get_bool("diff", None, "relative").unwrap_or(false) {
-                cwd_relative_prefix(repo)
-            } else {
-                Ok(None)
-            }
-        }
-    }
-}
-
-fn cwd_relative_prefix(repo: &RepositoryContext) -> Result<Option<Vec<u8>>> {
-    let root = repo.worktree_root()?;
-    let cwd = repo.cwd();
-    let Ok(relative) = cwd.strip_prefix(root) else {
-        return Ok(None);
-    };
-    let text = relative.to_string_lossy().replace('\\', "/");
-    Ok(normalize_relative_prefix(&text))
-}
-
-fn normalize_relative_prefix(path: &str) -> Option<Vec<u8>> {
-    let trimmed = path.trim_matches('/');
-    if trimmed.is_empty() || trimmed == "." {
-        return None;
-    }
-    let mut bytes = trimmed.as_bytes().to_vec();
-    bytes.push(b'/');
-    Some(bytes)
 }
 
 fn apply_format_patch_relative(

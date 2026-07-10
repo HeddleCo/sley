@@ -4,8 +4,9 @@
 //! transports are deliberately excluded here: Sley must never fall through to
 //! an installed Git's core `git-remote-http` (or similar) executable.
 
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use sley_config::GitConfig;
@@ -13,6 +14,8 @@ use sley_config::remotes::{remote_config_values, remote_exists, rewrite_url_with
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_protocol::{RefAdvertisement, parse_refspec, refspec_map_source};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate};
+
+use crate::{CredentialProvider, FetchOptions, FetchServices, ProgressSink};
 
 /// A resolved user-owned remote-helper invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +175,172 @@ pub enum RemoteHelperRefValue {
 pub struct RemoteHelperRef {
     pub name: String,
     pub value: RemoteHelperRefValue,
+}
+
+/// A runtime request for the fast-export half of a remote-helper push.
+///
+/// The helper engine owns protocol sequencing and supplies the resolved
+/// capability values. The caller owns how native fast-export is executed.
+pub struct RemoteHelperExportRequest<'a> {
+    /// Local repository receiving the helper operation.
+    pub git_dir: &'a Path,
+    /// Object format negotiated with the helper.
+    pub format: ObjectFormat,
+    /// Preserve signed tag objects verbatim during export.
+    pub signed_tags: bool,
+    /// Existing marks file the helper asked fast-export to consume.
+    pub import_marks: Option<&'a str>,
+    /// Marks file the helper asked fast-export to update.
+    pub export_marks: Option<&'a str>,
+    /// Expanded source-to-destination refspecs to export.
+    pub refspecs: &'a [String],
+}
+
+/// Injected native plumbing used by import/export remote helpers.
+///
+/// The CLI implementation re-enters the currently running Sley executable;
+/// embedders can provide in-process implementations without depending on an
+/// installed Git executable.
+pub trait RemoteHelperPlumbing {
+    /// Install one helper-produced fast-import stream into `git_dir`.
+    fn fast_import(&mut self, git_dir: &Path, stream: &[u8]) -> Result<()>;
+    /// Produce the fast-export stream requested by the helper engine.
+    fn fast_export(&mut self, request: RemoteHelperExportRequest<'_>) -> Result<Vec<u8>>;
+}
+
+/// Structured presentation events emitted while executing a helper operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteHelperEvent {
+    /// Import helper omitted the recommended private `refspec` capability.
+    MissingRefspecCapability,
+    /// The helper process failed while producing its fast-import stream.
+    FastImportFailed,
+    /// Helper rejected a destination and supplied this protocol detail.
+    PushRejected(String),
+}
+
+/// Presentation seam for helper warnings and per-ref rejection diagnostics.
+pub trait RemoteHelperEventSink {
+    /// Receive one structured event in protocol order.
+    fn event(&mut self, event: RemoteHelperEvent);
+}
+
+/// Fully resolved inputs for a remote-helper fetch.
+pub struct RemoteHelperFetchOperation<'a> {
+    /// Local repository `$GIT_DIR`.
+    pub git_dir: &'a Path,
+    /// Local repository object format.
+    pub format: ObjectFormat,
+    /// Effective repository configuration.
+    pub config: &'a GitConfig,
+    /// Remote name used for fetch config and FETCH_HEAD descriptions.
+    pub remote_name: &'a str,
+    /// Already-resolved user-owned helper invocation.
+    pub spec: &'a RemoteHelperSpec,
+    /// Caller-requested fetch refspecs.
+    pub refspecs: &'a [String],
+    /// Ordinary fetch behavior applied after helper import.
+    pub options: &'a FetchOptions,
+}
+
+/// Runtime seams used by a remote-helper fetch.
+pub struct RemoteHelperFetchServices<'a> {
+    /// Native fast-import/export runtime.
+    pub plumbing: &'a mut dyn RemoteHelperPlumbing,
+    /// Warning and rejection presentation sink.
+    pub events: &'a mut dyn RemoteHelperEventSink,
+    /// Credential provider passed to ordinary fetch finalization.
+    pub credentials: &'a mut dyn CredentialProvider,
+    /// Fetch progress and prune-event sink.
+    pub progress: &'a mut dyn ProgressSink,
+    /// Optional reference-transaction hook runner.
+    pub ref_hook: Option<&'a dyn sley_refs::ReferenceTransactionHook>,
+}
+
+/// Controls for the protocol-affecting portion of a remote-helper push.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemoteHelperPushOptions {
+    /// Ask an option-capable helper to accept non-fast-forward updates.
+    pub force: bool,
+    /// Validate and discover the helper without exporting objects or refs.
+    pub dry_run: bool,
+}
+
+/// Classified failure from [`push_via_remote_helper`].
+#[derive(Debug)]
+pub enum RemoteHelperPushError {
+    /// The helper omitted the mandatory private `refspec` mapping needed by the
+    /// import/export push protocol.
+    RefspecRequired,
+    /// Git v2.55 rejects export helpers that advertise neither import nor
+    /// export marks; callers preserve that oracle-visible classification.
+    MarksRequired,
+    /// Any other protocol, repository, runtime, or ref-update failure.
+    Engine(GitError),
+}
+
+impl std::fmt::Display for RemoteHelperPushError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RefspecRequired => {
+                formatter.write_str("remote-helper doesn't support push; refspec needed")
+            }
+            Self::MarksRequired => formatter.write_str("remote-helper export requires marks"),
+            Self::Engine(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for RemoteHelperPushError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Engine(error) => Some(error),
+            Self::RefspecRequired | Self::MarksRequired => None,
+        }
+    }
+}
+
+impl From<GitError> for RemoteHelperPushError {
+    fn from(error: GitError) -> Self {
+        Self::Engine(error)
+    }
+}
+
+/// Fully resolved inputs for a remote-helper push.
+pub struct RemoteHelperPushOperation<'a> {
+    /// Local repository `$GIT_DIR`.
+    pub git_dir: &'a Path,
+    /// Local repository object format.
+    pub format: ObjectFormat,
+    /// Effective repository configuration.
+    pub config: &'a GitConfig,
+    /// Remote name used to update configured tracking refs.
+    pub remote_name: &'a str,
+    /// Already-resolved user-owned helper invocation.
+    pub spec: &'a RemoteHelperSpec,
+    /// Caller-requested push refspecs before wildcard expansion.
+    pub refspecs: &'a [String],
+    /// Protocol-affecting push controls.
+    pub options: RemoteHelperPushOptions,
+}
+
+/// Runtime seams used by a remote-helper push.
+pub struct RemoteHelperPushServices<'a> {
+    /// Native fast-import/export runtime.
+    pub plumbing: &'a mut dyn RemoteHelperPlumbing,
+    /// Warning and rejection presentation sink.
+    pub events: &'a mut dyn RemoteHelperEventSink,
+}
+
+/// Structured result of a successful remote-helper push.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteHelperPushOutcome {
+    /// Concrete refspecs sent to fast-export after wildcard expansion.
+    pub expanded_refspecs: Vec<String>,
+    /// Destination ref names acknowledged by the helper.
+    pub successful_refs: Vec<String>,
+    /// Whether execution stopped after helper discovery because of `dry_run`.
+    pub dry_run: bool,
 }
 
 /// A live remote-helper process. The caller may inspect capabilities/listing,
@@ -407,6 +576,325 @@ impl Drop for RemoteHelperSession {
     }
 }
 
+/// Execute a user-owned remote helper's import flow and finalize it through the
+/// ordinary fetch engine. Repository semantics remain identical to native
+/// transports: refspec planning, FETCH_HEAD, pruning, and ref transactions all
+/// pass through [`crate::finalize_remote_helper_fetch`].
+pub fn fetch_via_remote_helper(
+    request: RemoteHelperFetchOperation<'_>,
+    services: RemoteHelperFetchServices<'_>,
+) -> Result<crate::FetchOutcome> {
+    let mut session =
+        RemoteHelperSession::start(request.spec.clone(), request.git_dir, request.format)?;
+    let capabilities = session.capabilities().clone();
+    let refs = session.list()?;
+    if capabilities.refspecs.is_empty() {
+        services
+            .events
+            .event(RemoteHelperEvent::MissingRefspecCapability);
+    }
+    let import_refs = refs
+        .iter()
+        .filter(|reference| !matches!(reference.value, RemoteHelperRefValue::Symbolic(_)))
+        .map(|reference| reference.name.clone())
+        .collect::<Vec<_>>();
+    let source_refs_before_import = if capabilities.refspecs.is_empty() {
+        Vec::new()
+    } else {
+        snapshot_helper_source_refs(request.git_dir, request.format, &import_refs)?
+    };
+    let stream = match session.import(&import_refs) {
+        Ok(stream) => stream,
+        Err(error) => {
+            services.events.event(RemoteHelperEvent::FastImportFailed);
+            return Err(error);
+        }
+    };
+    let stream = rewrite_remote_helper_import_stream(&stream, &capabilities.refspecs)?;
+    services.plumbing.fast_import(request.git_dir, &stream)?;
+    let (advertisements, head_symref) = imported_remote_helper_advertisements(
+        request.git_dir,
+        request.format,
+        &capabilities,
+        &refs,
+    )?;
+    restore_helper_import_source_refs(request.git_dir, request.format, &source_refs_before_import)?;
+    crate::finalize_remote_helper_fetch(
+        crate::RemoteHelperFetchRequest {
+            git_dir: request.git_dir,
+            format: request.format,
+            config: request.config,
+            remote_name: request.remote_name,
+            advertisements: &advertisements,
+            head_symref,
+            refspecs: request.refspecs,
+            options: request.options,
+        },
+        FetchServices {
+            credentials: services.credentials,
+            progress: services.progress,
+            ref_hook: services.ref_hook,
+        },
+    )
+}
+
+/// Execute a user-owned remote helper's export flow, including wildcard
+/// expansion, marks rollback on helper failure, and tracking/private-ref
+/// updates for successful destinations.
+pub fn push_via_remote_helper(
+    request: RemoteHelperPushOperation<'_>,
+    services: RemoteHelperPushServices<'_>,
+) -> std::result::Result<RemoteHelperPushOutcome, RemoteHelperPushError> {
+    let mut session =
+        RemoteHelperSession::start(request.spec.clone(), request.git_dir, request.format)?;
+    let capabilities = session.capabilities().clone();
+    let _remote_refs = session.list()?;
+    if capabilities.refspecs.is_empty() {
+        return Err(RemoteHelperPushError::RefspecRequired);
+    }
+    // Git v2.55's import/export helper path still treats a marks-free export as
+    // unsupported. Keep that oracle behavior until the enrolled TODO changes.
+    if capabilities.import_marks.is_none() && capabilities.export_marks.is_none() {
+        return Err(RemoteHelperPushError::MarksRequired);
+    }
+    if request.options.dry_run {
+        return Ok(RemoteHelperPushOutcome {
+            dry_run: true,
+            ..RemoteHelperPushOutcome::default()
+        });
+    }
+    if request.options.force {
+        let _ = session.set_option("force", "true")?;
+    }
+    let refspecs = expand_helper_push_refspecs(request.git_dir, request.format, request.refspecs)?;
+    let marks_snapshot = snapshot_marks(capabilities.export_marks.as_deref())?;
+    let stream = services.plumbing.fast_export(RemoteHelperExportRequest {
+        git_dir: request.git_dir,
+        format: request.format,
+        signed_tags: capabilities.signed_tags,
+        import_marks: capabilities.import_marks.as_deref(),
+        export_marks: capabilities.export_marks.as_deref(),
+        refspecs: &refspecs,
+    })?;
+    let response = match session.export(&stream) {
+        Ok(response) => response,
+        Err(error) => {
+            restore_marks(marks_snapshot)?;
+            return Err(error.into());
+        }
+    };
+    let mut failed = false;
+    let mut successful = Vec::new();
+    for line in response {
+        if let Some(reference) = line.strip_prefix("ok ") {
+            successful.push(reference.to_string());
+        } else if let Some(rest) = line.strip_prefix("error ") {
+            failed = true;
+            services
+                .events
+                .event(RemoteHelperEvent::PushRejected(rest.to_string()));
+        }
+    }
+    if failed {
+        return Err(GitError::Exit(1).into());
+    }
+    update_helper_push_tracking_refs(
+        request.git_dir,
+        request.format,
+        request.config,
+        request.remote_name,
+        &capabilities,
+        &refspecs,
+        &successful,
+    )?;
+    Ok(RemoteHelperPushOutcome {
+        expanded_refspecs: refspecs,
+        successful_refs: successful,
+        dry_run: false,
+    })
+}
+
+fn expand_helper_push_refspecs(
+    git_dir: &Path,
+    format: ObjectFormat,
+    refspecs: &[String],
+) -> Result<Vec<String>> {
+    let store = FileRefStore::new(git_dir, format);
+    let refs = store.list_refs()?;
+    let mut expanded = Vec::new();
+    for raw in refspecs {
+        let force = raw.starts_with('+');
+        let normalized = crate::normalize_push_refspec(raw);
+        let body = normalized.strip_prefix('+').unwrap_or(&normalized);
+        let (src, dst) = body.split_once(':').unwrap_or((body, body));
+        let (Some((src_prefix, src_suffix)), Some((dst_prefix, dst_suffix))) =
+            (src.split_once('*'), dst.split_once('*'))
+        else {
+            expanded.push(normalized);
+            continue;
+        };
+        for reference in &refs {
+            let Some(stem) = reference
+                .name
+                .strip_prefix(src_prefix)
+                .and_then(|rest| rest.strip_suffix(src_suffix))
+            else {
+                continue;
+            };
+            expanded.push(format!(
+                "{}{}:{}{}{}",
+                if force { "+" } else { "" },
+                reference.name,
+                dst_prefix,
+                stem,
+                dst_suffix
+            ));
+        }
+    }
+    Ok(expanded)
+}
+
+struct MarksSnapshot {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+fn snapshot_marks(path: Option<&str>) -> Result<Option<MarksSnapshot>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    let contents = match fs::read(&path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(MarksSnapshot { path, contents }))
+}
+
+fn restore_marks(snapshot: Option<MarksSnapshot>) -> Result<()> {
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    match snapshot.contents {
+        Some(contents) => fs::write(snapshot.path, contents)?,
+        None => match fs::remove_file(snapshot.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        },
+    }
+    Ok(())
+}
+
+fn update_helper_push_tracking_refs(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    remote: &str,
+    capabilities: &RemoteHelperCapabilities,
+    refspecs: &[String],
+    successful: &[String],
+) -> Result<()> {
+    let store = FileRefStore::new(git_dir, format);
+    let private_mappings = capabilities
+        .refspecs
+        .iter()
+        .map(|spec| parse_refspec(spec))
+        .collect::<Result<Vec<_>>>()?;
+    let tracking_mappings = config
+        .get_all("remote", Some(remote), "fetch")
+        .into_iter()
+        .flatten()
+        .map(parse_refspec)
+        .collect::<Result<Vec<_>>>()?;
+    for refspec in refspecs {
+        let normalized = crate::normalize_push_refspec(refspec);
+        let body = normalized.strip_prefix('+').unwrap_or(&normalized);
+        let (source, destination) = body.split_once(':').unwrap_or((body, body));
+        if !successful.iter().any(|name| name == destination) {
+            continue;
+        }
+        let oid = if source.is_empty() {
+            None
+        } else {
+            sley_refs::resolve_ref_peeled(&store, source)?
+        };
+        let mut destinations = Vec::new();
+        if !capabilities.no_private_update {
+            for mapping in &private_mappings {
+                if let Some(name) = refspec_map_source(mapping, destination)? {
+                    destinations.push(name);
+                }
+            }
+        }
+        for mapping in &tracking_mappings {
+            if let Some(name) = refspec_map_source(mapping, destination)? {
+                destinations.push(name);
+            }
+        }
+        destinations.sort();
+        destinations.dedup();
+        for name in destinations {
+            match oid {
+                Some(oid) => {
+                    let mut transaction = store.transaction();
+                    transaction.update(RefUpdate {
+                        name,
+                        expected: None,
+                        new: RefTarget::Direct(oid),
+                        reflog: None,
+                    });
+                    transaction.commit()?;
+                }
+                None if store.read_ref(&name)?.is_some() => {
+                    store.delete_ref(&name)?;
+                }
+                None => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_helper_source_refs(
+    git_dir: &Path,
+    format: ObjectFormat,
+    refs: &[String],
+) -> Result<Vec<(String, Option<RefTarget>)>> {
+    let store = FileRefStore::new(git_dir, format);
+    refs.iter()
+        .map(|name| store.read_ref(name).map(|target| (name.clone(), target)))
+        .collect()
+}
+
+fn restore_helper_import_source_refs(
+    git_dir: &Path,
+    format: ObjectFormat,
+    refs: &[(String, Option<RefTarget>)],
+) -> Result<()> {
+    let store = FileRefStore::new(git_dir, format);
+    for (name, previous) in refs {
+        match previous {
+            Some(target) => {
+                let mut transaction = store.transaction();
+                transaction.update(RefUpdate {
+                    name: name.clone(),
+                    expected: None,
+                    new: target.clone(),
+                    reflog: None,
+                });
+                transaction.commit()?;
+            }
+            None if store.read_ref(name)?.is_some() => {
+                store.delete_ref(name)?;
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
 fn parse_list_line(line: &str, object_format_capability: bool) -> Result<RemoteHelperRef> {
     if line.starts_with(':') {
         return Err(GitError::InvalidFormat(format!(
@@ -621,6 +1109,18 @@ fn helper_ref_oid(store: &FileRefStore, name: &str) -> Result<Option<ObjectId>> 
 mod tests {
     use super::*;
     use sley_config::{ConfigEntry, ConfigSection};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn helper_test_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "sley-remote-helper-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn resolves_double_colon_and_vcs_helpers_but_not_core_helpers() {
@@ -722,11 +1222,151 @@ mod tests {
         );
     }
 
+    #[test]
+    fn expands_helper_push_wildcards_and_updates_tracking_refs() {
+        let git_dir = helper_test_dir("push-refs");
+        fs::create_dir_all(git_dir.join("refs/heads")).expect("refs");
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("oid");
+        fs::write(
+            git_dir.join("refs/heads/main"),
+            format!("{}\n", oid.to_hex()),
+        )
+        .expect("main ref");
+        fs::write(
+            git_dir.join("refs/heads/topic"),
+            format!("{}\n", oid.to_hex()),
+        )
+        .expect("topic ref");
+
+        let expanded = expand_helper_push_refspecs(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &["+refs/heads/*:refs/heads/*".into()],
+        )
+        .expect("expand");
+        assert_eq!(
+            expanded,
+            [
+                "+refs/heads/main:refs/heads/main",
+                "+refs/heads/topic:refs/heads/topic"
+            ]
+        );
+
+        let config = GitConfig {
+            sections: vec![ConfigSection::new(
+                "remote",
+                Some("origin".into()),
+                vec![ConfigEntry::new(
+                    "fetch",
+                    Some("+refs/heads/*:refs/remotes/origin/*".into()),
+                )],
+            )],
+            ..GitConfig::default()
+        };
+        let capabilities = RemoteHelperCapabilities {
+            refspecs: vec!["refs/heads/*:refs/private/*".into()],
+            ..RemoteHelperCapabilities::default()
+        };
+        update_helper_push_tracking_refs(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &config,
+            "origin",
+            &capabilities,
+            &["refs/heads/main:refs/heads/main".into()],
+            &["refs/heads/main".into()],
+        )
+        .expect("tracking update");
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        assert_eq!(
+            store.read_ref("refs/private/main").expect("private ref"),
+            Some(RefTarget::Direct(oid))
+        );
+        assert_eq!(
+            store
+                .read_ref("refs/remotes/origin/main")
+                .expect("tracking ref"),
+            Some(RefTarget::Direct(oid))
+        );
+        let _ = fs::remove_dir_all(git_dir);
+    }
+
+    #[test]
+    fn restores_marks_and_import_source_refs() {
+        let git_dir = helper_test_dir("rollback");
+        fs::create_dir_all(git_dir.join("refs/heads")).expect("refs");
+        let marks = git_dir.join("marks");
+        fs::write(&marks, b"old marks\n").expect("marks");
+        let marks_path = marks.to_string_lossy().into_owned();
+        let marks_snapshot = snapshot_marks(Some(&marks_path)).expect("marks snapshot");
+        fs::write(&marks, b"new marks\n").expect("mutated marks");
+        restore_marks(marks_snapshot).expect("restore marks");
+        assert_eq!(fs::read(&marks).expect("marks read"), b"old marks\n");
+
+        let original = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "2222222222222222222222222222222222222222",
+        )
+        .expect("original");
+        let imported = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "3333333333333333333333333333333333333333",
+        )
+        .expect("imported");
+        fs::write(
+            git_dir.join("refs/heads/main"),
+            format!("{}\n", original.to_hex()),
+        )
+        .expect("original ref");
+        let names = vec!["refs/heads/main".into(), "refs/heads/new".into()];
+        let refs = snapshot_helper_source_refs(&git_dir, ObjectFormat::Sha1, &names)
+            .expect("ref snapshot");
+        fs::write(
+            git_dir.join("refs/heads/main"),
+            format!("{}\n", imported.to_hex()),
+        )
+        .expect("mutated ref");
+        fs::write(
+            git_dir.join("refs/heads/new"),
+            format!("{}\n", imported.to_hex()),
+        )
+        .expect("new ref");
+        restore_helper_import_source_refs(&git_dir, ObjectFormat::Sha1, &refs)
+            .expect("restore refs");
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        assert_eq!(
+            store.read_ref("refs/heads/main").expect("main"),
+            Some(RefTarget::Direct(original))
+        );
+        assert_eq!(store.read_ref("refs/heads/new").expect("new"), None);
+        let _ = fs::remove_dir_all(git_dir);
+    }
+
+    #[test]
+    fn classifies_push_setup_errors_without_message_matching() {
+        assert_eq!(
+            RemoteHelperPushError::RefspecRequired.to_string(),
+            "remote-helper doesn't support push; refspec needed"
+        );
+        assert_eq!(
+            RemoteHelperPushError::MarksRequired.to_string(),
+            "remote-helper export requires marks"
+        );
+        assert!(matches!(
+            RemoteHelperPushError::from(GitError::Exit(7)),
+            RemoteHelperPushError::Engine(GitError::Exit(7))
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejected_mandatory_capability_reaps_a_waiting_helper() {
         use std::os::unix::fs::PermissionsExt;
-        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+        use std::time::{Duration, Instant};
 
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

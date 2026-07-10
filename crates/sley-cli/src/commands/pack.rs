@@ -6376,24 +6376,6 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     };
     pack_names.sort();
 
-    // Per-pack mtimes drive both duplicate resolution and the default
-    // preferred pack (upstream uses the .pack mtime for both). Captured once —
-    // the duplicate-resolution sort consults them O(n log n) times.
-    let pack_mtimes: Vec<std::time::SystemTime> = pack_names
-        .iter()
-        .map(|name| {
-            fs::metadata(pack_dir.join(name).with_extension("pack"))
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(std::time::UNIX_EPOCH)
-        })
-        .collect();
-    let pack_mtime = |pack_int_id: u32| -> std::time::SystemTime {
-        pack_mtimes
-            .get(pack_int_id as usize)
-            .copied()
-            .unwrap_or(std::time::UNIX_EPOCH)
-    };
-
     if pack_names.is_empty() {
         // Upstream resolves the preferred-pack name against the (here empty)
         // pack set first, warning when it is unknown, and only then refuses to
@@ -6405,178 +6387,45 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
         eprintln!("error: no pack files to index.");
         return Err(GitError::Exit(1));
     }
-
-    let mut objects = Vec::new();
-    let mut pack_object_counts = vec![0usize; pack_names.len()];
-    for (pack_int_id, pack_name) in pack_names.iter().enumerate() {
-        let pack_path = pack_dir.join(pack_name).with_extension("pack");
-        if !pack_path.exists() {
-            eprintln!("error: could not load pack");
-            return Err(GitError::Exit(1));
-        }
-        let index_bytes = fs::read(pack_dir.join(pack_name))?;
-        let force_large_offset = pack_index_has_large_offset_area(&index_bytes, format);
-        let index = PackIndex::parse_without_checksum(&index_bytes, format)?;
-        pack_object_counts[pack_int_id] = index.entries.len();
-        for entry in index.entries {
-            objects.push(MultiPackIndexEntry {
-                oid: entry.oid,
-                pack_int_id: pack_int_id as u32,
-                offset: entry.offset,
-                force_large_offset,
-            });
-        }
-    }
-
-    if write_bitmap && objects.is_empty() {
-        // Upstream refuses a multi-pack .bitmap over zero objects but still
-        // writes the midx itself.
-        eprintln!("warning: refusing to write multi-pack .bitmap without any objects");
-        write_bitmap = false;
-    }
-
-    // Preferred pack: explicit name, else (when writing a bitmap) the pack
-    // with the oldest mtime — it gets pseudo-pack priority so its objects
-    // lead the bit order.
-    let preferred_pack: Option<u32> = match &preferred_pack_name {
-        Some(name) => {
-            let normalized = name.strip_suffix(".pack").map(|stem| format!("{stem}.idx"));
-            match pack_names.iter().position(|pack_name| {
-                pack_name == name || Some(pack_name.as_str()) == normalized.as_deref()
-            }) {
-                Some(position) => {
-                    if pack_object_counts.get(position).copied().unwrap_or(0) == 0 {
-                        let pack_path = pack_dir.join(&pack_names[position]).with_extension("pack");
-                        eprintln!(
-                            "error: cannot select preferred pack {} with no objects",
-                            pack_path.display()
-                        );
-                        return Err(GitError::Exit(255));
-                    }
-                    Some(position as u32)
-                }
-                None => {
-                    eprintln!("warning: unknown preferred pack: '{name}'");
-                    write_bitmap.then_some(0)
-                }
-            }
-        }
-        None if write_bitmap => {
-            let mut preferred = 0u32;
-            let mut oldest: Option<std::time::SystemTime> = None;
-            for pack_int_id in 0..pack_names.len() as u32 {
-                let mtime = pack_mtime(pack_int_id);
-                if oldest.is_none_or(|current| mtime < current) {
-                    oldest = Some(mtime);
-                    preferred = pack_int_id;
-                }
-            }
-            Some(preferred)
-        }
-        None => None,
-    };
-
-    // Duplicate resolution across packs (upstream midx_oid_compare): keep the
-    // copy from the preferred pack, else the newest pack, else the lowest
-    // pack id.
-    objects.sort_by(|left, right| {
-        left.oid
-            .as_bytes()
-            .cmp(right.oid.as_bytes())
-            .then_with(|| {
-                let left_preferred = Some(left.pack_int_id) == preferred_pack;
-                let right_preferred = Some(right.pack_int_id) == preferred_pack;
-                right_preferred.cmp(&left_preferred)
+    let write_reverse_index = write_bitmap
+        && env::var("GIT_TEST_MIDX_WRITE_REV").is_ok_and(|value| value == "1" || value == "true");
+    let layer = build_midx_layer(
+        sley_odb::MultiPackIndexLayerOptions {
+            object_dir: object_dir.clone(),
+            format,
+            version: 1,
+            pack_names,
+            excluded_oids: HashSet::new(),
+            write_bitmap,
+            preferred_pack_name,
+            skip_if_unchanged: true,
+        },
+        |db| {
+            Ok(sley_odb::MultiPackIndexBitmapInputs {
+                preferred_tips: midx_bitmap_tips(&git_dir, db, format, refs_snapshot.as_deref())?,
+                pseudo_merge_groups: repack_pseudo_merge_groups(&git_dir, db, format)?,
+                write_lookup_table: write_bitmap_lookup_table,
+                write_hash_cache: write_bitmap_hash_cache,
+                restrict_to_tips: refs_snapshot.is_some(),
+                write_reverse_index,
+                missing_closure: sley_odb::MissingMidxBitmapPolicy::Error,
             })
-            .then_with(|| pack_mtime(right.pack_int_id).cmp(&pack_mtime(left.pack_int_id)))
-            .then_with(|| left.pack_int_id.cmp(&right.pack_int_id))
-    });
-    objects.dedup_by(|next, kept| next.oid == kept.oid);
-
-    let bitmapped_packs = write_bitmap.then(|| {
-        midx_bitmapped_pack_ranges(pack_names.len(), &objects, preferred_pack.unwrap_or(0))
-    });
-
-    let midx = MultiPackIndex::write_with_bitmap_packs(
-        format,
-        1,
-        &pack_names,
-        &objects,
-        write_bitmap.then(|| preferred_pack.unwrap_or(0)),
-        bitmapped_packs.as_deref(),
+        },
     )?;
-    let midx_checksum = ObjectId::from_raw(format, &midx[midx.len() - format.raw_len()..])?;
-    let bitmap_name = format!("multi-pack-index-{}.bitmap", midx_checksum.to_hex());
-    if fs::read(pack_dir.join("multi-pack-index")).is_ok_and(|existing| existing == midx)
-        && (!write_bitmap || pack_dir.join(&bitmap_name).exists())
-    {
+    if layer.unchanged {
         return Ok(());
     }
+    let midx_checksum = layer.checksum;
+    let bitmap_name = format!("multi-pack-index-{midx_checksum}.bitmap");
 
-    // Build the bitmap BEFORE the midx lands on disk: a closure failure must
-    // abort the whole write (upstream dies and leaves no midx behind),
-    // unlike repack's warn-and-continue.
-    let bitmap = if write_bitmap {
-        let db = FileObjectDatabase::new(object_dir.clone(), format);
-        let tips = midx_bitmap_tips(&git_dir, &db, format, refs_snapshot.as_deref())?;
-        let pseudo_merge_groups = repack_pseudo_merge_groups(&git_dir, &db, format)?;
-        let preferred_pack = preferred_pack.unwrap_or(0);
-        let name_hash_cache = if write_bitmap_hash_cache {
-            Some(midx_bitmap_name_hash_cache(
-                &pack_dir,
-                &pack_names,
-                &objects,
-                format,
-            )?)
-        } else {
-            None
-        };
-        match sley_odb::build_midx_bitmap_with_options(
-            &db,
-            format,
-            &objects,
-            &midx_checksum,
-            preferred_pack,
-            &tips,
-            &pseudo_merge_groups,
-            &sley_odb::ReachabilityBitmapOptions {
-                write_lookup_table: write_bitmap_lookup_table,
-                name_hash_cache,
-                restrict_to_tips: refs_snapshot.is_some(),
-            },
-        )? {
-            Some(bitmap) => Some(bitmap),
-            None => {
-                eprintln!("fatal: could not write multi-pack bitmap");
-                return Err(GitError::Exit(1));
-            }
-        }
-    } else {
-        None
-    };
-
-    fs::write(pack_dir.join("multi-pack-index"), &midx)?;
+    // The engine constructs every dependent artifact before the MIDX lands;
+    // a bitmap closure failure therefore leaves no partially updated index.
+    fs::write(pack_dir.join("multi-pack-index"), &layer.midx)?;
     remove_incremental_midx_dir(&pack_dir)?;
 
-    // GIT_TEST_MIDX_WRITE_REV=1 (t5327): additionally write the bit-order
-    // permutation as a separate `multi-pack-index-<checksum>.rev` file, the
-    // way upstream's write_midx_reverse_index does alongside the RIDX chunk.
-    let rev_name = format!("multi-pack-index-{}.rev", midx_checksum.to_hex());
-    let write_rev_file = write_bitmap
-        && env::var("GIT_TEST_MIDX_WRITE_REV").is_ok_and(|value| value == "1" || value == "true");
-    if write_rev_file {
-        let mut pseudo: Vec<u32> = (0..objects.len() as u32).collect();
-        let preferred = preferred_pack.unwrap_or(0);
-        pseudo.sort_by_key(|&midx_pos| {
-            let object = &objects[midx_pos as usize];
-            (
-                object.pack_int_id != preferred,
-                object.pack_int_id,
-                object.offset,
-            )
-        });
-        let rev_bytes = PackReverseIndex::write(format, &pseudo, &midx_checksum)?;
-        fs::write(pack_dir.join(&rev_name), &rev_bytes)?;
+    let rev_name = format!("multi-pack-index-{midx_checksum}.rev");
+    if let Some(reverse_index) = &layer.reverse_index {
+        fs::write(pack_dir.join(&rev_name), reverse_index)?;
     }
 
     // Clear midx bitmap/rev sidecars that don't belong to this write: stale
@@ -6589,14 +6438,14 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
         };
         if name.starts_with("multi-pack-index-")
             && (name.ends_with(".bitmap") || name.ends_with(".rev"))
-            && (!write_bitmap || name != bitmap_name)
-            && (!write_rev_file || name != rev_name)
+            && (!layer.wrote_bitmap || name != bitmap_name)
+            && (layer.reverse_index.is_none() || name != rev_name)
         {
             let _ = fs::remove_file(&path);
         }
     }
 
-    if let Some(bitmap) = bitmap {
+    if let Some(bitmap) = layer.bitmap {
         if write_bitmap_lookup_table {
             sley_core::trace2::region("pack-bitmap-write", "writing_lookup_table");
         }
@@ -6608,43 +6457,47 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn midx_bitmap_name_hash_cache(
-    pack_dir: &Path,
-    pack_names: &[String],
-    objects: &[MultiPackIndexEntry],
-    format: ObjectFormat,
-) -> Result<Vec<u32>> {
-    let mut by_oid = HashMap::new();
-    for pack_name in pack_names {
-        let index_path = pack_dir.join(pack_name);
-        let bitmap_path = index_path.with_extension("bitmap");
-        let Ok(index_bytes) = fs::read(&index_path) else {
-            continue;
-        };
-        let Ok(index) = PackIndex::parse_without_checksum(&index_bytes, format) else {
-            continue;
-        };
-        let Ok(bitmap_bytes) = fs::read(bitmap_path) else {
-            continue;
-        };
-        let Ok(bitmap) =
-            sley_pack::PackBitmapIndex::parse(&bitmap_bytes, format, index.entries.len())
-        else {
-            continue;
-        };
-        let Some(cache) = bitmap.name_hash_cache else {
-            continue;
-        };
-        let mut entries = index.entries;
-        entries.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
-        for (entry, hash) in entries.into_iter().zip(cache) {
-            by_oid.entry(entry.oid).or_insert(hash);
+fn build_midx_layer<F>(
+    options: sley_odb::MultiPackIndexLayerOptions,
+    bitmap_inputs: F,
+) -> Result<sley_odb::MultiPackIndexLayerOutcome>
+where
+    F: FnOnce(&FileObjectDatabase) -> Result<sley_odb::MultiPackIndexBitmapInputs>,
+{
+    sley_odb::build_multi_pack_index_layer(options, bitmap_inputs, render_midx_event)
+        .map_err(render_midx_error)
+}
+
+fn render_midx_event(event: sley_odb::MultiPackIndexEvent) {
+    match event {
+        sley_odb::MultiPackIndexEvent::UnknownPreferredPack(name) => {
+            eprintln!("warning: unknown preferred pack: '{name}'");
+        }
+        sley_odb::MultiPackIndexEvent::RefusingEmptyBitmap => {
+            eprintln!("warning: refusing to write multi-pack .bitmap without any objects");
         }
     }
-    Ok(objects
-        .iter()
-        .map(|entry| by_oid.get(&entry.oid).copied().unwrap_or(0))
-        .collect())
+}
+
+fn render_midx_error(err: sley_odb::MultiPackIndexLayerError) -> GitError {
+    match err {
+        sley_odb::MultiPackIndexLayerError::Source(err) => err,
+        sley_odb::MultiPackIndexLayerError::CouldNotLoadPack => {
+            eprintln!("error: could not load pack");
+            GitError::Exit(1)
+        }
+        sley_odb::MultiPackIndexLayerError::EmptyPreferredPack(path) => {
+            eprintln!(
+                "error: cannot select preferred pack {} with no objects",
+                path.display()
+            );
+            GitError::Exit(255)
+        }
+        sley_odb::MultiPackIndexLayerError::BitmapUnavailable => {
+            eprintln!("fatal: could not write multi-pack bitmap");
+            GitError::Exit(1)
+        }
+    }
 }
 
 struct MidxWriteIncremental<'a> {
@@ -6708,7 +6561,6 @@ fn cmd_multi_pack_index_write_incremental(options: MidxWriteIncremental<'_>) -> 
     let layer = build_midx_layer_from_packs(
         options.git_dir,
         options.object_dir,
-        options.pack_dir,
         options.format,
         pack_names,
         &chained_oids,
@@ -6755,202 +6607,44 @@ struct BuiltMidxLayer {
 fn build_midx_layer_from_packs(
     git_dir: &Path,
     object_dir: &Path,
-    pack_dir: &Path,
     format: ObjectFormat,
     pack_names: Vec<String>,
     excluded_oids: &HashSet<ObjectId>,
-    mut write_bitmap: bool,
+    write_bitmap: bool,
     preferred_pack_name: Option<&str>,
     refs_snapshot: Option<&Path>,
     version: u8,
 ) -> Result<BuiltMidxLayer> {
-    let pack_mtimes: Vec<std::time::SystemTime> = pack_names
-        .iter()
-        .map(|name| {
-            fs::metadata(pack_dir.join(name).with_extension("pack"))
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(std::time::UNIX_EPOCH)
-        })
-        .collect();
-    let pack_mtime = |pack_int_id: u32| -> std::time::SystemTime {
-        pack_mtimes
-            .get(pack_int_id as usize)
-            .copied()
-            .unwrap_or(std::time::UNIX_EPOCH)
-    };
-
-    let mut objects = Vec::new();
-    let mut pack_object_counts = vec![0usize; pack_names.len()];
-    for (pack_int_id, pack_name) in pack_names.iter().enumerate() {
-        let pack_path = pack_dir.join(pack_name).with_extension("pack");
-        if !pack_path.exists() {
-            eprintln!("error: could not load pack");
-            return Err(GitError::Exit(1));
-        }
-        let index_bytes = fs::read(pack_dir.join(pack_name))?;
-        let force_large_offset = pack_index_has_large_offset_area(&index_bytes, format);
-        let index = PackIndex::parse_without_checksum(&index_bytes, format)?;
-        pack_object_counts[pack_int_id] = index.entries.len();
-        for entry in index.entries {
-            if excluded_oids.contains(&entry.oid) {
-                continue;
-            }
-            objects.push(MultiPackIndexEntry {
-                oid: entry.oid,
-                pack_int_id: pack_int_id as u32,
-                offset: entry.offset,
-                force_large_offset,
-            });
-        }
-    }
-
-    if write_bitmap && objects.is_empty() {
-        eprintln!("warning: refusing to write multi-pack .bitmap without any objects");
-        write_bitmap = false;
-    }
-
-    let preferred_pack = match preferred_pack_name {
-        Some(name) => {
-            let normalized = name.strip_suffix(".pack").map(|stem| format!("{stem}.idx"));
-            match pack_names.iter().position(|pack_name| {
-                pack_name == name || Some(pack_name.as_str()) == normalized.as_deref()
-            }) {
-                Some(position) => {
-                    if pack_object_counts.get(position).copied().unwrap_or(0) == 0 {
-                        let pack_path = pack_dir.join(&pack_names[position]).with_extension("pack");
-                        eprintln!(
-                            "error: cannot select preferred pack {} with no objects",
-                            pack_path.display()
-                        );
-                        return Err(GitError::Exit(255));
-                    }
-                    Some(position as u32)
-                }
-                None => {
-                    eprintln!("warning: unknown preferred pack: '{name}'");
-                    write_bitmap.then_some(0)
-                }
-            }
-        }
-        None if write_bitmap => {
-            let mut preferred = 0u32;
-            let mut oldest: Option<std::time::SystemTime> = None;
-            for pack_int_id in 0..pack_names.len() as u32 {
-                let mtime = pack_mtime(pack_int_id);
-                if oldest.is_none_or(|current| mtime < current) {
-                    oldest = Some(mtime);
-                    preferred = pack_int_id;
-                }
-            }
-            Some(preferred)
-        }
-        None => None,
-    };
-
-    objects.sort_by(|left, right| {
-        left.oid
-            .as_bytes()
-            .cmp(right.oid.as_bytes())
-            .then_with(|| {
-                let left_preferred = Some(left.pack_int_id) == preferred_pack;
-                let right_preferred = Some(right.pack_int_id) == preferred_pack;
-                right_preferred.cmp(&left_preferred)
-            })
-            .then_with(|| pack_mtime(right.pack_int_id).cmp(&pack_mtime(left.pack_int_id)))
-            .then_with(|| left.pack_int_id.cmp(&right.pack_int_id))
-    });
-    objects.dedup_by(|next, kept| next.oid == kept.oid);
-
-    write_midx_layer_bytes(
-        git_dir,
-        object_dir,
-        format,
-        version,
-        pack_names,
-        objects,
-        write_bitmap,
-        preferred_pack,
-        refs_snapshot,
-    )
-}
-
-fn write_midx_layer_bytes(
-    git_dir: &Path,
-    object_dir: &Path,
-    format: ObjectFormat,
-    version: u8,
-    pack_names: Vec<String>,
-    objects: Vec<MultiPackIndexEntry>,
-    write_bitmap: bool,
-    preferred_pack: Option<u32>,
-    refs_snapshot: Option<&Path>,
-) -> Result<BuiltMidxLayer> {
-    let bitmapped_packs = write_bitmap.then(|| {
-        if version == 2 {
-            incremental_compact_bitmapped_pack_ranges(pack_names.len(), &objects)
-        } else {
-            midx_bitmapped_pack_ranges(pack_names.len(), &objects, preferred_pack.unwrap_or(0))
-        }
-    });
-    let midx = MultiPackIndex::write_with_bitmap_packs(
-        format,
-        version,
-        &pack_names,
-        &objects,
-        write_bitmap.then(|| preferred_pack.unwrap_or(0)),
-        bitmapped_packs.as_deref(),
-    )?;
-    let checksum = ObjectId::from_raw(format, &midx[midx.len() - format.raw_len()..])?;
-
-    let bitmap = if write_bitmap {
-        let db = FileObjectDatabase::new(object_dir.to_path_buf(), format);
-        let tips = midx_bitmap_tips(git_dir, &db, format, refs_snapshot)?;
-        let pseudo_merge_groups = repack_pseudo_merge_groups(git_dir, &db, format)?;
-        match sley_odb::build_midx_bitmap(
-            &db,
+    let write_reverse_index = write_bitmap
+        && env::var("GIT_TEST_MIDX_WRITE_REV").is_ok_and(|value| value == "1" || value == "true");
+    let outcome = build_midx_layer(
+        sley_odb::MultiPackIndexLayerOptions {
+            object_dir: object_dir.to_path_buf(),
             format,
-            &objects,
-            &checksum,
-            preferred_pack.unwrap_or(0),
-            &tips,
-            &pseudo_merge_groups,
-        )? {
-            Some(bitmap) => Some(bitmap),
-            None => Some(write_empty_midx_bitmap(
-                &db,
-                format,
-                &objects,
-                &checksum,
-                preferred_pack,
-            )?),
-        }
-    } else {
-        None
-    };
-
-    let rev = if write_bitmap
-        && env::var("GIT_TEST_MIDX_WRITE_REV").is_ok_and(|value| value == "1" || value == "true")
-    {
-        let mut pseudo: Vec<u32> = (0..objects.len() as u32).collect();
-        let preferred = preferred_pack.unwrap_or(0);
-        pseudo.sort_by_key(|&midx_pos| {
-            let object = &objects[midx_pos as usize];
-            (
-                object.pack_int_id != preferred,
-                object.pack_int_id,
-                object.offset,
-            )
-        });
-        Some(PackReverseIndex::write(format, &pseudo, &checksum)?)
-    } else {
-        None
-    };
-
+            version,
+            pack_names,
+            excluded_oids: excluded_oids.clone(),
+            write_bitmap,
+            preferred_pack_name: preferred_pack_name.map(ToString::to_string),
+            skip_if_unchanged: false,
+        },
+        |db| {
+            Ok(sley_odb::MultiPackIndexBitmapInputs {
+                preferred_tips: midx_bitmap_tips(git_dir, db, format, refs_snapshot)?,
+                pseudo_merge_groups: repack_pseudo_merge_groups(git_dir, db, format)?,
+                write_lookup_table: false,
+                write_hash_cache: false,
+                restrict_to_tips: false,
+                write_reverse_index,
+                missing_closure: sley_odb::MissingMidxBitmapPolicy::WriteEmpty,
+            })
+        },
+    )?;
     Ok(BuiltMidxLayer {
-        checksum: checksum.to_hex(),
-        midx,
-        bitmap,
-        rev,
+        checksum: outcome.checksum.to_hex(),
+        midx: outcome.midx,
+        bitmap: outcome.bitmap,
+        rev: outcome.reverse_index,
     })
 }
 
@@ -6978,34 +6672,6 @@ fn midx_bitmap_tips(
         tips.insert(commit);
     }
     Ok(tips)
-}
-
-fn write_empty_midx_bitmap(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    objects: &[MultiPackIndexEntry],
-    checksum: &ObjectId,
-    preferred_pack: Option<u32>,
-) -> Result<Vec<u8>> {
-    let preferred = preferred_pack.unwrap_or(0);
-    let mut pseudo: Vec<usize> = (0..objects.len()).collect();
-    pseudo.sort_by_key(|&midx_pos| {
-        let object = &objects[midx_pos];
-        (
-            object.pack_int_id != preferred,
-            object.pack_int_id,
-            object.offset,
-        )
-    });
-    let mut object_types = Vec::with_capacity(objects.len());
-    for midx_pos in pseudo {
-        let oid = objects[midx_pos].oid;
-        let (object_type, _size) = db.read_object_header(&oid)?.ok_or_else(|| {
-            GitError::InvalidFormat(format!("object {oid} missing while writing bitmap"))
-        })?;
-        object_types.push(object_type);
-    }
-    PackBitmapWriter::new(format, *checksum, &object_types)?.write()
 }
 
 fn install_incremental_midx_layer(
@@ -7295,17 +6961,37 @@ fn cmd_multi_pack_index_compact(args: &[String]) -> Result<()> {
     objects.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
     objects.dedup_by(|next, kept| next.oid == kept.oid);
 
-    let compacted = write_midx_layer_bytes(
-        &git_dir,
-        &object_dir,
-        format,
-        2,
-        pack_names,
-        objects,
-        write_bitmap,
-        write_bitmap.then_some(0),
-        None,
-    )?;
+    let write_reverse_index = write_bitmap
+        && env::var("GIT_TEST_MIDX_WRITE_REV").is_ok_and(|value| value == "1" || value == "true");
+    let compacted = sley_odb::build_multi_pack_index_layer_from_entries(
+        sley_odb::MultiPackIndexEntryLayerOptions {
+            object_dir: object_dir.clone(),
+            format,
+            version: 2,
+            pack_names,
+            objects,
+            write_bitmap,
+            preferred_pack: write_bitmap.then_some(0),
+        },
+        |db| {
+            Ok(sley_odb::MultiPackIndexBitmapInputs {
+                preferred_tips: midx_bitmap_tips(&git_dir, db, format, None)?,
+                pseudo_merge_groups: repack_pseudo_merge_groups(&git_dir, db, format)?,
+                write_lookup_table: false,
+                write_hash_cache: false,
+                restrict_to_tips: false,
+                write_reverse_index,
+                missing_closure: sley_odb::MissingMidxBitmapPolicy::WriteEmpty,
+            })
+        },
+    )
+    .map_err(render_midx_error)?;
+    let compacted = BuiltMidxLayer {
+        checksum: compacted.checksum.to_hex(),
+        midx: compacted.midx,
+        bitmap: compacted.bitmap,
+        rev: compacted.reverse_index,
+    };
     install_incremental_midx_layer(&pack_dir, format, &compacted)?;
 
     let old: HashSet<String> = chain[from_idx..=to_idx].iter().cloned().collect();
@@ -7328,84 +7014,6 @@ fn cmd_multi_pack_index_compact(args: &[String]) -> Result<()> {
     }
     clear_incremental_midx_sidecars(&pack_dir, format)?;
     Ok(())
-}
-
-fn midx_bitmapped_pack_ranges(
-    pack_count: usize,
-    objects: &[MultiPackIndexEntry],
-    preferred_pack: u32,
-) -> Vec<sley_pack::MultiPackBitmapPack> {
-    let mut ranges = vec![
-        sley_pack::MultiPackBitmapPack {
-            bitmap_pos: 0,
-            bitmap_nr: 0,
-        };
-        pack_count
-    ];
-    let mut pseudo: Vec<usize> = (0..objects.len()).collect();
-    pseudo.sort_by_key(|&midx_pos| {
-        let object = &objects[midx_pos];
-        (
-            object.pack_int_id != preferred_pack,
-            object.pack_int_id,
-            object.offset,
-        )
-    });
-    for (bitmap_pos, midx_pos) in pseudo.into_iter().enumerate() {
-        let pack = &mut ranges[objects[midx_pos].pack_int_id as usize];
-        if pack.bitmap_nr == 0 {
-            pack.bitmap_pos = bitmap_pos as u32;
-        }
-        pack.bitmap_nr += 1;
-    }
-    ranges
-}
-
-fn incremental_compact_bitmapped_pack_ranges(
-    pack_count: usize,
-    objects: &[MultiPackIndexEntry],
-) -> Vec<sley_pack::MultiPackBitmapPack> {
-    let mut ranges = vec![
-        sley_pack::MultiPackBitmapPack {
-            bitmap_pos: 0,
-            bitmap_nr: 0,
-        };
-        pack_count
-    ];
-    for object in objects {
-        if let Some(pack) = ranges.get_mut(object.pack_int_id as usize) {
-            pack.bitmap_nr += 1;
-        }
-    }
-    ranges
-}
-
-fn pack_index_has_large_offset_area(bytes: &[u8], format: ObjectFormat) -> bool {
-    let hash_len = format.raw_len();
-    if bytes.len() < 8 + 256 * 4 + 2 * hash_len || bytes.get(..4) != Some(&[0xff, b't', b'O', b'c'])
-    {
-        return false;
-    }
-    let count = {
-        let start = 8 + 255 * 4;
-        u32::from_be_bytes([
-            bytes[start],
-            bytes[start + 1],
-            bytes[start + 2],
-            bytes[start + 3],
-        ]) as usize
-    };
-    let Some(after_oids) = (8usize + 256 * 4).checked_add(count.saturating_mul(hash_len)) else {
-        return false;
-    };
-    let Some(after_crc) = after_oids.checked_add(count.saturating_mul(4)) else {
-        return false;
-    };
-    let Some(after_small_offsets) = after_crc.checked_add(count.saturating_mul(4)) else {
-        return false;
-    };
-    let trailer_start = bytes.len().saturating_sub(2 * hash_len);
-    after_small_offsets < trailer_start
 }
 
 /// Scan `<object_dir>/pack` for `.idx` files and write a fresh, non-bitmap

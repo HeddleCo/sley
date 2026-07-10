@@ -59,8 +59,11 @@ impl PatchRecord {
     }
 }
 
-pub(crate) fn cmd_range_diff(args: &[String]) -> Result<()> {
-    let repo = RepositoryContext::discover_current()?;
+pub(crate) fn cmd_range_diff(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let repo = RepositoryContext::from_session(cli_session)?;
     let mut options = default_options(&repo)?;
     let parsed = parse_range_diff_args(&repo, args, &mut options)?;
     if options.left_only && options.right_only {

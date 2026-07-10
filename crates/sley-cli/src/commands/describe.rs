@@ -100,7 +100,10 @@ pub(crate) fn describe_for_format(
     }
 }
 
-pub(crate) fn cmd_describe(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_describe(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut options = DescribeOptions::default();
     let mut commits: Vec<String> = Vec::new();
     let mut positional_only = false;
@@ -197,7 +200,7 @@ pub(crate) fn cmd_describe(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     if options.contains {
-        return describe_contains(&options, &commits);
+        return describe_contains(cli_session, &options, &commits);
     }
     if options.dirty.is_some() && !commits.is_empty() {
         eprintln!("fatal: option '--dirty' and commit-ishes cannot be used together");
@@ -208,10 +211,11 @@ pub(crate) fn cmd_describe(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let repo = RepositoryContext::discover_current()?;
-    let git_dir = repo.git_dir();
-    let format = repo.format();
-    let db = repo.objects();
+    let repo = RepositoryContext::from_session(cli_session)?;
+    let repository = repo.repository();
+    let git_dir = repository.git_dir();
+    let format = repository.object_format();
+    let db = repository.object_database();
 
     // Resolve the effective abbreviation length once: an unset/`--abbrev`
     // sentinel falls back to the repository's `core.abbrev` (default 7).
@@ -487,7 +491,11 @@ fn describe_ref_names(refname: &str, options: &DescribeOptions) -> Option<Descri
 /// `name-rev --peel-tag --name-only --no-undefined`, with tag-only filtering
 /// unless `--all` was requested. Keep that route so the two commands share the
 /// same naming walk and exact-tag handling.
-fn describe_contains(options: &DescribeOptions, commits: &[String]) -> Result<()> {
+fn describe_contains(
+    cli_session: &crate::session::CliSession,
+    options: &DescribeOptions,
+    commits: &[String],
+) -> Result<()> {
     let mut args = vec![
         "--peel-tag".to_string(),
         "--name-only".to_string(),
@@ -520,7 +528,7 @@ fn describe_contains(options: &DescribeOptions, commits: &[String]) -> Result<()
     } else {
         args.extend(commits.iter().cloned());
     }
-    crate::commands::name_rev::cmd_name_rev(&args)
+    crate::commands::name_rev::cmd_name_rev(cli_session, &args)
 }
 
 fn describe_ref_passes_filters(match_name: &str, options: &DescribeOptions) -> bool {

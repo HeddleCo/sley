@@ -20,6 +20,90 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Match a refname component against Git's ref-filter wildcard rules.
+///
+/// `*` spans slashes, `?` matches one byte, bracket classes and backslash
+/// escapes are supported, and malformed bracket classes treat `[` literally.
+pub fn refname_pattern_matches_case(pattern: &str, name: &str, ignore_case: bool) -> bool {
+    fn matches_from(pattern: &[u8], name: &[u8]) -> bool {
+        match pattern {
+            [] => name.is_empty(),
+            [b'*', rest @ ..] => {
+                matches_from(rest, name) || (!name.is_empty() && matches_from(pattern, &name[1..]))
+            }
+            [b'?', rest @ ..] => !name.is_empty() && matches_from(rest, &name[1..]),
+            [b'\\', escaped, rest @ ..] => {
+                matches!(name, [first, ..] if first == escaped) && matches_from(rest, &name[1..])
+            }
+            [b'[', rest @ ..] => {
+                if let Some((matched, consumed)) =
+                    match_refname_pattern_class(rest, name.first().copied())
+                {
+                    !name.is_empty() && matched && matches_from(&rest[consumed..], &name[1..])
+                } else {
+                    matches!(name, [b'[', ..]) && matches_from(rest, &name[1..])
+                }
+            }
+            [literal, rest @ ..] => {
+                matches!(name, [first, ..] if first == literal) && matches_from(rest, &name[1..])
+            }
+        }
+    }
+
+    if ignore_case {
+        let pattern = pattern
+            .as_bytes()
+            .iter()
+            .map(u8::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        let name = name
+            .as_bytes()
+            .iter()
+            .map(u8::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        matches_from(&pattern, &name)
+    } else {
+        matches_from(pattern.as_bytes(), name.as_bytes())
+    }
+}
+
+fn match_refname_pattern_class(class: &[u8], name: Option<u8>) -> Option<(bool, usize)> {
+    let mut idx = 0;
+    let negated = matches!(class.first(), Some(b'!' | b'^'));
+    if negated {
+        idx += 1;
+    }
+
+    let mut matched = false;
+    let mut saw_member = false;
+    while idx < class.len() {
+        if class[idx] == b']' && saw_member {
+            return Some((if negated { !matched } else { matched }, idx + 1));
+        }
+        let start = class[idx];
+        if start == b'\\' && idx + 1 < class.len() {
+            idx += 1;
+        }
+        let start = class[idx];
+        saw_member = true;
+        if idx + 2 < class.len() && class[idx + 1] == b'-' && class[idx + 2] != b']' {
+            let mut end_idx = idx + 2;
+            if class[end_idx] == b'\\' && end_idx + 1 < class.len() {
+                end_idx += 1;
+            }
+            let end = class[end_idx];
+            if let Some(value) = name {
+                matched |= start <= value && value <= end;
+            }
+            idx = end_idx + 1;
+        } else {
+            matched |= name == Some(start);
+            idx += 1;
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefTarget {
     Direct(ObjectId),
@@ -6414,6 +6498,23 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn refname_patterns_match_git_wildcards_and_case_policy() {
+        assert!(refname_pattern_matches_case(
+            "release/*",
+            "release/1",
+            false
+        ));
+        assert!(refname_pattern_matches_case("V[1-3].?", "v2.0", true));
+        assert!(!refname_pattern_matches_case("V[1-3].?", "v2.0", false));
+        assert!(refname_pattern_matches_case(
+            r"release\*",
+            "release*",
+            false
+        ));
+        assert!(refname_pattern_matches_case("release[", "release[", false));
+    }
 
     #[test]
     fn core_fsync_reference_component_matches_git_groups_and_negation() {

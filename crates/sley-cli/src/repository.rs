@@ -10,9 +10,9 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use sley::GitConfig;
 use sley::ObjectDatabase as FileObjectDatabase;
 use sley::RefStore as FileRefStore;
+use sley::{GitConfig, OpenOptions, Repository};
 use sley::{ObjectFormat, Result};
 
 use crate::{
@@ -22,41 +22,54 @@ use crate::{
 
 pub(crate) struct RepositoryContext {
     cwd: PathBuf,
-    git_dir: PathBuf,
-    format: ObjectFormat,
+    repository: Repository,
     config: GitConfig,
-    objects: FileObjectDatabase,
     refs: FileRefStore,
     worktree_root: OnceLock<PathBuf>,
     abbrev: OnceLock<Option<usize>>,
 }
 
 impl RepositoryContext {
+    /// Open the invocation repository without consulting compatibility globals.
+    pub(crate) fn from_session(cli_session: &session::CliSession) -> Result<Self> {
+        Self::from_git_dir_and_cwd(
+            cli_session.git_dir()?,
+            cli_session.cwd().to_path_buf(),
+            cli_session.replace_objects(),
+        )
+    }
+
     pub(crate) fn discover_current() -> Result<Self> {
-        let cwd = session::cli_session()
-            .map(|session| session.cwd)
-            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self::discover(cwd)
     }
 
     pub(crate) fn discover(cwd: impl AsRef<Path>) -> Result<Self> {
         let cwd = cwd.as_ref().to_path_buf();
         let git_dir = session::cli_git_dir_from(&cwd)?;
-        Self::from_git_dir_and_cwd(git_dir, cwd)
+        let replace_objects = session::cli_session()
+            .map(|session| session.replace_objects())
+            .unwrap_or(true);
+        Self::from_git_dir_and_cwd(git_dir, cwd, replace_objects)
     }
 
-    fn from_git_dir_and_cwd(git_dir: PathBuf, cwd: PathBuf) -> Result<Self> {
-        let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-        let format = repository_object_format(&common_git_dir)?;
+    fn from_git_dir_and_cwd(git_dir: PathBuf, cwd: PathBuf, replace_objects: bool) -> Result<Self> {
         let config = read_repo_config(&git_dir)?;
-        let refs = FileRefStore::new(&git_dir, format);
-        let objects = open_object_database(&git_dir, format)?;
+        let use_replace_refs = config
+            .get_bool("core", None, "useReplaceRefs")
+            .unwrap_or(true);
+        let repository = Repository::open_with(
+            &git_dir,
+            OpenOptions::new()
+                .exact_path(true)
+                .replace_objects(replace_objects)
+                .effective_use_replace_refs(use_replace_refs),
+        )?;
+        let refs = repository.references();
         Ok(Self {
             cwd,
-            git_dir,
-            format,
+            repository,
             config,
-            objects,
             refs,
             worktree_root: OnceLock::new(),
             abbrev: OnceLock::new(),
@@ -67,12 +80,16 @@ impl RepositoryContext {
         &self.cwd
     }
 
+    pub(crate) fn repository(&self) -> &Repository {
+        &self.repository
+    }
+
     pub(crate) fn git_dir(&self) -> &Path {
-        &self.git_dir
+        self.repository.git_dir()
     }
 
     pub(crate) fn format(&self) -> ObjectFormat {
-        self.format
+        self.repository.object_format()
     }
 
     pub(crate) fn config(&self) -> &GitConfig {
@@ -80,7 +97,7 @@ impl RepositoryContext {
     }
 
     pub(crate) fn objects(&self) -> &FileObjectDatabase {
-        &self.objects
+        self.repository.object_database()
     }
 
     pub(crate) fn refs(&self) -> &FileRefStore {
@@ -91,7 +108,7 @@ impl RepositoryContext {
         if let Some(root) = self.worktree_root.get() {
             return Ok(root);
         }
-        let root = worktree_root_for_git_dir(&self.git_dir)?;
+        let root = worktree_root_for_git_dir(self.repository.git_dir())?;
         let _ = self.worktree_root.set(root);
         Ok(self
             .worktree_root
@@ -104,7 +121,7 @@ impl RepositoryContext {
         if let Some(abbrev) = self.abbrev.get() {
             return Ok(*abbrev);
         }
-        let abbrev = repository_abbrev(&self.git_dir, self.format)?;
+        let abbrev = repository_abbrev(self.repository.git_dir(), self.repository.object_format())?;
         let _ = self.abbrev.set(abbrev);
         Ok(*self
             .abbrev
@@ -113,17 +130,29 @@ impl RepositoryContext {
     }
 
     pub(crate) fn resolve_revision(&self, rev: &str) -> Result<sley_core::ObjectId> {
-        warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, rev);
+        warn_ambiguous_refname_for_object_prefix(
+            self.repository.git_dir(),
+            self.repository.object_format(),
+            rev,
+        );
         self.revision_resolver().resolve(rev)
     }
 
     pub(crate) fn resolve_path(&self, rev: &str, path: &str) -> Result<sley_rev::ResolvedTreePath> {
-        warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, rev);
+        warn_ambiguous_refname_for_object_prefix(
+            self.repository.git_dir(),
+            self.repository.object_format(),
+            rev,
+        );
         self.revision_resolver().resolve_path(rev, path)
     }
 
     pub(crate) fn revision_resolver(&self) -> sley_rev::RevisionResolver<'_, FileObjectDatabase> {
-        sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.objects)
+        sley_rev::RevisionResolver::new(
+            self.repository.git_dir(),
+            self.repository.object_format(),
+            self.repository.object_database(),
+        )
     }
 }
 

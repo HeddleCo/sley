@@ -37,7 +37,10 @@ struct FormatRevFormat {
     date_mode: &'static DateMode,
 }
 
-pub(crate) fn cmd_format_rev(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_format_rev(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = parse_format_rev_options(args)?;
     let Some(format) = options.format.as_deref() else {
         eprintln!("fatal: '--format' is required");
@@ -47,10 +50,11 @@ pub(crate) fn cmd_format_rev(args: &[String]) -> Result<()> {
         eprintln!("fatal: '--stdin-mode' is required");
         return Err(GitError::Exit(128));
     };
-    let repo = RepositoryContext::discover_current()?;
-    let git_dir = repo.git_dir();
-    let object_format = repo.format();
-    let db = repo.objects();
+    let repo = RepositoryContext::from_session(cli_session)?;
+    let repository = repo.repository();
+    let git_dir = repository.git_dir();
+    let object_format = repository.object_format();
+    let db = repository.object_database();
     let config = read_repo_config(git_dir)?;
     let abbrev_len = repository_abbrev(git_dir, object_format)?;
     let resolved = resolve_pretty_spec(format, true, &config)?;

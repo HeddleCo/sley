@@ -402,7 +402,7 @@ impl super::grep_args::GrepArgOptions for ShowOptions {
     }
 }
 
-pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_show(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let profile_enabled = show_profile_enabled();
     let profile_start = std::time::Instant::now();
     let mut profile_last = profile_start;
@@ -414,11 +414,12 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
         &mut profile_last,
     );
 
-    let repo = RepositoryContext::discover_current()?;
-    let git_dir = repo.git_dir();
-    let format = repo.format();
+    let repo = RepositoryContext::from_session(cli_session)?;
+    let repository = repo.repository();
+    let git_dir = repository.git_dir();
+    let format = repository.object_format();
     let config = repo.config();
-    let db = repo.objects();
+    let db = repository.object_database();
     show_profile_mark(
         profile_enabled,
         "discover",

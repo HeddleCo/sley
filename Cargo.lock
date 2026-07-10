@@ -1521,6 +1521,8 @@ dependencies = [
  "sley-pathspec",
  "sley-refs",
  "sley-rev",
+ "sley-unpack-trees",
+ "tempfile",
 ]
 
 [[package]]

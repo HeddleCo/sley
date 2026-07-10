@@ -216,15 +216,15 @@ impl CliSession {
     pub(crate) fn open_repository(&self) -> Result<Repository> {
         let git_dir = self.git_dir()?;
         let config = crate::read_repo_config(&git_dir)?;
-        let replace_objects = self.replace_objects()
-            && config
-                .get_bool("core", None, "useReplaceRefs")
-                .unwrap_or(true);
+        let use_replace_refs = config
+            .get_bool("core", None, "useReplaceRefs")
+            .unwrap_or(true);
         Repository::open_with(
             git_dir,
             OpenOptions::new()
                 .exact_path(true)
-                .replace_objects(replace_objects),
+                .replace_objects(self.replace_objects())
+                .effective_use_replace_refs(use_replace_refs),
         )
     }
 

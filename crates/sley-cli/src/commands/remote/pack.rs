@@ -806,11 +806,11 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             format,
             helper_remote,
             &refspecs,
-            super::helper::RemoteHelperPushOptions {
+            sley_remote::RemoteHelperPushOptions {
                 force: options.force,
-                quiet: options.quiet,
                 dry_run: options.dry_run,
             },
+            options.quiet,
         )?
         .is_some()
         {

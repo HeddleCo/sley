@@ -196,7 +196,10 @@ fn name_rev_option_specs() -> &'static [OptionSpec<'static>] {
     SPECS
 }
 
-pub(crate) fn cmd_name_rev(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_name_rev(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = setup_name_rev_options(args)?;
 
     // Upstream rejects mixing an explicit list with the whole-graph modes.
@@ -213,10 +216,11 @@ pub(crate) fn cmd_name_rev(args: &[String]) -> Result<()> {
         eprintln!("This option will be removed in a future release.");
     }
 
-    let repo = RepositoryContext::discover_current()?;
-    let git_dir = repo.git_dir();
-    let format = repo.format();
-    let db = repo.objects();
+    let repo = RepositoryContext::from_session(cli_session)?;
+    let repository = repo.repository();
+    let git_dir = repository.git_dir();
+    let format = repository.object_format();
+    let db = repository.object_database();
 
     let mut commit_cache = CommitMetadataCache::default();
     let tips = collect_tips(git_dir, format, db, &options, &mut commit_cache)?;
