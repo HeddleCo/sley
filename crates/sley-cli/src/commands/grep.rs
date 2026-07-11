@@ -693,6 +693,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
                 db,
                 config: repo.config(),
                 lazy_fetch: cli_session.lazy_fetch(),
+                replace_objects: cli_session.replace_objects(),
             },
             b"",
             &plan,
@@ -712,6 +713,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
                     common_dir: repo.git_dir(),
                     worktree_root: worktree_root.as_deref(),
                     lazy_fetch: cli_session.lazy_fetch(),
+                    replace_objects: cli_session.replace_objects(),
                 },
                 b"",
                 &plan,
@@ -1436,12 +1438,16 @@ fn submodule_name_to_gitdir(common_dir: &Path, name: &str) -> PathBuf {
 /// Open a submodule via its populated worktree gitlink (`<worktree>/.git`), as
 /// `grep_cache`'s recursion does. Returns `None` for an unpopulated/unresolvable
 /// gitlink.
-fn open_submodule_worktree(worktree_root: &Path, sub_rel: &[u8]) -> Option<OwnedSubrepo> {
+fn open_submodule_worktree(
+    worktree_root: &Path,
+    sub_rel: &[u8],
+    replace_objects: bool,
+) -> Option<OwnedSubrepo> {
     let sub_worktree = worktree_root.join(bytes_to_path(sub_rel));
     let git_dir = sley_diff_merge::gitlink_git_dir(&sub_worktree)?;
     let common = common_git_dir_for_git_dir(&git_dir).ok()?;
     let format = repository_object_format(&common).ok()?;
-    let db = FileObjectDatabase::from_git_dir(&common, format);
+    let db = crate::repository::open_object_database(&git_dir, format, replace_objects).ok()?;
     let config = read_repo_config(&git_dir).ok()?;
     Some(OwnedSubrepo {
         git_dir: common,
@@ -1464,6 +1470,7 @@ fn open_submodule_tree(
     common_dir: &Path,
     name: &str,
     path: &[u8],
+    replace_objects: bool,
 ) -> Option<OwnedSubrepo> {
     let sub_worktree = worktree_root.map(|root| root.join(bytes_to_path(path)));
     let git_dir = sub_worktree
@@ -1475,7 +1482,7 @@ fn open_submodule_tree(
         })?;
     let common = common_git_dir_for_git_dir(&git_dir).ok()?;
     let format = repository_object_format(&common).ok()?;
-    let db = FileObjectDatabase::from_git_dir(&common, format);
+    let db = crate::repository::open_object_database(&git_dir, format, replace_objects).ok()?;
     let config = read_repo_config(&git_dir).ok()?;
     Some(OwnedSubrepo {
         git_dir: common,
@@ -1590,6 +1597,7 @@ struct GrepIndexSource<'a> {
     db: &'a FileObjectDatabase,
     config: &'a GitConfig,
     lazy_fetch: bool,
+    replace_objects: bool,
 }
 
 fn grep_index_source(
@@ -1677,7 +1685,8 @@ fn grep_index_level(
         if mode == 0o160000 {
             if let Some(submodules) = &submodules
                 && submodule_active(source.config, submodules, &path)
-                && let Some(sub) = open_submodule_worktree(source.worktree_root, &path)
+                && let Some(sub) =
+                    open_submodule_worktree(source.worktree_root, &path, source.replace_objects)
                 && let Some(sub_worktree) = sub.worktree_root.as_deref()
             {
                 let sub_source = GrepIndexSource {
@@ -1687,6 +1696,7 @@ fn grep_index_level(
                     db: &sub.db,
                     config: &sub.config,
                     lazy_fetch: source.lazy_fetch,
+                    replace_objects: source.replace_objects,
                 };
                 let sub_prefix = submodule_prefix(prefix, &path);
                 let matched = grep_index_level(&sub_source, &sub_prefix, plan, out, printed_file)?;
@@ -1773,6 +1783,7 @@ struct GrepTreeSource<'a> {
     /// submodule's worktree.
     worktree_root: Option<&'a Path>,
     lazy_fetch: bool,
+    replace_objects: bool,
 }
 
 fn grep_tree_source(
@@ -1810,7 +1821,13 @@ fn grep_tree_level(
                 && let Ok(path_str) = std::str::from_utf8(path)
                 && let Some(name) = submodules.from_path(path_str).map(|m| m.name.clone())
                 && let Some(sub) =
-                    open_submodule_tree(source.worktree_root, source.common_dir, &name, path)
+                    open_submodule_tree(
+                        source.worktree_root,
+                        source.common_dir,
+                        &name,
+                        path,
+                        source.replace_objects,
+                    )
                 // A historical superproject tree can name a submodule commit
                 // omitted by `clone --also-filter-submodules`. Materialize the
                 // promised commit before peeling it; blob reads below retain
@@ -1827,6 +1844,7 @@ fn grep_tree_level(
                     common_dir: &sub.git_dir,
                     worktree_root: sub.worktree_root.as_deref(),
                     lazy_fetch: source.lazy_fetch,
+                    replace_objects: source.replace_objects,
                 };
                 let sub_prefix = submodule_prefix(prefix, path);
                 let matched = grep_tree_level(&sub_source, &sub_prefix, plan, out, printed_file)?;

@@ -38,7 +38,13 @@ fn git(cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) {
-    assert!(git(cwd, args).status.success(), "git {args:?} failed");
+    let output = git(cwd, args);
+    assert!(
+        output.status.success(),
+        "git {args:?} failed in {}:\n{}",
+        cwd.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn sley(cwd: &Path, args: &[&str]) -> Output {
@@ -400,5 +406,68 @@ fn grep_historical_partial_submodule_lazy_fetch_matches_git() {
         String::from_utf8_lossy(&actual_grep.stdout),
         "HEAD^:sub/sub-file:Some content for sub-file\nHEAD^:super-file:Some content for super-file\n"
     );
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn grep_recursive_submodule_replace_config_is_repository_scoped() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("grep-submodule-replacements");
+    let repo = root.join("base");
+    let submodule = repo.join("sub");
+    git_ok(&root, &["init", "-q", repo.to_str().unwrap_or("base")]);
+    git_ok(&repo, &["init", "-q", submodule.to_str().unwrap_or("sub")]);
+    fs::write(repo.join("a"), "A\n").expect("write a");
+    fs::write(repo.join("b"), "B\n").expect("write b");
+    fs::write(submodule.join("c"), "C\n").expect("write c");
+    fs::write(submodule.join("d"), "D\n").expect("write d");
+    git_ok(&submodule, &["add", "c", "d"]);
+    git_ok(&submodule, &["commit", "-qm", "submodule files"]);
+    git_ok(
+        &repo,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "./sub",
+        ],
+    );
+    git_ok(&repo, &["add", "a", "b", "sub"]);
+    git_ok(&repo, &["commit", "-qm", "superproject files"]);
+
+    let object_id = |cwd: &Path, revision: &str| {
+        let output = git(cwd, &["rev-parse", revision]);
+        assert!(output.status.success(), "rev-parse {revision} failed");
+        String::from_utf8(output.stdout)
+            .expect("object id is utf8")
+            .trim()
+            .to_string()
+    };
+    let a = object_id(&repo, "HEAD:a");
+    let b = object_id(&repo, "HEAD:b");
+    let c = object_id(&submodule, "HEAD:c");
+    let d = object_id(&submodule, "HEAD:d");
+    git_ok(&repo, &["replace", &a, &b]);
+    git_ok(&submodule, &["replace", &c, &d]);
+
+    let grep_a = ["grep", "--cached", "--recurse-submodules", "A"];
+    let grep_c = ["grep", "--cached", "--recurse-submodules", "C"];
+    assert_same(&repo, &grep_a);
+    assert_same(&repo, &grep_c);
+
+    git_ok(&repo, &["config", "core.useReplaceRefs", "false"]);
+    assert_same(&repo, &grep_a);
+    assert_same(&repo, &grep_c);
+
+    git_ok(&submodule, &["config", "core.useReplaceRefs", "false"]);
+    assert_same(&repo, &grep_a);
+    assert_same(&repo, &grep_c);
+
+    git_ok(&repo, &["config", "--unset", "core.useReplaceRefs"]);
+    assert_same(&repo, &grep_a);
+    assert_same(&repo, &grep_c);
     fs::remove_dir_all(&root).ok();
 }
