@@ -495,6 +495,11 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
         eprintln!("fatal: the option '--also-filter-submodules' requires '--recurse-submodules'");
         return Err(GitError::Exit(128));
     }
+    let submodule_filter = if also_filter_submodules {
+        partial_clone_filter.as_deref()
+    } else {
+        None
+    };
     if bundle_uri.is_some() && (depth.is_some() || deepen_since.is_some() || !deepen_not.is_empty())
     {
         eprintln!(
@@ -716,6 +721,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
             bare,
             checkout,
             depth,
+            submodule_filter,
             quiet,
             &reference_alternates,
         );
@@ -763,6 +769,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
             bare,
             checkout,
             depth,
+            submodule_filter,
             quiet,
             &reference_alternates,
         );
@@ -810,6 +817,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
             bare,
             checkout,
             depth,
+            submodule_filter,
             quiet,
             &reference_alternates,
         );
@@ -1304,6 +1312,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
         bare,
         checkout,
         depth,
+        submodule_filter,
         quiet,
         &reference_alternates,
     )
@@ -1582,6 +1591,7 @@ fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Resu
         options.bare,
         options.checkout,
         options.depth,
+        None,
         options.quiet,
         options.submodules,
     )
@@ -3443,6 +3453,7 @@ fn recurse_clone_submodules(
     bare: bool,
     checkout: bool,
     depth: Option<u32>,
+    filter: Option<&str>,
     quiet: bool,
     references: &[CloneReferenceAlternate],
 ) -> Result<()> {
@@ -3528,6 +3539,9 @@ fn recurse_clone_submodules(
     command.arg("update").arg("--init").arg("--recursive");
     if let Some(depth) = depth {
         command.arg(format!("--depth={depth}"));
+    }
+    if let Some(filter) = filter {
+        command.arg(format!("--filter={filter}"));
     }
     // Restrict to the matched pathspecs (the all-case `.` forwards none).
     for value in pathspecs {

@@ -1511,12 +1511,13 @@ fn submodule_active(
         .collect();
     if !active_specs.is_empty() {
         return active_specs.iter().any(|spec| {
-            sley_pathspec::PathspecElement::parse(
-                spec.as_bytes(),
-                sley_pathspec::PathspecMatchMagic::default(),
-            )
-            .map(|element| element.matches_path(path))
-            .unwrap_or(false)
+            *spec == "."
+                || sley_pathspec::PathspecElement::parse(
+                    spec.as_bytes(),
+                    sley_pathspec::PathspecMatchMagic::default(),
+                )
+                .map(|element| element.matches_path(path))
+                .unwrap_or(false)
         });
     }
     config.get("submodule", Some(name), "url").is_some()
@@ -1733,7 +1734,8 @@ fn grep_index_level(
                 i = next(false, i);
                 continue;
             }
-            let object = read_object_maybe_prefetch_promisor(source.db, &oid, source.lazy_fetch)?;
+            let object =
+                grep_read_object_maybe_prefetch_promisor(source.db, &oid, source.lazy_fetch)?;
             Cow::Owned(object.body.to_vec())
         } else {
             let absolute = source.worktree_root.join(bytes_to_path(&path));
@@ -1809,6 +1811,11 @@ fn grep_tree_level(
                 && let Some(name) = submodules.from_path(path_str).map(|m| m.name.clone())
                 && let Some(sub) =
                     open_submodule_tree(source.worktree_root, source.common_dir, &name, path)
+                // A historical superproject tree can name a submodule commit
+                // omitted by `clone --also-filter-submodules`. Materialize the
+                // promised commit before peeling it; blob reads below retain
+                // their own lazy-fetch boundary.
+                && grep_read_object_maybe_prefetch_promisor(&sub.db, oid, source.lazy_fetch).is_ok()
                 && let Ok(sub_tree) = sley_rev::peel_to_tree(&sub.db, sub.format, oid)
             {
                 let sub_source = GrepTreeSource {
@@ -1837,7 +1844,7 @@ fn grep_tree_level(
             continue;
         }
         let display = plan.pathspec.display(&full);
-        let object = read_object_maybe_prefetch_promisor(source.db, oid, source.lazy_fetch)?;
+        let object = grep_read_object_maybe_prefetch_promisor(source.db, oid, source.lazy_fetch)?;
         let driver = grep_userdiff_driver(plan, &full)?;
         let funcname = driver.as_ref().and_then(|driver| driver.funcname.as_ref());
         let matched = grep_buffer(
@@ -1852,6 +1859,22 @@ fn grep_tree_level(
         any = any || matched;
     }
     Ok(any)
+}
+
+/// Read an object through the shared promisor boundary and record grep's
+/// command-level lazy-fetch count only when this call actually materialized a
+/// previously missing object.
+fn grep_read_object_maybe_prefetch_promisor(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+    lazy_fetch: bool,
+) -> Result<Arc<EncodedObject>> {
+    let was_missing = lazy_fetch && !db.contains(oid)?;
+    let object = read_object_maybe_prefetch_promisor(db, oid, lazy_fetch)?;
+    if was_missing {
+        sley_core::trace2::data("promisor", "fetch_count", 1);
+    }
+    Ok(object)
 }
 
 // ---------------------------------------------------------------------------
@@ -3003,5 +3026,17 @@ mod tests {
         assert_eq!(submodule_prefix(b"", b"submodule"), b"submodule/");
         assert_eq!(submodule_prefix(b"submodule/", b"sub"), b"submodule/sub/");
         assert_eq!(join_prefix(b"submodule/", b"a"), b"submodule/a");
+    }
+
+    #[test]
+    fn dot_submodule_active_selects_every_configured_submodule() {
+        let config =
+            GitConfig::parse(b"[submodule]\n\tactive = .\n[submodule \"sub\"]\n\turl = ./sub\n")
+                .expect("config parses");
+        let gitmodules = GitConfig::parse(b"[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n")
+            .expect("gitmodules parses");
+        let submodules = sley_submodule::SubmoduleConfigSet::parse(&gitmodules);
+
+        assert!(submodule_active(&config, &submodules, b"sub"));
     }
 }

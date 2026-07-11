@@ -312,3 +312,93 @@ fn grep_only_matching_match_git() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn grep_historical_partial_submodule_lazy_fetch_matches_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("grep-partial-submodule");
+    let source = root.join("source");
+    let submodule = source.join("sub");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    git_ok(&root, &["init", "-q", source.to_str().unwrap_or("source")]);
+    fs::write(source.join("super-file"), "Some content for super-file\n")
+        .expect("write superproject file");
+    git_ok(&source, &["add", "super-file"]);
+    git_ok(&source, &["commit", "-qm", "superproject"]);
+
+    git_ok(
+        &source,
+        &["init", "-q", submodule.to_str().unwrap_or("sub")],
+    );
+    fs::write(submodule.join("sub-file"), "Some content for sub-file\n")
+        .expect("write submodule file");
+    git_ok(&submodule, &["add", "sub-file"]);
+    git_ok(&submodule, &["commit", "-qm", "submodule"]);
+    git_ok(
+        &source,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "./sub",
+        ],
+    );
+    git_ok(&source, &["commit", "-qm", "add submodule"]);
+    fs::write(
+        submodule.join("sub-file"),
+        "Some content for sub-file\nSome more content for sub-file\n",
+    )
+    .expect("update submodule file");
+    git_ok(&submodule, &["add", "sub-file"]);
+    git_ok(&submodule, &["commit", "-qm", "update submodule"]);
+    git_ok(&source, &["add", "sub"]);
+    git_ok(&source, &["commit", "-qm", "update gitlink"]);
+    for repo in [&source, &submodule] {
+        git_ok(repo, &["config", "uploadpack.allowFilter", "true"]);
+        git_ok(repo, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    }
+
+    let source_url = format!("file://{}", source.display());
+    let clone_args = |destination: &Path| {
+        vec![
+            "-c".to_string(),
+            "protocol.file.allow=always".to_string(),
+            "clone".to_string(),
+            "-q".to_string(),
+            "--filter=blob:none".to_string(),
+            "--also-filter-submodules".to_string(),
+            "--recurse-submodules".to_string(),
+            source_url.clone(),
+            destination.to_string_lossy().into_owned(),
+        ]
+    };
+    let expected_args = clone_args(&expected);
+    let expected_refs = expected_args.iter().map(String::as_str).collect::<Vec<_>>();
+    assert!(
+        git(&root, &expected_refs).status.success(),
+        "oracle filtered recursive clone should succeed"
+    );
+    let actual_args = clone_args(&actual);
+    let actual_refs = actual_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let cloned = sley(&root, &actual_refs);
+    assert!(
+        cloned.status.success(),
+        "sley filtered recursive clone failed: {}",
+        String::from_utf8_lossy(&cloned.stderr)
+    );
+
+    let args = ["grep", "-e", "content", "--recurse-submodules", "HEAD^"];
+    let expected_grep = git(&expected, &args);
+    let actual_grep = sley(&actual, &args);
+    assert_eq!(actual_grep.status.code(), expected_grep.status.code());
+    assert_eq!(actual_grep.stdout, expected_grep.stdout);
+    assert_eq!(
+        String::from_utf8_lossy(&actual_grep.stdout),
+        "HEAD^:sub/sub-file:Some content for sub-file\nHEAD^:super-file:Some content for super-file\n"
+    );
+    fs::remove_dir_all(&root).ok();
+}
