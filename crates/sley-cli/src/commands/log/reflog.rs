@@ -357,28 +357,24 @@ pub(super) fn log_committer_matcher_matches(
 
 /// git's `apply_mailmap_to_header`: when `--use-mailmap`/`log.mailmap` is active
 /// the `--author`/`--committer` grep runs against the *mailmapped* identity
-/// header. Rewrites `Name <email> <ts> <tz>` → `MappedName <mapped@email> ...`.
-/// With no mailmap (or an empty one) the original header bytes are returned.
+/// header. Git's `strip_timestamp` then limits the searchable bytes to the
+/// final `>` so dates and timezone offsets can never satisfy identity filters.
 fn log_mailmapped_identity_header(
     raw: &[u8],
     mailmap: Option<&commands::utility::Mailmap>,
 ) -> Vec<u8> {
     let Some(mailmap) = mailmap.filter(|m| !m.is_empty()) else {
-        return raw.to_vec();
+        return raw
+            .iter()
+            .rposition(|&byte| byte == b'>')
+            .map_or_else(|| raw.to_vec(), |end| raw[..=end].to_vec());
     };
     let (name, email) = mailmap.rewrite_identity(raw);
-    // Preserve the trailing ` <ts> <tz>` (everything after the closing `>`).
-    let tail = raw
-        .iter()
-        .position(|&b| b == b'>')
-        .map(|idx| &raw[idx + 1..])
-        .unwrap_or(b"");
-    let mut out = Vec::with_capacity(name.len() + email.len() + tail.len() + 4);
+    let mut out = Vec::with_capacity(name.len() + email.len() + 3);
     out.extend_from_slice(&name);
     out.extend_from_slice(b" <");
     out.extend_from_slice(&email);
     out.push(b'>');
-    out.extend_from_slice(tail);
     out
 }
 

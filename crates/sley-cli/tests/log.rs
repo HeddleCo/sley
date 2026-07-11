@@ -1054,6 +1054,47 @@ fn log_committer_filter_matches_upstream_git() {
 }
 
 #[test]
+fn log_identity_filters_end_at_email_and_exclude_timestamp() {
+    let root = unique_temp_dir("log-identity-filter-boundary");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        git_with_env(
+            &root,
+            &[
+                "-c",
+                "user.name=Committer Person",
+                "-c",
+                "user.email=committer@example.invalid",
+                "commit",
+                "--allow-empty",
+                "--author",
+                "With Asterisk <xyzzy@frotz.com>",
+                "-m",
+                "identity boundary",
+                "-q",
+            ],
+            &[
+                ("GIT_AUTHOR_DATE", "@1112911993 -0700"),
+                ("GIT_COMMITTER_DATE", "@1112911993 -0700"),
+            ],
+        );
+
+        for args in [
+            vec!["log", r"--author=frotz\.com>$", "--format=%s"],
+            vec!["log", "--author=-0700", "--format=%s"],
+            vec!["log", r"--committer=example\.invalid>$", "--format=%s"],
+            vec!["log", "--committer=-0700", "--format=%s"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = sley(&root, &args);
+            assert_eq!(actual, expected, "sley log output differed for {args:?}");
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn log_epoch_age_filters_match_upstream_git() {
     let root = unique_temp_dir("log-age-filter");
     fs::create_dir_all(&root).expect("create temp repo");
