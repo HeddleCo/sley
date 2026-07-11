@@ -976,6 +976,13 @@ pub(crate) fn cmd_commit(
             .unwrap_or(0);
     }
     let commit_odb = FileObjectDatabase::from_git_dir(&git_dir, format);
+    author_override = resolve_commit_author_nickname(
+        &git_dir,
+        &commit_odb,
+        format,
+        author_override.as_deref(),
+        cli_session.replace_objects(),
+    )?;
     let in_merge = git_dir.join("MERGE_HEAD").is_file();
     let in_cherry_pick = git_dir.join("CHERRY_PICK_HEAD").is_file();
     let in_revert = git_dir.join("REVERT_HEAD").is_file();
@@ -3576,6 +3583,72 @@ fn build_commit_author_identity(
     let date = canonicalize_commit_date(&date);
     validate_commit_identity_name("AUTHOR", &name, &email)?;
     sley_sequencer::format_commit_identity_bytes(&name, &email, &date)
+}
+
+/// Resolve git's nickname form of `commit --author=<pattern>`.
+///
+/// A value that already has a closing contact delimiter is parsed normally by
+/// `build_commit_author_identity`. Otherwise git searches every reachable
+/// commit, case-insensitively, after applying the repository mailmap and uses
+/// the newest matching canonical identity.
+fn resolve_commit_author_nickname(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    author: Option<&str>,
+    replace_objects: bool,
+) -> Result<Option<String>> {
+    let Some(author) = author else {
+        return Ok(None);
+    };
+    if author.contains('>') {
+        return Ok(Some(author.to_string()));
+    }
+
+    let pattern = regex::RegexBuilder::new(author)
+        .case_insensitive(true)
+        .build()
+        .map_err(|error| {
+            eprintln!("fatal: invalid --author pattern '{author}': {error}");
+            GitError::Exit(128)
+        })?;
+    let refs = FileRefStore::new(git_dir, format);
+    let mut tips = Vec::new();
+    let head_oid = match refs.read_ref("HEAD")? {
+        Some(RefTarget::Direct(oid)) => Some(oid),
+        Some(RefTarget::Symbolic(name)) => match refs.read_ref(&name)? {
+            Some(RefTarget::Direct(oid)) => Some(oid),
+            _ => None,
+        },
+        None => None,
+    };
+    if let Some(oid) = head_oid
+        && let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid)
+    {
+        tips.push(commit);
+    }
+    for reference in refs.list_refs()? {
+        let RefTarget::Direct(oid) = reference.target else {
+            continue;
+        };
+        if let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid) {
+            tips.push(commit);
+        }
+    }
+    tips.sort_unstable();
+    tips.dedup();
+
+    let mailmap = commands::utility::Mailmap::load_default(git_dir, format, replace_objects)?;
+    for record in rev_list_walk_commits(db, format, tips, false)? {
+        let (name, email) = commit_identity_name_email(&record.commit.author);
+        let (name, email) = mailmap.map_user(&name, &email);
+        let canonical = format!("{name} <{email}>");
+        if pattern.is_match(&canonical) {
+            return Ok(Some(canonical));
+        }
+    }
+
+    commit_invalid_author_error(author).map(|_| None)
 }
 
 fn parse_commit_author(author: &str) -> Result<(String, String)> {
