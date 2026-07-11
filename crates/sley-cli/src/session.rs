@@ -267,6 +267,13 @@ impl CliSession {
             })
     }
 
+    /// Resolve the invocation's effective worktree without requiring one.
+    /// Read-only commands use this to distinguish a bare repository from a
+    /// bare repository paired with an explicit `--work-tree`.
+    pub(crate) fn optional_worktree_for_git_dir(&self, git_dir: &Path) -> Result<Option<PathBuf>> {
+        self.effective_worktree_for_git_dir(git_dir)
+    }
+
     /// Resolve Git's effective worktree policy without requiring one to exist.
     ///
     /// An explicit git directory changes the implicit worktree from the

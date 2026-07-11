@@ -3585,8 +3585,9 @@ fn parse_commit_author(author: &str) -> Result<(String, String)> {
     let Some(email) = rest.strip_suffix('>') else {
         return commit_invalid_author_error(author);
     };
-    let name = name.trim_end();
-    if name.is_empty() || email.is_empty() {
+    let name = name.trim();
+    let email = email.trim();
+    if name.is_empty() {
         return commit_invalid_author_error(author);
     }
     Ok((name.to_string(), email.to_string()))
@@ -3602,11 +3603,9 @@ fn parse_commit_author_bytes(author: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let Some(email) = email_with_suffix.strip_suffix(b">") else {
         return commit_invalid_author_bytes_error(author);
     };
-    let mut name = &author[..open];
-    while name.ends_with(b" ") || name.ends_with(b"\t") {
-        name = &name[..name.len() - 1];
-    }
-    if name.is_empty() || email.is_empty() {
+    let name = author[..open].trim_ascii();
+    let email = email.trim_ascii();
+    if name.is_empty() {
         return commit_invalid_author_bytes_error(author);
     }
     Ok((name.to_vec(), email.to_vec()))
@@ -3621,4 +3620,21 @@ fn commit_invalid_author_bytes_error<T>(author: &[u8]) -> Result<T> {
     let author = String::from_utf8_lossy(author);
     eprintln!("fatal: --author '{author}' is not 'Name <email>' and matches no existing author");
     Err(GitError::Exit(128))
+}
+
+#[cfg(test)]
+mod commit_author_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_author_trims_outer_whitespace_and_allows_empty_email() {
+        assert_eq!(
+            parse_commit_author_bytes(b"  A Name  < address@example.com >").expect("valid author"),
+            (b"A Name".to_vec(), b"address@example.com".to_vec())
+        );
+        assert_eq!(
+            parse_commit_author_bytes(b"A Name <>").expect("empty email is valid"),
+            (b"A Name".to_vec(), Vec::new())
+        );
+    }
 }

@@ -683,13 +683,16 @@ fn log_output_needs_mailmap(output: &LogOutput, use_mailmap: bool) -> bool {
 
 fn log_cached_mailmap<'a>(
     cache: &'a mut Option<commands::utility::Mailmap>,
+    cli_session: &session::CliSession,
     git_dir: &Path,
     format: ObjectFormat,
     replace_objects: bool,
 ) -> Result<&'a commands::utility::Mailmap> {
     if cache.is_none() {
-        *cache = Some(commands::utility::Mailmap::load_default(
+        let worktree = cli_session.optional_worktree_for_git_dir(git_dir)?;
+        *cache = Some(commands::utility::Mailmap::load_default_with_worktree(
             git_dir,
+            worktree.as_deref(),
             format,
             replace_objects,
         )?);
@@ -3141,6 +3144,7 @@ fn cmd_log_impl(
     {
         Some(log_cached_mailmap(
             &mut mailmap_cache,
+            cli_session,
             &git_dir,
             format,
             cli_session.replace_objects(),
@@ -3515,6 +3519,7 @@ fn cmd_log_impl(
     let output_mailmap = if log_output_needs_mailmap(&output, use_mailmap) {
         log_cached_mailmap(
             &mut mailmap_cache,
+            cli_session,
             &git_dir,
             format,
             cli_session.replace_objects(),

@@ -902,6 +902,7 @@ pub(crate) fn cmd_check_mailmap(
         &source_specs,
         repository.config(),
         cli_session.replace_objects(),
+        None,
     )?;
     for contact in contacts {
         println!("{}", mailmap.resolve_contact(&contact).display());
@@ -988,7 +989,26 @@ impl Mailmap {
         config: &GitConfig,
         replace_objects: bool,
     ) -> Result<Self> {
-        Self::load(git_dir, format, &[], config, replace_objects)
+        Self::load(git_dir, format, &[], config, replace_objects, None)
+    }
+
+    /// Load default sources using an invocation-resolved worktree. This keeps
+    /// `--git-dir=<bare> --work-tree=<path>` distinct from a truly bare access.
+    pub(crate) fn load_default_with_worktree(
+        git_dir: &Path,
+        worktree_root: Option<&Path>,
+        format: ObjectFormat,
+        replace_objects: bool,
+    ) -> Result<Self> {
+        let config = read_repo_config(git_dir).unwrap_or_default();
+        Self::load(
+            git_dir,
+            format,
+            &[],
+            &config,
+            replace_objects,
+            worktree_root,
+        )
     }
 
     /// Load the mailmap when there may be no repository (git's `read_mailmap`
@@ -1052,12 +1072,16 @@ impl Mailmap {
         source_specs: &[MailmapSourceSpec],
         config: &GitConfig,
         replace_objects: bool,
+        worktree_override: Option<&Path>,
     ) -> Result<Self> {
         // git's `read_mailmap` order (mailmap.c): `.mailmap` (worktree only) →
         // `mailmap.blob` → `mailmap.file` (last, so it overrides). A bare repo
         // skips `.mailmap` and defaults the blob to `HEAD:.mailmap`.
         let mut mailmap = Self::default();
-        let worktree_root = sley_worktree::worktree_root_for_git_dir(git_dir)?;
+        let worktree_root = match worktree_override {
+            Some(path) => Some(path.to_path_buf()),
+            None => sley_worktree::worktree_root_for_git_dir(git_dir)?,
+        };
         let is_bare = worktree_root.is_none();
         let mailmap_file = config.get("mailmap", None, "file").map(str::to_owned);
         let mut mailmap_blob = config.get("mailmap", None, "blob").map(str::to_owned);
@@ -1067,7 +1091,7 @@ impl Mailmap {
 
         // `.mailmap` from the worktree (non-bare only).
         if let Some(root) = &worktree_root {
-            mailmap.add_file(&root.join(".mailmap"))?;
+            mailmap.add_in_tree_file(&root.join(".mailmap"))?;
         }
         // `mailmap.blob` (config value, or the bare-repo default).
         if let Some(blob) = &mailmap_blob {
@@ -1094,6 +1118,18 @@ impl Mailmap {
     fn add_file(&mut self, path: &Path) -> Result<()> {
         match fs::read(path) {
             Ok(bytes) => self.add_bytes(&bytes),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(GitError::Io(err.to_string())),
+        }
+    }
+
+    /// Load the repository-top-level `.mailmap`. Unlike an explicit
+    /// `mailmap.file`, Git refuses to follow a symlink here so a checkout cannot
+    /// redirect identity rewriting outside the tree.
+    fn add_in_tree_file(&mut self, path: &Path) -> Result<()> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Ok(()),
+            Ok(_) => self.add_file(path),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(GitError::Io(err.to_string())),
         }
@@ -1161,12 +1197,16 @@ impl Mailmap {
             return;
         };
         // Second token (commit-side name+email) is optional.
-        let (old_name, old_email) = parse_name_and_email(&mut rest, true).unwrap_or((None, None));
-        // add_mapping's reshuffle: with no commit-side email, the proper email
-        // is itself the lookup key and only the name is replaced.
-        let (new_email, old_email) = match old_email {
-            Some(old_email) => (Some(new_email), old_email),
-            None => (None, new_email),
+        let old_contact = parse_name_and_email(&mut rest, true);
+        // add_mapping's reshuffle: with no commit-side contact, the proper
+        // email is itself the lookup key and only the name is replaced. An
+        // explicitly empty `<>` is different: it is the empty lookup key and
+        // may map to the canonical email (the last such entry wins).
+        let (new_email, old_name, old_email) = match old_contact {
+            Some((old_name, old_email)) => {
+                (Some(new_email), old_name, old_email.unwrap_or_default())
+            }
+            None => (None, None, new_email),
         };
         self.add_mapping(new_name, new_email, old_name, old_email);
     }
@@ -1290,6 +1330,32 @@ fn parse_mailmap_contact(value: &str) -> MailmapContact {
     MailmapContact {
         name: None,
         email: value.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod mailmap_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_empty_commit_email_is_a_real_lookup_key() {
+        let mut mailmap = Mailmap::default();
+        mailmap.read_mailmap_line("Ah <ah@example.com> <>");
+        mailmap.read_mailmap_line("Bee <bee@example.com> <>");
+        assert_eq!(
+            mailmap.map_user("A", ""),
+            ("Bee".into(), "bee@example.com".into())
+        );
+    }
+
+    #[test]
+    fn missing_commit_contact_still_uses_the_canonical_email_key() {
+        let mut mailmap = Mailmap::default();
+        mailmap.read_mailmap_line("Canonical <old@example.com>");
+        assert_eq!(
+            mailmap.map_user("Original", "old@example.com"),
+            ("Canonical".into(), "old@example.com".into())
+        );
     }
 }
 
