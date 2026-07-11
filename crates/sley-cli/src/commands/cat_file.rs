@@ -1111,7 +1111,8 @@ impl CatFileBatchRequest {
         // command runs immediately. The flush-on-exit is suppressed by the test-only env var
         // `GIT_TEST_CAT_FILE_NO_FLUSH_ON_EXIT`. Queued lines are owned because the borrow of
         // the input buffer cannot outlive a streaming read.
-        let mut queued: Vec<OwnedBatchCommand> = Vec::new();
+        let mut queued: Vec<(OwnedBatchCommand, bool)> = Vec::new();
+        let mut use_mailmap = self.use_mailmap;
         // `--batch-command` always reads with CRLF-stripping getdelim; stream so an unbuffered
         // `info`/`contents` response is emitted before the next line is read.
         let input_delim = if self.input_nul { b'\0' } else { b'\n' };
@@ -1124,12 +1125,13 @@ impl CatFileBatchRequest {
             let line = String::from_utf8_lossy(record);
             let command = parse_batch_command(line.as_ref())?;
             match command {
+                BatchCommand::Mailmap(enabled) => use_mailmap = enabled,
                 BatchCommand::Flush => {
                     if !self.buffer {
                         eprintln!("fatal: flush is only for --buffer mode");
                         return Err(GitError::Exit(128));
                     }
-                    for queued_command in queued.drain(..) {
+                    for (queued_command, queued_mailmap) in queued.drain(..) {
                         self.run_batch_command(
                             &mut stdout,
                             &view,
@@ -1137,11 +1139,12 @@ impl CatFileBatchRequest {
                             apply_replace,
                             terminator,
                             queued_command.as_ref(),
+                            queued_mailmap,
                         )?;
                     }
                     stdout.flush()?;
                 }
-                _ if self.buffer => queued.push(command.into_owned()),
+                _ if self.buffer => queued.push((command.into_owned(), use_mailmap)),
                 _ => {
                     self.run_batch_command(
                         &mut stdout,
@@ -1150,6 +1153,7 @@ impl CatFileBatchRequest {
                         apply_replace,
                         terminator,
                         command,
+                        use_mailmap,
                     )?;
                     // Unbuffered: every record is visible immediately.
                     stdout.flush()?;
@@ -1157,7 +1161,7 @@ impl CatFileBatchRequest {
             }
         }
         if self.buffer && !queued.is_empty() && !cat_file_no_flush_on_exit() {
-            for queued_command in queued.drain(..) {
+            for (queued_command, queued_mailmap) in queued.drain(..) {
                 self.run_batch_command(
                     &mut stdout,
                     &view,
@@ -1165,6 +1169,7 @@ impl CatFileBatchRequest {
                     apply_replace,
                     terminator,
                     queued_command.as_ref(),
+                    queued_mailmap,
                 )?;
             }
         }
@@ -1180,11 +1185,12 @@ impl CatFileBatchRequest {
         apply_replace: bool,
         terminator: u8,
         command: BatchCommand<'_>,
+        use_mailmap: bool,
     ) -> Result<()> {
         let (object_name, check_only) = match command {
             BatchCommand::Info(name) => (name, true),
             BatchCommand::Contents(name) => (name, false),
-            BatchCommand::Flush => return Ok(()),
+            BatchCommand::Flush | BatchCommand::Mailmap(_) => return Ok(()),
         };
         print_cat_file_batch_record(
             stdout,
@@ -1201,7 +1207,7 @@ impl CatFileBatchRequest {
                 follow_symlinks: self.follow_symlinks,
                 filter: self.filter,
                 all_objects: false,
-                use_mailmap: self.use_mailmap,
+                use_mailmap,
             },
         )
     }
@@ -1212,6 +1218,7 @@ impl CatFileBatchRequest {
 enum BatchCommand<'a> {
     Info(&'a str),
     Contents(&'a str),
+    Mailmap(bool),
     Flush,
 }
 
@@ -1221,6 +1228,7 @@ impl BatchCommand<'_> {
         match self {
             BatchCommand::Info(name) => OwnedBatchCommand::Info(name.to_string()),
             BatchCommand::Contents(name) => OwnedBatchCommand::Contents(name.to_string()),
+            BatchCommand::Mailmap(enabled) => OwnedBatchCommand::Mailmap(enabled),
             BatchCommand::Flush => OwnedBatchCommand::Flush,
         }
     }
@@ -1230,6 +1238,7 @@ impl BatchCommand<'_> {
 enum OwnedBatchCommand {
     Info(String),
     Contents(String),
+    Mailmap(bool),
     Flush,
 }
 
@@ -1238,6 +1247,7 @@ impl OwnedBatchCommand {
         match self {
             OwnedBatchCommand::Info(name) => BatchCommand::Info(name),
             OwnedBatchCommand::Contents(name) => BatchCommand::Contents(name),
+            OwnedBatchCommand::Mailmap(enabled) => BatchCommand::Mailmap(*enabled),
             OwnedBatchCommand::Flush => BatchCommand::Flush,
         }
     }
@@ -1280,7 +1290,12 @@ fn parse_batch_command(line: &str) -> Result<BatchCommand<'_>> {
         eprintln!("fatal: whitespace before command: '{line}'");
         return Err(GitError::Exit(128));
     }
-    for (name, takes_args) in [("contents", true), ("info", true), ("flush", false)] {
+    for (name, takes_args) in [
+        ("contents", true),
+        ("info", true),
+        ("mailmap", true),
+        ("flush", false),
+    ] {
         let Some(rest) = line.strip_prefix(name) else {
             continue;
         };
@@ -1290,10 +1305,18 @@ fn parse_batch_command(line: &str) -> Result<BatchCommand<'_>> {
                 eprintln!("fatal: {name} requires arguments");
                 return Err(GitError::Exit(128));
             };
-            return Ok(match name {
-                "info" => BatchCommand::Info(arg),
-                _ => BatchCommand::Contents(arg),
-            });
+            return match name {
+                "info" => Ok(BatchCommand::Info(arg)),
+                "contents" => Ok(BatchCommand::Contents(arg)),
+                "mailmap" => match sley_config::parse_config_bool(arg) {
+                    Some(enabled) => Ok(BatchCommand::Mailmap(enabled)),
+                    None => {
+                        eprintln!("fatal: mailmap: invalid boolean '{arg}'");
+                        Err(GitError::Exit(128))
+                    }
+                },
+                _ => unreachable!(),
+            };
         }
         if !rest.is_empty() {
             eprintln!("fatal: {name} takes no arguments");
@@ -2445,6 +2468,18 @@ mod tests {
         assert!(matches!(
             parse_batch_command("flush"),
             Ok(BatchCommand::Flush)
+        ));
+        assert!(matches!(
+            parse_batch_command("mailmap yes"),
+            Ok(BatchCommand::Mailmap(true))
+        ));
+        assert!(matches!(
+            parse_batch_command("mailmap false"),
+            Ok(BatchCommand::Mailmap(false))
+        ));
+        assert!(matches!(
+            parse_batch_command("mailmap maybe"),
+            Err(GitError::Exit(128))
         ));
     }
 }
