@@ -91,6 +91,9 @@ pub struct CloneOptions<'a> {
     /// `refs/remotes/<origin>/HEAD` is only written if the checked-out branch is
     /// the remote default.
     pub single_branch: bool,
+    /// Concrete transfer-progress policy resolved by the embedding wrapper.
+    /// The library never inspects terminal/process-global state itself.
+    pub progress: bool,
     /// Shallow clone depth (`--depth N`): truncate history to `N` commits per tip,
     /// writing `$GIT_DIR/shallow`. `None` is a full clone. Honored by the HTTP
     /// and SSH transports and by the in-process local server (`git clone
@@ -147,6 +150,9 @@ pub struct CloneOutcome {
     /// The caller prints git's "You appear to have cloned an empty repository."
     /// warning and skips the worktree checkout.
     pub empty: bool,
+    /// Equal-work counts from the clone's fetch, when its transport exposes
+    /// truthful native transfer metadata.
+    pub transfer_progress: Option<crate::TransferProgress>,
 }
 
 /// Fully resolved inputs for a [`clone`] run.
@@ -258,6 +264,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         },
     };
     let fetch_options = clone_fetch_options(CloneFetchOptions {
+        progress: request.options.progress,
         depth: request.options.depth,
         deepen_since: request.options.deepen_since,
         deepen_not: request.options.deepen_not.clone(),
@@ -313,6 +320,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
             git_dir,
             branch_oid: Some(*detached),
             empty: false,
+            transfer_progress: fetch_outcome.transfer_progress,
         });
     }
     let remote_branch_ref = format!(
@@ -357,6 +365,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
                 git_dir,
                 branch_oid: None,
                 empty: true,
+                transfer_progress: fetch_outcome.transfer_progress,
             });
         }
     };
@@ -412,6 +421,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         git_dir,
         branch_oid: Some(branch_oid),
         empty: false,
+        transfer_progress: fetch_outcome.transfer_progress,
     })
 }
 
@@ -657,6 +667,7 @@ fn collect_tree_materialization_wants(
 /// `--tags`, not a dry run, not appending). Mirrors the options the CLI's clone
 /// paths passed.
 struct CloneFetchOptions<'a> {
+    progress: bool,
     depth: Option<u32>,
     deepen_since: Option<i64>,
     deepen_not: Vec<String>,
@@ -670,6 +681,7 @@ struct CloneFetchOptions<'a> {
 
 fn clone_fetch_options(options: CloneFetchOptions<'_>) -> FetchOptions {
     let CloneFetchOptions {
+        progress,
         depth,
         deepen_since,
         deepen_not,
@@ -681,7 +693,10 @@ fn clone_fetch_options(options: CloneFetchOptions<'_>) -> FetchOptions {
         upload_pack_command,
     } = options;
     FetchOptions {
-        quiet: true,
+        // Clone keeps fetch bookkeeping quiet, but an explicitly/resolved
+        // enabled transfer-progress policy must reach the progress sink.
+        quiet: !progress,
+        progress: Some(progress),
         auto_follow_tags: true,
         fetch_all_tags: false,
         prune: false,

@@ -724,6 +724,20 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
         Ok(())
     }
 
+    fn sparse_checkout_path_present(&self, path: &[u8]) -> Result<bool> {
+        let Some(file_path) = safe_worktree_path(&self.worktree_root, path) else {
+            return Ok(false);
+        };
+        let Ok(metadata) = fs::symlink_metadata(&file_path) else {
+            return Ok(false);
+        };
+        Ok(!sley_worktree::path_matches_standard_ignore(
+            &self.worktree_root,
+            path,
+            metadata.is_dir(),
+        )?)
+    }
+
     fn check_submodule_move_head(
         &self,
         path: &[u8],
@@ -1014,6 +1028,18 @@ pub(crate) fn checkout_two_way_engine(
         sley_unpack_trees::plan_checkout_transition(&index, old_leaves, new_leaves, options, &wt)?;
     refuse_if_unpack_result_removes_current_directory(worktree_root, plan.result())?;
     let result = plan.apply(&mut wt)?;
+    if !result.sparse_checkout_present_paths.is_empty() {
+        eprintln!(
+            "warning: The following paths were already present and thus not updated despite sparse patterns:"
+        );
+        for path in &result.sparse_checkout_present_paths {
+            eprintln!("\t{}", String::from_utf8_lossy(path));
+        }
+        eprintln!();
+        eprintln!(
+            "After fixing the above paths, you may want to run `git sparse-checkout reapply`."
+        );
+    }
 
     // Serialize the merged index. check_updates folded the post-write `lstat`
     // back into each freshly-written entry, so the stat info is accurate.

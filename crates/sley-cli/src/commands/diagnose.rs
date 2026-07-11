@@ -7,6 +7,8 @@
 //! metadata for `--mode=all`, and write them as a zip of the empty tree.
 
 use sley::plumbing::{sley_config, sley_core};
+use std::collections::{HashSet, VecDeque};
+use std::env;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -147,12 +149,17 @@ fn create_diagnostics_archive(
         .files
         .push(virtual_file("diagnostics.log", log.into_bytes()));
 
-    // packs-local.txt: object-directory file sizes.
+    // packs-local.txt: file sizes from the primary and alternate object
+    // directories. Git's ODB source list includes alternates here even though
+    // objects-local.txt deliberately remains scoped to the primary store.
     let objects_dir = git_dir.join("objects");
-    extras.files.push(virtual_file(
-        "packs-local.txt",
-        pack_stats(&objects_dir).into_bytes(),
-    ));
+    let pack_report = diagnostic_object_directories(&objects_dir)
+        .iter()
+        .map(|objects_dir| pack_stats(objects_dir))
+        .collect::<String>();
+    extras
+        .files
+        .push(virtual_file("packs-local.txt", pack_report.into_bytes()));
 
     // objects-local.txt: loose-object counts per fan-out.
     extras.files.push(virtual_file(
@@ -281,6 +288,63 @@ fn pack_stats(objects_dir: &Path) -> String {
         }
     }
     out
+}
+
+/// Return Git's object-database source order for diagnostic pack reporting:
+/// the primary store, environment alternates, then `info/alternates`, including
+/// chained alternates. Canonical identities prevent a malformed cycle from
+/// repeating sections forever and normalize relative alternate headings just
+/// as Git's ODB preparation does.
+fn diagnostic_object_directories(objects_dir: &Path) -> Vec<PathBuf> {
+    diagnostic_object_directories_with_environment(
+        objects_dir,
+        env::var_os("GIT_ALTERNATE_OBJECT_DIRECTORIES").as_deref(),
+    )
+}
+
+fn diagnostic_object_directories_with_environment(
+    objects_dir: &Path,
+    environment_alternates: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let mut pending = VecDeque::new();
+    pending.push_back(objects_dir.to_path_buf());
+    if let Some(value) = environment_alternates {
+        pending.extend(env::split_paths(value).filter(|path| !path.as_os_str().is_empty()));
+    }
+
+    let mut seen = HashSet::new();
+    let mut sources = Vec::new();
+    while let Some(source) = pending.pop_front() {
+        let identity = fs::canonicalize(&source).unwrap_or_else(|_| source.clone());
+        if !seen.insert(identity.clone()) {
+            continue;
+        }
+        pending.extend(alternates_file_entries(&identity));
+        sources.push(identity);
+    }
+    sources
+}
+
+fn alternates_file_entries(objects_dir: &Path) -> Vec<PathBuf> {
+    let Ok(contents) = fs::read(objects_dir.join("info").join("alternates")) else {
+        return Vec::new();
+    };
+    contents
+        .split(|byte| *byte == b'\n')
+        .filter_map(|raw| {
+            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+            if line.is_empty() || line.starts_with(b"#") {
+                return None;
+            }
+            let value = std::str::from_utf8(line).ok()?;
+            let path = Path::new(value);
+            Some(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                objects_dir.join(path)
+            })
+        })
+        .collect()
 }
 
 /// git's `loose_objs_stats`: per-fanout loose-object counts plus a final
@@ -430,4 +494,89 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_root(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "sley-diagnose-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create diagnose fixture");
+        root
+    }
+
+    #[test]
+    fn pack_report_includes_chained_alternates_once_but_loose_stats_stay_local() {
+        let root = fixture_root("alternates");
+        let primary = root.join("primary/objects");
+        let alternate = root.join("alternate/objects");
+        let chained = root.join("chained/objects");
+        for objects in [&primary, &alternate, &chained] {
+            fs::create_dir_all(objects.join("info")).expect("create object info");
+            fs::create_dir_all(objects.join("pack")).expect("create pack dir");
+        }
+        fs::write(primary.join("pack/pack-primary.pack"), b"primary").expect("write primary pack");
+        fs::write(alternate.join("pack/pack-alternate.idx"), b"alternate")
+            .expect("write alternate index");
+        fs::write(chained.join("pack/pack-chained.pack"), b"chained").expect("write chained pack");
+        fs::write(
+            primary.join("info/alternates"),
+            b"../../alternate/objects\n# ignored\r\n",
+        )
+        .expect("write primary alternates");
+        fs::write(
+            alternate.join("info/alternates"),
+            format!("{}\n", chained.display()),
+        )
+        .expect("write chained alternate");
+        fs::write(
+            chained.join("info/alternates"),
+            format!("{}\n", primary.display()),
+        )
+        .expect("write alternate cycle");
+
+        fs::create_dir_all(primary.join("aa")).expect("create primary fanout");
+        fs::write(primary.join("aa/one"), b"one").expect("write primary loose object");
+        fs::create_dir_all(alternate.join("bb")).expect("create alternate fanout");
+        fs::write(alternate.join("bb/one"), b"one").expect("write alternate loose object");
+        fs::write(alternate.join("bb/two"), b"two").expect("write alternate loose object");
+
+        let sources = diagnostic_object_directories_with_environment(&primary, None);
+        assert_eq!(sources.len(), 3, "cycle should not duplicate an ODB source");
+        let report = sources
+            .iter()
+            .map(|source| pack_stats(source))
+            .collect::<String>();
+        for expected in [
+            primary.canonicalize().expect("canonical primary"),
+            alternate.canonicalize().expect("canonical alternate"),
+            chained.canonicalize().expect("canonical chained"),
+        ] {
+            assert!(
+                report.contains(&format!("Contents of {}:", expected.display())),
+                "{report}"
+            );
+        }
+        for expected in [
+            "pack-primary.pack",
+            "pack-alternate.idx",
+            "pack-chained.pack",
+        ] {
+            assert!(report.contains(expected), "{report}");
+        }
+
+        let loose = loose_object_stats(&primary);
+        assert!(loose.contains("aa :       1 files"), "{loose}");
+        assert!(loose.contains("Total: 1 loose objects"), "{loose}");
+        assert!(!loose.contains("bb :"), "{loose}");
+        fs::remove_dir_all(root).ok();
+    }
 }

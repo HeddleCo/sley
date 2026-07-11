@@ -406,3 +406,122 @@ fn format_patch_unknown_revision_matches_git() {
 
     fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
+
+#[test]
+fn format_patch_bare_attach_config_matches_git() {
+    if !interop_enabled() {
+        return;
+    }
+    let repo = build_repo("format-patch-bare-attach");
+    let config_path = repo.join(".git/config");
+    let mut config = fs::read_to_string(&config_path).expect("read repository config");
+    config.push_str("\n[format]\n\tattach\n");
+    fs::write(config_path, config).expect("write bare format.attach config");
+
+    assert_same_stdout(&repo, &["format-patch", "-1", "--stdout"]);
+
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
+}
+
+#[test]
+fn format_patch_interdiff_honors_planned_diff_policy_and_pathspec() {
+    if !interop_enabled() {
+        return;
+    }
+    let root = unique_temp_dir("format-patch-interdiff-policy");
+    let repo = root.join("repo");
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            repo.to_str().expect("repository path"),
+        ],
+    );
+    fs::create_dir_all(repo.join("sub")).expect("create subdirectory");
+    fs::write(
+        repo.join("sub/keep.txt"),
+        "one\ntwo\nthree\nfour\nfive\nsix\n",
+    )
+    .expect("write kept path");
+    fs::write(repo.join("sub/skip.txt"), "base skip\n").expect("write skipped path");
+    fs::write(repo.join("sub/ordered.txt"), "ordered base\n").expect("write ordered path");
+    fs::write(
+        repo.join("sub/rename.txt"),
+        "rename one\nrename two\nrename three\nrename four\n",
+    )
+    .expect("write rename source");
+    fs::write(repo.join("sub/source.txt"), "copy source\nsecond line\n")
+        .expect("write copy source");
+    fs::write(repo.join("outside.txt"), "outside base\n").expect("write outside path");
+    git_ok(&repo, &["add", "-A"]);
+    git_ok(&repo, &["commit", "-qm", "base"]);
+
+    git_ok(&repo, &["checkout", "-qb", "previous"]);
+    git_ok(&repo, &["mv", "sub/rename.txt", "sub/old-name.txt"]);
+    fs::write(
+        repo.join("sub/keep.txt"),
+        "one\nprevious two\nthree\nfour\nfive\nsix\n",
+    )
+    .expect("write previous kept path");
+    fs::write(repo.join("sub/skip.txt"), "previous skip\n").expect("write previous skipped");
+    fs::write(repo.join("sub/ordered.txt"), "ordered previous\n").expect("write previous ordered");
+    fs::write(repo.join("outside.txt"), "outside previous\n").expect("write previous outside");
+    git_ok(&repo, &["add", "-A"]);
+    git_ok(&repo, &["commit", "-qm", "previous series"]);
+    git_ok(&repo, &["tag", "previous-tip"]);
+
+    git_ok(&repo, &["checkout", "-q", "main"]);
+    git_ok(&repo, &["mv", "sub/rename.txt", "sub/new-name.txt"]);
+    fs::write(
+        repo.join("sub/keep.txt"),
+        "one\ntwo\nthree\ncurrent four\nfive\nsix\n",
+    )
+    .expect("write current kept path");
+    fs::write(repo.join("sub/skip.txt"), "current skip\n").expect("write current skipped");
+    fs::write(repo.join("sub/ordered.txt"), "ordered current\n").expect("write current ordered");
+    fs::copy(repo.join("sub/source.txt"), repo.join("sub/copy.txt")).expect("copy source path");
+    fs::write(repo.join("outside.txt"), "outside current\n").expect("write current outside");
+    git_ok(&repo, &["add", "-A"]);
+    git_ok(&repo, &["commit", "-qm", "current series"]);
+
+    fs::write(repo.join("diff.order"), "*ordered.txt\n*keep.txt\n").expect("write diff order");
+
+    for args in [
+        vec![
+            "format-patch",
+            "--stdout",
+            "-1",
+            "--interdiff=previous-tip",
+            "-M",
+        ],
+        vec![
+            "format-patch",
+            "--stdout",
+            "-1",
+            "--interdiff=previous-tip",
+            "-C",
+            "--find-copies-harder",
+        ],
+        vec![
+            "format-patch",
+            "--stdout",
+            "-1",
+            "--interdiff=previous-tip",
+            "--no-renames",
+            "-U0",
+            "--no-prefix",
+            "--relative=sub",
+            "-Odiff.order",
+            "--",
+            "sub/keep.txt",
+            "sub/ordered.txt",
+        ],
+    ] {
+        assert_same_stdout(&repo, &args);
+    }
+
+    fs::remove_dir_all(root).ok();
+}

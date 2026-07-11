@@ -68,6 +68,7 @@ pub(crate) fn cmd_checkout(
     let mut overwrite_ignore = true;
     let mut pathspec_from_file: Option<PathBuf> = None;
     let mut pathspec_file_nul = false;
+    let mut ignore_skip_worktree_bits = false;
     let mut positional = Vec::new();
     let mut dashdash_index = None;
     let mut iter = args.iter();
@@ -156,6 +157,8 @@ pub(crate) fn cmd_checkout(
             "--no-overwrite-ignore" => overwrite_ignore = false,
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
+            "--ignore-skip-worktree-bits" => ignore_skip_worktree_bits = true,
+            "--no-ignore-skip-worktree-bits" => ignore_skip_worktree_bits = false,
             "--pathspec-from-file" => {
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("checkout --pathspec-from-file requires a value".into())
@@ -514,12 +517,18 @@ pub(crate) fn cmd_checkout(
                             _ => sley_worktree::CheckoutConflictStyle::Merge,
                         }
                     });
-                    let outcome = sley_worktree::checkout_index_paths_with_database_outcome(
+                    let sparse_policy = if ignore_skip_worktree_bits {
+                        sley_worktree::CheckoutIndexSparsePolicy::Ignore
+                    } else {
+                        sley_worktree::CheckoutIndexSparsePolicy::Honor
+                    };
+                    let outcome = sley_worktree::checkout_index_paths_with_database_outcome_sparse(
                         worktree_root,
                         &git_dir,
                         format,
                         &resolved_paths,
                         db,
+                        sparse_policy,
                         sley_worktree::CheckoutIndexPathOptions {
                             force,
                             merge: path_merge || conflict_implies_merge,
@@ -737,6 +746,7 @@ pub(crate) fn cmd_checkout(
                         eprintln!("fatal: You are on a branch yet to be born");
                         return Err(GitError::Exit(128));
                     };
+                    sley_worktree::reapply_active_sparse_checkout(worktree_root, &git_dir, format)?;
                     let _ = checkout_show_local_changes(cli_session, &git_dir, &head, quiet, force);
                     return Ok(());
                 }

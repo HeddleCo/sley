@@ -44,6 +44,53 @@ pub enum FormatPatchRelativeMode {
     On(Option<String>),
 }
 
+/// Diff semantics selected for every patch emitted by one `format-patch`
+/// invocation, including cover-letter interdiffs.
+///
+/// Keeping this policy in the repository-level plan prevents secondary diff
+/// renderers from reconstructing command-line state and silently falling back
+/// to generic diff defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatPatchDiffPolicy {
+    /// Detect renames between the compared trees.
+    pub detect_renames: bool,
+    /// Detect copies between the compared trees.
+    pub detect_copies: bool,
+    /// Consider unmodified files as copy sources.
+    pub find_copies_harder: bool,
+    /// Rename similarity threshold, as a percentage.
+    pub rename_threshold: u8,
+    /// Copy similarity threshold, as a percentage.
+    pub copy_threshold: u8,
+    /// Unified-diff context lines.
+    pub context_lines: usize,
+    /// Prefix prepended to old-side paths.
+    pub src_prefix: String,
+    /// Prefix prepended to new-side paths.
+    pub dst_prefix: String,
+    /// Optional diff order file, resolved by the presentation layer.
+    pub order_file: Option<String>,
+    /// Emit applicable binary patch bodies.
+    pub binary: bool,
+}
+
+impl Default for FormatPatchDiffPolicy {
+    fn default() -> Self {
+        Self {
+            detect_renames: true,
+            detect_copies: false,
+            find_copies_harder: false,
+            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            context_lines: 3,
+            src_prefix: "a/".to_string(),
+            dst_prefix: "b/".to_string(),
+            order_file: None,
+            binary: true,
+        }
+    }
+}
+
 /// Semantic options consumed by [`plan_format_patch_series`].
 #[derive(Debug, Clone)]
 pub struct FormatPatchPlanOptions {
@@ -59,6 +106,8 @@ pub struct FormatPatchPlanOptions {
     pub base: FormatPatchBaseMode,
     /// Relative path selection policy.
     pub relative: FormatPatchRelativeMode,
+    /// Diff policy shared by patch and interdiff rendering.
+    pub diff: FormatPatchDiffPolicy,
 }
 
 /// Existing repository handles and paths needed to plan a patch series.
@@ -134,6 +183,8 @@ pub struct FormatPatchPlanOutcome {
     pub pathspecs: Vec<String>,
     /// Repository-relative prefix to strip from rendered diff paths.
     pub relative_prefix: Option<Vec<u8>>,
+    /// Diff policy captured from this invocation.
+    pub diff: FormatPatchDiffPolicy,
     /// Optional validated base and prerequisite patch ids.
     pub base: Option<FormatPatchBaseInfo>,
 }
@@ -298,6 +349,7 @@ pub fn plan_format_patch_series(
         commits: selected,
         pathspecs: setup.pathspecs,
         relative_prefix,
+        diff: request.options.diff.clone(),
         base,
     })
 }
@@ -315,6 +367,9 @@ fn format_patch_setup_args(options: &FormatPatchPlanOptions) -> Vec<String> {
         .unwrap_or(args.len());
     if revision_end == 0 {
         args.insert(0, "HEAD".to_string());
+        if options.count.is_none() && !options.root {
+            args.insert(1, "^HEAD".to_string());
+        }
     }
     args
 }
@@ -404,7 +459,13 @@ fn resolve_base_info(
     let Some(base) = base else {
         return Ok(None);
     };
-    validate_base_commit(request.objects, request.format, &base, commits)?;
+    validate_base_commit(
+        request.git_dir,
+        request.objects,
+        request.format,
+        &base,
+        commits,
+    )?;
     let prerequisites =
         prerequisite_patch_ids(request.objects, request.format, &base, commits, patch_ids)?;
     Ok(Some(FormatPatchBaseInfo {
@@ -456,6 +517,7 @@ fn current_branch_name(refs: &FileRefStore) -> Result<Option<String>> {
 }
 
 fn validate_base_commit(
+    git_dir: &Path,
     objects: &FileObjectDatabase,
     format: ObjectFormat,
     base: &ObjectId,
@@ -464,10 +526,10 @@ fn validate_base_commit(
     if commits.iter().any(|record| &record.oid == base) {
         return Err(FormatPatchPlanError::BaseNotAncestor { base: *base });
     }
-    let tips = commits.iter().map(|record| record.oid).collect::<Vec<_>>();
-    let reachable = rev_list_walk_commits(objects, format, tips, false)?;
-    if !reachable.iter().any(|record| &record.oid == base) {
-        return Err(FormatPatchPlanError::BaseNotAncestor { base: *base });
+    for record in commits {
+        if !crate::is_ancestor(git_dir, format, objects, base, &record.oid)? {
+            return Err(FormatPatchPlanError::BaseNotAncestor { base: *base });
+        }
     }
     Ok(())
 }
@@ -594,6 +656,25 @@ mod tests {
     }
 
     #[test]
+    fn no_argument_series_is_empty_unless_count_or_root_requests_head() {
+        let options = |count, root| FormatPatchPlanOptions {
+            setup_args: Vec::new(),
+            count,
+            root,
+            ignore_if_in_upstream: false,
+            base: FormatPatchBaseMode::None,
+            relative: FormatPatchRelativeMode::Off,
+            diff: FormatPatchDiffPolicy::default(),
+        };
+        assert_eq!(
+            format_patch_setup_args(&options(None, false)),
+            ["HEAD", "^HEAD"]
+        );
+        assert_eq!(format_patch_setup_args(&options(Some(1), false)), ["HEAD"]);
+        assert_eq!(format_patch_setup_args(&options(None, true)), ["HEAD"]);
+    }
+
+    #[test]
     fn plans_oldest_first_range_base_and_relative_prefix() {
         let root = std::env::temp_dir().join(format!(
             "sley-format-patch-plan-{}-{}",
@@ -616,6 +697,12 @@ mod tests {
 
         let config = GitConfig::default();
         let refs = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let diff = FormatPatchDiffPolicy {
+            context_lines: 7,
+            src_prefix: "old/".into(),
+            dst_prefix: "new/".into(),
+            ..FormatPatchDiffPolicy::default()
+        };
         let options = FormatPatchPlanOptions {
             setup_args: vec![base.to_hex()],
             count: None,
@@ -623,6 +710,7 @@ mod tests {
             ignore_if_in_upstream: false,
             base: FormatPatchBaseMode::Commit(base.to_hex()),
             relative: FormatPatchRelativeMode::On(None),
+            diff: diff.clone(),
         };
         let mut revisions = Resolver {
             git_dir: &git_dir,
@@ -661,6 +749,7 @@ mod tests {
             outcome.relative_prefix.as_deref(),
             Some(b"subdir/".as_slice())
         );
+        assert_eq!(outcome.diff, diff);
         assert_eq!(
             outcome.base,
             Some(FormatPatchBaseInfo {

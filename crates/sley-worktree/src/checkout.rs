@@ -1569,6 +1569,31 @@ pub fn checkout_index_paths_with_database_outcome(
     db: &FileObjectDatabase,
     options: CheckoutIndexPathOptions<'_>,
 ) -> Result<CheckoutIndexPathOutcome> {
+    checkout_index_paths_with_database_outcome_sparse(
+        worktree_root,
+        git_dir,
+        format,
+        paths,
+        db,
+        CheckoutIndexSparsePolicy::Ignore,
+        options,
+    )
+}
+
+/// Restore index paths with an explicit sparse-selection policy.
+///
+/// The historical embedding API above retains its all-index behavior. Git
+/// porcelain should use this operation with [`CheckoutIndexSparsePolicy::Honor`]
+/// by default and switch to `Ignore` only for its explicit override.
+pub fn checkout_index_paths_with_database_outcome_sparse(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    db: &FileObjectDatabase,
+    sparse_policy: CheckoutIndexSparsePolicy,
+    options: CheckoutIndexPathOptions<'_>,
+) -> Result<CheckoutIndexPathOutcome> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -1614,6 +1639,13 @@ pub fn checkout_index_paths_with_database_outcome(
         let is_unmerged = positions
             .iter()
             .any(|position| index.entries[*position].stage() != Stage::Normal);
+
+        if sparse_policy == CheckoutIndexSparsePolicy::Honor
+            && stage0.is_some_and(|position| index.entries[position].is_skip_worktree())
+            && !is_unmerged
+        {
+            continue;
+        }
 
         if is_unmerged {
             if let Some(stage) = options.stage {
@@ -1674,12 +1706,16 @@ pub fn checkout_index_paths_with_database_outcome(
         }
 
         if let Some(position) = stage0 {
+            let mut checkout_entry = index.entries[position].clone();
+            if sparse_policy == CheckoutIndexSparsePolicy::Ignore {
+                clear_skip_worktree(&mut checkout_entry);
+            }
             let prepared = prepare_index_checkout_entry(
                 worktree_root,
                 git_dir,
                 format,
                 db,
-                &index.entries[position],
+                &checkout_entry,
                 options.smudge_config,
                 Some(&stat_cache),
                 &mut delayed_checkout,

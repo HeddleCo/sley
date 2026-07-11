@@ -40,7 +40,10 @@
 #
 #   SLEY_BIN            absolute path to the sley binary. If unset we try
 #                       $CARGO_BIN_EXE_sley, then target/debug/sley, and
-#                       finally `cargo build -p sley-cli --bin sley`.
+#                       finally build all native sley-cli binaries.
+#   SLEY_SCALAR_BIN     absolute path to Sley's native scalar binary. Defaults
+#                       to the `scalar` sibling of SLEY_BIN; the runner refuses
+#                       to borrow a system-installed Scalar when it is absent.
 #   SLEY_TESTS          space-separated script list (overrides the default
 #                       manifest-defined 891-script surface). The special
 #                       values are `curated` and `foundational`. Positional
@@ -401,6 +404,7 @@ case $test_target in
 esac
 
 sley_bin=""
+sley_scalar_bin=""
 oracle_bin=""
 oracle_exec_path=""
 if [ "$test_target" = "sley" ]; then
@@ -416,13 +420,22 @@ if [ "$test_target" = "sley" ]; then
     fi
 
     if [ -z "$sley_bin" ] || [ ! -x "$sley_bin" ]; then
-        log "sley binary not found; building with 'cargo build -p sley-cli --release --bin sley --features git-compat-i18n'..."
-        ( cd "$repo_root" && cargo build -p sley-cli --release --bin sley --features git-compat-i18n ) \
-            || die "cargo build -p sley-cli --release --bin sley --features git-compat-i18n failed"
+        log "sley binary not found; building native CLI binaries..."
+        ( cd "$repo_root" && cargo build -p sley-cli --release --bins --features git-compat-i18n ) \
+            || die "cargo build -p sley-cli --release --bins --features git-compat-i18n failed"
         sley_bin=$repo_root/target/release/sley
     fi
     [ -x "$sley_bin" ] || die "sley binary still not executable: $sley_bin"
     case $sley_bin in /*) ;; *) sley_bin=$(pwd)/$sley_bin ;; esac
+    if [ -n "${SLEY_SCALAR_BIN:-}" ]; then
+        sley_scalar_bin=$SLEY_SCALAR_BIN
+    else
+        sley_scalar_bin=$(dirname -- "$sley_bin")/scalar
+        case $sley_bin in *.exe) sley_scalar_bin=$(dirname -- "$sley_bin")/scalar.exe ;; esac
+    fi
+    [ -x "$sley_scalar_bin" ] \
+        || die "native scalar binary missing beside Sley; build sley-cli --bins or set SLEY_SCALAR_BIN"
+    case $sley_scalar_bin in /*) ;; *) sley_scalar_bin=$(pwd)/$sley_scalar_bin ;; esac
     target_bin=$sley_bin
     log "sley binary: $sley_bin"
 else
@@ -511,6 +524,22 @@ if [ "$test_target" = "sley" ]; then
         die "could not expose Sley as a direct installed git launcher"
     fi
     chmod +x "$installed_git"
+
+    # Scalar is a separate native binary. Put it in the same isolated installed
+    # prefix so upstream tests cannot silently borrow Homebrew/system Git's
+    # scalar from the remainder of PATH.
+    installed_scalar=$bindir/scalar
+    case $sley_scalar_bin in *.exe) installed_scalar=$bindir/scalar.exe ;; esac
+    if ln "$sley_scalar_bin" "$installed_scalar" 2>/dev/null; then
+        : direct scalar hardlink
+    elif ln -s "$sley_scalar_bin" "$installed_scalar" 2>/dev/null; then
+        : direct scalar symlink
+    elif cp "$sley_scalar_bin" "$installed_scalar"; then
+        : direct scalar copy
+    else
+        die "could not expose native Scalar in the installed test prefix"
+    fi
+    chmod +x "$installed_scalar"
 
     # Apache's upstream test configuration passes GIT_EXEC_PATH into CGI
     # programs but not SLEY_BIN. Sley's owned git-http-backend adapter needs
@@ -1120,6 +1149,7 @@ run_one() {
         # grandchild `sh` regardless of how the chosen shell scopes assignment
         # prefixes on a shell-function invocation.
         export GIT_TEST_INSTALLED="$bindir"
+        export PATH="$bindir:$PATH"
         if [ "$test_target" = "sley" ]; then
             export SLEY_BIN="$sley_bin"
         else

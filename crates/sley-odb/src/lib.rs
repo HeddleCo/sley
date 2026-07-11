@@ -1703,10 +1703,13 @@ mod tests {
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         let mut roots = Vec::new();
+        let shared = "streamed reachable shared payload ".repeat(16);
         for idx in 0..(REACHABLE_PACK_STREAMING_MIN_OBJECTS + 5) {
             let object = EncodedObject::new(
                 ObjectType::Blob,
-                format!("streamed reachable blob {idx:04}\n").into_bytes(),
+                // Large enough that the tiny varying suffix remains inside
+                // Git's half-target-minus-object-id delta budget.
+                format!("{shared}{idx:04}\n").into_bytes(),
             );
             roots.push(
                 db.write_object(object)
@@ -2579,6 +2582,88 @@ mod tests {
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
+    fn repack_a_unpacks_unreachable_before_pruning(format: ObjectFormat) {
+        let root = temp_root("sley-repack-unpack-unreachable");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        let mut database = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let graph = write_commit_graph(&mut database, b"reachable graph\n");
+        let root_oid = graph[0].0;
+        let unreachable = EncodedObject::new(ObjectType::Blob, b"packed unreachable\n".to_vec());
+        let unreachable_oid = database
+            .write_object(unreachable.clone())
+            .expect("write unreachable");
+
+        let mut source_objects = graph
+            .iter()
+            .map(|(_, object)| object.clone())
+            .collect::<Vec<_>>();
+        source_objects.push(unreachable);
+        let source =
+            PackFile::write_undeltified(&source_objects, format).expect("write source pack");
+        let installed = database.install_pack(&source).expect("install source pack");
+        for oid in graph
+            .iter()
+            .map(|(oid, _)| *oid)
+            .chain(std::iter::once(unreachable_oid))
+        {
+            fs::remove_file(database.loose().object_path(&oid).expect("loose path"))
+                .expect("remove loose source");
+        }
+        fs::OpenOptions::new()
+            .read(true)
+            .open(&installed.pack_path)
+            .expect("open source pack")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(123))
+            .expect("set pack mtime");
+
+        let outcome = repack_reachable_objects_unpack_unreachable(
+            &git_dir,
+            format,
+            &[root_oid],
+            &RepackOptions::default(),
+            None,
+            &[],
+        )
+        .expect("build -A repack");
+        assert_eq!(
+            outcome.unpacked_oids().collect::<Vec<_>>(),
+            vec![unreachable_oid]
+        );
+        install_repack_with_unpacked_unreachable(&git_dir, format, &outcome, true)
+            .expect("install -A repack");
+
+        assert!(!installed.pack_path.exists());
+        let loose_path = database
+            .loose()
+            .object_path(&unreachable_oid)
+            .expect("unreachable loose path");
+        assert!(loose_path.is_file());
+        let mtime = fs::metadata(&loose_path)
+            .expect("loose metadata")
+            .modified()
+            .expect("loose mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("mtime after epoch")
+            .as_secs();
+        assert_eq!(mtime, 123);
+        let reopened = FileObjectDatabase::from_git_dir(&git_dir, format);
+        assert!(reopened.read_object(&root_oid).is_ok());
+        assert!(reopened.read_object(&unreachable_oid).is_ok());
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn sha1_repack_a_unpacks_unreachable_before_pruning() {
+        repack_a_unpacks_unreachable_before_pruning(ObjectFormat::Sha1);
+    }
+
+    #[test]
+    fn sha256_repack_a_unpacks_unreachable_before_pruning() {
+        repack_a_unpacks_unreachable_before_pruning(ObjectFormat::Sha256);
+    }
+
     fn rewriting_cruft_only_object_creates_loose_copy(format: ObjectFormat) {
         let root = temp_root("sley-cruft-freshen-loose");
         let git_dir = root.join(".git");
@@ -2645,6 +2730,75 @@ mod tests {
     #[test]
     fn rewriting_sha256_cruft_only_object_creates_loose_copy() {
         rewriting_cruft_only_object_creates_loose_copy(ObjectFormat::Sha256);
+    }
+
+    fn expired_cruft_pack_survives_source_pruning(format: ObjectFormat) {
+        let root = temp_root("sley-cruft-expire-to");
+        let git_dir = root.join("source.git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create source object directory");
+        let database = FileObjectDatabase::from_git_dir(&git_dir, format);
+
+        let stale = EncodedObject::new(ObjectType::Blob, b"stale cruft\n".to_vec());
+        let stale_oid = database.write_object(stale).expect("write stale object");
+        let recent = EncodedObject::new(ObjectType::Blob, b"recent cruft\n".to_vec());
+        let recent_oid = database.write_object(recent).expect("write recent object");
+        for (oid, mtime) in [(stale_oid, 100), (recent_oid, 200)] {
+            let path = database.loose().object_path(&oid).expect("loose path");
+            fs::OpenOptions::new()
+                .read(true)
+                .open(path)
+                .expect("open loose object")
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime))
+                .expect("set object mtime");
+        }
+
+        // Expiration operates on packed cruft in the real `--expire-to`
+        // workflow. Establish that state first so pruning removes the stale
+        // object's only local copy.
+        let initial = repack_cruft(&git_dir, format, &[], None).expect("build initial cruft pack");
+        install_cruft_repack_result(&git_dir, format, &initial, true)
+            .expect("install initial cruft pack");
+
+        let result = repack_cruft(&git_dir, format, &[], Some(150)).expect("build expiring repack");
+        assert_eq!(
+            result.cruft.as_ref().map(|pack| pack.oids.as_slice()),
+            Some(std::slice::from_ref(&recent_oid))
+        );
+        assert_eq!(
+            result.expired.as_ref().map(|pack| pack.oids.as_slice()),
+            Some(std::slice::from_ref(&stale_oid))
+        );
+
+        // Mirror the CLI's safe order: prune the source first, then prove the
+        // self-contained expired output can still be installed elsewhere.
+        install_cruft_repack_result(&git_dir, format, &result, true)
+            .expect("install source repack");
+        let source = FileObjectDatabase::from_git_dir(&git_dir, format);
+        assert!(source.read_object(&recent_oid).is_ok());
+        assert!(source.read_object(&stale_oid).is_err());
+
+        let destination = root.join("expired.git/objects/pack/pack");
+        install_cruft_pack_at_prefix(
+            format,
+            result.expired.as_ref().expect("expired pack"),
+            &destination,
+        )
+        .expect("install expired pack");
+        let expired = FileObjectDatabase::new(root.join("expired.git/objects"), format);
+        assert!(expired.read_object(&stale_oid).is_ok());
+        assert!(expired.read_object(&recent_oid).is_err());
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn sha1_expired_cruft_pack_survives_source_pruning() {
+        expired_cruft_pack_survives_source_pruning(ObjectFormat::Sha1);
+    }
+
+    #[test]
+    fn sha256_expired_cruft_pack_survives_source_pruning() {
+        expired_cruft_pack_survives_source_pruning(ObjectFormat::Sha256);
     }
 
     #[test]

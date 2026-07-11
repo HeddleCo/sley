@@ -979,6 +979,13 @@ fn cmd_log_impl(
     let mut null_terminate = false;
     let mut graph = false;
     let mut boundary = false;
+    // `--merge` is revision.c's conflict-history mode (distinct from
+    // `--merges`, which merely filters by parent count).
+    let mut show_merge = false;
+    // Keep the oldest N commits from the fully filtered/simplified revision
+    // result. Unlike `--max-count`, this is applied from the tail of the normal
+    // newest-first walk, before an optional `--reverse` presentation flip.
+    let mut max_count_oldest: Option<usize> = None;
     let mut show_linear_break = false;
     let mut show_source = false;
     let mut ignored_missing_input = false;
@@ -1337,6 +1344,7 @@ fn cmd_log_impl(
             {
                 setup_args.push(arg.clone());
             }
+            "--merge" => show_merge = true,
             "--merges" => min_parents = Some(2),
             "--no-merges" => max_parents = Some(1),
             "--no-min-parents" => min_parents = None,
@@ -1966,6 +1974,15 @@ fn cmd_log_impl(
                 preset_oneline = None;
                 plain_oneline = false;
             }
+            "--max-count-oldest" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("--max-count-oldest requires a value".into())
+                })?;
+                max_count_oldest = Some(log_parse_parent_count(value)?);
+            }
+            value if let Some(count) = value.strip_prefix("--max-count-oldest=") => {
+                max_count_oldest = Some(log_parse_parent_count(count)?);
+            }
             "-n" | "--max-count" => {
                 setup_args.push(arg.clone());
                 setup_args.push(
@@ -2200,8 +2217,11 @@ fn cmd_log_impl(
                     }
                     follow_config_allowed = false;
                 }
-                if let Some((_, path)) = log_pathspec_magic(value) {
-                    setup_args.push(path.to_string());
+                if log_pathspec_magic(value).is_some() {
+                    // Preserve the complete magic expression for revision
+                    // setup. Stripping `:(exclude)`/other magic here prevents
+                    // ambiguity handling and unknown-magic validation.
+                    setup_args.push(value.to_string());
                 } else if value == ".." && Path::new(value).is_dir() {
                     if !setup_args.iter().any(|arg| arg == "--") {
                         setup_args.push("--".to_string());
@@ -2271,6 +2291,16 @@ fn cmd_log_impl(
         } else {
             setup_args.push(rev);
         }
+    }
+    if show_merge {
+        let merge_revisions = log_show_merge_revisions(&git_dir, format, &db, &config)?;
+        // Add these before command-line revision toggles such as `--not`:
+        // prepare_show_merge marks its heads interesting independently of the
+        // user's pending polarity.
+        setup_args.splice(0..0, merge_revisions);
+        // The mode supplies HEAD and the in-progress operation's other head;
+        // do not also install the ordinary single-HEAD default.
+        default_revision_given = true;
     }
     if !default_revision_given && !revision_input_with_ignore_missing {
         setup_args.splice(0..0, ["--default".to_string(), "HEAD".to_string()]);
@@ -2435,7 +2465,29 @@ fn cmd_log_impl(
         sley_rev::NoWalkMode::Unsorted => (false, true),
     };
     let first_parent = revision_options.first_parent;
-    let pathspecs = setup.pathspecs;
+    let mut pathspecs = setup.pathspecs;
+    if show_merge {
+        let user_pathspec = if pathspecs.is_empty() {
+            None
+        } else {
+            let worktree_root = repository.worktree_root()?;
+            Some(DiffPathspec::new(
+                &cwd,
+                worktree_root,
+                &pathspecs,
+                effective_pathspec_flags(cli_session),
+            )?)
+        };
+        pathspecs = log_show_merge_conflict_paths(&git_dir, format, user_pathspec.as_ref())?;
+    }
+    if max_count_oldest.is_some() && max_count.is_some() {
+        eprintln!("fatal: options '--max-count-oldest' and '--max-count' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if max_count_oldest.is_some() && skip > 0 {
+        eprintln!("fatal: options '--max-count-oldest' and '--skip' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
     if !follow_explicit
         && !saw_follow
         && follow_config_allowed
@@ -2904,6 +2956,7 @@ fn cmd_log_impl(
         return Err(GitError::Command("unsupported log option --dirstat".into()));
     }
     if plain_oneline
+        && max_count_oldest.is_none()
         && walk
         && !graph
         && line_prefix.is_none()
@@ -2967,6 +3020,7 @@ fn cmd_log_impl(
         return Ok(());
     }
     if walk
+        && max_count_oldest.is_none()
         && !graph
         && line_prefix.is_none()
         && ordering == RevListOrdering::Default
@@ -3076,6 +3130,7 @@ fn cmd_log_impl(
         return Ok(());
     }
     if walk
+        && max_count_oldest.is_none()
         && !graph
         && line_prefix.is_none()
         && ordering == RevListOrdering::Default
@@ -3449,9 +3504,17 @@ fn cmd_log_impl(
         });
         log_decoration_map(&git_dir, &db, format, map_mode, &decoration_filter)?
     };
+    let decoration_simplified_storage;
     if simplify_by_decoration {
-        selected
-            .retain(|record| decorations.contains_key(&record.oid) || record.parents.is_empty());
+        decoration_simplified_storage = log_simplify_by_decoration(selected, &decorations);
+        selected = rev_list_topo_order(decoration_simplified_storage.iter().collect())?;
+    } else {
+        decoration_simplified_storage = Vec::new();
+    }
+    let _ = &decoration_simplified_storage;
+    if let Some(count) = max_count_oldest {
+        let discard = selected.len().saturating_sub(count);
+        selected = selected.into_iter().skip(discard).collect();
     }
     // `--boundary` (with `--graph`): the uninteresting commits directly adjacent
     // to the shown set are git's BOUNDARY commits. Emit them as leaf nodes (`o`)
@@ -3652,13 +3715,17 @@ fn cmd_log_impl(
                             &mut msg,
                         )?;
                     }
+                    let mut diff_attached = false;
                     if let Some(log_diff) = &log_diff {
-                        let mut padding = String::new();
-                        graph_state.padding_line(&mut padding);
+                        // Measuring a padding row by rendering it mutates the
+                        // graph's collapsing state and silently consumes a
+                        // topology row. Its visible width is already tracked by
+                        // the graph, so use that without advancing it.
                         let prefix_width =
-                            log_prefix_display_width(&padding) + log_prefix_display_width(prefix);
+                            graph_state.graph_width() as i64 + log_prefix_display_width(prefix);
                         log_diff.render(record, prefix_width, &mut diff_block)?;
                         if !diff_block.is_empty() {
+                            diff_attached = true;
                             if msg.last() != Some(&b'\n') {
                                 msg.push(b'\n');
                             }
@@ -3670,6 +3737,7 @@ fn cmd_log_impl(
                     let newline_terminated = msg.last() == Some(&b'\n');
                     prev_missing_newline = !newline_terminated;
                     if *final_newline
+                        && (!diff_attached || !newline_terminated)
                         && (!*suppress_extra_final_newline
                             || index + 1 < selected.len()
                             || !newline_terminated)
@@ -3702,10 +3770,8 @@ fn cmd_log_impl(
                             msg.extend_from_slice(&notes);
                         }
                         if let Some(log_diff) = &log_diff {
-                            let mut padding = String::new();
-                            graph_state.padding_line(&mut padding);
-                            let prefix_width = log_prefix_display_width(&padding)
-                                + log_prefix_display_width(prefix);
+                            let prefix_width =
+                                graph_state.graph_width() as i64 + log_prefix_display_width(prefix);
                             log_diff.render(record, prefix_width, &mut diff_block)?;
                             if !diff_block.is_empty() {
                                 msg.extend_from_slice(diff_opts.block_separator_for(record));
@@ -3823,10 +3889,8 @@ fn cmd_log_impl(
                         // Measure the graph padding that will prefix the diff
                         // lines so the stat width math sees the same budget
                         // git's line-prefix callback gives it.
-                        let mut padding = String::new();
-                        graph_state.padding_line(&mut padding);
                         let prefix_width =
-                            log_prefix_display_width(&padding) + log_prefix_display_width(prefix);
+                            graph_state.graph_width() as i64 + log_prefix_display_width(prefix);
                         log_diff.render(record, prefix_width, &mut diff_block)?;
                         if !diff_block.is_empty() {
                             msg.extend_from_slice(diff_opts.block_separator_for(record));
@@ -4359,6 +4423,158 @@ fn log_parse_parent_count(value: &str) -> Result<usize> {
         eprintln!("fatal: '{value}': not an integer");
         GitError::Exit(128)
     })
+}
+
+/// Build revision.c's `prepare_show_merge()` pending set: both sides of the
+/// in-progress operation are interesting and their best common ancestors are
+/// uninteresting boundaries.
+fn log_show_merge_revisions<R: ObjectReader>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reader: &R,
+    config: &GitConfig,
+) -> Result<Vec<String>> {
+    let head =
+        sley_rev::resolve_revision_commitish_with_config(git_dir, format, reader, "HEAD", config)
+            .map_err(|_| {
+            eprintln!("fatal: --merge without HEAD?");
+            GitError::Exit(128)
+        })?;
+
+    let mut other = None;
+    for name in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "REBASE_HEAD",
+    ] {
+        if !git_dir.join(name).exists() {
+            continue;
+        }
+        let oid = sley_rev::resolve_revision_commitish_with_config(
+            git_dir, format, reader, name, config,
+        )?;
+        other = Some((name, oid));
+        break;
+    }
+    let Some((other_name, other_oid)) = other else {
+        eprintln!(
+            "fatal: --merge requires one of the pseudorefs MERGE_HEAD, CHERRY_PICK_HEAD, REVERT_HEAD or REBASE_HEAD"
+        );
+        return Err(GitError::Exit(128));
+    };
+
+    let mut revisions = vec!["HEAD".to_string(), other_name.to_string()];
+    revisions.extend(
+        sley_rev::merge_bases(git_dir, format, reader, &head, &other_oid)?
+            .into_iter()
+            .map(|base| format!("^{base}")),
+    );
+    Ok(revisions)
+}
+
+/// Replace the command-line pathspec with the set of currently unmerged index
+/// paths it selects. This mirrors `prepare_show_merge()`'s stage scan and makes
+/// later history simplification operate only on paths involved in the conflict.
+fn log_show_merge_conflict_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+    user_pathspec: Option<&DiffPathspec>,
+) -> Result<Vec<String>> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let bytes = match fs::read(index_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let index = Index::parse(&bytes, format)?;
+    let mut paths = BTreeSet::new();
+    for entry in index.entries {
+        if entry.stage().as_u16() == 0
+            || user_pathspec.is_some_and(|pathspec| !pathspec.matches(&entry.path))
+        {
+            continue;
+        }
+        paths.insert(argv_string_from_bytes(&entry.path));
+    }
+    Ok(paths.into_iter().collect())
+}
+
+/// `--simplify-by-decoration` treats undecorated commits as TREESAME, but it
+/// must retain merge connectors that join two decorated parent histories and
+/// rewrite parents across omitted commits. A plain `retain(decorated)` loses
+/// those connectors and leaves the survivors in date order rather than the
+/// topology Git presents.
+fn log_simplify_by_decoration(
+    selected: Vec<&sley_rev::CommitRecord>,
+    decorations: &HashMap<ObjectId, Vec<String>>,
+) -> Vec<sley_rev::CommitRecord> {
+    let records: HashMap<ObjectId, &sley_rev::CommitRecord> = selected
+        .iter()
+        .map(|record| (record.oid, *record))
+        .collect();
+    let decorated: HashSet<ObjectId> = decorations.keys().copied().collect();
+    let mut keep: HashSet<ObjectId> = selected
+        .iter()
+        .filter(|record| decorated.contains(&record.oid) || record.parents.is_empty())
+        .map(|record| record.oid)
+        .collect();
+
+    for record in &selected {
+        if record.parents.len() < 2 || keep.contains(&record.oid) {
+            continue;
+        }
+        let decorated_parents = record
+            .parents
+            .iter()
+            .filter(|parent| decorated.contains(*parent))
+            .take(2)
+            .count();
+        if decorated_parents >= 2 {
+            keep.insert(record.oid);
+        }
+    }
+
+    let mut simplified = selected
+        .into_iter()
+        .filter(|record| keep.contains(&record.oid))
+        .cloned()
+        .collect::<Vec<_>>();
+    for record in &mut simplified {
+        let mut rewritten = Vec::new();
+        let mut emitted = HashSet::new();
+        for parent in &record.parents {
+            log_nearest_kept_ancestors(*parent, &records, &keep, &mut emitted, &mut rewritten);
+        }
+        record.parents = rewritten.clone();
+        record.commit.parents = rewritten;
+    }
+    simplified
+}
+
+fn log_nearest_kept_ancestors(
+    start: ObjectId,
+    records: &HashMap<ObjectId, &sley_rev::CommitRecord>,
+    keep: &HashSet<ObjectId>,
+    emitted: &mut HashSet<ObjectId>,
+    out: &mut Vec<ObjectId>,
+) {
+    let mut pending = vec![start];
+    let mut visited = HashSet::new();
+    while let Some(oid) = pending.pop() {
+        if !visited.insert(oid) {
+            continue;
+        }
+        if keep.contains(&oid) {
+            if emitted.insert(oid) {
+                out.push(oid);
+            }
+            continue;
+        }
+        if let Some(record) = records.get(&oid) {
+            pending.extend(record.parents.iter().rev().copied());
+        }
+    }
 }
 
 fn log_parse_abbrev_width(value: &str) -> usize {

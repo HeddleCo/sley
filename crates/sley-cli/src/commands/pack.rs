@@ -1426,6 +1426,9 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
     let mut prune = false;
     let mut quiet = false;
     let mut all = false;
+    let mut unpack_unreachable = false;
+    let mut unpack_unreachable_before: Option<Option<u32>> = None;
+    let mut keep_unreachable = false;
     let mut local = false;
     let mut write_bitmaps: Option<bool> = None;
     let mut geometric: Option<u64> = None;
@@ -1437,6 +1440,10 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
     let mut cruft = false;
     let mut cruft_expiration: Option<Option<u32>> = None;
     let mut expire_to: Option<String> = None;
+    let mut max_pack_size: Option<u64> = None;
+    let mut max_cruft_size: Option<u64> = None;
+    let mut combine_cruft_below_size: Option<u64> = None;
+    let mut window: Option<usize> = None;
     let mut filter: Option<String> = None;
     let mut filter_to: Option<String> = None;
     let mut iter = expand_repack_short_clusters(args).into_iter().peekable();
@@ -1446,7 +1453,11 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             "-q" | "--quiet" => quiet = true,
             "-b" | "--write-bitmap-index" => write_bitmaps = Some(true),
             "--no-write-bitmap-index" => write_bitmaps = Some(false),
-            "-a" | "-A" => all = true,
+            "-a" => all = true,
+            "-A" => {
+                all = true;
+                unpack_unreachable = true;
+            }
             "-m" | "--write-midx" => write_midx = true,
             "-l" | "--local" => local = true,
             "-n" => update_server_info = Some(false),
@@ -1473,13 +1484,61 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             value if value.starts_with("--expire-to=") => {
                 expire_to = Some(value["--expire-to=".len()..].to_string());
             }
+            "--max-pack-size" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("option `max-pack-size' requires a value".into())
+                })?;
+                max_pack_size = Some(parse_gc_size(&value)?);
+            }
+            value if value.starts_with("--max-pack-size=") => {
+                max_pack_size = Some(parse_gc_size(&value["--max-pack-size=".len()..])?);
+            }
+            "--max-cruft-size" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("option `max-cruft-size' requires a value".into())
+                })?;
+                max_cruft_size = Some(parse_gc_size(&value)?);
+            }
+            value if value.starts_with("--max-cruft-size=") => {
+                max_cruft_size = Some(parse_gc_size(&value["--max-cruft-size=".len()..])?);
+            }
+            "--combine-cruft-below-size" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("option `combine-cruft-below-size' requires a value".into())
+                })?;
+                combine_cruft_below_size = Some(parse_gc_size(&value)?);
+            }
+            value if value.starts_with("--combine-cruft-below-size=") => {
+                combine_cruft_below_size = Some(parse_gc_size(
+                    &value["--combine-cruft-below-size=".len()..],
+                )?);
+            }
+            "--window" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("option `window' requires a value".into()))?;
+                window = Some(parse_repack_window(&value)?);
+            }
+            value if value.starts_with("--window=") => {
+                window = Some(parse_repack_window(&value["--window=".len()..])?);
+            }
             value if value.starts_with("--filter=") => {
                 filter = Some(value["--filter=".len()..].to_string());
             }
             value if value.starts_with("--filter-to=") => {
                 filter_to = Some(value["--filter-to=".len()..].to_string());
             }
-            "-k" | "--keep-unreachable" => {}
+            "--unpack-unreachable" => {
+                unpack_unreachable = true;
+                unpack_unreachable_before = Some(None);
+            }
+            value if value.starts_with("--unpack-unreachable=") => {
+                unpack_unreachable = true;
+                unpack_unreachable_before = Some(parse_cruft_expiration(
+                    &value["--unpack-unreachable=".len()..],
+                )?);
+            }
+            "-k" | "--keep-unreachable" => keep_unreachable = true,
             "--pack-kept-objects" => pack_kept_objects = true,
             "-g" | "--geometric" => {
                 let value = iter.next().ok_or_else(|| {
@@ -1504,12 +1563,8 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             // Accepted no-ops.
             "--progress" | "--no-progress" | "--no-pack-kept-objects" => {}
             value
-                if value.starts_with("--window")
-                    || value.starts_with("--depth")
+                if value.starts_with("--depth")
                     || value.starts_with("--threads")
-                    || value.starts_with("--max-pack-size")
-                    || value.starts_with("--max-cruft-size")
-                    || value.starts_with("--combine-cruft-below-size")
                     || value.starts_with("--pack.packSizeLimit") => {}
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!(
@@ -1626,6 +1681,23 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
 
     if cruft {
         validate_repack_cruft_numeric_config(&config)?;
+        let configured_pack_size = config
+            .get("pack", None, "packSizeLimit")
+            .map(parse_gc_size)
+            .transpose()?;
+        let cruft_pack_size =
+            resolve_cruft_pack_size(max_pack_size, max_cruft_size, configured_pack_size);
+        // Cruft-specific config intentionally overrides the general command
+        // option. Otherwise the command option overrides pack.window.
+        let cruft_window = if let Some(value) = config.get("repack", None, "cruftWindow") {
+            parse_repack_window(value)?
+        } else if let Some(value) = window {
+            value
+        } else if let Some(value) = config.get("pack", None, "window") {
+            parse_repack_window(value)?
+        } else {
+            PackWriteOptions::new().window
+        };
         return cmd_repack_cruft(
             cli_session,
             &git_dir,
@@ -1637,6 +1709,9 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             write_midx,
             &keep_packs,
             include_kept_objects,
+            cruft_pack_size,
+            cruft_window,
+            combine_cruft_below_size.filter(|size| *size > 0),
         );
     }
 
@@ -1648,10 +1723,80 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
         );
         return Err(GitError::Exit(128));
     }
+
+    // `-A -d` differs from `-a -d`: objects that are no longer reachable must
+    // be materialized loose before their source packs are removed. Build that
+    // transition as one engine outcome so neither the CLI nor concurrent
+    // readers observe a gap between pruning the pack and writing the loose
+    // copies.
+    if all && unpack_unreachable && prune && !keep_unreachable {
+        if blob_limit_filter.is_some() {
+            return Err(GitError::Command(
+                "--unpack-unreachable cannot be combined with --filter".into(),
+            ));
+        }
+        let roots = repack_roots
+            .as_deref()
+            .expect("all-object repacks prepared traversal roots");
+        let keep_pack_stems: HashSet<String> = keep_packs.iter().cloned().collect();
+        let options = sley_odb::RepackOptions {
+            local,
+            force_rewrite,
+            pack_kept_objects: include_kept_objects,
+            keep_pack_stems,
+        };
+        let recent_roots = prune_recent_hook_roots(&common_git_dir, format)?;
+        let unpacked = sley_odb::repack_reachable_objects_unpack_unreachable(
+            &common_git_dir,
+            format,
+            roots,
+            &options,
+            unpack_unreachable_before.flatten(),
+            &recent_roots,
+        )?;
+        sley_odb::install_repack_with_unpacked_unreachable(
+            &common_git_dir,
+            format,
+            &unpacked,
+            true,
+        )?;
+        if unpacked.repack.as_ref().is_none_or(|result| {
+            result.loose_object_prune_outcome() != sley_odb::LooseObjectPruneOutcome::Complete
+        }) {
+            prune_packed_loose_objects(&common_git_dir, format, false)?;
+        }
+        if !write_bitmaps || write_midx {
+            remove_pack_bitmap_sidecars(&common_git_dir)?;
+        }
+        if write_midx {
+            let mut midx_args = Vec::new();
+            if write_bitmaps {
+                midx_args.push("--bitmap".to_string());
+            }
+            cmd_multi_pack_index_write(cli_session, &midx_args)?;
+        }
+        if update_server_info {
+            let updated = match unpacked.repack.as_ref() {
+                Some(result) => {
+                    repack_try_update_server_info_from_result(&common_git_dir, format, result)?
+                }
+                None => false,
+            };
+            if !updated {
+                crate::commands::refs::update_server_info_at(&common_git_dir, &[])?;
+            }
+        }
+        prune_repack_shallow_file(&common_git_dir, format, roots)?;
+        let _ = quiet;
+        return Ok(());
+    }
+
     // `-a`: pack the reachability closure of refs/HEAD/reflogs/index (borrowed
     // objects included, unreachable ones dropped). Without `-a`, pack only
     // loose objects and leave existing packs in place.
-    let result = if all {
+    let result = if all && keep_unreachable {
+        sley_odb::repack_all_objects(&common_git_dir, format)?
+    } else if all {
         let roots = repack_roots
             .as_deref()
             .expect("all-object repacks prepared traversal roots");
@@ -1679,7 +1824,13 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             )?,
         }
     } else {
-        sley_odb::repack_loose_objects(&common_git_dir, format)?
+        let roots = repack_traversal_roots(
+            &git_dir,
+            &common_git_dir,
+            format,
+            cli_session.replace_objects(),
+        )?;
+        sley_odb::repack_reachable_loose_objects(&common_git_dir, format, &roots)?
     };
     let mut loose_prune_complete = false;
     if let Some(result) = result.as_ref() {
@@ -1735,6 +1886,12 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             crate::commands::refs::update_server_info_at(&common_git_dir, &[])?;
         }
     }
+    if all && prune {
+        let roots = repack_roots
+            .as_deref()
+            .expect("all-object repacks prepared traversal roots");
+        prune_repack_shallow_file(&common_git_dir, format, roots)?;
+    }
     let _ = quiet;
     Ok(())
 }
@@ -1757,6 +1914,23 @@ fn parse_geometric_factor(value: &str) -> Result<u64> {
         .ok()
         .filter(|&n| n >= 1)
         .ok_or_else(|| GitError::Command(format!("cannot parse geometric factor: {value}")))
+}
+
+fn parse_repack_window(value: &str) -> Result<usize> {
+    value
+        .parse::<usize>()
+        .map_err(|_| GitError::Command(format!("invalid window size: {value}")))
+}
+
+fn resolve_cruft_pack_size(
+    max_pack_size: Option<u64>,
+    max_cruft_size: Option<u64>,
+    configured_pack_size: Option<u64>,
+) -> Option<u64> {
+    max_cruft_size
+        .filter(|size| *size > 0)
+        .or_else(|| max_pack_size.filter(|size| *size > 0))
+        .or_else(|| configured_pack_size.filter(|size| *size > 0))
 }
 
 fn strip_pack_suffix(name: &str) -> String {
@@ -1913,6 +2087,9 @@ fn cmd_repack_cruft(
     write_midx: bool,
     keep_packs: &[String],
     pack_kept_objects: bool,
+    max_pack_size: Option<u64>,
+    cruft_window: usize,
+    combine_cruft_below_size: Option<u64>,
 ) -> Result<()> {
     let roots = repack_traversal_roots(
         git_dir,
@@ -1928,49 +2105,28 @@ fn cmd_repack_cruft(
         keep_pack_stems,
     };
 
-    // With `--expire-to` + `-d`, the main cruft pack expires (drops) objects
-    // older than the cutoff; those expired objects are written into the
-    // expire-to repo as a second cruft pack (with no expiration, so it keeps
-    // them all). Compute the pre-expiry unreachable set first so we can diff.
-    let pre_expiry = if expire_to.is_some() && prune {
-        Some(repack_cruft_or_bad_object(
-            sley_odb::repack_cruft_with_options(common_git_dir, format, &roots, None, &options),
-        )?)
-    } else {
-        None
+    let cruft_options = sley_odb::CruftPackOptions {
+        max_pack_size,
+        combine_cruft_below_size,
+        pack_write: PackWriteOptions::new().with_window(cruft_window),
     };
-
-    let result = repack_cruft_or_bad_object(sley_odb::repack_cruft_with_options(
+    let window_arg = format!("--window={}", cruft_options.pack_write.window);
+    trace2_child_start(&["pack-objects", &window_arg, "--cruft"]);
+    let result = repack_cruft_or_bad_object(sley_odb::repack_cruft_with_pack_options(
         common_git_dir,
         format,
         &roots,
         cruft_expiration,
         &options,
+        &cruft_options,
     ))?;
-    sley_odb::install_cruft_repack_result(common_git_dir, format, &result, prune)?;
-
-    // Move the expired objects into the --expire-to repository.
-    if let (Some(dir), Some(pre)) = (expire_to, pre_expiry.as_ref()) {
-        let kept: HashSet<ObjectId> = result
-            .cruft
-            .as_ref()
-            .map(|c| c.oids.iter().copied().collect())
-            .unwrap_or_default();
-        let expired: Vec<ObjectId> = pre
-            .cruft
-            .as_ref()
-            .map(|c| {
-                c.oids
-                    .iter()
-                    .copied()
-                    .filter(|oid| !kept.contains(oid))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !expired.is_empty() {
-            write_expire_to_cruft_pack(common_git_dir, format, dir, &expired, cruft_expiration)?;
-        }
-    }
+    sley_odb::install_cruft_repack_result_with_expire_to(
+        common_git_dir,
+        format,
+        &result,
+        prune,
+        expire_to.map(Path::new),
+    )?;
 
     if write_midx && pack_dir_has_packs(common_git_dir, format)? {
         cmd_multi_pack_index_write(cli_session, &[])?;
@@ -1993,46 +2149,6 @@ fn repack_cruft_or_bad_object(
         }
         Err(err) => Err(err),
     }
-}
-
-/// Write a cruft pack of `expired` objects into the `--expire-to` repository's
-/// pack directory (an `<dir>/pack` prefix like git's `--expire-to=.../pack`).
-fn write_expire_to_cruft_pack(
-    common_git_dir: &Path,
-    format: ObjectFormat,
-    expire_to: &str,
-    expired: &[ObjectId],
-    cruft_expiration: Option<u32>,
-) -> Result<()> {
-    let _ = cruft_expiration;
-    // `--expire-to=<repo>/objects/pack/pack` names a pack-file prefix. Resolve
-    // the directory it lives in and write the limbo cruft pack there.
-    let prefix = Path::new(expire_to);
-    let dest_dir = prefix
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    fs::create_dir_all(&dest_dir)?;
-
-    let objects_dir = repository_objects_dir(common_git_dir);
-    let database = FileObjectDatabase::new(objects_dir.clone(), format);
-
-    // Stamp each expired object with the best mtime from its on-disk copy.
-    let on_disk = sley_odb::object_mtimes_on_disk_pub(&objects_dir, format)?;
-    let mut survivors: HashMap<ObjectId, u32> = HashMap::new();
-    for oid in expired {
-        let mtime = on_disk.get(oid).copied().unwrap_or(0);
-        survivors.insert(*oid, mtime);
-    }
-    let Some(cruft) = sley_odb::build_cruft_pack_pub(&database, format, &survivors)? else {
-        return Ok(());
-    };
-    let pack_name = format!("pack-{}", cruft.checksum.to_hex());
-    fs::write(dest_dir.join(format!("{pack_name}.pack")), &cruft.pack)?;
-    fs::write(dest_dir.join(format!("{pack_name}.rev")), &cruft.rev)?;
-    fs::write(dest_dir.join(format!("{pack_name}.mtimes")), &cruft.mtimes)?;
-    fs::write(dest_dir.join(format!("{pack_name}.idx")), &cruft.idx)?;
-    Ok(())
 }
 
 /// True when `objects/pack` holds at least one `.pack` file.
@@ -2266,6 +2382,9 @@ fn gc_run_locked(
         cli_session.replace_objects(),
     )?;
     let keep_pack_stems = gc_keep_pack_stems(common_git_dir, config, options)?;
+    let resolved_max_cruft_size = options
+        .max_cruft_size
+        .or_else(|| gc_config_u64(config, "maxCruftSize"));
 
     // builtin/gc.c add_repack_all_option: pick the repack flavour in the ODB
     // engine, leaving this layer to execute the selected filesystem operation.
@@ -2274,9 +2393,7 @@ fn gc_run_locked(
         prune_expire: prune_expire.as_deref(),
         cruft_packs,
         expire_to: options.expire_to.as_deref(),
-        max_cruft_size: options
-            .max_cruft_size
-            .or_else(|| gc_config_u64(config, "maxCruftSize")),
+        max_cruft_size: resolved_max_cruft_size,
         repack_filter: config.get("gc", None, "repackFilter"),
         repack_filter_to: config.get("gc", None, "repackFilterTo"),
     })
@@ -2327,25 +2444,24 @@ fn gc_run_locked(
                 pack_kept_objects: false,
                 keep_pack_stems,
             };
-            let result = sley_odb::repack_cruft_with_options(
+            let result = sley_odb::repack_cruft_with_pack_options(
                 &common_git_dir,
                 format,
                 &roots,
                 cruft_expiration,
                 &repack_options,
+                &sley_odb::CruftPackOptions {
+                    max_pack_size: resolved_max_cruft_size,
+                    ..sley_odb::CruftPackOptions::default()
+                },
             )?;
-            sley_odb::install_cruft_repack_result(&common_git_dir, format, &result, true)?;
-            if let Some(expire_to) = options.expire_to.as_deref() {
-                if let Some(cruft) = result.cruft.as_ref() {
-                    write_expire_to_cruft_pack(
-                        &common_git_dir,
-                        format,
-                        expire_to,
-                        &cruft.oids,
-                        cruft_expiration,
-                    )?;
-                }
-            }
+            sley_odb::install_cruft_repack_result_with_expire_to(
+                &common_git_dir,
+                format,
+                &result,
+                true,
+                options.expire_to.as_deref().map(Path::new),
+            )?;
         }
         sley_odb::GcRepackMode::Reachable => {
             // gc.cruftPacks=false: repack reachable objects, then prune loose
@@ -6227,6 +6343,16 @@ fn prune_empty_loose_object_dirs(objects_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn prune_repack_shallow_file(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+) -> Result<()> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let reachable = collect_reachable_object_ids(&db, format, roots.iter().copied())?;
+    prune_shallow_file(git_dir, format, &reachable, false, false)
+}
+
 fn prune_shallow_file(
     git_dir: &Path,
     format: ObjectFormat,
@@ -8344,4 +8470,29 @@ fn pack_redundant_pack_bytes(pack: &RedundantPack) -> u64 {
     let pack_size = fs::metadata(&pack.pack_path).map(|m| m.len()).unwrap_or(0);
     let idx_size = fs::metadata(&pack.idx_path).map(|m| m.len()).unwrap_or(0);
     pack_size + idx_size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_cruft_pack_size;
+
+    #[test]
+    fn cruft_pack_size_uses_git_override_precedence() {
+        assert_eq!(
+            resolve_cruft_pack_size(Some(1), Some(10), Some(100)),
+            Some(10),
+            "--max-cruft-size overrides --max-pack-size and config"
+        );
+        assert_eq!(
+            resolve_cruft_pack_size(Some(10), None, Some(1)),
+            Some(10),
+            "explicit --max-pack-size overrides config"
+        );
+        assert_eq!(
+            resolve_cruft_pack_size(Some(10), Some(0), Some(1)),
+            Some(10),
+            "zero max-cruft-size inherits the general command limit"
+        );
+        assert_eq!(resolve_cruft_pack_size(None, None, Some(1)), Some(1));
+    }
 }

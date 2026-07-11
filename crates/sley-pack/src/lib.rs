@@ -2119,9 +2119,14 @@ mod tests {
                 format!("unrelated streamed source object {idx:04}\n").into_bytes(),
             ));
         }
-        let base_body = b"cross-window base payload with enough shared anchors\nbase\n".to_vec();
-        let target_body =
-            b"cross-window base payload with enough shared anchors\ntarget\n".to_vec();
+        // Keep this candidate inside Git's first-delta budget (half the
+        // target size minus one raw object id), while still straddling two
+        // streaming compression windows.
+        let shared = b"cross-window base payload with enough shared anchors\n".repeat(64);
+        let mut base_body = shared.clone();
+        base_body.extend_from_slice(b"base\n");
+        let mut target_body = shared;
+        target_body.extend_from_slice(b"target\n");
         objects.push(EncodedObject::new(ObjectType::Blob, base_body));
         objects.push(EncodedObject::new(ObjectType::Blob, target_body));
 

@@ -851,6 +851,75 @@ mod tests {
     }
 
     #[test]
+    fn path_checkout_honors_and_can_explicitly_clear_skip_worktree() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        fs::create_dir_all(root.join("sub")).expect("create selected directory");
+        fs::write(root.join("outside"), b"outside\n").expect("write outside file");
+        fs::write(root.join("sub/file"), b"selected\n").expect("write selected file");
+        build_commit(&root, &git_dir, &["outside", "sub/file"]);
+
+        apply_sparse_checkout_with_mode(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &full_sparse(&[b"/sub/"]),
+            SparseCheckoutMode::Full,
+        )
+        .expect("apply sparse checkout");
+        assert!(!root.join("outside").exists());
+        assert!(index_entry_for(&read_index(&git_dir), b"outside").is_skip_worktree());
+
+        fs::write(root.join("sub/file"), b"dirty\n").expect("dirty selected file");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let options = CheckoutIndexPathOptions {
+            force: false,
+            merge: false,
+            overlay: true,
+            stage: None,
+            conflict_style: CheckoutConflictStyle::Merge,
+            smudge_config: None,
+        };
+        let outcome = checkout_index_paths_with_database_outcome_sparse(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &[root.join(".")],
+            &db,
+            CheckoutIndexSparsePolicy::Honor,
+            options,
+        )
+        .expect("honor sparse path checkout");
+        assert_eq!(outcome.restored, 1);
+        assert!(!root.join("outside").exists());
+        assert_eq!(
+            fs::read(root.join("sub/file")).expect("selected file"),
+            b"selected\n"
+        );
+        assert!(index_entry_for(&read_index(&git_dir), b"outside").is_skip_worktree());
+
+        let outcome = checkout_index_paths_with_database_outcome_sparse(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &[root.join(".")],
+            &db,
+            CheckoutIndexSparsePolicy::Ignore,
+            options,
+        )
+        .expect("override sparse path checkout");
+        assert_eq!(outcome.restored, 1);
+        assert_eq!(
+            fs::read(root.join("outside")).expect("outside file"),
+            b"outside\n"
+        );
+        assert!(!index_entry_for(&read_index(&git_dir), b"outside").is_skip_worktree());
+
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[test]
     fn apply_sparse_checkout_full_mode_skips_out_of_cone_paths() {
         let root = temp_root();
         let git_dir = root.join(".git");

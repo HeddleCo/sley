@@ -4,6 +4,7 @@ use crate::session::CliSession;
 use sley::plumbing::sley_worktree::{FsmonitorDaemonSession, FsmonitorDaemonState};
 use sley::{GitError, Result};
 use std::env;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -120,11 +121,7 @@ fn usage<T>() -> Result<T> {
     Err(GitError::Exit(129))
 }
 
-fn start_daemon(
-    daemon: &FsmonitorDaemonSession,
-    worktree: &std::path::Path,
-    args: &DaemonArgs,
-) -> Result<()> {
+fn start_daemon(daemon: &FsmonitorDaemonSession, worktree: &Path, args: &DaemonArgs) -> Result<()> {
     if daemon.state()? == FsmonitorDaemonState::Listening {
         eprintln!(
             "fatal: fsmonitor--daemon is already running '{}'",
@@ -133,7 +130,7 @@ fn start_daemon(
         return Err(GitError::Exit(128));
     }
 
-    let executable = env::current_exe().map_err(|err| GitError::Io(err.to_string()))?;
+    let executable = daemon_executable()?;
     let mut command = Command::new(executable);
     command
         .arg(format!("--git-dir={}", daemon.git_dir().display()))
@@ -175,11 +172,7 @@ fn start_daemon(
     }
 }
 
-fn run_daemon(
-    daemon: &FsmonitorDaemonSession,
-    worktree: &std::path::Path,
-    _detach: bool,
-) -> Result<()> {
+fn run_daemon(daemon: &FsmonitorDaemonSession, worktree: &Path, _detach: bool) -> Result<()> {
     if daemon.state()? == FsmonitorDaemonState::Listening {
         eprintln!(
             "fatal: fsmonitor--daemon is already running '{}'",
@@ -198,7 +191,7 @@ fn stop_daemon(daemon: &FsmonitorDaemonSession) -> Result<()> {
     daemon.request_stop(Duration::from_secs(30))
 }
 
-fn status_daemon(daemon: &FsmonitorDaemonSession, worktree: &std::path::Path) -> Result<()> {
+fn status_daemon(daemon: &FsmonitorDaemonSession, worktree: &Path) -> Result<()> {
     if daemon.state()? == FsmonitorDaemonState::Listening {
         println!("fsmonitor-daemon is watching '{}'", worktree.display());
         Ok(())
@@ -206,6 +199,45 @@ fn status_daemon(daemon: &FsmonitorDaemonSession, worktree: &std::path::Path) ->
         println!("fsmonitor-daemon is not watching '{}'", worktree.display());
         Err(GitError::Exit(1))
     }
+}
+
+/// Resolve the main Sley executable for the detached server process. Normally
+/// `fsmonitor--daemon start` is entered through Sley itself, but Scalar invokes
+/// the same native adapter in-process. Spawning Scalar with Git arguments would
+/// immediately terminate, so prefer the harness-provided binary and otherwise
+/// locate a sibling `sley` executable. Deliberately do not fall back to a
+/// sibling or PATH-resolved `git`: Scalar must never borrow installed Git.
+fn daemon_executable() -> Result<PathBuf> {
+    let current = env::current_exe().map_err(|err| GitError::Io(err.to_string()))?;
+    daemon_executable_from(
+        &current,
+        env::var_os("SLEY_BIN").map(PathBuf::from).as_deref(),
+    )
+}
+
+fn daemon_executable_from(current: &Path, configured: Option<&Path>) -> Result<PathBuf> {
+    if let Some(executable) = configured.filter(|path| path.is_file()) {
+        return Ok(executable.to_path_buf());
+    }
+    if current
+        .file_stem()
+        .is_some_and(|name| name.eq_ignore_ascii_case("scalar"))
+    {
+        let directory = current
+            .parent()
+            .ok_or_else(|| GitError::Io("Scalar executable has no parent directory".into()))?;
+        let mut sibling = directory.join("sley");
+        if cfg!(windows) {
+            sibling.set_extension("exe");
+        }
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+        return Err(GitError::Io(
+            "could not locate Sley beside the Scalar executable".into(),
+        ));
+    }
+    Ok(current.to_path_buf())
 }
 
 #[cfg(test)]
@@ -231,5 +263,32 @@ mod tests {
         let err = parse_args(&["run".into(), "--ipc-threads=0".into()])
             .expect_err("zero threads must fail");
         assert_eq!(err, GitError::Exit(128));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scalar_daemon_resolution_never_borrows_sibling_git() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root =
+            env::temp_dir().join(format!("sley-fsmonitor-bin-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root).expect("temporary binary directory");
+        let scalar = root.join("scalar");
+        std::fs::write(&scalar, b"scalar").expect("scalar placeholder");
+        std::fs::write(root.join("git"), b"installed git").expect("git placeholder");
+
+        let error = daemon_executable_from(&scalar, None)
+            .expect_err("a sibling Git must not satisfy native daemon resolution");
+        assert!(error.to_string().contains("locate Sley"), "{error}");
+
+        let sley = root.join("sley");
+        std::fs::write(&sley, b"sley").expect("sley placeholder");
+        assert_eq!(
+            daemon_executable_from(&scalar, None).expect("native sibling"),
+            sley
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 }

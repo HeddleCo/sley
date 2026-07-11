@@ -2669,6 +2669,7 @@ fn run_am_series(
             lazy_fetch,
         )? {
             ApplyResult::Committed => number += 1,
+            ApplyResult::Skipped => number += 1,
             ApplyResult::Conflict => {
                 am_print_conflict_hints();
                 println!("Patch failed at {number:04} {}", patch.subject);
@@ -2734,6 +2735,7 @@ fn prepare_am_commit_message(
 /// Outcome of attempting to apply (and commit) a single patch.
 enum ApplyResult {
     Committed,
+    Skipped,
     Conflict,
 }
 
@@ -4198,6 +4200,19 @@ fn apply_three_way(
     )?;
 
     if conflicts.is_empty() {
+        // A successful constructed-ancestor merge can resolve exactly to the
+        // current HEAD tree when the patch's change is already present. Git
+        // treats that as an already-applied patch and advances the mailbox
+        // without manufacturing an empty commit.
+        if let Some(head_oid) = head_oid.as_ref()
+            && !am_index_is_dirty(git_dir, common_git_dir, format, head_oid)?
+        {
+            if !quiet {
+                println!("No changes -- Patch already applied.");
+            }
+            record_rebase_rewrite(state_dir, format, number, head_oid)?;
+            return Ok(ApplyResult::Skipped);
+        }
         let new_oid = create_am_commit(
             git_dir,
             common_git_dir,

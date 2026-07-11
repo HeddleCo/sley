@@ -697,6 +697,27 @@ where
         missing_policy,
         ReachablePackThinBaseCandidates::default(),
     )
+    .map(|outcome| outcome.install)
+}
+
+/// Result of one reachable transfer installation. `object_count` describes
+/// equal work independently of storage policy: it is retained when a small
+/// transfer is unpacked into loose objects and `install` is therefore `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachablePackInstallOutcome {
+    /// Installed pack metadata, or `None` when the transfer was empty or was
+    /// exploded into loose objects by `unpack_limit`.
+    pub install: Option<PackInstallResult>,
+    /// Number of objects selected and written by this transfer.
+    pub object_count: usize,
+    /// Number of selected objects eligible for Git's delta-compression search.
+    /// Git excludes objects smaller than 50 bytes before displaying its
+    /// `Compressing objects` phase; the Sley writer applies the same threshold.
+    pub compression_count: usize,
+    /// Number of deltified objects written into the generated transfer pack.
+    /// This remains available when the receiving side subsequently explodes a
+    /// small transfer into loose objects.
+    pub delta_count: u32,
 }
 
 /// Build and install a filtered transfer pack, optionally considering objects
@@ -715,7 +736,7 @@ pub fn build_and_install_reachable_pack_filtered_with_thin_bases<R, I>(
     unpack_limit: Option<usize>,
     missing_policy: ReachablePackMissingPolicy,
     thin_base_candidates: ReachablePackThinBaseCandidates<'_>,
-) -> Result<Option<PackInstallResult>>
+) -> Result<ReachablePackInstallOutcome>
 where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
@@ -733,27 +754,31 @@ where
         }
     };
     retain_filtered_pack_objects(&mut objects, filter.as_ref(), &wanted, source, format)?;
+    let object_count = objects.len();
+    let compression_count = objects
+        .iter()
+        .filter(|entry| entry.object.body.len() >= 50)
+        .count();
     if objects.is_empty() {
-        return Ok(None);
+        return Ok(ReachablePackInstallOutcome {
+            install: None,
+            object_count,
+            compression_count,
+            delta_count: 0,
+        });
     }
-    // Mirror fetch-pack's unpack-limit: small transfers are exploded into
-    // loose objects instead of landing as a pack (upstream `get_pack` picks
-    // unpack-objects when the header count is below fetch/transfer.unpackLimit).
-    if let Some(limit) = unpack_limit
-        && objects.len() < limit
-    {
-        for entry in &objects {
-            destination.loose().write_object((*entry.object).clone())?;
-        }
-        return Ok(None);
-    }
+    // upload-pack always prepares the transfer pack. `unpack_limit` is a
+    // client-side storage choice made after receiving its header; retain the
+    // server's real delta/compression work and counts even when the destination
+    // ultimately explodes the transfer into loose objects.
+    let unpack_loose = unpack_limit.is_some_and(|limit| objects.len() < limit);
     let inputs = pack_inputs(&objects);
     let (thin_bases, preferred_thin_bases) =
         select_reachable_pack_thin_bases(source, &objects, thin_base_candidates.object_ids)?;
     let pack_dir = destination.objects_dir.join("pack");
     fs::create_dir_all(&pack_dir)?;
     let temp_pack_path = unique_temp_path(&pack_dir);
-    let result = (|| -> Result<PackInstallResult> {
+    let result = (|| -> Result<(Option<PackInstallResult>, u32)> {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -771,18 +796,33 @@ where
         file.sync_all()?;
         drop(file);
         trace_packfile_path(&temp_pack_path)?;
-        destination.install_pack_file_from_temp(
-            &temp_pack_path,
-            summary.checksum,
-            &summary.index,
-            summary.entries.iter().map(|entry| entry.oid).collect(),
-            options,
-        )
+        let delta_count = summary.delta_count;
+        if unpack_loose {
+            for entry in &objects {
+                destination.loose().write_object((*entry.object).clone())?;
+            }
+            fs::remove_file(&temp_pack_path)?;
+            return Ok((None, delta_count));
+        }
+        destination
+            .install_pack_file_from_temp(
+                &temp_pack_path,
+                summary.checksum,
+                &summary.index,
+                summary.entries.iter().map(|entry| entry.oid).collect(),
+                options,
+            )
+            .map(|install| (Some(install), delta_count))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_pack_path);
     }
-    result.map(Some)
+    result.map(|(install, delta_count)| ReachablePackInstallOutcome {
+        install,
+        object_count,
+        compression_count,
+        delta_count,
+    })
 }
 
 /// Select only bases of deltas already stored by the source. This performs one
@@ -823,6 +863,37 @@ fn select_reachable_pack_thin_bases<R: ObjectReader>(
 #[cfg(test)]
 mod thin_base_tests {
     use super::*;
+
+    #[test]
+    fn reachable_transfer_retains_count_when_unpacking_loose_objects() {
+        let format = ObjectFormat::Sha1;
+        let root = unique_temp_path(&env::temp_dir());
+        let source = FileObjectDatabase::new(root.join("source/objects"), format);
+        let destination = FileObjectDatabase::new(root.join("destination/objects"), format);
+        let blob = EncodedObject::new(ObjectType::Blob, b"small transfer\n".to_vec());
+        let oid = source.write_object(blob).expect("write source blob");
+
+        let outcome = build_and_install_reachable_pack_filtered_with_thin_bases(
+            &source,
+            &destination,
+            format,
+            [oid],
+            &HashSet::new(),
+            RawPackInstallOptions::default(),
+            None,
+            Some(100),
+            ReachablePackMissingPolicy::RequireComplete,
+            ReachablePackThinBaseCandidates::default(),
+        )
+        .expect("install loose transfer");
+
+        assert_eq!(outcome.object_count, 1);
+        assert_eq!(outcome.compression_count, 0);
+        assert_eq!(outcome.delta_count, 0);
+        assert!(outcome.install.is_none());
+        assert!(destination.contains(&oid).expect("read destination blob"));
+        fs::remove_dir_all(root).expect("remove test repositories");
+    }
 
     #[test]
     fn reachable_transfer_reuses_stored_client_owned_blob_base() {
@@ -871,6 +942,7 @@ mod thin_base_tests {
                 ReachablePackThinBaseCandidates::from_object_ids(&candidates),
             )
             .expect("build thin transfer")
+            .install
             .expect("installed pack");
 
             let index = PackIndex::parse(

@@ -80,6 +80,10 @@ impl<'a> DeltaIndex<'a> {
         self.candidate_blocks(hash).next().is_some()
     }
 
+    pub(crate) fn source_len(&self) -> usize {
+        self.base.len()
+    }
+
     pub(crate) fn has_shared_anchor(&self, target: &[u8]) -> bool {
         if target.len() < DELTA_BLOCK_SIZE || self.blocks.is_empty() {
             return false;
@@ -369,7 +373,12 @@ pub(crate) fn plan_streaming_window_deltas(
             let Some(delta) = base_entry.index.delta(target) else {
                 continue;
             };
-            if !delta_is_acceptable(&delta, target.len()) {
+            if !delta_is_acceptable(
+                &delta,
+                target.len(),
+                base_entry.index.source_len(),
+                object_ids[idx].as_bytes().len(),
+            ) {
                 continue;
             }
             if best_delta
@@ -405,7 +414,12 @@ pub(crate) fn plan_streaming_window_deltas(
             let Some(delta) = base_index.delta(target) else {
                 continue;
             };
-            if !delta_is_acceptable(&delta, target.len()) {
+            if !delta_is_acceptable(
+                &delta,
+                target.len(),
+                base_index.source_len(),
+                object_ids[idx].as_bytes().len(),
+            ) {
                 continue;
             }
             if best_delta
@@ -430,10 +444,14 @@ pub(crate) fn plan_streaming_window_deltas(
             && base.object_type == target_type
         {
             let base_index = DeltaIndex::new(&base.body);
-            if let Some(delta) = base_index
-                .delta(target)
-                .filter(|delta| delta_is_acceptable(delta, target.len()))
-            {
+            if let Some(delta) = base_index.delta(target).filter(|delta| {
+                delta_is_acceptable(
+                    delta,
+                    target.len(),
+                    base.body.len(),
+                    object_ids[idx].as_bytes().len(),
+                )
+            }) {
                 best_delta = Some(delta);
                 best_base_depth = 0;
                 best_base = StreamingPlannedBase::External {
@@ -587,7 +605,12 @@ pub(crate) fn plan_pack_deltas(
             let Some(delta) = base_entry.index.delta(target) else {
                 continue;
             };
-            if !delta_is_acceptable(&delta, target.len()) {
+            if !delta_is_acceptable(
+                &delta,
+                target.len(),
+                objects[base_idx].body.len(),
+                object_ids[idx].as_bytes().len(),
+            ) {
                 continue;
             }
             if best_delta
@@ -613,7 +636,12 @@ pub(crate) fn plan_pack_deltas(
             let Some(delta) = base_index.delta(target) else {
                 continue;
             };
-            if !delta_is_acceptable(&delta, target.len()) {
+            if !delta_is_acceptable(
+                &delta,
+                target.len(),
+                base_index.source_len(),
+                object_ids[idx].as_bytes().len(),
+            ) {
                 continue;
             }
             if best_delta
@@ -636,10 +664,14 @@ pub(crate) fn plan_pack_deltas(
             && base.object_type == target_type
         {
             let base_index = DeltaIndex::new(&base.body);
-            if let Some(delta) = base_index
-                .delta(target)
-                .filter(|delta| delta_is_acceptable(delta, target.len()))
-            {
+            if let Some(delta) = base_index.delta(target).filter(|delta| {
+                delta_is_acceptable(
+                    delta,
+                    target.len(),
+                    base.body.len(),
+                    object_ids[idx].as_bytes().len(),
+                )
+            }) {
                 best_delta = Some(delta);
                 best_base = PlannedBase::External {
                     base_oid: *base_oid,
@@ -675,12 +707,30 @@ pub(crate) fn plan_pack_deltas(
     Ok((plan, order))
 }
 
-/// Whether a generated delta is worth using instead of storing the object
-/// undeltified. The encoded delta must be strictly smaller than the object's own
-/// body; otherwise the undeltified form is the same size or smaller and is
-/// always self-contained.
-pub(crate) fn delta_is_acceptable(delta: &[u8], target_len: usize) -> bool {
-    !delta.is_empty() && delta.len() < target_len
+/// Whether Git's pack-objects planner would accept a first delta candidate.
+///
+/// Git reserves half the target body plus one raw object id for the
+/// undeltified representation, and rejects source/target size relationships
+/// which cannot fit inside that budget before running the delta search. Its
+/// `create_delta()` accepts a result exactly at the limit.
+pub(crate) fn delta_is_acceptable(
+    delta: &[u8],
+    target_len: usize,
+    source_len: usize,
+    object_id_len: usize,
+) -> bool {
+    if target_len < 50 || source_len < 50 {
+        return false;
+    }
+    let max_size = (target_len / 2).wrapping_sub(object_id_len);
+    if max_size == 0 {
+        return false;
+    }
+    let size_difference = target_len.saturating_sub(source_len);
+    if size_difference >= max_size || target_len < source_len / 32 {
+        return false;
+    }
+    !delta.is_empty() && delta.len() <= max_size
 }
 
 pub(crate) fn write_delta_varint(out: &mut Vec<u8>, mut value: u64) {
@@ -733,5 +783,26 @@ pub(crate) fn write_delta_insert(out: &mut Vec<u8>, mut bytes: &[u8]) {
         out.push(chunk_len as u8);
         out.extend_from_slice(&bytes[..chunk_len]);
         bytes = &bytes[chunk_len..];
+    }
+}
+
+#[cfg(test)]
+mod git_delta_acceptance_tests {
+    use super::delta_is_acceptable;
+
+    #[test]
+    fn first_candidate_uses_git_half_target_minus_oid_budget() {
+        // Git v2.55 pack-objects gives a 165-byte SHA-1 target a first-delta
+        // budget of 165 / 2 - 20 = 62 bytes. create_delta accepts the exact
+        // limit and rejects the next byte.
+        assert!(delta_is_acceptable(&[1; 62], 165, 165, 20));
+        assert!(!delta_is_acceptable(&[1; 63], 165, 165, 20));
+    }
+
+    #[test]
+    fn first_candidate_applies_git_source_size_filters() {
+        assert!(!delta_is_acceptable(&[1], 1_000, 100, 20));
+        assert!(!delta_is_acceptable(&[1], 100, 3_232, 20));
+        assert!(delta_is_acceptable(&[1], 1_000, 999, 20));
     }
 }

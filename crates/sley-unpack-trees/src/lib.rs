@@ -326,6 +326,16 @@ pub trait WorktreeProbe {
     /// removing `path` discard an untracked working-tree file at that name?
     fn verify_absent_remove(&self, path: &[u8], reset: ResetType) -> Result<()>;
 
+    /// Sparse checkout's delayed `verify_absent` probe for a newly-added,
+    /// in-cone path. Returning `true` records Git's warning-only condition;
+    /// the checkout continues and the writer decides how to materialize the
+    /// tracked result. This is separate from `verify_absent_overwrite` because
+    /// sparse unpack reports these paths after tree traversal rather than
+    /// aborting the transition.
+    fn sparse_checkout_path_present(&self, _path: &[u8]) -> Result<bool> {
+        Ok(false)
+    }
+
     /// git's `check_submodule_move_head` (`unpack-trees.c`): would moving this
     /// gitlink's HEAD from `old_oid` (`None` when the submodule is newly
     /// appearing in the target tree) to `new_oid` lose uncommitted submodule
@@ -452,6 +462,7 @@ pub struct UnpackTreesState {
     /// git's `o->internal.nontrivial_merge`: set when threeway_merge falls
     /// through to emitting conflict stages.
     nontrivial_merge: bool,
+    sparse_checkout_present_paths: Vec<Vec<u8>>,
 }
 
 impl UnpackTreesState {
@@ -460,6 +471,7 @@ impl UnpackTreesState {
             result: Vec::new(),
             removals: Vec::new(),
             nontrivial_merge: false,
+            sparse_checkout_present_paths: Vec::new(),
         }
     }
 
@@ -498,6 +510,10 @@ pub struct UnpackTreesResult {
     /// `entries` are removed from the index too; retained skip-worktree rows
     /// represent sparse-cone contraction and remain in the index.
     pub removed_paths: Vec<Vec<u8>>,
+    /// Newly-added in-cone paths that were already present in the worktree.
+    /// Git completes the transition but renders these as a sparse-checkout
+    /// warning rather than treating them as fatal untracked collisions.
+    pub sparse_checkout_present_paths: Vec<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -847,17 +863,12 @@ fn merged_entry<P: WorktreeProbe + ?Sized>(
     match old {
         None => {
             // New index entry: verify it won't clobber an untracked file.
-            // Git initially tags a new out-of-cone entry with
+            // Git initially tags every new sparse-checkout entry with
             // CE_NEW_SKIP_WORKTREE. That makes this first verify_absent call a
-            // no-op; the later sparse-pattern pass performs the warning-only
-            // orphan check once the final cone is known. Our flattened input
-            // already carries that logical decision, so do not reject an
-            // untracked worktree path we have no intention of writing.
-            if opts.merge
-                && opts.update
-                && !opts.index_only
-                && !(opts.apply_sparse_checkout && merge.skip_worktree)
-            {
+            // no-op; the later sparse-pattern pass performs the real check
+            // once the final cone is known and reports an in-cone collision as
+            // a warning instead of aborting the whole transition.
+            if opts.merge && opts.update && !opts.index_only && !opts.apply_sparse_checkout {
                 probe.verify_absent_overwrite(path, &merge, opts.reset)?;
             }
             // git's `check_submodule_move_head(o, ce, NULL, oid_to_hex(&ce->oid))`:
@@ -1338,7 +1349,19 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
             let path = result.path.as_slice();
             let Some((old_mode, old_oid, old_stat)) = index.get(path) else {
                 // New entries already received should_skip_worktree in their
-                // tree slot and merged_entry suppressed an out-of-cone write.
+                // tree slot. Sparse checkout deliberately delayed their
+                // untracked-file check until the final cone was known.
+                let should_skip = index.should_skip_worktree(path);
+                result.entry.skip_worktree = should_skip;
+                if !should_skip && probe.sparse_checkout_path_present(path)? {
+                    state
+                        .sparse_checkout_present_paths
+                        .push(result.path.clone());
+                    // Git keeps the tracked index entry but leaves the
+                    // pre-existing untracked worktree path untouched. The
+                    // caller renders the warning after the transition.
+                    result.wt_update = false;
+                }
                 continue;
             };
             let was_skip = index.was_skip_worktree(path);
@@ -1375,6 +1398,7 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
     let UnpackTreesState {
         mut result,
         removals,
+        mut sparse_checkout_present_paths,
         ..
     } = state;
     result.sort_by(|a, b| {
@@ -1384,9 +1408,12 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
     });
 
     let removed_paths = removals.into_iter().map(|r| r.path).collect();
+    sparse_checkout_present_paths.sort();
+    sparse_checkout_present_paths.dedup();
     Ok(UnpackTreesResult {
         entries: result,
         removed_paths,
+        sparse_checkout_present_paths,
     })
 }
 
@@ -1539,6 +1566,7 @@ mod tests {
     #[derive(Default)]
     struct RejectAbsentProbe {
         absent_checks: std::cell::Cell<usize>,
+        sparse_present: bool,
     }
 
     impl WorktreeProbe for RejectAbsentProbe {
@@ -1558,6 +1586,10 @@ mod tests {
 
         fn verify_absent_remove(&self, _path: &[u8], _reset: ResetType) -> Result<()> {
             Ok(())
+        }
+
+        fn sparse_checkout_path_present(&self, _path: &[u8]) -> Result<bool> {
+            Ok(self.sparse_present)
         }
     }
 
@@ -1581,6 +1613,34 @@ mod tests {
         assert_eq!(result.entries.len(), 1);
         assert!(result.entries[0].entry.is_skip_worktree());
         assert!(!result.entries[0].wt_update);
+    }
+
+    #[test]
+    fn new_in_cone_sparse_path_defers_absent_check_to_warning_outcome() {
+        let mut index = FlatIndex::new();
+        index.set_sparse_checkout_skip(b"selected/file".to_vec(), false);
+        let target = flat(&[(b"selected/file", 1)]);
+        let mut options = opts();
+        options.update = true;
+        options.apply_sparse_checkout = true;
+        let probe = RejectAbsentProbe {
+            sparse_present: true,
+            ..RejectAbsentProbe::default()
+        };
+
+        let result = unpack_trees(&index, &[target], MergeFn::OneWay, &options, &probe)
+            .expect("present in-cone sparse addition is warning-only");
+
+        assert_eq!(probe.absent_checks.get(), 0);
+        assert_eq!(
+            result.sparse_checkout_present_paths,
+            vec![b"selected/file".to_vec()]
+        );
+        assert!(
+            !result.entries[0].wt_update,
+            "the warning outcome must preserve the untracked worktree path"
+        );
+        assert!(!result.entries[0].entry.is_skip_worktree());
     }
 
     #[test]

@@ -86,6 +86,37 @@ pub enum ConfigFileWriteError {
     },
 }
 
+/// A locked config read-modify-write transaction failed either while applying
+/// the caller's edit or while managing the lockfile.
+#[derive(Debug)]
+pub enum ConfigFileEditError<E> {
+    /// The caller rejected or could not construct the replacement bytes.
+    Edit(E),
+    /// Lock acquisition, reading, writing, or atomic promotion failed.
+    Write(ConfigFileWriteError),
+}
+
+impl<E: fmt::Display> fmt::Display for ConfigFileEditError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Edit(error) => error.fmt(f),
+            Self::Write(error) => error.fmt(f),
+        }
+    }
+}
+
+impl<E> std::error::Error for ConfigFileEditError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Edit(error) => Some(error),
+            Self::Write(error) => Some(error),
+        }
+    }
+}
+
 impl fmt::Display for ConfigFileWriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -161,6 +192,53 @@ pub fn write_config_file_locked(
     if let Err(err) = fs::rename(&lock_path, path) {
         let _ = fs::remove_file(&lock_path);
         return Err(ConfigFileWriteError::io(path, err));
+    }
+    Ok(())
+}
+
+/// Atomically edit a config file while holding `<path>.lock` across the entire
+/// read-modify-write transaction.
+///
+/// The callback receives the bytes read after the lock is acquired (or an
+/// empty slice when the config does not yet exist) and returns the complete
+/// replacement. This prevents two editors from both reading stale bytes before
+/// serializing their writes. Symlink resolution and permission preservation
+/// match [`write_config_file_locked`].
+pub fn edit_config_file_locked<E>(
+    path: impl AsRef<Path>,
+    options: ConfigFileWriteOptions,
+    edit: impl FnOnce(&[u8]) -> Result<Vec<u8>, E>,
+) -> Result<(), ConfigFileEditError<E>> {
+    let path = resolve_symlink(path.as_ref());
+    let path = path.as_path();
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| ConfigFileEditError::Write(ConfigFileWriteError::io(parent, error)))?;
+    }
+
+    let lock_path = config_lock_path(path).map_err(ConfigFileEditError::Write)?;
+    let mut lock = ConfigFileLock::acquire(lock_path).map_err(ConfigFileEditError::Write)?;
+    let original = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(ConfigFileEditError::Write(ConfigFileWriteError::io(
+                path, error,
+            )));
+        }
+    };
+    let replacement = edit(&original).map_err(ConfigFileEditError::Edit)?;
+    lock.write_all(&replacement, options.fsync)
+        .map_err(ConfigFileEditError::Write)?;
+    let lock_path = lock.close();
+    preserve_existing_mode(path, &lock_path);
+    if let Err(error) = fs::rename(&lock_path, path) {
+        let _ = fs::remove_file(&lock_path);
+        return Err(ConfigFileEditError::Write(ConfigFileWriteError::io(
+            path, error,
+        )));
     }
     Ok(())
 }
@@ -1264,6 +1342,30 @@ mod tests {
         assert_eq!(
             fs::read(&path).expect("read config"),
             b"[user]\n\tname = Ada\n"
+        );
+        assert!(!path.with_file_name("config.lock").exists());
+    }
+
+    #[test]
+    fn edit_config_file_locked_reads_each_serialized_predecessor_under_lock() {
+        let temp = TempDir::new();
+        let path = temp.path.join("config");
+        for line in [b"one = 1\n".as_slice(), b"two = 2\n".as_slice()] {
+            edit_config_file_locked(&path, ConfigFileWriteOptions::default(), |original| {
+                assert!(
+                    path.with_file_name("config.lock").exists(),
+                    "the callback must run while the config lock is held"
+                );
+                let mut replacement = original.to_vec();
+                replacement.extend_from_slice(line);
+                Ok::<_, std::convert::Infallible>(replacement)
+            })
+            .expect("serialized config edit");
+        }
+
+        assert_eq!(
+            fs::read(&path).expect("read edited config"),
+            b"one = 1\ntwo = 2\n"
         );
         assert!(!path.with_file_name("config.lock").exists());
     }

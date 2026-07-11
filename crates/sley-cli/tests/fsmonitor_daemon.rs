@@ -33,6 +33,20 @@ impl Drop for RepositoryGuard {
 }
 
 #[test]
+fn build_options_advertise_the_native_unix_daemon() {
+    let output = run(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        &["version", "--build-options"],
+    );
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("feature: fsmonitor--daemon\n"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn start_status_stop_tracks_a_live_daemon() {
     let repo = temp_repository();
     fs::create_dir_all(&repo).expect("create repository directory");

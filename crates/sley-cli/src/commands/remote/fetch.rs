@@ -21,7 +21,8 @@ use crate::remote::{
 };
 use crate::*;
 use sley::plumbing::sley_odb::ObjectReader;
-use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord};
+use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord, TransferProgress};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 
@@ -50,6 +51,7 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
     let mut refspecs = Vec::new();
     let mut options = FetchOptions {
         quiet: false,
+        progress: None,
         auto_follow_tags: true,
         fetch_all_tags: false,
         prune: false,
@@ -110,6 +112,8 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
             "--no-multiple" if source.is_none() => fetch_multiple = false,
             "-q" | "--quiet" => options.quiet = true,
             "--no-quiet" => options.quiet = false,
+            "--progress" => options.progress = Some(true),
+            "--no-progress" => options.progress = Some(false),
             "--write-fetch-head" => options.write_fetch_head = true,
             "--no-write-fetch-head" => options.write_fetch_head = false,
             "--append" | "-a" => options.append = true,
@@ -384,6 +388,11 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
                 .map(rewrite_empty_source_refspec),
         );
     }
+    // Process-global terminal policy belongs in the CLI wrapper. The library
+    // receives a concrete decision and remains deterministic for embedders.
+    options
+        .progress
+        .get_or_insert_with(|| io::stderr().is_terminal());
     options.upload_pack_command = upload_pack_command.clone();
     let context = RemoteCommandContext::require_repository(cli_session)?;
     let repository = context.required_repository()?;
@@ -1923,12 +1932,100 @@ pub(crate) fn fetch_local_repository_with_outcome(
 pub(crate) struct StdoutProgress;
 
 impl sley_remote::ProgressSink for StdoutProgress {
+    fn transfer(&mut self, progress: &TransferProgress) {
+        let _ = io::stderr().write_all(&render_transfer_progress(progress));
+    }
+
     fn message(&mut self, message: &str) {
         let _ = writeln!(io::stdout(), "{message}");
     }
 
     fn diagnostic(&mut self, message: &str) {
         let _ = writeln!(io::stderr(), "{message}");
+    }
+}
+
+fn render_transfer_progress(progress: &TransferProgress) -> Vec<u8> {
+    let mut out = Vec::new();
+    if progress.total_objects == 0 {
+        return out;
+    }
+    writeln!(
+        out,
+        "remote: Enumerating objects: {}, done.        ",
+        progress.total_objects
+    )
+    .expect("write to Vec cannot fail");
+    render_transfer_progress_phase(&mut out, "Counting objects", progress.total_objects);
+    if progress.compression_objects > 1 {
+        render_transfer_progress_phase(
+            &mut out,
+            "Compressing objects",
+            progress.compression_objects,
+        );
+    }
+    writeln!(
+        out,
+        "remote: Total {} (delta {}), reused 0 (delta 0), pack-reused 0 (from 0)        ",
+        progress.total_objects, progress.delta_objects
+    )
+    .expect("write to Vec cannot fail");
+    out
+}
+
+fn render_transfer_progress_phase(out: &mut Vec<u8>, label: &str, total: usize) {
+    for current in 1..=total {
+        let percent = current.saturating_mul(100) / total;
+        write!(
+            out,
+            "remote: {label}: {percent:3}% ({current}/{total})        \r"
+        )
+        .expect("write to Vec cannot fail");
+    }
+    writeln!(
+        out,
+        "remote: {label}: 100% ({total}/{total}), done.        "
+    )
+    .expect("write to Vec cannot fail");
+}
+
+#[cfg(test)]
+mod transfer_progress_tests {
+    use super::{TransferProgress, render_transfer_progress};
+
+    #[test]
+    fn zero_delta_progress_bytes_match_git_sideband_rendering() {
+        let rendered = render_transfer_progress(&TransferProgress {
+            total_objects: 3,
+            compression_objects: 1,
+            delta_objects: 0,
+        });
+        assert_eq!(
+            rendered,
+            b"remote: Enumerating objects: 3, done.        \n\
+remote: Counting objects:  33% (1/3)        \r\
+remote: Counting objects:  66% (2/3)        \r\
+remote: Counting objects: 100% (3/3)        \r\
+remote: Counting objects: 100% (3/3), done.        \n\
+remote: Total 3 (delta 0), reused 0 (delta 0), pack-reused 0 (from 0)        \n"
+        );
+    }
+
+    #[test]
+    fn delta_progress_includes_compression_phase_with_exact_padding() {
+        let rendered = render_transfer_progress(&TransferProgress {
+            total_objects: 4,
+            compression_objects: 3,
+            delta_objects: 1,
+        });
+        assert!(
+            rendered
+                .windows(b"remote: Compressing objects:  33% (1/3)        \r".len())
+                .any(|window| window == b"remote: Compressing objects:  33% (1/3)        \r")
+        );
+        assert!(rendered.ends_with(
+            b"remote: Total 4 (delta 1), reused 0 (delta 0), pack-reused 0 (from 0)        \n"
+        ));
     }
 }
 

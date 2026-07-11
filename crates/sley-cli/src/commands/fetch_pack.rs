@@ -21,6 +21,7 @@ struct FetchPackFlags {
     stdin_refs: bool,
     keep_pack: bool,
     depth: Option<u32>,
+    filter: Option<String>,
     diag_url: bool,
 }
 
@@ -108,11 +109,12 @@ pub(crate) fn cmd_fetch_pack(
                 if let Some(value) = arg.strip_prefix("--depth=") {
                     let depth = value.parse::<i64>().unwrap_or(0);
                     flags.depth = Some(depth.clamp(0, i64::from(INFINITE_DEPTH)) as u32);
+                } else if let Some(filter) = arg.strip_prefix("--filter=") {
+                    flags.filter = Some(filter.to_string());
                 } else if arg.starts_with("--upload-pack=")
                     || arg.starts_with("--exec=")
                     || arg.starts_with("--shallow-since=")
                     || arg.starts_with("--shallow-exclude=")
-                    || arg.starts_with("--filter=")
                 {
                     // Accepted but unused by the in-process local transport.
                 } else {
@@ -165,6 +167,22 @@ pub(crate) fn cmd_fetch_pack(
         )));
     }
     let advertisements = sley_remote::local_fetch_advertisements(&remote_git_dir, format)?;
+    let remote_config = read_repo_config(&remote_common_git_dir)?;
+    let transfer_filter = match flags.filter.as_deref() {
+        None => None,
+        Some(_)
+            if !remote_config
+                .get_bool("uploadpack", None, "allowfilter")
+                .unwrap_or(false) =>
+        {
+            eprintln!("warning: filtering not recognized by server, ignoring");
+            None
+        }
+        Some(spec) => Some(
+            sley_remote::pack_filter_from_spec(spec)
+                .ok_or_else(|| GitError::InvalidFormat(format!("invalid filter-spec '{spec}'")))?,
+        ),
+    };
 
     // filter_refs: name matches first, then the raw-oid pass over advertised
     // tips (or the uploadpack.allow*sha1inwant escape hatches).
@@ -212,7 +230,6 @@ pub(crate) fn cmd_fetch_pack(
             .iter()
             .map(|advertisement| advertisement.oid)
             .collect();
-        let remote_config = read_repo_config(&remote_common_git_dir)?;
         let allow_unadvertised = [
             "allowtipsha1inwant",
             "allowreachablesha1inwant",
@@ -275,7 +292,7 @@ pub(crate) fn cmd_fetch_pack(
             deepen_plan.as_ref(),
             false,
             false,
-            None,
+            transfer_filter,
             None,
             false,
             None,

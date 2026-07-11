@@ -398,6 +398,11 @@ fn print_version_build_options() {
     println!("sizeof-long: {}", std::mem::size_of::<std::ffi::c_long>());
     println!("sizeof-size_t: {}", std::mem::size_of::<usize>());
     println!("shell-path: /bin/sh");
+    // The native daemon uses Unix-domain simple-IPC. Advertise the capability
+    // only where that engine is compiled; test-lib gates daemon assertions on
+    // this exact build-options line.
+    #[cfg(unix)]
+    println!("feature: fsmonitor--daemon");
     // sley creates `files`-backed ref storage and hashes with SHA-1 by default;
     // these two lines are what upstream test-lib.sh consumes to prime its oid
     // database and select the default ref format.

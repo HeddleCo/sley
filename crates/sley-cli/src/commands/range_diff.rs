@@ -106,10 +106,14 @@ pub(crate) fn render_format_patch_range_diff(
     new_range_args: &[String],
     pathspecs: &[String],
     notes_refs: &[String],
+    creation_factor: Option<i32>,
     lazy_fetch: bool,
 ) -> Result<Vec<u8>> {
     let mut options = default_options(repo)?;
     options.notes = NotesMode::None;
+    if let Some(factor) = creation_factor {
+        options.creation_factor = factor;
+    }
     let range1 = match normalize_range_arg(repo, previous)? {
         Some(range) if range.len() != 1 || is_commit_range(repo, previous) => range,
         _ => {

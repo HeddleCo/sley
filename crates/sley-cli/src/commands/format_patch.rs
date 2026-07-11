@@ -207,6 +207,9 @@ struct FormatPatchOptions {
     /// an attachment (`--attach`) or inline (`--inline`). `None` is the default
     /// (plain mbox patch). The boundary defaults to the git version string.
     mime: Option<MimeAttach>,
+    /// Distinguishes an explicit `--no-attach` from the unset state that
+    /// consults `format.attach`.
+    mime_explicit: bool,
     /// `-<n>`: limit to the last n commits of the default tip.
     count: Option<usize>,
     /// `--numbered-files`: name output files `1`, `2`, ... with no slug.
@@ -269,6 +272,12 @@ struct FormatPatchOptions {
     /// `--range-diff=<previous>` commentary to include in the cover letter or
     /// single patch.
     range_diff: Option<String>,
+    /// Patch-pair creation/deletion cost percentage for `--range-diff`.
+    creation_factor: Option<i32>,
+    /// `--interdiff=<previous>` commentary to include in the cover letter or
+    /// single patch. This compares the previous tip directly with the current
+    /// series tip, unlike `--range-diff`, which pairs individual patches.
+    interdiff: Option<String>,
     /// Mboxrd message body escaping (`--pretty=mboxrd` or `format.mboxrd`).
     mboxrd: bool,
     /// `--base=<commit>`, `--base=auto`, `--no-base`, or config fallback.
@@ -364,6 +373,7 @@ impl Default for FormatPatchOptions {
             signature_file: None,
             zero_commit: false,
             mime: None,
+            mime_explicit: false,
             count: None,
             numbered_files: false,
             suffix: None,
@@ -386,6 +396,8 @@ impl Default for FormatPatchOptions {
             in_reply_to: None,
             notes: FormatPatchNotes::default(),
             range_diff: None,
+            creation_factor: None,
+            interdiff: None,
             mboxrd: false,
             base: BaseMode::Config,
             ignore_if_in_upstream: false,
@@ -574,6 +586,21 @@ pub(crate) fn cmd_format_patch(
         options.dst_prefix.clear();
     }
     options.mboxrd |= config.get_bool("format", None, "mboxrd").unwrap_or(false);
+    if !options.mime_explicit {
+        options.mime = match config.get_all("format", None, "attach").last() {
+            // A bare `format.attach` enables MIME using Git's version string;
+            // an explicitly empty value disables the configured default.
+            Some(None) => Some(MimeAttach {
+                boundary: sley_core::UPSTREAM_GIT_COMPAT_VERSION.to_string(),
+                inline: false,
+            }),
+            Some(Some(boundary)) if !boundary.is_empty() => Some(MimeAttach {
+                boundary: boundary.to_string(),
+                inline: false,
+            }),
+            Some(Some(_)) | None => None,
+        };
+    }
 
     let grep_kind = log_grep_pattern_kind_from_config(
         config,
@@ -590,7 +617,11 @@ pub(crate) fn cmd_format_patch(
         all_match: options.grep_all_match,
         invert: options.grep_invert,
     });
-    let plan_options = sley_rev::format_patch::FormatPatchPlanOptions {
+    let auto_base_when_able = matches!(options.base, BaseMode::Config)
+        && config
+            .get("format", None, "useAutoBase")
+            .is_some_and(|value| value.eq_ignore_ascii_case("whenAble"));
+    let mut plan_options = sley_rev::format_patch::FormatPatchPlanOptions {
         setup_args: options.setup_args.clone(),
         count: options.count,
         root: options.root,
@@ -610,6 +641,18 @@ pub(crate) fn cmd_format_patch(
                 sley_rev::format_patch::FormatPatchRelativeMode::On(path.clone())
             }
         },
+        diff: sley_rev::format_patch::FormatPatchDiffPolicy {
+            detect_renames: options.detect_renames,
+            detect_copies: options.detect_copies,
+            find_copies_harder: options.find_copies_harder,
+            rename_threshold: options.rename_threshold,
+            copy_threshold: options.copy_threshold,
+            context_lines: options.context_lines,
+            src_prefix: options.src_prefix.clone(),
+            dst_prefix: options.dst_prefix.clone(),
+            order_file: options.order_file.clone(),
+            binary: options.binary,
+        },
     };
     let relative_needs_worktree = matches!(options.relative_mode, RelativeMode::On(None))
         || (matches!(options.relative_mode, RelativeMode::Config)
@@ -625,7 +668,7 @@ pub(crate) fn cmd_format_patch(
         format,
         lazy_fetch: cli_session.lazy_fetch(),
     };
-    let plan = sley_rev::format_patch::plan_format_patch_series(
+    let plan_result = sley_rev::format_patch::plan_format_patch_series(
         sley_rev::format_patch::FormatPatchPlanRequest {
             git_dir,
             worktree_root,
@@ -643,9 +686,40 @@ pub(crate) fn cmd_format_patch(
                 .as_mut()
                 .map(|filter| filter as &mut dyn sley_rev::format_patch::FormatPatchCommitFilter),
         },
-    )
+    );
+    let plan = match plan_result {
+        Err(sley_rev::format_patch::FormatPatchPlanError::BaseNotAncestor { .. })
+            if auto_base_when_able =>
+        {
+            // `whenAble` differs from boolean true precisely here: inability to
+            // find one usable merge base suppresses base metadata rather than
+            // aborting an otherwise valid patch series.
+            plan_options.base = sley_rev::format_patch::FormatPatchBaseMode::None;
+            sley_rev::format_patch::plan_format_patch_series(
+                sley_rev::format_patch::FormatPatchPlanRequest {
+                    git_dir,
+                    worktree_root,
+                    cwd,
+                    format,
+                    objects: db,
+                    refs: repo.refs(),
+                    config,
+                    options: &plan_options,
+                },
+                sley_rev::format_patch::FormatPatchPlanServices {
+                    revisions: &mut revisions,
+                    patch_ids: &mut patch_ids,
+                    commit_filter: commit_filter.as_mut().map(|filter| {
+                        filter as &mut dyn sley_rev::format_patch::FormatPatchCommitFilter
+                    }),
+                },
+            )
+        }
+        result => result,
+    }
     .map_err(format_patch_plan_error)?;
     options.relative_prefix = plan.relative_prefix.clone();
+    let interdiff_policy = plan.diff.clone();
     let options = options;
     let resolved = resolve_format(&options, config)?;
 
@@ -662,17 +736,34 @@ pub(crate) fn cmd_format_patch(
     };
 
     let count = commits.len();
-    let range_diff_setup_args = plan.revision_args;
+    // Range-diff's right-hand series must describe exactly the commits emitted
+    // after count/filter processing. Reusing setup's positive tip by itself
+    // accidentally compares the previous series with the tip's entire history.
+    let range_diff_setup_args = match (commits.first(), commits.last()) {
+        (Some(oldest), Some(newest)) => {
+            let mut args = vec![newest.oid.to_hex()];
+            if let Some(parent) = oldest.parents.first() {
+                args.push(format!("^{parent}"));
+            }
+            args
+        }
+        _ => plan.revision_args,
+    };
     // A cover letter forces `[PATCH n/m]` numbering (the cover is `0/m`), so it
     // also flips a single-patch run from the bare `[PATCH]` to `[PATCH 1/1]`.
     // git emits no cover (and no patches) when the range is empty.
     let mut cover_letter = count > 0 && resolve_cover_letter(&options, config, count);
-    if options.range_diff.is_some() && count > 1 {
+    if (options.range_diff.is_some() || options.interdiff.is_some()) && count > 1 {
         let config_disables_cover = config
             .get("format", None, "coverLetter")
             .is_some_and(|value| matches!(git_config_bool_str(value), Some(false)));
         if options.cover_letter == Some(false) || config_disables_cover {
-            eprintln!("fatal: --range-diff requires --cover-letter for multi-patch series");
+            let option = if options.interdiff.is_some() {
+                "--interdiff"
+            } else {
+                "--range-diff"
+            };
+            eprintln!("fatal: {option} requires --cover-letter for multi-patch series");
             return Err(GitError::Exit(128));
         }
         cover_letter = true;
@@ -705,6 +796,20 @@ pub(crate) fn cmd_format_patch(
             &range_diff_setup_args,
             &plan.pathspecs,
             &notes_refs,
+            options.creation_factor,
+            cli_session.lazy_fetch(),
+        )?),
+        None => None,
+    };
+    let interdiff = match options.interdiff.as_deref() {
+        Some(previous) => Some(render_format_patch_interdiff(
+            &repo,
+            previous,
+            &commits,
+            &interdiff_policy,
+            diff_pathspec.as_ref(),
+            options.relative_prefix.as_deref(),
+            abbrev,
             cli_session.lazy_fetch(),
         )?),
         None => None,
@@ -764,6 +869,7 @@ pub(crate) fn cmd_format_patch(
             abbrev,
             &cover_thread,
             range_diff.as_deref(),
+            interdiff.as_deref(),
             cli_session.lazy_fetch(),
         )?)
     } else {
@@ -806,8 +912,11 @@ pub(crate) fn cmd_format_patch(
                 config,
                 git_dir,
                 notes_refs: &notes_refs,
-                range_diff: range_diff.as_deref().filter(|_| count == 1),
-                base_info: base_info.as_ref(),
+                range_diff: range_diff
+                    .as_deref()
+                    .filter(|_| count == 1 && !cover_letter),
+                interdiff: interdiff.as_deref().filter(|_| count == 1 && !cover_letter),
+                base_info: (idx == 0).then_some(base_info.as_ref()).flatten(),
                 lazy_fetch: cli_session.lazy_fetch(),
             })?;
             if options.graph {
@@ -852,8 +961,11 @@ pub(crate) fn cmd_format_patch(
                 config,
                 git_dir,
                 notes_refs: &notes_refs,
-                range_diff: range_diff.as_deref().filter(|_| count == 1),
-                base_info: base_info.as_ref(),
+                range_diff: range_diff
+                    .as_deref()
+                    .filter(|_| count == 1 && !cover_letter),
+                interdiff: interdiff.as_deref().filter(|_| count == 1 && !cover_letter),
+                base_info: (idx == 0).then_some(base_info.as_ref()).flatten(),
                 lazy_fetch: cli_session.lazy_fetch(),
             })?;
             if options.graph {
@@ -927,8 +1039,11 @@ pub(crate) fn cmd_format_patch(
             config,
             git_dir,
             notes_refs: &notes_refs,
-            range_diff: range_diff.as_deref().filter(|_| count == 1),
-            base_info: base_info.as_ref(),
+            range_diff: range_diff
+                .as_deref()
+                .filter(|_| count == 1 && !cover_letter),
+            interdiff: interdiff.as_deref().filter(|_| count == 1 && !cover_letter),
+            base_info: (idx == 0).then_some(base_info.as_ref()).flatten(),
             lazy_fetch: cli_session.lazy_fetch(),
         })?;
         if options.graph {
@@ -1037,6 +1152,7 @@ fn build_cover_letter(
     abbrev: usize,
     thread: &MailThreadHeaders,
     range_diff: Option<&[u8]>,
+    interdiff: Option<&[u8]>,
     lazy_fetch: bool,
 ) -> Result<Vec<u8>> {
     let _ = abbrev; // the cover never emits index lines; kept for signature parity.
@@ -1112,10 +1228,6 @@ fn build_cover_letter(
     let list_format = resolve_commit_list_format(options, config);
     write_commit_list_cover(&mut out, &list_format, commits)?;
 
-    if let Some(range_diff) = range_diff {
-        write_range_diff_commentary(&mut out, options, range_diff);
-    }
-
     // The cumulative diffstat against the boundary commit, when there is a unique
     // boundary (a single parent of the oldest commit). git omits it otherwise.
     if let Some(origin_tree) = cover_origin_tree(db, format, commits)? {
@@ -1137,6 +1249,13 @@ fn build_cover_letter(
             // before the signature.
             out.push(b'\n');
         }
+    }
+
+    if let Some(range_diff) = range_diff {
+        write_range_diff_commentary(&mut out, options, range_diff);
+    }
+    if let Some(interdiff) = interdiff {
+        write_interdiff_commentary(&mut out, options, interdiff, false);
     }
 
     // Signature trailer, identical framing to a normal patch.
@@ -1171,7 +1290,86 @@ fn write_range_diff_commentary(out: &mut Vec<u8>, options: &FormatPatchOptions, 
         out.extend_from_slice(line);
         out.push(b'\n');
     }
-    out.push(b'\n');
+}
+
+fn render_format_patch_interdiff(
+    repo: &RepositoryContext,
+    previous: &str,
+    commits: &[sley_rev::CommitRecord],
+    policy: &sley_rev::format_patch::FormatPatchDiffPolicy,
+    diff_pathspec: Option<&DiffPathspec>,
+    relative_prefix: Option<&[u8]>,
+    abbrev: usize,
+    lazy_fetch: bool,
+) -> Result<Vec<u8>> {
+    let previous_oid = repo.resolve_revision(previous)?;
+    let previous_object = repo.objects().read_object(&previous_oid)?;
+    let previous_commit = Commit::parse_ref(repo.format(), &previous_object.body)?;
+    let current = commits
+        .last()
+        .ok_or_else(|| GitError::Command("--interdiff requires a non-empty series".into()))?;
+    let entries = sley_diff_merge::diff_name_status_trees_with_options(
+        repo.objects(),
+        repo.format(),
+        &previous_commit.tree,
+        &current.commit.tree,
+        sley_diff_merge::DiffNameStatusOptions {
+            detect_renames: policy.detect_renames,
+            detect_copies: policy.detect_copies,
+            find_copies_harder: policy.find_copies_harder,
+            rename_empty: true,
+            detect_inexact: true,
+            rename_threshold: policy.rename_threshold,
+            copy_threshold: policy.copy_threshold,
+            rename_limit: 0,
+            ..Default::default()
+        },
+    )?;
+    let entries = match diff_pathspec {
+        Some(pathspec) => apply_diff_pathspec(entries, pathspec),
+        None => entries,
+    };
+    let entries = apply_format_patch_relative_prefix(entries, relative_prefix);
+    let entries = apply_diff_order_file(entries, policy.order_file.as_deref())?;
+    let mut out = Vec::new();
+    for entry in &entries {
+        write_diff_patch_entry(
+            &mut out,
+            entry,
+            format_patch_diff_options_with(
+                repo.objects(),
+                repo.format(),
+                policy.binary,
+                &policy.src_prefix,
+                &policy.dst_prefix,
+                policy.context_lines,
+                abbrev,
+                lazy_fetch,
+            ),
+        )?;
+    }
+    Ok(out)
+}
+
+fn write_interdiff_commentary(
+    out: &mut Vec<u8>,
+    options: &FormatPatchOptions,
+    diff: &[u8],
+    indent: bool,
+) {
+    match range_diff_previous_label(options) {
+        Some(label) => out.extend_from_slice(format!("Interdiff against {label}:\n").as_bytes()),
+        None => out.extend_from_slice(b"Interdiff:\n"),
+    }
+    for line in diff.split_inclusive(|byte| *byte == b'\n') {
+        if indent {
+            out.extend_from_slice(b"  ");
+        }
+        out.extend_from_slice(line);
+        if !line.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+    }
 }
 
 fn range_diff_previous_label(options: &FormatPatchOptions) -> Option<String> {
@@ -1207,14 +1405,13 @@ fn resolve_cover_text(
     let placeholder_subject = "*** SUBJECT HERE ***".to_string();
     let placeholder_body = "*** BLURB HERE ***".to_string();
 
-    let mode = options
-        .cover_from_description
-        .or_else(|| {
-            config
-                .get("format", None, "coverFromDescription")
-                .and_then(|value| parse_cover_from_description(value).ok())
-        })
-        .unwrap_or(CoverFromDescription::Message);
+    let mode = match options.cover_from_description {
+        Some(mode) => mode,
+        None => match config.get("format", None, "coverFromDescription") {
+            Some(value) => parse_cover_from_description(value)?,
+            None => CoverFromDescription::Message,
+        },
+    };
 
     if mode == CoverFromDescription::None {
         return Ok((placeholder_subject, placeholder_body));
@@ -2388,6 +2585,8 @@ struct RenderContext<'a> {
     notes_refs: &'a [String],
     /// Optional rendered range-diff commentary for a single-patch output.
     range_diff: Option<&'a [u8]>,
+    /// Optional rendered interdiff commentary for a single-patch output.
+    interdiff: Option<&'a [u8]>,
     /// Optional base/prerequisite metadata block.
     base_info: Option<&'a BaseInfo>,
     lazy_fetch: bool,
@@ -2414,6 +2613,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
         git_dir,
         notes_refs,
         range_diff,
+        interdiff,
         base_info,
         lazy_fetch,
     } = ctx;
@@ -2530,7 +2730,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     // normalized to end in exactly one newline. With --signoff the trailer is
     // appended to the body. Under `--attach`/`--inline` the blank line is
     // supplied by the multipart preamble's trailing `\n\n` instead.
-    let body = format_patch_body(&message, &subject_bytes, signoff_line);
+    let body = format_patch_body(&message, &subject_bytes, signoff_line, config);
     if let Some(mime) = &options.mime {
         write_mime_preamble(&mut out, mime);
         // git renders the text/plain part's body (the in-body From + commit
@@ -2552,11 +2752,6 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     } else {
         out.extend_from_slice(&body);
     }
-    if let Some(range_diff) = range_diff {
-        out.push(b'\n');
-        write_range_diff_commentary(&mut out, options, range_diff);
-    }
-
     // Diff entries against the first parent (or the empty tree for a root).
     let entries = first_parent_diff_entries(db, format, options, diff_pathspec, commit)?;
 
@@ -2593,6 +2788,15 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
                 format_patch_diff_options(db, format, options, abbrev, lazy_fetch),
             )?;
         }
+    }
+
+    if let Some(range_diff) = range_diff {
+        out.push(b'\n');
+        write_range_diff_commentary(&mut out, options, range_diff);
+    }
+    if let Some(interdiff) = interdiff {
+        out.push(b'\n');
+        write_interdiff_commentary(&mut out, options, interdiff, true);
     }
 
     if let Some(base) = base_info {
@@ -3136,7 +3340,12 @@ fn build_thread_plan(
 /// that by running the trailer logic over `subject\n\n<body>` and then slicing
 /// the subject framing back off — this is what makes the subject-only case emit
 /// exactly one blank line before the sign-off (no spurious extra blanks).
-fn format_patch_body(message: &[u8], subject: &[u8], signoff_line: Option<&[u8]>) -> Vec<u8> {
+fn format_patch_body(
+    message: &[u8],
+    subject: &[u8],
+    signoff_line: Option<&[u8]>,
+    config: &GitConfig,
+) -> Vec<u8> {
     let mut body = message[format_patch_body_start(message)..].to_vec();
     // Strip any trailing newlines, then re-add a single one (when non-empty) so
     // the body always ends "...text\n" before the sign-off / separator.
@@ -3158,7 +3367,7 @@ fn format_patch_body(message: &[u8], subject: &[u8], signoff_line: Option<&[u8]>
     framed.push(b'\n');
     let frame_len = framed.len();
     framed.extend_from_slice(&body);
-    append_signoff_trailer(&mut framed, signoff);
+    append_signoff_trailer(&mut framed, signoff, config);
     framed.split_off(frame_len)
 }
 
@@ -3219,7 +3428,7 @@ fn mboxrd_needs_escape(line: &[u8]) -> bool {
 /// git appends the new sob directly after it with no blank line — and if that
 /// block's last entry is already an identical sob, it appends nothing at all
 /// (dedup). Otherwise a blank line precedes the sob.
-fn append_signoff_trailer(body: &mut Vec<u8>, signoff_line: &[u8]) {
+fn append_signoff_trailer(body: &mut Vec<u8>, signoff_line: &[u8], config: &GitConfig) {
     let mut sob = signoff_line.to_vec();
     sob.push(b'\n');
 
@@ -3229,7 +3438,7 @@ fn append_signoff_trailer(body: &mut Vec<u8>, signoff_line: &[u8]) {
         return;
     }
 
-    let footer = conforming_footer_state(body, &sob);
+    let footer = conforming_footer_state(body, &sob, config);
 
     if footer == FooterState::None {
         // Add a blank line so the body and the sob are separated, mirroring
@@ -3269,8 +3478,8 @@ enum FooterState {
 /// Port of git's `has_conforming_footer` (sequencer.c) over `body`: detect the
 /// trailing trailer block via [`find_trailer_block_start`], iterate its trailer
 /// lines, and report whether the new `sob` appears and whether it is last.
-fn conforming_footer_state(body: &[u8], sob: &[u8]) -> FooterState {
-    let start = find_trailer_block_start(body);
+fn conforming_footer_state(body: &[u8], sob: &[u8], config: &GitConfig) -> FooterState {
+    let start = find_trailer_block_start(body, config);
     let block = &body[start..];
     // Trailer lines are the non-blank, non-continuation lines of the block whose
     // text begins a trailer (`Token: value`, or a recognised prefix). git counts
@@ -3331,7 +3540,7 @@ fn line_is_trailer(line: &[u8]) -> bool {
 /// begins (or `buf.len()` if the trailing paragraph is not a trailer block).
 /// Mirrors the for-each-ref port already in the tree, kept local to avoid a
 /// cross-module dependency.
-fn find_trailer_block_start(buf: &[u8]) -> usize {
+fn find_trailer_block_start(buf: &[u8], config: &GitConfig) -> usize {
     let len = buf.len();
     // Skip the title paragraph up to the first blank line.
     let mut s = 0usize;
@@ -3381,6 +3590,7 @@ fn find_trailer_block_start(buf: &[u8]) -> usize {
             {
                 trailer_lines += 1;
                 possible_continuation = 0;
+                recognized_prefix |= configured_trailer_token(config, text);
             } else if buf[l].is_ascii_whitespace() {
                 possible_continuation += 1;
             } else {
@@ -3395,6 +3605,22 @@ fn find_trailer_block_start(buf: &[u8]) -> usize {
         maybe_l = last_line(buf, l);
     }
     len
+}
+
+fn configured_trailer_token(config: &GitConfig, line: &[u8]) -> bool {
+    let Some(separator) = trailer_separator_pos(line) else {
+        return false;
+    };
+    let Ok(token) = std::str::from_utf8(&line[..separator]) else {
+        return false;
+    };
+    config.sections.iter().any(|section| {
+        section.name.eq_ignore_ascii_case("trailer")
+            && section
+                .subsection
+                .as_deref()
+                .is_some_and(|configured| configured.eq_ignore_ascii_case(token))
+    })
 }
 
 /// The position of the trailer `:` separator in a line's text, requiring the
@@ -3531,7 +3757,14 @@ fn apply_format_patch_relative(
     entries: Vec<sley_diff_merge::NameStatusEntry>,
     options: &FormatPatchOptions,
 ) -> Vec<sley_diff_merge::NameStatusEntry> {
-    let Some(prefix) = options.relative_prefix.as_deref() else {
+    apply_format_patch_relative_prefix(entries, options.relative_prefix.as_deref())
+}
+
+fn apply_format_patch_relative_prefix(
+    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    prefix: Option<&[u8]>,
+) -> Vec<sley_diff_merge::NameStatusEntry> {
+    let Some(prefix) = prefix else {
         return entries;
     };
     entries
@@ -3716,10 +3949,33 @@ fn format_patch_diff_options<'a>(
     abbrev: usize,
     lazy_fetch: bool,
 ) -> crate::DiffRenderOptions<'a> {
+    format_patch_diff_options_with(
+        db,
+        format,
+        options.binary,
+        &options.src_prefix,
+        &options.dst_prefix,
+        options.context_lines,
+        abbrev,
+        lazy_fetch,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_patch_diff_options_with<'a>(
+    db: &'a FileObjectDatabase,
+    format: ObjectFormat,
+    binary: bool,
+    src_prefix: &'a str,
+    dst_prefix: &'a str,
+    context_lines: usize,
+    abbrev: usize,
+    lazy_fetch: bool,
+) -> crate::DiffRenderOptions<'a> {
     crate::DiffRenderOptions {
         line_indicators: sley_diff_merge::render::LineIndicators::default(),
         suppress_blank_empty: false,
-        binary: options.binary,
+        binary,
         anchors: &[],
         allow_textconv: false,
         db,
@@ -3728,9 +3984,9 @@ fn format_patch_diff_options<'a>(
         use_worktree_new: false,
         format,
         abbrev,
-        src_prefix: &options.src_prefix,
-        dst_prefix: &options.dst_prefix,
-        context: options.context_lines,
+        src_prefix,
+        dst_prefix,
+        context: context_lines,
         userdiff: None,
         funcname: None,
         colors: None,
@@ -4038,6 +4294,28 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             value if let Some(previous) = value.strip_prefix("--range-diff=") => {
                 options.range_diff = Some(previous.to_string());
             }
+            "--interdiff" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--interdiff requires a value".into()))?;
+                options.interdiff = Some(value.clone());
+            }
+            value if let Some(previous) = value.strip_prefix("--interdiff=") => {
+                options.interdiff = Some(previous.to_string());
+            }
+            "--creation-factor" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("--creation-factor requires a value".into())
+                })?;
+                options.creation_factor = Some(value.parse::<i32>().map_err(|_| {
+                    GitError::Command(format!("invalid --creation-factor value: {value}"))
+                })?);
+            }
+            value if let Some(factor) = value.strip_prefix("--creation-factor=") => {
+                options.creation_factor = Some(factor.parse::<i32>().map_err(|_| {
+                    GitError::Command(format!("invalid --creation-factor value: {factor}"))
+                })?);
+            }
             "--filename-max-length" => {
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("--filename-max-length requires a value".into())
@@ -4166,30 +4444,37 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             // optional `=<boundary>` overrides the default (git version string).
             // `--no-attach` clears it. git: builtin/log.c attach/inline handlers.
             "--attach" => {
+                options.mime_explicit = true;
                 options.mime = Some(MimeAttach {
                     boundary: sley_core::UPSTREAM_GIT_COMPAT_VERSION.to_string(),
                     inline: false,
                 });
             }
             value if let Some(boundary) = value.strip_prefix("--attach=") => {
+                options.mime_explicit = true;
                 options.mime = Some(MimeAttach {
                     boundary: boundary.to_string(),
                     inline: false,
                 });
             }
             "--inline" => {
+                options.mime_explicit = true;
                 options.mime = Some(MimeAttach {
                     boundary: sley_core::UPSTREAM_GIT_COMPAT_VERSION.to_string(),
                     inline: true,
                 });
             }
             value if let Some(boundary) = value.strip_prefix("--inline=") => {
+                options.mime_explicit = true;
                 options.mime = Some(MimeAttach {
                     boundary: boundary.to_string(),
                     inline: true,
                 });
             }
-            "--no-attach" => options.mime = None,
+            "--no-attach" => {
+                options.mime_explicit = true;
+                options.mime = None;
+            }
             "--no-prefix" => options.prefix_mode = Some(false),
             "--default-prefix" => options.prefix_mode = Some(true),
             "--relative" => options.relative_mode = RelativeMode::On(None),

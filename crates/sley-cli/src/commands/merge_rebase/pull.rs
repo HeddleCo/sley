@@ -933,6 +933,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
     }
     let fetch_options = FetchOptions {
         quiet: verbosity < 0,
+        progress: None,
         auto_follow_tags: true,
         fetch_all_tags: tags == Some(true),
         prune: false,

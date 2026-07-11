@@ -41,7 +41,7 @@ use sley_protocol::{
 use sley_refs::{FileRefStore, Ref, RefTarget, RefUpdate, ReflogEntry};
 use sley_transport::{RemoteTransport, RemoteUrl};
 
-use crate::{CredentialProvider, ProgressSink};
+use crate::{CredentialProvider, ProgressSink, TransferProgress};
 
 /// How a fetch obtains refs and objects from the remote.
 ///
@@ -73,6 +73,10 @@ pub struct FetchOptions {
     /// Suppress prune notices (deletions still happen; only the [`ProgressSink`]
     /// output is silenced — the caller wires that).
     pub quiet: bool,
+    /// Explicit transfer-progress policy. `Some(true)` corresponds to
+    /// `--progress`, `Some(false)` to `--no-progress`; `None` leaves terminal
+    /// policy to the embedding wrapper.
+    pub progress: Option<bool>,
     /// Auto-follow annotated tags pointing at fetched commits.
     pub auto_follow_tags: bool,
     /// Fetch every tag (`--tags`), independent of reachability.
@@ -202,6 +206,10 @@ pub struct FetchOutcome {
     pub accepted_promisor_remotes: Vec<PromisorRemoteAdvertisement>,
     /// Accepted advertised fields persisted into existing client remotes.
     pub stored_promisor_fields: Vec<crate::PromisorRemoteFieldUpdate>,
+    /// Equal-work counts for the object transfer, when this transport exposes
+    /// truthful native counts. `None` means no objects moved or the transport
+    /// did not provide trustworthy progress metadata.
+    pub transfer_progress: Option<TransferProgress>,
 }
 
 /// Repository-derived defaults for one fetch invocation.
@@ -420,8 +428,12 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         .validation
         .map(|_| {
             sley_odb::IncomingPackQuarantine::new(request.git_dir, request.format).map(|incoming| {
-                incoming
-                    .with_promisor_remote_present(crate::config_has_promisor_remote(request.config))
+                // A filtered request creates a promisor pack even when the
+                // remote was not previously configured as promisor. Validate
+                // the quarantined graph with that same missing-object policy;
+                // otherwise the deliberately omitted blobs are rejected before
+                // the `.promisor` pack can be promoted.
+                incoming.with_promisor_remote_present(promisor_remote)
             })
         })
         .transpose()?;
@@ -977,7 +989,12 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 && updates
                     .iter()
                     .any(|update| ObjectId::from_hex(request.format, &update.src).is_ok());
-            let shallow_info = if !want_refs.is_empty() || has_exact_oid_want {
+            let (
+                shallow_info,
+                transferred_objects,
+                transferred_compression_objects,
+                transferred_deltas,
+            ) = if !want_refs.is_empty() || has_exact_oid_want {
                 let mut seen_exact_wants = HashSet::new();
                 let exact_wants = updates
                     .iter()
@@ -1003,14 +1020,14 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                         }
                     }
                 }
-                ref_in_want.shallow_info
+                (ref_in_want.shallow_info, 0, 0, 0)
             } else if starts.is_empty() && deepen_plan.is_none() {
                 if !updates.is_empty() {
                     sley_protocol::trace_packet_write_payload(b"0000");
                 }
-                Vec::new()
+                (Vec::new(), 0, 0, 0)
             } else {
-                crate::local::install_fetch_pack_via_local_upload_pack_with_promisor_decision_into(
+                let transfer = crate::local::install_fetch_pack_via_local_upload_pack_with_promisor_decision_into(
                     request.git_dir,
                     transfer_git_dir,
                     remote_git_dir,
@@ -1024,8 +1041,26 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     options.refetch,
                     local_fetch_unpack_limit(request.config, options.cloning, promisor_remote),
                     &promisor_decision,
-                )?
+                    crate::local::LocalFetchPackRequestMode::Traversal,
+                )?;
+                (
+                    transfer.shallow_info,
+                    transfer.object_count,
+                    transfer.compression_count,
+                    transfer.delta_count,
+                )
             };
+            outcome.transfer_progress = (transferred_objects > 0).then_some(TransferProgress {
+                total_objects: transferred_objects,
+                compression_objects: transferred_compression_objects,
+                delta_objects: transferred_deltas,
+            });
+            if options.progress == Some(true)
+                && !options.quiet
+                && let Some(progress) = outcome.transfer_progress.as_ref()
+            {
+                services.progress.transfer(progress);
+            }
             finalize_fetch(
                 FetchFinalize {
                     git_dir: request.git_dir,
@@ -2957,6 +2992,7 @@ mod tests {
     fn default_options() -> FetchOptions {
         FetchOptions {
             quiet: true,
+            progress: None,
             auto_follow_tags: false,
             fetch_all_tags: false,
             prune: false,
@@ -2988,6 +3024,71 @@ mod tests {
             negotiation_restrict: None,
             negotiation_include: None,
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingProgress {
+        transfers: Vec<TransferProgress>,
+    }
+
+    impl ProgressSink for RecordingProgress {
+        fn transfer(&mut self, progress: &TransferProgress) {
+            self.transfers.push(*progress);
+        }
+    }
+
+    #[test]
+    fn local_fetch_returns_and_emits_truthful_transfer_counts() {
+        let remote = temp_repo("remote-transfer-progress");
+        let local = temp_repo("local-transfer-progress");
+        let remote_tip = commit_on(&remote, "main", "remote tip");
+        let source = FetchSource::Local {
+            git_dir: remote.clone(),
+            common_git_dir: remote.clone(),
+        };
+        let refspecs = vec!["refs/heads/main:refs/remotes/origin/main".to_string()];
+        let mut options = default_options();
+        options.quiet = false;
+        options.progress = Some(true);
+        let mut credentials = NoCredentials;
+        let mut progress = RecordingProgress::default();
+
+        let outcome = fetch(
+            FetchRequest {
+                git_dir: &local,
+                format: ObjectFormat::Sha1,
+                config: &GitConfig::default(),
+                remote_name: "origin",
+                source: &source,
+                refspecs: &refspecs,
+                options: &options,
+                validation: None,
+            },
+            FetchServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+                ref_hook: None,
+            },
+        )
+        .expect("fetch should succeed");
+
+        let transfer = outcome
+            .transfer_progress
+            .expect("non-empty local fetch should report equal-work counts");
+        assert_eq!(
+            transfer,
+            TransferProgress {
+                total_objects: 2,
+                compression_objects: 1,
+                delta_objects: 0,
+            }
+        );
+        assert_eq!(progress.transfers, vec![transfer]);
+        assert!(
+            FileObjectDatabase::from_git_dir(&local, ObjectFormat::Sha1)
+                .contains(&remote_tip)
+                .expect("read fetched commit")
+        );
     }
 
     #[test]

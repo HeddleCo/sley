@@ -28,6 +28,7 @@ use crate::remote::{
 use crate::*;
 use sley::plumbing::sley_odb::ObjectReader;
 use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 
@@ -479,6 +480,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
             value => positional.push(value.to_string()),
         }
     }
+    let progress = progress.unwrap_or_else(|| io::stderr().is_terminal()) && !quiet;
     if positional.is_empty() || positional.len() > 2 {
         return Err(GitError::Command(
             "clone currently supports: clone [-q|-v] [--bare|--mirror] [--progress|--no-progress] [--single-branch] [--reject-shallow|--no-reject-shallow] [--depth <depth>|--no-depth] [--shallow-since <time>|--no-shallow-since] [--shallow-exclude <revision>|--no-shallow-exclude] [--recurse-submodules|--recursive|--no-recurse-submodules|--no-recursive] [--no-sparse] [--no-filter] [--also-filter-submodules|--no-also-filter-submodules] [--remote-submodules|--no-remote-submodules] [--shallow-submodules|--no-shallow-submodules] [--bundle-uri <uri>|--no-bundle-uri] [-s|--shared|--no-shared] [--reference <repo>|--no-reference] [--reference-if-able <repo>|--no-reference-if-able] [--dissociate|--no-dissociate] [--separate-git-dir <gitdir>|--no-separate-git-dir] [--template <dir>|--no-template|--no-jobs] [--revision <rev>|--no-revision] [-4|--ipv4|-6|--ipv6] [-l|--local|--no-local] [--hardlinks|--no-hardlinks] [--ref-format=files|--no-ref-format] [-c <key=value>] [-u|--upload-pack <path>] [--server-option <value>] [-j|--jobs <n>] [--origin <name>|--no-origin] [--branch <name>|--no-branch] [--tags|--no-tags] <repository> [<directory>]"
@@ -1196,6 +1198,11 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
         checkout_branch: &checkout_branch,
         remote_head_branch: &remote_head_branch,
         single_branch,
+        // A plain local clone installs objects by hardlink/copy and upstream
+        // does not run the transfer progress machinery for that path. Keep
+        // progress enabled for `file://` and explicit `--no-local`, which do
+        // use the in-process fetch transport.
+        progress: progress && !local_source,
         // A non-local path clone (`--no-local` / `file://`) honors `--depth`
         // through the in-process transport; a plain local clone had its depth
         // warned-and-ignored above, leaving `None` (a full clone).
@@ -1257,7 +1264,9 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
                 };
                 // A detached source HEAD may sit on commits unreachable from
                 // any ref; copy its closure so the detached checkout works.
-                if let Some(detached) = clone_options.detached_head.as_ref() {
+                if branch_tag_oid.is_none()
+                    && let Some(detached) = clone_options.detached_head.as_ref()
+                {
                     copy_local_revision_objects(
                         &remote_common_git_dir_for_head,
                         git_dir,
@@ -1304,9 +1313,6 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
     }
     if let Some(separate_git_dir) = separate_git_dir.as_deref() {
         apply_clone_separate_git_dir(&checkout_destination, &git_dir, separate_git_dir)?;
-    }
-    if !local_source {
-        emit_explicit_clone_progress(progress, quiet, outcome.empty);
     }
     if !quiet && local_source {
         eprintln!("done.");
@@ -1531,6 +1537,7 @@ fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Resu
     }
     let fetch_options = FetchOptions {
         quiet: true,
+        progress: None,
         auto_follow_tags: options.tag_opt != Some("--no-tags"),
         fetch_all_tags: false,
         prune: false,
@@ -1747,6 +1754,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
         &bundle,
         FetchOptions {
             quiet: true,
+            progress: None,
             auto_follow_tags: true,
             fetch_all_tags: false,
             prune: false,
@@ -1861,7 +1869,7 @@ struct CloneHttpOptions<'a> {
     deepen_since: Option<i64>,
     deepen_not: &'a [String],
     ref_storage: RefStorageFormat,
-    progress: Option<bool>,
+    progress: bool,
     ssh_options: sley_remote::SshTransportOptions,
     upload_pack_command: Option<&'a str>,
     reject_shallow: bool,
@@ -2141,6 +2149,7 @@ fn clone_network_repository(
         checkout_branch: &checkout_branch,
         remote_head_branch: &remote_head_branch,
         single_branch,
+        progress: options.progress && !options.quiet,
         depth: options.depth,
         deepen_since: options.deepen_since,
         deepen_not: options.deepen_not.to_vec(),
@@ -2261,7 +2270,6 @@ fn clone_network_repository(
         if let Some(separate_git_dir) = options.separate_git_dir {
             apply_clone_separate_git_dir(options.destination, &git_dir, separate_git_dir)?;
         }
-        emit_explicit_clone_progress(options.progress, options.quiet, empty);
         // An empty-repository clone stops before the checkout that would print
         // "done."; git emits only the warning in that case.
         if !options.quiet && !empty {
@@ -2300,12 +2308,6 @@ fn remove_clone_junk_directory(path: &Path, pre_existed: bool) {
         } else {
             let _ = fs::remove_file(&entry_path);
         }
-    }
-}
-
-fn emit_explicit_clone_progress(progress: Option<bool>, quiet: bool, empty: bool) {
-    if progress == Some(true) && !quiet && !empty {
-        eprintln!("Receiving objects: 100% (0/0), done.");
     }
 }
 
@@ -2378,6 +2380,7 @@ fn clone_bare_network_repository(
         &refspecs,
         FetchOptions {
             quiet: true,
+            progress: None,
             auto_follow_tags: options.tag_opt != Some("--no-tags") || options.branch.is_some(),
             fetch_all_tags: options.tag_opt == Some("--tags"),
             prune: false,
@@ -2864,6 +2867,7 @@ fn clone_bare_or_mirror_local_repository(
         &refspecs,
         FetchOptions {
             quiet: true,
+            progress: None,
             auto_follow_tags: !options.mirror
                 && (options.tag_opt != Some("--no-tags") || options.branch_explicit),
             fetch_all_tags: options.tag_opt == Some("--tags"),

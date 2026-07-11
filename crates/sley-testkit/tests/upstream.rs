@@ -160,6 +160,10 @@ mod runner_artifacts {
                     sley_exec_path.display()
                 ),
             );
+            write_executable(
+                &root.join("scalar"),
+                "#!/bin/sh\nif [ -n \"${SLEY_SCALAR_LAUNCH_MARKER:-}\" ]; then printf '%s\\n' \"$0\" >\"$SLEY_SCALAR_LAUNCH_MARKER\"; fi\nexit 0\n",
+            );
 
             write_executable(
                 &root.join("httpd"),
@@ -172,6 +176,10 @@ mod runner_artifacts {
 if test -n "${SLEY_HTTPD_PROBE-}"
 then
 	"$LIB_HTTPD_PATH" -v || exit 98
+fi
+if test -n "${SLEY_SCALAR_LAUNCH_MARKER-}"
+then
+	scalar list || exit 97
 fi
 test "${GIT_TEST_EXT_CHAIN_LINT:-}" = 0 || {
     printf '%s\n' 'runner did not disable redundant external chainlint' >&2
@@ -611,6 +619,30 @@ include\tt0003-attributes.sh\t{other_platform}\toracle\teligible\tupstream-decla
                 .and_then(|name| name.to_str()),
             Some("git"),
             "Sley must be invoked directly under the installed git name"
+        );
+    }
+
+    #[test]
+    fn sley_runner_exposes_the_native_scalar_launcher() {
+        let fixture = Fixture::new();
+        let marker = fixture.path("scalar-launch-marker.txt");
+        let output = fixture
+            .command("sley", "scalar-direct-launch")
+            .arg("t0001-init.sh")
+            .env("SLEY_SCALAR_LAUNCH_MARKER", &marker)
+            .output()
+            .expect("run native Scalar fixture");
+        assert!(
+            !output.status.success(),
+            "fixture contains one real parity failure"
+        );
+        let invoked = fs::read_to_string(marker).expect("read Scalar launcher marker");
+        assert_eq!(
+            Path::new(invoked.trim())
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("scalar"),
+            "upstream tests must execute Sley's native Scalar from the isolated prefix"
         );
     }
 

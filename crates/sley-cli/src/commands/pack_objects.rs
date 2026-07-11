@@ -318,6 +318,7 @@ pub(crate) fn cmd_pack_objects(
             format,
             &options,
             progress,
+            max_pack_size,
         );
     }
     let traversal = options.revs || options.all;
@@ -2571,6 +2572,7 @@ fn write_cruft_pack(
     format: ObjectFormat,
     options: &PackObjectsOptions,
     progress: bool,
+    max_pack_size: Option<u64>,
 ) -> Result<()> {
     let objects_dir = sley_odb::repository_objects_dir(common_git_dir);
     let pack_dir = objects_dir.join("pack");
@@ -2579,6 +2581,7 @@ fn write_cruft_pack(
     // packs. Both name the *new* world; any pack not mentioned is "unknown" and
     // is kept (its objects ignored), exactly like upstream's third branch.
     let mut fresh_packs: HashSet<String> = HashSet::new();
+    let mut discard_packs: HashSet<String> = HashSet::new();
     {
         let stdin = io::stdin();
         let mut input = stdin.lock();
@@ -2595,19 +2598,19 @@ fn write_cruft_pack(
             // Discard packs (`-name`) are not retained, so their objects are
             // *candidates* for the new cruft pack — they are not "fresh".
             if let Some(stripped) = name.strip_prefix('-') {
-                let _ = stripped;
+                discard_packs.insert(stripped.to_string());
             } else {
                 fresh_packs.insert(name.to_string());
             }
         }
     }
 
-    // Index every pack on disk. A pack is "kept" (its objects skipped) iff it
-    // is fresh or was not mentioned at all; a pack is a candidate source iff it
-    // was named on the discard list OR it is a non-fresh pack the caller knew
-    // about. Upstream keeps both fresh and unknown packs; we collect from the
-    // complement, which on this suite's `keep="$(...).idx"` invocations is the
-    // set of unreachable/cruft packs left behind.
+    // Index every pack on disk. A pack is "kept" (its objects skipped) when it
+    // is fresh or was not mentioned at all. Only an explicit discard-list entry
+    // makes a pack a candidate source. That distinction matters when a pack is
+    // created after the caller enumerates its inputs: upstream treats such an
+    // unknown pack as retained instead of silently folding it into the cruft
+    // output.
     //
     // The mtime contributed by a packed object is the pack's own mtime, except
     // for a cruft pack (`.mtimes` present) where each object carries its own
@@ -2643,8 +2646,12 @@ fn write_cruft_pack(
                 continue;
             };
             // Skip a `.keep`-marked pack just like a kept pack.
-            let is_kept_pack =
-                fresh_packs.contains(&pack_name) || idx_path.with_extension("keep").exists();
+            // Unknown packs (mentioned in neither set) appeared after the
+            // caller enumerated its inputs and must also be retained. Only an
+            // explicit `-pack-name.pack` line selects a pack for replacement.
+            let is_kept_pack = fresh_packs.contains(&pack_name)
+                || !discard_packs.contains(&pack_name)
+                || idx_path.with_extension("keep").exists();
             if is_kept_pack {
                 for entry in &index.entries {
                     kept_pack_oids.insert(entry.oid);
@@ -2724,87 +2731,53 @@ fn write_cruft_pack(
         rescue_and_expire_cruft(database, format, &mut mtimes, expiration)?;
     }
 
-    // Materialise the surviving objects. A blob that exists only as a missing
-    // tree link (recorded with no readable body) is skipped — matching
-    // add_cruft_object_entry's "missing non-tip blob" guard.
-    let mut survivors: Vec<(ObjectId, u32)> = mtimes.into_iter().collect();
-    survivors.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-
     let _ = (git_dir, progress);
-
-    let mut inputs_oids: Vec<ObjectId> = Vec::with_capacity(survivors.len());
-    let mut inputs_objects: Vec<Arc<EncodedObject>> = Vec::with_capacity(survivors.len());
-    let mut mtime_by_oid: HashMap<ObjectId, u32> = HashMap::with_capacity(survivors.len());
-    for (oid, mtime) in survivors {
-        match database.read_object(&oid) {
-            Ok(object) => {
-                inputs_oids.push(oid);
-                inputs_objects.push(object);
-                mtime_by_oid.insert(oid, mtime);
-            }
-            Err(GitError::NotFound(_)) => {
-                // Unreadable object (e.g. a missing blob referenced only by a
-                // tree link); upstream never adds it to the pack.
-            }
-            Err(err) => return Err(err),
-        }
+    let mut cruft_packs = sley_odb::build_cruft_packs_from_mtimes(
+        database,
+        format,
+        &mtimes,
+        &sley_odb::CruftPackOptions {
+            max_pack_size,
+            pack_write: PackWriteOptions::new(),
+            ..sley_odb::CruftPackOptions::default()
+        },
+    )?;
+    if cruft_packs.is_empty() {
+        cruft_packs.push(sley_odb::build_empty_cruft_pack(
+            format,
+            &PackWriteOptions::new(),
+        )?);
     }
 
-    let inputs: Vec<PackInput<'_>> = inputs_oids
-        .iter()
-        .zip(&inputs_objects)
-        .map(|(oid, object)| PackInput {
-            oid,
-            object: object.as_ref(),
-        })
-        .collect();
-
-    let written = PackFile::write_packed_with_known_ids_and_options(
-        &inputs,
-        format,
-        &PackWriteOptions::new(),
-    )?;
-
-    // The `.mtimes` table is stored in lexicographic (index) order, which is
-    // NOT the pack-emit order `written.entries` carries — sort a copy by oid
-    // first so the table lines up with the `.idx` fanout the reader walks.
-    let mut sorted_entries: Vec<&sley_pack::PackIndexEntry> = written.entries.iter().collect();
-    sorted_entries.sort_by(|a, b| a.oid.as_bytes().cmp(b.oid.as_bytes()));
-    let mtimes_table: Vec<u32> = sorted_entries
-        .iter()
-        .map(|entry| mtime_by_oid.get(&entry.oid).copied().unwrap_or(0))
-        .collect();
-
-    let base_name = options.base_name.clone();
-    let checksum_hex = written.checksum.to_hex();
-
-    let reverse_index = if options.write_reverse_index {
-        let positions = pack_order_index_positions(&written.entries);
-        Some(PackReverseIndex::write(
-            format,
-            &positions,
-            &written.checksum,
-        )?)
-    } else {
-        None
-    };
-    let mtimes_bytes = sley_pack::PackMtimes::write(format, &mtimes_table, &written.checksum)?;
-
     if options.stdout_mode {
+        let Some(cruft) = cruft_packs.first() else {
+            return Ok(());
+        };
+        if cruft_packs.len() != 1 {
+            return Err(GitError::InvalidFormat(
+                "stdout cruft output unexpectedly produced multiple packs".into(),
+            ));
+        }
         let mut stdout = io::stdout();
-        stdout.write_all(&written.pack)?;
+        stdout.write_all(&cruft.pack)?;
         stdout.flush()?;
         return Ok(());
     }
 
-    let base_name = base_name.expect("base name required without --stdout");
-    fs::write(format!("{base_name}-{checksum_hex}.pack"), &written.pack)?;
-    if let Some(reverse_index) = reverse_index {
-        fs::write(format!("{base_name}-{checksum_hex}.rev"), reverse_index)?;
+    let base_name = options
+        .base_name
+        .as_ref()
+        .expect("base name required without --stdout");
+    for cruft in cruft_packs {
+        let checksum_hex = cruft.checksum.to_hex();
+        fs::write(format!("{base_name}-{checksum_hex}.pack"), &cruft.pack)?;
+        if options.write_reverse_index {
+            fs::write(format!("{base_name}-{checksum_hex}.rev"), &cruft.rev)?;
+        }
+        fs::write(format!("{base_name}-{checksum_hex}.mtimes"), &cruft.mtimes)?;
+        fs::write(format!("{base_name}-{checksum_hex}.idx"), &cruft.idx)?;
+        println!("{checksum_hex}");
     }
-    fs::write(format!("{base_name}-{checksum_hex}.mtimes"), &mtimes_bytes)?;
-    fs::write(format!("{base_name}-{checksum_hex}.idx"), &written.index)?;
-    println!("{checksum_hex}");
     Ok(())
 }
 

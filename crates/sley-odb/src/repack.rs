@@ -1,12 +1,12 @@
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
-use sley_pack::{PackFile, PackIndex, PackIndexEntry, PackInput};
+use sley_pack::{PackFile, PackIndex, PackIndexEntry, PackInput, PackWriteOptions};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::{ObjectReader, grafted_parents};
+use crate::{ObjectReader, ObjectWriter, grafted_parents};
 
 use crate::install::{replace_pack_component, write_pack_component, write_promisor_pack_sidecar};
 use crate::loose::LooseObjectStore;
@@ -50,6 +50,29 @@ pub struct RepackResult {
     /// retained; bitmap construction only needs their type and pack position.
     bitmap_cache: Vec<RepackBitmapObject>,
     loose_prune_outcome: LooseObjectPruneOutcome,
+}
+
+#[derive(Debug, Clone)]
+struct UnpackedObject {
+    oid: ObjectId,
+    object: Arc<EncodedObject>,
+    mtime: u32,
+}
+
+/// Outcome for `repack -A`: a reachable pack plus packed-but-unreachable
+/// objects that must become loose before obsolete source packs are removed.
+#[derive(Debug, Clone)]
+pub struct UnpackUnreachableRepackResult {
+    pub repack: Option<RepackResult>,
+    unpacked: Vec<UnpackedObject>,
+    obsolete_packs: Vec<PathBuf>,
+    retained_pack_stems: Vec<String>,
+}
+
+impl UnpackUnreachableRepackResult {
+    pub fn unpacked_oids(&self) -> impl ExactSizeIterator<Item = ObjectId> + '_ {
+        self.unpacked.iter().map(|entry| entry.oid)
+    }
 }
 
 /// Whether installing a repack result accounts for every loose object that is
@@ -303,6 +326,122 @@ pub fn repack_reachable_objects_with_options(
     options: &RepackOptions,
 ) -> Result<Option<RepackResult>> {
     repack_reachable_objects_with_filter_to(git_dir, format, roots, options, None)
+}
+
+/// Build the `-A` form of an all-object repack.
+///
+/// Reachable objects go into the replacement pack. Objects found only in packs
+/// being replaced are materialized as loose objects, retaining their source
+/// pack timestamp, before those packs are pruned. When `unpack_before` is set,
+/// old unreachable objects are omitted; `recent_roots` and their dependency
+/// closure are always retained (the engine input for `gc.recentObjectsHook`).
+pub fn repack_reachable_objects_unpack_unreachable(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    options: &RepackOptions,
+    unpack_before: Option<u32>,
+    recent_roots: &[ObjectId],
+) -> Result<UnpackUnreachableRepackResult> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let pack_dir = objects_dir.join("pack");
+    let database = if options.local {
+        FileObjectDatabase::without_alternates(objects_dir.clone(), format)
+    } else {
+        FileObjectDatabase::new(objects_dir.clone(), format)
+    };
+    let retained_pack_stems = repack_retained_pack_stems(
+        &pack_dir,
+        &options.keep_pack_stems,
+        !options.pack_kept_objects,
+    )?;
+    let retained = retained_pack_stems
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let obsolete_packs = existing_pack_files(&pack_dir)?
+        .into_iter()
+        .filter(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_none_or(|stem| !retained.contains(stem))
+                && !path.with_extension("keep").exists()
+                && !path.with_extension("promisor").exists()
+        })
+        .collect::<Vec<_>>();
+
+    let reachable = collect_reachable_object_ids_excluding_promised_missing(
+        &database,
+        format,
+        roots.iter().copied(),
+        &promisor_pack_object_ids(&objects_dir, format)?,
+    )?;
+    let recent = if recent_roots.is_empty() {
+        HashSet::new()
+    } else {
+        collect_reachable_object_ids_excluding_promised_missing(
+            &database,
+            format,
+            recent_roots.iter().copied(),
+            &HashSet::new(),
+        )?
+    };
+    let loose = loose_object_ids(&objects_dir, format)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let packed_mtimes = packed_object_mtimes_for_paths(&obsolete_packs, format)?;
+    let mut unpacked = Vec::new();
+    for (oid, mtime) in packed_mtimes {
+        if reachable.contains(&oid) || loose.contains(&oid) {
+            continue;
+        }
+        if unpack_before.is_some_and(|cutoff| mtime <= cutoff) && !recent.contains(&oid) {
+            continue;
+        }
+        match database.read_object(&oid) {
+            Ok(object) => unpacked.push(UnpackedObject { oid, object, mtime }),
+            Err(GitError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    unpacked.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
+
+    let repack = repack_reachable_objects_with_options(git_dir, format, roots, options)?;
+    Ok(UnpackUnreachableRepackResult {
+        repack,
+        unpacked,
+        obsolete_packs,
+        retained_pack_stems,
+    })
+}
+
+fn packed_object_mtimes_for_paths(
+    pack_paths: &[PathBuf],
+    format: ObjectFormat,
+) -> Result<HashMap<ObjectId, u32>> {
+    let mut mtimes: HashMap<ObjectId, u32> = HashMap::new();
+    for pack_path in pack_paths {
+        let index = PackIndex::parse(&fs::read(pack_path.with_extension("idx"))?, format)?;
+        let per_object = fs::read(pack_path.with_extension("mtimes"))
+            .ok()
+            .and_then(|bytes| {
+                sley_pack::PackMtimes::parse(&bytes, format, index.entries.len())
+                    .ok()
+                    .map(|parsed| parsed.mtimes)
+            });
+        let pack_mtime = path_mtime_secs(pack_path);
+        for (position, entry) in index.entries.iter().enumerate() {
+            let mtime = per_object
+                .as_ref()
+                .and_then(|values| values.get(position).copied())
+                .unwrap_or(pack_mtime);
+            mtimes
+                .entry(entry.oid)
+                .and_modify(|existing| *existing = (*existing).max(mtime))
+                .or_insert(mtime);
+        }
+    }
+    Ok(mtimes)
 }
 
 /// Repack reachable objects while moving blobs at least `limit` bytes into a
@@ -710,6 +849,48 @@ pub fn repack_loose_objects(git_dir: &Path, format: ObjectFormat) -> Result<Opti
     let objects_dir = repository_objects_dir(git_dir);
     let database = FileObjectDatabase::new(objects_dir.clone(), format);
     let loose_oids = loose_object_ids(&objects_dir, format)?;
+    repack_selected_loose_objects(&database, format, loose_oids)
+}
+
+/// Pack only loose objects that belong to the reachability closure of
+/// `roots`. This is the engine for incremental `git repack`: unreachable loose
+/// objects remain loose so a later cruft repack can timestamp and collect them.
+pub fn repack_reachable_loose_objects(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+) -> Result<Option<RepackResult>> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let database = FileObjectDatabase::new(objects_dir.clone(), format);
+    let promisor_oids = promisor_pack_object_ids(&objects_dir, format)?;
+    // Reflogs can legitimately retain object ids whose objects have already
+    // been pruned. `git repack` ignores those stale roots while still treating
+    // a missing dependency below a present root as corruption. Filter only the
+    // initial roots here, then keep the ordinary strict closure walk.
+    let mut present_roots = Vec::with_capacity(roots.len());
+    for oid in roots {
+        if promisor_oids.contains(oid) || database.contains(oid)? {
+            present_roots.push(*oid);
+        }
+    }
+    let reachable = collect_reachable_object_ids_excluding_promised_missing(
+        &database,
+        format,
+        present_roots,
+        &promisor_oids,
+    )?;
+    let loose_oids = loose_object_ids(&objects_dir, format)?
+        .into_iter()
+        .filter(|oid| reachable.contains(oid))
+        .collect::<Vec<_>>();
+    repack_selected_loose_objects(&database, format, loose_oids)
+}
+
+fn repack_selected_loose_objects(
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    loose_oids: Vec<ObjectId>,
+) -> Result<Option<RepackResult>> {
     if loose_oids.is_empty() {
         return Ok(None);
     }
@@ -1013,6 +1194,45 @@ pub fn install_repack_result(
     prune: bool,
 ) -> Result<()> {
     install_repack_result_with_bitmap(git_dir, format, result, prune, None, None)
+}
+
+/// Install a `repack -A` outcome. Unreachable objects are written loose before
+/// pruning their source packs, so readers never observe them missing.
+pub fn install_repack_with_unpacked_unreachable(
+    git_dir: &Path,
+    format: ObjectFormat,
+    result: &UnpackUnreachableRepackResult,
+    prune: bool,
+) -> Result<()> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let loose = LooseObjectStore::new(objects_dir.clone(), format);
+    for entry in &result.unpacked {
+        let written = loose.write_object(entry.object.as_ref().clone())?;
+        if written != entry.oid {
+            return Err(GitError::InvalidObject(
+                "unpacked unreachable object changed identity".into(),
+            ));
+        }
+        let path = loose.object_path(&entry.oid)?;
+        fs::OpenOptions::new().read(true).open(path)?.set_modified(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::from(entry.mtime)),
+        )?;
+    }
+
+    if let Some(repack) = result.repack.as_ref() {
+        install_repack_result(git_dir, format, repack, prune)?;
+    } else if prune {
+        let nonexistent = objects_dir.join("pack/.sley-no-replacement-pack");
+        prune_obsolete_pack_paths(
+            &objects_dir,
+            format,
+            &result.obsolete_packs,
+            &nonexistent,
+            &result.retained_pack_stems,
+            false,
+        )?;
+    }
+    Ok(())
 }
 
 /// [`install_repack_result`] that additionally writes a `pack-<checksum>.bitmap`
@@ -1327,6 +1547,34 @@ pub struct CruftPack {
     pub checksum: ObjectId,
     /// Object ids the cruft pack holds (its surviving unreachable set).
     pub oids: Vec<ObjectId>,
+    /// Writer provenance used to validate the public pack/index bytes without
+    /// inflating a potentially large cruft pack again during installation.
+    index_entries: Vec<PackIndexEntry>,
+}
+
+/// Pack-writing policy specific to the unreachable-object side of a cruft
+/// repack. Keeping this separate from [`RepackOptions`] lets callers resolve
+/// command/config precedence once while the engine applies the same policy to
+/// both the surviving and expired cruft packs.
+#[derive(Debug, Clone)]
+pub struct CruftPackOptions {
+    /// Target size for each cruft pack. A single oversized object is allowed.
+    pub max_pack_size: Option<u64>,
+    /// Repack existing cruft packs strictly smaller than this size while
+    /// retaining larger cruft packs unchanged. Ignored for expiring repacks.
+    pub combine_cruft_below_size: Option<u64>,
+    /// Delta-search and compression policy used to encode cruft objects.
+    pub pack_write: PackWriteOptions,
+}
+
+impl Default for CruftPackOptions {
+    fn default() -> Self {
+        Self {
+            max_pack_size: None,
+            combine_cruft_below_size: None,
+            pack_write: PackWriteOptions::new(),
+        }
+    }
 }
 
 /// Outcome of `git repack --cruft`: the reachable pack (if any) plus the cruft
@@ -1337,6 +1585,13 @@ pub struct CruftRepackResult {
     pub reachable: Option<RepackResult>,
     /// The cruft pack of unreachable objects, or `None` when there are none.
     pub cruft: Option<CruftPack>,
+    /// Additional cruft packs produced by a size-limited repack. The first
+    /// pack remains in `cruft` for API compatibility with single-pack callers.
+    pub additional_cruft: Vec<CruftPack>,
+    /// Objects removed by `--cruft-expiration`, encoded before source packs are
+    /// pruned. Callers implementing `--expire-to` can install this pack after
+    /// the main repack without reopening objects that no longer exist locally.
+    pub expired: Option<CruftPack>,
     /// Pre-existing non-cruft, non-kept pack `.pack` paths superseded by the
     /// reachable pack (removed under `-d`).
     pub obsolete_packs: Vec<PathBuf>,
@@ -1430,39 +1685,194 @@ fn build_cruft_pack(
     format: ObjectFormat,
     survivors: &HashMap<ObjectId, u32>,
 ) -> Result<Option<CruftPack>> {
+    Ok(
+        build_cruft_packs(database, format, survivors, None, &PackWriteOptions::new())?
+            .into_iter()
+            .next(),
+    )
+}
+
+fn build_cruft_packs(
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    survivors: &HashMap<ObjectId, u32>,
+    max_pack_size: Option<u64>,
+    pack_write: &PackWriteOptions,
+) -> Result<Vec<CruftPack>> {
     if survivors.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let mut ordered: Vec<(ObjectId, u32)> = survivors.iter().map(|(o, m)| (*o, *m)).collect();
     ordered.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
-    let mut oids: Vec<ObjectId> = Vec::with_capacity(ordered.len());
-    let mut objects: Vec<Arc<EncodedObject>> = Vec::with_capacity(ordered.len());
-    let mut mtime_by_oid: HashMap<ObjectId, u32> = HashMap::with_capacity(ordered.len());
+    let mut objects = Vec::with_capacity(ordered.len());
     for (oid, mtime) in ordered {
         match database.read_object(&oid) {
-            Ok(object) => {
-                oids.push(oid);
-                objects.push(object);
-                mtime_by_oid.insert(oid, mtime);
-            }
+            Ok(object) => objects.push((oid, mtime, object)),
             Err(GitError::NotFound(_)) => {}
             Err(err) => return Err(err),
         }
     }
-    if oids.is_empty() {
-        return Ok(None);
+    if objects.is_empty() {
+        return Ok(Vec::new());
     }
 
-    let inputs: Vec<PackInput<'_>> = oids
+    // Prepare the complete pack once. This is both the common no-split result
+    // and the sizing oracle for a limited run: its index offsets expose the
+    // actual compressed/deltified byte contribution of every entry. Unlike an
+    // uncompressed-body estimate, this keeps highly compressible objects
+    // together and accounts for the configured delta window.
+    let complete = build_one_cruft_pack(&objects, format, pack_write)?;
+    let Some(limit) = max_pack_size.filter(|limit| *limit > 0) else {
+        return Ok(vec![complete]);
+    };
+    if objects.len() == 1 || (complete.pack.len() as u64) < limit {
+        return Ok(vec![complete]);
+    }
+
+    let groups = partition_cruft_objects_by_encoded_size(objects, &complete, format, limit)?;
+    let mut packs = Vec::with_capacity(groups.len());
+    for group in groups {
+        build_size_limited_cruft_group(group, format, pack_write, limit, &mut packs)?;
+    }
+    Ok(packs)
+}
+
+/// Build one or more self-contained cruft packs from per-object mtimes using
+/// the same encoded-size-aware splitter as `repack --cruft`.
+///
+/// This is the typed engine seam for the `pack-objects --cruft` adapter: the
+/// caller remains responsible only for selecting candidate objects and
+/// installing/rendering each returned pack.
+pub fn build_cruft_packs_from_mtimes(
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    object_mtimes: &HashMap<ObjectId, u32>,
+    options: &CruftPackOptions,
+) -> Result<Vec<CruftPack>> {
+    build_cruft_packs(
+        database,
+        format,
+        object_mtimes,
+        options.max_pack_size,
+        &options.pack_write,
+    )
+}
+
+/// Build the protocol-visible empty cruft pack emitted by `pack-objects` when
+/// expiration removes every candidate. Repository-level repack callers omit
+/// empty cruft output, but the plumbing command still prints a pack name and
+/// writes an empty `.mtimes` sidecar.
+pub fn build_empty_cruft_pack(
+    format: ObjectFormat,
+    pack_write: &PackWriteOptions,
+) -> Result<CruftPack> {
+    build_one_cruft_pack(&[], format, pack_write)
+}
+
+type CruftObject = (ObjectId, u32, Arc<EncodedObject>);
+
+fn build_size_limited_cruft_group(
+    objects: Vec<CruftObject>,
+    format: ObjectFormat,
+    pack_write: &PackWriteOptions,
+    limit: u64,
+    packs: &mut Vec<CruftPack>,
+) -> Result<()> {
+    let pack = build_one_cruft_pack(&objects, format, pack_write)?;
+    if objects.len() == 1 || (pack.pack.len() as u64) < limit {
+        packs.push(pack);
+        return Ok(());
+    }
+
+    // Removing a delta base that landed in an earlier pack can enlarge a later
+    // group. Repartition only that overflowing group from its newly encoded
+    // bytes. The usual path writes the complete sizing pack once and each final
+    // group once; repeated work is confined to groups whose delta plan changed
+    // across the split.
+    let groups = partition_cruft_objects_by_encoded_size(objects, &pack, format, limit)?;
+    if groups.len() <= 1 {
+        return Err(GitError::InvalidFormat(
+            "size-limited cruft pack could not make partition progress".into(),
+        ));
+    }
+    for group in groups {
+        build_size_limited_cruft_group(group, format, pack_write, limit, packs)?;
+    }
+    Ok(())
+}
+
+fn partition_cruft_objects_by_encoded_size(
+    objects: Vec<CruftObject>,
+    pack: &CruftPack,
+    format: ObjectFormat,
+    limit: u64,
+) -> Result<Vec<Vec<CruftObject>>> {
+    let trailer_start = pack
+        .pack
+        .len()
+        .checked_sub(format.raw_len())
+        .ok_or_else(|| GitError::InvalidFormat("cruft pack is shorter than its trailer".into()))?;
+    let mut entries = pack.index_entries.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.offset);
+    let mut objects_by_oid = objects
+        .into_iter()
+        .map(|entry| (entry.0, entry))
+        .collect::<HashMap<_, _>>();
+    let fixed_bytes = 12_u64.saturating_add(format.raw_len() as u64);
+    let mut current_size = fixed_bytes;
+    let mut current = Vec::new();
+    let mut groups = Vec::new();
+
+    for (position, entry) in entries.iter().enumerate() {
+        let end = entries
+            .get(position + 1)
+            .map(|next| next.offset)
+            .unwrap_or(trailer_start as u64);
+        let encoded_size = end.checked_sub(entry.offset).ok_or_else(|| {
+            GitError::InvalidFormat("cruft pack index offsets are not monotonic".into())
+        })?;
+        let object = objects_by_oid.remove(&entry.oid).ok_or_else(|| {
+            GitError::InvalidFormat("cruft pack index names an unknown object".into())
+        })?;
+        // Git starts a new pack when the next encoded entry plus the final hash
+        // would reach the limit, except that the first object is always allowed
+        // to exceed it. `current_size` already includes header and trailer.
+        if !current.is_empty() && current_size.saturating_add(encoded_size) >= limit {
+            groups.push(std::mem::take(&mut current));
+            current_size = fixed_bytes;
+        }
+        current_size = current_size.saturating_add(encoded_size);
+        current.push(object);
+    }
+    if !objects_by_oid.is_empty() {
+        return Err(GitError::InvalidFormat(
+            "cruft pack omitted objects from its index".into(),
+        ));
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    Ok(groups)
+}
+
+fn build_one_cruft_pack(
+    objects: &[CruftObject],
+    format: ObjectFormat,
+    pack_write: &PackWriteOptions,
+) -> Result<CruftPack> {
+    let inputs: Vec<PackInput<'_>> = objects
         .iter()
-        .zip(&objects)
-        .map(|(oid, object)| PackInput {
+        .map(|(oid, _, object)| PackInput {
             oid,
             object: object.as_ref(),
         })
         .collect();
-    let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
+    let written = PackFile::write_packed_with_known_ids_and_options(&inputs, format, pack_write)?;
+    let mtime_by_oid = objects
+        .iter()
+        .map(|(oid, mtime, _)| (*oid, *mtime))
+        .collect::<HashMap<_, _>>();
 
     // `.mtimes` table is in lexicographic (index/fanout) order.
     let mut sorted_entries: Vec<&sley_pack::PackIndexEntry> = written.entries.iter().collect();
@@ -1477,14 +1887,15 @@ fn build_cruft_pack(
 
     let mut cruft_oids: Vec<ObjectId> = sorted_entries.iter().map(|e| e.oid).collect();
     cruft_oids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    Ok(Some(CruftPack {
+    Ok(CruftPack {
         pack: written.pack,
         idx: written.index,
         rev,
         mtimes,
         checksum: written.checksum,
         oids: cruft_oids,
-    }))
+        index_entries: written.entries,
+    })
 }
 
 /// `git repack --cruft [--cruft-expiration=<t>] [-d]`: pack the reachable
@@ -1518,6 +1929,40 @@ pub fn repack_cruft_with_options(
     cruft_expiration: Option<u32>,
     options: &RepackOptions,
 ) -> Result<CruftRepackResult> {
+    repack_cruft_with_options_and_max_size(git_dir, format, roots, cruft_expiration, options, None)
+}
+
+pub fn repack_cruft_with_options_and_max_size(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    cruft_expiration: Option<u32>,
+    options: &RepackOptions,
+    max_pack_size: Option<u64>,
+) -> Result<CruftRepackResult> {
+    let cruft_options = CruftPackOptions {
+        max_pack_size,
+        ..CruftPackOptions::default()
+    };
+    repack_cruft_with_pack_options(
+        git_dir,
+        format,
+        roots,
+        cruft_expiration,
+        options,
+        &cruft_options,
+    )
+}
+
+/// Run a cruft repack with an explicit, typed cruft-pack policy.
+pub fn repack_cruft_with_pack_options(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    cruft_expiration: Option<u32>,
+    options: &RepackOptions,
+    cruft_options: &CruftPackOptions,
+) -> Result<CruftRepackResult> {
     let objects_dir = repository_objects_dir(git_dir);
     let database = if options.local {
         FileObjectDatabase::without_alternates(objects_dir.clone(), format)
@@ -1525,6 +1970,21 @@ pub fn repack_cruft_with_options(
         FileObjectDatabase::new(objects_dir.clone(), format)
     };
     let pack_dir = objects_dir.join("pack");
+    // Selective combination keeps large local cruft packs intact and only
+    // feeds objects from smaller cruft packs (plus loose objects) to the new
+    // cruft pack. Expiration deliberately disables this selection because all
+    // unreachable objects must participate in rescue/expiry decisions.
+    let retained_cruft_pack_stems = if cruft_expiration.is_none() {
+        cruft_options
+            .combine_cruft_below_size
+            .filter(|limit| *limit > 0)
+            .map(|limit| retained_cruft_pack_stems(&pack_dir, limit))
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let retained_cruft_oids = pack_oids_for_stems(&pack_dir, format, &retained_cruft_pack_stems)?;
     let retained_pack_stems = repack_retained_pack_stems(
         &pack_dir,
         &options.keep_pack_stems,
@@ -1612,15 +2072,39 @@ pub fn repack_cruft_with_options(
             !reachable_ids.contains(oid)
                 && !excluded_oids.contains(oid)
                 && !promisor_oids.contains(oid)
+                && !retained_cruft_oids.contains(oid)
         })
         .collect();
 
     // Expiration: rescue older objects reachable from a recent one, drop the rest.
+    // Preserve the dropped set as encoded output before installation can prune
+    // its only source packs. This keeps `--expire-to` an engine operation rather
+    // than forcing callers to race source deletion with a second ODB walk.
+    let mut expired = None;
     if let Some(expiration) = cruft_expiration {
+        let before_expiration = survivors.clone();
         rescue_and_expire_cruft_objects(&database, format, &mut survivors, expiration)?;
+        let dropped = before_expiration
+            .into_iter()
+            .filter(|(oid, _)| !survivors.contains_key(oid))
+            .collect::<HashMap<_, _>>();
+        expired = build_cruft_packs(&database, format, &dropped, None, &cruft_options.pack_write)?
+            .into_iter()
+            .next();
     }
 
-    let cruft = build_cruft_pack(&database, format, &survivors)?;
+    let mut cruft_packs = build_cruft_packs(
+        &database,
+        format,
+        &survivors,
+        cruft_options.max_pack_size,
+        &cruft_options.pack_write,
+    )?;
+    let cruft = if cruft_packs.is_empty() {
+        None
+    } else {
+        Some(cruft_packs.remove(0))
+    };
 
     // The packs the reachable+cruft packs supersede: every pre-existing
     // non-kept pack. Cruft packs are tracked separately.
@@ -1628,7 +2112,10 @@ pub fn repack_cruft_with_options(
     let mut obsolete_cruft_packs = Vec::new();
     for pack_path in existing_pack_files(&pack_dir)? {
         if let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str())
-            && retained_pack_stems.iter().any(|retained| retained == stem)
+            && (retained_pack_stems.iter().any(|retained| retained == stem)
+                || retained_cruft_pack_stems
+                    .iter()
+                    .any(|retained| retained == stem))
         {
             continue;
         }
@@ -1645,10 +2132,127 @@ pub fn repack_cruft_with_options(
     Ok(CruftRepackResult {
         reachable: reachable_result,
         cruft,
+        additional_cruft: cruft_packs,
+        expired,
         obsolete_packs,
         obsolete_cruft_packs,
         retained_pack_stems,
     })
+}
+
+fn retained_cruft_pack_stems(pack_dir: &Path, combine_below_size: u64) -> Result<Vec<String>> {
+    let mut retained = Vec::new();
+    for pack_path in existing_pack_files(pack_dir)? {
+        if !pack_path.with_extension("mtimes").exists()
+            || fs::metadata(&pack_path)?.len() < combine_below_size
+        {
+            continue;
+        }
+        if let Some(stem) = pack_path.file_stem().and_then(|stem| stem.to_str()) {
+            retained.push(stem.to_string());
+        }
+    }
+    retained.sort();
+    Ok(retained)
+}
+
+fn validate_cruft_pack(format: ObjectFormat, cruft: &CruftPack) -> Result<()> {
+    validate_pack_checksum(&cruft.pack, format, &cruft.checksum, "cruft pack")?;
+    let parsed_index = PackIndex::parse(&cruft.idx, format)?;
+    if parsed_index.pack_checksum != cruft.checksum
+        || !pack_index_entries_match_writer(&parsed_index.entries, &cruft.index_entries)
+    {
+        return Err(GitError::InvalidFormat(
+            "cruft pack index does not match pack contents".into(),
+        ));
+    }
+
+    let mut indexed_oids = parsed_index
+        .entries
+        .iter()
+        .map(|entry| entry.oid)
+        .collect::<Vec<_>>();
+    indexed_oids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let mut declared_oids = cruft.oids.clone();
+    declared_oids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    if declared_oids != indexed_oids {
+        return Err(GitError::InvalidFormat(
+            "cruft object list does not match pack index".into(),
+        ));
+    }
+
+    let reverse =
+        sley_pack::PackReverseIndex::parse(&cruft.rev, format, parsed_index.entries.len())?;
+    if reverse.pack_checksum != cruft.checksum {
+        return Err(GitError::InvalidFormat(
+            "cruft reverse index does not match pack checksum".into(),
+        ));
+    }
+    let mtimes = sley_pack::PackMtimes::parse(&cruft.mtimes, format, parsed_index.entries.len())?;
+    if mtimes.pack_checksum != cruft.checksum {
+        return Err(GitError::InvalidFormat(
+            "cruft mtimes does not match pack checksum".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cruft_repack_result(format: ObjectFormat, result: &CruftRepackResult) -> Result<()> {
+    if let Some(reachable) = result.reachable.as_ref() {
+        validate_pack_checksum(
+            &reachable.pack,
+            format,
+            &reachable.pack_checksum,
+            "reachable repack",
+        )?;
+        let parsed_index = PackIndex::parse(&reachable.idx, format)?;
+        if parsed_index.pack_checksum != reachable.pack_checksum
+            || !pack_index_entries_match_writer(&parsed_index.entries, &reachable.index_entries)
+        {
+            return Err(GitError::InvalidFormat(
+                "reachable repack index does not match pack contents".into(),
+            ));
+        }
+    }
+    for cruft in result
+        .cruft
+        .iter()
+        .chain(result.additional_cruft.iter())
+        .chain(result.expired.iter())
+    {
+        validate_cruft_pack(format, cruft)?;
+    }
+    Ok(())
+}
+
+/// Install an already-built cruft pack at a pack-file prefix such as
+/// `expired.git/objects/pack/pack`.
+///
+/// The bytes are self-contained, so this remains valid after the source
+/// repository's obsolete packs have been pruned.
+pub fn install_cruft_pack_at_prefix(
+    format: ObjectFormat,
+    cruft: &CruftPack,
+    prefix: &Path,
+) -> Result<PathBuf> {
+    validate_cruft_pack(format, cruft)?;
+    install_cruft_pack_at_prefix_validated(cruft, prefix)
+}
+
+fn install_cruft_pack_at_prefix_validated(cruft: &CruftPack, prefix: &Path) -> Result<PathBuf> {
+    let parent = prefix.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let base = prefix
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pack");
+    let stem = format!("{base}-{}", cruft.checksum.to_hex());
+    let pack_path = parent.join(format!("{stem}.pack"));
+    write_pack_component(&pack_path, &cruft.pack)?;
+    write_pack_component(&parent.join(format!("{stem}.rev")), &cruft.rev)?;
+    replace_pack_component(&parent.join(format!("{stem}.mtimes")), &cruft.mtimes)?;
+    write_pack_component(&parent.join(format!("{stem}.idx")), &cruft.idx)?;
+    Ok(pack_path)
 }
 
 /// Apply `--cruft-expiration` over the survivor map in place: starting from the
@@ -1714,6 +2318,33 @@ pub fn install_cruft_repack_result(
     result: &CruftRepackResult,
     prune: bool,
 ) -> Result<()> {
+    validate_cruft_repack_result(format, result)?;
+    install_cruft_repack_result_validated(git_dir, format, result, prune)
+}
+
+/// Install an optional expired-object backup before committing the source
+/// cruft repack. Every output is validated before either destination is
+/// mutated; a destination failure therefore leaves all source packs intact.
+pub fn install_cruft_repack_result_with_expire_to(
+    git_dir: &Path,
+    format: ObjectFormat,
+    result: &CruftRepackResult,
+    prune: bool,
+    expire_to: Option<&Path>,
+) -> Result<()> {
+    validate_cruft_repack_result(format, result)?;
+    if let (Some(prefix), Some(expired)) = (expire_to, result.expired.as_ref()) {
+        install_cruft_pack_at_prefix_validated(expired, prefix)?;
+    }
+    install_cruft_repack_result_validated(git_dir, format, result, prune)
+}
+
+fn install_cruft_repack_result_validated(
+    git_dir: &Path,
+    format: ObjectFormat,
+    result: &CruftRepackResult,
+    prune: bool,
+) -> Result<()> {
     let objects_dir = repository_objects_dir(git_dir);
     let pack_dir = objects_dir.join("pack");
     fs::create_dir_all(&pack_dir)?;
@@ -1723,10 +2354,12 @@ pub fn install_cruft_repack_result(
         .reachable
         .as_ref()
         .map(|r| format!("pack-{}.pack", r.pack_checksum.to_hex()));
-    let new_cruft_name = result
+    let new_cruft_names = result
         .cruft
-        .as_ref()
-        .map(|c| format!("pack-{}.pack", c.checksum.to_hex()));
+        .iter()
+        .chain(result.additional_cruft.iter())
+        .map(|cruft| format!("pack-{}.pack", cruft.checksum.to_hex()))
+        .collect::<HashSet<_>>();
 
     // Write the reachable pack (idx + rev + pack), content-addressed.
     if let Some(reachable) = result.reachable.as_ref() {
@@ -1743,7 +2376,7 @@ pub fn install_cruft_repack_result(
     }
 
     // Write the cruft pack (pack + rev + mtimes + idx).
-    if let Some(cruft) = result.cruft.as_ref() {
+    for cruft in result.cruft.iter().chain(result.additional_cruft.iter()) {
         let pack_name = format!("pack-{}", cruft.checksum.to_hex());
         write_pack_component(&pack_dir.join(format!("{pack_name}.pack")), &cruft.pack)?;
         write_pack_component(&pack_dir.join(format!("{pack_name}.rev")), &cruft.rev)?;
@@ -1766,7 +2399,7 @@ pub fn install_cruft_repack_result(
     if let Some(reachable) = result.reachable.as_ref() {
         present.extend(reachable.index_entries.iter().map(|e| e.oid));
     }
-    if let Some(cruft) = result.cruft.as_ref() {
+    for cruft in result.cruft.iter().chain(result.additional_cruft.iter()) {
         present.extend(cruft.oids.iter().copied());
     }
 
@@ -1778,7 +2411,9 @@ pub fn install_cruft_repack_result(
         .chain(result.obsolete_cruft_packs.iter())
     {
         let file_name = pack_path.file_name().and_then(|n| n.to_str());
-        if file_name == new_reachable_name.as_deref() || file_name == new_cruft_name.as_deref() {
+        if file_name == new_reachable_name.as_deref()
+            || file_name.is_some_and(|name| new_cruft_names.contains(name))
+        {
             continue;
         }
         if let Some(stem) = pack_path.file_stem().and_then(|s| s.to_str())
@@ -1833,6 +2468,354 @@ pub(crate) fn pack_index_entries_match_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_objects_dir(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let objects = std::env::temp_dir().join(format!(
+            "sley-cruft-{label}-{}-{nonce}/objects",
+            std::process::id()
+        ));
+        fs::create_dir_all(&objects).expect("create objects directory");
+        objects
+    }
+
+    fn pseudo_random_bytes(len: usize, mut seed: u32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(len);
+        for _ in 0..len {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            bytes.push((seed >> 24) as u8);
+        }
+        bytes
+    }
+
+    #[test]
+    fn size_limited_cruft_build_uses_encoded_size_and_allows_one_oversized_object() {
+        let objects_dir = test_objects_dir("size-limit");
+        let database = FileObjectDatabase::new(objects_dir.clone(), ObjectFormat::Sha1);
+        let first = database
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                vec![b'a'; 1024 * 1024],
+            ))
+            .expect("write first blob");
+        let second = database
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                vec![b'b'; 1024 * 1024],
+            ))
+            .expect("write second blob");
+        let survivors = HashMap::from([(first, 1_u32), (second, 2_u32)]);
+
+        let compressible = build_cruft_packs(
+            &database,
+            ObjectFormat::Sha1,
+            &survivors,
+            Some(1024 * 1024),
+            &PackWriteOptions::new(),
+        )
+        .expect("pack compressible cruft objects");
+        assert_eq!(compressible.len(), 1);
+        assert_eq!(compressible[0].oids.len(), 2);
+        assert!(compressible[0].pack.len() < 1024 * 1024);
+
+        let random_first = database
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                pseudo_random_bytes(700 * 1024, 11),
+            ))
+            .expect("write incompressible first blob");
+        let random_second = database
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                pseudo_random_bytes(700 * 1024, 29),
+            ))
+            .expect("write incompressible second blob");
+        let split = build_cruft_packs(
+            &database,
+            ObjectFormat::Sha1,
+            &HashMap::from([(random_first, 3_u32), (random_second, 4_u32)]),
+            Some(1024 * 1024),
+            &PackWriteOptions::new(),
+        )
+        .expect("split incompressible cruft objects");
+        assert_eq!(split.len(), 2);
+        assert!(
+            split
+                .iter()
+                .all(|pack| { pack.oids.len() == 1 && pack.pack.len() < 1024 * 1024 })
+        );
+
+        let oversized = database
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                pseudo_random_bytes(2 * 1024 * 1024, 47),
+            ))
+            .expect("write oversized blob");
+        let oversized_pack = build_cruft_packs(
+            &database,
+            ObjectFormat::Sha1,
+            &HashMap::from([(oversized, 5_u32)]),
+            Some(1024 * 1024),
+            &PackWriteOptions::new(),
+        )
+        .expect("pack one oversized cruft object");
+        assert_eq!(oversized_pack.len(), 1);
+        assert_eq!(oversized_pack[0].oids, vec![oversized]);
+        assert!(oversized_pack[0].pack.len() > 1024 * 1024);
+        fs::remove_dir_all(objects_dir.parent().expect("fixture root")).ok();
+    }
+
+    #[test]
+    fn cruft_build_applies_pack_window_to_delta_selection() {
+        let objects_dir = test_objects_dir("window");
+        let database = FileObjectDatabase::new(objects_dir.clone(), ObjectFormat::Sha1);
+        let mut seed = 0x1234_5678_u32;
+        let mut base = Vec::with_capacity(128 * 1024);
+        for _ in 0..128 * 1024 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            base.push((seed >> 24) as u8);
+        }
+        let mut survivors = HashMap::new();
+        for variant in 0..4_u8 {
+            let mut body = base.clone();
+            body[..32].fill(variant);
+            let oid = database
+                .write_object(EncodedObject::new(ObjectType::Blob, body))
+                .expect("write similar blob");
+            survivors.insert(oid, u32::from(variant) + 1);
+        }
+
+        let without_window = build_cruft_packs(
+            &database,
+            ObjectFormat::Sha1,
+            &survivors,
+            None,
+            &PackWriteOptions::new().with_window(0),
+        )
+        .expect("build cruft pack without delta candidates");
+        let with_window = build_cruft_packs(
+            &database,
+            ObjectFormat::Sha1,
+            &survivors,
+            None,
+            &PackWriteOptions::new().with_window(3),
+        )
+        .expect("build cruft pack with delta candidates");
+
+        assert_eq!(without_window.len(), 1);
+        assert_eq!(with_window.len(), 1);
+        assert!(
+            with_window[0].pack.len() < without_window[0].pack.len() / 2,
+            "delta window should materially reduce similar-object pack size"
+        );
+        fs::remove_dir_all(objects_dir.parent().expect("fixture root")).ok();
+    }
+
+    #[test]
+    fn selective_cruft_combination_retains_large_pack_and_rewrites_small_pack() {
+        let objects_dir = test_objects_dir("combine-selection");
+        let git_dir = objects_dir.parent().expect("fixture git directory");
+        let database = FileObjectDatabase::new(objects_dir.clone(), ObjectFormat::Sha1);
+        let small_oid = database
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                pseudo_random_bytes(32 * 1024, 1),
+            ))
+            .expect("write small blob");
+        let large_oid = database
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                pseudo_random_bytes(128 * 1024, 2),
+            ))
+            .expect("write large blob");
+        let small = build_cruft_pack(
+            &database,
+            ObjectFormat::Sha1,
+            &HashMap::from([(small_oid, 1_u32)]),
+        )
+        .expect("build small cruft pack")
+        .expect("small cruft output");
+        let large = build_cruft_pack(
+            &database,
+            ObjectFormat::Sha1,
+            &HashMap::from([(large_oid, 2_u32)]),
+        )
+        .expect("build large cruft pack")
+        .expect("large cruft output");
+        let prefix = objects_dir.join("pack/pack");
+        let small_path = install_cruft_pack_at_prefix(ObjectFormat::Sha1, &small, &prefix)
+            .expect("install small cruft pack");
+        let large_path = install_cruft_pack_at_prefix(ObjectFormat::Sha1, &large, &prefix)
+            .expect("install large cruft pack");
+        let small_size = fs::metadata(&small_path).expect("small metadata").len();
+        let large_size = fs::metadata(&large_path).expect("large metadata").len();
+        assert!(small_size < large_size);
+        let threshold = small_size + (large_size - small_size) / 2;
+
+        let result = repack_cruft_with_pack_options(
+            git_dir,
+            ObjectFormat::Sha1,
+            &[],
+            None,
+            &RepackOptions::default(),
+            &CruftPackOptions {
+                combine_cruft_below_size: Some(threshold),
+                ..CruftPackOptions::default()
+            },
+        )
+        .expect("selective cruft repack");
+
+        assert_eq!(
+            result.cruft.as_ref().map(|pack| pack.oids.as_slice()),
+            Some([small_oid].as_slice())
+        );
+        assert!(result.obsolete_cruft_packs.contains(&small_path));
+        assert!(!result.obsolete_cruft_packs.contains(&large_path));
+        fs::remove_dir_all(git_dir).ok();
+    }
+
+    fn one_blob_cruft(objects_dir: &Path, body: &[u8]) -> CruftPack {
+        let database = FileObjectDatabase::new(objects_dir.to_path_buf(), ObjectFormat::Sha1);
+        let oid = database
+            .write_object(EncodedObject::new(ObjectType::Blob, body.to_vec()))
+            .expect("write cruft blob");
+        build_cruft_pack(
+            &database,
+            ObjectFormat::Sha1,
+            &HashMap::from([(oid, 123_u32)]),
+        )
+        .expect("build cruft output")
+        .expect("non-empty cruft output")
+    }
+
+    #[test]
+    fn cruft_prefix_installer_validates_every_component_before_mutation() {
+        let objects_dir = test_objects_dir("prevalidate-prefix");
+        let root = objects_dir.parent().expect("fixture root");
+        let valid = one_blob_cruft(&objects_dir, b"validated cruft\n");
+        let mut invalid = Vec::new();
+
+        let mut bad_pack = valid.clone();
+        bad_pack.pack[12] ^= 1;
+        invalid.push(("pack", bad_pack));
+        let mut bad_index = valid.clone();
+        let last = bad_index.idx.len() - 1;
+        bad_index.idx[last] ^= 1;
+        invalid.push(("index", bad_index));
+        let mut bad_reverse = valid.clone();
+        let last = bad_reverse.rev.len() - 1;
+        bad_reverse.rev[last] ^= 1;
+        invalid.push(("reverse", bad_reverse));
+        let mut bad_mtimes = valid.clone();
+        let last = bad_mtimes.mtimes.len() - 1;
+        bad_mtimes.mtimes[last] ^= 1;
+        invalid.push(("mtimes", bad_mtimes));
+        let mut bad_oids = valid.clone();
+        bad_oids.oids.clear();
+        invalid.push(("oids", bad_oids));
+
+        for (label, cruft) in invalid {
+            let destination = root.join(format!("invalid-{label}"));
+            let error =
+                install_cruft_pack_at_prefix(ObjectFormat::Sha1, &cruft, &destination.join("pack"))
+                    .expect_err("invalid cruft output must be rejected");
+            assert!(!error.to_string().is_empty());
+            assert!(
+                !destination.exists(),
+                "validation must precede destination creation for {label}"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn expire_to_failure_leaves_source_pack_intact() {
+        let objects_dir = test_objects_dir("expire-to-order");
+        let git_dir = objects_dir.parent().expect("fixture git directory");
+        let pack_dir = objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir).expect("create source pack directory");
+        let obsolete = pack_dir.join("pack-obsolete.pack");
+        fs::write(&obsolete, b"source must survive destination failure")
+            .expect("write source marker");
+        let cruft = one_blob_cruft(&objects_dir, b"expired backup\n");
+        let result = CruftRepackResult {
+            reachable: None,
+            cruft: None,
+            additional_cruft: Vec::new(),
+            expired: Some(cruft),
+            obsolete_packs: vec![obsolete.clone()],
+            obsolete_cruft_packs: Vec::new(),
+            retained_pack_stems: Vec::new(),
+        };
+        let blocked_parent = git_dir.join("blocked");
+        fs::write(&blocked_parent, b"not a directory").expect("write blocked destination");
+
+        install_cruft_repack_result_with_expire_to(
+            git_dir,
+            ObjectFormat::Sha1,
+            &result,
+            true,
+            Some(&blocked_parent.join("pack")),
+        )
+        .expect_err("destination failure must abort before source prune");
+        assert!(obsolete.is_file());
+        fs::remove_dir_all(git_dir).ok();
+    }
+
+    #[test]
+    fn invalid_cruft_result_does_not_prune_source_pack() {
+        let objects_dir = test_objects_dir("prevalidate-source-prune");
+        let git_dir = objects_dir.parent().expect("fixture git directory");
+        let pack_dir = objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir).expect("create source pack directory");
+        let obsolete = pack_dir.join("pack-obsolete.pack");
+        fs::write(&obsolete, b"source marker").expect("write source marker");
+        let mut cruft = one_blob_cruft(&objects_dir, b"invalid replacement\n");
+        cruft.rev.pop();
+        let result = CruftRepackResult {
+            reachable: None,
+            cruft: Some(cruft),
+            additional_cruft: Vec::new(),
+            expired: None,
+            obsolete_packs: vec![obsolete.clone()],
+            obsolete_cruft_packs: Vec::new(),
+            retained_pack_stems: Vec::new(),
+        };
+
+        install_cruft_repack_result(git_dir, ObjectFormat::Sha1, &result, true)
+            .expect_err("invalid replacement must abort before prune");
+        assert!(obsolete.is_file());
+        fs::remove_dir_all(git_dir).ok();
+    }
+
+    #[test]
+    fn incremental_repack_ignores_only_missing_roots() {
+        let objects_dir = test_objects_dir("incremental-stale-root");
+        let git_dir = objects_dir.parent().expect("fixture git directory");
+        let database = FileObjectDatabase::new(objects_dir.clone(), ObjectFormat::Sha1);
+        let present = database
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"reachable loose\n".to_vec(),
+            ))
+            .expect("write reachable loose object");
+        let missing = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("missing root oid");
+
+        let result =
+            repack_reachable_loose_objects(git_dir, ObjectFormat::Sha1, &[missing, present])
+                .expect("stale roots are ignored")
+                .expect("reachable loose pack");
+        assert_eq!(result.object_count, 1);
+        assert_eq!(result.index_entries[0].oid, present);
+        fs::remove_dir_all(git_dir).ok();
+    }
 
     #[test]
     fn bitmap_cache_does_not_retain_blob_bodies() {

@@ -34,16 +34,18 @@ use sley_protocol::{
     ReceivePackCommandStatus, ReceivePackFeatures, ReceivePackPushRequest,
     ReceivePackPushRequestHeader, ReceivePackReportStatus, ReceivePackRequest,
     ReceivePackUnpackStatus, RefAdvertisement, SideBandChannel, SideBandPacket, TransportHandshake,
-    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackPackfileResponse,
-    UploadPackRawPackfileResponse, UploadPackRequest, apply_receive_pack_push_request,
-    build_upload_pack_raw_packfile_response, classify_protocol_v2_command_request,
-    encode_protocol_v2_fetch_capability, encode_protocol_v2_ls_refs_capability,
-    encode_receive_pack_features, encode_upload_pack_features, read_protocol_v2_command_request,
+    UploadPackAckStatus, UploadPackAcknowledgment, UploadPackFeatures,
+    UploadPackNegotiationRequest, UploadPackPackfileResponse, UploadPackRawPackfileResponse,
+    UploadPackRequest, apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
+    classify_protocol_v2_command_request, encode_protocol_v2_fetch_capability,
+    encode_protocol_v2_ls_refs_capability, encode_receive_pack_features,
+    encode_upload_pack_features, read_protocol_v2_command_request, read_upload_pack_acknowledgment,
     read_upload_pack_negotiation_request, read_upload_pack_request,
     validate_receive_pack_push_request_features, write_pkt_line_frame, write_pkt_line_payload,
     write_protocol_v2_advertisement, write_protocol_v2_fetch_request,
     write_protocol_v2_fetch_response, write_protocol_v2_ls_refs_response,
-    write_upload_pack_negotiation_request, write_upload_pack_request,
+    write_upload_pack_acknowledgment, write_upload_pack_negotiation_request,
+    write_upload_pack_request,
 };
 use sley_refs::{
     DeleteRef, FileRefStore, Ref, RefDeletePrecondition, RefPrecondition, RefTarget, ReflogEntry,
@@ -672,7 +674,45 @@ pub(crate) fn local_negotiation_have_oids(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<Vec<ObjectId>> {
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    local_negotiation_have_oids_stopping_at(git_dir, format, &HashSet::new())
+}
+
+/// Commit haves ordered like [`local_negotiation_have_oids`], but stop walking
+/// behind commits the remote advertised as ref tips. The advertisement is a
+/// promise that the server already has the tip and its reachable history, so
+/// sending ancestors of that tip only wastes negotiation lines. This mirrors
+/// fetch-pack's `mark_tips()` boundary for the default/consecutive negotiator.
+fn local_negotiation_have_oids_pruned_by_remote_tips(
+    git_dir: &Path,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<ObjectId>> {
+    let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format)
+        .with_promisor_remote_present(repo_has_promisor_remote(remote_git_dir));
+    let mut advertised_commits = HashSet::new();
+    for advertisement in local_fetch_advertisements(remote_git_dir, format)? {
+        // A corrupt advertisement is diagnosed later when its ref is wanted.
+        // It cannot establish a negotiation frontier because the server does
+        // not actually own the advertised object.
+        if !remote_db.contains(&advertisement.oid)? {
+            continue;
+        }
+        if let Some(commit) =
+            peel_to_commit_for_negotiation(&remote_db, format, &advertisement.oid)?
+        {
+            advertised_commits.insert(commit);
+        }
+    }
+    local_negotiation_have_oids_stopping_at(git_dir, format, &advertised_commits)
+}
+
+fn local_negotiation_have_oids_stopping_at(
+    git_dir: &Path,
+    format: ObjectFormat,
+    stop_commits: &HashSet<ObjectId>,
+) -> Result<Vec<ObjectId>> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format)
+        .with_promisor_remote_present(repo_has_promisor_remote(git_dir));
     let mut seen = HashSet::new();
     let mut queue = BinaryHeap::new();
     let commit_time = |oid: &ObjectId| -> Result<i64> {
@@ -683,7 +723,7 @@ pub(crate) fn local_negotiation_have_oids(
             .unwrap_or(0))
     };
     for advertisement in local_fetch_advertisements(git_dir, format)? {
-        if let Some(commit) = peel_to_commit(&db, format, &advertisement.oid)?
+        if let Some(commit) = peel_to_commit_for_negotiation(&db, format, &advertisement.oid)?
             && seen.insert(commit)
         {
             queue.push((commit_time(&commit)?, commit));
@@ -693,6 +733,9 @@ pub(crate) fn local_negotiation_have_oids(
     let mut haves = Vec::new();
     while let Some((_time, oid)) = queue.pop() {
         haves.push(oid);
+        if stop_commits.contains(&oid) {
+            continue;
+        }
         let object = db.read_object(&oid)?;
         for parent in
             sley_odb::grafted_parents(&db, &oid, Commit::parse_ref(format, &object.body)?.parents)
@@ -749,6 +792,30 @@ fn peel_to_commit<R: ObjectReader>(
     let mut oid = *oid;
     loop {
         let object = remote_db.read_object(&oid)?;
+        match object.object_type {
+            ObjectType::Commit => return Ok(Some(oid)),
+            ObjectType::Tag => oid = Tag::parse_ref(format, &object.body)?.object,
+            _ => return Ok(None),
+        }
+    }
+}
+
+/// Negotiation-frontier variant of [`peel_to_commit`]. An annotated tag may be
+/// present in a promisor pack while its filtered target is legitimately absent.
+/// Such a tag cannot establish a commit-have boundary, but it must not abort an
+/// unrelated branch fetch. Missing objects not proven promised remain errors.
+fn peel_to_commit_for_negotiation<R: ObjectReader>(
+    remote_db: &R,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Option<ObjectId>> {
+    let mut oid = *oid;
+    loop {
+        let object = match remote_db.read_object(&oid) {
+            Ok(object) => object,
+            Err(GitError::NotFound(_)) if remote_db.is_promised_object(&oid) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         match object.object_type {
             ObjectType::Commit => return Ok(Some(oid)),
             ObjectType::Tag => oid = Tag::parse_ref(format, &object.body)?.object,
@@ -1067,6 +1134,147 @@ pub fn compute_local_deepen_by_rev_list<R: ObjectReader>(
     })
 }
 
+const INITIAL_NEGOTIATION_BATCH: usize = 16;
+const MAX_IN_VAIN: usize = 256;
+
+#[derive(Debug, Default)]
+struct LocalNegotiationOutcome {
+    common_haves: Vec<ObjectId>,
+    total_rounds: usize,
+}
+
+/// Run the in-process transport through protocol-v2 fetch-pack's multi-round
+/// state. Haves are sent in exponentially growing batches; an ACK resets
+/// `in_vain`, and the client only gives up after 256 further haves once an ACK
+/// has been observed. Requests and responses round-trip through the upload-pack
+/// codecs, so trace data reflects the wire-driven state rather than a count
+/// inferred after the pack has already been selected.
+fn negotiate_local_upload_pack(
+    remote_db: &FileObjectDatabase,
+    format: ObjectFormat,
+    wants: &[ObjectId],
+    haves: Vec<ObjectId>,
+) -> Result<LocalNegotiationOutcome> {
+    let wanted_commits = wants
+        .iter()
+        .map(|want| {
+            if remote_db.contains(want)? {
+                peel_to_commit(remote_db, format, want)
+            } else {
+                // Preserve the fetch path's typed "requested missing object"
+                // diagnostic after negotiation; a corrupt advertisement cannot
+                // participate in readiness.
+                Ok(None)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut outcome = LocalNegotiationOutcome::default();
+    let mut next_have = 0usize;
+    let mut batch_size = INITIAL_NEGOTIATION_BATCH;
+    let mut in_vain = 0usize;
+    let mut seen_ack = false;
+    let mut common = HashSet::new();
+
+    loop {
+        outcome.total_rounds += 1;
+        let end = next_have.saturating_add(batch_size).min(haves.len());
+        let batch = haves[next_have..end].to_vec();
+        next_have = end;
+        in_vain = in_vain.saturating_add(batch.len());
+        let done = batch.is_empty() || (seen_ack && in_vain >= MAX_IN_VAIN);
+
+        let mut request_bytes = Vec::new();
+        write_upload_pack_negotiation_request(
+            &mut request_bytes,
+            &UploadPackNegotiationRequest { haves: batch, done },
+        )?;
+        let decoded = read_upload_pack_negotiation_request(format, &mut request_bytes.as_slice())?;
+        if decoded.done {
+            break;
+        }
+
+        let mut round_common = Vec::new();
+        for oid in &decoded.haves {
+            if remote_db.contains(oid)? && common.insert(*oid) {
+                round_common.push(*oid);
+            }
+        }
+        let ready = !round_common.is_empty()
+            && common_covers_wanted_commits(remote_db, format, &wanted_commits, &common)?;
+        let mut acknowledgments = if round_common.is_empty() {
+            vec![UploadPackAcknowledgment::Nak]
+        } else {
+            round_common
+                .iter()
+                .enumerate()
+                .map(|(index, oid)| UploadPackAcknowledgment::Ack {
+                    oid: *oid,
+                    status: Some(if ready && index + 1 == round_common.len() {
+                        UploadPackAckStatus::Ready
+                    } else {
+                        UploadPackAckStatus::Common
+                    }),
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut response_bytes = Vec::new();
+        for acknowledgment in &acknowledgments {
+            write_upload_pack_acknowledgment(&mut response_bytes, acknowledgment)?;
+        }
+        acknowledgments.clear();
+        let mut response = response_bytes.as_slice();
+        while !response.is_empty() {
+            acknowledgments.push(read_upload_pack_acknowledgment(format, &mut response)?);
+        }
+        let mut received_ready = false;
+        for acknowledgment in acknowledgments {
+            if let UploadPackAcknowledgment::Ack { oid, status } = acknowledgment {
+                seen_ack = true;
+                in_vain = 0;
+                outcome.common_haves.push(oid);
+                received_ready |= status == Some(UploadPackAckStatus::Ready);
+            }
+        }
+        if received_ready {
+            break;
+        }
+        batch_size = batch_size.saturating_mul(2);
+    }
+    Ok(outcome)
+}
+
+fn common_covers_wanted_commits(
+    remote_db: &FileObjectDatabase,
+    format: ObjectFormat,
+    wanted_commits: &[Option<ObjectId>],
+    common: &HashSet<ObjectId>,
+) -> Result<bool> {
+    for wanted in wanted_commits.iter().flatten() {
+        let mut stack = vec![*wanted];
+        let mut seen = HashSet::new();
+        let mut covered = false;
+        while let Some(oid) = stack.pop() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            if common.contains(&oid) {
+                covered = true;
+                break;
+            }
+            let object = remote_db.read_object(&oid)?;
+            stack.extend(sley_odb::grafted_parents(
+                remote_db,
+                &oid,
+                Commit::parse_ref(format, &object.body)?.parents,
+            ));
+        }
+        if !covered {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Fetch `wants` from a local repository at `remote_git_dir` into the repository
 /// at `git_dir`, round-tripping the request and response through the protocol
 /// codecs into the in-process upload-pack so the local path exercises the same
@@ -1142,7 +1350,26 @@ pub fn install_fetch_pack_via_local_upload_pack_with_promisor_decision(
         refetch,
         unpack_limit,
         promisor_decision,
+        LocalFetchPackRequestMode::ExactObjects,
     )
+    .map(|outcome| outcome.shallow_info)
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct LocalFetchPackOutcome {
+    pub shallow_info: Vec<ProtocolV2FetchShallowInfo>,
+    pub object_count: usize,
+    pub compression_count: usize,
+    pub delta_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LocalFetchPackRequestMode {
+    /// Traverse from the requested tips, applying any negotiated object filter.
+    Traversal,
+    /// Hydrate explicitly named objects, which must not be removed by the
+    /// repository's ordinary partial-clone traversal filter.
+    ExactObjects,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1160,9 +1387,10 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
     refetch: bool,
     unpack_limit: Option<usize>,
     promisor_decision: &crate::PromisorRemoteDecision,
-) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
+    request_mode: LocalFetchPackRequestMode,
+) -> Result<LocalFetchPackOutcome> {
     if wants.is_empty() {
-        return Ok(Vec::new());
+        return Ok(LocalFetchPackOutcome::default());
     }
     let local_db = FileObjectDatabase::from_git_dir(git_dir, format)
         .with_promisor_remote_present(repo_has_promisor_remote(git_dir));
@@ -1178,13 +1406,16 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
     };
     if all_wants_present && deepen_noop && !refetch {
         sley_protocol::trace_packet_write_payload(b"0000");
-        return Ok(Vec::new());
+        return Ok(LocalFetchPackOutcome::default());
     }
 
     // A lazy promisor request names the exact missing objects it needs. The
     // repository's partial-clone filter describes ordinary traversal, but it
     // must not remove an explicitly wanted blob from this direct response.
-    let direct_promisor_object_fetch = promisor && deepen.is_none() && !record_promisor_refs;
+    let direct_promisor_object_fetch = promisor
+        && deepen.is_none()
+        && !record_promisor_refs
+        && request_mode == LocalFetchPackRequestMode::ExactObjects;
     let transfer_filter = if direct_promisor_object_fetch {
         None
     } else {
@@ -1221,32 +1452,35 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
     if direct_promisor_object_fetch && local_upload_pack_client_wants_v2(git_dir) {
         trace_local_upload_pack_v2_capabilities(remote_git_dir, format);
     }
+    let use_default_haves = !refetch && !direct_promisor_object_fetch && custom_haves.is_none();
     let haves = if refetch || direct_promisor_object_fetch {
         Vec::new()
     } else if let Some(haves) = custom_haves {
         haves
     } else {
-        local_have_oids(git_dir, format)?
+        local_negotiation_have_oids_pruned_by_remote_tips(git_dir, remote_git_dir, format)?
     };
-    let negotiation = UploadPackNegotiationRequest { haves, done: true };
-    let mut encoded_negotiation = Vec::new();
-    write_upload_pack_negotiation_request(&mut encoded_negotiation, &negotiation)?;
-    let decoded_negotiation =
-        read_upload_pack_negotiation_request(format, &mut encoded_negotiation.as_slice())?;
-    sley_core::trace2::data("negotiation_v2", "total_rounds", 1);
-
     let remote_has_promisor = repo_has_promisor_remote(remote_git_dir);
     let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format)
         .with_promisor_remote_present(remote_has_promisor);
-    let known_haves = decoded_negotiation
-        .haves
-        .into_iter()
-        .filter_map(|oid| match remote_db.contains(&oid) {
-            Ok(true) => Some(Ok(oid)),
-            Ok(false) => None,
-            Err(err) => Some(Err(err)),
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let negotiation =
+        negotiate_local_upload_pack(&remote_db, format, &decoded_request.wants, haves)?;
+    sley_core::trace2::data("negotiation_v2", "total_rounds", negotiation.total_rounds);
+    let mut known_haves = negotiation.common_haves;
+    if use_default_haves {
+        // The local transport can cheaply retain the full destination-object
+        // exclusion set without putting every loose object on the simulated
+        // wire. The packet negotiation above stays commit-only and
+        // advertisement-pruned; this internal augmentation preserves support
+        // for fetching from an intentionally incomplete local repository when
+        // the destination already owns its missing delta/base objects.
+        let mut seen = known_haves.iter().copied().collect::<HashSet<_>>();
+        for oid in local_have_oids(git_dir, format)? {
+            if seen.insert(oid) && remote_db.contains(&oid)? {
+                known_haves.push(oid);
+            }
+        }
+    }
     // Trace2 `fetch-info` parity: upstream upload-pack emits a data_json
     // event the shallow tests grep for; the in-process server inherits the
     // client's GIT_TRACE2_EVENT just like a spawned upload-pack would.
@@ -1266,7 +1500,19 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
     let mut excluded = match deepen {
         Some(plan) => {
             let cut: HashSet<ObjectId> = plan.client_shallow.iter().copied().collect();
-            sley_odb::collect_reachable_object_ids_with_cut(&remote_db, format, known_haves, &cut)?
+            let mut excluded = sley_odb::collect_reachable_object_ids_with_cut(
+                &remote_db,
+                format,
+                known_haves,
+                &cut,
+            )?;
+            // A `shallow <oid>` request line also proves that the client owns
+            // the boundary commit itself. It only withholds knowledge of that
+            // commit's parents. Exclude the boundary object while retaining
+            // the cut so a deepen response can still send newly exposed
+            // history below it.
+            excluded.extend(plan.client_shallow.iter().copied());
+            excluded
         }
         None => {
             // The negotiated haves describe the client's object graph. A local
@@ -1282,6 +1528,19 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
     };
     let mut starts = decoded_request.wants;
     let promisor_ref_wants = starts.iter().copied().collect::<HashSet<_>>();
+    if deepen.is_some() {
+        // Deepening names the current tip again so upload-pack can plan the
+        // boundary, but a client that already owns that tip must not receive a
+        // duplicate loose copy. Newly exposed parents are added below through
+        // `extra_wants`; retain only genuinely missing primary tips here.
+        let mut missing_starts = Vec::with_capacity(starts.len());
+        for oid in starts {
+            if !local_db.contains(&oid)? {
+                missing_starts.push(oid);
+            }
+        }
+        starts = missing_starts;
+    }
     for want in &starts {
         excluded.remove(want);
     }
@@ -1320,7 +1579,7 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
     } else {
         ReachablePackThinBaseCandidates::default()
     };
-    let install = build_and_install_reachable_pack_filtered_with_thin_bases(
+    let transfer = build_and_install_reachable_pack_filtered_with_thin_bases(
         &remote_db,
         &destination_db,
         format,
@@ -1337,14 +1596,19 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
     )?;
     if promisor
         && record_promisor_refs
-        && let Some(result) = install
-        && let Some(promisor_path) = result.promisor_path
+        && let Some(result) = transfer.install.as_ref()
+        && let Some(promisor_path) = result.promisor_path.as_ref()
     {
-        append_promisor_ref_lines(&promisor_path, remote_git_dir, format, &promisor_ref_wants)?;
+        append_promisor_ref_lines(promisor_path, remote_git_dir, format, &promisor_ref_wants)?;
     }
-    Ok(deepen
-        .map(|plan| plan.shallow_info.clone())
-        .unwrap_or_default())
+    Ok(LocalFetchPackOutcome {
+        shallow_info: deepen
+            .map(|plan| plan.shallow_info.clone())
+            .unwrap_or_default(),
+        object_count: transfer.object_count,
+        compression_count: transfer.compression_count,
+        delta_count: transfer.delta_count,
+    })
 }
 
 /// Hydrate the requested object IDs from configured local/file promisor
@@ -1813,12 +2077,10 @@ fn trace2_fetch_info(
     }
     let filter_json = match filter {
         Some(sley_odb::PackObjectFilter::BlobNone) => "\"blob:none\"".to_string(),
-        Some(sley_odb::PackObjectFilter::BlobLimit(limit)) => {
-            format!("\"blob:limit={limit}\"")
-        }
-        Some(sley_odb::PackObjectFilter::TreeDepth(depth)) => {
-            format!("\"tree:{depth}\"")
-        }
+        // upload-pack's trace2 `fetch-info` records the filter choice name,
+        // not the normalized wire specification or its parameter.
+        Some(sley_odb::PackObjectFilter::BlobLimit(_)) => "\"blob:limit\"".to_string(),
+        Some(sley_odb::PackObjectFilter::TreeDepth(_)) => "\"tree\"".to_string(),
         Some(sley_odb::PackObjectFilter::SparsePathSet(_)) => "\"sparse:oid\"".to_string(),
         None => "null".to_string(),
     };
@@ -2387,6 +2649,326 @@ mod tests {
     use super::*;
     use sley_object::{BString, EncodedObject, Tree, TreeEntry};
     use sley_odb::ObjectWriter;
+
+    #[test]
+    fn filtered_clone_and_exact_checkout_hydration_install_separate_promisor_packs() {
+        for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+            let root = unique_local_test_dir("split-partial-clone");
+            let remote_git = root.join("remote.git");
+            let client_git = root.join("client.git");
+            for git_dir in [&remote_git, &client_git] {
+                fs::create_dir_all(git_dir.join("objects")).expect("test repository objects");
+                fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+                    .expect("test repository HEAD");
+            }
+            let remote_db = FileObjectDatabase::from_git_dir(&remote_git, format);
+            let blob = write_test_object(
+                &remote_db,
+                &EncodedObject::new(ObjectType::Blob, b"checkout payload\n".to_vec()),
+            );
+            let tree = write_test_object(&remote_db, &test_tree(&[(0o100644, b"file", blob)]));
+            let commit = write_test_object(&remote_db, &test_commit(tree, &[], b"tip\n"));
+
+            install_fetch_pack_via_local_upload_pack_with_promisor_decision_into(
+                &client_git,
+                &client_git,
+                &remote_git,
+                format,
+                vec![commit],
+                None,
+                true,
+                false,
+                Some(sley_odb::PackObjectFilter::BlobNone),
+                None,
+                false,
+                Some(1),
+                &crate::PromisorRemoteDecision::default(),
+                LocalFetchPackRequestMode::Traversal,
+            )
+            .expect("install filtered refs pack");
+            let client_db = FileObjectDatabase::from_git_dir(&client_git, format);
+            assert!(client_db.contains(&commit).expect("read filtered commit"));
+            assert!(client_db.contains(&tree).expect("read filtered tree"));
+            assert!(!client_db.contains(&blob).expect("check filtered blob"));
+
+            install_fetch_pack_via_local_upload_pack(
+                &client_git,
+                &remote_git,
+                format,
+                vec![blob],
+                None,
+                true,
+                false,
+                None,
+                None,
+                false,
+                Some(1),
+            )
+            .expect("install exact checkout blob pack");
+            assert!(client_db.contains(&blob).expect("read hydrated blob"));
+            let promisor_packs = fs::read_dir(client_git.join("objects/pack"))
+                .expect("read client packs")
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|ext| ext == "promisor")
+                })
+                .count();
+            assert_eq!(promisor_packs, 2);
+            fs::remove_dir_all(root).expect("remove test repositories");
+        }
+    }
+
+    #[test]
+    fn multi_round_negotiation_resets_in_vain_on_unrelated_ack() {
+        let git_dir = unique_local_test_dir("negotiation-in-vain-reset");
+        fs::create_dir_all(git_dir.join("objects")).expect("test repository objects");
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("test repository HEAD");
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let tree_oid = write_test_object(&db, &test_tree(&[]));
+        let side_common = write_test_object(&db, &test_commit(tree_oid, &[], b"side\n"));
+        let main_common = write_test_object(&db, &test_commit(tree_oid, &[], b"main\n"));
+        let want = write_test_object(&db, &test_commit(tree_oid, &[main_common], b"want\n"));
+
+        let missing = |value: usize| {
+            ObjectId::from_hex(format, &format!("{value:040x}")).expect("synthetic negotiation oid")
+        };
+        let mut haves = (1..=255).map(missing).collect::<Vec<_>>();
+        haves.push(side_common);
+        haves.extend((256..=510).map(missing));
+        haves.push(main_common);
+
+        let outcome = negotiate_local_upload_pack(&db, format, &[want], haves)
+            .expect("multi-round negotiation");
+        assert_eq!(outcome.total_rounds, 6);
+        assert_eq!(outcome.common_haves, vec![side_common, main_common]);
+
+        fs::remove_dir_all(git_dir).expect("remove test repository");
+    }
+
+    #[test]
+    fn multi_round_negotiation_does_not_give_up_before_first_ack() {
+        let git_dir = unique_local_test_dir("negotiation-first-ack");
+        fs::create_dir_all(git_dir.join("objects")).expect("test repository objects");
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("test repository HEAD");
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let tree_oid = write_test_object(&db, &test_tree(&[]));
+        let common = write_test_object(&db, &test_commit(tree_oid, &[], b"common\n"));
+        let want = write_test_object(&db, &test_commit(tree_oid, &[common], b"want\n"));
+        let mut haves = (1..=496)
+            .map(|value| {
+                ObjectId::from_hex(format, &format!("{value:040x}"))
+                    .expect("synthetic negotiation oid")
+            })
+            .collect::<Vec<_>>();
+        haves.push(common);
+
+        let outcome = negotiate_local_upload_pack(&db, format, &[want], haves)
+            .expect("multi-round negotiation");
+        assert_eq!(outcome.total_rounds, 6);
+        assert_eq!(outcome.common_haves, vec![common]);
+
+        fs::remove_dir_all(git_dir).expect("remove test repository");
+    }
+
+    #[test]
+    fn negotiation_haves_stop_behind_remote_advertised_commit_tips() {
+        let root = unique_local_test_dir("negotiation-advertised-tip");
+        let remote_git = root.join("remote.git");
+        let client_git = root.join("client.git");
+        for git_dir in [&remote_git, &client_git] {
+            fs::create_dir_all(git_dir.join("objects")).expect("test repository objects");
+            fs::create_dir_all(git_dir.join("refs/heads")).expect("test repository refs");
+            fs::create_dir_all(git_dir.join("refs/tags")).expect("test repository tags");
+            fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+                .expect("test repository HEAD");
+        }
+
+        let format = ObjectFormat::Sha1;
+        let client_db = FileObjectDatabase::from_git_dir(&client_git, format);
+        let remote_db = FileObjectDatabase::from_git_dir(&remote_git, format);
+        let tree = test_tree(&[]);
+        let tree_oid = write_test_object(&client_db, &tree);
+        write_test_object(&remote_db, &tree);
+        let root_commit = test_commit(tree_oid, &[], b"root\n");
+        let root_oid = write_test_object(&client_db, &root_commit);
+        write_test_object(&remote_db, &root_commit);
+        let common_commit = test_commit(tree_oid, &[root_oid], b"common\n");
+        let common_oid = write_test_object(&client_db, &common_commit);
+        write_test_object(&remote_db, &common_commit);
+        let client_commit = test_commit(tree_oid, &[common_oid], b"client\n");
+        let client_oid = write_test_object(&client_db, &client_commit);
+        let remote_commit = test_commit(tree_oid, &[common_oid], b"remote\n");
+        let remote_oid = write_test_object(&remote_db, &remote_commit);
+        fs::write(
+            client_git.join("refs/heads/main"),
+            format!("{client_oid}\n"),
+        )
+        .expect("client main ref");
+        fs::write(
+            client_git.join("refs/tags/common"),
+            format!("{common_oid}\n"),
+        )
+        .expect("client common tag");
+        fs::write(
+            remote_git.join("refs/heads/main"),
+            format!("{remote_oid}\n"),
+        )
+        .expect("remote main ref");
+        fs::write(
+            remote_git.join("refs/tags/common"),
+            format!("{common_oid}\n"),
+        )
+        .expect("remote common tag");
+
+        let haves =
+            local_negotiation_have_oids_pruned_by_remote_tips(&client_git, &remote_git, format)
+                .expect("plan negotiation haves");
+        assert!(haves.contains(&client_oid));
+        assert!(haves.contains(&common_oid));
+        assert!(!haves.contains(&root_oid));
+
+        fs::remove_dir_all(root).expect("remove test repositories");
+    }
+
+    #[test]
+    fn negotiation_ignores_advertised_tags_with_promised_missing_targets() {
+        for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+            let root = unique_local_test_dir("negotiation-promised-tag-target");
+            let source_git = root.join("source.git");
+            let remote_git = root.join("remote.git");
+            let client_git = root.join("client.git");
+            for git_dir in [&source_git, &remote_git, &client_git] {
+                fs::create_dir_all(git_dir.join("objects")).expect("test repository objects");
+                fs::create_dir_all(git_dir.join("refs/heads")).expect("test repository heads");
+                fs::create_dir_all(git_dir.join("refs/tags")).expect("test repository tags");
+                fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+                    .expect("test repository HEAD");
+            }
+
+            let source_db = FileObjectDatabase::from_git_dir(&source_git, format);
+            let promised_blob = write_test_object(
+                &source_db,
+                &EncodedObject::new(ObjectType::Blob, b"promised tag target\n".to_vec()),
+            );
+            let tree = write_test_object(&source_db, &test_tree(&[]));
+            let commit = write_test_object(&source_db, &test_commit(tree, &[], b"main\n"));
+            let tag = write_test_object(
+                &source_db,
+                &EncodedObject::new(
+                    ObjectType::Tag,
+                    Tag {
+                        object: promised_blob,
+                        object_type: ObjectType::Blob,
+                        name: b"promised-blob".to_vec(),
+                        tagger: None,
+                        message: b"promised blob tag\n".to_vec(),
+                        raw_body: None,
+                    }
+                    .write(),
+                ),
+            );
+
+            sley_odb::build_and_install_reachable_pack_filtered(
+                &source_db,
+                &FileObjectDatabase::from_git_dir(&remote_git, format),
+                format,
+                [commit, tag],
+                &HashSet::new(),
+                RawPackInstallOptions {
+                    promisor: true,
+                    ..Default::default()
+                },
+                Some(sley_odb::PackObjectFilter::BlobNone),
+                None,
+            )
+            .expect("build partial remote")
+            .expect("install partial remote pack");
+            sley_odb::build_and_install_reachable_pack_filtered(
+                &source_db,
+                &FileObjectDatabase::from_git_dir(&client_git, format),
+                format,
+                [tag],
+                &HashSet::new(),
+                RawPackInstallOptions {
+                    promisor: true,
+                    ..Default::default()
+                },
+                Some(sley_odb::PackObjectFilter::BlobNone),
+                None,
+            )
+            .expect("build partial client")
+            .expect("install partial client pack");
+            fs::write(
+                remote_git.join("config"),
+                b"[extensions]\n\tpartialClone = origin\n[remote \"origin\"]\n\tpromisor = true\n",
+            )
+            .expect("partial remote config");
+            fs::write(
+                client_git.join("config"),
+                b"[extensions]\n\tpartialClone = origin\n[remote \"origin\"]\n\tpromisor = true\n",
+            )
+            .expect("partial client config");
+            fs::write(remote_git.join("refs/heads/main"), format!("{commit}\n"))
+                .expect("remote main ref");
+            fs::write(
+                remote_git.join("refs/tags/promised-blob"),
+                format!("{tag}\n"),
+            )
+            .expect("remote tag ref");
+            fs::write(
+                client_git.join("refs/tags/promised-blob"),
+                format!("{tag}\n"),
+            )
+            .expect("client tag ref");
+
+            let remote_db = FileObjectDatabase::from_git_dir(&remote_git, format)
+                .with_promisor_remote_present(true);
+            assert!(remote_db.contains(&commit).expect("remote commit lookup"));
+            assert!(remote_db.contains(&tag).expect("remote tag lookup"));
+            assert!(
+                !remote_db
+                    .contains(&promised_blob)
+                    .expect("remote blob lookup")
+            );
+            assert!(remote_db.is_promised_object(&promised_blob));
+            let client_db = FileObjectDatabase::from_git_dir(&client_git, format)
+                .with_promisor_remote_present(true);
+            assert!(client_db.contains(&tag).expect("client tag lookup"));
+            assert!(
+                !client_db
+                    .contains(&promised_blob)
+                    .expect("client blob lookup")
+            );
+            assert!(client_db.is_promised_object(&promised_blob));
+
+            install_fetch_pack_via_local_upload_pack(
+                &client_git,
+                &remote_git,
+                format,
+                vec![commit],
+                None,
+                false,
+                false,
+                None,
+                None,
+                false,
+                None,
+            )
+            .expect("unrelated branch fetch ignores promised tag target");
+            assert!(
+                FileObjectDatabase::from_git_dir(&client_git, format)
+                    .contains(&commit)
+                    .expect("client commit lookup")
+            );
+
+            fs::remove_dir_all(root).expect("remove test repositories");
+        }
+    }
 
     #[test]
     fn receive_pack_advertises_no_thin_until_server_fixes_thin_packs() {

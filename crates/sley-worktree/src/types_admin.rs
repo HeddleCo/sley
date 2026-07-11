@@ -809,6 +809,17 @@ pub enum CheckoutConflictStyle {
     Diff3,
 }
 
+/// How an index-backed path checkout treats entries outside the sparse cone.
+///
+/// Git's default path checkout honors `CE_SKIP_WORKTREE`; the explicit
+/// `--ignore-skip-worktree-bits` mode selects those entries too and clears the
+/// bit when their worktree copies are materialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckoutIndexSparsePolicy {
+    Honor,
+    Ignore,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CheckoutIndexPathOptions<'a> {
     pub force: bool,
