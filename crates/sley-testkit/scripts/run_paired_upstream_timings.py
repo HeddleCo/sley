@@ -47,6 +47,7 @@ class ArtifactPaths:
     cells: Path
     details: Path
     history: Path
+    metadata: Path
     stdout: Path
     stderr: Path
 
@@ -74,6 +75,7 @@ class RunRecord:
     timings: str
     cells: str
     details: str
+    metadata: str
     stdout: str
     stderr: str
 
@@ -94,6 +96,7 @@ CONTROLLED_ENV = {
     "SLEY_DETAILS",
     "SLEY_DEFAULT_HASH",
     "SLEY_HISTORY",
+    "SLEY_METADATA",
     "SLEY_ORACLE_BIN",
     "SLEY_ORACLE_CELLS",
     "SLEY_ORACLE_DETAILS",
@@ -134,6 +137,7 @@ def artifact_paths(output_dir: Path, trial: int, target: str) -> ArtifactPaths:
         cells=root / "cells.csv",
         details=root / "details.csv",
         history=root / "history.csv",
+        metadata=root / "metadata.tsv",
         stdout=root / "stdout.txt",
         stderr=root / "stderr.txt",
     )
@@ -156,6 +160,7 @@ def build_run_spec(
         "SLEY_CELLS": str(artifacts.cells),
         "SLEY_DETAILS": str(artifacts.details),
         "SLEY_HISTORY": str(artifacts.history),
+        "SLEY_METADATA": str(artifacts.metadata),
     }
     if args.git_src_dir:
         env["GIT_SRC_DIR"] = str(args.git_src_dir)
@@ -224,6 +229,7 @@ def execute_spec(spec: RunSpec) -> RunRecord:
         spec.artifacts.timings,
         spec.artifacts.cells,
         spec.artifacts.details,
+        spec.artifacts.metadata,
     )
     missing = [path.name for path in required if not path.is_file()]
     if missing:
@@ -243,14 +249,56 @@ def execute_spec(spec: RunSpec) -> RunRecord:
         timings=str(spec.artifacts.timings),
         cells=str(spec.artifacts.cells),
         details=str(spec.artifacts.details),
+        metadata=str(spec.artifacts.metadata),
         stdout=str(spec.artifacts.stdout),
         stderr=str(spec.artifacts.stderr),
     )
 
 
+def load_run_metadata(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise DriverError(f"could not read run metadata {path}: {error}") from error
+    for line in lines:
+        key, separator, value = line.partition("\t")
+        if not separator or not key or key in values:
+            raise DriverError(f"invalid run metadata line in {path}: {line!r}")
+        values[key] = value
+    if values.get("schema") != "sley-upstream-run-metadata-v1":
+        raise DriverError(f"unsupported or missing run metadata schema: {path}")
+    return values
+
+
+def validate_trial_metadata(oracle_path: Path, sley_path: Path) -> None:
+    oracle = load_run_metadata(oracle_path)
+    sley = load_run_metadata(sley_path)
+    if oracle.get("target") != "oracle" or sley.get("target") != "sley":
+        raise DriverError("paired run metadata has incorrect target identity")
+    shared = (
+        "candidate_commit",
+        "candidate_tree_state",
+        "upstream_commit",
+        "upstream_tree_state",
+        "manifest_checksum",
+        "platform",
+        "architecture",
+        "hash",
+        "selection_count",
+        "selection_checksum",
+    )
+    mismatched = [key for key in shared if oracle.get(key) != sley.get(key)]
+    if mismatched:
+        raise DriverError(
+            "paired run metadata mismatch for " + ", ".join(mismatched)
+        )
+
+
 def analyze_trial(output_dir: Path, trial: int) -> TrialAnalysis:
     oracle_paths = artifact_paths(output_dir, trial, "oracle")
     sley_paths = artifact_paths(output_dir, trial, "sley")
+    validate_trial_metadata(oracle_paths.metadata, sley_paths.metadata)
     oracle = analyzer.load_run(oracle_paths.timings, oracle_paths.summary)
     sley = analyzer.load_run(sley_paths.timings, sley_paths.summary)
     oracle_cells = analyzer.load_cells(oracle_paths.cells)

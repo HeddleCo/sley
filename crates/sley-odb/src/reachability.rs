@@ -527,6 +527,27 @@ pub enum ReachablePackMissingPolicy {
     OmitPromised,
 }
 
+/// Optional client-owned objects that upload-pack may use as external delta
+/// bases while building a thin transfer pack.
+///
+/// The candidates are object ids from the negotiated have closure. They stay
+/// separate from `excluded`: exclusion controls which objects are sent, while
+/// this option controls which already-owned objects may participate in delta
+/// selection. Keeping those concerns explicit prevents a have from being sent
+/// merely so it can act as a base.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReachablePackThinBaseCandidates<'a> {
+    pub object_ids: Option<&'a HashSet<ObjectId>>,
+}
+
+impl<'a> ReachablePackThinBaseCandidates<'a> {
+    pub fn from_object_ids(object_ids: &'a HashSet<ObjectId>) -> Self {
+        Self {
+            object_ids: Some(object_ids),
+        }
+    }
+}
+
 /// [`build_and_install_reachable_pack`] with an optional partial-clone
 /// `filter`. With `Some(BlobNone)`, blobs are dropped from the pack unless
 /// they are directly wanted (named in `starts`).
@@ -664,6 +685,41 @@ where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
 {
+    build_and_install_reachable_pack_filtered_with_thin_bases(
+        source,
+        destination,
+        format,
+        starts,
+        excluded,
+        options,
+        filter,
+        unpack_limit,
+        missing_policy,
+        ReachablePackThinBaseCandidates::default(),
+    )
+}
+
+/// Build and install a filtered transfer pack, optionally considering objects
+/// from the client's negotiated have closure as external thin-pack bases.
+/// Candidate selection is bounded per object type and deterministic so a large
+/// client repository cannot turn delta planning into an unbounded comparison.
+#[allow(clippy::too_many_arguments)]
+pub fn build_and_install_reachable_pack_filtered_with_thin_bases<R, I>(
+    source: &R,
+    destination: &FileObjectDatabase,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    options: RawPackInstallOptions,
+    filter: Option<PackObjectFilter>,
+    unpack_limit: Option<usize>,
+    missing_policy: ReachablePackMissingPolicy,
+    thin_base_candidates: ReachablePackThinBaseCandidates<'_>,
+) -> Result<Option<PackInstallResult>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
     let starts: Vec<ObjectId> = starts.into_iter().collect();
     let wanted: HashSet<ObjectId> = starts.iter().copied().collect();
     let mut objects = match missing_policy {
@@ -692,6 +748,8 @@ where
         return Ok(None);
     }
     let inputs = pack_inputs(&objects);
+    let (thin_bases, preferred_thin_bases) =
+        select_reachable_pack_thin_bases(source, &objects, thin_base_candidates.object_ids)?;
     let pack_dir = destination.objects_dir.join("pack");
     fs::create_dir_all(&pack_dir)?;
     let temp_pack_path = unique_temp_path(&pack_dir);
@@ -700,10 +758,13 @@ where
             .write(true)
             .create_new(true)
             .open(&temp_pack_path)?;
+        let pack_options = PackWriteOptions::new()
+            .with_thin_bases(thin_bases)
+            .with_preferred_thin_bases(preferred_thin_bases);
         let summary = PackFile::write_packed_with_known_ids_to_writer(
             &inputs,
             format,
-            &PackWriteOptions::new(),
+            &pack_options,
             &mut file,
         )?;
         file.flush()?;
@@ -722,6 +783,133 @@ where
         let _ = fs::remove_file(&temp_pack_path);
     }
     result.map(Some)
+}
+
+/// Select only bases of deltas already stored by the source. This performs one
+/// metadata lookup per object being sent and never decodes the complete client
+/// have closure. Base bodies are decoded once per distinct reusable base.
+fn select_reachable_pack_thin_bases<R: ObjectReader>(
+    source: &R,
+    objects: &[ReachablePackObject],
+    candidate_ids: Option<&HashSet<ObjectId>>,
+) -> Result<(
+    HashMap<ObjectId, EncodedObject>,
+    HashMap<ObjectId, ObjectId>,
+)> {
+    let Some(candidate_ids) = candidate_ids else {
+        return Ok((HashMap::new(), HashMap::new()));
+    };
+    if candidate_ids.is_empty() || objects.is_empty() {
+        return Ok((HashMap::new(), HashMap::new()));
+    }
+
+    let mut bases = HashMap::new();
+    let mut preferred = HashMap::new();
+    for entry in objects {
+        let Some(base_oid) = source.reusable_delta_base(&entry.oid)? else {
+            continue;
+        };
+        if !candidate_ids.contains(&base_oid) {
+            continue;
+        }
+        if let std::collections::hash_map::Entry::Vacant(slot) = bases.entry(base_oid) {
+            slot.insert((*source.read_object(&base_oid)?).clone());
+        }
+        preferred.insert(entry.oid, base_oid);
+    }
+    Ok((bases, preferred))
+}
+
+#[cfg(test)]
+mod thin_base_tests {
+    use super::*;
+
+    #[test]
+    fn reachable_transfer_reuses_stored_client_owned_blob_base() {
+        for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+            let root = unique_temp_path(&env::temp_dir());
+            let source = FileObjectDatabase::new(root.join("source/objects"), format);
+            let destination = FileObjectDatabase::new(root.join("destination/objects"), format);
+
+            let base = EncodedObject::new(ObjectType::Blob, vec![b'a'; 16_384]);
+            let mut target_body = base.body.clone();
+            target_body[8_192..8_256].fill(b'b');
+            let target = EncodedObject::new(ObjectType::Blob, target_body);
+            let base_oid = base.object_id(format).expect("base oid");
+            let target_oid = target.object_id(format).expect("target oid");
+            let source_pack = PackFile::write_packed_with_options(
+                &[base.clone(), target.clone()],
+                format,
+                &PackWriteOptions::new().with_reorder(false),
+            )
+            .expect("write source pack");
+            source
+                .install_pack(&source_pack)
+                .expect("install source pack");
+            assert_eq!(
+                source
+                    .reusable_delta_base(&target_oid)
+                    .expect("read source delta metadata"),
+                Some(base_oid)
+            );
+            destination
+                .write_object(base)
+                .expect("client already owns base");
+
+            let candidates = HashSet::from([base_oid]);
+
+            let result = build_and_install_reachable_pack_filtered_with_thin_bases(
+                &source,
+                &destination,
+                format,
+                [target_oid],
+                &HashSet::new(),
+                RawPackInstallOptions::default(),
+                None,
+                Some(1),
+                ReachablePackMissingPolicy::RequireComplete,
+                ReachablePackThinBaseCandidates::from_object_ids(&candidates),
+            )
+            .expect("build thin transfer")
+            .expect("installed pack");
+
+            let index = PackIndex::parse(
+                &fs::read(&result.index_path).expect("read transfer index"),
+                format,
+            )
+            .expect("parse transfer index");
+            let target_offset = index
+                .entries
+                .iter()
+                .find(|entry| entry.oid == target_oid)
+                .expect("target index entry")
+                .offset as usize;
+            let pack = fs::read(&result.pack_path).expect("read transfer pack");
+            let first = pack[target_offset];
+            assert_eq!((first >> 4) & 0x07, 7, "target must be a ref-delta");
+            let mut base_offset = target_offset + 1;
+            let mut header_byte = first;
+            while header_byte & 0x80 != 0 {
+                header_byte = pack[base_offset];
+                base_offset += 1;
+            }
+            assert_eq!(
+                &pack[base_offset..base_offset + format.raw_len()],
+                base_oid.as_bytes(),
+                "thin delta should use the buried client-owned base"
+            );
+
+            destination.refresh_read_cache();
+            assert_eq!(
+                destination
+                    .read_object(&target_oid)
+                    .expect("read target through external pack base")
+                    .as_ref(),
+                &target
+            );
+            fs::remove_dir_all(root).expect("remove test repository");
+        }
+    }
 }
 
 fn trace_packfile_path(pack_path: &Path) -> Result<()> {
@@ -2895,6 +3083,26 @@ pub struct BitmapWalkResult {
     pub pseudo_merges_cascades: usize,
 }
 
+/// Strategy used to compute the bitmap closure of the receiver's `have` tips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BitmapHaveTraversal {
+    /// Traditional depth-first fill-in walk.
+    #[default]
+    Classic,
+    /// Find the first have-covered commits reached from wants, then fill only
+    /// those boundary tips instead of expanding unrelated have-side objects.
+    Boundary,
+}
+
+impl BitmapHaveTraversal {
+    fn trace_label(self) -> &'static str {
+        match self {
+            Self::Classic => "haves/classic",
+            Self::Boundary => "haves/boundary",
+        }
+    }
+}
+
 impl BitmapWalkResult {
     /// Removes everything reachable in `haves` from this result.
     pub fn subtract(&mut self, haves: &BitmapWalkResult) {
@@ -2903,6 +3111,26 @@ impl BitmapWalkResult {
         }
         let have_ext: HashSet<ObjectId> = haves.extended.iter().map(|(oid, _)| *oid).collect();
         self.extended.retain(|(oid, _)| !have_ext.contains(oid));
+    }
+
+    fn union(&mut self, other: &BitmapWalkResult) {
+        for (dst, src) in self.words.iter_mut().zip(other.words.iter()) {
+            *dst |= *src;
+        }
+        let mut seen = self
+            .extended
+            .iter()
+            .map(|(oid, _)| *oid)
+            .collect::<HashSet<_>>();
+        self.extended.extend(
+            other
+                .extended
+                .iter()
+                .filter(|(oid, _)| seen.insert(*oid))
+                .copied(),
+        );
+        self.pseudo_merges_satisfied += other.pseudo_merges_satisfied;
+        self.pseudo_merges_cascades += other.pseudo_merges_cascades;
     }
 }
 
@@ -2923,13 +3151,248 @@ pub fn bitmap_reachable(
     roots: &[ObjectId],
     include_objects: bool,
 ) -> Result<BitmapWalkResult> {
+    bitmap_reachable_fill(bitmap, db, format, roots, include_objects)
+}
+
+/// Compute wants minus haves using the selected have-side bitmap traversal.
+/// The trace2 region is emitted here, around real bitmap-engine work, so every
+/// transport/CLI consumer observes the same strategy decision.
+pub fn bitmap_reachable_excluding_haves(
+    bitmap: &LoadedPackBitmap,
+    db: &impl ObjectReader,
+    format: ObjectFormat,
+    want_roots: &[ObjectId],
+    have_roots: &[ObjectId],
+    include_objects: bool,
+    have_traversal: BitmapHaveTraversal,
+) -> Result<BitmapWalkResult> {
+    let mut result = bitmap_reachable(bitmap, db, format, want_roots, include_objects)?;
+    if have_roots.is_empty() {
+        return Ok(result);
+    }
+    sley_core::trace2::region("bitmap", have_traversal.trace_label());
+    let haves = match have_traversal {
+        BitmapHaveTraversal::Classic => {
+            bitmap_reachable(bitmap, db, format, have_roots, include_objects)?
+        }
+        BitmapHaveTraversal::Boundary => {
+            bitmap_boundary_haves(bitmap, db, format, want_roots, have_roots, include_objects)?.0
+        }
+    };
+    result.subtract(&haves);
+    Ok(result)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BitmapBoundaryStats {
+    have_commits_walked: usize,
+    want_commits_walked: usize,
+    boundary_tips_filled: usize,
+}
+
+/// Upstream `find_boundary_objects` shape: seed coverage from have roots with
+/// stored bitmaps, walk uncovered haves as commit metadata only, find the first
+/// have-covered commits reached from wants, and perform object fill-in solely
+/// from those boundary tips. Have-side branches that never intersect wants are
+/// never expanded into trees/blobs.
+fn bitmap_boundary_haves(
+    bitmap: &LoadedPackBitmap,
+    db: &impl ObjectReader,
+    format: ObjectFormat,
+    want_roots: &[ObjectId],
+    have_roots: &[ObjectId],
+    include_objects: bool,
+) -> Result<(BitmapWalkResult, BitmapBoundaryStats)> {
+    let mut base = BitmapWalkResult {
+        words: vec![0; bitmap.word_count()],
+        extended: Vec::new(),
+        pseudo_merges_satisfied: 0,
+        pseudo_merges_cascades: 0,
+    };
+    let mut stats = BitmapBoundaryStats::default();
+    let mut have_commits = HashSet::new();
+    let mut pending = have_roots.to_vec();
+    while let Some(oid) = pending.pop() {
+        if bitmap_result_contains(&base, bitmap, &oid) || !have_commits.insert(oid) {
+            continue;
+        }
+        let object = db.read_object(&oid)?;
+        if object.object_type != ObjectType::Commit {
+            // The boundary optimization is commit-specific. Preserve exact
+            // semantics for tag/tree/blob negative roots via classic fill.
+            return Ok((
+                bitmap_reachable(bitmap, db, format, have_roots, include_objects)?,
+                stats,
+            ));
+        }
+        if bitmap.bitmap_for_commit(&oid).is_some() {
+            let covered = bitmap_reachable(bitmap, db, format, &[oid], include_objects)?;
+            base.union(&covered);
+            continue;
+        }
+        stats.have_commits_walked += 1;
+        let commit = Commit::parse_ref(format, &object.body)?;
+        pending.extend(grafted_parents(db, &oid, commit.parents));
+    }
+
+    let mut boundary = Vec::new();
+    let mut seen_wants = HashSet::new();
+    let mut pending = want_roots.to_vec();
+    while let Some(oid) = pending.pop() {
+        if !seen_wants.insert(oid) {
+            continue;
+        }
+        if have_commits.contains(&oid) || bitmap_result_contains(&base, bitmap, &oid) {
+            boundary.push(oid);
+            continue;
+        }
+        let object = db.read_object(&oid)?;
+        if object.object_type != ObjectType::Commit {
+            return Ok((
+                bitmap_reachable(bitmap, db, format, have_roots, include_objects)?,
+                stats,
+            ));
+        }
+        stats.want_commits_walked += 1;
+        let commit = Commit::parse_ref(format, &object.body)?;
+        pending.extend(grafted_parents(db, &oid, commit.parents));
+    }
+
+    boundary.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    boundary.dedup();
+    boundary.retain(|oid| !bitmap_result_contains(&base, bitmap, oid));
+    stats.boundary_tips_filled = boundary.len();
+    if !boundary.is_empty() {
+        let fill = bitmap_reachable(bitmap, db, format, &boundary, include_objects)?;
+        base.union(&fill);
+    }
+    Ok((base, stats))
+}
+
+fn bitmap_result_contains(
+    result: &BitmapWalkResult,
+    bitmap: &LoadedPackBitmap,
+    oid: &ObjectId,
+) -> bool {
+    match bitmap.pack_position(oid) {
+        Some(position) => bitset_get(&result.words, position),
+        None => result
+            .extended
+            .iter()
+            .any(|(candidate, _)| candidate == oid),
+    }
+}
+
+#[cfg(test)]
+mod bitmap_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn boundary_haves_match_classic_while_filling_only_intersection_tip() {
+        for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+            let root = unique_temp_path(&env::temp_dir());
+            let db = FileObjectDatabase::new(root.join("objects"), format);
+            let tree = db
+                .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
+                .expect("write tree");
+            let base = write_commit(&db, format, tree, &[], b"base\n");
+            let shared = write_commit(&db, format, tree, &[base], b"shared\n");
+            let want = write_commit(&db, format, tree, &[shared], b"want\n");
+            let unrelated_have = write_commit(&db, format, tree, &[shared], b"have\n");
+            let bitmap = empty_loaded_bitmap();
+
+            let classic = bitmap_reachable_excluding_haves(
+                &bitmap,
+                &db,
+                format,
+                &[want],
+                &[unrelated_have],
+                true,
+                BitmapHaveTraversal::Classic,
+            )
+            .expect("classic have traversal");
+            let boundary = bitmap_reachable_excluding_haves(
+                &bitmap,
+                &db,
+                format,
+                &[want],
+                &[unrelated_have],
+                true,
+                BitmapHaveTraversal::Boundary,
+            )
+            .expect("boundary have traversal");
+            assert_eq!(object_set(&classic), object_set(&boundary));
+            assert_eq!(object_set(&boundary), HashSet::from([want]));
+
+            let (boundary_haves, stats) =
+                bitmap_boundary_haves(&bitmap, &db, format, &[want], &[unrelated_have], true)
+                    .expect("boundary have set");
+            assert_eq!(stats.have_commits_walked, 3);
+            assert_eq!(stats.want_commits_walked, 1);
+            assert_eq!(stats.boundary_tips_filled, 1);
+            let covered = object_set(&boundary_haves);
+            assert!(covered.contains(&shared));
+            assert!(covered.contains(&base));
+            assert!(!covered.contains(&unrelated_have));
+            fs::remove_dir_all(root).expect("remove test repository");
+        }
+    }
+
+    fn write_commit(
+        db: &FileObjectDatabase,
+        format: ObjectFormat,
+        tree: ObjectId,
+        parents: &[ObjectId],
+        message: &[u8],
+    ) -> ObjectId {
+        db.write_object(EncodedObject::new(
+            ObjectType::Commit,
+            Commit {
+                tree,
+                parents: parents.to_vec(),
+                author: b"A <a@example.com> 1 +0000".to_vec(),
+                committer: b"A <a@example.com> 1 +0000".to_vec(),
+                encoding: None,
+                message: message.to_vec(),
+            }
+            .write(),
+        ))
+        .unwrap_or_else(|error| panic!("write {format:?} commit: {error}"))
+    }
+
+    fn empty_loaded_bitmap() -> LoadedPackBitmap {
+        LoadedPackBitmap {
+            object_count: 0,
+            oid_to_pack: HashMap::new(),
+            pack_to_oid: Vec::new(),
+            commit_words: HashMap::new(),
+            pseudo_merges: Vec::new(),
+            commits: Vec::new(),
+            trees: Vec::new(),
+            blobs: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
+
+    fn object_set(result: &BitmapWalkResult) -> HashSet<ObjectId> {
+        result.extended.iter().map(|(oid, _)| *oid).collect()
+    }
+}
+
+fn bitmap_reachable_fill(
+    bitmap: &LoadedPackBitmap,
+    db: &impl ObjectReader,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    include_objects: bool,
+) -> Result<BitmapWalkResult> {
     let mut walk = BitmapFillWalk {
         bitmap,
         words: vec![0u64; bitmap.word_count()],
         extended: Vec::new(),
         extended_seen: HashSet::new(),
     };
-    let mut commit_stack: Vec<ObjectId> = Vec::new();
+    let mut commit_stack = Vec::new();
 
     for root in roots {
         let mut oid = *root;

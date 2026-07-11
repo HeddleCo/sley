@@ -1552,6 +1552,27 @@ impl FileObjectDatabase {
     }
 }
 impl ObjectReader for FileObjectDatabase {
+    fn reusable_delta_base(&self, oid: &ObjectId) -> Result<Option<ObjectId>> {
+        let Some(pack_lookup) = self.find_pack_containing(oid)? else {
+            return Ok(None);
+        };
+        let pack = pack_lookup.pack_bytes(self)?;
+        match pack_entry_delta_base(self.format, &pack, pack_lookup.offset)? {
+            Some(PackDeltaBase::Ref(base_oid)) => Ok(Some(base_oid)),
+            Some(PackDeltaBase::Offset(base_offset)) => {
+                let base_oid = self
+                    .pack_oid_at_offset(&pack_lookup, base_offset)?
+                    .ok_or_else(|| {
+                        GitError::InvalidFormat(format!(
+                            "ofs-delta base offset {base_offset} not found"
+                        ))
+                    })?;
+                Ok(Some(base_oid))
+            }
+            None => Ok(None),
+        }
+    }
+
     fn is_promised_object(&self, oid: &ObjectId) -> bool {
         // Gate on a configured promisor remote, exactly like git's
         // `is_promisor_object` (which short-circuits when

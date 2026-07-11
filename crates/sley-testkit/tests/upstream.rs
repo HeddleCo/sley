@@ -377,6 +377,59 @@ include\tt[0-9][0-9][0-9][0-9]-*.sh\toracle\toracle\teligible\tupstream-declared
     }
 
     #[test]
+    fn curated_manifest_filters_explicit_platform_and_hash_applicability() {
+        let fixture = Fixture::new();
+        let manifest = fixture.path("hash-applicability.tsv");
+        let other_platform = match std::env::consts::OS {
+            "windows" => "linux",
+            _ => "windows",
+        };
+        fs::write(
+            &manifest,
+            format!(
+                "# sley-upstream-manifest-v1\n\
+# expected_included=3\n\
+include\tt[0-9][0-9][0-9][0-9]-*.sh\toracle\toracle\teligible\tupstream-declared\tfixture\n\
+include\tt0002-gitfile.sh\toracle\tsha256\teligible\tupstream-declared\tsha256 only\n\
+include\tt0003-attributes.sh\t{other_platform}\toracle\teligible\tupstream-declared\tother platform only\n"
+            ),
+        )
+        .expect("write hash applicability manifest");
+
+        let list = |hash: &str| {
+            Command::new("sh")
+                .arg(runner())
+                .arg("--list-curated")
+                .env("SLEY_UPSTREAM_T", &fixture.upstream_t)
+                .env("SLEY_UPSTREAM_MANIFEST", &manifest)
+                .env("SLEY_DEFAULT_HASH", hash)
+                .output()
+                .expect("list curated fixture")
+        };
+        let sha1 = list("sha1");
+        assert!(
+            sha1.status.success(),
+            "{}",
+            String::from_utf8_lossy(&sha1.stderr)
+        );
+        let sha1 = String::from_utf8(sha1.stdout).expect("sha1 list utf8");
+        assert!(sha1.contains("t0001-init.sh"));
+        assert!(!sha1.contains("t0002-gitfile.sh"));
+        assert!(!sha1.contains("t0003-attributes.sh"));
+
+        let sha256 = list("sha256");
+        assert!(
+            sha256.status.success(),
+            "{}",
+            String::from_utf8_lossy(&sha256.stderr)
+        );
+        let sha256 = String::from_utf8(sha256.stdout).expect("sha256 list utf8");
+        assert!(sha256.contains("t0001-init.sh"));
+        assert!(sha256.contains("t0002-gitfile.sh"));
+        assert!(!sha256.contains("t0003-attributes.sh"));
+    }
+
+    #[test]
     fn classifies_tap_cells_and_compares_oracle_to_sley() {
         let fixture = Fixture::new();
         let oracle = fixture
@@ -562,6 +615,38 @@ include\tt[0-9][0-9][0-9][0-9]-*.sh\toracle\toracle\teligible\tupstream-declared
     }
 
     #[test]
+    fn serial_runner_writes_reconcilable_run_identity_metadata() {
+        let fixture = Fixture::new();
+        let metadata = fixture.path("artifacts/run-metadata.tsv");
+        let output = fixture
+            .command("sley", "metadata-fixture")
+            .arg("t0001-init.sh")
+            .env("SLEY_METADATA", &metadata)
+            .env("SLEY_RUN_LABEL", "metadata-fixture")
+            .env("SLEY_CANDIDATE_COMMIT", "candidate-test-commit")
+            .env("SLEY_DEFAULT_HASH", "sha256")
+            .output()
+            .expect("run metadata fixture");
+        assert!(
+            !output.status.success(),
+            "fixture has an intentional failure"
+        );
+        let metadata = fs::read_to_string(metadata).expect("read run metadata");
+        assert!(metadata.contains("schema\tsley-upstream-run-metadata-v1\n"));
+        assert!(metadata.contains("run_label\tmetadata-fixture\n"));
+        assert!(metadata.contains("target\tsley\n"));
+        assert!(metadata.contains("candidate_commit\tcandidate-test-commit\n"));
+        assert!(metadata.contains("candidate_tree_state\t"));
+        assert!(metadata.contains("hash\tsha256\n"));
+        assert!(metadata.contains("target_binary_checksum\t"));
+        assert!(metadata.contains("manifest_checksum\t"));
+        assert!(metadata.contains("upstream_tree_state\t"));
+        assert!(metadata.contains("platform\t"));
+        assert!(metadata.contains("selection_count\t1\n"));
+        assert!(metadata.contains("selection_checksum\t"));
+    }
+
+    #[test]
     fn sley_runner_passes_candidate_binary_into_http_cgi_environment() {
         let fixture = Fixture::new();
         let marker = fixture.path("httpd-probe.txt");
@@ -604,7 +689,9 @@ include\tt[0-9][0-9][0-9][0-9]-*.sh\toracle\toracle\teligible\tupstream-declared
             .env("SLEY_HISTORY", artifact_root.join("waves-history.csv"))
             .env("SLEY_TIMINGS", artifact_root.join("waves-timings.csv"))
             .env("SLEY_CELLS", artifact_root.join("waves-cells.csv"))
-            .env("SLEY_DETAILS", artifact_root.join("waves-details.csv"));
+            .env("SLEY_DETAILS", artifact_root.join("waves-details.csv"))
+            .env("SLEY_METADATA", artifact_root.join("waves-metadata.tsv"))
+            .env("SLEY_CANDIDATE_COMMIT", "wave-candidate");
         let output = command.output().expect("run wave fixture");
         assert!(!output.status.success());
 
@@ -615,5 +702,10 @@ include\tt[0-9][0-9][0-9][0-9]-*.sh\toracle\toracle\teligible\tupstream-declared
         assert_eq!(details.lines().count(), 3, "header plus two scripts");
         assert!(details.contains("sley,t0001-init.sh,FAIL"));
         assert!(details.contains("sley,t0002-gitfile.sh,ABORT"));
+        let metadata = fs::read_to_string(artifact_root.join("waves-metadata.tsv"))
+            .expect("read wave metadata");
+        assert!(metadata.contains("candidate_commit\twave-candidate\n"));
+        assert!(metadata.contains("target\tsley\n"));
+        assert!(metadata.contains("selection_count\t2\n"));
     }
 }

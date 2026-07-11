@@ -715,6 +715,83 @@ pub struct CheckoutChangeSummary {
     pub changes: Vec<sley_diff_merge::NameStatusEntry>,
 }
 
+/// Deterministic worker selection for checkout materialization.
+///
+/// A zero `worker_count` means the caller should stay sequential.  Otherwise
+/// exactly `worker_count` workers consume a shared queue; path-conflicting
+/// entries are serialized by the materializer while independent top-level
+/// paths may be written concurrently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParallelCheckoutPlan {
+    pub worker_count: usize,
+    pub item_count: usize,
+    pub threshold: usize,
+}
+
+/// One path that could not be restored during an otherwise partially
+/// successful index checkout.
+#[derive(Debug)]
+pub struct CheckoutPathFailure {
+    pub path: Vec<u8>,
+    pub error: GitError,
+}
+
+/// Typed result of a path checkout after every independent entry and delayed
+/// filter has had a chance to complete.
+#[derive(Debug)]
+pub struct CheckoutIndexPathOutcome {
+    pub restored: usize,
+    pub failures: Vec<CheckoutPathFailure>,
+}
+
+/// One independent blob/symlink checkout requested by an unpack-trees
+/// consumer. Gitlinks remain with the caller because recursive submodule
+/// movement has repository-level semantics beyond file materialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutMaterializationEntry {
+    pub path: Vec<u8>,
+    pub mode: u32,
+    pub oid: ObjectId,
+}
+
+/// Stat data produced by a completed checkout materialization batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutMaterializationOutcome {
+    pub stats: BTreeMap<Vec<u8>, Option<sley_unpack_trees::StatInfo>>,
+}
+
+impl ParallelCheckoutPlan {
+    pub fn from_config(config: &GitConfig, item_count: usize) -> Self {
+        let requested = config
+            .get("checkout", None, "workers")
+            .and_then(sley_config::parse_config_int)
+            .unwrap_or(1);
+        let threshold = config
+            .get("checkout", None, "thresholdForParallelism")
+            .and_then(sley_config::parse_config_int)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(100);
+        let available = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let requested = match requested {
+            0 => available,
+            value if value > 0 => usize::try_from(value).unwrap_or(usize::MAX),
+            _ => 1,
+        };
+        let worker_count = if requested > 1 && item_count >= threshold && item_count > 1 {
+            requested.min(item_count)
+        } else {
+            0
+        };
+        Self {
+            worker_count,
+            item_count,
+            threshold,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreResult {
     pub restored: usize,

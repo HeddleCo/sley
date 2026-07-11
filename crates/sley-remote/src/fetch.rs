@@ -1620,10 +1620,6 @@ fn finalize_fetch(
         validation,
         quarantine,
     } = finalize;
-    if options.dry_run {
-        outcome.ref_updates = std::mem::take(updates);
-        return Ok(());
-    }
     let main_db = FileObjectDatabase::from_git_dir(git_dir, format);
     let quarantine_db = quarantine
         .as_ref()
@@ -1637,6 +1633,10 @@ fn finalize_fetch(
     // tips against the destination object database.
     if let Some(incoming) = quarantine.take() {
         incoming.promote()?;
+    }
+    if options.dry_run {
+        outcome.ref_updates = std::mem::take(updates);
+        return Ok(());
     }
     drop_redundant_symref_alias_updates(store, updates)?;
     validate_fetch_ref_updates(git_dir, format, store, options.update_head_ok, updates)?;

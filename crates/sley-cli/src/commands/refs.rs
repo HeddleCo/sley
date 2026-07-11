@@ -909,7 +909,8 @@ fn expire_reflogs_at(
         };
         // A `--all`-discovered reflog that is empty is not an error.
         let target = (target_git_dir.clone(), reference.clone());
-        if all_discovered.contains(&target) && target_store.read_reflog(&reference)?.is_empty() {
+        let discovered = all_discovered.contains(&target);
+        if discovered && target_store.read_reflog_for_expiry(&reference)?.is_empty() {
             continue;
         }
         let mut target_options = options;
@@ -923,6 +924,7 @@ fn expire_reflogs_at(
             target_options,
             replace_objects,
             &mut context,
+            discovered,
         ) {
             exit_code = code;
         }
@@ -949,8 +951,13 @@ fn expire_reflog_entries(
     options: ReflogExpireOptions,
     replace_objects: bool,
     context: &mut ReflogExpireRunContext,
+    lenient: bool,
 ) -> Result<()> {
-    let mut entries = store.read_reflog(reference)?;
+    let mut entries = if lenient {
+        store.read_reflog_for_expiry(reference)?
+    } else {
+        store.read_reflog(reference)?
+    };
     if entries.is_empty() {
         eprintln!("error: reflog could not be found: '{reference}'");
         return Err(GitError::Exit(255));
@@ -1014,6 +1021,7 @@ fn expire_reflog_entries(
         return Ok(());
     }
     if retained.len() == entries.len() && !rewrote_old_oid {
+        store.adjust_reflog_permissions(reference)?;
         return Ok(());
     }
     let old_tip = entries.last().map(|entry| entry.new_oid);
@@ -1531,14 +1539,22 @@ pub(crate) fn cmd_update_ref(
     let identity_config = identity_effective_config_for(cli_session).unwrap_or_default();
     let core_fsync = global_config_value("core.fsync")?;
     let core_fsync_method = global_config_value("core.fsyncMethod")?;
-    let store = FileRefStore::new(&git_dir, format)
+    let prefer_symlink_refs = global_config_value("core.preferSymlinkRefs")?
+        .as_deref()
+        .and_then(sley_config::parse_config_bool)
+        .or_else(|| identity_config.get_bool("core", None, "preferSymlinkRefs"));
+    let mut store = FileRefStore::new(&git_dir, format)
         .with_reference_fsync_config(core_fsync.as_deref(), core_fsync_method.as_deref())
+        .with_packed_refs_lock_timeout_millis(packed_refs_lock_timeout_override()?)
         .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?)
         .with_reftable_write_options(reftable_write_options_override()?)
         // `update-ref` is a native ref transaction: its ref and reflog records
         // share one reftable update index. Other command families still opt in
         // independently while their combined-table parity is completed.
         .with_reftable_combined_logs(true);
+    if let Some(prefer_symlink_refs) = prefer_symlink_refs {
+        store = store.with_prefer_symlink_refs(prefer_symlink_refs);
+    }
     if stdin {
         if delete || !positional.is_empty() {
             return Err(GitError::Command(
@@ -1741,6 +1757,12 @@ fn update_ref_usage() -> Result<()> {
 
 fn reftable_lock_timeout_override() -> Result<Option<u64>> {
     Ok(global_config_value("reftable.lockTimeout")?.and_then(|value| value.parse::<u64>().ok()))
+}
+
+fn packed_refs_lock_timeout_override() -> Result<u64> {
+    Ok(global_config_value("core.packedRefsTimeout")?
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1_000))
 }
 
 fn reftable_write_options_override() -> Result<ReftableWriteOptions> {
@@ -2561,6 +2583,16 @@ fn parse_df_conflict_message(message: &str) -> Option<(String, String)> {
     Some((new_ref.to_string(), existing_ref.to_string()))
 }
 
+fn parse_non_empty_ref_directory_message(message: &str) -> Option<(String, String)> {
+    let rest = message.strip_prefix("cannot lock ref '")?;
+    let (new_ref, rest) = rest.split_once("': there is a non-empty directory '")?;
+    let (path, suffix) = rest.split_once("' blocking reference '")?;
+    suffix
+        .strip_suffix('\'')
+        .filter(|blocked| *blocked == new_ref)?;
+    Some((new_ref.to_string(), path.to_string()))
+}
+
 struct UpdateRefStdinTransaction {
     active: bool,
     explicit: bool,
@@ -2568,7 +2600,7 @@ struct UpdateRefStdinTransaction {
     closed: bool,
     applied: bool,
     originals: BTreeMap<String, Option<RefTarget>>,
-    ref_snapshot: Option<HashMap<String, RefTarget>>,
+    ref_snapshot: Option<sley_refs::RefReadSnapshot>,
     duplicate: Option<String>,
     duplicate_message: Option<String>,
     locks: Vec<PathBuf>,
@@ -2681,6 +2713,22 @@ impl UpdateRefStdinTransaction {
                     }
                     return update_ref_stdin_invalid_ref_format(name);
                 }
+                Err(GitError::InvalidFormat(message))
+                    if message.starts_with(&format!("reference {current} ")) =>
+                {
+                    eprintln!(
+                        "fatal: cannot lock ref '{requested}': unable to resolve reference '{current}': reference broken"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                Err(GitError::NotFound(sley::NotFoundKind::BrokenReference { name, .. }))
+                    if name == current =>
+                {
+                    eprintln!(
+                        "fatal: cannot lock ref '{requested}': unable to resolve reference '{current}': reference broken"
+                    );
+                    return Err(GitError::Exit(128));
+                }
                 Err(err) => return Err(err),
             }
         }
@@ -2702,18 +2750,19 @@ impl UpdateRefStdinTransaction {
             return store.read_ref(name);
         }
         if self.ref_snapshot.is_none() {
-            self.ref_snapshot = Some(
-                store
-                    .list_refs()?
-                    .into_iter()
-                    .map(|reference| (reference.name, reference.target))
-                    .collect(),
-            );
+            self.ref_snapshot = Some(store.read_snapshot_for_update()?);
         }
-        Ok(self
+        match self
             .ref_snapshot
             .as_ref()
-            .and_then(|snapshot| snapshot.get(name).cloned()))
+            .and_then(|snapshot| snapshot.get(name))
+        {
+            Some(sley_refs::RefReadSnapshotValue::Target(target)) => Ok(Some(target.clone())),
+            Some(sley_refs::RefReadSnapshotValue::Broken) => {
+                Err(GitError::broken_reference(name, ""))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Reshape a backend D/F-conflict error into the git-shaped `fatal:` exit-128
@@ -2735,6 +2784,12 @@ impl UpdateRefStdinTransaction {
         let GitError::Transaction(message) = &err else {
             return err;
         };
+        if let Some((new_ref, path)) = parse_non_empty_ref_directory_message(message) {
+            eprintln!(
+                "fatal: cannot lock ref '{requested}': there is a non-empty directory '{path}' blocking reference '{new_ref}'"
+            );
+            return GitError::Exit(128);
+        }
         // Backend message: "cannot lock ref '<new>': '<existing>' exists; cannot create '<new>'".
         let Some((new_ref, existing_ref)) = parse_df_conflict_message(message) else {
             return err;
@@ -2795,22 +2850,7 @@ impl UpdateRefStdinTransaction {
     }
 
     fn original_ref(&mut self, store: &FileRefStore, name: &str) -> Result<Option<RefTarget>> {
-        if name == "HEAD" || !name.starts_with("refs/") {
-            return store.read_ref(name);
-        }
-        if self.ref_snapshot.is_none() {
-            self.ref_snapshot = Some(
-                store
-                    .list_refs()?
-                    .into_iter()
-                    .map(|reference| (reference.name, reference.target))
-                    .collect(),
-            );
-        }
-        Ok(self
-            .ref_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.get(name).cloned()))
+        self.read_ref_for_deref(store, name)
     }
 
     fn is_prepared(&self) -> bool {
@@ -3394,6 +3434,14 @@ fn update_ref_stdin_commit_staged(
     staged: Vec<UpdateRefStdinStagedChange>,
     run_hooks: bool,
 ) -> Result<()> {
+    let warn_symlink_refs = context.store.prefers_symlink_refs()
+        && staged.iter().any(|change| {
+            matches!(
+                change,
+                UpdateRefStdinStagedChange::SymrefCreate(_)
+                    | UpdateRefStdinStagedChange::SymrefUpdate(_)
+            )
+        });
     let zero = zero_oid(context.format)?;
     let hook = ReferenceTransactionHookRunner::new(context.git_dir);
     let mut tx = context.store.transaction();
@@ -3500,7 +3548,7 @@ fn update_ref_stdin_commit_staged(
             }
             UpdateRefStdinStagedChange::SymrefCreate(create) => {
                 requested_by_name.insert(create.name.clone(), create.name.clone());
-                validate_ref_name(&create.name)?;
+                sley_refs::validate_ref_name_for_update(&create.name)?;
                 if let Some(current) = context.store.read_ref(&create.name)? {
                     return match current {
                         RefTarget::Symbolic(_) => {
@@ -3519,7 +3567,7 @@ fn update_ref_stdin_commit_staged(
             }
             UpdateRefStdinStagedChange::SymrefUpdate(update) => {
                 requested_by_name.insert(update.name.clone(), update.requested.clone());
-                validate_ref_name(&update.name)?;
+                sley_refs::validate_ref_name_for_update(&update.name)?;
                 let current =
                     update_ref_stdin_current_target(context, &current_refs, &update.name)?;
                 check_update_ref_stdin_symref_expected(
@@ -3544,7 +3592,7 @@ fn update_ref_stdin_commit_staged(
             }
             UpdateRefStdinStagedChange::SymrefDelete(delete) => {
                 requested_by_name.insert(delete.name.clone(), delete.name.clone());
-                validate_ref_name(&delete.name)?;
+                sley_refs::validate_ref_name_for_update(&delete.name)?;
                 let current =
                     update_ref_stdin_current_target(context, &current_refs, &delete.name)?;
                 if let Some(expected) = delete.expected.as_deref() {
@@ -3577,7 +3625,7 @@ fn update_ref_stdin_commit_staged(
             }
             UpdateRefStdinStagedChange::SymrefVerify(verify) => {
                 requested_by_name.insert(verify.name.clone(), verify.name.clone());
-                validate_ref_name(&verify.name)?;
+                sley_refs::validate_ref_name_for_update(&verify.name)?;
                 let current =
                     update_ref_stdin_current_target(context, &current_refs, &verify.name)?;
                 update_ref_stdin_symref_verify_current(
@@ -3588,9 +3636,17 @@ fn update_ref_stdin_commit_staged(
             }
         }
     }
-    match tx.commit() {
+    let result = match tx.commit() {
         Err(GitError::Transaction(message)) => {
-            if let Some((new_ref, existing_ref)) = parse_df_conflict_message(&message) {
+            if let Some((new_ref, path)) = parse_non_empty_ref_directory_message(&message) {
+                let requested = requested_by_name
+                    .get(&new_ref)
+                    .map(String::as_str)
+                    .unwrap_or(new_ref.as_str());
+                eprintln!(
+                    "fatal: cannot lock ref '{requested}': there is a non-empty directory '{path}' blocking reference '{new_ref}'"
+                );
+            } else if let Some((new_ref, existing_ref)) = parse_df_conflict_message(&message) {
                 let requested = requested_by_name
                     .get(&new_ref)
                     .map(String::as_str)
@@ -3604,7 +3660,23 @@ fn update_ref_stdin_commit_staged(
             Err(GitError::Exit(128))
         }
         result => result,
+    };
+    if result.is_ok() && warn_symlink_refs {
+        warn_prefer_symlink_refs_deprecated();
     }
+    result
+}
+
+fn warn_prefer_symlink_refs_deprecated() {
+    eprintln!("warning: 'core.preferSymlinkRefs=true' is nominated for removal.");
+    eprintln!("hint: The use of symbolic links for symbolic refs is deprecated");
+    eprintln!("hint: and will be removed in Git 3.0. The configuration that");
+    eprintln!("hint: tells Git to use them is thus going away. You can unset");
+    eprintln!("hint: it with:");
+    eprintln!("hint:");
+    eprintln!("hint:\tgit config unset core.preferSymlinkRefs");
+    eprintln!("hint:");
+    eprintln!("hint: Git will then use the textual symref format instead.");
 }
 
 fn update_ref_stdin_bad_command(command: &str) -> Result<()> {
@@ -3668,7 +3740,7 @@ fn update_ref_stdin_symref_create(
     name: &str,
     target: &str,
 ) -> Result<()> {
-    validate_ref_name(name)?;
+    sley_refs::validate_ref_name_for_update(name)?;
     if let Some(current) = context.store.read_ref(name)? {
         return match current {
             RefTarget::Symbolic(_) => update_ref_stdin_symref_exists(name, true),
@@ -3699,7 +3771,7 @@ fn update_ref_stdin_symref_update(
     target: &str,
     expected: Option<UpdateRefStdinSymrefExpected>,
 ) -> Result<()> {
-    validate_ref_name(name)?;
+    sley_refs::validate_ref_name_for_update(name)?;
     match expected {
         Some(UpdateRefStdinSymrefExpected::Target(expected)) => {
             update_ref_stdin_symref_verify(context.store, name, Some(&expected))?;

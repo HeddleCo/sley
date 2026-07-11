@@ -389,6 +389,7 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
     let mut materialized_paths: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut collided_paths: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut index_entries = Vec::new();
+    let mut prepared_entries = Vec::new();
     let mut delayed_checkout = DelayedCheckoutQueue::default();
     for (path, entry) in &target_entries {
         if ignore_case {
@@ -404,22 +405,25 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
             }
             materialized_paths.push((folded, path.clone()));
         }
-        // Single type-by-mode materializer: gitlinks become a directory (mkdir,
-        // no blob read), symlinks (mode 120000) a real symlink to the raw blob
-        // bytes, and regular files the smudge-filtered content. Inlining the blob
-        // write here previously dropped the symlink arm and wrote the link target
-        // as a regular file — the whole symlink-checkout class.
-        index_entries.push(materialize_tree_entry_with_optional_smudge(
+        match prepare_checkout_entry(
             &db,
             format,
-            worktree_root,
             path,
             entry,
             smudge_config,
             attributes.as_ref(),
-            Some(&mut delayed_checkout),
-        )?);
+            &mut delayed_checkout,
+        )? {
+            PreparedCheckoutResult::Ready(prepared) => prepared_entries.push(prepared),
+            PreparedCheckoutResult::Delayed(entry) => index_entries.push(entry),
+        }
     }
+    let default_config = GitConfig::default();
+    index_entries.extend(materialize_prepared_checkout_entries(
+        worktree_root,
+        smudge_config.unwrap_or(&default_config),
+        prepared_entries,
+    )?);
     let mut delayed_updates = finish_delayed_checkout(worktree_root, delayed_checkout)?;
     for entry in &mut index_entries {
         if let Some(updated) = delayed_updates.remove(entry.path.as_bytes()) {
@@ -548,6 +552,327 @@ struct DelayedCheckoutEntry {
     entry: TrackedEntry,
 }
 
+struct PreparedCheckoutEntry {
+    path: Vec<u8>,
+    entry: TrackedEntry,
+    body: Option<Vec<u8>>,
+    index_template: Option<IndexEntry>,
+}
+
+enum PreparedCheckoutResult {
+    Ready(PreparedCheckoutEntry),
+    Delayed(IndexEntry),
+}
+
+fn prepare_checkout_entry(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    path: &[u8],
+    entry: &TrackedEntry,
+    smudge_config: Option<&GitConfig>,
+    attributes: Option<&AttributeMatcher>,
+    delayed: &mut DelayedCheckoutQueue,
+) -> Result<PreparedCheckoutResult> {
+    if sley_index::is_gitlink(entry.mode) {
+        return Ok(PreparedCheckoutResult::Ready(PreparedCheckoutEntry {
+            path: path.to_vec(),
+            entry: entry.clone(),
+            body: None,
+            index_template: None,
+        }));
+    }
+    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
+    let body = if (entry.mode & 0o170000) == 0o120000 {
+        object.body.clone()
+    } else if let (Some(config), Some(matcher)) = (smudge_config, attributes) {
+        let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
+        match apply_smudge_filter_with_attributes_maybe_delayed(
+            config,
+            &checks,
+            path,
+            &object.body,
+            format,
+            true,
+        )? {
+            SmudgeFilterResult::Content(body) => body.into_owned(),
+            SmudgeFilterResult::Delayed { process } => {
+                delayed.enqueue(process, path, entry);
+                return Ok(PreparedCheckoutResult::Delayed(unmaterialized_index_entry(
+                    path, entry,
+                )));
+            }
+        }
+    } else {
+        object.body.clone()
+    };
+    Ok(PreparedCheckoutResult::Ready(PreparedCheckoutEntry {
+        path: path.to_vec(),
+        entry: entry.clone(),
+        body: Some(body),
+        index_template: None,
+    }))
+}
+
+fn prepare_index_checkout_entry(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    entry: &IndexEntry,
+    smudge_config: Option<&GitConfig>,
+    stat_cache: Option<&IndexStatCache>,
+    delayed: &mut DelayedCheckoutQueue,
+) -> Result<Option<PreparedCheckoutResult>> {
+    if sley_index::is_gitlink(entry.mode) {
+        let dir_path = worktree_path(worktree_root, entry.path.as_bytes())?;
+        materialize_gitlink_dir(worktree_root, &dir_path)?;
+        return Ok(None);
+    }
+    let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
+    if let Some(stat_cache) = stat_cache
+        && let Ok(metadata) = fs::symlink_metadata(&file_path)
+        && stat_cache
+            .reuse_index_entry_for_checkout(entry, &metadata)
+            .is_some()
+    {
+        return Ok(None);
+    }
+    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
+    let body = match smudge_config {
+        Some(config) if (entry.mode & 0o170000) != 0o120000 => {
+            let checks = smudge_attribute_checks_from_index(
+                worktree_root,
+                git_dir,
+                format,
+                entry.path.as_bytes(),
+            )?;
+            match apply_smudge_filter_with_attributes_maybe_delayed(
+                config,
+                &checks,
+                entry.path.as_bytes(),
+                &object.body,
+                format,
+                true,
+            )? {
+                SmudgeFilterResult::Content(body) => body.into_owned(),
+                SmudgeFilterResult::Delayed { process } => {
+                    delayed.enqueue(
+                        process,
+                        entry.path.as_bytes(),
+                        &TrackedEntry {
+                            mode: entry.mode,
+                            oid: entry.oid,
+                        },
+                    );
+                    return Ok(Some(PreparedCheckoutResult::Delayed(
+                        unmaterialized_index_entry_from_index(entry),
+                    )));
+                }
+            }
+        }
+        _ => object.body.clone(),
+    };
+    Ok(Some(PreparedCheckoutResult::Ready(PreparedCheckoutEntry {
+        path: entry.path.as_bytes().to_vec(),
+        entry: TrackedEntry {
+            mode: entry.mode,
+            oid: entry.oid,
+        },
+        body: Some(body),
+        index_template: Some(entry.clone()),
+    })))
+}
+
+fn materialize_prepared_checkout_entry(
+    worktree_root: &Path,
+    prepared: PreparedCheckoutEntry,
+) -> Result<IndexEntry> {
+    let PreparedCheckoutEntry {
+        path,
+        entry,
+        body,
+        index_template,
+    } = prepared;
+    if sley_index::is_gitlink(entry.mode) {
+        let dir_path = worktree_path(worktree_root, &path)?;
+        materialize_gitlink_dir(worktree_root, &dir_path)?;
+        return Ok(index_template.unwrap_or_else(|| unmaterialized_index_entry(&path, &entry)));
+    }
+    let body = body.ok_or_else(|| {
+        GitError::InvalidFormat("checkout blob materialization had no body".into())
+    })?;
+    let file_path = worktree_path(worktree_root, &path)?;
+    prepare_blob_parent_dirs(worktree_root, &file_path)?;
+    remove_existing_worktree_path(&file_path)?;
+    write_blob_body_or_symlink(&file_path, entry.mode, &body, &body)?;
+    let metadata = fs::symlink_metadata(&file_path)?;
+    let mut index_entry = match index_template {
+        Some(template) => index_entry_with_refreshed_stat(&template, &metadata),
+        None => index_entry_from_metadata(path, entry.oid, &metadata),
+    };
+    index_entry.mode = entry.mode;
+    Ok(index_entry)
+}
+
+fn checkout_worker_collision_key(path: &[u8]) -> Vec<u8> {
+    path.split(|byte| *byte == b'/')
+        .next()
+        .unwrap_or(path)
+        .to_vec()
+}
+
+fn materialize_prepared_checkout_entries(
+    worktree_root: &Path,
+    config: &GitConfig,
+    prepared: Vec<PreparedCheckoutEntry>,
+) -> Result<Vec<IndexEntry>> {
+    let plan = ParallelCheckoutPlan::from_config(config, prepared.len());
+    if plan.worker_count == 0 {
+        return prepared
+            .into_iter()
+            .map(|entry| materialize_prepared_checkout_entry(worktree_root, entry))
+            .collect();
+    }
+
+    let mut lock_by_prefix = BTreeMap::new();
+    for entry in &prepared {
+        lock_by_prefix
+            .entry(checkout_worker_collision_key(&entry.path))
+            .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())));
+    }
+    let queue = std::sync::Arc::new(std::sync::Mutex::new(
+        prepared
+            .into_iter()
+            .enumerate()
+            .collect::<std::collections::VecDeque<_>>(),
+    ));
+    let results = std::sync::Arc::new(std::sync::Mutex::new(
+        (0..plan.item_count)
+            .map(|_| None)
+            .collect::<Vec<Option<Result<IndexEntry>>>>(),
+    ));
+    let locks = std::sync::Arc::new(lock_by_prefix);
+    let worker_argv = vec!["git".to_string(), "checkout--worker".to_string()];
+
+    std::thread::scope(|scope| {
+        for worker_id in 0..plan.worker_count {
+            sley_core::trace2::child_start_with_id("checkout", worker_id, &worker_argv);
+            let queue = std::sync::Arc::clone(&queue);
+            let results = std::sync::Arc::clone(&results);
+            let locks = std::sync::Arc::clone(&locks);
+            scope.spawn(move || {
+                loop {
+                    let next = queue
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .pop_front();
+                    let Some((position, entry)) = next else {
+                        break;
+                    };
+                    let prefix = checkout_worker_collision_key(&entry.path);
+                    let result = if let Some(path_lock) = locks.get(&prefix) {
+                        let _guard = path_lock
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        materialize_prepared_checkout_entry(worktree_root, entry)
+                    } else {
+                        materialize_prepared_checkout_entry(worktree_root, entry)
+                    };
+                    results
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())[position] = Some(result);
+                }
+            });
+        }
+    });
+
+    let mut results = results
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    results
+        .drain(..)
+        .map(|result| {
+            result.unwrap_or_else(|| {
+                Err(GitError::Transaction(
+                    "parallel checkout worker did not report a result".into(),
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Materialize an unpack-trees checkout batch through the shared worker queue.
+///
+/// Content conversion is resolved before workers start, so external filters
+/// remain single-session/sequential while independent filesystem writes run in
+/// parallel. Recursive gitlinks deliberately stay with the caller.
+pub fn materialize_checkout_entries_with_database(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    config: &GitConfig,
+    attributes: Option<&TreeAttributes>,
+    entries: &[CheckoutMaterializationEntry],
+) -> Result<CheckoutMaterializationOutcome> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let mut prepared = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if sley_index::is_gitlink(entry.mode) {
+            return Err(GitError::InvalidFormat(
+                "recursive gitlink passed to blob checkout materializer".into(),
+            ));
+        }
+        let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
+        let body = if (entry.mode & 0o170000) == 0o120000 {
+            object.body.clone()
+        } else {
+            match attributes {
+                Some(attributes) => {
+                    attributes.apply_smudge_filter(config, &entry.path, &object.body)?
+                }
+                None => apply_smudge_filter(
+                    worktree_root,
+                    git_dir,
+                    format,
+                    config,
+                    &entry.path,
+                    &object.body,
+                )?,
+            }
+        };
+        prepared.push(PreparedCheckoutEntry {
+            path: entry.path.clone(),
+            entry: TrackedEntry {
+                mode: entry.mode,
+                oid: entry.oid,
+            },
+            body: Some(body),
+            index_template: None,
+        });
+    }
+    let materialized = materialize_prepared_checkout_entries(worktree_root, config, prepared)?;
+    let stats = materialized
+        .into_iter()
+        .map(|entry| {
+            let stat = sley_unpack_trees::StatInfo {
+                ctime_seconds: entry.ctime_seconds,
+                ctime_nanoseconds: entry.ctime_nanoseconds,
+                mtime_seconds: entry.mtime_seconds,
+                mtime_nanoseconds: entry.mtime_nanoseconds,
+                dev: entry.dev,
+                ino: entry.ino,
+                uid: entry.uid,
+                gid: entry.gid,
+                size: entry.size,
+            };
+            (entry.path.into_bytes(), Some(stat))
+        })
+        .collect();
+    Ok(CheckoutMaterializationOutcome { stats })
+}
+
 impl DelayedCheckoutQueue {
     pub(crate) fn is_empty(&self) -> bool {
         self.pending.is_empty()
@@ -567,13 +892,35 @@ impl DelayedCheckoutQueue {
 
 pub(crate) fn finish_delayed_checkout(
     worktree_root: &Path,
-    mut delayed: DelayedCheckoutQueue,
+    delayed: DelayedCheckoutQueue,
 ) -> Result<BTreeMap<Vec<u8>, IndexEntry>> {
+    let outcome = finish_delayed_checkout_outcome(worktree_root, delayed)?;
+    if outcome.had_error {
+        return Err(GitError::Exit(1));
+    }
+    Ok(outcome.updates)
+}
+
+struct DelayedCheckoutFinishOutcome {
+    updates: BTreeMap<Vec<u8>, IndexEntry>,
+    failed_paths: Vec<Vec<u8>>,
+    had_error: bool,
+}
+
+fn finish_delayed_checkout_outcome(
+    worktree_root: &Path,
+    mut delayed: DelayedCheckoutQueue,
+) -> Result<DelayedCheckoutFinishOutcome> {
     if delayed.is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok(DelayedCheckoutFinishOutcome {
+            updates: BTreeMap::new(),
+            failed_paths: Vec::new(),
+            had_error: false,
+        });
     }
 
     let mut updates = BTreeMap::new();
+    let mut failed_paths = BTreeSet::new();
     let mut had_error = false;
     let mut active_filters = delayed.filters.iter().cloned().collect::<Vec<_>>();
     while !active_filters.is_empty() {
@@ -604,6 +951,7 @@ pub(crate) fn finish_delayed_checkout(
                         String::from_utf8_lossy(&path)
                     );
                     had_error = true;
+                    failed_paths.insert(path);
                     keep_filter = false;
                     continue;
                 };
@@ -614,6 +962,7 @@ pub(crate) fn finish_delayed_checkout(
                         String::from_utf8_lossy(&path)
                     );
                     had_error = true;
+                    failed_paths.insert(path);
                     keep_filter = false;
                     continue;
                 }
@@ -627,19 +976,29 @@ pub(crate) fn finish_delayed_checkout(
                     false,
                 ) {
                     Ok(ProcessFilterOutcome::Filtered(output)) => {
-                        let index_entry = write_delayed_checkout_output(
+                        match write_delayed_checkout_output(
                             worktree_root,
                             &path,
                             &delayed_entry.entry,
                             &output,
-                        )?;
-                        if let Some(index_entry) = index_entry {
-                            updates.insert(path, index_entry);
+                        ) {
+                            Ok(Some(index_entry)) => {
+                                updates.insert(path, index_entry);
+                            }
+                            Ok(None) => {
+                                failed_paths.insert(path);
+                                had_error = true;
+                            }
+                            Err(_) => {
+                                failed_paths.insert(path);
+                                had_error = true;
+                            }
                         }
                     }
                     Ok(ProcessFilterOutcome::Unsupported) => {
                         eprintln!("error: external filter '{}' failed", process);
                         had_error = true;
+                        failed_paths.insert(path);
                         keep_filter = false;
                     }
                     Ok(ProcessFilterOutcome::Status(status)) => {
@@ -648,6 +1007,7 @@ pub(crate) fn finish_delayed_checkout(
                             process
                         );
                         had_error = true;
+                        failed_paths.insert(path);
                         keep_filter = false;
                     }
                     Err(err) => {
@@ -655,6 +1015,7 @@ pub(crate) fn finish_delayed_checkout(
                             eprintln!("error: external filter '{}' failed", process);
                         }
                         had_error = true;
+                        failed_paths.insert(path);
                         keep_filter = false;
                     }
                 }
@@ -673,12 +1034,14 @@ pub(crate) fn finish_delayed_checkout(
             String::from_utf8_lossy(path)
         );
         had_error = true;
+        failed_paths.insert(path.clone());
     }
 
-    if had_error {
-        return Err(GitError::Exit(1));
-    }
-    Ok(updates)
+    Ok(DelayedCheckoutFinishOutcome {
+        updates,
+        failed_paths: failed_paths.into_iter().collect(),
+        had_error,
+    })
 }
 
 fn write_delayed_checkout_output(
@@ -1069,6 +1432,36 @@ pub fn checkout_index_paths_with_database(
     db: &FileObjectDatabase,
     options: CheckoutIndexPathOptions<'_>,
 ) -> Result<RestoreResult> {
+    let outcome = checkout_index_paths_with_database_outcome(
+        worktree_root,
+        git_dir,
+        format,
+        paths,
+        db,
+        options,
+    )?;
+    if let Some(failure) = outcome.failures.into_iter().next() {
+        return Err(failure.error);
+    }
+    Ok(RestoreResult {
+        restored: outcome.restored,
+    })
+}
+
+/// Restore all independently viable paths and retain per-path failures.
+///
+/// This is the path-checkout equivalent of Git's parallel-checkout result
+/// collection: one missing object does not prevent unrelated entries or
+/// delayed filters from finishing. Callers still decide how to render the
+/// successful count and which retained error determines their exit status.
+pub fn checkout_index_paths_with_database_outcome(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    db: &FileObjectDatabase,
+    options: CheckoutIndexPathOptions<'_>,
+) -> Result<CheckoutIndexPathOutcome> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -1096,6 +1489,9 @@ pub fn checkout_index_paths_with_database(
 
     let mut refreshed = BTreeMap::new();
     let mut restored = BTreeSet::new();
+    let mut prepared_entries = Vec::new();
+    let mut prepared_positions = BTreeMap::new();
+    let mut failures = Vec::new();
     let mut delayed_checkout = DelayedCheckoutQueue::default();
     for path in selected {
         let positions = index
@@ -1171,7 +1567,7 @@ pub fn checkout_index_paths_with_database(
         }
 
         if let Some(position) = stage0 {
-            if let Some(updated) = restore_index_entry_maybe_delayed(
+            let prepared = prepare_index_checkout_entry(
                 worktree_root,
                 git_dir,
                 format,
@@ -1179,15 +1575,44 @@ pub fn checkout_index_paths_with_database(
                 &index.entries[position],
                 options.smudge_config,
                 Some(&stat_cache),
-                Some(&mut delayed_checkout),
-            )? {
-                refreshed.insert(position, updated);
-                restored.insert(path);
+                &mut delayed_checkout,
+            );
+            match prepared {
+                Ok(Some(PreparedCheckoutResult::Ready(prepared))) => {
+                    prepared_positions.insert(prepared.path.clone(), position);
+                    prepared_entries.push(prepared);
+                    restored.insert(path);
+                }
+                Ok(Some(PreparedCheckoutResult::Delayed(entry))) => {
+                    refreshed.insert(position, entry);
+                }
+                Ok(None) => {}
+                Err(error) => failures.push(CheckoutPathFailure { path, error }),
             }
         }
     }
 
-    let mut delayed_updates = finish_delayed_checkout(worktree_root, delayed_checkout)?;
+    let default_config = GitConfig::default();
+    let materialized = materialize_prepared_checkout_entries(
+        worktree_root,
+        options.smudge_config.unwrap_or(&default_config),
+        prepared_entries,
+    )?;
+    for entry in materialized {
+        if let Some(position) = prepared_positions.get(entry.path.as_bytes()).copied() {
+            refreshed.insert(position, entry);
+        }
+    }
+
+    let mut delayed_finish = finish_delayed_checkout_outcome(worktree_root, delayed_checkout)?;
+    for path in delayed_finish.failed_paths {
+        failures.push(CheckoutPathFailure {
+            path,
+            error: GitError::Exit(1),
+        });
+    }
+    let mut delayed_updates = std::mem::take(&mut delayed_finish.updates);
+    restored.extend(delayed_updates.keys().cloned());
     for (position, entry) in index.entries.iter().enumerate() {
         if let Some(updated) = delayed_updates.remove(entry.path.as_bytes()) {
             refreshed.insert(position, updated);
@@ -1200,8 +1625,9 @@ pub fn checkout_index_paths_with_database(
     if !index.entries.is_empty() {
         write_repository_index_ref(git_dir, format, &index)?;
     }
-    Ok(RestoreResult {
+    Ok(CheckoutIndexPathOutcome {
         restored: restored.len(),
+        failures,
     })
 }
 
@@ -1986,7 +2412,7 @@ pub fn reset_index_and_worktree_to_commit(
         .as_ref()
         .map(|(spec, mode)| SparseMatcher::new(spec, *mode));
     refuse_if_current_working_directory_becomes_file(worktree_root, &target_entries)?;
-    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    let config = effective_worktree_config(git_dir, None).unwrap_or_default();
     let attributes = build_tree_attribute_matcher(worktree_root, &db, format, &commit.tree)?;
 
     // git's `reset --hard` runs a one-way merge through unpack-trees: EVERY path
@@ -2002,6 +2428,7 @@ pub fn reset_index_and_worktree_to_commit(
     }
 
     let mut index_entries = Vec::new();
+    let mut prepared_entries = Vec::new();
     let mut delayed_checkout = DelayedCheckoutQueue::default();
     for (path, entry) in &target_entries {
         if sparse_matcher
@@ -2019,18 +2446,25 @@ pub fn reset_index_and_worktree_to_commit(
             skipped.set_skip_worktree(true);
             index_entries.push(skipped);
         } else {
-            index_entries.push(materialize_tree_entry_with_optional_smudge(
+            match prepare_checkout_entry(
                 &db,
                 format,
-                worktree_root,
                 path,
                 entry,
                 Some(&config),
                 Some(&attributes),
-                Some(&mut delayed_checkout),
-            )?);
+                &mut delayed_checkout,
+            )? {
+                PreparedCheckoutResult::Ready(prepared) => prepared_entries.push(prepared),
+                PreparedCheckoutResult::Delayed(entry) => index_entries.push(entry),
+            }
         }
     }
+    index_entries.extend(materialize_prepared_checkout_entries(
+        worktree_root,
+        &config,
+        prepared_entries,
+    )?);
     let mut delayed_updates = finish_delayed_checkout(worktree_root, delayed_checkout)?;
     for entry in &mut index_entries {
         if let Some(updated) = delayed_updates.remove(entry.path.as_bytes()) {
@@ -2264,9 +2698,15 @@ pub(crate) fn prepare_blob_parent_dirs(worktree_root: &Path, file_path: &Path) -
         Some(parent) => parent,
         None => return Ok(()),
     };
-    // Fast path: parent already a directory (the overwhelmingly common case).
-    if parent.is_dir() {
-        return Ok(());
+    // Fast path: parent already is a directory (the overwhelmingly common
+    // case).  Do not use `Path::is_dir()` here: it follows a symlink.  A
+    // checkout of `D/file` with an untracked `D -> elsewhere` must replace the
+    // link with a real directory, never write through it into `elsewhere`.
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => return Ok(()),
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
     }
     // Collect the ancestor chain from worktree_root (exclusive) down to `parent`
     // (inclusive). We can't `create_dir_all` blindly because a non-directory may
@@ -3531,5 +3971,58 @@ mod sparse_index_expansion_tests {
         assert_eq!(index.entries[0].path.as_bytes(), b"outside/file");
         assert!(index.entries[0].is_skip_worktree());
         assert!(!index.is_sparse());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod checkout_parent_safety_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn preparing_blob_parent_replaces_symlink_instead_of_following_it() {
+        let root = tempfile::tempdir().expect("temporary worktree");
+        let outside = tempfile::tempdir().expect("outside directory");
+        symlink(outside.path(), root.path().join("D")).expect("leading symlink");
+
+        prepare_blob_parent_dirs(root.path(), &root.path().join("D/file"))
+            .expect("prepare real parent directory");
+
+        let metadata = fs::symlink_metadata(root.path().join("D")).expect("D metadata");
+        assert!(metadata.is_dir());
+        assert!(!metadata.file_type().is_symlink());
+        assert!(!outside.path().join("file").exists());
+    }
+
+    #[test]
+    fn parallel_materializer_uses_queue_and_serializes_shared_prefix() {
+        let root = tempfile::tempdir().expect("temporary worktree");
+        let outside = tempfile::tempdir().expect("outside directory");
+        symlink(outside.path(), root.path().join("D")).expect("leading symlink");
+        let config =
+            GitConfig::parse(b"[checkout]\n\tworkers = 2\n\tthresholdForParallelism = 0\n")
+                .expect("parallel checkout config");
+        let oid = ObjectId::null(ObjectFormat::Sha1);
+        let prepared = [b"D/A".as_slice(), b"D/B".as_slice()]
+            .into_iter()
+            .map(|path| PreparedCheckoutEntry {
+                path: path.to_vec(),
+                entry: TrackedEntry {
+                    mode: 0o100644,
+                    oid,
+                },
+                body: Some(path.to_vec()),
+                index_template: None,
+            })
+            .collect();
+
+        let entries = materialize_prepared_checkout_entries(root.path(), &config, prepared)
+            .expect("parallel materialization");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(fs::read(root.path().join("D/A")).expect("D/A"), b"D/A");
+        assert_eq!(fs::read(root.path().join("D/B")).expect("D/B"), b"D/B");
+        assert!(!outside.path().join("A").exists());
+        assert!(!outside.path().join("B").exists());
     }
 }

@@ -22,8 +22,8 @@ use sley_core::{
 use sley_object::{Commit, ObjectType, Tag};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, ReachablePackMissingPolicy,
-    build_and_install_reachable_pack,
-    build_and_install_reachable_pack_filtered_with_missing_policy, build_reachable_pack,
+    ReachablePackThinBaseCandidates, build_and_install_reachable_pack,
+    build_and_install_reachable_pack_filtered_with_thin_bases, build_reachable_pack,
     build_reachable_pack_filtered, collect_reachable_object_ids,
 };
 use sley_protocol::{
@@ -1310,7 +1310,17 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
     };
     let destination_db = FileObjectDatabase::from_git_dir(destination_git_dir, format)
         .with_promisor_remote_present(repo_has_promisor_remote(git_dir));
-    let install = build_and_install_reachable_pack_filtered_with_missing_policy(
+    // A bitmap-assisted server knows the complete client-have closure cheaply.
+    // Keep those objects excluded from the response, but expose a bounded set
+    // to pack generation as external bases so buried old blobs can be reused in
+    // a thin pack. Without bitmap traversal Git intentionally limits the have
+    // walk and does not discover those deep bases.
+    let thin_base_candidates = if local_upload_pack_uses_bitmaps(remote_git_dir) {
+        ReachablePackThinBaseCandidates::from_object_ids(&excluded)
+    } else {
+        ReachablePackThinBaseCandidates::default()
+    };
+    let install = build_and_install_reachable_pack_filtered_with_thin_bases(
         &remote_db,
         &destination_db,
         format,
@@ -1323,6 +1333,7 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
         transfer_filter,
         unpack_limit,
         missing_policy,
+        thin_base_candidates,
     )?;
     if promisor
         && record_promisor_refs
@@ -1665,6 +1676,20 @@ fn local_upload_pack_client_wants_v2(git_dir: &Path) -> bool {
         .and_then(|config| config.get("protocol", None, "version").map(str::to_string))
         .as_deref()
         == Some("2")
+}
+
+fn local_upload_pack_uses_bitmaps(git_dir: &Path) -> bool {
+    let configured = sley_config::read_repo_config(git_dir, None)
+        .ok()
+        .and_then(|config| config.get_bool("pack", None, "usebitmaps"));
+    configured.unwrap_or_else(|| {
+        fs::read_dir(git_dir.join("objects/pack"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "bitmap"))
+    })
 }
 
 fn repo_has_promisor_remote(git_dir: &Path) -> bool {

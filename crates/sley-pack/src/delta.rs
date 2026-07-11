@@ -313,12 +313,20 @@ pub(crate) fn plan_streaming_window_deltas(
         return (plan, order);
     }
 
+    let preferred_base_oids = options
+        .preferred_thin_bases
+        .values()
+        .copied()
+        .collect::<HashSet<_>>();
     let mut external_indexes: Vec<(ObjectId, ObjectType, DeltaIndex<'_>)> =
         Vec::with_capacity(options.thin_bases.len());
     let mut external_bases = options.thin_bases.iter().collect::<Vec<_>>();
     external_bases
         .sort_by(|(left_oid, _), (right_oid, _)| left_oid.as_bytes().cmp(right_oid.as_bytes()));
     for (oid, object) in external_bases {
+        if preferred_base_oids.contains(oid) {
+            continue;
+        }
         external_indexes.push((*oid, object.object_type, DeltaIndex::new(&object.body)));
     }
 
@@ -403,6 +411,28 @@ pub(crate) fn plan_streaming_window_deltas(
             if best_delta
                 .as_ref()
                 .is_none_or(|current| delta.len() < current.len())
+            {
+                best_delta = Some(delta);
+                best_base_depth = 0;
+                best_base = StreamingPlannedBase::External {
+                    base_oid: *base_oid,
+                    delta: Vec::new(),
+                };
+            }
+        }
+
+        // Reuse the server's existing delta relationship when its base is in
+        // the client's have closure. This intentionally overrides a dynamic
+        // in-pack choice: pack reuse avoids an all-pairs search and matches
+        // upload-pack's reuse-object behavior.
+        if let Some(base_oid) = options.preferred_thin_bases.get(&object_ids[idx])
+            && let Some(base) = options.thin_bases.get(base_oid)
+            && base.object_type == target_type
+        {
+            let base_index = DeltaIndex::new(&base.body);
+            if let Some(delta) = base_index
+                .delta(target)
+                .filter(|delta| delta_is_acceptable(delta, target.len()))
             {
                 best_delta = Some(delta);
                 best_base_depth = 0;
@@ -515,9 +545,17 @@ pub(crate) fn plan_pack_deltas(
 
     // Pre-build delta indexes for external thin-pack bases, grouped by type so
     // an object only compares against compatible bases.
+    let preferred_base_oids = options
+        .preferred_thin_bases
+        .values()
+        .copied()
+        .collect::<HashSet<_>>();
     let mut external_indexes: Vec<(ObjectId, ObjectType, DeltaIndex<'_>)> =
         Vec::with_capacity(options.thin_bases.len());
     for (oid, object) in &options.thin_bases {
+        if preferred_base_oids.contains(oid) {
+            continue;
+        }
         external_indexes.push((*oid, object.object_type, DeltaIndex::new(&object.body)));
     }
 
@@ -581,6 +619,26 @@ pub(crate) fn plan_pack_deltas(
             if best_delta
                 .as_ref()
                 .is_none_or(|current| delta.len() < current.len())
+            {
+                best_delta = Some(delta);
+                best_base = PlannedBase::External {
+                    base_oid: *base_oid,
+                    delta: Vec::new(),
+                };
+            }
+        }
+
+        // Prefer a reusable on-disk delta over dynamic window selection. The
+        // caller only supplies this mapping when the external base is known to
+        // be owned by the receiver.
+        if let Some(base_oid) = options.preferred_thin_bases.get(&object_ids[idx])
+            && let Some(base) = options.thin_bases.get(base_oid)
+            && base.object_type == target_type
+        {
+            let base_index = DeltaIndex::new(&base.body);
+            if let Some(delta) = base_index
+                .delta(target)
+                .filter(|delta| delta_is_acceptable(delta, target.len()))
             {
                 best_delta = Some(delta);
                 best_base = PlannedBase::External {

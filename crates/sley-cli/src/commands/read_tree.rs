@@ -591,6 +591,9 @@ struct ReadTreeWorktree<'a> {
     /// `is_submodule_active` resolution (`submodule.<name>.active` /
     /// `submodule.active` / `submodule.<name>.url`).
     repo_config: GitConfig,
+    /// Attribute stack from the target tree. Workers receive already-converted
+    /// bytes and never consult a concurrently changing worktree stack.
+    tree_attributes: Option<sley_worktree::TreeAttributes>,
     /// Which command's abort text the safety checks emit (git's
     /// `setup_unpack_trees_porcelain`). `read-tree` keeps its historic
     /// per-path messages; `checkout`/`switch` use the collected-path block.
@@ -859,6 +862,47 @@ impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
         )
     }
 
+    fn write_blobs(
+        &mut self,
+        entries: &[(Vec<u8>, u32, ObjectId)],
+    ) -> Result<Vec<Option<sley_unpack_trees::StatInfo>>> {
+        let ordinary = entries
+            .iter()
+            .filter(|(_, mode, _)| !sley_index::is_gitlink(*mode))
+            .map(
+                |(path, mode, oid)| sley_worktree::CheckoutMaterializationEntry {
+                    path: path.clone(),
+                    mode: *mode,
+                    oid: *oid,
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut ordinary_stats = sley_worktree::materialize_checkout_entries_with_database(
+            &self.worktree_root,
+            &self.git_dir,
+            self.format,
+            self.db,
+            &self.repo_config,
+            self.tree_attributes.as_ref(),
+            &ordinary,
+        )?
+        .stats;
+        entries
+            .iter()
+            .map(|(path, mode, oid)| {
+                if sley_index::is_gitlink(*mode) {
+                    return self.write_blob(path, *mode, oid);
+                }
+                ordinary_stats.remove(path).ok_or_else(|| {
+                    GitError::Transaction(format!(
+                        "checkout worker did not report path '{}'",
+                        String::from_utf8_lossy(path)
+                    ))
+                })
+            })
+            .collect()
+    }
+
     fn remove_path(&mut self, path: &[u8]) -> Result<()> {
         if self.recurse_submodules && self.path_is_configured_submodule(path) {
             return remove_submodule_worktree(&self.worktree_root, &self.git_dir, path);
@@ -929,9 +973,13 @@ pub(crate) fn checkout_two_way_engine(
     };
     let new_leaves = sley_diff_merge::flatten_tree(db, format, new_tree)?;
 
+    let repo_config = commands::remote::read_effective_repo_config(git_dir, worktree_root)?;
+    let tree_attributes =
+        sley_worktree::TreeAttributes::from_tree(worktree_root, git_dir, db, format, new_tree)?;
     let mut wt = ReadTreeWorktree {
         submodules: load_superproject_submodules(worktree_root),
-        repo_config: read_repo_config(git_dir).unwrap_or_default(),
+        repo_config,
+        tree_attributes: Some(tree_attributes),
         worktree_root: worktree_root.to_path_buf(),
         git_dir: git_dir.to_path_buf(),
         db,
@@ -1099,9 +1147,16 @@ fn merge_trees(
         .ok_or_else(|| {
             GitError::Unsupported("read-tree currently requires a non-bare worktree".into())
         })?;
+    let tree_attributes = tree_oids
+        .last()
+        .map(|tree| {
+            sley_worktree::TreeAttributes::from_tree(&worktree_root, git_dir, db, format, tree)
+        })
+        .transpose()?;
     let mut wt = ReadTreeWorktree {
         submodules: load_superproject_submodules(&worktree_root),
         repo_config: read_repo_config(git_dir).unwrap_or_default(),
+        tree_attributes,
         worktree_root,
         git_dir: git_dir.to_path_buf(),
         db,
@@ -1619,7 +1674,7 @@ fn gitlink_should_recurse(worktree_root: &Path, repo_config: &GitConfig, path: &
     is_submodule_active(repo_config, &submodule.name, path_str)
 }
 
-fn checkout_submodule_to_commit(
+pub(crate) fn checkout_submodule_to_commit(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -1636,7 +1691,17 @@ fn checkout_submodule_to_commit(
     }
     let (submodule_name, submodule_url) = submodule_name_and_url_for_path(worktree_root, &path_str)
         .unwrap_or_else(|| (path_str.to_string(), None));
-    let sub_git_dir = submodule_admin_git_dir(git_dir, &submodule_name);
+    let embedded_git_dir = sub_root.join(".git");
+    let admin_git_dir = submodule_admin_git_dir(git_dir, &submodule_name);
+    // Older/native-add repositories may still carry an embedded `.git`
+    // directory even when an admin copy also exists. Use that live repository
+    // directly; trying to replace the directory with a gitfile would fail with
+    // EISDIR and prevent recursive checkout from reaching the child engine.
+    let sub_git_dir = if embedded_git_dir.is_dir() {
+        embedded_git_dir.clone()
+    } else {
+        admin_git_dir
+    };
     if !sub_git_dir.is_dir() {
         if sub_root.join(".git").is_dir() {
             copy_dir_recursive(&sub_root.join(".git"), &sub_git_dir)?;
@@ -1652,7 +1717,9 @@ fn checkout_submodule_to_commit(
         remove_path_in_the_way(&sub_root)?;
     }
     fs::create_dir_all(&sub_root)?;
-    connect_submodule_worktree(&sub_root, &sub_git_dir)?;
+    if sub_git_dir != embedded_git_dir {
+        connect_submodule_worktree(&sub_root, &sub_git_dir)?;
+    }
 
     let sub_format = repository_object_format(&sub_git_dir).unwrap_or(format);
     if let Err(_err) =
@@ -1686,6 +1753,48 @@ fn checkout_submodule_to_commit(
                     &entry.oid,
                 )?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Reconcile populated submodules selected by a superproject path checkout.
+///
+/// The superproject index owns the target gitlink OID; each child uses the
+/// same worktree reset engine, including its configured materialization queue.
+pub(crate) fn checkout_submodules_for_paths(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+) -> Result<()> {
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok(());
+    };
+    let configured = load_superproject_submodules(worktree_root);
+    for entry in index.entries.into_iter().filter(|entry| {
+        entry.stage() == sley_index::Stage::Normal && sley_index::is_gitlink(entry.mode)
+    }) {
+        let git_path = entry.path.as_bytes();
+        let Ok(path_str) = std::str::from_utf8(git_path) else {
+            continue;
+        };
+        if configured
+            .as_ref()
+            .and_then(|set| set.from_path(path_str))
+            .is_none()
+        {
+            continue;
+        }
+        let full = worktree_root.join(path_str);
+        let selected = paths.iter().any(|requested| {
+            requested == worktree_root
+                || full == *requested
+                || full.starts_with(requested)
+                || requested.starts_with(&full)
+        });
+        if selected {
+            checkout_submodule_to_commit(worktree_root, git_dir, format, git_path, &entry.oid)?;
         }
     }
     Ok(())

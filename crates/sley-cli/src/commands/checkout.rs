@@ -25,7 +25,7 @@ impl CheckoutContext {
             GitError::Unsupported("checkout requires a repository worktree".into())
         })?;
         let format = repo.object_format();
-        let config = read_repo_config(&git_dir)?;
+        let config = commands::remote::read_effective_repo_config(&git_dir, cli_session.cwd())?;
         let refs = repo.references();
         Ok(Self {
             cwd: cli_session.cwd().to_path_buf(),
@@ -514,7 +514,7 @@ pub(crate) fn cmd_checkout(
                             _ => sley_worktree::CheckoutConflictStyle::Merge,
                         }
                     });
-                    let result = sley_worktree::checkout_index_paths_with_database(
+                    let outcome = sley_worktree::checkout_index_paths_with_database_outcome(
                         worktree_root,
                         &git_dir,
                         format,
@@ -529,9 +529,20 @@ pub(crate) fn cmd_checkout(
                             smudge_config: Some(config),
                         },
                     )?;
-                    if !quiet && dashdash_index.is_none() && result.restored > 0 {
-                        let suffix = if result.restored == 1 { "" } else { "s" };
-                        eprintln!("Updated {} path{} from the index", result.restored, suffix);
+                    if !quiet && dashdash_index.is_none() && outcome.restored > 0 {
+                        let suffix = if outcome.restored == 1 { "" } else { "s" };
+                        eprintln!("Updated {} path{} from the index", outcome.restored, suffix);
+                    }
+                    if recurse_submodules {
+                        commands::read_tree::checkout_submodules_for_paths(
+                            worktree_root,
+                            &git_dir,
+                            format,
+                            &resolved_paths,
+                        )?;
+                    }
+                    if let Some(failure) = outcome.failures.into_iter().next() {
+                        return Err(failure.error);
                     }
                 }
             }
@@ -546,8 +557,8 @@ pub(crate) fn cmd_checkout(
     // of upstream's test_commit_bulk): force-restore the index and working tree
     // to that commit without changing which branch HEAD is on, and stay silent on
     // success — exactly git's behavior when no branch switch happens.
-    if force && matches!(branch_mode, CheckoutBranchMode::Existing) && positional.len() == 1 {
-        let target = &positional[0];
+    if force && matches!(branch_mode, CheckoutBranchMode::Existing) && positional.len() <= 1 {
+        let target = positional.first().map(String::as_str).unwrap_or("HEAD");
         let head_commit = resolve_ref_peeled(store, "HEAD")?;
         if let Ok(target_oid) =
             checkout_resolve_start_oid(&git_dir, format, target, context.replace_objects)

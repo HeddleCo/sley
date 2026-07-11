@@ -46,6 +46,7 @@ cells=${SLEY_CELLS:-${summary%.csv}-cells.csv}
 details=${SLEY_DETAILS:-${summary%.csv}-details.csv}
 comparison=${SLEY_COMPARISON:-${summary%.csv}-comparison.csv}
 comparison_summary=${SLEY_COMPARISON_SUMMARY:-${comparison%.csv}-summary.csv}
+metadata=${SLEY_METADATA:-${summary%.csv}-metadata.tsv}
 run_label=${SLEY_RUN_LABEL:-}
 if [ -z "$run_label" ]; then
     run_label=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date 2>/dev/null || printf 'unknown')
@@ -54,10 +55,71 @@ fi
 # Artifact paths are frequently rooted in a fresh certification directory.
 # Create every parent before launching workers so a missing report directory
 # cannot start an expensive run whose merged outputs are impossible to write.
-for artifact in "$report" "$summary" "$history" "$timings" "$cells" "$details" "$comparison" "$comparison_summary"; do
+for artifact in "$report" "$summary" "$history" "$timings" "$cells" "$details" "$comparison" "$comparison_summary" "$metadata"; do
     artifact_parent=$(dirname -- "$artifact")
     mkdir -p "$artifact_parent" || die "could not create artifact directory: $artifact_parent"
 done
+
+metadata_value() {
+    printf '%s' "$1" | tr '\t\r\n' '   '
+}
+metadata_hash=${SLEY_DEFAULT_HASH:-${GIT_TEST_DEFAULT_HASH:-sha1}}
+metadata_uname=$(uname -s 2>/dev/null || printf unknown)
+case ${OS:-}:$metadata_uname in
+    *Windows*:* | *:MINGW* | *:MSYS* | *:CYGWIN*) metadata_platform=windows ;;
+    *:Darwin) metadata_platform=macos ;;
+    *:Linux) metadata_platform=linux ;;
+    *) metadata_platform=$(printf '%s' "$metadata_uname" | tr '[:upper:]' '[:lower:]') ;;
+esac
+metadata_upstream_t=${SLEY_UPSTREAM_T:-${GIT_SRC_DIR:+$GIT_SRC_DIR/t}}
+metadata_upstream_root=$(dirname -- "${metadata_upstream_t:-unknown/t}")
+metadata_upstream_commit=$(git -C "$metadata_upstream_root" rev-parse HEAD 2>/dev/null || printf unknown)
+metadata_candidate_commit=${SLEY_CANDIDATE_COMMIT:-$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || printf unknown)}
+if metadata_candidate_status=$(git -C "$repo_root" status --porcelain --untracked-files=normal 2>/dev/null); then
+    if [ -n "$metadata_candidate_status" ]; then metadata_candidate_tree_state=dirty; else metadata_candidate_tree_state=clean; fi
+else
+    metadata_candidate_tree_state=unknown
+fi
+if metadata_upstream_status=$(git -C "$metadata_upstream_root" status --porcelain --untracked-files=normal 2>/dev/null); then
+    if [ -n "$metadata_upstream_status" ]; then metadata_upstream_tree_state=dirty; else metadata_upstream_tree_state=clean; fi
+else
+    metadata_upstream_tree_state=unknown
+fi
+metadata_target=${SLEY_TEST_TARGET:-sley}
+if [ "$metadata_target" = "oracle" ]; then
+    metadata_binary=${SLEY_ORACLE_BIN:-${SLEY_TEST_GIT:-unknown}}
+else
+    metadata_binary=${SLEY_BIN:-unknown}
+fi
+metadata_version=$("$metadata_binary" --version 2>/dev/null | head -n 1 || true)
+metadata_binary_checksum=$(cksum "$metadata_binary" 2>/dev/null | awk '{ print $1 ":" $2; exit }')
+metadata_binary_checksum=${metadata_binary_checksum:-unknown}
+metadata_manifest=${SLEY_UPSTREAM_MANIFEST:-$testkit_dir/upstream-manifest.tsv}
+metadata_manifest_checksum=$(cksum "$metadata_manifest" 2>/dev/null | awk '{ print $1 ":" $2; exit }')
+metadata_manifest_checksum=${metadata_manifest_checksum:-unknown}
+metadata_arch=$(uname -m 2>/dev/null || printf unknown)
+metadata_selection_count=$(printf '%s\n' $selection | awk 'NF { count++ } END { print count + 0 }')
+metadata_selection_checksum=$(printf '%s\n' $selection | cksum | awk '{ print $1 ":" $2; exit }')
+{
+    printf 'schema\tsley-upstream-run-metadata-v1\n'
+    printf 'run_label\t%s\n' "$(metadata_value "$run_label")"
+    printf 'target\t%s\n' "$(metadata_value "$metadata_target")"
+    printf 'candidate_commit\t%s\n' "$(metadata_value "$metadata_candidate_commit")"
+    printf 'candidate_tree_state\t%s\n' "$(metadata_value "$metadata_candidate_tree_state")"
+    printf 'target_binary\t%s\n' "$(metadata_value "$metadata_binary")"
+    printf 'target_binary_checksum\t%s\n' "$(metadata_value "$metadata_binary_checksum")"
+    printf 'target_version\t%s\n' "$(metadata_value "$metadata_version")"
+    printf 'upstream_commit\t%s\n' "$(metadata_value "$metadata_upstream_commit")"
+    printf 'upstream_tree_state\t%s\n' "$(metadata_value "$metadata_upstream_tree_state")"
+    printf 'upstream_t\t%s\n' "$(metadata_value "$metadata_upstream_t")"
+    printf 'manifest\t%s\n' "$(metadata_value "$metadata_manifest")"
+    printf 'manifest_checksum\t%s\n' "$(metadata_value "$metadata_manifest_checksum")"
+    printf 'platform\t%s\n' "$(metadata_value "$metadata_platform")"
+    printf 'architecture\t%s\n' "$(metadata_value "$metadata_arch")"
+    printf 'hash\t%s\n' "$(metadata_value "$metadata_hash")"
+    printf 'selection_count\t%s\n' "$(metadata_value "$metadata_selection_count")"
+    printf 'selection_checksum\t%s\n' "$(metadata_value "$metadata_selection_checksum")"
+} > "$metadata"
 
 tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/sley-upstream-waves.XXXXXX") \
     || die "could not create temp wave root"
@@ -102,6 +164,7 @@ done
     printf 'selected scripts: %s\n' "$selected_count"
     printf 'per-script timeout: %ss\n' "$timeout_secs"
     printf 'serial runner: %s\n' "$runner"
+    printf 'metadata: %s\n' "$metadata"
     printf '\n'
 } > "$report"
 
@@ -131,6 +194,7 @@ while [ "$i" -le "$waves" ]; do
             export SLEY_TIMINGS="$tmp_root/wave-$i/timings.csv"
             export SLEY_CELLS="$tmp_root/wave-$i/cells.csv"
             export SLEY_DETAILS="$tmp_root/wave-$i/details.csv"
+            export SLEY_METADATA="$tmp_root/wave-$i/metadata.tsv"
             export SLEY_RUN_LABEL="$run_label-wave-$i"
             export SLEY_TEST_TIMEOUT="$timeout_secs"
             if [ -n "${SLEY_ORACLE_CELLS:-}" ]; then
@@ -244,6 +308,7 @@ log "Pass-rate history (appended): $history"
 log "Merged per-script timings: $timings"
 log "Merged exact TAP cells: $cells"
 log "Merged per-script classifications: $details"
+log "Run identity metadata: $metadata"
 if [ -n "${SLEY_ORACLE_CELLS:-}" ]; then
     log "Merged oracle/Sley cell comparison: $comparison"
     log "Merged oracle/Sley comparison summary: $comparison_summary"

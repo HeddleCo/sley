@@ -62,6 +62,14 @@ either target. A host that forbids loopback or local IPC is invalid rather than
 recording credential-cache, fsmonitor, ssh-agent, and protocol failures as
 semantic mismatches.
 
+Every serial or wave run writes a `*-metadata.tsv` identity sidecar recording
+the candidate commit and binary checksum, upstream commit, manifest checksum,
+platform/architecture, hash lane, target, version, and run label. Keep it with
+the CSV artifacts: results without matching identity metadata must not be
+combined into a parity or performance claim. Explicit manifest platform/hash
+applicability is applied while resolving the curated list; `oracle` continues
+to defer cell applicability to upstream Git's own prerequisite/SKIP rules.
+
 ## Upstream timing analysis
 
 Use [`scripts/analyze_upstream_timings.py`](scripts/analyze_upstream_timings.py)

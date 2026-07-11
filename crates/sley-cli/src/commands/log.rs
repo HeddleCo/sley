@@ -2379,6 +2379,12 @@ fn cmd_log_impl(
         },
     ) {
         Ok(setup) => setup,
+        Err(GitError::NotFound(sley::NotFoundKind::BrokenReference { name, .. }))
+            if name == "HEAD" =>
+        {
+            eprintln!("fatal: your current branch appears to be broken");
+            return Err(GitError::Exit(128));
+        }
         Err(err) if inserted_default_head => {
             if repository.resolve_revision("HEAD").is_err()
                 && let Some(branch) = log_unborn_head_branch(&git_dir)
@@ -2388,7 +2394,18 @@ fn cmd_log_impl(
             }
             return Err(err);
         }
-        Err(err) => return Err(err),
+        Err(err) => {
+            if matches!(
+                repository.resolve_revision("HEAD"),
+                Err(GitError::NotFound(
+                    sley::NotFoundKind::BrokenReference { .. }
+                ))
+            ) {
+                eprintln!("fatal: your current branch appears to be broken");
+                return Err(GitError::Exit(128));
+            }
+            return Err(err);
+        }
     };
     if let Some(leftover) = setup.leftovers.first() {
         return Err(GitError::Command(format!(

@@ -75,6 +75,10 @@
 #                       a git short-SHA or tag). Defaults to a UTC timestamp.
 #                       The library never reads a clock; pass this to make runs
 #                       reproducibly labelled.
+#   SLEY_METADATA       immutable run-identity sidecar (default:
+#                       <summary-base>-metadata.tsv). Records the candidate,
+#                       upstream, manifest, platform, hash, and binary identity
+#                       needed to reconcile artifacts from separate runs.
 #   SLEY_CELLS          exact per-cell CSV. Columns: target,script,cell,status,
 #                       raw_result,directive,description. Status is one of
 #                       PASS, FAIL, TODO, or SKIP.
@@ -169,6 +173,19 @@ die() { printf 'run-upstream-tests: %s\n' "$*" >&2; exit 1; }
 
 [ -f "$manifest" ] || die "curated manifest missing: $manifest"
 
+manifest_hash=${SLEY_DEFAULT_HASH:-${GIT_TEST_DEFAULT_HASH:-sha1}}
+case $manifest_hash in
+    sha1 | sha256) ;;
+    *) die "unsupported manifest hash lane: $manifest_hash" ;;
+esac
+manifest_uname=$(uname -s 2>/dev/null || printf unknown)
+case ${OS:-}:$manifest_uname in
+    *Windows*:* | *:MINGW* | *:MSYS* | *:CYGWIN*) manifest_platform=windows ;;
+    *:Darwin) manifest_platform=macos ;;
+    *:Linux) manifest_platform=linux ;;
+    *) manifest_platform=$(printf '%s' "$manifest_uname" | tr '[:upper:]' '[:lower:]') ;;
+esac
+
 # Print the last manifest rule matching SCRIPT. Fields after the script are:
 # action, platforms, hashes, performance, prerequisites, reason. Ordered rules
 # make a broad include plus explicit exclusions compact and reviewable.
@@ -246,7 +263,14 @@ manifest_selected_tests() {
     for candidate in "$upstream_t"/t[0-9][0-9][0-9][0-9]-*.sh; do
         [ -f "$candidate" ] || continue
         printf '%s\n' "${candidate##*/}"
-    done | awk -F '\t' '
+    done | awk -F '\t' -v platform="$manifest_platform" -v hash="$manifest_hash" '
+        function applies(values, wanted,    count, part, item) {
+            if (values == "" || values == "oracle" || values == "all") return 1
+            count = split(values, part, ",")
+            for (item = 1; item <= count; item++)
+                if (tolower(part[item]) == tolower(wanted)) return 1
+            return 0
+        }
         function glob_regex(glob,    regex, i, char, close_offset, class) {
             regex = "^"
             for (i = 1; i <= length(glob); i++) {
@@ -281,14 +305,27 @@ manifest_selected_tests() {
                 rules++
                 action[rules] = $1
                 selector[rules] = glob_regex($2)
+                platforms[rules] = $3
+                hashes[rules] = $4
             }
             next
         }
         {
             selected = ""
-            for (rule = 1; rule <= rules; rule++)
-                if ($0 ~ selector[rule]) selected = action[rule]
-            if (selected == "include") included[++included_count] = $0
+            selected_platforms = ""
+            selected_hashes = ""
+            for (rule = 1; rule <= rules; rule++) {
+                if ($0 ~ selector[rule]) {
+                    selected = action[rule]
+                    selected_platforms = platforms[rule]
+                    selected_hashes = hashes[rule]
+                }
+            }
+            if (selected == "include") {
+                included[++included_count] = $0
+                included_platforms[included_count] = selected_platforms
+                included_hashes[included_count] = selected_hashes
+            }
             else if (selected == "exclude") excluded_count++
         }
         END {
@@ -305,7 +342,9 @@ manifest_selected_tests() {
                 exit 1
             }
             for (output_index = 1; output_index <= included_count; output_index++)
-                print included[output_index]
+                if (applies(included_platforms[output_index], platform) &&
+                    applies(included_hashes[output_index], hash))
+                    print included[output_index]
         }
     ' "$manifest" -
 }
@@ -701,11 +740,12 @@ run_label=${SLEY_RUN_LABEL:-}
 if [ -z "$run_label" ]; then
     run_label=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date 2>/dev/null || printf 'unknown')
 fi
+metadata=${SLEY_METADATA:-${summary%.csv}-metadata.tsv}
 
 # A fresh artifact root is the normal certification layout. Create all parent
 # directories before running a script so a missing output directory cannot
 # waste the run and discard its exact-cell evidence.
-for artifact in "$report" "$summary" "$history" "$timings" "$cells" "$details" "$comparison" "$comparison_summary"; do
+for artifact in "$report" "$summary" "$history" "$timings" "$cells" "$details" "$comparison" "$comparison_summary" "$metadata"; do
     artifact_parent=$(dirname -- "$artifact")
     mkdir -p "$artifact_parent" || die "could not create artifact directory: $artifact_parent"
 done
@@ -717,7 +757,52 @@ done
 # assertions. A built checkout's GIT-BUILD-OPTIONS often omits
 # GIT_TEST_BUILTIN_HASH, so we default it here to keep results meaningful.
 # Callers can override (e.g. SLEY_DEFAULT_HASH=sha256).
-default_hash=${SLEY_DEFAULT_HASH:-${GIT_TEST_DEFAULT_HASH:-sha1}}
+default_hash=$manifest_hash
+
+metadata_value() {
+    printf '%s' "$1" | tr '\t\r\n' '   '
+}
+
+upstream_commit=$(git -C "$upstream_source_root" rev-parse HEAD 2>/dev/null || printf unknown)
+candidate_commit=${SLEY_CANDIDATE_COMMIT:-$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || printf unknown)}
+if candidate_status=$(git -C "$repo_root" status --porcelain --untracked-files=normal 2>/dev/null); then
+    if [ -n "$candidate_status" ]; then candidate_tree_state=dirty; else candidate_tree_state=clean; fi
+else
+    candidate_tree_state=unknown
+fi
+if upstream_status=$(git -C "$upstream_source_root" status --porcelain --untracked-files=normal 2>/dev/null); then
+    if [ -n "$upstream_status" ]; then upstream_tree_state=dirty; else upstream_tree_state=clean; fi
+else
+    upstream_tree_state=unknown
+fi
+target_version=$("$bindir/git" --version 2>/dev/null | head -n 1 || true)
+target_checksum=$(cksum "$target_bin" 2>/dev/null | awk '{ print $1 ":" $2; exit }')
+target_checksum=${target_checksum:-unknown}
+manifest_checksum=$(cksum "$manifest" 2>/dev/null | awk '{ print $1 ":" $2; exit }')
+manifest_checksum=${manifest_checksum:-unknown}
+machine_arch=$(uname -m 2>/dev/null || printf unknown)
+selection_count=$(printf '%s\n' $scripts | awk 'NF { count++ } END { print count + 0 }')
+selection_checksum=$(printf '%s\n' $scripts | cksum | awk '{ print $1 ":" $2; exit }')
+{
+    printf 'schema\tsley-upstream-run-metadata-v1\n'
+    printf 'run_label\t%s\n' "$(metadata_value "$run_label")"
+    printf 'target\t%s\n' "$(metadata_value "$test_target")"
+    printf 'candidate_commit\t%s\n' "$(metadata_value "$candidate_commit")"
+    printf 'candidate_tree_state\t%s\n' "$(metadata_value "$candidate_tree_state")"
+    printf 'target_binary\t%s\n' "$(metadata_value "$target_bin")"
+    printf 'target_binary_checksum\t%s\n' "$(metadata_value "$target_checksum")"
+    printf 'target_version\t%s\n' "$(metadata_value "$target_version")"
+    printf 'upstream_commit\t%s\n' "$(metadata_value "$upstream_commit")"
+    printf 'upstream_tree_state\t%s\n' "$(metadata_value "$upstream_tree_state")"
+    printf 'upstream_t\t%s\n' "$(metadata_value "$upstream_t")"
+    printf 'manifest\t%s\n' "$(metadata_value "$manifest")"
+    printf 'manifest_checksum\t%s\n' "$(metadata_value "$manifest_checksum")"
+    printf 'platform\t%s\n' "$(metadata_value "$manifest_platform")"
+    printf 'architecture\t%s\n' "$(metadata_value "$machine_arch")"
+    printf 'hash\t%s\n' "$(metadata_value "$default_hash")"
+    printf 'selection_count\t%s\n' "$(metadata_value "$selection_count")"
+    printf 'selection_checksum\t%s\n' "$(metadata_value "$selection_checksum")"
+} > "$metadata"
 
 # Map a script basename back to a friendly command name (inverse of the
 # command_alias table) for the summary/history; falls back to the basename.
@@ -743,6 +828,7 @@ command_for_script() {
     printf 'target binary: %s\n' "$target_bin"
     printf 'upstream t/: %s\n' "$upstream_t"
     printf 'manifest: %s\n' "$manifest"
+    printf 'metadata: %s\n' "$metadata"
     printf 'default hash: %s\n' "$default_hash"
     printf 'per-script timeout: %ss\n' "$timeout_secs"
     printf '\n'
@@ -1222,6 +1308,7 @@ log "Pass-rate history (appended): $history"
 log "Per-script timings: $timings"
 log "Exact TAP cells: $cells"
 log "Per-script classifications: $details"
+log "Run identity metadata: $metadata"
 
 # Non-zero exit if anything did not pass, so CI/wrappers can gate on it.
 if [ $((passed + skipped_scripts)) -eq "$total" ]; then

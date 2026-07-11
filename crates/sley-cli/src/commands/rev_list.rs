@@ -761,6 +761,10 @@ pub(crate) fn cmd_rev_list(
             object_filter: object_filter.clone(),
             filter_provided_objects,
             unpacked,
+            have_traversal: rev_list_bitmap_have_traversal(
+                &config,
+                std::env::var_os("GIT_TEST_PACK_USE_BITMAP_BOUNDARY_TRAVERSAL").as_deref(),
+            ),
         };
         if !bitmap_eligible || want_roots.is_empty() {
             let objects_dir = sley_odb::repository_objects_dir(&git_dir);
@@ -3498,6 +3502,67 @@ struct RevListBitmapQuery<'a> {
     object_filter: RevListObjectFilter,
     filter_provided_objects: bool,
     unpacked: bool,
+    have_traversal: sley_odb::BitmapHaveTraversal,
+}
+
+fn rev_list_bitmap_have_traversal(
+    config: &sley_config::GitConfig,
+    env_value: Option<&std::ffi::OsStr>,
+) -> sley_odb::BitmapHaveTraversal {
+    let env_override = env_value.map(|value| !value.is_empty() && value != "0");
+    let use_boundary = env_override
+        .or_else(|| config.get_bool("pack", None, "useBitmapBoundaryTraversal"))
+        .or_else(|| config.get_bool("feature", None, "experimental"))
+        .unwrap_or(false);
+    if use_boundary {
+        sley_odb::BitmapHaveTraversal::Boundary
+    } else {
+        sley_odb::BitmapHaveTraversal::Classic
+    }
+}
+
+#[cfg(test)]
+mod bitmap_have_traversal_tests {
+    use super::*;
+
+    #[test]
+    fn environment_overrides_config_and_experimental_default() {
+        let config = sley_config::GitConfig::parse(
+            b"[pack]\n\tuseBitmapBoundaryTraversal = true\n[feature]\n\texperimental = true\n",
+        )
+        .expect("parse config");
+        assert_eq!(
+            rev_list_bitmap_have_traversal(&config, Some(std::ffi::OsStr::new("0"))),
+            sley_odb::BitmapHaveTraversal::Classic
+        );
+
+        let config =
+            sley_config::GitConfig::parse(b"[pack]\n\tuseBitmapBoundaryTraversal = false\n")
+                .expect("parse config");
+        assert_eq!(
+            rev_list_bitmap_have_traversal(&config, Some(std::ffi::OsStr::new("1"))),
+            sley_odb::BitmapHaveTraversal::Boundary
+        );
+    }
+
+    #[test]
+    fn explicit_pack_setting_overrides_experimental_default() {
+        let config = sley_config::GitConfig::parse(
+            b"[feature]\n\texperimental = true\n[pack]\n\tuseBitmapBoundaryTraversal = false\n",
+        )
+        .expect("parse config");
+        assert_eq!(
+            rev_list_bitmap_have_traversal(&config, None),
+            sley_odb::BitmapHaveTraversal::Classic
+        );
+
+        let config = sley_config::GitConfig::parse(b"[feature]\n\texperimental = true\n")
+            .expect("parse config");
+        assert_eq!(
+            rev_list_bitmap_have_traversal(&config, None),
+            sley_odb::BitmapHaveTraversal::Boundary
+        );
+    }
 }
 
 /// Sorted set-bit positions of `words & mask`.
@@ -3547,13 +3612,15 @@ fn rev_list_try_bitmap(
         return Ok(false);
     }
 
-    let mut result =
-        sley_odb::bitmap_reachable(&bitmap, db, format, query.want_roots, query.objects)?;
-    if !query.exclude_tips.is_empty() {
-        let haves =
-            sley_odb::bitmap_reachable(&bitmap, db, format, query.exclude_tips, query.objects)?;
-        result.subtract(&haves);
-    }
+    let mut result = sley_odb::bitmap_reachable_excluding_haves(
+        &bitmap,
+        db,
+        format,
+        query.want_roots,
+        query.exclude_tips,
+        query.objects,
+        query.have_traversal,
+    )?;
     rev_list_bitmap_apply_filter(&bitmap, db, &mut result, query)?;
 
     if query.unpacked {
@@ -3734,6 +3801,7 @@ fn rev_list_bitmap_apply_filter(
                     object_filter: filter.clone(),
                     filter_provided_objects: query.filter_provided_objects,
                     unpacked: query.unpacked,
+                    have_traversal: query.have_traversal,
                 };
                 rev_list_bitmap_apply_filter(bitmap, db, result, &subquery)?;
             }

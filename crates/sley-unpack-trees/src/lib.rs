@@ -394,6 +394,18 @@ pub trait WorktreeWriter {
     /// not `lstat` the written path); the entry then keeps an all-zero stat,
     /// which git treats as "needs a refresh / racily clean".
     fn write_blob(&mut self, path: &[u8], mode: u32, oid: &ObjectId) -> Result<Option<StatInfo>>;
+    /// Materialize a validated set of independent writes. The default keeps
+    /// the historical sequential contract; checkout consumers may override it
+    /// with a deterministic worker queue while preserving result order.
+    fn write_blobs(
+        &mut self,
+        entries: &[(Vec<u8>, u32, ObjectId)],
+    ) -> Result<Vec<Option<StatInfo>>> {
+        entries
+            .iter()
+            .map(|(path, mode, oid)| self.write_blob(path, *mode, oid))
+            .collect()
+    }
     /// Remove `path` from the working tree (idempotent on an absent target).
     /// This is git's `unlink_entry`.
     fn remove_path(&mut self, path: &[u8]) -> Result<()>;
@@ -1281,13 +1293,27 @@ pub fn check_updates<W: WorktreeWriter>(
     for path in &result.removed_paths {
         writer.remove_path(path)?;
     }
+    let writes = result
+        .entries
+        .iter()
+        .filter(|entry| entry.wt_update && entry.entry.stage == 0)
+        .map(|entry| (entry.path.clone(), entry.entry.mode, entry.entry.oid))
+        .collect::<Vec<_>>();
+    let mut stats = writer.write_blobs(&writes)?.into_iter();
     for entry in &mut result.entries {
         if entry.wt_update && entry.entry.stage == 0 {
-            let stat = writer.write_blob(&entry.path, entry.entry.mode, &entry.entry.oid)?;
+            let stat = stats.next().ok_or_else(|| {
+                GitError::Transaction("worktree writer returned too few batch results".into())
+            })?;
             // git's fill_stat_cache_info: stamp the freshly-written file's
             // lstat onto the entry so a follow-up diff-files reports it clean.
             entry.entry.stat = stat;
         }
+    }
+    if stats.next().is_some() {
+        return Err(GitError::Transaction(
+            "worktree writer returned too many batch results".into(),
+        ));
     }
     Ok(())
 }

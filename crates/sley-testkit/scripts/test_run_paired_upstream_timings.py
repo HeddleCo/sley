@@ -69,6 +69,7 @@ class PairedDriverTest(unittest.TestCase):
         self.assertEqual(oracle.env["SLEY_ORACLE_BIN"], str(args.oracle_bin))
         self.assertNotIn("SLEY_BIN", oracle.env)
         self.assertEqual(sley.env["SLEY_BIN"], str(args.sley_bin))
+        self.assertEqual(sley.env["SLEY_METADATA"], str(sley.artifacts.metadata))
         self.assertNotIn("SLEY_ORACLE_BIN", sley.env)
         self.assertNotEqual(oracle.artifacts.root, sley.artifacts.root)
         self.assertIn("trial-01/oracle", str(oracle.artifacts.summary))
@@ -121,6 +122,41 @@ class PairedDriverTest(unittest.TestCase):
         with mock.patch.object(driver.subprocess, "run", return_value=completed):
             with self.assertRaisesRegex(driver.DriverError, "socket bind denied"):
                 driver.validate_environment(args)
+
+    def test_paired_metadata_rejects_cross_commit_or_hash_artifacts(self) -> None:
+        def write(path: Path, target: str, *, commit: str = "abc", hash_lane: str = "sha1"):
+            path.write_text(
+                "\n".join(
+                    [
+                        "schema\tsley-upstream-run-metadata-v1",
+                        f"target\t{target}",
+                        f"candidate_commit\t{commit}",
+                        "candidate_tree_state\tclean",
+                        "upstream_commit\tupstream",
+                        "upstream_tree_state\tclean",
+                        "manifest_checksum\tmanifest",
+                        "platform\tlinux",
+                        "architecture\tx86_64",
+                        f"hash\t{hash_lane}",
+                        "selection_count\t891",
+                        "selection_checksum\tselection",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        oracle = self.root / "oracle-metadata.tsv"
+        sley = self.root / "sley-metadata.tsv"
+        write(oracle, "oracle")
+        write(sley, "sley")
+        driver.validate_trial_metadata(oracle, sley)
+
+        write(sley, "sley", commit="different", hash_lane="sha256")
+        with self.assertRaisesRegex(
+            driver.DriverError, "candidate_commit, hash"
+        ):
+            driver.validate_trial_metadata(oracle, sley)
 
     @staticmethod
     def comparison(
@@ -273,6 +309,7 @@ class PairedDriverTest(unittest.TestCase):
             timings="timings",
             cells="cells",
             details="details",
+            metadata="metadata",
             stdout="stdout",
             stderr="stderr",
         )

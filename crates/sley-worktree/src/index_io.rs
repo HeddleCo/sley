@@ -539,7 +539,7 @@ impl IndexStatCache {
         })
     }
 
-    fn reuse_index_entry_for_checkout(
+    pub(crate) fn reuse_index_entry_for_checkout(
         &self,
         entry: &IndexEntry,
         worktree_metadata: &fs::Metadata,

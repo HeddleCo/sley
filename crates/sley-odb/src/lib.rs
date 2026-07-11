@@ -31,6 +31,16 @@ static TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub trait ObjectReader {
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>>;
 
+    /// Return the immediate on-disk delta base for `oid`, when the reader can
+    /// expose storage metadata without decoding the object body.
+    ///
+    /// Transfer-pack generation uses this optional hint to preserve an
+    /// existing delta whose base is already owned by the receiver. Readers
+    /// without pack storage keep the default `None` behavior.
+    fn reusable_delta_base(&self, _oid: &ObjectId) -> Result<Option<ObjectId>> {
+        Ok(None)
+    }
+
     /// Graft-points seam (shallow clones today, replace refs/grafts later):
     /// `true` when history is cut at `oid`, so every walk must treat the
     /// commit as parentless even though its raw body still names parents.

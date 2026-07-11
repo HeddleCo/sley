@@ -54,6 +54,11 @@ pub struct PackWriteOptions {
     /// produces a thin pack (see [`PackFile::write_thin`]). Empty by default,
     /// yielding a self-contained pack.
     pub thin_bases: HashMap<ObjectId, EncodedObject>,
+    /// Preferred external base for a specific target object. Upload-pack uses
+    /// this to preserve an existing on-disk delta when its base belongs to the
+    /// client. Preferred pairs avoid comparing every target with every thin
+    /// base and are used when the recomputed delta remains worthwhile.
+    pub preferred_thin_bases: HashMap<ObjectId, ObjectId>,
     /// When `true` (the default), objects are reordered by type and size for
     /// better delta locality. When `false`, the input order is preserved (the
     /// emitted pack lists objects in the order supplied); deltas then only
@@ -80,6 +85,7 @@ impl PackWriteOptions {
             depth: DEFAULT_PACK_DEPTH,
             prefer_ofs_delta: true,
             thin_bases: HashMap::new(),
+            preferred_thin_bases: HashMap::new(),
             reorder: true,
             compression_level: 6,
         }
@@ -107,6 +113,15 @@ impl PackWriteOptions {
     /// Provide the set of external base objects permitted for a thin pack.
     pub fn with_thin_bases(mut self, thin_bases: HashMap<ObjectId, EncodedObject>) -> Self {
         self.thin_bases = thin_bases;
+        self
+    }
+
+    /// Prefer a particular external base for each target object id.
+    pub fn with_preferred_thin_bases(
+        mut self,
+        preferred_thin_bases: HashMap<ObjectId, ObjectId>,
+    ) -> Self {
+        self.preferred_thin_bases = preferred_thin_bases;
         self
     }
 

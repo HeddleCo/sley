@@ -935,6 +935,9 @@ fn resolve_revision_ref_candidate(refs: &FileRefStore, name: &str) -> Result<Opt
             Some(RefTarget::Direct(oid)) => return Ok(Some(oid)),
             Some(RefTarget::Symbolic(target)) => {
                 if validate_symref_target(&target).is_err() {
+                    if name == "HEAD" {
+                        return Err(GitError::broken_reference(name, target));
+                    }
                     eprintln!("warning: ignoring dangling symref {name}");
                     return Ok(None);
                 }
@@ -6823,12 +6826,31 @@ mod tests {
     use sley_core::ObjectFormat;
     use sley_object::EncodedObject;
     use sley_odb::{ObjectDatabase, ObjectWriter};
-    use sley_refs::{RefTarget, RefUpdate, ReflogEntry};
+    use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry};
     use std::cell::Cell;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn revision_head_reports_invalid_symbolic_target_as_broken_reference() {
+        let git_dir = temp_git_dir();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/invalid.lock\n")
+            .expect("test operation should succeed");
+        let refs = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+
+        let error = resolve_revision_ref_candidate(&refs, "HEAD")
+            .expect_err("invalid HEAD target must be reported as broken");
+        assert!(matches!(
+            error,
+            GitError::NotFound(sley_core::NotFoundKind::BrokenReference {
+                name,
+                target
+            }) if name == "HEAD" && target == "refs/heads/invalid.lock"
+        ));
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
 
     #[test]
     fn setup_revisions_parses_ranges_carets_and_not() {
