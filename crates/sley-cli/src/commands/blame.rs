@@ -3374,6 +3374,7 @@ fn render_blame(
             fake,
             previous_map,
             marks,
+            replace_objects,
         );
     }
 
@@ -3519,7 +3520,7 @@ fn render_blame(
 
 #[allow(clippy::too_many_arguments)]
 fn render_porcelain(
-    _git_dir: &Path,
+    git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
     lines: &[LineBlame],
@@ -3528,7 +3529,12 @@ fn render_porcelain(
     fake: Option<&FakeCommit>,
     previous_map: &PreviousMap,
     marks: BlameMarks,
+    replace_objects: bool,
 ) -> Result<()> {
+    // Git's porcelain metadata is built from the same mailmapped commit-info
+    // records as its human-readable output. This applies to both author and
+    // committer fields, even though porcelain has no explicit mailmap option.
+    let mailmap = commands::utility::Mailmap::load_default(git_dir, format, replace_objects)?;
     // git's MORE_THAN_ONE_PATH: a commit blamed for lines via two or more
     // distinct paths repeats its `previous`/`filename` info on every group so a
     // porcelain consumer can attribute each line to the right path. Computed
@@ -3594,6 +3600,7 @@ fn render_porcelain(
             &multi_path,
             &mut shown,
             options.line_porcelain,
+            &mailmap,
         )?;
 
         for offset in 0..group_len {
@@ -3619,6 +3626,7 @@ fn render_porcelain(
                         &multi_path,
                         &mut shown,
                         true,
+                        &mailmap,
                     )?;
                 }
             }
@@ -3657,8 +3665,11 @@ fn emit_porcelain_details(
     multi_path: &HashSet<ObjectId>,
     shown: &mut HashSet<ObjectId>,
     repeat: bool,
+    mailmap: &commands::utility::Mailmap,
 ) -> Result<()> {
-    let emitted = emit_one_suspect_detail(handle, db, format, blame, options, fake, shown, repeat)?;
+    let emitted = emit_one_suspect_detail(
+        handle, db, format, blame, options, fake, shown, repeat, mailmap,
+    )?;
     if emitted || multi_path.contains(&blame.commit) {
         write_filename_info(handle, blame, fake, previous_map)?;
     }
@@ -3677,6 +3688,7 @@ fn emit_one_suspect_detail(
     fake: Option<&FakeCommit>,
     shown: &mut HashSet<ObjectId>,
     repeat: bool,
+    mailmap: &commands::utility::Mailmap,
 ) -> Result<bool> {
     if !repeat && shown.contains(&blame.commit) {
         return Ok(false);
@@ -3710,23 +3722,15 @@ fn emit_one_suspect_detail(
 
     let object = db.read_object(&blame.commit)?;
     let commit = Commit::parse(format, &object.body)?;
+    let (author_name, author_email) = mailmap.rewrite_identity(&commit.author);
+    let (committer_name, committer_email) = mailmap.rewrite_identity(&commit.committer);
     let author = Signature::from_ident_line(&commit.author);
     let committer = Signature::from_ident_line(&commit.committer);
-    writeln!(
-        handle,
-        "author {}",
-        author
-            .as_ref()
-            .map(|sig| String::from_utf8_lossy(sig.name.as_bytes()).into_owned())
-            .unwrap_or_default()
-    )?;
+    writeln!(handle, "author {}", String::from_utf8_lossy(&author_name))?;
     writeln!(
         handle,
         "author-mail <{}>",
-        author
-            .as_ref()
-            .map(|sig| String::from_utf8_lossy(sig.email.as_bytes()).into_owned())
-            .unwrap_or_default()
+        String::from_utf8_lossy(&author_email)
     )?;
     writeln!(
         handle,
@@ -3744,18 +3748,12 @@ fn emit_one_suspect_detail(
     writeln!(
         handle,
         "committer {}",
-        committer
-            .as_ref()
-            .map(|sig| String::from_utf8_lossy(sig.name.as_bytes()).into_owned())
-            .unwrap_or_default()
+        String::from_utf8_lossy(&committer_name)
     )?;
     writeln!(
         handle,
         "committer-mail <{}>",
-        committer
-            .as_ref()
-            .map(|sig| String::from_utf8_lossy(sig.email.as_bytes()).into_owned())
-            .unwrap_or_default()
+        String::from_utf8_lossy(&committer_email)
     )?;
     writeln!(
         handle,

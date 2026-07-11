@@ -430,3 +430,45 @@ fn blame_missing_path_matches_git() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+/// Porcelain metadata is mailmapped implicitly, including both author and
+/// committer identity fields. This is the behavior exercised by upstream
+/// t4203's complex-map blame cell.
+#[test]
+fn blame_porcelain_mailmaps_commit_metadata_like_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("blame-porcelain-mailmap");
+    let repo = root.join("repo");
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            repo.to_str().expect("utf8 path"),
+        ],
+    );
+    fs::write(repo.join("f.txt"), "mapped line\n").expect("write mapped file");
+    git_ok(&repo, &["add", "f.txt"]);
+    git_commit_env(
+        &repo,
+        &["commit", "-q", "-m", "mapped"],
+        "Legacy Person",
+        "legacy@example.com",
+        "@1790000000 -0500",
+    );
+    fs::write(
+        repo.join("complex.map"),
+        "Canonical Person <canonical@example.com> Legacy Person <legacy@example.com>\n",
+    )
+    .expect("write mailmap");
+    git_ok(&repo, &["config", "mailmap.file", "complex.map"]);
+
+    assert_same(&repo, &["blame", "--porcelain", "f.txt"]);
+    assert_same(&repo, &["blame", "--line-porcelain", "f.txt"]);
+
+    fs::remove_dir_all(&root).ok();
+}
