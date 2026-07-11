@@ -413,6 +413,12 @@ pub(crate) fn cmd_status(cli_session: &crate::session::CliSession, args: &[Strin
             GitError::Command("status object database was not initialized".into())
         })?,
     };
+    sley_worktree::prepare_status_index_layout(
+        &git_dir,
+        format,
+        db,
+        status_sparse_index_enabled(&git_dir, cli_session.cwd())?,
+    )?;
     commands::submodule::ensure_populated_gitlinks_readable(&worktree_root, &git_dir, format)?;
     let status_options = sley_worktree::ShortStatusOptions {
         include_ignored: show_ignored,
@@ -621,6 +627,27 @@ pub(crate) fn cmd_status(cli_session: &crate::session::CliSession, args: &[Strin
     apply_status_split_index_config(&git_dir, format, &config)?;
     commands::hooks::run_post_index_change_hook(cli_session, false, false)?;
     Ok(())
+}
+
+/// Resolve `index.sparse` in system/global/repository/worktree/command
+/// precedence order. Linked-worktree config is stored separately from the
+/// ordinary repository config, while `-c` remains the final override.
+fn status_sparse_index_enabled(git_dir: &Path, cwd: &Path) -> Result<bool> {
+    let effective = commands::remote::read_effective_repo_config(git_dir, cwd)
+        .map_err(report_config_setup_error)?;
+    let worktree = GitConfig::read(git_dir.join("config.worktree")).unwrap_or_default();
+    let mut enabled = worktree
+        .get_bool("index", None, "sparse")
+        .or_else(|| effective.get_bool("index", None, "sparse"))
+        .unwrap_or(false);
+    for parameter in crate::injected_config_parameters()? {
+        if parameter.split_key() == ("index", None, "sparse") {
+            enabled = parameter.value.as_deref().map_or(true, |value| {
+                sley_config::parse_config_bool(value).unwrap_or(false)
+            });
+        }
+    }
+    Ok(enabled)
 }
 
 fn apply_status_split_index_config(

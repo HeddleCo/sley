@@ -1140,13 +1140,21 @@ fn merge_message_target_name(git_dir: &Path, format: ObjectFormat, target: &str)
     if !target.contains("@{") {
         return target.to_string();
     }
-    match sley_rev::resolve_revision_symbolic_full_name(git_dir, format, target) {
-        Ok(Some(refname)) => refname
-            .strip_prefix("refs/remotes/")
-            .or_else(|| refname.strip_prefix("refs/heads/"))
-            .or_else(|| refname.strip_prefix("refs/tags/"))
-            .unwrap_or(&refname)
-            .to_string(),
+    // A previous-checkout/reflog selector may itself carry ancestry operators
+    // (`@{-1}~1`). Resolve the symbolic selector for the human-facing merge
+    // origin, then retain the suffix so the existing early-branch classifier
+    // can describe it as "branch '<name>' (early part)".
+    let selector_end = target.find('}').map_or(target.len(), |index| index + 1);
+    let (selector, suffix) = target.split_at(selector_end);
+    match sley_rev::resolve_revision_symbolic_full_name(git_dir, format, selector) {
+        Ok(Some(refname)) => {
+            let name = refname
+                .strip_prefix("refs/remotes/")
+                .or_else(|| refname.strip_prefix("refs/heads/"))
+                .or_else(|| refname.strip_prefix("refs/tags/"))
+                .unwrap_or(&refname);
+            format!("{name}{suffix}")
+        }
         _ => target.to_string(),
     }
 }

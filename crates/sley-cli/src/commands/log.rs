@@ -32,6 +32,27 @@ use reflog::{
     log_walk_reflogs,
 };
 
+/// Resolve a file-backed config value across Git's system, global, and local
+/// layers. `RepositoryContext` intentionally carries the repository config and
+/// command-scoped injections; callers use this only when those higher
+/// precedence layers did not define the key.
+fn log_effective_file_config_value(
+    git_dir: &Path,
+    cwd: &Path,
+    section: &str,
+    variable: &str,
+) -> Result<Option<String>> {
+    let config = commands::remote::read_effective_repo_config(git_dir, cwd)
+        .map_err(report_config_setup_error)?;
+    Ok(config
+        .get(section, None, variable)
+        .map(str::to_string)
+        .or_else(|| {
+            matches!(config.get_all(section, None, variable).last(), Some(None))
+                .then(|| "true".to_string())
+        }))
+}
+
 /// Tracks `git log`'s notes-display state (`--notes`, `--show-notes[=ref]`,
 /// `--no-notes`, `--standard-notes`, `--no-standard-notes`), mirroring git's
 /// `display_notes_opt` / `show_notes` resolution.
@@ -2572,6 +2593,10 @@ fn cmd_log_impl(
                 matches!(config.get_all("log", None, "decorate").last(), Some(None))
                     .then(|| "true".to_string())
             });
+        let decorate_config = match decorate_config {
+            Some(value) => Some(value),
+            None => log_effective_file_config_value(&git_dir, &cwd, "log", "decorate")?,
+        };
         if let Some(value) = decorate_config {
             match value.trim().to_ascii_lowercase().as_str() {
                 "short" | "true" | "yes" | "on" | "1" | "" => decoration = LogDecorationMode::Short,

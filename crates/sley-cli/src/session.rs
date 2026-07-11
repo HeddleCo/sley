@@ -234,17 +234,22 @@ impl CliSession {
     /// facade owns the repository-scoped object database and other handles.
     pub(crate) fn open_repository(&self) -> Result<Repository> {
         let git_dir = self.git_dir()?;
+        let work_tree = self.effective_worktree_for_git_dir(&git_dir)?;
         let config = crate::read_repo_config(&git_dir)?;
         let use_replace_refs = config
             .get_bool("core", None, "useReplaceRefs")
             .unwrap_or(true);
-        Repository::open_with(
+        let repository = Repository::open_with(
             git_dir,
             OpenOptions::new()
                 .exact_path(true)
                 .replace_objects(self.replace_objects())
                 .effective_use_replace_refs(use_replace_refs),
-        )
+        )?;
+        Ok(match work_tree {
+            Some(work_tree) => repository.with_work_tree(work_tree),
+            None => repository,
+        })
     }
 
     pub(crate) fn common_git_dir(&self, git_dir: &Path) -> Result<PathBuf> {
@@ -256,20 +261,42 @@ impl CliSession {
 
     /// Resolve the worktree for `git_dir` using this invocation's location policy.
     pub(crate) fn worktree_root_for_git_dir(&self, git_dir: &Path) -> Result<PathBuf> {
+        self.effective_worktree_for_git_dir(git_dir)?
+            .ok_or_else(|| {
+                GitError::Unsupported("update-index currently requires a non-bare worktree".into())
+            })
+    }
+
+    /// Resolve Git's effective worktree policy without requiring one to exist.
+    ///
+    /// An explicit git directory changes the implicit worktree from the
+    /// repository-intrinsic `.git` parent to the invocation cwd. Delegate that
+    /// distinction (including `core.worktree`, `core.bare`, and
+    /// `GIT_IMPLICIT_WORK_TREE`) to the shared setup engine.
+    fn effective_worktree_for_git_dir(&self, git_dir: &Path) -> Result<Option<PathBuf>> {
         if let Some(work_tree) = self.explicit_work_tree() {
             let work_tree =
                 discovery::resolve_cli_path(&self.cwd, work_tree.to_string_lossy().as_ref());
-            return fs::canonicalize(work_tree).map_err(|err| GitError::Io(err.to_string()));
-        }
-        if let Some(root) = crate::sley_worktree::worktree_root_for_git_dir(git_dir)? {
-            return Ok(root);
+            return fs::canonicalize(work_tree)
+                .map(Some)
+                .map_err(|err| GitError::Io(err.to_string()));
         }
         if self.explicit_git_dir().is_some() {
-            return Ok(self.cwd.clone());
+            let setup = crate::setup::setup_git_directory(self).ok_or_else(|| {
+                GitError::repository_not_found(format!(
+                    "not a git repository: {}",
+                    git_dir.display()
+                ))
+            })?;
+            return Ok(setup.worktree);
         }
-        Err(GitError::Unsupported(
-            "update-index currently requires a non-bare worktree".into(),
-        ))
+        if self.explicit_bare() {
+            return Ok(None);
+        }
+        if let Some(root) = crate::sley_worktree::worktree_root_for_git_dir(git_dir)? {
+            return Ok(Some(root));
+        }
+        Ok(None)
     }
 
     /// Resolved git directory for this session's cwd.
@@ -384,6 +411,27 @@ mod tests {
         assert_eq!(
             fs::canonicalize(opened.git_dir()).expect("canonical opened git dir"),
             fs::canonicalize(initialized.git_dir()).expect("canonical initialized git dir")
+        );
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn open_repository_carries_explicit_git_dir_implicit_worktree() {
+        let root = unique_temp_dir("explicit-session-worktree");
+        let repository_root = root.join("repository");
+        let invocation_cwd = root.join("input");
+        fs::create_dir_all(&invocation_cwd).expect("create invocation cwd");
+        let initialized = Repository::init(&repository_root).expect("initialize repository");
+        let session = session(
+            invocation_cwd.clone(),
+            Some(initialized.git_dir().to_path_buf()),
+        );
+
+        let opened = session.open_repository().expect("open repository");
+        assert_eq!(
+            opened.workdir().expect("effective worktree"),
+            fs::canonicalize(&invocation_cwd).expect("canonical invocation cwd")
         );
 
         fs::remove_dir_all(root).expect("remove fixture");

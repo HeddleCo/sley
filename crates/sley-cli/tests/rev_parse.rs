@@ -579,6 +579,14 @@ fn rev_parse_git_path_matches_upstream_git() {
                 "sley result differed for {args:?} with env {envs:?}"
             );
         }
+
+        let custom_hooks = root.join(".git").join("custom-hooks");
+        fs::create_dir_all(&custom_hooks).expect("create custom hooks dir");
+        git(&root, &["config", "core.hooksPath", ".git/custom-hooks"]);
+        let args = vec!["rev-parse", "--git-path", "hooks/abc"];
+        let expected = run_status(sley_testkit::oracle_git(), &root, &args);
+        let actual = run_status(sley_testkit::sley_bin!(), &root, &args);
+        assert_eq!(actual, expected, "configured hooks path differed");
     };
     let _ = fs::remove_dir_all(&root);
 }

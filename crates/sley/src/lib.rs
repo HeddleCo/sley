@@ -540,6 +540,17 @@ impl Repository {
         Self::from_git_dir(git_dir, None, true, None)
     }
 
+    /// Return this repository handle with an invocation-specific working tree.
+    ///
+    /// This is useful to embedders which resolve Git's setup policy outside of
+    /// process environment variables. In particular, `git --git-dir=<path>`
+    /// treats the invocation's current directory as its implicit working tree,
+    /// which is not necessarily the parent of `<path>`.
+    pub fn with_work_tree(mut self, work_tree: impl Into<PathBuf>) -> Self {
+        self.work_tree_override = Some(work_tree.into());
+        self
+    }
+
     /// Initialize a new non-bare repository rooted at `path` (creating its
     /// `.git` directory) and return a handle to it. Re-initializing an existing
     /// repository is a no-op on already-present files, matching `git init`.

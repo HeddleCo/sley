@@ -451,6 +451,11 @@ pub fn http_service_advertisements(
     credentials: &mut dyn CredentialProvider,
     config: Option<&GitConfig>,
 ) -> Result<HttpServiceAdvertisements> {
+    // Git's smart-HTTP packet stream is owned by the logical remote-curl
+    // helper, whose packet trace identity is `git` even though Sley performs
+    // the same operation in-process. Keep this observable boundary without
+    // spawning `git-remote-http(s)` or consulting an installed Git.
+    let _packet_trace_identity = sley_protocol::scoped_packet_trace_identity("git");
     let git_protocol = http_git_protocol_header_value_for_service(config, service)?;
     let url = http_smart_info_refs_url(remote, service)?;
     let mut response = http_send_with_auth(remote, credentials, |auth| {

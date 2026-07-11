@@ -128,6 +128,59 @@ fn add_dry_run_reports_without_staging_like_upstream_git() {
 }
 
 #[test]
+fn add_with_explicit_git_dir_uses_invocation_cwd_as_worktree() {
+    let root = unique_temp_dir("add-explicit-git-dir-cwd");
+    let upstream_repo = root.join("upstream-repo");
+    let upstream_worktree = root.join("upstream-input");
+    let rust_repo = root.join("rust-repo");
+    let rust_worktree = root.join("rust-input");
+    for path in [
+        &upstream_repo,
+        &upstream_worktree,
+        &rust_repo,
+        &rust_worktree,
+    ] {
+        fs::create_dir_all(path).expect("create fixture directory");
+    }
+    prepare_repo(&upstream_repo);
+    prepare_repo(&rust_repo);
+    fs::write(upstream_worktree.join("fixture.txt"), b"fixture\n").expect("write fixture");
+    fs::write(rust_worktree.join("fixture.txt"), b"fixture\n").expect("write fixture");
+
+    let upstream_git_dir = format!("--git-dir={}", upstream_repo.join(".git").display());
+    let rust_git_dir = format!("--git-dir={}", rust_repo.join(".git").display());
+    let expected = run_output(
+        sley_testkit::oracle_git(),
+        &upstream_worktree,
+        &[&upstream_git_dir, "add", "."],
+    );
+    let actual = run_output(
+        sley_testkit::sley_bin!(),
+        &rust_worktree,
+        &[&rust_git_dir, "add", "."],
+    );
+    assert_same_output(actual, expected, &["--git-dir=<separate>", "add", "."]);
+
+    let expected_index = run_output(
+        sley_testkit::oracle_git(),
+        &upstream_worktree,
+        &[&upstream_git_dir, "ls-files", "--stage"],
+    );
+    let actual_index = run_output(
+        sley_testkit::sley_bin!(),
+        &rust_worktree,
+        &[&rust_git_dir, "ls-files", "--stage"],
+    );
+    assert_same_output(
+        actual_index,
+        expected_index,
+        &["--git-dir=<separate>", "ls-files", "--stage"],
+    );
+
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[test]
 fn add_verbose_stages_and_reports_directory_paths_like_upstream_git() {
     let root = unique_temp_dir("add-verbose");
     let upstream = root.join("upstream");

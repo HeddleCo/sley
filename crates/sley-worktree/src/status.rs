@@ -3,6 +3,7 @@
 //! Split out of `lib.rs` in the wave-47 mechanical refactor: a pure code move
 //! (no function body changed); all items are re-exported from `lib.rs`.
 use super::*;
+use crate::attributes::SparseMatcher;
 use crate::checkout::*;
 use crate::ignore::*;
 use crate::index::*;
@@ -743,6 +744,36 @@ pub(crate) fn short_status_unmerged_codes(stages: &BTreeSet<u16>) -> (u8, u8) {
     }
 }
 
+/// Apply the invocation-effective `index.sparse` policy before status reads
+/// the index. Git treats status as an index-aware operation: disabling sparse
+/// layout expands and persists a full index, while re-enabling it converts a
+/// compatible cone checkout back to its collapsed representation.
+pub fn prepare_status_index_layout(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    desired_sparse: bool,
+) -> Result<()> {
+    let Some(mut index) = read_repository_index(git_dir, format)? else {
+        return Ok(());
+    };
+    let currently_sparse = index.is_sparse() || index.entries.iter().any(IndexEntry::is_sparse_dir);
+    if !desired_sparse && currently_sparse {
+        expand_sparse_index(&mut index, db, format)?;
+        return write_repository_index_ref(git_dir, format, &index);
+    }
+    if desired_sparse
+        && !currently_sparse
+        && let Some((sparse, mode)) = active_sparse_checkout(git_dir)?
+        && matches!(mode, SparseCheckoutMode::Cone)
+    {
+        let matcher = SparseMatcher::new(&sparse, mode);
+        collapse_to_sparse_index(&mut index, &matcher, db, format)?;
+        return write_repository_index_ref(git_dir, format, &index);
+    }
+    Ok(())
+}
+
 pub(crate) fn sparse_checkout_active_for_status(git_dir: &Path, index: &Index) -> bool {
     index.is_sparse()
         || index.entries.iter().any(IndexEntry::is_sparse_dir)
@@ -758,6 +789,36 @@ pub(crate) fn sparse_checkout_active_for_borrowed_status(
         .iter()
         .any(|entry| entry.mode == SPARSE_DIR_MODE && entry.is_skip_worktree())
         || sparse_checkout_config_enabled(git_dir)
+}
+
+/// A collapsed sparse-directory entry is already a complete description of an
+/// absent out-of-cone subtree. Status can compare its tree object directly to
+/// HEAD and treat the missing worktree directory as clean without inflating the
+/// index. Once any such directory exists on disk, however, individual leaves
+/// may have been vivified or modified and the full-index path is required.
+pub(crate) fn borrowed_sparse_directory_is_materialized(
+    worktree_root: &Path,
+    index: &BorrowedIndex<'_>,
+) -> Result<bool> {
+    let mut absolute = PathBuf::new();
+    for entry in index
+        .entries
+        .iter()
+        .filter(|entry| entry.mode == SPARSE_DIR_MODE && entry.is_skip_worktree())
+    {
+        let path = entry.path.strip_suffix(b"/").unwrap_or(entry.path);
+        set_worktree_path_from_repo_path(worktree_root, path, &mut absolute)?;
+        match fs::symlink_metadata(&absolute) {
+            Ok(_) => return Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn sparse_checkout_config_enabled(git_dir: &Path) -> bool {
@@ -1185,11 +1246,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_if_possible(
         ],
     );
     let sparse_checkout_active = sparse_checkout_active_for_borrowed_status(git_dir, &borrowed);
-    if borrowed
-        .entries
-        .iter()
-        .any(|entry| entry.mode == SPARSE_DIR_MODE && entry.is_skip_worktree())
-    {
+    if borrowed_sparse_directory_is_materialized(worktree_root, &borrowed)? {
         return Ok(None);
     }
     if borrowed
@@ -1475,11 +1532,7 @@ where
         ],
     );
     let sparse_checkout_active = sparse_checkout_active_for_borrowed_status(git_dir, &borrowed);
-    if borrowed
-        .entries
-        .iter()
-        .any(|entry| entry.mode == SPARSE_DIR_MODE && entry.is_skip_worktree())
-    {
+    if borrowed_sparse_directory_is_materialized(worktree_root, &borrowed)? {
         return Ok(None);
     }
     if borrowed
@@ -1751,11 +1804,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_count_if_possible(
         Err(err) => return Err(err),
     };
     let sparse_checkout_active = sparse_checkout_active_for_borrowed_status(git_dir, &borrowed);
-    if borrowed
-        .entries
-        .iter()
-        .any(|entry| entry.mode == SPARSE_DIR_MODE && entry.is_skip_worktree())
-    {
+    if borrowed_sparse_directory_is_materialized(worktree_root, &borrowed)? {
         return Ok(None);
     }
     let Some(head_tree_oid) = resolve_head_tree_oid(git_dir, format, db)? else {

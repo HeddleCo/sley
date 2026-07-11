@@ -1682,3 +1682,42 @@ fn log_reverse_matches_upstream_git() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn log_decorate_full_from_global_config_matches_upstream_git() {
+    let root = unique_temp_dir("log-global-decorate-full");
+    fs::create_dir_all(&root).expect("create temp repo");
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=Example User",
+            "-c",
+            "user.email=example@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "subject",
+            "-q",
+        ],
+    );
+
+    let global = root.join("global-config");
+    fs::write(&global, b"[log]\n\tdecorate = full\n").expect("write global config");
+    let args = ["log", "--format=%s%d", "-1"];
+    let run_with_global = |program: &str| {
+        Command::new(program)
+            .current_dir(&root)
+            .args(args)
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+    };
+    let expected = run_with_global(sley_testkit::oracle_git());
+    let actual = run_with_global(sley_testkit::sley_bin!());
+    assert_same_output(actual, expected, &args);
+
+    let _ = fs::remove_dir_all(&root);
+}

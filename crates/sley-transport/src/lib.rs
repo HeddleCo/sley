@@ -1573,6 +1573,7 @@ impl Default for UreqHttpClient {
 #[cfg(feature = "http-client")]
 impl HttpClient for UreqHttpClient {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
+        trace_curl_request("GET", url, headers, false);
         let mut request = self.agent.get(url);
         for (name, value) in headers {
             request = request.header(*name, *value);
@@ -1590,6 +1591,7 @@ impl HttpClient for UreqHttpClient {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<HttpResponse> {
+        trace_curl_request("POST", url, headers, false);
         let mut request = self.agent.post(url).header("Content-Type", content_type);
         for (name, value) in headers {
             request = request.header(*name, *value);
@@ -1607,6 +1609,7 @@ impl HttpClient for UreqHttpClient {
         headers: &[(&str, &str)],
         body: &mut dyn std::io::Read,
     ) -> Result<HttpResponse> {
+        trace_curl_request("POST", url, headers, true);
         let mut request = self.agent.post(url).header("Content-Type", content_type);
         for (name, value) in headers {
             request = request.header(*name, *value);
@@ -1617,6 +1620,53 @@ impl HttpClient for UreqHttpClient {
             .send(ureq::SendBody::from_reader(body))
             .map_err(|err| http_transport_error(url, &err))?;
         Ok(http_response_from_ureq(response))
+    }
+}
+
+/// Emit the stable request-side portion of Git's curl trace for Sley's native
+/// HTTP client. The transfer remains in-process; this preserves the public
+/// `GIT_TRACE_CURL` observability surface without manufacturing a helper
+/// process. Response payloads and authorization values are intentionally not
+/// logged.
+#[cfg(feature = "http-client")]
+fn trace_curl_request(method: &str, url: &str, headers: &[(&str, &str)], chunked: bool) {
+    let Some(mut sink) = curl_trace_sink() else {
+        return;
+    };
+    let rendered = curl_request_trace(method, url, headers, chunked);
+    let _ = sink.write_all(rendered.as_bytes());
+    let _ = sink.flush();
+}
+
+#[cfg(feature = "http-client")]
+fn curl_request_trace(method: &str, url: &str, headers: &[(&str, &str)], chunked: bool) -> String {
+    let display_url = sley_core::redact_url_for_display(url);
+    let mut rendered = format!("=> Send header: {method} {display_url}\n");
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        rendered.push_str(&format!("=> Send header: {name}: {value}\n"));
+    }
+    if chunked {
+        rendered.push_str("=> Send header: Transfer-Encoding: chunked\n");
+    }
+    rendered
+}
+
+#[cfg(feature = "http-client")]
+fn curl_trace_sink() -> Option<Box<dyn Write>> {
+    let value = std::env::var("GIT_TRACE_CURL").ok()?;
+    match value.to_ascii_lowercase().as_str() {
+        "" | "0" | "false" => None,
+        "1" | "2" | "true" => Some(Box::new(std::io::stderr())),
+        _ if std::path::Path::new(&value).is_absolute() => std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(value)
+            .ok()
+            .map(|file| Box::new(file) as Box<dyn Write>),
+        _ => None,
     }
 }
 
@@ -2823,5 +2873,24 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn native_http_trace_reports_protocol_and_chunking_without_credentials() {
+        let trace = curl_request_trace(
+            "POST",
+            "https://user:secret@example.test/repo/git-upload-pack",
+            &[
+                ("Git-Protocol", "version=2"),
+                ("Authorization", "Basic c2VjcmV0"),
+            ],
+            true,
+        );
+        assert!(trace.contains("Send header: POST https://<redacted>@example.test/"));
+        assert!(trace.contains("Send header: Git-Protocol: version=2"));
+        assert!(trace.contains("Send header: Transfer-Encoding: chunked"));
+        assert!(!trace.contains("Authorization"));
+        assert!(!trace.contains("secret"));
     }
 }

@@ -20,8 +20,8 @@ pub(crate) use admin::{
 };
 pub(crate) use clone::{cmd_clone, parse_clone_depth};
 pub(crate) use config::{
-    read_repo_config, read_repo_config_on_disk, remote_exists, remote_names,
-    repo_current_branch_name, validate_remote_name, write_repo_config,
+    read_effective_repo_config, read_repo_config, read_repo_config_on_disk, remote_exists,
+    remote_names, repo_current_branch_name, validate_remote_name, write_repo_config,
 };
 pub(crate) use fetch::{
     FetchSubmoduleRequest, StdoutProgress, changed_gitlinks_for_fetch, cmd_fetch, fetch_bundle,

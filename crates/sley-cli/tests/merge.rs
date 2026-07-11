@@ -156,6 +156,57 @@ fn default_branch(dir: &Path) -> String {
 }
 
 #[test]
+fn merge_previous_branch_with_ancestry_suffix_names_branch_like_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("merge-previous-branch-suffix");
+    let reference = root.join("reference");
+    let candidate = root.join("candidate");
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            reference.to_str().expect("UTF-8 test repository path"),
+        ],
+    );
+    write_file(&reference, "base", "base\n");
+    git_ok(&reference, &["add", "base"]);
+    git_ok(&reference, &["commit", "-qm", "base"]);
+    git_ok(&reference, &["branch", "other"]);
+    write_file(&reference, "main", "main\n");
+    git_ok(&reference, &["add", "main"]);
+    git_ok(&reference, &["commit", "-qm", "main"]);
+    git_ok(&reference, &["checkout", "-q", "other"]);
+    for (path, subject) in [("other-one", "other one"), ("other-two", "other two")] {
+        write_file(&reference, path, subject);
+        git_ok(&reference, &["add", path]);
+        git_ok(&reference, &["commit", "-qm", subject]);
+    }
+    git_ok(&reference, &["checkout", "-q", "main"]);
+    copy_dir_all(&reference, &candidate);
+
+    let expected = git(&reference, &["merge", "@{-1}~1"]);
+    let actual = sley(&candidate, &["merge", "@{-1}~1"]);
+    assert!(expected.status.success());
+    assert!(
+        actual.status.success(),
+        "Sley merge failed: {}",
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert_eq!(
+        git(&candidate, &["cat-file", "commit", "HEAD"]).stdout,
+        git(&reference, &["cat-file", "commit", "HEAD"]).stdout,
+        "merge commit bytes differed"
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn merge_branch_mergeoptions_malformed_on_main_fails_like_git() {
     if !git_available() {
         return;

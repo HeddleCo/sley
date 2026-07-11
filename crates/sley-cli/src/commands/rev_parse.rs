@@ -2176,6 +2176,9 @@ fn display_git_path(
     if let Some(path) = display_git_path_env_override(cwd, path_format, path)? {
         return Ok(path);
     }
+    if let Some(path) = display_git_path_hooks_override(cwd, git_dir, path_format, path)? {
+        return Ok(path);
+    }
     let base = git_path_base_dir(cli_session, git_dir, path)?;
     match path_format {
         RevParsePathFormat::Default => Ok(join_display_path(
@@ -2186,6 +2189,40 @@ fn display_git_path(
         RevParsePathFormat::Relative => {
             let target = base.join(path);
             relative_path_from_absolute(cwd, &target)
+        }
+    }
+}
+
+fn display_git_path_hooks_override(
+    cwd: &Path,
+    git_dir: &Path,
+    path_format: RevParsePathFormat,
+    path: &str,
+) -> Result<Option<String>> {
+    let suffix = if path == "hooks" {
+        Some("")
+    } else {
+        path.strip_prefix("hooks/")
+    };
+    let Some(suffix) = suffix else {
+        return Ok(None);
+    };
+    let config = commands::remote::read_effective_repo_config(git_dir, cwd)
+        .map_err(report_config_setup_error)?;
+    let Some(configured) = config.get("core", None, "hookspath") else {
+        return Ok(None);
+    };
+    let base = PathBuf::from(configured);
+    match path_format {
+        RevParsePathFormat::Default => Ok(Some(join_display_path(configured, suffix))),
+        RevParsePathFormat::Absolute => Ok(Some(
+            absolute_env_git_path(cwd, &base, suffix)?
+                .display()
+                .to_string(),
+        )),
+        RevParsePathFormat::Relative => {
+            let target = absolute_env_git_path(cwd, &base, suffix)?;
+            Ok(Some(relative_path_from_absolute(cwd, &target)?))
         }
     }
 }
