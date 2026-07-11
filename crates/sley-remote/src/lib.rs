@@ -117,13 +117,13 @@ mod local;
 pub use local::{
     INFINITE_DEPTH, LocalDeepenPlan, attach_receive_pack_capabilities,
     attach_upload_pack_capabilities, compute_local_deepen, compute_local_deepen_by_rev_list,
-    hydrate_reachable_from_local_promisor_remotes, install_fetch_pack_via_local_upload_pack,
-    local_fetch_advertisements, local_have_oids, receive_pack_features,
-    receive_pack_into_local_repository, receive_pack_request_uses_push_options,
-    receive_pack_stream_into_local_repository, serve_upload_pack_v2,
-    serve_upload_pack_v2_stateless_with_config, serve_upload_pack_v2_with_config,
-    upload_pack_features, upload_pack_from_local_repository, upload_pack_request_uses_sideband,
-    upload_pack_sideband_response,
+    hydrate_objects_from_local_promisor_remotes, hydrate_reachable_from_local_promisor_remotes,
+    install_fetch_pack_via_local_upload_pack, local_fetch_advertisements, local_have_oids,
+    receive_pack_features, receive_pack_into_local_repository,
+    receive_pack_request_uses_push_options, receive_pack_stream_into_local_repository,
+    serve_upload_pack_v2, serve_upload_pack_v2_stateless_with_config,
+    serve_upload_pack_v2_with_config, upload_pack_features, upload_pack_from_local_repository,
+    upload_pack_request_uses_sideband, upload_pack_sideband_response,
 };
 
 mod filter;
@@ -193,8 +193,9 @@ pub use protocol::{
 mod promisor;
 pub use promisor::{
     PromisorAcceptPolicy, PromisorRemoteDecision, PromisorRemoteField, PromisorRemoteFieldUpdate,
-    apply_promisor_remote_field_updates, config_has_promisor_remote, decide_promisor_remote_reply,
-    promisor_accept_policy, promisor_remote_auto_filter, promisor_remote_server_capability,
+    apply_promisor_remote_field_updates, config_has_promisor_remote,
+    configured_promisor_remote_names, decide_promisor_remote_reply, promisor_accept_policy,
+    promisor_remote_auto_filter, promisor_remote_server_capability,
 };
 
 mod resolve;

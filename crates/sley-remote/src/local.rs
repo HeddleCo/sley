@@ -1249,7 +1249,7 @@ pub fn install_fetch_pack_via_local_upload_pack_with_promisor_decision(
         starts.extend(plan.extra_wants.iter().copied());
     }
     if remote_has_promisor && promisor_decision.accepted.is_empty() {
-        hydrate_reachable_promised_objects(remote_git_dir, &remote_db, format, &starts)?;
+        hydrate_reachable_promised_objects(remote_git_dir, &remote_db, format, &starts, &excluded)?;
     }
     for want in &starts {
         if !remote_db.contains(want)?
@@ -1291,6 +1291,80 @@ pub fn install_fetch_pack_via_local_upload_pack_with_promisor_decision(
         .unwrap_or_default())
 }
 
+/// Hydrate the requested object IDs from configured local/file promisor
+/// remotes, returning the subset that was installed.
+///
+/// Remotes are tried in [`crate::configured_promisor_remote_names`] order. A
+/// source that cannot provide an object is skipped so the next promisor can be
+/// tried; non-local transports remain the caller's responsibility.
+pub fn hydrate_objects_from_local_promisor_remotes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    objects: &[ObjectId],
+) -> Result<Vec<ObjectId>> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format)
+        .with_promisor_remote_present(repo_has_promisor_remote(git_dir));
+    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    let relative_base = if git_dir.file_name().is_some_and(|name| name == ".git") {
+        git_dir.parent().unwrap_or(git_dir)
+    } else {
+        git_dir
+    };
+    let mut missing = objects
+        .iter()
+        .copied()
+        .filter_map(|oid| match db.contains(&oid) {
+            Ok(false) => Some(Ok(oid)),
+            Ok(true) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    missing.sort_by_key(ObjectId::to_hex);
+    missing.dedup();
+    let requested = missing.clone();
+
+    for remote_name in crate::configured_promisor_remote_names(&config) {
+        let Some(url) = config
+            .get("remote", Some(&remote_name), "url")
+            .filter(|url| !url.is_empty())
+        else {
+            continue;
+        };
+        let Ok(crate::fetch::FetchSource::Local {
+            git_dir: promisor_git_dir,
+            ..
+        }) = crate::fetch_source_for_url(url, relative_base)
+        else {
+            continue;
+        };
+        for oid in missing.iter().copied() {
+            let _ = install_fetch_pack_via_local_upload_pack(
+                git_dir,
+                &promisor_git_dir,
+                format,
+                vec![oid],
+                None,
+                true,
+                false,
+                Some(sley_odb::PackObjectFilter::BlobNone),
+                Some(Vec::new()),
+                false,
+                None,
+            );
+        }
+        db.refresh_read_cache();
+        missing.retain(|oid| !db.contains(oid).unwrap_or(false));
+        if missing.is_empty() {
+            break;
+        }
+    }
+
+    Ok(requested
+        .into_iter()
+        .filter(|oid| db.contains(oid).unwrap_or(false))
+        .collect())
+}
+
 /// Hydrate every missing object in `starts`' reachable closure from configured
 /// local promisor remotes.
 ///
@@ -1304,7 +1378,7 @@ pub fn hydrate_reachable_from_local_promisor_remotes(
 ) -> Result<()> {
     let remote_db =
         FileObjectDatabase::from_git_dir(remote_git_dir, format).with_promisor_remote_present(true);
-    hydrate_reachable_promised_objects(remote_git_dir, &remote_db, format, starts)
+    hydrate_reachable_promised_objects(remote_git_dir, &remote_db, format, starts, &HashSet::new())
 }
 
 fn hydrate_reachable_promised_objects(
@@ -1312,6 +1386,7 @@ fn hydrate_reachable_promised_objects(
     remote_db: &FileObjectDatabase,
     format: ObjectFormat,
     starts: &[ObjectId],
+    excluded: &HashSet<ObjectId>,
 ) -> Result<()> {
     let config = sley_config::read_repo_config(remote_git_dir, None).unwrap_or_default();
     let relative_base = if remote_git_dir
@@ -1331,6 +1406,7 @@ fn hydrate_reachable_promised_objects(
         )?;
         let mut missing = reachable
             .into_iter()
+            .filter(|oid| !excluded.contains(oid))
             .filter_map(|oid| match remote_db.contains(&oid) {
                 Ok(false) => Some(Ok(oid)),
                 Ok(_) => None,
@@ -2678,6 +2754,47 @@ mod tests {
     }
 
     #[test]
+    fn exact_object_hydration_uses_configured_local_promisors() {
+        let root = unique_local_test_dir("exact-promisor-hydration");
+        let client_git = root.join("client.git");
+        let origin_git = root.join("origin.git");
+        let lop_git = root.join("lop.git");
+        for git_dir in [&client_git, &origin_git, &lop_git] {
+            fs::create_dir_all(git_dir.join("objects")).expect("test repository objects");
+            fs::create_dir_all(git_dir.join("refs")).expect("test repository refs");
+            fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+                .expect("test repository HEAD");
+        }
+        fs::write(
+            client_git.join("config"),
+            format!(
+                "[extensions]\n\tpartialClone = origin\n\
+                 [remote \"origin\"]\n\tpromisor = true\n\turl = {}\n\
+                 [remote \"lop\"]\n\tpromisor = true\n\turl = {}\n",
+                origin_git.display(),
+                lop_git.display()
+            ),
+        )
+        .expect("client promisor config");
+
+        let format = ObjectFormat::Sha1;
+        let blob = EncodedObject::new(ObjectType::Blob, b"lazy payload\n".to_vec());
+        let blob_oid =
+            write_test_object(&FileObjectDatabase::from_git_dir(&lop_git, format), &blob);
+        let hydrated =
+            hydrate_objects_from_local_promisor_remotes(&client_git, format, &[blob_oid])
+                .expect("hydrate exact object");
+        assert_eq!(hydrated, vec![blob_oid]);
+        assert!(
+            FileObjectDatabase::from_git_dir(&client_git, format)
+                .contains(&blob_oid)
+                .expect("client object lookup")
+        );
+
+        fs::remove_dir_all(root).expect("remove test repositories");
+    }
+
+    #[test]
     fn accepted_promisor_omits_gap_while_rejection_hydrates_server() {
         let root = unique_local_test_dir("promisor-traversal-policy");
         let origin_git = root.join("origin.git");
@@ -2844,6 +2961,78 @@ mod tests {
             .expect("hydrate configured promisor gap");
         server_db.refresh_read_cache();
         assert!(server_db.contains(&blob_oid).expect("hydrated blob lookup"));
+
+        fs::remove_dir_all(root).expect("remove test repositories");
+    }
+
+    #[test]
+    fn promisor_hydration_skips_objects_excluded_by_client_haves() {
+        let root = unique_local_test_dir("promisor-fetch-exclusions");
+        let origin_git = root.join("origin.git");
+        let server_git = root.join("server.git");
+        let lop_git = root.join("lop.git");
+        for git_dir in [&origin_git, &server_git, &lop_git] {
+            fs::create_dir_all(git_dir.join("objects")).expect("test repository objects");
+            fs::create_dir_all(git_dir.join("refs")).expect("test repository refs");
+            fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+                .expect("test repository HEAD");
+        }
+
+        let format = ObjectFormat::Sha1;
+        let origin_db = FileObjectDatabase::from_git_dir(&origin_git, format);
+        let old_blob = EncodedObject::new(ObjectType::Blob, b"old promised payload\n".to_vec());
+        let new_blob = EncodedObject::new(ObjectType::Blob, b"new promised payload\n".to_vec());
+        let old_blob_oid = write_test_object(&origin_db, &old_blob);
+        let new_blob_oid = write_test_object(&origin_db, &new_blob);
+        let tree_oid = write_test_object(
+            &origin_db,
+            &test_tree(&[
+                (0o100644, b"old", old_blob_oid),
+                (0o100644, b"new", new_blob_oid),
+            ]),
+        );
+        let commit_oid = write_test_object(&origin_db, &test_commit(tree_oid, &[], b"tip\n"));
+        let lop_db = FileObjectDatabase::from_git_dir(&lop_git, format);
+        write_test_object(&lop_db, &old_blob);
+        write_test_object(&lop_db, &new_blob);
+
+        sley_odb::build_and_install_reachable_pack_filtered(
+            &origin_db,
+            &FileObjectDatabase::from_git_dir(&server_git, format),
+            format,
+            vec![commit_oid],
+            &HashSet::new(),
+            RawPackInstallOptions {
+                promisor: true,
+                ..Default::default()
+            },
+            Some(sley_odb::PackObjectFilter::BlobNone),
+            None,
+        )
+        .expect("create incomplete promisor server")
+        .expect("promisor pack");
+        fs::write(
+            server_git.join("config"),
+            format!(
+                "[remote \"lop\"]\n\tpromisor = true\n\turl = {}\n",
+                lop_git.display()
+            ),
+        )
+        .expect("server promisor config");
+
+        let server_db = FileObjectDatabase::from_git_dir(&server_git, format)
+            .with_promisor_remote_present(true);
+        hydrate_reachable_promised_objects(
+            &server_git,
+            &server_db,
+            format,
+            &[commit_oid],
+            &HashSet::from([old_blob_oid]),
+        )
+        .expect("hydrate only non-excluded gap");
+        server_db.refresh_read_cache();
+        assert!(!server_db.contains(&old_blob_oid).expect("old blob lookup"));
+        assert!(server_db.contains(&new_blob_oid).expect("new blob lookup"));
 
         fs::remove_dir_all(root).expect("remove test repositories");
     }

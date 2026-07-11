@@ -180,6 +180,47 @@ pub fn config_has_promisor_remote(config: &GitConfig) -> bool {
         })
 }
 
+/// Configured promisor remotes in Git's lazy-fetch order.
+///
+/// Remotes retain config order, except the legacy/default remote named by
+/// `extensions.partialClone`, which Git moves to the tail so more specialized
+/// promisors are tried first. If that default is not otherwise configured as a
+/// promisor, it is still appended as the final fallback.
+pub fn configured_promisor_remote_names(config: &GitConfig) -> Vec<String> {
+    let mut config_order = Vec::new();
+    for section in &config.sections {
+        if section.name.eq_ignore_ascii_case("remote")
+            && let Some(name) = section.subsection.as_deref()
+            && !config_order.iter().any(|existing| existing == name)
+        {
+            config_order.push(name.to_string());
+        }
+    }
+    let mut names = config_order
+        .into_iter()
+        .filter(|name| {
+            config
+                .get_bool("remote", Some(name), "promisor")
+                .unwrap_or(false)
+                || config
+                    .get("remote", Some(name), "partialCloneFilter")
+                    .is_some_and(|value| !value.is_empty())
+        })
+        .collect::<Vec<_>>();
+    if let Some(default) = config
+        .get("extensions", None, "partialClone")
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(position) = names.iter().position(|name| name == default) {
+            let default = names.remove(position);
+            names.push(default);
+        } else {
+            names.push(default.to_string());
+        }
+    }
+    names
+}
+
 fn configured_fields(config: &GitConfig, key: &str) -> Vec<String> {
     config
         .get("promisor", None, key)
@@ -401,6 +442,21 @@ mod tests {
         assert_eq!(
             promisor_remote_auto_filter(&decision),
             Some(sley_odb::PackObjectFilter::BlobLimit(9500))
+        );
+    }
+
+    #[test]
+    fn lazy_fetch_order_moves_default_partial_clone_remote_to_tail() {
+        let config = GitConfig::parse(
+            b"[extensions]\n\tpartialClone = origin\n\
+              [remote \"origin\"]\n\tpromisor = true\n\turl = file:///origin\n\
+              [remote \"lop\"]\n\tpromisor = true\n\turl = file:///lop\n\
+              [remote \"archive\"]\n\tpartialCloneFilter = blob:none\n\turl = file:///archive\n",
+        )
+        .expect("config");
+        assert_eq!(
+            configured_promisor_remote_names(&config),
+            vec!["lop", "archive", "origin"]
         );
     }
 }

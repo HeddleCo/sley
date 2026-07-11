@@ -697,6 +697,35 @@ fn pull_checkout_into_void(
     Ok(())
 }
 
+fn hydrate_pull_target_blobs(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+    lazy_fetch: bool,
+) -> Result<()> {
+    if !lazy_fetch {
+        return Ok(());
+    }
+    let tree_oid = read_commit_tree(db, format, commit_oid)?;
+    let target = sley_diff_merge::flatten_tree(db, format, &tree_oid)?;
+    let missing = target
+        .values()
+        .filter(|(mode, _)| !sley_index::is_gitlink(*mode))
+        .filter_map(|(_, oid)| match db.contains(oid) {
+            Ok(false) => Some(Ok(*oid)),
+            Ok(true) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !missing.is_empty() {
+        let _ =
+            sley_remote::hydrate_objects_from_local_promisor_remotes(git_dir, format, &missing)?;
+        db.refresh_read_cache();
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     // git's `set_reflog_message`: record the pull invocation (`pull …`) as the
     // reflog action so a fast-forward merge writes `pull …: Fast-forward`. The
@@ -1124,6 +1153,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
         ensure_pull_can_merge(&config)?;
     }
     if fast_forward {
+        hydrate_pull_target_blobs(&git_dir, &db, format, &theirs_oid, cli_session.lazy_fetch())?;
         let mut merge_args = Vec::new();
         if effective_rebase.enabled() {
             merge_args.push("--ff-only".to_string());

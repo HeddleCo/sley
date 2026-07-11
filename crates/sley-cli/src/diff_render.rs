@@ -2,7 +2,7 @@
 #![allow(clippy::expect_used)]
 
 use crate::commands;
-use crate::commands::remote::{read_repo_config, remote_names};
+use crate::commands::remote::read_repo_config;
 use crate::session;
 use crate::{
     BString, DEFAULT_BIG_FILE_THRESHOLD, GitConfig, GitError, ObjectFormat, ObjectId, Result,
@@ -2440,25 +2440,10 @@ pub(crate) fn read_object_maybe_prefetch_promisor(
     Ok(object)
 }
 
-/// Promisor remotes to consult for a lazy fetch, in git's
-/// `promisor_remote_get_direct` order: the default remote named by
-/// `extensions.partialclone` first, then every other `remote.<name>.promisor`.
+/// Promisor remotes to consult for a lazy fetch, in Git's
+/// `promisor_remote_get_direct` order.
 pub(crate) fn promisor_remote_names(config: &GitConfig) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Some(default) = config
-        .get("extensions", None, "partialclone")
-        .filter(|value| !value.is_empty())
-    {
-        names.push(default.to_string());
-    }
-    for name in remote_names(config) {
-        if config.get_bool("remote", Some(&name), "promisor") == Some(true)
-            && !names.contains(&name)
-        {
-            names.push(name);
-        }
-    }
-    names
+    sley_remote::configured_promisor_remote_names(config)
 }
 
 fn prefetch_local_promisor_object(
