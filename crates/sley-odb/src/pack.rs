@@ -667,7 +667,11 @@ impl FileObjectDatabase {
     }
 
     pub fn from_git_dir(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Self {
-        Self::new(repository_objects_dir(git_dir), format)
+        let git_dir = git_dir.as_ref();
+        let shared_repository = sley_formats::SharedRepositoryPermissions::from_git_dir(git_dir);
+        let mut database = Self::new(repository_objects_dir(git_dir), format);
+        database.loose = database.loose.with_shared_repository(shared_repository);
+        database
     }
 
     /// Attach an explicit replacement map. Object enumeration/storage queries

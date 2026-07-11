@@ -3647,12 +3647,23 @@ fn gitdir_link_path(_worktree: &Path, git_dir: &Path) -> Result<String> {
 
 fn create_shared_dir(path: impl AsRef<Path>, shared_repository: Option<&str>) -> Result<()> {
     let path = path.as_ref();
-    if path.exists() {
-        apply_shared_dir_mode(path, shared_repository)?;
-        return Ok(());
+    let mut created = Vec::new();
+    let mut ancestor = path;
+    while !ancestor.exists() {
+        created.push(ancestor.to_path_buf());
+        let Some(parent) = ancestor.parent() else {
+            break;
+        };
+        ancestor = parent;
     }
     fs::create_dir_all(path)?;
-    apply_shared_dir_mode(path, shared_repository)?;
+    if created.is_empty() {
+        apply_shared_dir_mode(path, shared_repository)?;
+    } else {
+        for directory in created.iter().rev() {
+            apply_shared_dir_mode(directory, shared_repository)?;
+        }
+    }
     Ok(())
 }
 
@@ -3710,6 +3721,61 @@ fn apply_shared_file_mode(path: &Path, shared_repository: Option<&str>) -> Resul
 /// rules. Engine crates call this after atomically publishing repository files.
 pub fn adjust_shared_repository_file(path: &Path, shared_repository: Option<&str>) -> Result<()> {
     apply_shared_file_mode(path, shared_repository)
+}
+
+/// Repository permission policy captured once and reused by storage writers.
+///
+/// Keeping this typed policy on an open object/reference store avoids rereading
+/// config for every loose object, ref, or reflog while ensuring every newly
+/// published path receives Git's `core.sharedRepository` adjustment.
+#[derive(Debug, Clone, Default)]
+pub struct SharedRepositoryPermissions {
+    git_dir: Option<PathBuf>,
+    value: std::sync::Arc<std::sync::OnceLock<Option<String>>>,
+}
+
+impl SharedRepositoryPermissions {
+    /// Capture a repository path; the sharing mode is loaded lazily on the
+    /// first write and then reused by every clone of the policy.
+    #[must_use]
+    pub fn from_git_dir(git_dir: &Path) -> Self {
+        Self {
+            git_dir: Some(git_dir.to_path_buf()),
+            value: std::sync::Arc::default(),
+        }
+    }
+
+    /// Apply the policy to a file after it is atomically published.
+    pub fn adjust_file(&self, path: &Path) -> Result<()> {
+        apply_shared_file_mode(path, self.value())
+    }
+
+    /// Create a directory hierarchy and apply the policy to every directory
+    /// created by this call, including intermediate components.
+    pub fn create_dir_all(&self, path: &Path) -> Result<()> {
+        create_shared_dir(path, self.value())
+    }
+
+    /// Apply the policy to an existing directory.
+    pub fn adjust_dir(&self, path: &Path) -> Result<()> {
+        apply_shared_dir_mode(path, self.value())
+    }
+
+    fn value(&self) -> Option<&str> {
+        self.value
+            .get_or_init(|| {
+                self.git_dir.as_ref().and_then(|git_dir| {
+                    GitConfig::read(git_dir.join("config"))
+                        .ok()
+                        .and_then(|config| {
+                            config
+                                .get("core", None, "sharedRepository")
+                                .map(str::to_string)
+                        })
+                })
+            })
+            .as_deref()
+    }
 }
 
 /// Validate and canonicalize a `core.sharedRepository` value as `git init`
@@ -5059,6 +5125,54 @@ mod tests {
 
         let config = GitConfig::read(layout.git_dir.join("config")).expect("read config");
         assert_eq!(config.get("core", None, "sharedRepository"), Some("1"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_shared_repository_adjusts_intermediate_layout_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_temp_dir("init-shared-exact-dirs");
+        let repo = root.join("repo");
+        let layout = RepositoryBootstrap::init(InitOptions {
+            git_dir_override: None,
+            core_worktree: None,
+            object_dir: None,
+            worktree: repo,
+            object_format: ObjectFormat::Sha1,
+            object_format_explicit: false,
+            bare: false,
+            initial_branch: "main".into(),
+            template_dir: None,
+            copy_template_config: false,
+            separate_git_dir: None,
+            shared_repository: Some("0660".into()),
+            ref_storage: RefStorageFormat::Files,
+            ref_storage_explicit: false,
+        })
+        .expect("init shared repository");
+
+        for relative in [
+            "",
+            "objects",
+            "objects/info",
+            "objects/pack",
+            "refs",
+            "refs/heads",
+        ] {
+            let path = layout.git_dir.join(relative);
+            let mode = fs::metadata(&path)
+                .expect("shared directory")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o7777,
+                0o2770,
+                "unexpected mode for {}",
+                path.display()
+            );
+        }
         let _ = fs::remove_dir_all(&root);
     }
 

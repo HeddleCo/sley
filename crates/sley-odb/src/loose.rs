@@ -216,6 +216,7 @@ pub enum LooseObjectIntegrity {
 pub struct LooseObjectStore {
     pub(crate) objects_dir: PathBuf,
     format: ObjectFormat,
+    shared_repository: sley_formats::SharedRepositoryPermissions,
     /// Lazily-populated set of loose object ids present on disk, mirroring git's
     /// `loose_objects_cache` (object-file.c). A lookup scans the queried
     /// `objects/XX/` fanout once; afterward misses in that fanout are in-memory
@@ -232,8 +233,17 @@ impl LooseObjectStore {
         Self {
             objects_dir: objects_dir.into(),
             format,
+            shared_repository: sley_formats::SharedRepositoryPermissions::default(),
             loose_cache: Arc::new(Mutex::new(LoosePresenceCache::default())),
         }
+    }
+
+    pub(crate) fn with_shared_repository(
+        mut self,
+        shared_repository: sley_formats::SharedRepositoryPermissions,
+    ) -> Self {
+        self.shared_repository = shared_repository;
+        self
     }
 
     /// Whether `oid` is present according to the loose-object cache, populating
@@ -671,7 +681,7 @@ impl ObjectWriter for LooseObjectStore {
         let parent = path
             .parent()
             .ok_or_else(|| GitError::InvalidPath("loose object path has no parent".into()))?;
-        fs::create_dir_all(parent)?;
+        self.shared_repository.create_dir_all(parent)?;
         let temp_path = unique_temp_path(parent);
         let write_result = (|| -> Result<()> {
             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -706,6 +716,7 @@ impl ObjectWriter for LooseObjectStore {
             let _ = fs::remove_file(&temp_path);
         }
         write_result?;
+        self.shared_repository.adjust_file(&path)?;
         self.note_loose_write(oid);
         Ok(oid)
     }

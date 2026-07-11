@@ -1049,7 +1049,8 @@ pub fn install_repack_result_with_bitmap_options(
 ) -> Result<()> {
     let objects_dir = repository_objects_dir(git_dir);
     let pack_dir = objects_dir.join("pack");
-    fs::create_dir_all(&pack_dir)?;
+    let shared_repository = sley_formats::SharedRepositoryPermissions::from_git_dir(git_dir);
+    shared_repository.create_dir_all(&pack_dir)?;
 
     // Validate the public bytes against the private provenance that
     // `repack_all_objects` captured from `PackFile::write_packed`. This avoids
@@ -1091,6 +1092,14 @@ pub fn install_repack_result_with_bitmap_options(
     }
     write_pack_component(&new_index_path, &result.idx)?;
     let new_promisor_path = write_promisor_pack_sidecar(&pack_dir, &pack_name, result.promisor)?;
+    shared_repository.adjust_file(&new_pack_path)?;
+    if new_rev_path.exists() {
+        shared_repository.adjust_file(&new_rev_path)?;
+    }
+    shared_repository.adjust_file(&new_index_path)?;
+    if let Some(path) = new_promisor_path.as_deref() {
+        shared_repository.adjust_file(path)?;
+    }
 
     if let Some(tips) = bitmap_tips {
         // Build before pruning: the closure walk reads objects through the
@@ -1133,6 +1142,7 @@ pub fn install_repack_result_with_bitmap_options(
             let bitmap_path = pack_dir.join(format!("{pack_name}.bitmap"));
             remove_file_if_exists(&bitmap_path)?;
             write_pack_component(&bitmap_path, &bitmap)?;
+            shared_repository.adjust_file(&bitmap_path)?;
         }
     }
 

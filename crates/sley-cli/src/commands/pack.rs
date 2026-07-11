@@ -1356,13 +1356,15 @@ fn repack_try_update_server_info_from_result(
         info_refs.push(b'\n');
     }
 
+    let shared_repository =
+        sley::plumbing::sley_formats::SharedRepositoryPermissions::from_git_dir(common_git_dir);
     let info_dir = common_git_dir.join("info");
-    fs::create_dir_all(&info_dir)?;
-    repack_write_server_info_file(&info_dir.join("refs"), &info_refs)?;
+    shared_repository.create_dir_all(&info_dir)?;
+    repack_write_server_info_file(&info_dir.join("refs"), &info_refs, &shared_repository)?;
 
     let objects_dir = repository_objects_dir(common_git_dir);
     let objects_info_dir = objects_dir.join("info");
-    fs::create_dir_all(&objects_info_dir)?;
+    shared_repository.create_dir_all(&objects_info_dir)?;
     let pack_dir = objects_dir.join("pack");
     let mut packs = Vec::new();
     if pack_dir.exists() {
@@ -1393,16 +1395,23 @@ fn repack_try_update_server_info_from_result(
         info_packs.push(b'\n');
     }
     info_packs.push(b'\n');
-    repack_write_server_info_file(&objects_info_dir.join("packs"), &info_packs)?;
+    repack_write_server_info_file(
+        &objects_info_dir.join("packs"),
+        &info_packs,
+        &shared_repository,
+    )?;
     Ok(true)
 }
 
-fn repack_write_server_info_file(path: &Path, content: &[u8]) -> Result<()> {
-    if fs::read(path).is_ok_and(|existing| existing == content) {
-        return Ok(());
+fn repack_write_server_info_file(
+    path: &Path,
+    content: &[u8],
+    shared_repository: &sley::plumbing::sley_formats::SharedRepositoryPermissions,
+) -> Result<()> {
+    if !fs::read(path).is_ok_and(|existing| existing == content) {
+        fs::write(path, content)?;
     }
-    fs::write(path, content)?;
-    Ok(())
+    shared_repository.adjust_file(path)
 }
 
 pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {

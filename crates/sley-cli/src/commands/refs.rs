@@ -1334,25 +1334,20 @@ pub(crate) fn update_server_info_at(git_dir: &Path, args: &[String]) -> Result<(
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    let shared_repository = sley_config::GitConfig::read(common_git_dir.join("config"))
-        .ok()
-        .and_then(|config| {
-            config
-                .get("core", None, "sharedRepository")
-                .map(str::to_owned)
-        });
+    let shared_repository =
+        sley::plumbing::sley_formats::SharedRepositoryPermissions::from_git_dir(&common_git_dir);
 
     let info_dir = common_git_dir.join("info");
-    fs::create_dir_all(&info_dir)?;
+    shared_repository.create_dir_all(&info_dir)?;
     update_server_info_file(
         &info_dir.join("refs"),
         &update_server_info_refs(&store, &db, format)?,
         force,
-        shared_repository.as_deref(),
+        &shared_repository,
     )?;
 
     let objects_info_dir = repository_objects_dir(&common_git_dir).join("info");
-    fs::create_dir_all(&objects_info_dir)?;
+    shared_repository.create_dir_all(&objects_info_dir)?;
     update_server_info_file(
         &objects_info_dir.join("packs"),
         &update_server_info_packs(
@@ -1360,7 +1355,7 @@ pub(crate) fn update_server_info_at(git_dir: &Path, args: &[String]) -> Result<(
             format,
         )?,
         force,
-        shared_repository.as_deref(),
+        &shared_repository,
     )?;
     Ok(())
 }
@@ -1405,17 +1400,12 @@ fn update_server_info_file(
     path: &Path,
     content: &[u8],
     force: bool,
-    shared_repository: Option<&str>,
+    shared_repository: &sley::plumbing::sley_formats::SharedRepositoryPermissions,
 ) -> Result<()> {
-    if !force
-        && let Ok(existing) = fs::read(path)
-        && existing == content
-    {
-        return Ok(());
+    if force || !fs::read(path).is_ok_and(|existing| existing == content) {
+        fs::write(path, content)?;
     }
-    fs::write(path, content)?;
-    sley::plumbing::sley_formats::adjust_shared_repository_file(path, shared_repository)?;
-    Ok(())
+    shared_repository.adjust_file(path)
 }
 
 fn update_server_info_refs(

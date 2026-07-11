@@ -784,6 +784,7 @@ pub struct FileRefStore {
     reftable_write_options: ReftableWriteOptions,
     combine_reftable_logs: bool,
     reference_fsync: ReferenceFsyncPolicy,
+    shared_repository: sley_formats::SharedRepositoryPermissions,
 }
 
 #[derive(Debug, Clone)]
@@ -1080,6 +1081,8 @@ impl FileRefStore {
         let common_dir = repository_common_dir(&git_dir);
         let configured = configured_ref_storage_backend(&common_dir, honor_reference_backend_env);
         let reference_fsync = configured_reference_fsync(&common_dir);
+        let shared_repository =
+            sley_formats::SharedRepositoryPermissions::from_git_dir(&common_dir);
         let storage_dir = match configured.backend.as_ref() {
             Some((_, Some(path))) => path.clone(),
             Some((RefBackendKind::Reftable, None)) if git_dir != common_dir => git_dir.clone(),
@@ -1095,6 +1098,7 @@ impl FileRefStore {
             reftable_write_options: ReftableWriteOptions::default(),
             combine_reftable_logs: false,
             reference_fsync,
+            shared_repository,
         }
     }
 
@@ -1263,12 +1267,13 @@ impl FileRefStore {
         let parent = path
             .parent()
             .ok_or_else(|| GitError::InvalidPath("reflog path has no parent".into()))?;
-        fs::create_dir_all(parent)?;
+        self.shared_repository.create_dir_all(parent)?;
         let mut bytes = Vec::new();
         for entry in entries {
             bytes.extend_from_slice(&entry.to_line());
         }
-        write_locked(&path, &bytes, self.reference_fsync.method_if_enabled())
+        write_locked(&path, &bytes, self.reference_fsync.method_if_enabled())?;
+        self.shared_repository.adjust_file(&path)
     }
 
     /// Export the live refs and, when requested, all non-empty reflogs from the
@@ -2569,6 +2574,7 @@ impl FileRefStore {
             reftable_write_options: self.reftable_write_options,
             combine_reftable_logs: self.combine_reftable_logs,
             reference_fsync: self.reference_fsync,
+            shared_repository: self.shared_repository.clone(),
         }
     }
 
@@ -3288,12 +3294,13 @@ impl FileRefStore {
         let parent = path
             .parent()
             .ok_or_else(|| GitError::InvalidPath("ref path has no parent".into()))?;
-        fs::create_dir_all(parent)?;
+        self.shared_repository.create_dir_all(parent)?;
         write_locked(
             &path,
             &write_loose_ref(reference),
             self.reference_fsync.method_if_enabled(),
-        )
+        )?;
+        self.shared_repository.adjust_file(&path)
     }
 
     fn delete_loose_ref(&self, name: &str) -> Result<()> {
@@ -3497,13 +3504,14 @@ impl FileRefStore {
         let parent = path
             .parent()
             .ok_or_else(|| GitError::InvalidPath("reflog path has no parent".into()))?;
-        fs::create_dir_all(parent)?;
+        self.shared_repository.create_dir_all(parent)?;
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)?;
+            .open(&path)?;
         file.write_all(&entry.to_line())?;
-        Ok(())
+        drop(file);
+        self.shared_repository.adjust_file(&path)
     }
 
     /// Append a completed loose-backend transaction's reflogs with one
@@ -3519,13 +3527,15 @@ impl FileRefStore {
                 .parent()
                 .ok_or_else(|| GitError::InvalidPath("reflog path has no parent".into()))?;
             if prepared_parents.insert(parent.to_path_buf()) {
-                fs::create_dir_all(parent)?;
+                self.shared_repository.create_dir_all(parent)?;
             }
             let mut file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path)?;
+                .open(&path)?;
             file.write_all(&entry.to_line())?;
+            drop(file);
+            self.shared_repository.adjust_file(&path)?;
         }
         Ok(())
     }
@@ -4848,6 +4858,12 @@ impl FileRefStore {
                 return Err(err);
             }
             if let Err(err) = apply_pending_change(&pending[index]) {
+                rollback_after_apply(&pending, index + 1);
+                return Err(err);
+            }
+            if matches!(pending[index].action, PendingPathAction::Write { .. })
+                && let Err(err) = self.shared_repository.adjust_file(&pending[index].path)
+            {
                 rollback_after_apply(&pending, index + 1);
                 return Err(err);
             }
