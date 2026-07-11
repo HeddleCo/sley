@@ -295,6 +295,11 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
     let mut options = request.options.clone();
     apply_configured_remote_tag_option(request.config, request.remote_name, &mut options);
     apply_configured_fetch_prune_option(request.config, request.remote_name, &mut options);
+    normalize_relative_deepen_for_complete_repository(
+        request.git_dir,
+        request.format,
+        &mut options,
+    )?;
     crate::protocol::check_transport_allowed(
         scheme_for_fetch_source(request.source),
         Some(request.config),
@@ -512,9 +517,6 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 )?
             };
             reject_shallow_clone_fetch(&options, &shallow_info)?;
-            if !options.dry_run {
-                crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
-            }
             finalize_fetch(
                 FetchFinalize {
                     git_dir: request.git_dir,
@@ -528,6 +530,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     opportunistic_dsts: &opportunistic_dsts,
                     validation: request.validation,
                     quarantine: &mut quarantine,
+                    shallow_info: &shallow_info,
                 },
                 &mut updates,
                 &mut outcome,
@@ -597,9 +600,6 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 },
             )?;
             reject_shallow_clone_fetch(&options, &shallow_info)?;
-            if !options.dry_run {
-                crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
-            }
             finalize_fetch(
                 FetchFinalize {
                     git_dir: request.git_dir,
@@ -613,6 +613,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     opportunistic_dsts: &opportunistic_dsts,
                     validation: request.validation,
                     quarantine: &mut quarantine,
+                    shallow_info: &shallow_info,
                 },
                 &mut updates,
                 &mut outcome,
@@ -691,9 +692,6 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 },
             )?;
             reject_shallow_clone_fetch(&options, &shallow_info)?;
-            if !options.dry_run {
-                crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
-            }
             finalize_fetch(
                 FetchFinalize {
                     git_dir: request.git_dir,
@@ -707,6 +705,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     opportunistic_dsts: &opportunistic_dsts,
                     validation: request.validation,
                     quarantine: &mut quarantine,
+                    shallow_info: &shallow_info,
                 },
                 &mut updates,
                 &mut outcome,
@@ -1023,13 +1022,10 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     options.filter.clone(),
                     negotiation_haves.clone(),
                     options.refetch,
-                    local_fetch_unpack_limit(request.git_dir, promisor_remote),
+                    local_fetch_unpack_limit(request.config, options.cloning, promisor_remote),
                     &promisor_decision,
                 )?
             };
-            if !options.dry_run {
-                crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
-            }
             finalize_fetch(
                 FetchFinalize {
                     git_dir: request.git_dir,
@@ -1043,6 +1039,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     opportunistic_dsts: &opportunistic_dsts,
                     validation: request.validation,
                     quarantine: &mut quarantine,
+                    shallow_info: &shallow_info,
                 },
                 &mut updates,
                 &mut outcome,
@@ -1201,6 +1198,7 @@ pub fn finalize_remote_helper_fetch(
             opportunistic_dsts: &opportunistic_dsts,
             validation: None,
             quarantine: &mut quarantine,
+            shallow_info: &[],
         },
         &mut updates,
         &mut outcome,
@@ -1231,16 +1229,28 @@ fn scheme_for_fetch_source(source: &FetchSource) -> &str {
     }
 }
 
-fn local_fetch_unpack_limit(git_dir: &Path, promisor_remote: bool) -> Option<usize> {
-    if promisor_remote {
+fn local_fetch_unpack_limit(
+    config: &GitConfig,
+    cloning: bool,
+    promisor_remote: bool,
+) -> Option<usize> {
+    // fetch-pack keeps the initial clone as a pack, but ordinary fetches use
+    // unpack-objects for transfers smaller than fetch.unpackLimit (falling
+    // back to transfer.unpackLimit, then Git's built-in default of 100).
+    // Promisor packs must remain packed so their sidecar metadata can describe
+    // the promised-object boundary.
+    if cloning || promisor_remote {
         return None;
     }
-    git_dir
-        .join("objects")
-        .join("info")
-        .join("alternates")
-        .exists()
-        .then_some(100)
+    let configured = config
+        .get("fetch", None, "unpackLimit")
+        .or_else(|| config.get("transfer", None, "unpackLimit"));
+    match configured.and_then(sley_config::parse_config_int) {
+        Some(limit) if limit > 0 => usize::try_from(limit).ok(),
+        Some(_) => None,
+        None if configured.is_some() => None,
+        None => Some(100),
+    }
 }
 
 /// Does the (graft-aware) history of `tip` on the remote touch one of the
@@ -1291,6 +1301,24 @@ fn shallow_boundary_for_request(
         return Ok(Vec::new());
     }
     crate::shallow::read_shallow(git_dir, format)
+}
+
+/// `git fetch --deepen=N` is relative to an existing shallow boundary. In a
+/// complete repository there is no boundary to move, so the fetch proceeds as
+/// an ordinary full fetch instead of truncating the repository at depth `N`.
+fn normalize_relative_deepen_for_complete_repository(
+    git_dir: &Path,
+    format: ObjectFormat,
+    options: &mut FetchOptions,
+) -> Result<()> {
+    if !options.deepen_relative || options.depth.is_none() {
+        return Ok(());
+    }
+    if crate::shallow::read_shallow(git_dir, format)?.is_empty() {
+        options.depth = None;
+        options.deepen_relative = false;
+    }
+    Ok(())
 }
 
 fn resolve_deepen_not_refs(
@@ -1580,6 +1608,10 @@ struct FetchFinalize<'a> {
     opportunistic_dsts: &'a HashSet<String>,
     validation: Option<&'a sley_fsck::FsckPolicy>,
     quarantine: &'a mut Option<sley_odb::IncomingPackQuarantine>,
+    /// Pending shallow boundary changes returned with the incoming pack. These
+    /// must participate in quarantine validation: without them a deliberately
+    /// truncated pack looks like it has a broken parent link.
+    shallow_info: &'a [sley_protocol::ProtocolV2FetchShallowInfo],
 }
 
 /// git's `store_updated_refs` (builtin/fetch.c) downgrades any for-merge
@@ -1619,7 +1651,15 @@ fn finalize_fetch(
         opportunistic_dsts,
         validation,
         quarantine,
+        shallow_info,
     } = finalize;
+    // Incoming connectivity is defined against the boundary sent alongside
+    // the pack. Stage that boundary only inside the quarantine first; a failed
+    // validation then drops both objects and metadata without mutating the
+    // destination repository.
+    if let Some(incoming) = quarantine.as_ref() {
+        crate::shallow::apply_shallow_info(incoming.git_dir(), format, shallow_info)?;
+    }
     let main_db = FileObjectDatabase::from_git_dir(git_dir, format);
     let quarantine_db = quarantine
         .as_ref()
@@ -1638,6 +1678,10 @@ fn finalize_fetch(
         outcome.ref_updates = std::mem::take(updates);
         return Ok(());
     }
+    // Commit shallow metadata only after the incoming object graph validates.
+    // This also keeps a failed fetch from leaving a boundary that names objects
+    // which never escaped quarantine.
+    crate::shallow::apply_shallow_info(git_dir, format, shallow_info)?;
     drop_redundant_symref_alias_updates(store, updates)?;
     validate_fetch_ref_updates(git_dir, format, store, options.update_head_ok, updates)?;
     if options.atomic {
@@ -2874,6 +2918,42 @@ mod tests {
         oid
     }
 
+    fn commit_child_on(git_dir: &Path, branch: &str, parent: ObjectId, message: &str) -> ObjectId {
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let tree = db
+            .write_object(EncodedObject::new(
+                ObjectType::Tree,
+                Tree { entries: vec![] }.write(),
+            ))
+            .expect("tree should write");
+        let identity = b"Test User <test@example.invalid> 2 +0000".to_vec();
+        let oid = db
+            .write_object(EncodedObject::new(
+                ObjectType::Commit,
+                Commit {
+                    tree,
+                    parents: vec![parent],
+                    author: identity.clone(),
+                    committer: identity,
+                    encoding: None,
+                    message: format!("{message}\n").into_bytes(),
+                }
+                .write(),
+            ))
+            .expect("child commit should write");
+        let store = FileRefStore::new(git_dir, format);
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: format!("refs/heads/{branch}"),
+            expected: None,
+            new: RefTarget::Direct(oid),
+            reflog: None,
+        });
+        tx.commit().expect("branch should update");
+        oid
+    }
+
     fn default_options() -> FetchOptions {
         FetchOptions {
             quiet: true,
@@ -3218,6 +3298,127 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shallow_validation_uses_pending_boundary_inside_quarantine() {
+        let remote = temp_repo("remote-shallow-validation");
+        let local = temp_repo("local-shallow-validation");
+        let parent = commit_on(&remote, "main", "parent");
+        let tip = commit_child_on(&remote, "main", parent, "tip");
+        let source = FetchSource::Local {
+            git_dir: remote.clone(),
+            common_git_dir: remote,
+        };
+        let config = GitConfig::default();
+        let policy = sley_fsck::FsckPolicy::from_config(
+            &config,
+            sley_fsck::FsckConfigKind::Fetch,
+            ObjectFormat::Sha1,
+            Path::new("."),
+            false,
+        )
+        .expect("fetch validation policy");
+        let mut options = default_options();
+        options.depth = Some(1);
+        let mut credentials = NoCredentials;
+        let mut progress = SilentProgress;
+
+        fetch(
+            FetchRequest {
+                git_dir: &local,
+                format: ObjectFormat::Sha1,
+                config: &config,
+                remote_name: "origin",
+                source: &source,
+                refspecs: &["refs/heads/main:refs/remotes/origin/main".to_string()],
+                options: &options,
+                validation: Some(&policy),
+            },
+            FetchServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+                ref_hook: None,
+            },
+        )
+        .expect("pending shallow boundary should make quarantine connected");
+
+        assert_eq!(
+            crate::shallow::read_shallow(&local, ObjectFormat::Sha1)
+                .expect("shallow file should read"),
+            vec![tip]
+        );
+        assert!(
+            !FileObjectDatabase::from_git_dir(&local, ObjectFormat::Sha1)
+                .contains(&parent)
+                .expect("parent lookup should succeed"),
+            "depth-one transfer should remain genuinely shallow"
+        );
+    }
+
+    #[test]
+    fn relative_deepen_is_noop_for_complete_repository() {
+        let remote = temp_repo("remote-complete-deepen");
+        let local = temp_repo("local-complete-deepen");
+        let parent = commit_on(&remote, "main", "parent");
+        let tip = commit_child_on(&remote, "main", parent, "tip");
+        let source = FetchSource::Local {
+            git_dir: remote.clone(),
+            common_git_dir: remote,
+        };
+        let refspecs = ["refs/heads/main:refs/remotes/origin/main".to_string()];
+        let mut credentials = NoCredentials;
+        let mut progress = SilentProgress;
+
+        fetch(
+            FetchRequest {
+                git_dir: &local,
+                format: ObjectFormat::Sha1,
+                config: &GitConfig::default(),
+                remote_name: "origin",
+                source: &source,
+                refspecs: &refspecs,
+                options: &default_options(),
+                validation: None,
+            },
+            FetchServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+                ref_hook: None,
+            },
+        )
+        .expect("full fetch should succeed");
+
+        let mut deepen = default_options();
+        deepen.depth = Some(1);
+        deepen.deepen_relative = true;
+        fetch(
+            FetchRequest {
+                git_dir: &local,
+                format: ObjectFormat::Sha1,
+                config: &GitConfig::default(),
+                remote_name: "origin",
+                source: &source,
+                refspecs: &refspecs,
+                options: &deepen,
+                validation: None,
+            },
+            FetchServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+                ref_hook: None,
+            },
+        )
+        .expect("relative deepen from a complete repository should be a full no-op");
+
+        assert!(
+            crate::shallow::read_shallow(&local, ObjectFormat::Sha1)
+                .expect("shallow file should read")
+                .is_empty()
+        );
+        let db = FileObjectDatabase::from_git_dir(&local, ObjectFormat::Sha1);
+        assert!(db.contains(&parent).expect("parent lookup"));
+        assert!(db.contains(&tip).expect("tip lookup"));
+    }
+
     fn pack_file_count(git_dir: &Path) -> usize {
         fs::read_dir(git_dir.join("objects/pack"))
             .expect("pack directory should read")
@@ -3409,5 +3610,28 @@ mod tests {
     fn fetch_max_input_size_non_positive_means_unlimited() {
         let cfg = config_from_ini("[fetch]\n\tmaxInputSize = 0\n");
         assert_eq!(fetch_max_input_size(&cfg), None);
+    }
+
+    #[test]
+    fn local_fetch_unpack_limit_matches_git_defaults_and_clone_policy() {
+        let cfg = GitConfig::default();
+        assert_eq!(local_fetch_unpack_limit(&cfg, false, false), Some(100));
+        assert_eq!(local_fetch_unpack_limit(&cfg, true, false), None);
+        assert_eq!(local_fetch_unpack_limit(&cfg, false, true), None);
+    }
+
+    #[test]
+    fn local_fetch_unpack_limit_prefers_fetch_over_transfer() {
+        let cfg = config_from_ini("[fetch]\n\tunpackLimit = 17\n[transfer]\n\tunpackLimit = 23\n");
+        assert_eq!(local_fetch_unpack_limit(&cfg, false, false), Some(17));
+    }
+
+    #[test]
+    fn local_fetch_unpack_limit_falls_back_to_transfer_and_zero_disables_unpacking() {
+        let transfer = config_from_ini("[transfer]\n\tunpackLimit = 23\n");
+        assert_eq!(local_fetch_unpack_limit(&transfer, false, false), Some(23));
+
+        let disabled = config_from_ini("[fetch]\n\tunpackLimit = 0\n");
+        assert_eq!(local_fetch_unpack_limit(&disabled, false, false), None);
     }
 }

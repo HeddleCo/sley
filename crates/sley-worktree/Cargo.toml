@@ -9,6 +9,7 @@ license.workspace = true
 
 [dependencies]
 encoding_rs = "0.8"
+same-file = "1.0.6"
 sley-config.workspace = true
 sley-core.workspace = true
 sley-diff-merge.workspace = true

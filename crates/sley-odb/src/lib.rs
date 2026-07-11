@@ -2579,6 +2579,74 @@ mod tests {
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
+    fn rewriting_cruft_only_object_creates_loose_copy(format: ObjectFormat) {
+        let root = temp_root("sley-cruft-freshen-loose");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        let object = EncodedObject::new(ObjectType::Blob, b"cruft-only object\n".to_vec());
+        let database = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let oid = database.write_object(object.clone()).expect("write object");
+        let loose_path = database.loose().object_path(&oid).expect("loose path");
+        fs::OpenOptions::new()
+            .read(true)
+            .open(&loose_path)
+            .expect("open loose object")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(100))
+            .expect("set original object mtime");
+
+        let result = repack_cruft(&git_dir, format, &[], None).expect("build cruft repack");
+        assert_eq!(
+            result.cruft.as_ref().map(|cruft| cruft.oids.as_slice()),
+            Some(std::slice::from_ref(&oid))
+        );
+        install_cruft_repack_result(&git_dir, format, &result, true).expect("install cruft repack");
+
+        assert!(!loose_path.exists());
+
+        // Cruft packs preserve an mtime per object. Rewriting an object which
+        // exists only in such a pack must therefore create a loose copy rather
+        // than freshening the pack (and implicitly every object in it).
+        let reopened = FileObjectDatabase::from_git_dir(&git_dir, format);
+        assert_eq!(reopened.write_object(object).expect("rewrite object"), oid);
+        assert!(loose_path.exists());
+        fs::OpenOptions::new()
+            .read(true)
+            .open(&loose_path)
+            .expect("open rewritten loose object")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(200))
+            .expect("set rewritten object mtime");
+
+        // Repacking the same object produces the same pack checksum, but must
+        // replace the mutable `.mtimes` sidecar with the fresher loose mtime.
+        let refreshed = repack_cruft(&git_dir, format, &[], None).expect("refresh cruft repack");
+        assert_eq!(
+            refreshed.cruft.as_ref().map(|cruft| cruft.checksum),
+            result.cruft.as_ref().map(|cruft| cruft.checksum)
+        );
+        install_cruft_repack_result(&git_dir, format, &refreshed, true)
+            .expect("install refreshed cruft repack");
+        let checksum = refreshed.cruft.as_ref().expect("cruft pack").checksum;
+        let mtimes_path = git_dir
+            .join("objects/pack")
+            .join(format!("pack-{}.mtimes", checksum.to_hex()));
+        let mtimes =
+            sley_pack::PackMtimes::parse(&fs::read(mtimes_path).expect("read mtimes"), format, 1)
+                .expect("parse mtimes");
+        assert_eq!(mtimes.mtimes, vec![200]);
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn rewriting_sha1_cruft_only_object_creates_loose_copy() {
+        rewriting_cruft_only_object_creates_loose_copy(ObjectFormat::Sha1);
+    }
+
+    #[test]
+    fn rewriting_sha256_cruft_only_object_creates_loose_copy() {
+        rewriting_cruft_only_object_creates_loose_copy(ObjectFormat::Sha256);
+    }
+
     #[test]
     fn reachable_repack_reuses_exact_single_pack_bytes() {
         let root = temp_root("sley-repack-reuse-exact-pack");

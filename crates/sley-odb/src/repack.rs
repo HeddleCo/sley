@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::{ObjectReader, grafted_parents};
 
-use crate::install::{write_pack_component, write_promisor_pack_sidecar};
+use crate::install::{replace_pack_component, write_pack_component, write_promisor_pack_sidecar};
 use crate::loose::LooseObjectStore;
 use crate::pack::FileObjectDatabase;
 use crate::pack::promisor_pack_object_ids;
@@ -1747,7 +1747,13 @@ pub fn install_cruft_repack_result(
         let pack_name = format!("pack-{}", cruft.checksum.to_hex());
         write_pack_component(&pack_dir.join(format!("{pack_name}.pack")), &cruft.pack)?;
         write_pack_component(&pack_dir.join(format!("{pack_name}.rev")), &cruft.rev)?;
-        write_pack_component(&pack_dir.join(format!("{pack_name}.mtimes")), &cruft.mtimes)?;
+        // A cruft repack may produce byte-identical pack contents after one of
+        // its objects was rewritten loose. The pack checksum (and therefore
+        // component basename) stays the same, but the per-object mtime table
+        // must be refreshed. The generic component writer intentionally reuses
+        // content-addressed files, so replace this mutable sidecar explicitly.
+        let mtimes_path = pack_dir.join(format!("{pack_name}.mtimes"));
+        replace_pack_component(&mtimes_path, &cruft.mtimes)?;
         write_pack_component(&pack_dir.join(format!("{pack_name}.idx")), &cruft.idx)?;
     }
 

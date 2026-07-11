@@ -1108,6 +1108,41 @@ pub(crate) fn write_pack_component(path: &Path, bytes: &[u8]) -> Result<()> {
     write_result
 }
 
+/// Write a mutable pack sidecar through a completed temporary file, replacing
+/// an existing destination. Unix can rename over the destination atomically;
+/// platforms which reject that operation fall back to removing the old file
+/// only after the replacement has been fully written and synced.
+pub(crate) fn replace_pack_component(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| GitError::InvalidPath("pack component path has no parent".into()))?;
+    fs::create_dir_all(parent)?;
+    let temp_path = unique_temp_path(parent);
+    let write_result = (|| -> Result<()> {
+        {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        match fs::rename(&temp_path, path) {
+            Ok(()) => Ok(()),
+            Err(_) if path.exists() => {
+                fs::remove_file(path)?;
+                fs::rename(&temp_path, path)?;
+                Ok(())
+            }
+            Err(err) => Err(GitError::Io(err.to_string())),
+        }
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
 pub(crate) fn write_promisor_pack_sidecar(
     pack_dir: &Path,
     pack_name: &str,

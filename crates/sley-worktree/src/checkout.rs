@@ -56,6 +56,7 @@ pub fn modified_index_entries(
     // unchanged files. A cached oid is only trusted on a non-racy stat match, so
     // genuinely modified files still fall through to a hash and are reported.
     let stat_cache = IndexStatCache::from_index(&index, &index_path);
+    let trust_filemode = trust_executable_bit_from_git_dir(git_dir, None);
     let mut modified = Vec::new();
     for entry in index.entries {
         if index_entry_skip_worktree(&entry) && !sparse_checkout_active {
@@ -76,7 +77,12 @@ pub fn modified_index_entries(
             }
             continue;
         };
-        if worktree_entry.mode != entry.mode || worktree_entry.oid != entry.oid {
+        let mode_changed = if trust_filemode {
+            worktree_entry.mode != entry.mode
+        } else {
+            sley_diff_merge::is_type_change(entry.mode, worktree_entry.mode)
+        };
+        if mode_changed || worktree_entry.oid != entry.oid {
             modified.push(entry);
         }
     }
@@ -386,24 +392,46 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
     }
 
     let ignore_case = checkout_should_detect_case_collisions(worktree_root, git_dir);
-    let mut materialized_paths: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let needs_filesystem_collision_probe =
+        ignore_case && target_entries.keys().any(|path| !path.is_ascii());
+    let collision_probe = needs_filesystem_collision_probe
+        .then(|| CheckoutCollisionProbe::new(worktree_root))
+        .transpose()?;
+    let mut collision_probe = collision_probe;
+    let mut materialized_paths = Vec::<CheckoutCollisionPath>::new();
     let mut collided_paths: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut index_entries = Vec::new();
     let mut prepared_entries = Vec::new();
     let mut delayed_checkout = DelayedCheckoutQueue::default();
     for (path, entry) in &target_entries {
         if ignore_case {
-            let folded = checkout_collision_key(path);
-            if let Some((_, existing_path)) = materialized_paths
-                .iter()
-                .find(|(existing, _)| checkout_paths_collide(existing, &folded))
-            {
-                collided_paths.insert(existing_path.clone());
+            let folded = checkout_ascii_collision_key(path);
+            let filesystem_key = if path.is_ascii() {
+                None
+            } else {
+                collision_probe
+                    .as_mut()
+                    .map(|probe| probe.key(path))
+                    .transpose()?
+            };
+            if let Some(existing) = materialized_paths.iter().find(|existing| {
+                checkout_paths_collide(&existing.ascii, &folded)
+                    || existing.filesystem.as_ref().is_some_and(|existing_key| {
+                        filesystem_key
+                            .as_ref()
+                            .is_some_and(|key| checkout_filesystem_paths_collide(existing_key, key))
+                    })
+            }) {
+                collided_paths.insert(existing.original.clone());
                 collided_paths.insert(path.clone());
                 index_entries.push(unmaterialized_index_entry(path, entry));
                 continue;
             }
-            materialized_paths.push((folded, path.clone()));
+            materialized_paths.push(CheckoutCollisionPath {
+                ascii: folded,
+                filesystem: filesystem_key,
+                original: path.clone(),
+            });
         }
         match prepare_checkout_entry(
             &db,
@@ -418,6 +446,7 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
             PreparedCheckoutResult::Delayed(entry) => index_entries.push(entry),
         }
     }
+    drop(collision_probe);
     let default_config = GitConfig::default();
     index_entries.extend(materialize_prepared_checkout_entries(
         worktree_root,
@@ -494,8 +523,86 @@ fn filesystem_is_case_insensitive(root: &Path) -> bool {
     result.unwrap_or(false)
 }
 
-fn checkout_collision_key(path: &[u8]) -> Vec<u8> {
+struct CheckoutCollisionPath {
+    ascii: Vec<u8>,
+    filesystem: Option<Vec<u64>>,
+    original: Vec<u8>,
+}
+
+struct CheckoutCollisionProbe {
+    root: PathBuf,
+    keys: BTreeMap<PathBuf, Vec<u64>>,
+}
+
+impl CheckoutCollisionProbe {
+    fn new(worktree_root: &Path) -> Result<Self> {
+        static NEXT_PROBE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        loop {
+            let serial = NEXT_PROBE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let root = worktree_root.join(format!(
+                ".sley-checkout-collision-{}-{serial}",
+                std::process::id()
+            ));
+            match fs::create_dir(&root) {
+                Ok(()) => {
+                    return Ok(Self {
+                        root,
+                        keys: BTreeMap::new(),
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    fn key(&mut self, path: &[u8]) -> Result<Vec<u64>> {
+        use std::hash::{Hash, Hasher};
+
+        let relative = repo_path_to_os_path(path)?;
+        let mut current = self.root.clone();
+        let mut relative_prefix = PathBuf::new();
+        let mut key = Vec::new();
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(GitError::InvalidPath(format!(
+                    "invalid checkout collision path {}",
+                    String::from_utf8_lossy(path)
+                )));
+            };
+            current.push(name);
+            relative_prefix.push(name);
+            if let Some(cached) = self.keys.get(&relative_prefix) {
+                key.clone_from(cached);
+                continue;
+            }
+            match fs::create_dir(&current) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err.into()),
+            }
+            let handle = same_file::Handle::from_path(&current)?;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            handle.hash(&mut hasher);
+            key.push(hasher.finish());
+            self.keys.insert(relative_prefix.clone(), key.clone());
+        }
+        Ok(key)
+    }
+}
+
+impl Drop for CheckoutCollisionProbe {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn checkout_ascii_collision_key(path: &[u8]) -> Vec<u8> {
     path.iter().map(u8::to_ascii_lowercase).collect()
+}
+
+fn checkout_filesystem_paths_collide(left: &[u64], right: &[u64]) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 fn checkout_paths_collide(left: &[u8], right: &[u8]) -> bool {
@@ -3978,6 +4085,24 @@ mod sparse_index_expansion_tests {
 mod checkout_parent_safety_tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn collision_probe_preserves_component_boundaries_and_filesystem_identity() {
+        let root = tempfile::tempdir().expect("temporary worktree");
+        let mut probe = CheckoutCollisionProbe::new(root.path()).expect("collision probe");
+        let parent = probe.key(b"dir").expect("parent collision key");
+        let child = probe.key(b"dir/file").expect("child collision key");
+        assert!(checkout_filesystem_paths_collide(&parent, &child));
+
+        fs::create_dir(root.path().join("ä")).expect("unicode probe directory");
+        if root.path().join("a\u{308}").exists() {
+            let decomposed = probe
+                .key("a\u{308}/file".as_bytes())
+                .expect("decomposed collision key");
+            let composed = probe.key("ä".as_bytes()).expect("composed collision key");
+            assert!(checkout_filesystem_paths_collide(&decomposed, &composed));
+        }
+    }
 
     #[test]
     fn preparing_blob_parent_replaces_symlink_instead_of_following_it() {

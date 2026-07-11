@@ -502,14 +502,32 @@ impl IndexStatCache {
         git_path: &[u8],
         worktree_metadata: &fs::Metadata,
     ) -> Option<TrackedEntry> {
+        self.reuse_tracked_entry_with_filemode(git_path, worktree_metadata, true)
+    }
+
+    pub(crate) fn reuse_tracked_entry_with_filemode(
+        &self,
+        git_path: &[u8],
+        worktree_metadata: &fs::Metadata,
+        trust_filemode: bool,
+    ) -> Option<TrackedEntry> {
         let entry = self.entries.get(git_path)?;
-        self.reuse_index_entry(entry, worktree_metadata)
+        self.reuse_index_entry_with_filemode(entry, worktree_metadata, trust_filemode)
     }
 
     pub(crate) fn reuse_index_entry(
         &self,
         entry: &IndexEntry,
         worktree_metadata: &fs::Metadata,
+    ) -> Option<TrackedEntry> {
+        self.reuse_index_entry_with_filemode(entry, worktree_metadata, true)
+    }
+
+    pub(crate) fn reuse_index_entry_with_filemode(
+        &self,
+        entry: &IndexEntry,
+        worktree_metadata: &fs::Metadata,
+        trust_filemode: bool,
     ) -> Option<TrackedEntry> {
         // Gitlink: reusable as-is whenever the worktree path is a directory (a
         // submodule is never re-hashed; its cached stat is ignored). Routes
@@ -524,7 +542,10 @@ impl IndexStatCache {
                 sley_index::GitlinkStatVerdict::TypeChanged => None,
             };
         }
-        if entry.mode != worktree_entry_mode(worktree_metadata) {
+        let worktree_mode = worktree_entry_mode(worktree_metadata);
+        if (trust_filemode && entry.mode != worktree_mode)
+            || (!trust_filemode && sley_diff_merge::is_type_change(entry.mode, worktree_mode))
+        {
             return None;
         }
         if !worktree_entry_is_uptodate(entry, worktree_metadata) {
@@ -1034,9 +1055,10 @@ pub(crate) fn worktree_entry_for_git_path(
         }));
     }
 
-    if let Some(tracked) =
-        stat_cache.and_then(|cache| cache.reuse_tracked_entry(git_path, &metadata))
-    {
+    let trust_filemode = trust_executable_bit_from_git_dir(git_dir, None);
+    if let Some(tracked) = stat_cache.and_then(|cache| {
+        cache.reuse_tracked_entry_with_filemode(git_path, &metadata, trust_filemode)
+    }) {
         return Ok(Some(tracked));
     }
 

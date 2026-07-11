@@ -230,6 +230,7 @@ pub(crate) fn cmd_read_tree(cli_session: &session::CliSession, args: &[String]) 
                 &tree_oids,
                 apply_worktree,
                 parsed.index_only,
+                parsed.sparse_checkout,
                 recurse_submodules,
             )?;
             if !parsed.dry_run {
@@ -963,7 +964,7 @@ pub(crate) fn checkout_two_way_engine(
     overwrite_untracked: bool,
 ) -> Result<()> {
     let previous_index = sley_worktree::read_repository_index(git_dir, format)?;
-    let index = sley_worktree::read_current_unpack_index(git_dir, format)?;
+    let mut index = sley_worktree::read_current_unpack_index(git_dir, format)?;
 
     // git's `merge_working_tree`: `trees[0]` = the tree of the HEAD being left
     // (empty when HEAD is unborn), `trees[1]` = the tree being checked out.
@@ -972,6 +973,16 @@ pub(crate) fn checkout_two_way_engine(
         None => None,
     };
     let new_leaves = sley_diff_merge::flatten_tree(db, format, new_tree)?;
+    let mut sparse_paths = index.keys().cloned().collect::<BTreeSet<_>>();
+    if let Some(old_leaves) = old_leaves.as_ref() {
+        sparse_paths.extend(old_leaves.keys().cloned());
+    }
+    sparse_paths.extend(new_leaves.keys().cloned());
+    let apply_sparse_checkout = sley_worktree::configure_active_sparse_checkout_for_unpack_index(
+        git_dir,
+        &mut index,
+        &sparse_paths,
+    )?;
 
     let repo_config = commands::remote::read_effective_repo_config(git_dir, worktree_root)?;
     let tree_attributes =
@@ -998,6 +1009,7 @@ pub(crate) fn checkout_two_way_engine(
     // "Aborting" guarantee.
     let mut options = sley_unpack_trees::CheckoutTransitionOptions::new(format);
     options.overwrite_untracked = overwrite_untracked;
+    options.apply_sparse_checkout = apply_sparse_checkout;
     let plan =
         sley_unpack_trees::plan_checkout_transition(&index, old_leaves, new_leaves, options, &wt)?;
     refuse_if_unpack_result_removes_current_directory(worktree_root, plan.result())?;
@@ -1016,6 +1028,7 @@ pub(crate) fn checkout_two_way_engine(
                     oid: e.entry.oid,
                     stage: e.entry.stage,
                     stat: e.entry.stat,
+                    skip_worktree: Some(e.entry.is_skip_worktree()),
                 },
             )
         })
@@ -1084,6 +1097,7 @@ fn merge_trees(
     tree_oids: &[ObjectId],
     update_worktree: bool,
     index_only: bool,
+    sparse_checkout: bool,
     recurse_submodules: bool,
 ) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
     use sley_unpack_trees::{MergeFn, UnpackTreesOptions, check_updates, unpack_trees};
@@ -1105,7 +1119,7 @@ fn merge_trees(
         }
     };
 
-    let index = sley_worktree::read_current_unpack_index(git_dir, format)?;
+    let mut index = sley_worktree::read_current_unpack_index(git_dir, format)?;
     let mut diagnostics = CliReadTreeDiagnostics;
     let trees: Vec<sley_unpack_trees::FlatTree> = tree_oids
         .iter()
@@ -1119,6 +1133,17 @@ fn merge_trees(
             ))
         })
         .collect::<Result<_>>()?;
+
+    let mut sparse_paths = index.keys().cloned().collect::<BTreeSet<_>>();
+    for tree in &trees {
+        sparse_paths.extend(tree.keys().cloned());
+    }
+    let apply_sparse_checkout = sparse_checkout
+        && sley_worktree::configure_active_sparse_checkout_for_unpack_index(
+            git_dir,
+            &mut index,
+            &sparse_paths,
+        )?;
 
     let mut opts = UnpackTreesOptions::new(format);
     opts.merge = true;
@@ -1140,6 +1165,7 @@ fn merge_trees(
     // checks entirely. This is also what makes `read-tree -i -m` usable in a bare
     // repository, where there is no worktree to require.
     opts.index_only = index_only;
+    opts.apply_sparse_checkout = apply_sparse_checkout && update_worktree && !index_only;
 
     let worktree_root = worktree_root
         .map(Path::to_path_buf)
@@ -1188,6 +1214,7 @@ fn merge_trees(
                     oid: e.entry.oid,
                     stage: e.entry.stage,
                     stat: e.entry.stat,
+                    skip_worktree: Some(e.entry.is_skip_worktree()),
                 },
             )
         })

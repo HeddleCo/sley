@@ -37,79 +37,104 @@ pub(super) fn log_walk_reflogs(
             .map(|revision| ReflogWalkTarget::new(&store, git_dir, format, Some(revision)))
             .collect::<Result<Vec<_>>>()?
     };
+    let mut walks = references
+        .into_iter()
+        .map(|target| {
+            let mut entries = store.read_reflog(&target.reference)?;
+            entries.reverse();
+            Ok(ReflogWalkCursor::new(target, entries, opts.reverse))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut skipped = 0usize;
     let mut emitted = 0usize;
-    for target in references {
-        let mut entries = store.read_reflog(&target.reference)?;
-        entries.reverse();
-        // Honor the `@{N}` selector: the walk starts at reflog entry `N`. Select
-        // the entries at index >= start_offset while preserving each entry's true
-        // index (so the `HEAD@{index}` selector shown is correct), then apply
-        // `--reverse` to the selected range only, matching git.
-        let mut selected: Vec<(usize, &ReflogEntry)> = entries
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index >= target.start_offset)
-            .collect();
-        if opts.reverse {
-            selected.reverse();
+    loop {
+        let selected_target = if opts.reverse {
+            // Preserve the historical reverse-walk behavior. Git currently
+            // rejects --reverse with --walk-reflogs, but keeping this path
+            // target-ordered avoids changing Sley's existing extension while
+            // the normal walk below gains Git's timestamp merge.
+            walks.iter().position(|walk| walk.next_index.is_some())
+        } else {
+            // Git's next_reflog_entry() performs a stable k-way merge over the
+            // current entry of every selected reflog. It replaces `best` only
+            // for a strictly newer timestamp, so equal timestamps retain the
+            // ref enumeration order (FileRefStore returns refname order).
+            let mut best: Option<(usize, i64)> = None;
+            for (target_index, walk) in walks.iter().enumerate() {
+                let Some((_, entry)) = walk.current() else {
+                    continue;
+                };
+                let timestamp = entry.timestamp_seconds()?;
+                if best.is_none_or(|(_, best_timestamp)| timestamp > best_timestamp) {
+                    best = Some((target_index, timestamp));
+                }
+            }
+            best.map(|(target_index, _)| target_index)
+        };
+        let Some(target_index) = selected_target else {
+            break;
+        };
+        let index = walks[target_index]
+            .next_index
+            .expect("selected reflog cursor has a current entry");
+        walks[target_index].advance(opts.reverse);
+        let target = &walks[target_index].target;
+        let entry = &walks[target_index].entries[index];
+
+        if !reflog_entry_matches(&db, format, entry, &mailmap, &opts)? {
+            continue;
         }
-        for (index, entry) in selected {
-            if !reflog_entry_matches(&db, format, entry, &mailmap, &opts)? {
-                continue;
-            }
-            if skipped < opts.skip {
-                skipped += 1;
-                continue;
-            }
-            if opts.max_count.is_some_and(|max_count| emitted >= max_count) {
-                stdout.flush()?;
-                return Ok(());
-            }
-            let emitted_entry = match opts.output {
-                LogOutput::Compiled {
+        if skipped < opts.skip {
+            skipped += 1;
+            continue;
+        }
+        if opts.max_count.is_some_and(|max_count| emitted >= max_count) {
+            stdout.flush()?;
+            return Ok(());
+        }
+        let emitted_entry = match opts.output {
+            LogOutput::Compiled {
+                compiled,
+                final_newline,
+                ..
+            } => {
+                let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+                let mut ctx = ReflogWalkFormatContext {
                     compiled,
-                    final_newline,
-                    ..
-                } => {
-                    let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
-                    let mut ctx = ReflogWalkFormatContext {
-                        compiled,
-                        db: &mut db,
-                        format,
-                        display_reference: &target.display_reference,
-                        full_reference: &target.full_display_reference,
-                        date_mode: opts.date_mode,
-                        decorations: &decorations,
-                        mailmap: &mailmap,
-                    };
-                    if !emit_compiled_reflog_walk_format(&mut ctx, entry, index, &mut line)? {
-                        false
-                    } else {
-                        stdout.write_all(&line)?;
-                        if *final_newline && !line.ends_with(b"\n") {
-                            stdout.write_all(b"\n")?;
-                        }
-                        true
+                    db: &mut db,
+                    format,
+                    display_reference: &target.display_reference,
+                    full_reference: &target.full_display_reference,
+                    date_mode: opts.date_mode,
+                    decorations: &decorations,
+                    mailmap: &mailmap,
+                };
+                if !emit_compiled_reflog_walk_format(&mut ctx, entry, index, &mut line)? {
+                    false
+                } else {
+                    stdout.write_all(&line)?;
+                    if *final_newline && !line.ends_with(b"\n") {
+                        stdout.write_all(b"\n")?;
                     }
+                    true
                 }
-                LogOutput::Default(_) => {
-                    let display_selector = target.display_selector(entry, index, opts.date_mode);
-                    emit_default_reflog_walk_format(
-                        &mut db,
-                        format,
-                        entry,
-                        &target.display_reference,
-                        &display_selector,
-                        opts.date_mode,
-                        &mailmap,
-                        &mut stdout,
-                    )?
-                }
-            };
-            if emitted_entry {
-                emitted += 1;
             }
+            LogOutput::Default(_) => {
+                let display_selector = target.display_selector(entry, index, opts.date_mode);
+                emit_default_reflog_walk_format(
+                    &mut db,
+                    format,
+                    entry,
+                    &target.display_reference,
+                    &display_selector,
+                    opts.date_mode,
+                    &mailmap,
+                    &mut stdout,
+                )?
+            }
+        };
+        if emitted_entry {
+            emitted += 1;
         }
     }
     stdout.flush()?;
@@ -161,6 +186,51 @@ struct ReflogWalkTarget {
     /// (`HEAD@{1}` skips the most-recent entry and starts one older). Zero for a
     /// bare ref or a non-numeric selector (date / `@{upstream}`).
     start_offset: usize,
+}
+
+struct ReflogWalkCursor {
+    target: ReflogWalkTarget,
+    /// Newest-first, so the vector index is also the `%gD`/`%gd` selector.
+    entries: Vec<ReflogEntry>,
+    /// Current selector index. `None` means this reflog is exhausted.
+    next_index: Option<usize>,
+}
+
+impl ReflogWalkCursor {
+    fn new(target: ReflogWalkTarget, entries: Vec<ReflogEntry>, reverse: bool) -> Self {
+        let next_index = if reverse {
+            entries
+                .len()
+                .checked_sub(1)
+                .filter(|index| *index >= target.start_offset)
+        } else {
+            (target.start_offset < entries.len()).then_some(target.start_offset)
+        };
+        Self {
+            target,
+            entries,
+            next_index,
+        }
+    }
+
+    fn current(&self) -> Option<(usize, &ReflogEntry)> {
+        let index = self.next_index?;
+        Some((index, &self.entries[index]))
+    }
+
+    fn advance(&mut self, reverse: bool) {
+        let Some(index) = self.next_index else {
+            return;
+        };
+        self.next_index = if reverse {
+            index
+                .checked_sub(1)
+                .filter(|next| *next >= self.target.start_offset)
+        } else {
+            let next = index + 1;
+            (next < self.entries.len()).then_some(next)
+        };
+    }
 }
 
 impl ReflogWalkTarget {

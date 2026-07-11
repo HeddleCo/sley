@@ -393,7 +393,13 @@ pub fn worktree_entry_state_by_git_path(
     else {
         return Ok(WorktreeEntryState::Deleted);
     };
-    if worktree_entry.mode == expected_mode && worktree_entry.oid == *expected_oid {
+    let trust_filemode = trust_executable_bit_from_git_dir(git_dir, None);
+    let mode_matches = if trust_filemode {
+        worktree_entry.mode == expected_mode
+    } else {
+        !sley_diff_merge::is_type_change(expected_mode, worktree_entry.mode)
+    };
+    if mode_matches && worktree_entry.oid == *expected_oid {
         Ok(WorktreeEntryState::Clean)
     } else {
         Ok(WorktreeEntryState::Modified)

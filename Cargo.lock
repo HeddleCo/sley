@@ -1510,6 +1510,7 @@ name = "sley-worktree"
 version = "0.4.2"
 dependencies = [
  "encoding_rs",
+ "same-file",
  "sley-config",
  "sley-core",
  "sley-diff-merge",

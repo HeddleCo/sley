@@ -1641,6 +1641,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn modified_entries_ignore_executable_bit_when_core_filemode_is_false() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        fs::write(root.join("script.sh"), b"true\n").expect("write script");
+        fs::set_permissions(root.join("script.sh"), fs::Permissions::from_mode(0o755))
+            .expect("make script executable");
+        build_commit(&root, &git_dir, &["script.sh"]);
+        fs::write(git_dir.join("config"), b"[core]\n\tfilemode = false\n")
+            .expect("disable filemode trust");
+        fs::set_permissions(root.join("script.sh"), fs::Permissions::from_mode(0o644))
+            .expect("remove physical executable bit");
+
+        let entry = index_entry_for(&read_index(&git_dir), b"script.sh").clone();
+        assert_eq!(
+            worktree_entry_state_by_git_path(
+                &root,
+                &git_dir,
+                ObjectFormat::Sha1,
+                b"script.sh",
+                &entry.oid,
+                entry.mode,
+                None,
+            )
+            .expect("probe worktree state with untrusted executable bit"),
+            WorktreeEntryState::Clean
+        );
+        assert!(
+            modified_index_entries(&root, &git_dir, ObjectFormat::Sha1)
+                .expect("inspect worktree with untrusted executable bit")
+                .is_empty()
+        );
+
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn checkout_replaces_symlink_with_tracked_directory() {
         let root = temp_root();
         let git_dir = root.join(".git");
@@ -2763,6 +2803,14 @@ mod tests {
             mode_cache.reuse_tracked_entry(b"f.txt", &metadata),
             None,
             "a mode mismatch must fall through to hashing"
+        );
+        assert_eq!(
+            mode_cache.reuse_tracked_entry_with_filemode(b"f.txt", &metadata, false),
+            Some(TrackedEntry {
+                mode: 0o100755,
+                oid,
+            }),
+            "an untrusted executable bit must retain the cached oid"
         );
 
         // Racily clean (index mtime not strictly after the entry mtime) -> hash.

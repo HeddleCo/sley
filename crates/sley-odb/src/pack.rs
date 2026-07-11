@@ -1746,7 +1746,41 @@ impl FileObjectDatabase {
         let Some(pack_lookup) = self.find_pack_containing(oid)? else {
             return Ok(false);
         };
-        freshen_file_mtime(pack_lookup.pack_path())
+        if !pack_lookup.pack_path().with_extension("mtimes").exists() {
+            return freshen_file_mtime(pack_lookup.pack_path());
+        }
+
+        // Cruft packs carry per-object mtimes in their `.mtimes` sidecar. Git
+        // deliberately never freshens the pack itself: doing so would make
+        // every unreachable object in it look recent. If another, non-cruft
+        // pack also contains the object, freshen that copy; otherwise return a
+        // miss so the caller writes a new loose copy with its own mtime.
+        let pack_dir = self.objects_dir.join("pack");
+        let Ok(entries) = fs::read_dir(pack_dir) else {
+            return Ok(false);
+        };
+        for entry in entries {
+            let idx_path = entry?.path();
+            if idx_path.extension().and_then(|ext| ext.to_str()) != Some("idx")
+                || idx_path.with_extension("mtimes").exists()
+            {
+                continue;
+            }
+            let pack_path = idx_path.with_extension("pack");
+            if !pack_path.exists() {
+                continue;
+            }
+            let Ok(index_bytes) = fs::read(&idx_path) else {
+                continue;
+            };
+            let Ok(index) = PackIndex::parse(&index_bytes, self.format) else {
+                continue;
+            };
+            if index.find(oid).is_some() {
+                return freshen_file_mtime(&pack_path);
+            }
+        }
+        Ok(false)
     }
 }
 pub(crate) fn freshen_file_mtime(path: &Path) -> Result<bool> {
@@ -1806,8 +1840,10 @@ impl ObjectWriter for FileObjectDatabase {
     fn write_object(&self, object: EncodedObject) -> Result<ObjectId> {
         // Mirror git's freshen semantics (`write_object_file`:
         // `freshen_packed_object || freshen_loose_object`): an object already
-        // present anywhere in the database is not written again, but its backing
-        // loose object or pack is touched so concurrent GC treats it as recent.
+        // present in a normal pack is not written again, but its backing pack is
+        // touched so concurrent GC treats it as recent. Cruft packs are excluded
+        // from freshening, so rewriting a cruft-only object creates a loose copy
+        // whose per-object mtime can be honored by the next cruft repack.
         let oid = object.object_id(self.format)?;
         if self.freshen_existing_object(&oid)? {
             return Ok(oid);

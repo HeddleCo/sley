@@ -729,12 +729,50 @@ fn reflog_walk_selector_preserves_git_full_selector_display() {
         &["commit", "--allow-empty", "-qm", "initial"],
         "@1700000000 +0000",
     );
-    for branch in ["root1/branch1", "root1/branch2"] {
-        run_success(sley_testkit::oracle_git(), &root, &["branch", branch]);
+    // Git merges multiple reflogs by reflog committer timestamp. Keep these
+    // dates distinct so the test deterministically exercises that ordering
+    // instead of depending on whether both branch commands land in one wall-
+    // clock second.
+    for (branch, date) in [
+        ("root1/branch1", "@1700000010 +0000"),
+        ("root1/branch2", "@1700000020 +0000"),
+    ] {
+        run_success_with_identity_at(&root, &["branch", branch], date);
     }
 
     let args = ["log", "-g", "--branches=root*", "--format=%gd|%gD"];
     let expected = run(sley_testkit::oracle_git(), &root, &args);
+    assert_eq!(
+        expected.stdout,
+        b"root1/branch2@{0}|root1/branch2@{0}\nroot1/branch1@{0}|root1/branch1@{0}\n"
+    );
+    let actual = run(sley_testkit::sley_bin!(), &root, &args);
+    assert_same_output(actual, expected, &args);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reflog_walk_equal_timestamps_preserve_ref_order() {
+    let root = unique_temp_dir("reflog-selector-timestamp-tie");
+    fs::create_dir_all(&root).expect("create repo");
+    run_success(
+        sley_testkit::oracle_git(),
+        &root,
+        &["init", "-q", "-b", "main"],
+    );
+    run_success_with_identity_at(
+        &root,
+        &["commit", "--allow-empty", "-qm", "initial"],
+        "@1700000000 +0000",
+    );
+    for branch in ["root1/branch1", "root1/branch2"] {
+        run_success_with_identity_at(&root, &["branch", branch], "@1700000010 +0000");
+    }
+
+    let args = ["log", "-g", "--branches=root*", "--format=%gd"];
+    let expected = run(sley_testkit::oracle_git(), &root, &args);
+    assert_eq!(expected.stdout, b"root1/branch1@{0}\nroot1/branch2@{0}\n");
     let actual = run(sley_testkit::sley_bin!(), &root, &args);
     assert_same_output(actual, expected, &args);
 

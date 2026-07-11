@@ -17,6 +17,9 @@ pub struct ReadTreeEntry {
     pub stage: u8,
     /// Cached worktree metadata preserved or refreshed by unpack-trees.
     pub stat: Option<sley_unpack_trees::StatInfo>,
+    /// Explicit unpack-trees sparse state. `None` preserves the current index
+    /// flag for legacy index-only projections; worktree transitions set it.
+    pub skip_worktree: Option<bool>,
 }
 
 impl ReadTreeEntry {
@@ -27,6 +30,7 @@ impl ReadTreeEntry {
             oid,
             stage: 0,
             stat: None,
+            skip_worktree: None,
         }
     }
 }
@@ -432,6 +436,27 @@ pub fn read_current_unpack_index(
     Ok(out)
 }
 
+/// Apply the repository's active sparse-checkout patterns to every logical
+/// path participating in an unpack-trees transition.
+///
+/// `paths` must be the union of the current logical index and all source-tree
+/// leaves so newly introduced out-of-cone entries receive an explicit decision.
+/// Returns whether sparse policy is active and should be enabled in the engine.
+pub fn configure_active_sparse_checkout_for_unpack_index(
+    git_dir: &Path,
+    index: &mut sley_unpack_trees::FlatIndex,
+    paths: &BTreeSet<Vec<u8>>,
+) -> Result<bool> {
+    let Some((sparse, mode)) = active_sparse_checkout(git_dir)? else {
+        return Ok(false);
+    };
+    let matcher = SparseMatcher::new(&sparse, mode);
+    for path in paths {
+        index.set_sparse_checkout_skip(path.clone(), !matcher.includes_file(path));
+    }
+    Ok(true)
+}
+
 /// Snapshot all current index paths, across every stage.
 pub fn read_current_index_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet<Vec<u8>>> {
     let Some(index) = read_repository_index(git_dir, format)? else {
@@ -530,7 +555,10 @@ fn project_read_tree_index(
             flags_extended: 0,
             path: BString::from(path),
         };
-        if skip_worktree_paths.contains(index_entry.path.as_bytes()) {
+        let skip_worktree = entry
+            .skip_worktree
+            .unwrap_or_else(|| skip_worktree_paths.contains(index_entry.path.as_bytes()));
+        if skip_worktree {
             index_entry.set_skip_worktree(true);
         }
         index_entries.push(index_entry);
