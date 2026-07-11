@@ -1446,9 +1446,9 @@ mod command_registry_tests {
         assert_eq!(
             COMMAND_REGISTRY.names_with(NATIVE).count(),
             if cfg!(feature = "git-compat-i18n") {
-                137
+                138
             } else {
-                136
+                137
             }
         );
         assert_eq!(COMMAND_REGISTRY.names_with(GIT_BUILTIN).count(), 149);

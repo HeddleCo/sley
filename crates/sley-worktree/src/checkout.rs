@@ -83,6 +83,31 @@ pub fn modified_index_entries(
     Ok(modified)
 }
 
+/// Compute Git's post-checkout local-change summary against `target_commit`.
+///
+/// The diff engine treats missing skip-worktree paths as their index entries,
+/// so this operation returns the same typed change set for full indexes,
+/// sparse checkouts, and sparse indexes.
+pub fn checkout_change_summary(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    target_commit: &ObjectId,
+) -> Result<CheckoutChangeSummary> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let commit = read_commit(&db, format, target_commit)?;
+    let changes = sley_diff_merge::diff_name_status_tree_worktree_with_options(
+        worktree_root,
+        git_dir,
+        format,
+        &commit.tree,
+        sley_diff_merge::DiffNameStatusOptions::default(),
+    )?;
+    Ok(CheckoutChangeSummary { changes })
+}
+
 pub fn checkout_branch(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
@@ -1840,43 +1865,59 @@ pub(crate) fn restore_index_and_worktree_paths_from_entries(
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
-    index: Index,
+    mut index: Index,
     source_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     paths: &[PathBuf],
     overlay: bool,
 ) -> Result<RestoreResult> {
-    let index_version = index.version;
-    let extensions = index_extensions_without_cache_tree(&index.extensions);
+    let sparse = active_sparse_checkout(git_dir)?;
     let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
-    let mut index_entries = index
-        .entries
-        .into_iter()
-        .map(|entry| (entry.path.as_bytes().to_vec(), entry))
-        .collect::<BTreeMap<_, _>>();
     let mut restored = BTreeSet::new();
+    let candidate_paths = index
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .chain(source_entries.keys().cloned())
+        .collect::<BTreeSet<_>>();
     let matched_paths = checkout_selected_paths(
         worktree_root,
         paths,
-        index_entries
-            .keys()
-            .chain(source_entries.keys())
-            .map(Vec::as_slice),
+        candidate_paths.iter().map(Vec::as_slice),
         false,
     )?;
+    let selected_sparse_boundaries = index
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.is_sparse_dir()
+                && matched_paths.iter().any(|path| {
+                    path.as_slice() == entry.path.as_bytes()
+                        || path.starts_with(entry.path.as_bytes())
+                })
+        })
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect::<BTreeSet<_>>();
+    let expanded_sparse_directories =
+        expand_sparse_index_directories(&mut index, db, format, |boundary| {
+            selected_sparse_boundaries.contains(boundary)
+        })?;
+    let index_version = index.version;
+    let extensions = index_extensions_without_cache_tree(&index.extensions);
+    let mut replacement_entries = Vec::new();
+    let mut replaced_paths = BTreeSet::new();
+    let mut replacement_leaf_paths = BTreeSet::new();
     for path in matched_paths {
         if let Some(entry) = source_entries.get(&path) {
-            index_entries.insert(
-                path.clone(),
-                materialize_path_restore_entry_filtered(
-                    db,
-                    format,
-                    worktree_root,
-                    git_dir,
-                    &path,
-                    entry,
-                    &config,
-                )?,
-            );
+            replacement_entries.push(materialize_path_restore_entry_filtered(
+                db,
+                format,
+                worktree_root,
+                git_dir,
+                &path,
+                entry,
+                &config,
+            )?);
+            replacement_leaf_paths.insert(path.clone());
         } else if overlay {
             // Overlay mode (git checkout default): a path that matches the
             // pathspec but is absent from the source tree is left untouched
@@ -1885,21 +1926,42 @@ pub(crate) fn restore_index_and_worktree_paths_from_entries(
         } else {
             // No-overlay mode (git restore default, checkout --no-overlay):
             // drop the path from the index and the working tree.
-            index_entries.remove(&path);
             remove_worktree_file(worktree_root, &path)?;
         }
+        replaced_paths.insert(path.clone());
         restored.insert(path);
     }
-    let mut entries = index_entries.into_values().collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    // A tree path checkout resolves every stage of a selected path to exactly
+    // one source entry. Apply the batch at the entry-vector boundary so an
+    // expanded sparse-directory leaf cannot survive beside its replacement,
+    // while unselected conflict stages remain byte-for-byte intact.
+    index.entries.retain(|entry| {
+        !replaced_paths.contains(entry.path.as_bytes())
+            && !replacement_leaf_paths
+                .iter()
+                .any(|replacement| checkout_paths_collide(entry.path.as_bytes(), replacement))
+    });
+    index.entries.extend(replacement_entries);
+    index.entries.sort_by(compare_index_key);
     let restored_paths = restored.iter().cloned().collect::<Vec<_>>();
     let mut index = Index {
         version: index_version,
-        entries,
+        entries: index.entries,
         extensions,
         checksum: None,
     };
     invalidate_untracked_cache_for_git_paths(&mut index, format, &restored_paths)?;
+    if let Some((sparse, mode)) = sparse
+        && sparse.sparse_index
+    {
+        if expanded_sparse_directories || !index.entries.iter().any(IndexEntry::is_sparse_dir) {
+            let matcher = SparseMatcher::new(&sparse, mode);
+            collapse_to_sparse_index(&mut index, &matcher, db, format)?;
+        } else {
+            index.set_sparse_extension();
+            normalize_index_version_for_extended_flags(&mut index);
+        }
+    }
     write_repository_index_ref(git_dir, format, &index)?;
     Ok(RestoreResult {
         restored: restored.len(),
@@ -2634,7 +2696,15 @@ pub fn apply_sparse_checkout_with_mode(
             // up to date" warning. Mirror that to avoid silent data loss.
             let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
             match fs::symlink_metadata(&file_path) {
-                Ok(metadata) if !worktree_entry_is_uptodate(entry, &metadata) => {
+                Ok(metadata)
+                    if !sparse_checkout_worktree_entry_is_uptodate(
+                        worktree_root,
+                        git_dir,
+                        format,
+                        entry,
+                        &metadata,
+                    )? =>
+                {
                     clear_skip_worktree(entry);
                     not_up_to_date.push(entry.path.as_bytes().to_vec());
                 }
@@ -3074,6 +3144,50 @@ pub(crate) fn worktree_entry_is_uptodate(entry: &IndexEntry, metadata: &fs::Meta
     };
     u64::from(entry.mtime_seconds) == mtime_seconds
         && u64::from(entry.mtime_nanoseconds) == mtime_nanoseconds
+}
+
+/// Returns whether an out-of-cone worktree entry is safe to remove.
+///
+/// Expanding a collapsed sparse-directory entry creates leaf entries without
+/// cached stat data. In that representation, the cheap stat comparison cannot
+/// prove that a present file is clean even when its bytes exactly match the
+/// index. Fall back to the normal worktree/index content comparison so sparse
+/// representation changes do not manufacture local modifications.
+fn sparse_checkout_worktree_entry_is_uptodate(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    entry: &IndexEntry,
+    metadata: &fs::Metadata,
+) -> Result<bool> {
+    if worktree_entry_is_uptodate(entry, metadata) {
+        return Ok(true);
+    }
+    let stat_cache_is_blank = entry.ctime_seconds == 0
+        && entry.ctime_nanoseconds == 0
+        && entry.mtime_seconds == 0
+        && entry.mtime_nanoseconds == 0
+        && entry.dev == 0
+        && entry.ino == 0
+        && entry.uid == 0
+        && entry.gid == 0
+        && entry.size == 0;
+    if !stat_cache_is_blank {
+        return Ok(false);
+    }
+    let Some(worktree_entry) = worktree_entry_for_git_path(
+        worktree_root,
+        git_dir,
+        format,
+        entry.path.as_bytes(),
+        &entry.oid,
+        entry.mode,
+        None,
+    )?
+    else {
+        return Ok(false);
+    };
+    Ok(worktree_entry.mode == entry.mode && worktree_entry.oid == entry.oid)
 }
 
 pub(crate) fn worktree_entry_ref_is_uptodate(

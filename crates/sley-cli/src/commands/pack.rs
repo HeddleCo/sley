@@ -697,21 +697,28 @@ fn index_pack_usage<T>() -> Result<T> {
 struct VerifyPackOptions {
     verbose: bool,
     stat_only: bool,
-    format: ObjectFormat,
+    format: Option<ObjectFormat>,
     index_paths: Vec<PathBuf>,
 }
 
-pub(crate) fn cmd_verify_pack(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_verify_pack(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = setup_verify_pack_options(args)?;
     // verify-pack inspects the named pack files directly, so it works outside a
-    // repository (git resolves the hash from `--object-format`, else SHA-1).
+    // repository. An explicit format wins; otherwise inherit a gently
+    // discovered repository's format and finally fall back to SHA-1.
+    let format = match options.format {
+        Some(format) => format,
+        None => match cli_session.open_repository() {
+            Ok(repository) => repository.object_format(),
+            Err(GitError::NotFound(_)) => ObjectFormat::Sha1,
+            Err(err) => return Err(err),
+        },
+    };
     for index_path in &options.index_paths {
-        verify_pack_one(
-            options.format,
-            index_path,
-            options.verbose,
-            options.stat_only,
-        )?;
+        verify_pack_one(format, index_path, options.verbose, options.stat_only)?;
     }
     Ok(())
 }
@@ -719,15 +726,15 @@ pub(crate) fn cmd_verify_pack(args: &[String]) -> Result<()> {
 fn setup_verify_pack_options(args: &[String]) -> Result<VerifyPackOptions> {
     let parsed = parse_options(args, verify_pack_option_specs(), &VERIFY_PACK_USAGE)
         .map_err(cli_usage_error)?;
-    let mut format = ObjectFormat::Sha1;
+    let mut format = None;
     for option in &parsed.options {
         if option.long != Some("object-format") {
             continue;
         }
         if matches!(option.name, OptionName::NegatedLong("object-format")) {
-            format = ObjectFormat::Sha1;
+            format = None;
         } else if let ParsedValue::Str(value) = &option.value {
-            format = parse_verify_pack_object_format(value)?;
+            format = Some(parse_verify_pack_object_format(value)?);
         }
     }
     let index_paths = parsed

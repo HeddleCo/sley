@@ -88,6 +88,7 @@ pub struct GitUploadPackAdvertisements {
     pub refs: Vec<RefAdvertisement>,
     pub features: UploadPackFeatures,
     pub protocol_v2: bool,
+    pub object_format: ObjectFormat,
 }
 
 pub(crate) fn ls_remote_git(
@@ -184,6 +185,7 @@ pub fn git_upload_pack_advertisements_with_protocol(
             refs: set.refs,
             features,
             protocol_v2: true,
+            object_format: format,
         });
     }
 
@@ -199,6 +201,48 @@ pub fn git_upload_pack_advertisements_with_protocol(
         refs: set.refs,
         features,
         protocol_v2: false,
+        object_format: format,
+    })
+}
+
+/// Discover upload-pack capabilities and object format before creating a clone.
+pub fn discover_git_upload_pack_advertisements(
+    remote: &RemoteUrl,
+    protocol_v2: bool,
+    config: Option<&GitConfig>,
+) -> Result<GitUploadPackAdvertisements> {
+    if protocol_v2 {
+        let mut stream = connect_git_service(
+            remote,
+            GitService::UploadPack,
+            Some(ProtocolVersion::V2),
+            config,
+        )?;
+        let handshake = read_protocol_v2_advertisement(&mut stream)?;
+        let object_format = protocol_v2_object_format(&handshake.capabilities)?;
+        let set = git_protocol_v2_ls_refs_on_stream(object_format, &mut stream)?;
+        let features = upload_pack_features_from_v2(&handshake, &set.refs)?;
+        return Ok(GitUploadPackAdvertisements {
+            refs: set.refs,
+            features,
+            protocol_v2: true,
+            object_format,
+        });
+    }
+
+    let mut stream = connect_git_service(remote, GitService::UploadPack, None, config)?;
+    let (set, object_format) = crate::read_discovered_upload_pack_advertisements(&mut stream)?;
+    let features = set
+        .refs
+        .first()
+        .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(GitUploadPackAdvertisements {
+        refs: set.refs,
+        features,
+        protocol_v2: false,
+        object_format,
     })
 }
 

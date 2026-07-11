@@ -19,11 +19,16 @@
 //! The lift proceeds in stages (see `docs/git-remote-extraction.md`); this is
 //! the scaffold (stage A).
 
+use std::io::Read;
 use std::path::Path;
 
 use sley_config::GitConfig;
 pub use sley_config::remotes::{SetUrlError, SetUrlKind, SetUrlOp, set_url};
-use sley_core::{ObjectFormat, Result};
+use sley_core::{GitError, ObjectFormat, Result};
+use sley_protocol::{
+    RefAdvertisementSet, parse_ref_advertisement_set, parse_upload_pack_features,
+    read_pkt_line_frames_until_flush,
+};
 use sley_transport::GitCredential;
 
 mod admin;
@@ -64,35 +69,38 @@ pub use http_backend::{
 mod http;
 #[cfg(feature = "http")]
 pub use http::{
-    HttpFetchPackRequest, HttpOperationBatch, HttpServiceAdvertisements, http_advertised_refs,
-    http_authorization_headers, http_check_status, http_protocol_v2_fetch_response,
-    http_send_with_auth, http_service_advertisements, http_upload_pack_advertisements,
-    http_upload_pack_features, http_validate_content_type,
+    HttpFetchPackRequest, HttpOperationBatch, HttpServiceAdvertisements, HttpUploadPackDiscovery,
+    http_advertised_refs, http_authorization_headers, http_check_status, http_discover_upload_pack,
+    http_protocol_v2_fetch_response, http_send_with_auth, http_service_advertisements,
+    http_upload_pack_advertisements, http_upload_pack_features, http_validate_content_type,
     install_fetch_pack_via_http_protocol_v2_fetch, install_fetch_pack_via_http_upload_pack,
     new_http_client, remote_url_is_http,
 };
 
 mod ssh;
 pub use ssh::{
-    SshFetchPackRequest, SshTransportOptions, install_fetch_pack_via_ssh_upload_pack, ssh_program,
-    ssh_transport_options_from_config, ssh_upload_pack_advertisements,
+    SshFetchPackRequest, SshTransportOptions, SshUploadPackDiscovery,
+    discover_ssh_upload_pack_advertisements_with_command, install_fetch_pack_via_ssh_upload_pack,
+    ssh_program, ssh_transport_options_from_config, ssh_upload_pack_advertisements,
     ssh_upload_pack_advertisements_with_command, ssh_upload_pack_advertisements_with_options,
 };
 
 mod git;
 mod git_proxy;
 pub use git::{
-    GitFetchPackRequest, git_upload_pack_advertisements,
+    GitFetchPackRequest, discover_git_upload_pack_advertisements, git_upload_pack_advertisements,
     git_upload_pack_advertisements_with_protocol, install_fetch_pack_via_git_upload_pack,
 };
 
 mod helper;
 pub use helper::{
-    RemoteHelperCapabilities, RemoteHelperEvent, RemoteHelperEventSink, RemoteHelperExportRequest,
+    DiscoveredRemoteHelperFetchOperation, RemoteHelperCapabilities, RemoteHelperEvent,
+    RemoteHelperEventSink, RemoteHelperExportRequest, RemoteHelperFetchDiscovery,
     RemoteHelperFetchOperation, RemoteHelperFetchServices, RemoteHelperPlumbing,
     RemoteHelperPushError, RemoteHelperPushOperation, RemoteHelperPushOptions,
     RemoteHelperPushOutcome, RemoteHelperPushServices, RemoteHelperRef, RemoteHelperRefValue,
-    RemoteHelperSession, RemoteHelperSpec, fetch_via_remote_helper,
+    RemoteHelperSession, RemoteHelperSpec, discover_remote_helper_fetch,
+    fetch_via_discovered_remote_helper, fetch_via_remote_helper,
     imported_remote_helper_advertisements, push_via_remote_helper, resolve_remote_helper,
     rewrite_remote_helper_import_stream,
 };
@@ -112,6 +120,43 @@ pub use receive_pack_server::{
     request_uses_sideband, run_receive_pack_post_hooks, serve_receive_pack,
     write_receive_pack_server_report, write_receive_pack_sideband_stderr,
 };
+
+/// Read a v0/v1 upload-pack advertisement before a local object format exists.
+///
+/// Clone is the important caller: the remote advertisement establishes the
+/// format of the repository that will be created. Fetch and push instead know
+/// their repository format already and continue to use the strict readers.
+pub(crate) fn read_discovered_upload_pack_advertisements(
+    reader: &mut impl Read,
+) -> Result<(RefAdvertisementSet, ObjectFormat)> {
+    let frames = read_pkt_line_frames_until_flush(reader)?;
+    let sha1 = parse_ref_advertisement_set(ObjectFormat::Sha1, &frames);
+    let sha256 = parse_ref_advertisement_set(ObjectFormat::Sha256, &frames);
+    for (format, parsed) in [
+        (ObjectFormat::Sha1, sha1.as_ref()),
+        (ObjectFormat::Sha256, sha256.as_ref()),
+    ] {
+        let Ok(set) = parsed else {
+            continue;
+        };
+        let advertised = set
+            .refs
+            .first()
+            .map(|reference| parse_upload_pack_features(&reference.capabilities))
+            .transpose()?
+            .and_then(|features| features.object_format)
+            .unwrap_or(ObjectFormat::Sha1);
+        if advertised == format {
+            return Ok((set.clone(), format));
+        }
+    }
+    match sha1 {
+        Err(err) => Err(err),
+        Ok(_) => Err(GitError::InvalidObjectId(
+            "advertised object format does not match advertised object ids".into(),
+        )),
+    }
+}
 
 mod local;
 pub use local::{
@@ -289,6 +334,31 @@ mod tests {
     use sley_transport::{RemoteUrl, parse_remote_url};
 
     #[test]
+    fn clone_discovery_adopts_advertised_sha256_format() {
+        let advertised = sley_protocol::RefAdvertisementSet {
+            protocol: sley_protocol::ProtocolVersion::V0,
+            refs: vec![sley_protocol::RefAdvertisement {
+                oid: sley_core::ObjectId::null(ObjectFormat::Sha256),
+                name: "capabilities^{}".into(),
+                capabilities: vec![sley_core::Capability {
+                    name: "object-format".into(),
+                    value: Some("sha256".into()),
+                }],
+            }],
+            shallow: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        sley_protocol::write_ref_advertisement_set(&mut bytes, &advertised)
+            .expect("advertisement should encode");
+
+        let (parsed, format) = read_discovered_upload_pack_advertisements(&mut bytes.as_slice())
+            .expect("format should be discovered");
+
+        assert_eq!(format, ObjectFormat::Sha256);
+        assert_eq!(parsed, advertised);
+    }
+
+    #[test]
     fn no_credentials_never_fills() {
         let mut provider = NoCredentials;
         let request = GitCredential::default();
@@ -459,6 +529,7 @@ mod tests {
                 source: &source,
                 refspecs: &[refspec],
                 options: &options,
+                validation: None,
             },
             FetchServices {
                 credentials,

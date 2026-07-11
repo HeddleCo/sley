@@ -3723,6 +3723,7 @@ fn cmd_diff_no_index(
         let global_external = global_external_diff_command(config.as_ref());
         if let Some(code) = run_external_diff_no_index_entries(
             &entries,
+            format,
             &userdiff,
             global_external.as_ref(),
             ExternalDiffRunOptions {
@@ -4324,6 +4325,7 @@ fn no_index_resolve_prefixes(
 
 fn run_external_diff_no_index_entries(
     entries: &[NoIndexEntry],
+    format: ObjectFormat,
     userdiff: &commands::userdiff::UserdiffResolver,
     global: Option<&ExternalDiffCommand>,
     options: ExternalDiffRunOptions<'_>,
@@ -4353,6 +4355,7 @@ fn run_external_diff_no_index_entries(
         }
         let rc = run_one_external_diff_no_index(
             entry,
+            format,
             &command,
             idx + 1,
             entries.len(),
@@ -4385,6 +4388,7 @@ fn run_external_diff_no_index_entries(
 
 fn run_one_external_diff_no_index(
     entry: &NoIndexEntry,
+    format: ObjectFormat,
     command: &ExternalDiffCommand,
     counter: usize,
     total: usize,
@@ -4397,8 +4401,8 @@ fn run_one_external_diff_no_index(
     let new_path = String::from_utf8_lossy(&entry.entry.path).into_owned();
     let old_file = external_no_index_file(&old_path, entry.old_content.as_deref(), autocrlf)?;
     let new_file = external_no_index_file(&new_path, entry.new_content.as_deref(), autocrlf)?;
-    let old_hex = ObjectId::null(ObjectFormat::Sha1).to_hex();
-    let new_hex = ObjectId::null(ObjectFormat::Sha1).to_hex();
+    let old_hex = ObjectId::null(format).to_hex();
+    let new_hex = ObjectId::null(format).to_hex();
     let old_mode = external_diff_mode(entry.entry.old_mode);
     let new_mode = external_diff_mode(entry.entry.new_mode);
     let args = [

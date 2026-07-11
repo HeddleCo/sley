@@ -2930,6 +2930,46 @@ fn diff_outside_repository_implicitly_uses_no_index() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[cfg(unix)]
+#[test]
+fn diff_no_index_external_diff_uses_repository_object_format_for_null_ids() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = unique_temp_dir("diff-no-index-external-sha256-null-ids");
+    fs::create_dir_all(&root).expect("create repository root");
+    git(
+        &root,
+        &["init", "-q", "-b", "main", "--object-format=sha256"],
+    );
+    fs::write(root.join("executable"), b"content\n").expect("write executable side");
+    fs::write(root.join("not-executable"), b"content\n").expect("write regular side");
+    let mut permissions = fs::metadata(root.join("executable"))
+        .expect("stat executable side")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(root.join("executable"), permissions).expect("chmod executable side");
+
+    let args = [
+        "-c",
+        "diff.external=echo diff",
+        "diff",
+        "--no-index",
+        "executable",
+        "not-executable",
+    ];
+    let oracle = run_status(sley_testkit::oracle_git(), &root, &args);
+    let actual = run_status(sley_testkit::sley_bin!(), &root, &args);
+    assert_eq!(actual, oracle);
+    assert_eq!(actual.0, 1);
+    assert!(
+        String::from_utf8_lossy(&actual.1).contains(&"0".repeat(64)),
+        "external diff did not receive SHA-256-width null ids: {}",
+        String::from_utf8_lossy(&actual.1),
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn diff_no_index_rejects_stdin_directory_without_reading_stdin() {
     let root = unique_temp_dir("diff-no-index-stdin-directory");

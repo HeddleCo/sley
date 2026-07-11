@@ -705,6 +705,16 @@ pub struct CheckoutResult {
     pub files: usize,
 }
 
+/// Typed local-change report produced after a branch checkout.
+///
+/// This is independent of the index's full or sparse representation; callers
+/// render the same entries for ordinary, sparse-checkout, and sparse-index
+/// repositories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutChangeSummary {
+    pub changes: Vec<sley_diff_merge::NameStatusEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreResult {
     pub restored: usize,

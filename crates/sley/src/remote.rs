@@ -116,6 +116,7 @@ impl Repository {
                 source: &source,
                 refspecs,
                 options: &options,
+                validation: None,
             },
             FetchServices {
                 credentials,

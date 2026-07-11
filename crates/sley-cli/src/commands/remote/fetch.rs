@@ -1948,6 +1948,16 @@ pub(super) fn run_fetch(
     server_options: &[String],
 ) -> Result<sley_remote::FetchOutcome> {
     let before_refs = fetch_ref_snapshot(git_dir, format)?;
+    let validation = sley_fsck::FsckPolicy::from_config(
+        config,
+        sley_fsck::FsckConfigKind::Fetch,
+        format,
+        cwd,
+        false,
+    )?;
+    for diagnostic in &validation.diagnostics {
+        eprintln!("{diagnostic}");
+    }
     let mut credentials = sley_remote::CredentialHelperProvider::new(Some(config));
     let mut progress = StdoutProgress;
     if matches!(
@@ -1971,6 +1981,7 @@ pub(super) fn run_fetch(
             source: fetch_source,
             refspecs,
             options: &options,
+            validation: Some(&validation),
         },
         sley_remote::FetchServices {
             credentials: &mut credentials,

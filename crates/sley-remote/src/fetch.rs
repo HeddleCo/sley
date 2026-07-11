@@ -260,6 +260,10 @@ pub struct FetchRequest<'a> {
     pub refspecs: &'a [String],
     /// Fetch behavior flags.
     pub options: &'a FetchOptions,
+    /// Optional incoming-object validation resolved by the caller. The CLI
+    /// supplies this for Git-compatible fetch/transfer fsck policy; embedders
+    /// may omit it when they own validation separately.
+    pub validation: Option<&'a sley_fsck::FsckPolicy>,
 }
 
 /// Mutable seams used while fetching.
@@ -407,6 +411,19 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         &options,
     )?;
     let mut outcome = FetchOutcome::default();
+    let mut quarantine = request
+        .validation
+        .map(|_| {
+            sley_odb::IncomingPackQuarantine::new(request.git_dir, request.format).map(|incoming| {
+                incoming
+                    .with_promisor_remote_present(crate::config_has_promisor_remote(request.config))
+            })
+        })
+        .transpose()?;
+    let transfer_git_dir = quarantine
+        .as_ref()
+        .map(sley_odb::IncomingPackQuarantine::git_dir)
+        .unwrap_or(request.git_dir);
 
     // Advertise refs, plan the ref-map, install the pack, then update refs/prune.
     // The two transports differ only in how they advertise and how they pull the
@@ -459,7 +476,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             let deepen_not = resolve_deepen_not_refs(&advertisements, &options.deepen_not)?;
             let pack_request = crate::http::HttpFetchPackRequest {
                 client,
-                git_dir: request.git_dir,
+                git_dir: transfer_git_dir,
                 format: request.format,
                 remote,
                 wants,
@@ -509,6 +526,8 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     log_all_ref_updates: fetch_log_all_ref_updates(request.config),
                     ref_hook,
                     opportunistic_dsts: &opportunistic_dsts,
+                    validation: request.validation,
+                    quarantine: &mut quarantine,
                 },
                 &mut updates,
                 &mut outcome,
@@ -563,7 +582,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 shallow_boundary_for_request(request.git_dir, request.format, &options)?;
             let shallow_info = crate::ssh::install_fetch_pack_via_ssh_upload_pack(
                 crate::ssh::SshFetchPackRequest {
-                    git_dir: request.git_dir,
+                    git_dir: transfer_git_dir,
                     format: request.format,
                     remote,
                     features: &features,
@@ -592,6 +611,8 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     log_all_ref_updates: fetch_log_all_ref_updates(request.config),
                     ref_hook,
                     opportunistic_dsts: &opportunistic_dsts,
+                    validation: request.validation,
+                    quarantine: &mut quarantine,
                 },
                 &mut updates,
                 &mut outcome,
@@ -624,6 +645,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                         ..sley_protocol::UploadPackFeatures::default()
                     },
                     protocol_v2: true,
+                    object_format: request.format,
                 }
             } else {
                 crate::git::git_upload_pack_advertisements_with_protocol(
@@ -654,7 +676,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 shallow_boundary_for_request(request.git_dir, request.format, &options)?;
             let shallow_info = crate::git::install_fetch_pack_via_git_upload_pack(
                 crate::git::GitFetchPackRequest {
-                    git_dir: request.git_dir,
+                    git_dir: transfer_git_dir,
                     format: request.format,
                     remote,
                     config: Some(request.config),
@@ -683,6 +705,8 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     log_all_ref_updates: fetch_log_all_ref_updates(request.config),
                     ref_hook,
                     opportunistic_dsts: &opportunistic_dsts,
+                    validation: request.validation,
+                    quarantine: &mut quarantine,
                 },
                 &mut updates,
                 &mut outcome,
@@ -965,6 +989,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 let ref_in_want = crate::local::install_fetch_pack_via_local_protocol_v2(
                     crate::local::LocalProtocolV2FetchRequest {
                         git_dir: request.git_dir,
+                        destination_git_dir: transfer_git_dir,
                         remote_git_dir,
                         format: request.format,
                         wants: exact_wants,
@@ -986,8 +1011,9 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 }
                 Vec::new()
             } else {
-                crate::local::install_fetch_pack_via_local_upload_pack_with_promisor_decision(
+                crate::local::install_fetch_pack_via_local_upload_pack_with_promisor_decision_into(
                     request.git_dir,
+                    transfer_git_dir,
                     remote_git_dir,
                     request.format,
                     starts,
@@ -1015,6 +1041,8 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     log_all_ref_updates: fetch_log_all_ref_updates(request.config),
                     ref_hook,
                     opportunistic_dsts: &opportunistic_dsts,
+                    validation: request.validation,
+                    quarantine: &mut quarantine,
                 },
                 &mut updates,
                 &mut outcome,
@@ -1159,6 +1187,7 @@ pub fn finalize_remote_helper_fetch(
         head_symref: request.head_symref,
         ..FetchOutcome::default()
     };
+    let mut quarantine = None;
     finalize_fetch(
         FetchFinalize {
             git_dir: request.git_dir,
@@ -1170,6 +1199,8 @@ pub fn finalize_remote_helper_fetch(
             log_all_ref_updates: fetch_log_all_ref_updates(request.config),
             ref_hook,
             opportunistic_dsts: &opportunistic_dsts,
+            validation: None,
+            quarantine: &mut quarantine,
         },
         &mut updates,
         &mut outcome,
@@ -1547,6 +1578,8 @@ struct FetchFinalize<'a> {
     /// Destinations of opportunistic tracking updates (git's `FETCH_HEAD_IGNORE`):
     /// applied as refs but excluded from `FETCH_HEAD`.
     opportunistic_dsts: &'a HashSet<String>,
+    validation: Option<&'a sley_fsck::FsckPolicy>,
+    quarantine: &'a mut Option<sley_odb::IncomingPackQuarantine>,
 }
 
 /// git's `store_updated_refs` (builtin/fetch.c) downgrades any for-merge
@@ -1555,16 +1588,15 @@ struct FetchFinalize<'a> {
 /// is recorded but never eligible for merge. Runs after the pack is installed so
 /// the objects are present locally.
 fn downgrade_non_commit_for_merge(
-    git_dir: &Path,
+    db: &FileObjectDatabase,
     format: ObjectFormat,
     updates: &mut [FetchRefUpdate],
 ) {
     if updates.iter().all(|update| update.not_for_merge) {
         return;
     }
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     for update in updates.iter_mut() {
-        if !update.not_for_merge && sley_rev::peel_to_commit(&db, format, &update.oid).is_err() {
+        if !update.not_for_merge && sley_rev::peel_to_commit(db, format, &update.oid).is_err() {
             update.not_for_merge = true;
         }
     }
@@ -1585,12 +1617,27 @@ fn finalize_fetch(
         log_all_ref_updates,
         ref_hook,
         opportunistic_dsts,
+        validation,
+        quarantine,
     } = finalize;
     if options.dry_run {
         outcome.ref_updates = std::mem::take(updates);
         return Ok(());
     }
-    downgrade_non_commit_for_merge(git_dir, format, updates);
+    let main_db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let quarantine_db = quarantine
+        .as_ref()
+        .map(sley_odb::IncomingPackQuarantine::database);
+    let validation_db = quarantine_db.as_ref().unwrap_or(&main_db);
+    validate_incoming_fetch_objects(validation_db, format, updates, validation)?;
+    downgrade_non_commit_for_merge(validation_db, format, updates);
+    // Once the incoming graph passes validation it is safe to expose the
+    // objects. Git retains a successfully received pack even when a later ref
+    // update is rejected, and the ref checks below must be able to walk the new
+    // tips against the destination object database.
+    if let Some(incoming) = quarantine.take() {
+        incoming.promote()?;
+    }
     drop_redundant_symref_alias_updates(store, updates)?;
     validate_fetch_ref_updates(git_dir, format, store, options.update_head_ok, updates)?;
     if options.atomic {
@@ -1601,11 +1648,11 @@ fn finalize_fetch(
         // an abort leaves the truncated (empty) file. Reject non-fast-forward
         // tracking updates first, then apply every update in one transaction
         // (firing the `reference-transaction` hook, which may itself abort).
-        if options.write_fetch_head && !options.append {
-            fs::write(git_dir.join("FETCH_HEAD"), b"")?;
-        }
         if let Some(reason) = atomic_non_fast_forward_rejection(git_dir, format, store, updates)? {
             return Err(GitError::Command(reason));
+        }
+        if options.write_fetch_head && !options.append {
+            fs::write(git_dir.join("FETCH_HEAD"), b"")?;
         }
         apply_fetch_ref_updates(
             store,
@@ -1631,6 +1678,19 @@ fn finalize_fetch(
         outcome.ref_updates = std::mem::take(updates);
         return Ok(());
     }
+    let (rejected, rejection) =
+        non_atomic_non_fast_forward_rejections(git_dir, format, store, updates)?;
+    let accepted = updates
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !rejected.contains(index))
+        .map(|(_, update)| update.clone())
+        .collect::<Vec<_>>();
+    if accepted.is_empty()
+        && let Some(reason) = rejection.as_ref()
+    {
+        return Err(GitError::Command(reason.clone()));
+    }
     if options.write_fetch_head {
         write_finalized_fetch_head(
             git_dir,
@@ -1642,14 +1702,6 @@ fn finalize_fetch(
         )?;
         outcome.wrote_fetch_head = true;
     }
-    let (rejected, rejection) =
-        non_atomic_non_fast_forward_rejections(git_dir, format, store, updates)?;
-    let accepted = updates
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !rejected.contains(index))
-        .map(|(_, update)| update.clone())
-        .collect::<Vec<_>>();
     apply_fetch_ref_updates(
         store,
         format,
@@ -1663,6 +1715,44 @@ fn finalize_fetch(
     }
     outcome.ref_updates = std::mem::take(updates);
     Ok(())
+}
+
+fn validate_incoming_fetch_objects(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    updates: &[FetchRefUpdate],
+    policy: Option<&sley_fsck::FsckPolicy>,
+) -> Result<()> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    let mut seen = HashSet::new();
+    let roots = updates
+        .iter()
+        .map(|update| update.oid)
+        .filter(|oid| seen.insert(*oid))
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return Ok(());
+    }
+    let report = sley_fsck::fsck_objects_with_options(
+        db,
+        format,
+        roots,
+        [],
+        policy.fsck_options(policy.enabled),
+    );
+    for issue in &report.issues {
+        match issue.stream {
+            sley_fsck::IssueStream::Stdout => println!("{}", issue.message),
+            sley_fsck::IssueStream::Stderr => eprintln!("{}", issue.message),
+        }
+    }
+    if report.is_ok() {
+        Ok(())
+    } else {
+        Err(GitError::Exit(128))
+    }
 }
 
 /// A wildcard fetch can map both a symbolic alias and its target, for example
@@ -2863,6 +2953,7 @@ mod tests {
                 source: &source,
                 refspecs: &refspecs,
                 options: &options,
+                validation: None,
             },
             FetchServices {
                 credentials: &mut credentials,
@@ -2888,6 +2979,7 @@ mod tests {
                 source: &source,
                 refspecs: &refspecs,
                 options: &options,
+                validation: None,
             },
             FetchServices {
                 credentials: &mut credentials,
@@ -2959,6 +3051,15 @@ mod tests {
         };
         let refspecs = vec!["refs/heads/main:refs/remotes/origin/main".to_string()];
         let options = default_options();
+        let config = GitConfig::parse(b"[fetch]\n\tfsckObjects = true\n").expect("config");
+        let policy = sley_fsck::FsckPolicy::from_config(
+            &config,
+            sley_fsck::FsckConfigKind::Fetch,
+            ObjectFormat::Sha1,
+            &local,
+            false,
+        )
+        .expect("fetch policy");
         let mut credentials = NoCredentials;
         let mut progress = SilentProgress;
 
@@ -2966,11 +3067,12 @@ mod tests {
             FetchRequest {
                 git_dir: &local,
                 format: ObjectFormat::Sha1,
-                config: &GitConfig::default(),
+                config: &config,
                 remote_name: "origin",
                 source: &source,
                 refspecs: &refspecs,
                 options: &options,
+                validation: Some(&policy),
             },
             FetchServices {
                 credentials: &mut credentials,
@@ -2996,6 +3098,87 @@ mod tests {
     }
 
     #[test]
+    fn fetch_fsck_rejects_before_ref_or_fetch_head_mutation() {
+        let remote = temp_repo("remote-fsck-reject");
+        let local = temp_repo("local-fsck-reject");
+        let format = ObjectFormat::Sha1;
+        let remote_db = FileObjectDatabase::from_git_dir(&remote, format);
+        let tree = remote_db
+            .write_object(EncodedObject::new(
+                ObjectType::Tree,
+                Tree { entries: vec![] }.write(),
+            ))
+            .expect("tree");
+        let malformed = format!(
+            "tree {tree}\nauthor Bugs Bunny 1 +0000\ncommitter Bugs <bugs@example.invalid> 1 +0000\n\nbad\n"
+        );
+        let tip = remote_db
+            .write_object(EncodedObject::new(
+                ObjectType::Commit,
+                malformed.into_bytes(),
+            ))
+            .expect("malformed commit");
+        let remote_refs = FileRefStore::new(&remote, format);
+        let mut tx = remote_refs.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(tip),
+            reflog: None,
+        });
+        tx.commit().expect("remote ref");
+        let config = GitConfig::parse(b"[fetch]\n\tfsckObjects = true\n").expect("config");
+        let policy = sley_fsck::FsckPolicy::from_config(
+            &config,
+            sley_fsck::FsckConfigKind::Fetch,
+            format,
+            Path::new("."),
+            false,
+        )
+        .expect("policy");
+        let source = FetchSource::Local {
+            git_dir: remote.clone(),
+            common_git_dir: remote,
+        };
+        let options = default_options();
+        let mut credentials = NoCredentials;
+        let mut progress = SilentProgress;
+        let result = fetch(
+            FetchRequest {
+                git_dir: &local,
+                format,
+                config: &config,
+                remote_name: "origin",
+                source: &source,
+                refspecs: &["refs/heads/main:refs/remotes/origin/main".to_string()],
+                options: &options,
+                validation: Some(&policy),
+            },
+            FetchServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+                ref_hook: None,
+            },
+        );
+        assert!(
+            result.is_err(),
+            "malformed incoming commit must be rejected"
+        );
+        assert_eq!(
+            FileRefStore::new(&local, format)
+                .read_ref("refs/remotes/origin/main")
+                .expect("local ref read"),
+            None
+        );
+        assert!(!local.join("FETCH_HEAD").exists());
+        assert!(
+            !FileObjectDatabase::from_git_dir(&local, format)
+                .contains(&tip)
+                .expect("rejected object lookup")
+        );
+    }
+
+    #[test]
     fn shallow_local_fetch_writes_depth_boundary_metadata() {
         let remote = temp_repo("remote-shallow");
         let local = temp_repo("local-shallow");
@@ -3018,6 +3201,7 @@ mod tests {
                 source: &source,
                 refspecs: &["refs/heads/main:refs/remotes/origin/main".to_string()],
                 options: &options,
+                validation: None,
             },
             FetchServices {
                 credentials: &mut credentials,
@@ -3066,6 +3250,7 @@ mod tests {
                 source: &source,
                 refspecs: &refspecs,
                 options: &options,
+                validation: None,
             },
             FetchServices {
                 credentials: &mut credentials,
@@ -3087,6 +3272,7 @@ mod tests {
                 source: &source,
                 refspecs: &refspecs,
                 options: &options,
+                validation: None,
             },
             FetchServices {
                 credentials: &mut credentials,
@@ -3172,6 +3358,7 @@ mod tests {
                 source: &source,
                 refspecs: &["refs/heads/main:refs/remotes/origin/main".to_string()],
                 options: &options,
+                validation: None,
             },
             FetchServices {
                 credentials: &mut credentials,

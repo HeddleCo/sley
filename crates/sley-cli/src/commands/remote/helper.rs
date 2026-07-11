@@ -55,6 +55,60 @@ pub(crate) fn fetch_with_remote_helper(
         },
     )
     .map(Some)
+    .map_err(render_remote_helper_error)
+}
+
+pub(crate) fn discover_remote_helper_for_clone(
+    config: &GitConfig,
+    git_dir: &Path,
+    spec: sley_remote::RemoteHelperSpec,
+) -> Result<sley_remote::RemoteHelperFetchDiscovery> {
+    // The clone dispatcher already validated the resolved URL. Once it has
+    // selected a custom helper, validate the helper transport name rather than
+    // reparsing its user-defined URL scheme as a native transport.
+    sley_remote::check_transport_allowed(&spec.name, Some(config), None).map_err(|error| {
+        eprintln!("fatal: {error}");
+        GitError::Exit(128)
+    })?;
+    trace_remote_helper(&spec);
+    sley_remote::discover_remote_helper_fetch(spec, git_dir, ObjectFormat::Sha1)
+        .map_err(render_remote_helper_error)
+}
+
+pub(crate) fn fetch_with_discovered_remote_helper(
+    context: &super::resolve::RemoteCommandContext,
+    discovery: sley_remote::RemoteHelperFetchDiscovery,
+    git_dir: &Path,
+    format: ObjectFormat,
+    source: &str,
+    refspecs: &[String],
+    options: FetchOptions,
+) -> Result<sley_remote::FetchOutcome> {
+    let config = repo_config_with_transport_policy(context, git_dir)?;
+    let ref_hook = crate::commands::refs::ReferenceTransactionHookRunner::new(git_dir);
+    let mut credentials = sley_remote::NoCredentials;
+    let mut progress = StdoutProgress;
+    let mut plumbing = NativeRemoteHelperPlumbing;
+    let mut events = CliRemoteHelperEvents;
+    sley_remote::fetch_via_discovered_remote_helper(
+        discovery,
+        sley_remote::DiscoveredRemoteHelperFetchOperation {
+            git_dir,
+            format,
+            config: &config,
+            remote_name: source,
+            refspecs,
+            options: &options,
+        },
+        sley_remote::RemoteHelperFetchServices {
+            plumbing: &mut plumbing,
+            events: &mut events,
+            credentials: &mut credentials,
+            progress: &mut progress,
+            ref_hook: Some(&ref_hook),
+        },
+    )
+    .map_err(render_remote_helper_error)
 }
 
 pub(super) fn push_with_remote_helper(
@@ -100,7 +154,9 @@ pub(super) fn push_with_remote_helper(
             eprintln!("fatal: {error}");
             return Err(GitError::Exit(128));
         }
-        Err(sley_remote::RemoteHelperPushError::Engine(error)) => return Err(error),
+        Err(sley_remote::RemoteHelperPushError::Engine(error)) => {
+            return Err(render_remote_helper_error(error));
+        }
     };
     if !quiet && !outcome.dry_run {
         eprintln!("To {}", spec.url.as_deref().unwrap_or(remote));
@@ -263,9 +319,43 @@ fn trace_remote_helper(spec: &sley_remote::RemoteHelperSpec) {
     crate::setup::git_trace_line("run-command.c:672", &line);
 }
 
+fn render_remote_helper_error(error: GitError) -> GitError {
+    match error {
+        GitError::Cli(sley::plumbing::sley_core::CliExit::UserError, message) => {
+            eprintln!("fatal: {message}");
+            GitError::Exit(128)
+        }
+        error => error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_helper_discovery_enforces_custom_protocol_policy() {
+        let config = GitConfig {
+            sections: vec![sley_config::ConfigSection::new(
+                "protocol",
+                Some("broken".into()),
+                vec![sley_config::ConfigEntry::new("allow", Some("never".into()))],
+            )],
+            ..GitConfig::default()
+        };
+        let error = discover_remote_helper_for_clone(
+            &config,
+            Path::new("/repository-is-not-opened-before-policy-check"),
+            sley_remote::RemoteHelperSpec {
+                name: "broken".into(),
+                alias: "broken://example.com/repo".into(),
+                url: Some("broken://example.com/repo".into()),
+            },
+        )
+        .err()
+        .expect("protocol policy should reject helper");
+        assert_eq!(error, GitError::Exit(128));
+    }
 
     #[test]
     fn poisoned_sley_bin_cannot_redirect_native_plumbing() {

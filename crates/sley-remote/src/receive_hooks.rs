@@ -10,10 +10,6 @@ use sley_protocol::ReceivePackCommand;
 
 use crate::proc_receive::ReceivePackCommandState;
 
-pub fn hook_exists(git_dir: &Path, hook_name: &str) -> bool {
-    find_hook_path(git_dir, hook_name).is_some()
-}
-
 pub fn run_pre_receive(
     git_dir: &Path,
     commands: &[ReceivePackCommand],

@@ -597,8 +597,10 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
     }
     let mut ssh_options = sley_remote::ssh_transport_options_from_config(&transport_config);
     ssh_options.ip_version = ssh_ip_version;
-    let resolved_repository = ls_remote_resolved_url(&remote_context, &repository)?;
-    check_transport_allowed_url(&resolved_repository, Some(&transport_config))?;
+    if remote_helper.is_none() {
+        let resolved_repository = ls_remote_resolved_url(&remote_context, &repository)?;
+        check_transport_allowed_url(&resolved_repository, Some(&transport_config))?;
+    }
     // An empty `--template=` (or `--template ""`) disables templating entirely,
     // matching upstream git's `copy_templates()`, which returns immediately when
     // the template directory is the empty string. Resolving "" against the cwd
@@ -1440,6 +1442,56 @@ fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Resu
         ref_storage_explicit: options.ref_storage != RefStorageFormat::Files,
     })?;
     let git_dir = layout.git_dir;
+    let helper_config = transport_policy_config_for_clone(options.context.cwd())?;
+    let helper_spec = clone_remote_helper_spec(
+        &helper_config,
+        options.repository,
+        options.origin,
+        options.config_overrides,
+    )
+    .ok_or_else(|| {
+        GitError::Unsupported(format!(
+            "remote helper disappeared while cloning {}",
+            options.repository
+        ))
+    })?;
+    let discovery =
+        super::helper::discover_remote_helper_for_clone(&helper_config, &git_dir, helper_spec)?;
+    let format = discovery.object_format();
+
+    // Discovery is protocol-only. Before changing the provisional repository's
+    // format, prove neither Sley nor the helper installed any object or
+    // object-bearing ref. HEAD is the format-neutral unborn symbolic ref made
+    // by init; helper-private marks/config live outside refs/objects and remain
+    // available because the live process keeps this same GIT_DIR.
+    let provisional_repository = sley::Repository::open(&git_dir)?;
+    let has_refs = !provisional_repository.references().list_refs()?.is_empty();
+    let objects_dir = git_dir.join("objects");
+    let has_loose_objects = fs::read_dir(&objects_dir)?
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name != "info" && name != "pack"
+        });
+    let has_packed_objects = fs::read_dir(objects_dir.join("pack"))?.next().is_some();
+    if has_refs || has_loose_objects || has_packed_objects {
+        return Err(GitError::InvalidFormat(
+            "remote helper mutated provisional repository before object-format discovery".into(),
+        ));
+    }
+    if format != ObjectFormat::Sha1 {
+        let mut config = read_repo_config_on_disk(&git_dir)?;
+        crate::set_config_value(&mut config, "core", None, "repositoryformatversion", "1");
+        crate::set_config_value(
+            &mut config,
+            "extensions",
+            None,
+            "objectformat",
+            format.name(),
+        );
+        write_repo_config(&git_dir, &config)?;
+    }
     let identity_config = read_repo_config(&git_dir)?;
     apply_clone_template(&git_dir, options.template, options.template_config)?;
     let configured_fetch = if options.bare {
@@ -1510,20 +1562,15 @@ fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Resu
         negotiation_restrict: None,
         negotiation_include: None,
     };
-    let outcome = super::helper::fetch_with_remote_helper(
+    let outcome = super::helper::fetch_with_discovered_remote_helper(
         options.context,
+        discovery,
         &git_dir,
-        ObjectFormat::Sha1,
+        format,
         options.origin,
         &refspecs,
         fetch_options,
-    )?
-    .ok_or_else(|| {
-        GitError::Unsupported(format!(
-            "remote helper disappeared while cloning {}",
-            options.repository
-        ))
-    })?;
+    )?;
     let head_branch = options.branch.map(str::to_string).or_else(|| {
         outcome
             .head_symref
@@ -1531,7 +1578,7 @@ fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Resu
             .and_then(|target| target.strip_prefix("refs/heads/"))
             .map(str::to_string)
     });
-    let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+    let store = FileRefStore::new(&git_dir, format);
     let mut empty = true;
     if let Some(branch) = head_branch {
         let source_ref = if options.bare {
@@ -1565,7 +1612,7 @@ fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Resu
                     sley_worktree::checkout_branch_filtered(
                         options.destination,
                         &git_dir,
-                        ObjectFormat::Sha1,
+                        format,
                         &branch,
                         committer_identity_for_reflog(&identity_config)?,
                         &config,
@@ -1578,9 +1625,9 @@ fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Resu
     if empty {
         warn_cloned_empty_repository();
     } else if !options.checkout && !options.bare {
-        remove_clone_worktree_files(options.destination, &git_dir, ObjectFormat::Sha1)?;
+        remove_clone_worktree_files(options.destination, &git_dir, format)?;
     } else if options.sparse && !options.bare {
-        apply_clone_sparse_checkout(options.destination, &git_dir, ObjectFormat::Sha1)?;
+        apply_clone_sparse_checkout(options.destination, &git_dir, format)?;
     }
     if let Some(separate_git_dir) = options.separate_git_dir {
         apply_clone_separate_git_dir(options.destination, &git_dir, separate_git_dir)?;
@@ -1619,7 +1666,7 @@ fn clone_bundle_path(cwd: &Path, repository: &str) -> Option<PathBuf> {
     for candidate in [suffixed, base] {
         if candidate.is_file()
             && let Ok(bytes) = fs::read(&candidate)
-            && Bundle::parse(&bytes, ObjectFormat::Sha1).is_ok()
+            && Bundle::parse_standalone(&bytes).is_ok()
         {
             return Some(candidate);
         }
@@ -1640,8 +1687,8 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
         ));
     }
     let bundle_bytes = fs::read(options.bundle_path)?;
-    let format = ObjectFormat::Sha1;
-    let bundle = Bundle::parse(&bundle_bytes, format)?;
+    let bundle = Bundle::parse_standalone(&bundle_bytes)?;
+    let format = bundle.format;
     let bundle_url = options.bundle_path.to_string_lossy().into_owned();
     if !options.quiet {
         eprintln!(
@@ -1939,6 +1986,7 @@ struct NetworkCloneDiscovery {
     advertisements: Vec<sley_protocol::RefAdvertisement>,
     features: sley_protocol::UploadPackFeatures,
     v2_handshake: Option<sley_protocol::TransportHandshake>,
+    object_format: ObjectFormat,
 }
 
 fn clone_network_repository(
@@ -1976,42 +2024,35 @@ fn clone_network_repository(
         CloneNetworkTransport::Http => {
             let client = sley_remote::new_http_client();
             let mut credentials = sley_remote::NoCredentials;
-            let discovered = sley_remote::http_service_advertisements(
+            let discovered = sley_remote::http_discover_upload_pack(
                 &client,
                 &remote,
-                ObjectFormat::Sha1,
-                sley_protocol::GitService::UploadPack,
                 &mut credentials,
                 Some(&transport_config),
             )?;
-            let features = sley_remote::http_upload_pack_features(
-                &discovered.set.refs,
-                discovered.handshake.as_ref(),
-            )?;
             NetworkCloneDiscovery {
-                advertisements: discovered.set.refs,
-                features,
-                v2_handshake: discovered.handshake,
+                advertisements: discovered.advertisements.set.refs,
+                features: discovered.features,
+                v2_handshake: discovered.advertisements.handshake,
+                object_format: discovered.object_format,
             }
         }
         CloneNetworkTransport::Ssh => {
-            let (advertisements, features) =
-                sley_remote::ssh_upload_pack_advertisements_with_command(
-                    &remote,
-                    ObjectFormat::Sha1,
-                    options.ssh_options,
-                    options.upload_pack_command,
-                )?;
+            let discovered = sley_remote::discover_ssh_upload_pack_advertisements_with_command(
+                &remote,
+                options.ssh_options,
+                options.upload_pack_command,
+            )?;
             NetworkCloneDiscovery {
-                advertisements,
-                features,
+                advertisements: discovered.refs,
+                features: discovered.features,
                 v2_handshake: None,
+                object_format: discovered.object_format,
             }
         }
         CloneNetworkTransport::Git => {
-            let discovered = sley_remote::git_upload_pack_advertisements_with_protocol(
+            let discovered = sley_remote::discover_git_upload_pack_advertisements(
                 &remote,
-                ObjectFormat::Sha1,
                 configured_protocol_version(Some(&transport_config)) == Some(ProtocolVersion::V2),
                 Some(&transport_config),
             )?;
@@ -2019,19 +2060,14 @@ fn clone_network_repository(
                 advertisements: discovered.refs,
                 features: discovered.features,
                 v2_handshake: None,
+                object_format: discovered.object_format,
             }
         }
     };
     let advertisements = discovery.advertisements;
     let features = discovery.features;
     let v2_handshake = discovery.v2_handshake;
-    let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
-    if format != ObjectFormat::Sha1 && matches!(transport, CloneNetworkTransport::Http) {
-        return Err(GitError::Unsupported(format!(
-            "cloning {} repositories over HTTP is not supported yet",
-            format.name()
-        )));
-    }
+    let format = discovery.object_format;
     let mut fetch_filter = None::<sley_odb::PackObjectFilter>;
     let mut fetch_filter_auto = false;
     let mut configured_partial_clone_filter = None::<&str>;

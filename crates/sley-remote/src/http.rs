@@ -230,6 +230,14 @@ pub struct HttpServiceAdvertisements {
     pub handshake: Option<TransportHandshake>,
 }
 
+/// Upload-pack discovery for a repository whose object format is not known yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpUploadPackDiscovery {
+    pub advertisements: HttpServiceAdvertisements,
+    pub features: UploadPackFeatures,
+    pub object_format: ObjectFormat,
+}
+
 /// Parse a smart-HTTP info/refs body into a ref advertisement set for protocol
 /// v0/v1. Protocol v2 discovery responses require a follow-up `ls-refs` RPC; use
 /// [`http_service_advertisements`] instead.
@@ -454,6 +462,24 @@ pub fn http_service_advertisements(
     credentials: &mut dyn CredentialProvider,
     config: Option<&GitConfig>,
 ) -> Result<HttpServiceAdvertisements> {
+    http_service_advertisements_with_expected_format(
+        client,
+        remote,
+        Some(format),
+        service,
+        credentials,
+        config,
+    )
+}
+
+fn http_service_advertisements_with_expected_format(
+    client: &UreqHttpClient,
+    remote: &RemoteUrl,
+    expected_format: Option<ObjectFormat>,
+    service: GitService,
+    credentials: &mut dyn CredentialProvider,
+    config: Option<&GitConfig>,
+) -> Result<HttpServiceAdvertisements> {
     // Git's smart-HTTP packet stream is owned by the logical remote-curl
     // helper, whose packet trace identity is `git` even though Sley performs
     // the same operation in-process. Keep this observable boundary without
@@ -466,7 +492,20 @@ pub fn http_service_advertisements(
     })?;
     http_check_status(&response, &url)?;
     http_validate_content_type(&response, &smart_http_advertisement_content_type(service)?)?;
-    let discovery = read_http_service_discovery_response(format, &mut response.body)?;
+    let discovery = read_http_service_discovery_response(
+        expected_format.unwrap_or(ObjectFormat::Sha1),
+        &mut response.body,
+    )?;
+    let object_format = service_discovery_object_format(&discovery)?;
+    if let Some(expected) = expected_format
+        && object_format != expected
+    {
+        return Err(GitError::InvalidObjectId(format!(
+            "remote repository uses {}, local repository uses {}",
+            object_format.name(),
+            expected.name()
+        )));
+    }
     match discovery.payload {
         ServiceDiscoveryPayload::AdvertisedRefs(set) => Ok(HttpServiceAdvertisements {
             set,
@@ -476,7 +515,7 @@ pub fn http_service_advertisements(
             let set = http_protocol_v2_ls_refs_advertisements(
                 client,
                 remote,
-                format,
+                object_format,
                 service,
                 handshake.clone(),
                 credentials,
@@ -488,6 +527,46 @@ pub fn http_service_advertisements(
             })
         }
     }
+}
+
+fn service_discovery_object_format(discovery: &ServiceDiscoveryResponse) -> Result<ObjectFormat> {
+    match &discovery.payload {
+        ServiceDiscoveryPayload::ProtocolV2(handshake) => {
+            protocol_v2_object_format(&handshake.capabilities)
+        }
+        ServiceDiscoveryPayload::AdvertisedRefs(set) => Ok(set
+            .refs
+            .first()
+            .map(|reference| parse_upload_pack_features(&reference.capabilities))
+            .transpose()?
+            .and_then(|features| features.object_format)
+            .unwrap_or(ObjectFormat::Sha1)),
+    }
+}
+
+/// Discover upload-pack capabilities and object format before creating a clone.
+pub fn http_discover_upload_pack(
+    client: &UreqHttpClient,
+    remote: &RemoteUrl,
+    credentials: &mut dyn CredentialProvider,
+    config: Option<&GitConfig>,
+) -> Result<HttpUploadPackDiscovery> {
+    let advertisements = http_service_advertisements_with_expected_format(
+        client,
+        remote,
+        None,
+        GitService::UploadPack,
+        credentials,
+        config,
+    )?;
+    let features =
+        http_upload_pack_features(&advertisements.set.refs, advertisements.handshake.as_ref())?;
+    let object_format = features.object_format.unwrap_or(ObjectFormat::Sha1);
+    Ok(HttpUploadPackDiscovery {
+        advertisements,
+        features,
+        object_format,
+    })
 }
 
 fn read_http_service_discovery_response(

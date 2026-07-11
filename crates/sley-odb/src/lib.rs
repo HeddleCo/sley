@@ -1143,6 +1143,72 @@ mod tests {
     }
 
     #[test]
+    fn incoming_pack_quarantine_discards_rejected_and_promotes_accepted_objects() {
+        let root = temp_root("sley-incoming-pack-quarantine");
+        let git_dir = root.join("repo.git");
+        fs::create_dir_all(git_dir.join("objects/pack")).expect("create object database");
+        let format = ObjectFormat::Sha1;
+        let destination = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let existing = destination
+            .write_object(EncodedObject::new(ObjectType::Blob, b"existing\n".to_vec()))
+            .expect("write existing object");
+        let borrowed_git_dir = root.join("borrowed.git");
+        fs::create_dir_all(borrowed_git_dir.join("objects/pack"))
+            .expect("create borrowed object database");
+        let borrowed_db = FileObjectDatabase::from_git_dir(&borrowed_git_dir, format);
+        let borrowed = borrowed_db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"borrowed\n".to_vec()))
+            .expect("write borrowed object");
+        fs::create_dir_all(git_dir.join("objects/info")).expect("create alternate metadata");
+        fs::write(
+            git_dir.join("objects/info/alternates"),
+            format!("{}\n", borrowed_git_dir.join("objects").display()),
+        )
+        .expect("write destination alternate");
+        let incoming = EncodedObject::new(ObjectType::Blob, b"incoming\n".to_vec());
+        let incoming_oid = incoming.object_id(format).expect("incoming oid");
+        let pack = PackFile::write_packed(&[&incoming], format).expect("write incoming pack");
+
+        {
+            let quarantine =
+                IncomingPackQuarantine::new(&git_dir, format).expect("create rejected quarantine");
+            let db = quarantine.database();
+            db.install_pack(&pack).expect("stage rejected pack");
+            assert!(db.contains(&existing).expect("read alternate object"));
+            assert!(
+                db.contains(&borrowed)
+                    .expect("read destination's borrowed object")
+            );
+            assert!(db.contains(&incoming_oid).expect("read staged object"));
+        }
+        let reopened = FileObjectDatabase::from_git_dir(&git_dir, format);
+        assert!(
+            reopened
+                .contains(&existing)
+                .expect("existing object remains")
+        );
+        assert!(
+            !reopened
+                .contains(&incoming_oid)
+                .expect("rejected object absent")
+        );
+
+        let quarantine =
+            IncomingPackQuarantine::new(&git_dir, format).expect("create accepted quarantine");
+        quarantine
+            .database()
+            .install_pack(&pack)
+            .expect("stage accepted pack");
+        quarantine.promote().expect("promote accepted pack");
+        let reopened = FileObjectDatabase::from_git_dir(&git_dir, format);
+        assert!(
+            reopened
+                .contains(&incoming_oid)
+                .expect("accepted object persists")
+        );
+    }
+
+    #[test]
     fn file_database_streams_raw_pack_install_to_packfile() {
         use std::io::Write as _;
 

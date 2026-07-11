@@ -778,8 +778,11 @@ fn write_unpack_file_temp(contents: &[u8]) -> Result<PathBuf> {
     ))
 }
 
-pub(crate) fn cmd_show_index(args: &[String]) -> Result<()> {
-    let mut format = ObjectFormat::Sha1;
+pub(crate) fn cmd_show_index(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let mut explicit_format = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -788,11 +791,13 @@ pub(crate) fn cmd_show_index(args: &[String]) -> Result<()> {
                     eprintln!("error: option `object-format' requires a value");
                     return Err(GitError::Exit(129));
                 };
-                format = parse_show_index_object_format(value)?;
+                explicit_format = Some(parse_show_index_object_format(value)?);
             }
-            "--no-object-format" => format = ObjectFormat::Sha1,
+            "--no-object-format" => explicit_format = None,
             value if value.starts_with("--object-format=") => {
-                format = parse_show_index_object_format(&value["--object-format=".len()..])?;
+                explicit_format = Some(parse_show_index_object_format(
+                    &value["--object-format=".len()..],
+                )?);
             }
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
@@ -801,6 +806,17 @@ pub(crate) fn cmd_show_index(args: &[String]) -> Result<()> {
             _ => {}
         }
     }
+    let format = match explicit_format {
+        Some(format) => format,
+        None => match cli_session.open_repository() {
+            Ok(repository) => repository.object_format(),
+            Err(GitError::NotFound(_)) => {
+                eprintln!("warning: assuming SHA-1; use --object-format to override");
+                ObjectFormat::Sha1
+            }
+            Err(err) => return Err(err),
+        },
+    };
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;
     if input.len() < 8 {

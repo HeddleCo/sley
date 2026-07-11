@@ -277,6 +277,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
             source: &fetch_source,
             refspecs: &[],
             options: &fetch_options,
+            validation: None,
         },
         crate::fetch::FetchServices {
             credentials: services.credentials,

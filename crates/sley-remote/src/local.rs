@@ -1128,6 +1128,39 @@ pub fn install_fetch_pack_via_local_upload_pack_with_promisor_decision(
     unpack_limit: Option<usize>,
     promisor_decision: &crate::PromisorRemoteDecision,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
+    install_fetch_pack_via_local_upload_pack_with_promisor_decision_into(
+        git_dir,
+        git_dir,
+        remote_git_dir,
+        format,
+        wants,
+        deepen,
+        promisor,
+        record_promisor_refs,
+        filter,
+        custom_haves,
+        refetch,
+        unpack_limit,
+        promisor_decision,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_into(
+    git_dir: &Path,
+    destination_git_dir: &Path,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    wants: Vec<ObjectId>,
+    deepen: Option<&LocalDeepenPlan>,
+    promisor: bool,
+    record_promisor_refs: bool,
+    filter: Option<sley_odb::PackObjectFilter>,
+    custom_haves: Option<Vec<ObjectId>>,
+    refetch: bool,
+    unpack_limit: Option<usize>,
+    promisor_decision: &crate::PromisorRemoteDecision,
+) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if wants.is_empty() {
         return Ok(Vec::new());
     }
@@ -1275,9 +1308,11 @@ pub fn install_fetch_pack_via_local_upload_pack_with_promisor_decision(
     } else {
         ReachablePackMissingPolicy::OmitPromised
     };
+    let destination_db = FileObjectDatabase::from_git_dir(destination_git_dir, format)
+        .with_promisor_remote_present(repo_has_promisor_remote(git_dir));
     let install = build_and_install_reachable_pack_filtered_with_missing_policy(
         &remote_db,
-        &local_db,
+        &destination_db,
         format,
         starts,
         &excluded,
@@ -1502,6 +1537,7 @@ fn hydrate_reachable_promised_objects(
 /// Inputs for one in-process protocol-v2 fetch using `want-ref`.
 pub(crate) struct LocalProtocolV2FetchRequest<'a> {
     pub git_dir: &'a Path,
+    pub destination_git_dir: &'a Path,
     pub remote_git_dir: &'a Path,
     pub format: ObjectFormat,
     pub wants: Vec<ObjectId>,
@@ -1536,6 +1572,7 @@ pub(crate) fn install_fetch_pack_via_local_protocol_v2(
         .map(Ok)
         .unwrap_or_else(|| local_have_oids(input.git_dir, input.format))?;
     let local_db = FileObjectDatabase::from_git_dir(input.git_dir, input.format);
+    let destination_db = FileObjectDatabase::from_git_dir(input.destination_git_dir, input.format);
     let remote_db = FileObjectDatabase::from_git_dir(input.remote_git_dir, input.format);
     let negotiation_rounds = protocol_v2_negotiation_rounds(&local_db, &remote_db, &haves)?;
     let fetch = ProtocolV2FetchRequest {
@@ -1578,7 +1615,7 @@ pub(crate) fn install_fetch_pack_via_local_protocol_v2(
         input.format,
         &mut response_bytes.as_slice(),
         false,
-        &local_db,
+        &destination_db,
         None,
     )?;
     let mut outcome = LocalProtocolV2FetchOutcome::default();
@@ -2373,6 +2410,7 @@ mod tests {
 
         let outcome = install_fetch_pack_via_local_protocol_v2(LocalProtocolV2FetchRequest {
             git_dir: &client_git,
+            destination_git_dir: &client_git,
             remote_git_dir: &remote_git,
             format,
             wants: Vec::new(),

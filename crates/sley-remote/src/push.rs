@@ -1175,13 +1175,6 @@ fn execute_push_local(
         &remote_config,
     )?;
 
-    // git's `transfer.fsckObjects`: the receiving side fscks every object the
-    // push introduces and rejects the push when one fails (most importantly a
-    // malicious `.gitmodules` url). The local fast path copies objects directly
-    // rather than through `index-pack --strict`, so run the same gate here.
-    if remote_transfer_fsck_objects(&remote_common_git_dir) {
-        fsck_pushed_objects(&local_db, request.format, &starts, &remote_excluded)?;
-    }
     let report = if push_local_uses_receive_pack_server(&remote_config, &remote_git_dir, &commands)
     {
         local_push_via_receive_pack_server(LocalPushViaReceivePackRequest {
@@ -1226,15 +1219,6 @@ fn execute_push_local(
         report: Some(report),
         remote_progress: Vec::new(),
     })
-}
-
-/// Whether the local remote enables `transfer.fsckObjects` (the receiving-side
-/// fsck gate). Reads only the remote's own config.
-fn remote_transfer_fsck_objects(remote_common_git_dir: &Path) -> bool {
-    GitConfig::read(remote_common_git_dir.join("config"))
-        .ok()
-        .and_then(|config| config.get_bool("transfer", None, "fsckObjects"))
-        .unwrap_or(false)
 }
 
 /// Disposable object directory used to expose incoming local-push objects to
@@ -1406,38 +1390,6 @@ fn append_remote_alternate_ref_tips(
     Ok(())
 }
 
-/// Run fsck over the objects this push introduces (reachable from `starts`,
-/// minus what the remote already has). On any error-severity finding, print it
-/// and reject the push — git's `transfer.fsckObjects` behavior.
-fn fsck_pushed_objects(
-    local_db: &FileObjectDatabase,
-    format: ObjectFormat,
-    starts: &[ObjectId],
-    remote_excluded: &std::collections::HashSet<ObjectId>,
-) -> Result<()> {
-    if starts.is_empty() {
-        return Ok(());
-    }
-    let new_objects: Vec<ObjectId> =
-        collect_reachable_object_ids(local_db, format, starts.to_vec())?
-            .into_iter()
-            .filter(|oid| !remote_excluded.contains(oid))
-            .collect();
-    // The reader is the COMPLETE local db so link-walks never spuriously report
-    // a "missing object" for something the remote already holds; only genuine
-    // content errors (e.g. a disallowed .gitmodules url) in the new objects fail.
-    let report = sley_fsck::fsck_objects(local_db, format, [], new_objects);
-    if report.is_ok() {
-        return Ok(());
-    }
-    for issue in &report.issues {
-        if issue.severity == sley_fsck::IssueSeverity::Error {
-            eprintln!("fatal: {}", issue.message);
-        }
-    }
-    Err(GitError::Exit(128))
-}
-
 /// Fully resolved inputs for a status-reporting push to a local repository.
 pub struct PushReportRequest<'a> {
     /// Local repository `$GIT_DIR`.
@@ -1538,6 +1490,16 @@ pub fn push_local_with_report_and_objects(
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, format);
     let remote_config =
         sley_config::read_repo_config(request.remote_git_dir, None).unwrap_or_default();
+    // receive-pack parses its fsck namespace before considering individual ref
+    // updates. Preserve that ordering even when the local client can reject a
+    // checked-out branch without otherwise entering the receive server.
+    let _ = sley_fsck::FsckPolicy::from_config(
+        &remote_config,
+        sley_fsck::FsckConfigKind::Receive,
+        format,
+        request.remote_git_dir,
+        false,
+    )?;
 
     // Classify each planned command the way git's send-pack does, collecting
     // rejections rather than bailing on the first one.
@@ -1631,12 +1593,6 @@ pub fn push_local_with_report_and_objects(
             remote_excluded_tips,
             &remote_config,
         )?;
-        // git's `transfer.fsckObjects`: fsck the introduced objects on the
-        // receiving side and reject the push on a content error (a disallowed
-        // `.gitmodules` url, a malformed object, ...).
-        if remote_transfer_fsck_objects(request.remote_common_git_dir) {
-            fsck_pushed_objects(&local_db, format, &starts, &remote_excluded)?;
-        }
         let report =
             if push_local_uses_receive_pack_server(&remote_config, request.remote_git_dir, &send) {
                 local_push_via_receive_pack_server(LocalPushViaReceivePackRequest {
@@ -2114,6 +2070,14 @@ pub fn push_local_uses_receive_pack_server(
     commands: &[ReceivePackCommand],
 ) -> bool {
     let _ = remote_git_dir;
+    if config.get_bool("receive", None, "fsckObjects").is_some()
+        || config.get_bool("transfer", None, "fsckObjects").is_some()
+        || !config
+            .section_entries_with_subsection("receive", Some("fsck"))
+            .is_empty()
+    {
+        return true;
+    }
     let patterns = parse_proc_receive_refs(config);
     if patterns.is_empty() {
         return false;
@@ -2164,6 +2128,13 @@ fn local_push_via_receive_pack_server(
     let mut packfile = Vec::new();
     write_push_packfile(&pack_request, &mut packfile)?;
     let config = sley_config::read_repo_config(request.remote_git_dir, None).unwrap_or_default();
+    let validation = sley_fsck::FsckPolicy::from_config(
+        &config,
+        sley_fsck::FsckConfigKind::Receive,
+        request.format,
+        request.remote_git_dir,
+        false,
+    )?;
     let mut pack_reader = Cursor::new(packfile);
     let mut discard_stderr = Vec::new();
     let capture_stderr = request.remote_stderr.is_some();
@@ -2177,6 +2148,7 @@ fn local_push_via_receive_pack_server(
         },
         pack_reader: &mut pack_reader,
         config: &config,
+        validation: &validation,
         options: ReceivePackServerOptions {
             quiet: request.quiet,
             remote_stderr: if capture_stderr {
@@ -2693,8 +2665,11 @@ pub fn apply_receive_pack_report_to_push_refs(
     if let Some(message) = report.unpack_failed() {
         for reference in refs.iter_mut() {
             if matches!(reference.status, PushRefStatus::Ok) {
-                reference.status =
-                    PushRefStatus::RemoteReject(format!("unpacker error: {message}"));
+                reference.status = PushRefStatus::RemoteReject(if message == "unpacker error" {
+                    message.to_string()
+                } else {
+                    format!("unpacker error: {message}")
+                });
             }
         }
         return;

@@ -33,6 +33,184 @@ pub struct PackInstallResult {
     pub object_ids: Vec<ObjectId>,
 }
 
+/// Disposable object database for an untrusted incoming pack.
+///
+/// Objects are written below the destination object directory, while an
+/// `info/alternates` entry makes the destination's existing objects available
+/// as delta bases and during connectivity validation. Dropping an unpromoted
+/// quarantine removes every incoming object. [`Self::promote`] moves accepted
+/// object files into the destination with per-file atomic renames.
+#[derive(Debug)]
+pub struct IncomingPackQuarantine {
+    git_dir: PathBuf,
+    object_dir: PathBuf,
+    destination_objects_dir: PathBuf,
+    format: ObjectFormat,
+    promisor_remote_present: bool,
+    promoted: bool,
+}
+
+impl IncomingPackQuarantine {
+    pub fn new(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Result<Self> {
+        let source_git_dir = git_dir.as_ref().to_path_buf();
+        let destination_objects_dir = crate::repository_objects_dir(&source_git_dir);
+        fs::create_dir_all(&destination_objects_dir)?;
+        let quarantine_git_dir = create_incoming_object_dir(&destination_objects_dir)?;
+        let object_dir = quarantine_git_dir.join("objects");
+        let result = (|| -> Result<()> {
+            fs::create_dir_all(object_dir.join("pack"))?;
+            fs::create_dir_all(object_dir.join("info"))?;
+            let mut alternates = vec![
+                fs::canonicalize(&destination_objects_dir)
+                    .unwrap_or_else(|_| destination_objects_dir.clone()),
+            ];
+            // FileObjectDatabase deliberately treats alternate entries as a
+            // flat search list. Preserve the destination's existing alternate
+            // visibility explicitly so a quarantined fetch into a shared or
+            // reference clone can validate objects that were already borrowed
+            // from its source repository.
+            alternates.extend(crate::registry::alternate_object_dirs(
+                &destination_objects_dir,
+            ));
+            let mut alternate_file = String::new();
+            for alternate in alternates {
+                let alternate = fs::canonicalize(&alternate).unwrap_or(alternate);
+                alternate_file.push_str(&alternate.to_string_lossy());
+                alternate_file.push('\n');
+            }
+            fs::write(object_dir.join("info/alternates"), alternate_file)?;
+            let shallow = quarantine_git_dir.join("shallow");
+            let source_shallow = source_git_dir.join("shallow");
+            if source_shallow.exists() {
+                fs::copy(source_shallow, shallow)?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            let _ = fs::remove_dir_all(&quarantine_git_dir);
+            return Err(err);
+        }
+        Ok(Self {
+            git_dir: quarantine_git_dir,
+            object_dir,
+            destination_objects_dir,
+            format,
+            promisor_remote_present: false,
+            promoted: false,
+        })
+    }
+
+    pub fn object_dir(&self) -> &Path {
+        &self.object_dir
+    }
+
+    /// A minimal bare repository path whose object database is quarantined.
+    /// Existing destination objects remain readable through its alternate.
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
+    /// Mark promised objects as valid missing links while validating a fetch
+    /// into a partial-clone repository.
+    pub fn with_promisor_remote_present(mut self, present: bool) -> Self {
+        self.promisor_remote_present = present;
+        self
+    }
+
+    pub fn database(&self) -> FileObjectDatabase {
+        FileObjectDatabase::new(self.object_dir.clone(), self.format)
+            .with_promisor_remote_present(self.promisor_remote_present)
+    }
+
+    /// Promote all accepted loose and packed objects into the destination.
+    ///
+    /// Pack indexes and sidecars are made visible before their `.pack`; a
+    /// reader therefore never observes a pack without its index. If any rename
+    /// fails, files newly moved by this call are rolled back into quarantine.
+    pub fn promote(mut self) -> Result<()> {
+        let mut files = incoming_object_files(&self.object_dir)?;
+        files.sort_by_key(|path| {
+            let is_pack = path.extension().is_some_and(|ext| ext == "pack");
+            (is_pack, path.clone())
+        });
+        let mut moved = Vec::new();
+        for source in files {
+            let relative = source
+                .strip_prefix(&self.object_dir)
+                .map_err(|_| GitError::InvalidPath("incoming object escaped quarantine".into()))?;
+            let destination = self.destination_objects_dir.join(relative);
+            let parent = destination.parent().ok_or_else(|| {
+                GitError::InvalidPath("incoming object has no destination parent".into())
+            })?;
+            fs::create_dir_all(parent)?;
+            if destination.exists() {
+                fs::remove_file(&source)?;
+                continue;
+            }
+            if let Err(err) = fs::rename(&source, &destination) {
+                for (promoted, staged) in moved.iter().rev() {
+                    let _ = fs::rename(promoted, staged);
+                }
+                return Err(GitError::Io(err.to_string()));
+            }
+            moved.push((destination, source));
+        }
+        self.promoted = true;
+        fs::remove_dir_all(&self.git_dir)?;
+        Ok(())
+    }
+}
+
+impl Drop for IncomingPackQuarantine {
+    fn drop(&mut self) {
+        if !self.promoted {
+            let _ = fs::remove_dir_all(&self.git_dir);
+        }
+    }
+}
+
+fn create_incoming_object_dir(objects_dir: &Path) -> Result<PathBuf> {
+    for _ in 0..100 {
+        let object_dir = unique_temp_path(objects_dir).with_extension("incoming");
+        match fs::create_dir(&object_dir) {
+            Ok(()) => return Ok(object_dir),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(GitError::Io(err.to_string())),
+        }
+    }
+    Err(GitError::Io(
+        "could not create incoming object quarantine".into(),
+    ))
+}
+
+fn incoming_object_files(object_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let pack_dir = object_dir.join("pack");
+    if pack_dir.exists() {
+        for entry in fs::read_dir(pack_dir)? {
+            let path = entry?.path();
+            if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    for entry in fs::read_dir(object_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.len() != 2 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        for loose in fs::read_dir(entry.path())? {
+            let path = loose?.path();
+            if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    Ok(files)
+}
+
 #[derive(Debug)]
 pub struct RawPackStreamingInstall {
     format: ObjectFormat,

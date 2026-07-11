@@ -11,7 +11,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use sley_config::GitConfig;
 use sley_config::remotes::{remote_config_values, remote_exists, rewrite_url_with_config};
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{CliExit, GitError, ObjectFormat, ObjectId, Result};
 use sley_protocol::{RefAdvertisement, parse_refspec, refspec_map_source};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate};
 
@@ -243,6 +243,23 @@ pub struct RemoteHelperFetchOperation<'a> {
     pub options: &'a FetchOptions,
 }
 
+/// Fetch inputs used after a live helper has already negotiated capabilities,
+/// refs, and object format during clone bootstrap.
+pub struct DiscoveredRemoteHelperFetchOperation<'a> {
+    /// Final repository `$GIT_DIR`; must equal the discovery directory.
+    pub git_dir: &'a Path,
+    /// Object format adopted from helper discovery.
+    pub format: ObjectFormat,
+    /// Effective configuration after clone bootstrap finalization.
+    pub config: &'a GitConfig,
+    /// Configured remote name used for fetch finalization.
+    pub remote_name: &'a str,
+    /// Caller-requested fetch refspecs.
+    pub refspecs: &'a [String],
+    /// Ordinary fetch behavior applied after helper import.
+    pub options: &'a FetchOptions,
+}
+
 /// Runtime seams used by a remote-helper fetch.
 pub struct RemoteHelperFetchServices<'a> {
     /// Native fast-import/export runtime.
@@ -348,6 +365,7 @@ pub struct RemoteHelperPushOutcome {
 pub struct RemoteHelperSession {
     spec: RemoteHelperSpec,
     format: ObjectFormat,
+    adopt_advertised_format: bool,
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
@@ -357,13 +375,35 @@ pub struct RemoteHelperSession {
 impl RemoteHelperSession {
     pub fn start(spec: RemoteHelperSpec, git_dir: &Path, format: ObjectFormat) -> Result<Self> {
         let executable = format!("git-remote-{}", spec.name);
-        Self::start_with_executable(spec, git_dir, format, executable)
+        Self::start_with_executable_mode(spec, git_dir, format, false, executable)
     }
 
+    /// Start a helper against a valid provisional repository, allowing its
+    /// `list` response to select the final object format before import begins.
+    pub fn start_for_discovery(
+        spec: RemoteHelperSpec,
+        git_dir: &Path,
+        provisional_format: ObjectFormat,
+    ) -> Result<Self> {
+        let executable = format!("git-remote-{}", spec.name);
+        Self::start_with_executable_mode(spec, git_dir, provisional_format, true, executable)
+    }
+
+    #[cfg(test)]
     fn start_with_executable(
         spec: RemoteHelperSpec,
         git_dir: &Path,
         format: ObjectFormat,
+        executable: impl AsRef<std::ffi::OsStr>,
+    ) -> Result<Self> {
+        Self::start_with_executable_mode(spec, git_dir, format, false, executable)
+    }
+
+    fn start_with_executable_mode(
+        spec: RemoteHelperSpec,
+        git_dir: &Path,
+        format: ObjectFormat,
+        adopt_advertised_format: bool,
         executable: impl AsRef<std::ffi::OsStr>,
     ) -> Result<Self> {
         let mut command = Command::new(executable.as_ref());
@@ -392,6 +432,7 @@ impl RemoteHelperSession {
         let mut session = Self {
             spec,
             format,
+            adopt_advertised_format,
             child,
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
@@ -421,21 +462,34 @@ impl RemoteHelperSession {
         &self.capabilities
     }
 
+    pub fn object_format(&self) -> ObjectFormat {
+        self.format
+    }
+
     pub fn list(&mut self) -> Result<Vec<RemoteHelperRef>> {
         self.write_line("list")?;
         let lines = self.read_block()?;
         if lines.is_empty() {
             return Err(self.aborted_error());
         }
+        for line in &lines {
+            let Some(value) = line.strip_prefix(":object-format ") else {
+                continue;
+            };
+            let advertised = parse_helper_object_format(value)?;
+            if self.adopt_advertised_format {
+                self.format = advertised;
+                self.adopt_advertised_format = false;
+            } else if advertised != self.format {
+                return Err(GitError::InvalidObjectId(format!(
+                    "remote helper uses {value}, local repository uses {}",
+                    self.format.name()
+                )));
+            }
+        }
         let mut refs = Vec::new();
         for line in lines {
-            if let Some(value) = line.strip_prefix(":object-format ") {
-                if value != self.format.name() {
-                    return Err(GitError::InvalidObjectId(format!(
-                        "remote helper uses {value}, local repository uses {}",
-                        self.format.name()
-                    )));
-                }
+            if line.starts_with(":object-format ") {
                 continue;
             }
             refs.push(parse_list_line(&line, self.capabilities.object_format)?);
@@ -553,10 +607,10 @@ impl RemoteHelperSession {
 
     fn aborted_error(&mut self) -> GitError {
         let _ = self.child.try_wait();
-        GitError::Command(format!(
-            "remote helper '{}' aborted session",
-            self.spec.name
-        ))
+        GitError::cli_exit(
+            CliExit::UserError,
+            format!("remote helper '{}' aborted session", self.spec.name),
+        )
     }
 }
 
@@ -576,6 +630,48 @@ impl Drop for RemoteHelperSession {
     }
 }
 
+fn parse_helper_object_format(value: &str) -> Result<ObjectFormat> {
+    match value {
+        "sha1" => Ok(ObjectFormat::Sha1),
+        "sha256" => Ok(ObjectFormat::Sha256),
+        _ => Err(GitError::InvalidFormat(format!(
+            "remote helper uses unknown object format {value}"
+        ))),
+    }
+}
+
+/// A live helper after capability and ref discovery, before any import or
+/// local object/ref mutation. Clone can finalize its provisional repository's
+/// object format and then continue this same protocol process.
+pub struct RemoteHelperFetchDiscovery {
+    session: RemoteHelperSession,
+    capabilities: RemoteHelperCapabilities,
+    refs: Vec<RemoteHelperRef>,
+    git_dir: PathBuf,
+}
+
+impl RemoteHelperFetchDiscovery {
+    pub fn object_format(&self) -> ObjectFormat {
+        self.session.object_format()
+    }
+}
+
+pub fn discover_remote_helper_fetch(
+    spec: RemoteHelperSpec,
+    git_dir: &Path,
+    provisional_format: ObjectFormat,
+) -> Result<RemoteHelperFetchDiscovery> {
+    let mut session = RemoteHelperSession::start_for_discovery(spec, git_dir, provisional_format)?;
+    let capabilities = session.capabilities().clone();
+    let refs = session.list()?;
+    Ok(RemoteHelperFetchDiscovery {
+        session,
+        capabilities,
+        refs,
+        git_dir: git_dir.to_path_buf(),
+    })
+}
+
 /// Execute a user-owned remote helper's import flow and finalize it through the
 /// ordinary fetch engine. Repository semantics remain identical to native
 /// transports: refspec planning, FETCH_HEAD, pruning, and ref transactions all
@@ -588,6 +684,51 @@ pub fn fetch_via_remote_helper(
         RemoteHelperSession::start(request.spec.clone(), request.git_dir, request.format)?;
     let capabilities = session.capabilities().clone();
     let refs = session.list()?;
+    fetch_via_discovered_remote_helper(
+        RemoteHelperFetchDiscovery {
+            session,
+            capabilities,
+            refs,
+            git_dir: request.git_dir.to_path_buf(),
+        },
+        DiscoveredRemoteHelperFetchOperation {
+            git_dir: request.git_dir,
+            format: request.format,
+            config: request.config,
+            remote_name: request.remote_name,
+            refspecs: request.refspecs,
+            options: request.options,
+        },
+        services,
+    )
+}
+
+/// Continue a previously discovered helper session after clone has finalized
+/// the provisional repository's object format. No second helper process is
+/// started, so helper-private marks and protocol state remain intact.
+pub fn fetch_via_discovered_remote_helper(
+    discovery: RemoteHelperFetchDiscovery,
+    request: DiscoveredRemoteHelperFetchOperation<'_>,
+    services: RemoteHelperFetchServices<'_>,
+) -> Result<crate::FetchOutcome> {
+    if discovery.git_dir != request.git_dir {
+        return Err(GitError::InvalidPath(
+            "remote helper discovery and import must use the same git directory".into(),
+        ));
+    }
+    if discovery.object_format() != request.format {
+        return Err(GitError::InvalidFormat(format!(
+            "remote helper uses {}, local repository uses {}",
+            discovery.object_format().name(),
+            request.format.name()
+        )));
+    }
+    let RemoteHelperFetchDiscovery {
+        session,
+        capabilities,
+        refs,
+        git_dir: _,
+    } = discovery;
     if capabilities.refspecs.is_empty() {
         services
             .events
@@ -1401,5 +1542,92 @@ mod tests {
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_abort_during_capabilities_is_a_typed_fatal_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = helper_test_dir("abort-capabilities");
+        fs::create_dir_all(&root).expect("temp dir");
+        let helper = root.join("git-remote-broken");
+        fs::write(&helper, b"#!/bin/sh\nread command\nexit 1\n").expect("helper script");
+        let mut permissions = fs::metadata(&helper).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&helper, permissions).expect("permissions");
+
+        let error = RemoteHelperSession::start_with_executable(
+            RemoteHelperSpec {
+                name: "broken".into(),
+                alias: "broken://example.com/repo".into(),
+                url: Some("broken://example.com/repo".into()),
+            },
+            &root,
+            ObjectFormat::Sha1,
+            &helper,
+        )
+        .err()
+        .expect("helper should abort");
+        assert_eq!(
+            error,
+            GitError::cli_exit(CliExit::UserError, "remote helper 'broken' aborted session")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_adopts_sha256_without_restarting_or_mutating_repository() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let git_dir = helper_test_dir("discover-sha256");
+        fs::create_dir_all(git_dir.join("objects/pack")).expect("objects");
+        fs::create_dir_all(git_dir.join("refs/heads")).expect("refs");
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("HEAD");
+        let helper = git_dir.join("git-remote-discovery");
+        fs::write(
+            &helper,
+            b"#!/bin/sh\nread command\ntest \"$command\" = capabilities || exit 2\nprintf 'import\\noption\\nobject-format\\n\\n'\nread command\ntest \"$command\" = 'option object-format true' || exit 3\nprintf 'ok\\n'\nread command\ntest \"$command\" = list || exit 4\nprintf ':object-format sha256\\n? refs/heads/main\\n@refs/heads/main HEAD\\n\\n'\nread command\ntest \"$command\" = 'import refs/heads/main' || exit 5\nread command\ntest -z \"$command\" || exit 6\nprintf 'done\\n'\n",
+        )
+        .expect("helper script");
+        let mut permissions = fs::metadata(&helper).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&helper, permissions).expect("permissions");
+
+        let mut session = RemoteHelperSession::start_with_executable_mode(
+            RemoteHelperSpec {
+                name: "discovery".into(),
+                alias: "origin".into(),
+                url: Some("unused".into()),
+            },
+            &git_dir,
+            ObjectFormat::Sha1,
+            true,
+            &helper,
+        )
+        .expect("start discovery");
+        let refs = session.list().expect("list");
+        assert_eq!(session.object_format(), ObjectFormat::Sha256);
+        assert_eq!(refs.len(), 2);
+        assert!(
+            FileRefStore::new(&git_dir, ObjectFormat::Sha1)
+                .list_refs()
+                .expect("refs remain empty")
+                .is_empty()
+        );
+        assert!(
+            fs::read_dir(git_dir.join("objects/pack"))
+                .expect("pack dir")
+                .next()
+                .is_none()
+        );
+        assert_eq!(
+            session
+                .import(&["refs/heads/main".into()])
+                .expect("continue same session"),
+            b"done\n"
+        );
+        let _ = fs::remove_dir_all(git_dir);
     }
 }

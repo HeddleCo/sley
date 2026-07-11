@@ -182,6 +182,8 @@ pub struct ProcReceiveHookInput<'a> {
     pub push_options: &'a [String],
     pub use_atomic: bool,
     pub use_push_options: bool,
+    /// Incoming-object quarantine environment inherited by the hook.
+    pub quarantine_env: &'a [(String, String)],
     pub remote_stderr: &'a mut Vec<u8>,
     pub capture_stderr: bool,
 }
@@ -218,6 +220,7 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
     child
         .current_dir(input.git_dir)
         .env("GIT_DIR", input.git_dir)
+        .envs(input.quarantine_env.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(if capture_stderr {

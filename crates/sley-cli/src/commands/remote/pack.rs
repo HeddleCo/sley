@@ -104,6 +104,16 @@ pub(crate) fn cmd_receive_pack(
     let git_dir = common_git_dir_for_git_dir(&ls_remote_git_dir(&remote_context, repository)?)?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
+    let validation = sley_fsck::FsckPolicy::from_config(
+        &config,
+        sley_fsck::FsckConfigKind::Receive,
+        format,
+        &git_dir,
+        false,
+    )?;
+    for diagnostic in &validation.diagnostics {
+        eprintln!("{diagnostic}");
+    }
     let mut features = sley_remote::receive_pack_features(format);
     features.atomic = config
         .get_bool("receive", None, "advertiseatomic")
@@ -158,6 +168,7 @@ pub(crate) fn cmd_receive_pack(
         header: &header,
         pack_reader: &mut stdin,
         config: &config,
+        validation: &validation,
         options: sley_remote::ReceivePackServerOptions {
             quiet,
             remote_stderr: Some(&mut hook_stderr),
@@ -3135,7 +3146,14 @@ fn render_push_status(
     // git prints "Done" under porcelain whenever the transport-level push
     // succeeded (`!push_ret`); ref-level rejections (non-ff, atomic, remote ng)
     // do not set push_ret, so over the local transport "Done" always prints.
-    if porcelain {
+    let unpack_failed = report.refs.iter().any(|reference| {
+        matches!(
+            &reference.status,
+            sley_remote::PushRefStatus::RemoteReject(message)
+                if message == "unpacker error" || message.starts_with("unpacker error: ")
+        )
+    });
+    if porcelain && !unpack_failed {
         println!("Done");
     } else if !report.had_errors() && !report.refs_pushed() {
         // stable plumbing output; do not modify or localize

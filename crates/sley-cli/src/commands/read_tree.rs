@@ -624,7 +624,6 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
             &self.worktree_root,
             &self.git_dir,
             self.format,
-            &self.repo_config,
             path,
             Some(&(ce.mode, ce.oid)),
             self.porcelain,
@@ -1264,26 +1263,24 @@ fn verify_uptodate_path(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
-    config: &GitConfig,
     path: &[u8],
     expected: Option<&(u32, ObjectId)>,
     porcelain: UnpackPorcelain,
 ) -> Result<()> {
-    let Some((_mode, expected_oid)) = expected else {
+    let Some((expected_mode, expected_oid)) = expected else {
         // Untracked path: nothing in the index to be out of date with.
         return Ok(());
     };
-    let Some(file_path) = safe_worktree_path(worktree_root, path) else {
-        return Ok(());
-    };
-    let body = match fs::read(&file_path) {
-        Ok(body) => body,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.into()),
-    };
-    let body = sley_worktree::apply_clean_filter(worktree_root, git_dir, config, path, &body)?;
-    let actual = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
-    if &actual != expected_oid {
+    let state = sley_worktree::worktree_entry_state_by_git_path(
+        worktree_root,
+        git_dir,
+        format,
+        path,
+        expected_oid,
+        *expected_mode,
+        None,
+    )?;
+    if state == sley_worktree::WorktreeEntryState::Modified {
         match porcelain {
             UnpackPorcelain::ReadTree => {
                 let display = String::from_utf8_lossy(path);
@@ -1633,7 +1630,7 @@ fn checkout_submodule_to_commit(
         return Ok(());
     };
     let path_str = String::from_utf8_lossy(path);
-    if submodule_path_contains_symlink(worktree_root, path)? {
+    if sley_submodule::submodule_path_has_symlink_parent(worktree_root, Path::new(&*path_str))? {
         eprintln!("fatal: refusing to checkout submodule path '{path_str}' through a symlink");
         return Err(GitError::Exit(128));
     }
@@ -1732,7 +1729,7 @@ fn remove_submodule_worktree(worktree_root: &Path, git_dir: &Path, path: &[u8]) 
         return Ok(());
     };
     let path_str = String::from_utf8_lossy(path);
-    if submodule_path_contains_symlink(worktree_root, path)? {
+    if sley_submodule::submodule_path_has_symlink_parent(worktree_root, Path::new(&*path_str))? {
         eprintln!("fatal: refusing to remove submodule path '{path_str}' through a symlink");
         return Err(GitError::Exit(128));
     }
@@ -1756,31 +1753,6 @@ fn submodule_admin_git_dir(super_git_dir: &Path, name: &str) -> PathBuf {
         }
     }
     path
-}
-
-fn submodule_path_contains_symlink(worktree_root: &Path, path: &[u8]) -> Result<bool> {
-    let Ok(path) = std::str::from_utf8(path) else {
-        return Ok(false);
-    };
-    let mut current = worktree_root.to_path_buf();
-    for component in Path::new(path).components() {
-        let std::path::Component::Normal(name) = component else {
-            continue;
-        };
-        current.push(name);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
-            Ok(_) => {}
-            Err(err)
-                if err.kind() == io::ErrorKind::NotFound
-                    || err.kind() == io::ErrorKind::NotADirectory =>
-            {
-                return Ok(false);
-            }
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Ok(false)
 }
 
 fn connect_submodule_worktree(sub_root: &Path, sub_git_dir: &Path) -> Result<()> {
@@ -2236,6 +2208,36 @@ mod submodule_hook_tests {
         fs::create_dir_all(&empty).expect("mkdir empty");
         assert!(!submodule_is_populated(&empty));
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_uptodate_hashes_symlink_target_without_following_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "sley-rt-symlink-dir-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let git_dir = base.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create git directory");
+        fs::create_dir_all(base.join("target")).expect("create symlink target directory");
+        std::os::unix::fs::symlink("target", base.join("link")).expect("create symlink");
+        let oid = EncodedObject::new(ObjectType::Blob, b"target".to_vec())
+            .object_id(ObjectFormat::Sha1)
+            .expect("hash symlink target");
+
+        verify_uptodate_path(
+            &base,
+            &git_dir,
+            ObjectFormat::Sha1,
+            b"link",
+            Some(&(sley_index::SYMLINK_MODE, oid)),
+            UnpackPorcelain::Checkout,
+        )
+        .expect("symlink pointing to a directory is clean");
+
+        fs::remove_dir_all(base).expect("clean fixture");
     }
 
     // ----- end-to-end: active+populated+dirty, non-forced → WouldLose ----

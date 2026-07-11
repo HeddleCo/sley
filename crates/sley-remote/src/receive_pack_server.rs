@@ -20,10 +20,8 @@ use crate::proc_receive::{
     ProcReceiveHookInput, ReceivePackCommandState, apply_proc_receive_hook_failure,
     mark_proc_receive_commands, parse_proc_receive_refs, run_proc_receive_hook,
 };
-use crate::push::stage_local_push_quarantine;
 use crate::receive_hooks::{
-    hook_exists, run_post_receive, run_post_update, run_pre_receive, run_push_to_checkout,
-    run_update_hooks,
+    run_post_receive, run_post_update, run_pre_receive, run_push_to_checkout, run_update_hooks,
 };
 
 pub struct ReceivePackServerOptions<'a> {
@@ -42,6 +40,9 @@ pub struct ReceivePackServerRequest<'a> {
     pub header: &'a ReceivePackPushRequestHeader,
     pub pack_reader: &'a mut dyn Read,
     pub config: &'a GitConfig,
+    /// Receive/transfer fsck policy resolved before advertising refs, so
+    /// malformed configuration fails before protocol I/O.
+    pub validation: &'a sley_fsck::FsckPolicy,
     pub options: ReceivePackServerOptions<'a>,
 }
 
@@ -88,9 +89,41 @@ pub fn serve_receive_pack(
     let run_proc_receive = mark_proc_receive_commands(&proc_patterns, &mut command_states);
 
     let mut unpack_error = None;
+    let mut quarantine = None;
     if needs_pack_data(&command_states) {
-        match install_pack_from_reader(request.git_dir, request.format, request.pack_reader) {
-            Ok(()) => {}
+        let incoming = sley_odb::IncomingPackQuarantine::new(request.git_dir, request.format)?;
+        let incoming_db = incoming.database();
+        match install_pack_from_reader(&incoming_db, request.pack_reader) {
+            Ok(installed) => {
+                let roots = command_states
+                    .iter()
+                    .filter(|state| !state.command.new_id.is_null())
+                    .map(|state| state.command.new_id)
+                    .collect::<Vec<_>>();
+                let validation = validate_receive_objects(
+                    &incoming_db,
+                    request.format,
+                    &roots,
+                    &installed,
+                    request.validation,
+                    remote_stderr,
+                );
+                if request.validation.enabled {
+                    if validation.is_err() {
+                        unpack_error = Some("unpacker error".to_string());
+                    } else {
+                        quarantine = Some(incoming);
+                    }
+                } else if validation.is_err() {
+                    for state in &mut command_states {
+                        if state.error_string.is_none() && !state.command.new_id.is_null() {
+                            state.error_string = Some("missing necessary objects".into());
+                        }
+                    }
+                } else {
+                    quarantine = Some(incoming);
+                }
+            }
             Err(err) => {
                 let message = err.to_string();
                 unpack_error = Some(message.clone());
@@ -109,22 +142,6 @@ pub fn serve_receive_pack(
         .map(|state| state.command.clone())
         .collect();
 
-    let quarantine = if unpack_error.is_none()
-        && !ok_commands.is_empty()
-        && receive_pre_hooks_may_run(request.git_dir)
-    {
-        let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
-        let common_git_dir = repository_common_dir(request.git_dir);
-        stage_local_push_quarantine(
-            request.git_dir,
-            &common_git_dir,
-            request.format,
-            &local_db,
-            &ok_commands,
-        )?
-    } else {
-        None
-    };
     let quarantine_env = quarantine
         .as_ref()
         .map(|q| quarantine_hook_env(request.git_dir, q.object_dir()))
@@ -173,11 +190,29 @@ pub fn serve_receive_pack(
             push_options,
             use_atomic,
             use_push_options: request_uses_push_options(request.header),
+            quarantine_env: &quarantine_env,
             remote_stderr,
             capture_stderr,
         })?;
         command_states = output.commands;
         apply_proc_receive_hook_failure(&mut command_states, use_atomic, output.hook_failed);
+    }
+
+    let accepts_incoming_objects = command_states
+        .iter()
+        .any(|state| state.error_string.is_none() && !state.command.new_id.is_null());
+    if unpack_error.is_none()
+        && accepts_incoming_objects
+        && let Some(incoming) = quarantine.take()
+        && let Err(err) = incoming.promote()
+    {
+        let message = err.to_string();
+        unpack_error = Some(message.clone());
+        for state in &mut command_states {
+            if state.error_string.is_none() && !state.command.new_id.is_null() {
+                state.error_string = Some(message.clone());
+            }
+        }
     }
 
     if unpack_error.is_none()
@@ -372,10 +407,6 @@ fn request_uses_push_options(header: &ReceivePackPushRequestHeader) -> bool {
         .any(|cap| cap.name == "push-options")
 }
 
-fn receive_pre_hooks_may_run(git_dir: &Path) -> bool {
-    hook_exists(git_dir, "pre-receive") || hook_exists(git_dir, "update")
-}
-
 fn quarantine_hook_env(git_dir: &Path, object_dir: &Path) -> Vec<(String, String)> {
     let alternate = repository_common_dir(git_dir)
         .join("objects")
@@ -396,14 +427,13 @@ fn needs_pack_data(states: &[ReceivePackCommandState]) -> bool {
 }
 
 fn install_pack_from_reader(
-    git_dir: &Path,
-    format: ObjectFormat,
+    db: &FileObjectDatabase,
     reader: &mut dyn Read,
-) -> Result<()> {
+) -> Result<Vec<sley_core::ObjectId>> {
     let mut prefix = [0u8; 4];
     match reader.read_exact(&mut prefix) {
         Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
         Err(err) => return Err(err.into()),
     }
     if &prefix != b"PACK" {
@@ -411,9 +441,39 @@ fn install_pack_from_reader(
             "receive-pack packfile must start with PACK".into(),
         ));
     }
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut stream = Cursor::new(prefix).chain(reader);
-    db.install_raw_pack_from_reader(&mut stream).map(|_| ())
+    db.install_raw_pack_from_reader(&mut stream)
+        .map(|installed| installed.object_ids)
+}
+
+fn validate_receive_objects(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    roots: &[sley_core::ObjectId],
+    installed: &[sley_core::ObjectId],
+    policy: &sley_fsck::FsckPolicy,
+    remote_stderr: &mut Vec<u8>,
+) -> Result<()> {
+    let report = sley_fsck::fsck_objects_with_options(
+        db,
+        format,
+        roots.iter().copied(),
+        installed.iter().copied(),
+        policy.fsck_options(policy.enabled),
+    );
+    for diagnostic in &policy.diagnostics {
+        remote_stderr.extend_from_slice(diagnostic.as_bytes());
+        remote_stderr.push(b'\n');
+    }
+    for issue in &report.issues {
+        remote_stderr.extend_from_slice(issue.message.as_bytes());
+        remote_stderr.push(b'\n');
+    }
+    if report.is_ok() {
+        Ok(())
+    } else {
+        Err(GitError::Exit(1))
+    }
 }
 
 fn apply_command_updates(
@@ -531,5 +591,157 @@ fn build_report(
             unpack,
             commands,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sley_object::{EncodedObject, ObjectType, Tree};
+    use sley_pack::PackFile;
+    use sley_refs::RefTarget;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn receive_quarantine_discards_rejected_and_promotes_accepted_pack() {
+        let format = ObjectFormat::Sha1;
+        let rejected_repo = temp_repo("receive-quarantine-rejected");
+        let tree = EncodedObject::new(ObjectType::Tree, Tree { entries: vec![] }.write());
+        let tree_oid = tree.object_id(format).expect("tree oid");
+        let malformed = EncodedObject::new(
+            ObjectType::Commit,
+            format!(
+                "tree {tree_oid}\nauthor Bugs Bunny 1 +0000\ncommitter Bugs <bugs@example.invalid> 1 +0000\n\nbad\n"
+            )
+            .into_bytes(),
+        );
+        let malformed_oid = malformed.object_id(format).expect("malformed oid");
+        let rejected_pack =
+            PackFile::write_packed(&[&tree, &malformed], format).expect("rejected pack");
+        let strict_config =
+            GitConfig::parse(b"[receive]\n\tfsckObjects = true\n").expect("strict receive config");
+        let strict_policy = sley_fsck::FsckPolicy::from_config(
+            &strict_config,
+            sley_fsck::FsckConfigKind::Receive,
+            format,
+            &rejected_repo,
+            false,
+        )
+        .expect("strict receive policy");
+        let rejected = serve_test_pack(
+            &rejected_repo,
+            format,
+            malformed_oid,
+            rejected_pack.pack,
+            &strict_config,
+            &strict_policy,
+        );
+        assert!(matches!(
+            rejected.report,
+            ReceivePackServerReport::V1(ReceivePackReportStatus {
+                unpack: ReceivePackUnpackStatus::Error(_),
+                ..
+            })
+        ));
+        let rejected_db = FileObjectDatabase::from_git_dir(&rejected_repo, format);
+        assert!(
+            !rejected_db
+                .contains(&malformed_oid)
+                .expect("rejected object lookup")
+        );
+        assert_eq!(
+            FileRefStore::new(&rejected_repo, format)
+                .read_ref("refs/heads/main")
+                .expect("rejected ref lookup"),
+            None
+        );
+
+        let accepted_repo = temp_repo("receive-quarantine-accepted");
+        let valid = EncodedObject::new(
+            ObjectType::Commit,
+            format!(
+                "tree {tree_oid}\nauthor A <a@example.invalid> 1 +0000\ncommitter A <a@example.invalid> 1 +0000\n\nok\n"
+            )
+            .into_bytes(),
+        );
+        let valid_oid = valid.object_id(format).expect("valid oid");
+        let accepted_pack =
+            PackFile::write_packed(&[&tree, &valid], format).expect("accepted pack");
+        let accepted = serve_test_pack(
+            &accepted_repo,
+            format,
+            valid_oid,
+            accepted_pack.pack,
+            &strict_config,
+            &strict_policy,
+        );
+        assert!(matches!(
+            accepted.report,
+            ReceivePackServerReport::V1(ReceivePackReportStatus {
+                unpack: ReceivePackUnpackStatus::Ok,
+                ..
+            })
+        ));
+        let accepted_db = FileObjectDatabase::from_git_dir(&accepted_repo, format);
+        assert!(
+            accepted_db
+                .contains(&valid_oid)
+                .expect("accepted object lookup")
+        );
+        assert_eq!(
+            FileRefStore::new(&accepted_repo, format)
+                .read_ref("refs/heads/main")
+                .expect("accepted ref lookup"),
+            Some(RefTarget::Direct(valid_oid))
+        );
+    }
+
+    fn serve_test_pack(
+        git_dir: &Path,
+        format: ObjectFormat,
+        new_id: sley_core::ObjectId,
+        pack: Vec<u8>,
+        config: &GitConfig,
+        policy: &sley_fsck::FsckPolicy,
+    ) -> ReceivePackServerOutcome {
+        let header = ReceivePackPushRequestHeader {
+            commands: sley_protocol::ReceivePackRequest {
+                commands: vec![ReceivePackCommand {
+                    old_id: sley_core::ObjectId::null(format),
+                    new_id,
+                    name: "refs/heads/main".into(),
+                }],
+                ..Default::default()
+            },
+            push_options: None,
+        };
+        let mut reader = Cursor::new(pack);
+        serve_receive_pack(ReceivePackServerRequest {
+            git_dir,
+            format,
+            header: &header,
+            pack_reader: &mut reader,
+            config,
+            validation: policy,
+            options: ReceivePackServerOptions {
+                quiet: true,
+                remote_stderr: None,
+                run_post_hooks: false,
+            },
+        })
+        .expect("serve receive pack")
+    }
+
+    fn temp_repo(name: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("sley-{name}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(path.join("objects/pack")).expect("repo object directory");
+        fs::create_dir_all(path.join("refs/heads")).expect("repo refs directory");
+        fs::write(path.join("HEAD"), b"ref: refs/heads/main\n").expect("repo HEAD");
+        path
     }
 }

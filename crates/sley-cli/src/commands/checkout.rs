@@ -2169,27 +2169,31 @@ fn checkout_show_local_changes(
     if new_commit.is_null() {
         return Ok(());
     }
-    if checkout_sparse_checkout_enabled(git_dir) {
-        return Ok(());
-    }
-    // Reuse the shared `diff-index` renderer (byte-identical with git's
-    // name-status output). It diffs the tree-ish against the working tree by
-    // default — exactly git's `run_diff_index(&rev, 0)`.
-    commands::diff_index::cmd_diff_index(
-        cli_session,
-        &["--name-status".to_string(), new_commit.to_hex()],
-    )
+    let repository = cli_session.open_repository()?;
+    let worktree_root = repository.workdir().ok_or_else(|| {
+        GitError::Unsupported("checkout change summary requires a repository worktree".into())
+    })?;
+    let summary = sley_worktree::checkout_change_summary(
+        worktree_root,
+        git_dir,
+        repository.object_format(),
+        new_commit,
+    )?;
+    write_checkout_change_summary(&mut io::stdout().lock(), &summary)
 }
 
-fn checkout_sparse_checkout_enabled(git_dir: &Path) -> bool {
-    GitConfig::read(git_dir.join("config.worktree"))
-        .ok()
-        .and_then(|config| config.get_bool("core", None, "sparseCheckout"))
-        == Some(true)
-        || GitConfig::read(git_dir.join("config"))
-            .ok()
-            .and_then(|config| config.get_bool("core", None, "sparseCheckout"))
-            == Some(true)
+fn write_checkout_change_summary(
+    output: &mut impl Write,
+    summary: &sley_worktree::CheckoutChangeSummary,
+) -> Result<()> {
+    for entry in &summary.changes {
+        write!(output, "{}", entry.status.label())?;
+        if let Some(old_path) = &entry.old_path {
+            write!(output, "\t{}", status_quote_path(old_path, false))?;
+        }
+        writeln!(output, "\t{}", status_quote_path(&entry.path, false))?;
+    }
+    Ok(())
 }
 
 fn prefetch_local_promisor_checkout_blobs(
@@ -2823,4 +2827,38 @@ fn detached_checkout_subject(git_dir: &Path, format: ObjectFormat, oid: &ObjectI
         .next()
         .unwrap_or("")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkout_change_summary_renderer_writes_name_status_rows() {
+        let summary = sley_worktree::CheckoutChangeSummary {
+            changes: vec![
+                sley_diff_merge::NameStatusEntry {
+                    status: sley_diff_merge::NameStatus::Added,
+                    path: b"added".as_slice().into(),
+                    old_path: None,
+                    old_mode: None,
+                    new_mode: Some(0o100644),
+                    old_oid: None,
+                    new_oid: None,
+                },
+                sley_diff_merge::NameStatusEntry {
+                    status: sley_diff_merge::NameStatus::Deleted,
+                    path: b"deleted".as_slice().into(),
+                    old_path: None,
+                    old_mode: Some(0o100644),
+                    new_mode: None,
+                    old_oid: None,
+                    new_oid: None,
+                },
+            ],
+        };
+        let mut output = Vec::new();
+        write_checkout_change_summary(&mut output, &summary).expect("render checkout summary");
+        assert_eq!(output, b"A\tadded\nD\tdeleted\n");
+    }
 }

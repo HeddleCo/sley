@@ -62,19 +62,29 @@ pub(crate) fn cmd_fsck(cli_session: &crate::session::CliSession, args: &[String]
     // us whether this is a partial clone: only then may a `.promisor` pack
     // excuse a missing object from the connectivity walk (git's
     // `is_promisor_object` is gated on `repo_has_promisor_remote`).
-    let mut severity = sley_fsck::SeverityConfig::new(strict);
+    let mut policy = None;
     let mut has_promisor_remote = false;
     if let Ok(config) = read_repo_config(&git_dir) {
-        for (key, value) in config.fsck_entries() {
-            severity.set(&key, &value);
-        }
+        policy = Some(sley_fsck::FsckPolicy::from_config(
+            &config,
+            sley_fsck::FsckConfigKind::Standalone,
+            format,
+            &cwd,
+            strict,
+        )?);
         has_promisor_remote = repo_has_promisor_remote(&config);
     }
+    let policy = policy.unwrap_or_else(|| sley_fsck::FsckPolicy {
+        enabled: true,
+        severity: sley_fsck::SeverityConfig::new(strict),
+        skip_objects: HashSet::new(),
+        diagnostics: Vec::new(),
+    });
     let db = FileObjectDatabase::from_git_dir(&git_dir, format)
         .with_promisor_remote_present(has_promisor_remote);
     // The ref-store consistency check shares the same severity table; clone it
     // before the object walk consumes `severity`.
-    let refs_severity = severity.clone();
+    let refs_severity = policy.severity.clone();
 
     // git runs `fsck_refs` (the `refs verify` consistency check) before the
     // object walk when `--references` is in effect (the default). Its findings
@@ -248,7 +258,9 @@ pub(crate) fn cmd_fsck(cli_session: &crate::session::CliSession, args: &[String]
             report_unreachable,
             connectivity_only,
             object_names,
-            severity,
+            severity: policy.severity,
+            skip_objects: policy.skip_objects,
+            check_content: true,
         },
     );
     // Match builtin/fsck.c's stream split: notices (dangling/unreachable) and

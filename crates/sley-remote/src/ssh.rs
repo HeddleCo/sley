@@ -59,6 +59,14 @@ pub struct SshTransportOptions {
     pub protocol: Option<ProtocolVersion>,
 }
 
+/// Upload-pack discovery for a repository whose object format is not known yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshUploadPackDiscovery {
+    pub refs: Vec<RefAdvertisement>,
+    pub features: UploadPackFeatures,
+    pub object_format: ObjectFormat,
+}
+
 pub fn ssh_transport_options_from_config(config: &GitConfig) -> SshTransportOptions {
     SshTransportOptions {
         variant: config
@@ -1094,6 +1102,57 @@ pub fn ssh_upload_pack_advertisements_with_command(
         .transpose()?
         .unwrap_or_default();
     Ok((set.refs, features))
+}
+
+/// Discover upload-pack capabilities and object format before creating a clone.
+pub fn discover_ssh_upload_pack_advertisements_with_command(
+    remote: &RemoteUrl,
+    options: SshTransportOptions,
+    upload_pack_command: Option<&str>,
+) -> Result<SshUploadPackDiscovery> {
+    if !matches!(
+        remote.transport,
+        RemoteTransport::Ssh | RemoteTransport::Ext
+    ) {
+        return Err(GitError::InvalidFormat(
+            "SSH upload-pack requires an SSH remote".into(),
+        ));
+    }
+    let (mut child, _stdin, mut stdout, stderr_drain) = spawn_service_process(
+        remote,
+        GitService::UploadPack,
+        false,
+        options,
+        upload_pack_command,
+    )?;
+    let set_result = crate::read_discovered_upload_pack_advertisements(&mut stdout);
+    let status = child.wait()?;
+    let stderr = stderr_drain.finish();
+    let (set, object_format) = match set_result {
+        Ok(discovered) => discovered,
+        Err(err) if is_ssh_protocol_v2_advertisement_error(&err) => {
+            return Err(ssh_protocol_v2_unsupported_error());
+        }
+        Err(_) if !status.success() => {
+            return Err(GitError::Command(format!(
+                "ssh upload-pack failed for {}: {}",
+                ssh_remote_display(remote),
+                ssh_command_failure_message("ssh upload-pack", &stderr, status)
+            )));
+        }
+        Err(err) => return Err(err),
+    };
+    let features = set
+        .refs
+        .first()
+        .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(SshUploadPackDiscovery {
+        refs: set.refs,
+        features,
+        object_format,
+    })
 }
 
 pub fn validate_ssh_fetch_options(

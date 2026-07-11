@@ -1,5 +1,5 @@
 use sley_config::GitConfig;
-use sley_core::{ObjectFormat, ObjectId, Result};
+use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
 use sley_odb::ObjectReader;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -14,6 +14,153 @@ pub use connectivity::{
     check_connectivity, check_refs,
 };
 pub use content::SeverityConfig;
+
+/// Config namespace whose fsck policy is being resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsckConfigKind {
+    Standalone,
+    Fetch,
+    Receive,
+}
+
+impl FsckConfigKind {
+    const fn section(self) -> &'static str {
+        match self {
+            Self::Standalone => "fsck",
+            Self::Fetch => "fetch.fsck",
+            Self::Receive => "receive.fsck",
+        }
+    }
+
+    const fn config_location(self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Self::Standalone => ("fsck", None),
+            Self::Fetch => ("fetch", Some("fsck")),
+            Self::Receive => ("receive", Some("fsck")),
+        }
+    }
+}
+
+/// Fully resolved fsck policy shared by standalone fsck, fetch and receive.
+#[derive(Debug, Clone)]
+pub struct FsckPolicy {
+    pub enabled: bool,
+    pub severity: SeverityConfig,
+    pub skip_objects: HashSet<ObjectId>,
+    /// Git-compatible non-fatal configuration diagnostics, emitted by the
+    /// caller on the command's normal diagnostics stream.
+    pub diagnostics: Vec<String>,
+}
+
+impl FsckPolicy {
+    pub fn from_config(
+        config: &GitConfig,
+        kind: FsckConfigKind,
+        format: ObjectFormat,
+        skip_list_base: &Path,
+        strict: bool,
+    ) -> Result<Self> {
+        let enabled = match kind {
+            FsckConfigKind::Standalone => true,
+            FsckConfigKind::Fetch => config
+                .get_bool("fetch", None, "fsckObjects")
+                .or_else(|| config.get_bool("transfer", None, "fsckObjects"))
+                .unwrap_or(false),
+            FsckConfigKind::Receive => config
+                .get_bool("receive", None, "fsckObjects")
+                .or_else(|| config.get_bool("transfer", None, "fsckObjects"))
+                .unwrap_or(false),
+        };
+        let mut policy = Self {
+            enabled,
+            severity: SeverityConfig::new(strict),
+            skip_objects: HashSet::new(),
+            diagnostics: Vec::new(),
+        };
+        let (section, subsection) = kind.config_location();
+        for (key, value) in config.section_entries_with_subsection(section, subsection) {
+            if key.eq_ignore_ascii_case("skipList") {
+                let Some(value) = value else {
+                    return Err(GitError::InvalidFormat(format!(
+                        "fatal: unable to parse '{}.skiplist' from command-line config",
+                        kind.section()
+                    )));
+                };
+                policy.read_skip_list(format, skip_list_base, &value)?;
+                continue;
+            }
+            let lower = key.to_ascii_lowercase();
+            let Some(message) = content::MsgId::from_config_name(&key) else {
+                match kind {
+                    FsckConfigKind::Standalone => {
+                        return Err(GitError::InvalidFormat(format!(
+                            "fatal: Unhandled message id: {lower}"
+                        )));
+                    }
+                    FsckConfigKind::Fetch => policy
+                        .diagnostics
+                        .push(format!("warning: Skipping unknown msg id '{lower}'")),
+                    FsckConfigKind::Receive => policy
+                        .diagnostics
+                        .push(format!("warning: skipping unknown msg id '{lower}'")),
+                }
+                continue;
+            };
+            let value = value.unwrap_or_else(|| "true".to_string());
+            if message.cannot_demote() && !value.trim().eq_ignore_ascii_case("error") {
+                return Err(GitError::InvalidFormat(format!(
+                    "fatal: Cannot demote {}",
+                    message.camel().to_ascii_lowercase()
+                )));
+            }
+            policy.severity.set(message.camel(), &value);
+        }
+        Ok(policy)
+    }
+
+    fn read_skip_list(
+        &mut self,
+        format: ObjectFormat,
+        base: &Path,
+        configured_path: &str,
+    ) -> Result<()> {
+        let raw_path = Path::new(configured_path);
+        let path = if raw_path.is_absolute() {
+            raw_path.to_path_buf()
+        } else {
+            base.join(raw_path)
+        };
+        let text = fs::read_to_string(&path).map_err(|_| {
+            GitError::InvalidFormat(format!(
+                "fatal: could not open object name list: {configured_path}"
+            ))
+        })?;
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let oid_text = line
+                .split(|ch: char| ch.is_ascii_whitespace() || ch == '#')
+                .next()
+                .unwrap_or_default();
+            let oid = ObjectId::from_hex(format, oid_text).map_err(|_| {
+                GitError::InvalidFormat(format!("fatal: invalid object name: {oid_text}"))
+            })?;
+            self.skip_objects.insert(oid);
+        }
+        Ok(())
+    }
+
+    pub fn fsck_options(&self, check_content: bool) -> FsckOptions {
+        FsckOptions {
+            severity: self.severity.clone(),
+            skip_objects: self.skip_objects.clone(),
+            check_content,
+            ..FsckOptions::default()
+        }
+    }
+}
 
 // Re-exported below: IssueSeverity, IssueStream, FsckIssue (declared here).
 
@@ -158,7 +305,7 @@ impl FsckReport {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FsckOptions {
     pub report_dangling: bool,
     pub report_unreachable: bool,
@@ -167,6 +314,26 @@ pub struct FsckOptions {
     /// `fsck.<msgid>` severity overrides plus `--strict`, applied to
     /// object-content findings.
     pub severity: SeverityConfig,
+    /// Objects listed through `*.fsck.skipList`. Their object identity and
+    /// links are still checked, but configured content findings are suppressed.
+    pub skip_objects: HashSet<ObjectId>,
+    /// Whether commit/tree/tag content rules run. Incoming packs always need
+    /// identity/connectivity checks even when strict content fsck is disabled.
+    pub check_content: bool,
+}
+
+impl Default for FsckOptions {
+    fn default() -> Self {
+        Self {
+            report_dangling: false,
+            report_unreachable: false,
+            connectivity_only: false,
+            object_names: HashMap::new(),
+            severity: SeverityConfig::default(),
+            skip_objects: HashSet::new(),
+            check_content: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +374,8 @@ where
         checked: HashSet::new(),
         issues: Vec::new(),
         severity: options.severity.clone(),
+        skip_objects: options.skip_objects.clone(),
+        check_content: options.check_content,
         connectivity_only: options.connectivity_only,
         object_names: options.object_names.clone(),
         error_bits: 0,
@@ -248,6 +417,8 @@ struct FsckChecker<'a, R> {
     checked: HashSet<ObjectId>,
     issues: Vec<FsckIssue>,
     severity: SeverityConfig,
+    skip_objects: HashSet<ObjectId>,
+    check_content: bool,
     connectivity_only: bool,
     object_names: HashMap<ObjectId, String>,
     /// Accumulated git exit-code bits (`ERROR_REACHABLE`).
@@ -384,6 +555,10 @@ where
                     return true;
                 }
             }
+        }
+
+        if !self.check_content || self.skip_objects.contains(&oid) {
+            return false;
         }
 
         // Run git's content checker (commit/tree/tag buffer validation). It
@@ -1009,6 +1184,152 @@ mod tests {
     use sley_core::BString;
     use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry};
     use sley_odb::{ObjectDatabase, ObjectWriter};
+
+    fn policy_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sley-fsck-policy-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("policy temp dir");
+        dir
+    }
+
+    #[test]
+    fn fetch_and_receive_fsck_objects_override_transfer_fallback() {
+        let fetch =
+            GitConfig::parse(b"[transfer]\n\tfsckObjects = true\n[fetch]\n\tfsckObjects = false\n")
+                .expect("fetch config");
+        let receive = GitConfig::parse(
+            b"[transfer]\n\tfsckObjects = false\n[receive]\n\tfsckObjects = true\n",
+        )
+        .expect("receive config");
+        let base = Path::new(".");
+        assert!(
+            !FsckPolicy::from_config(
+                &fetch,
+                FsckConfigKind::Fetch,
+                ObjectFormat::Sha1,
+                base,
+                false,
+            )
+            .expect("fetch policy")
+            .enabled
+        );
+        assert!(
+            FsckPolicy::from_config(
+                &receive,
+                FsckConfigKind::Receive,
+                ObjectFormat::Sha1,
+                base,
+                false,
+            )
+            .expect("receive policy")
+            .enabled
+        );
+    }
+
+    #[test]
+    fn fsck_policy_distinguishes_unknown_message_id_modes() {
+        let standalone =
+            GitConfig::parse(b"[fsck]\n\twhatever = ignore\n").expect("standalone config");
+        let fetch =
+            GitConfig::parse(b"[fetch \"fsck\"]\n\twhatever = error\n").expect("fetch config");
+        let receive =
+            GitConfig::parse(b"[receive \"fsck\"]\n\twhatever = error\n").expect("receive config");
+        let base = Path::new(".");
+        assert!(
+            FsckPolicy::from_config(
+                &standalone,
+                FsckConfigKind::Standalone,
+                ObjectFormat::Sha1,
+                base,
+                false,
+            )
+            .expect_err("standalone unknown id must fail")
+            .to_string()
+            .contains("Unhandled message id: whatever")
+        );
+        assert_eq!(
+            FsckPolicy::from_config(
+                &fetch,
+                FsckConfigKind::Fetch,
+                ObjectFormat::Sha1,
+                base,
+                false,
+            )
+            .expect("fetch policy")
+            .diagnostics,
+            vec!["warning: Skipping unknown msg id 'whatever'"]
+        );
+        assert_eq!(
+            FsckPolicy::from_config(
+                &receive,
+                FsckConfigKind::Receive,
+                ObjectFormat::Sha1,
+                base,
+                false,
+            )
+            .expect("receive policy")
+            .diagnostics,
+            vec!["warning: skipping unknown msg id 'whatever'"]
+        );
+    }
+
+    #[test]
+    fn fsck_policy_parses_skip_list_comments_and_trailing_text() {
+        let base = policy_temp_dir("skip-list");
+        let first = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("first oid");
+        let second = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "2222222222222222222222222222222222222222",
+        )
+        .expect("second oid");
+        fs::write(
+            base.join("SKIP"),
+            format!("# comment\n\n  {first} # known bad\n{second}\n"),
+        )
+        .expect("skip list");
+        let config = GitConfig::parse(b"[fsck]\n\tskipList = SKIP\n").expect("config");
+        let policy = FsckPolicy::from_config(
+            &config,
+            FsckConfigKind::Standalone,
+            ObjectFormat::Sha1,
+            &base,
+            false,
+        )
+        .expect("policy");
+        assert_eq!(policy.skip_objects, HashSet::from([first, second]));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn fatal_fsck_message_cannot_be_demoted() {
+        let config = GitConfig::parse(
+            b"[receive]\n\tfsckObjects = true\n[receive \"fsck\"]\n\tunterminatedHeader = warn\n",
+        )
+        .expect("config");
+        let error = FsckPolicy::from_config(
+            &config,
+            FsckConfigKind::Receive,
+            ObjectFormat::Sha1,
+            Path::new("."),
+            false,
+        )
+        .expect_err("fatal message demotion");
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot demote unterminatedheader")
+        );
+    }
 
     #[test]
     fn fsck_accepts_connected_commit_graph() {

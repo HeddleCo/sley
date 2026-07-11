@@ -32,6 +32,7 @@
 pub mod config;
 pub mod move_head;
 pub mod operations;
+pub mod path_safety;
 pub mod relative_url;
 pub mod update_strategy;
 
@@ -48,5 +49,6 @@ pub use operations::{
     ConfigMutation, InitCandidate, InitPlan, InitPlanError, InitRegistration, apply_init_plan,
     plan_init,
 };
+pub use path_safety::submodule_path_has_symlink_parent;
 pub use relative_url::{relative_url, resolve_relative_url};
 pub use update_strategy::determine_update_strategy;

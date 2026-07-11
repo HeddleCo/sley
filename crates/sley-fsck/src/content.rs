@@ -201,6 +201,96 @@ impl MsgId {
         }
     }
 
+    /// Resolve a config spelling case-insensitively, matching git's
+    /// `fsck_msg_id()` lookup for `fsck.<msg-id>` and its fetch/receive peers.
+    pub fn from_config_name(name: &str) -> Option<Self> {
+        const ALL: &[MsgId] = &[
+            MsgId::NulInHeader,
+            MsgId::UnterminatedHeader,
+            MsgId::BadHeaderContinuation,
+            MsgId::MissingTree,
+            MsgId::BadTreeSha1,
+            MsgId::BadParentSha1,
+            MsgId::MissingAuthor,
+            MsgId::MultipleAuthors,
+            MsgId::MissingCommitter,
+            MsgId::NulInCommit,
+            MsgId::MissingObject,
+            MsgId::BadObjectSha1,
+            MsgId::MissingTypeEntry,
+            MsgId::MissingType,
+            MsgId::BadType,
+            MsgId::MissingTagEntry,
+            MsgId::MissingTag,
+            MsgId::BadTagName,
+            MsgId::MissingTaggerEntry,
+            MsgId::BadGpgsig,
+            MsgId::ExtraHeaderEntry,
+            MsgId::MissingNameBeforeEmail,
+            MsgId::MissingEmail,
+            MsgId::BadName,
+            MsgId::MissingSpaceBeforeEmail,
+            MsgId::BadEmail,
+            MsgId::MissingSpaceBeforeDate,
+            MsgId::BadDate,
+            MsgId::ZeroPaddedDate,
+            MsgId::BadDateOverflow,
+            MsgId::BadTimezone,
+            MsgId::NullSha1,
+            MsgId::FullPathname,
+            MsgId::EmptyName,
+            MsgId::HasDot,
+            MsgId::HasDotdot,
+            MsgId::HasDotgit,
+            MsgId::ZeroPaddedFilemode,
+            MsgId::BadFilemode,
+            MsgId::DuplicateEntries,
+            MsgId::TreeNotSorted,
+            MsgId::LargePathname,
+            MsgId::BadTree,
+            MsgId::GitmodulesMissing,
+            MsgId::GitmodulesBlob,
+            MsgId::GitmodulesLarge,
+            MsgId::GitmodulesName,
+            MsgId::GitmodulesParse,
+            MsgId::GitmodulesPath,
+            MsgId::GitmodulesSymlink,
+            MsgId::GitmodulesUpdate,
+            MsgId::GitmodulesUrl,
+            MsgId::GitattributesMissing,
+            MsgId::GitattributesBlob,
+            MsgId::GitattributesLarge,
+            MsgId::GitattributesLineLength,
+            MsgId::GitattributesSymlink,
+            MsgId::GitignoreSymlink,
+            MsgId::MailmapSymlink,
+            MsgId::BadRefName,
+            MsgId::BadRefContent,
+            MsgId::BadRefFiletype,
+            MsgId::BadReferentName,
+            MsgId::BadRefOid,
+            MsgId::BadHeadTarget,
+            MsgId::RefMissingNewline,
+            MsgId::TrailingRefContent,
+            MsgId::SymrefTargetIsNotARef,
+            MsgId::SymlinkRef,
+            MsgId::BadPackedRefHeader,
+            MsgId::BadPackedRefEntry,
+            MsgId::PackedRefEntryNotTerminated,
+            MsgId::PackedRefUnsorted,
+            MsgId::EmptyPackedRefsFile,
+            MsgId::BadReftableTableName,
+        ];
+        ALL.iter()
+            .copied()
+            .find(|message| message.camel().eq_ignore_ascii_case(name))
+    }
+
+    /// FATAL fsck messages cannot be demoted through configuration.
+    pub const fn cannot_demote(self) -> bool {
+        matches!(self, MsgId::NulInHeader | MsgId::UnterminatedHeader)
+    }
+
     /// Default severity, before `fsck.<id>` / `--strict` overrides.
     pub const fn default_severity(self) -> DefaultSeverity {
         match self {
