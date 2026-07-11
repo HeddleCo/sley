@@ -377,6 +377,7 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
             "--show-origin" => display.show_origin = true,
             "--show-scope" => display.show_scope = true,
             "--fixed-value" => fixed_value = true,
+            "--no-fixed-value" => fixed_value = false,
             "--comment" => {
                 let value = iter
                     .next()

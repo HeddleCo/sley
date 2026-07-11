@@ -1129,6 +1129,27 @@ fn config_get_set_add_and_unset_match_upstream_git() {
         let unset_fixed = ["config", "--unset", "--fixed-value", "fixed.multi", "o.*e"];
         assert_eq!(git(&upstream, &unset_fixed), sley(&rust, &unset_fixed));
         assert_outputs_match(&upstream, &rust, &["config", "--get-all", "fixed.multi"]);
+
+        let add_no_fixed = [
+            "config",
+            "--add",
+            "--fixed-value",
+            "--no-fixed-value",
+            "maintenance.repo",
+            "/tmp/scalar-enlistment",
+        ];
+        assert_outputs_match(&upstream, &rust, &add_no_fixed);
+        assert_outputs_match(
+            &upstream,
+            &rust,
+            &[
+                "config",
+                "--get-all",
+                "--fixed-value",
+                "maintenance.repo",
+                "/tmp/scalar-enlistment",
+            ],
+        );
         let replace_fixed_missing = [
             "config",
             "--replace-all",
