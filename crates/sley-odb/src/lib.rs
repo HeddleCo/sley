@@ -17,6 +17,9 @@ mod repack;
 
 pub use install::*;
 pub use loose::*;
+// Re-exported so callers of the progress-aware installer can name the counter
+// struct without depending on `sley-pack` directly.
+pub use sley_pack::PackStreamProgress;
 pub use pack::*;
 pub use reachability::*;
 pub use registry::*;

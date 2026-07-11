@@ -21,7 +21,7 @@ use crate::install::{
     install_upload_pack_packfile_response_from_reader,
     install_upload_pack_shallow_packfile_promisor_response_from_reader,
     install_upload_pack_shallow_packfile_response_from_reader,
-    shallow_info_from_protocol_v2_fetch_header,
+    shallow_info_from_protocol_v2_fetch_header, ProgressInstaller,
 };
 use sley_config::GitConfig;
 use sley_core::{
@@ -49,7 +49,7 @@ use sley_transport::{
 };
 
 use crate::credentials::{credential_request_for_url, http_url_credential};
-use crate::CredentialProvider;
+use crate::{CredentialProvider, ProgressSink};
 
 /// Whether an already-resolved remote `url` uses HTTP(S) transport.
 ///
@@ -677,6 +677,7 @@ pub struct HttpFetchPackRequest<'a> {
 pub fn install_fetch_pack_via_http_upload_pack(
     request: HttpFetchPackRequest<'_>,
     credentials: &mut dyn CredentialProvider,
+    progress: &mut dyn ProgressSink,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if request.wants.is_empty() {
         return Ok(Vec::new());
@@ -725,7 +726,7 @@ pub fn install_fetch_pack_via_http_upload_pack(
             install_upload_pack_packfile_response_from_reader(
                 request.format,
                 &mut response.body,
-                &local_db,
+                &ProgressInstaller::new(&local_db, progress),
                 request.max_input_size,
             )?;
         }
@@ -752,7 +753,7 @@ pub fn install_fetch_pack_via_http_upload_pack(
         let (shallow_info, _) = install_upload_pack_shallow_packfile_response_from_reader(
             request.format,
             &mut response.body,
-            &local_db,
+            &ProgressInstaller::new(&local_db, progress),
             request.max_input_size,
         )?;
         shallow_info
@@ -764,6 +765,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
     request: HttpFetchPackRequest<'_>,
     handshake: &TransportHandshake,
     credentials: &mut dyn CredentialProvider,
+    progress: &mut dyn ProgressSink,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if request.wants.is_empty() {
         return Ok(Vec::new());
@@ -815,7 +817,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
             request.format,
             &mut response.body,
             sideband_all,
-            &local_db,
+            &ProgressInstaller::new(&local_db, progress),
             request.max_input_size,
         )?
     };

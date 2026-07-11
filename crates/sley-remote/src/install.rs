@@ -4,7 +4,65 @@
 
 use sley_core::ObjectFormat;
 use sley_core::Result;
-use sley_odb::{FileObjectDatabase, RawPackInstallOptions, RawPackInstallResult, RawPackInstaller};
+use sley_odb::{
+    FileObjectDatabase, PackStreamProgress, RawPackInstallOptions, RawPackInstallResult,
+    RawPackInstaller,
+};
+use std::cell::RefCell;
+
+use crate::{ProgressSink, TransferProgress};
+
+/// Wraps a [`RawPackInstaller`] so the streaming pack counters produced while
+/// indexing are forwarded to a [`ProgressSink`] as [`TransferProgress`]. Passed
+/// as the `destination` of the generic `install_upload_pack_*` helpers, it
+/// threads live byte/object progress without changing their signatures.
+///
+/// The [`RawPackInstaller`] method takes `&self`, so the `&mut dyn ProgressSink`
+/// is held behind a [`RefCell`]; the borrow is confined to one install call.
+pub(crate) struct ProgressInstaller<'a, I> {
+    inner: &'a I,
+    sink: RefCell<&'a mut dyn ProgressSink>,
+}
+
+impl<'a, I> ProgressInstaller<'a, I> {
+    pub(crate) fn new(inner: &'a I, sink: &'a mut dyn ProgressSink) -> Self {
+        Self {
+            inner,
+            sink: RefCell::new(sink),
+        }
+    }
+}
+
+impl<I> RawPackInstaller for ProgressInstaller<'_, I>
+where
+    I: RawPackInstaller,
+{
+    fn install_raw_pack_from_reader_with_options<R>(
+        &self,
+        reader: &mut R,
+        options: RawPackInstallOptions,
+    ) -> Result<RawPackInstallResult>
+    where
+        R: Read,
+    {
+        self.inner
+            .install_raw_pack_from_reader_with_progress(reader, options, |progress| {
+                self.sink.borrow_mut().transfer(transfer_from_pack(progress));
+            })
+    }
+}
+
+fn transfer_from_pack(progress: PackStreamProgress) -> TransferProgress {
+    TransferProgress {
+        received_bytes: progress.received_bytes,
+        received_objects: progress.received_objects,
+        total_objects: Some(progress.total_objects),
+        // Deltas are resolved in one batch after the streaming parse, so
+        // per-delta progress is not surfaced yet. TODO(sley#146 follow-up):
+        // thread indexed-deltas from `resolve_pack_entries`.
+        indexed_deltas: 0,
+    }
+}
 use sley_protocol::{
     PktLineFrame, ProtocolV2FetchResponseHeader, ProtocolV2FetchResponseSection,
     ProtocolV2FetchShallowInfo, SideBandChannel, demux_upload_pack_packfile_response,

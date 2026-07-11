@@ -25,12 +25,40 @@ where
     index_pack_from_stream(PackReadStream::new(reader, format, None)?, format)
 }
 
+pub(crate) fn index_pack_from_reader_to_trailer_with_progress<R, F>(
+    reader: &mut R,
+    format: ObjectFormat,
+    progress: F,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+    F: FnMut(PackStreamProgress),
+{
+    index_pack_from_stream_with_progress(PackReadStream::new(reader, format, None)?, format, progress)
+}
+
 pub(crate) fn index_pack_from_stream<R>(
-    mut stream: PackReadStream<'_, R>,
+    stream: PackReadStream<'_, R>,
     format: ObjectFormat,
 ) -> Result<PackStreamIndexBuild>
 where
     R: Read,
+{
+    index_pack_from_stream_with_progress(stream, format, |_| {})
+}
+
+/// Approximate cadence for progress emission: report at least every this many
+/// pack bytes, matching how git paces "Receiving objects" (no per-object churn).
+pub(crate) const PROGRESS_BYTE_STEP: u64 = 256 * 1024;
+
+pub(crate) fn index_pack_from_stream_with_progress<R, F>(
+    mut stream: PackReadStream<'_, R>,
+    format: ObjectFormat,
+    mut progress: F,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+    F: FnMut(PackStreamProgress),
 {
     let mut header = [0u8; 12];
     stream.read_pack_bytes(&mut header)?;
@@ -42,9 +70,22 @@ where
         return Err(GitError::Unsupported(format!("pack version {version}")));
     }
     let count = u32_be(&header[8..12]) as usize;
+    let total_objects = count as u64;
+    // Emit an initial sample so the consumer learns `total_objects` (the
+    // percentage denominator) as soon as the header is parsed.
+    progress(PackStreamProgress {
+        received_bytes: stream.pack_offset(),
+        received_objects: 0,
+        total_objects,
+    });
+    // Throttle per-object emission: every ~1% of objects or `PROGRESS_BYTE_STEP`
+    // bytes, whichever the loop hits first, plus a guaranteed final sample.
+    let object_step = (total_objects / 100).max(1);
+    let mut last_emit_bytes = stream.pack_offset();
+    let mut last_emit_objects = 0u64;
     let mut parsed_entries = Vec::with_capacity(count);
     let mut raw_entries = Vec::with_capacity(count);
-    for _ in 0..count {
+    for index in 0..count {
         let entry_offset = stream.pack_offset();
         let mut entry_crc = crc32fast::Hasher::new();
         let header = parse_entry_header_from_stream(&mut stream, &mut entry_crc)?;
@@ -98,6 +139,20 @@ where
                 },
                 object,
             }));
+        }
+        let received_objects = index as u64 + 1;
+        let received_bytes = stream.pack_offset();
+        if received_objects == total_objects
+            || received_objects - last_emit_objects >= object_step
+            || received_bytes - last_emit_bytes >= PROGRESS_BYTE_STEP
+        {
+            last_emit_objects = received_objects;
+            last_emit_bytes = received_bytes;
+            progress(PackStreamProgress {
+                received_bytes,
+                received_objects,
+                total_objects,
+            });
         }
     }
     if stream.pack_offset() != stream.trailer_pack_offset() {

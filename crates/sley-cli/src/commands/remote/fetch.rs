@@ -1829,11 +1829,54 @@ pub(super) fn fetch_local_repository_with_outcome(
 /// A [`sley_remote::ProgressSink`] that prints each progress/summary line to
 /// stdout, reproducing the CLI's fetch prune output. Write errors are ignored,
 /// matching how progress output is otherwise best-effort.
-pub(crate) struct StdoutProgress;
+#[derive(Default)]
+pub(crate) struct StdoutProgress {
+    /// Suppress the transfer progress line (git's `--quiet`).
+    quiet: bool,
+}
+
+impl StdoutProgress {
+    pub(crate) fn new(quiet: bool) -> Self {
+        Self { quiet }
+    }
+}
 
 impl sley_remote::ProgressSink for StdoutProgress {
     fn message(&mut self, message: &str) {
         let _ = writeln!(io::stdout(), "{message}");
+    }
+
+    fn transfer(&mut self, progress: sley_remote::TransferProgress) {
+        use std::io::{IsTerminal, Write};
+        // Match git's "Receiving objects": rendered only to an interactive
+        // stderr (so piped/scripted stdout stays clean), and suppressed by
+        // `--quiet`. A single `\r`-prefixed line rewrites in place.
+        if self.quiet || !std::io::stderr().is_terminal() {
+            return;
+        }
+        let mib = progress.received_bytes as f64 / (1024.0 * 1024.0);
+        let mut stderr = std::io::stderr();
+        match progress.total_objects {
+            Some(total) if total > 0 => {
+                let pct = progress.received_objects.saturating_mul(100) / total;
+                let done = progress.received_objects >= total;
+                let _ = write!(
+                    stderr,
+                    "\rReceiving objects: {pct}% ({}/{}), {mib:.2} MiB{}",
+                    progress.received_objects,
+                    total,
+                    if done { ", done.\n" } else { "" },
+                );
+            }
+            _ => {
+                let _ = write!(
+                    stderr,
+                    "\rReceiving objects: {} ({mib:.2} MiB)",
+                    progress.received_objects,
+                );
+            }
+        }
+        let _ = stderr.flush();
     }
 }
 
@@ -1853,7 +1896,7 @@ pub(super) fn run_fetch(
 ) -> Result<sley_remote::FetchOutcome> {
     let before_refs = fetch_ref_snapshot(git_dir, format)?;
     let mut credentials = sley_remote::CredentialHelperProvider::new(Some(config));
-    let mut progress = StdoutProgress;
+    let mut progress = StdoutProgress::new(options.quiet);
     if matches!(
         fetch_source,
         sley_remote::FetchSource::Local { .. } | sley_remote::FetchSource::Ssh(_)

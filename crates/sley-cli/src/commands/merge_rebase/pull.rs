@@ -668,7 +668,7 @@ fn run_fetch_with_outcome(
     options: FetchOptions,
 ) -> Result<FetchOutcome> {
     let mut credentials = sley_remote::CredentialHelperProvider::new(Some(config));
-    let mut progress = StdoutProgress;
+    let mut progress = StdoutProgress::default();
     sley_remote::fetch(
         sley_remote::FetchRequest {
             git_dir,
