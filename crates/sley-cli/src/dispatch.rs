@@ -345,7 +345,9 @@ fn dispatch_command(
             && !commands::help::has_command_specific_help(command);
         let generic_full_help = help_arg == Some("--help-all")
             && commands::help::is_main_command(command)
-            && !commands::help::has_command_specific_help(command);
+            && (!commands::help::has_command_specific_help(command)
+                || (commands::help::runs_setup_before_command_help(command)
+                    && setup::setup_git_directory(cli_session).is_none()));
         if generic_short_help || generic_full_help {
             commands::help::print_command_usage(command);
             return Err(GitError::Exit(129));
@@ -364,6 +366,7 @@ fn dispatch_command(
         "archive" => commands::plumbing::cmd_archive(cli_session, &args[1..]),
         "branch" => commands::branch::cmd_branch(cli_session, &args[1..]),
         "bundle" => commands::plumbing::cmd_bundle(cli_session, &args[1..]),
+        "column" => commands::column::cmd_column(&args[1..]),
         "hash-object" => commands::hash_object::cmd_hash_object(cli_session, &args[1..]),
         "history" => commands::history::cmd_history(cli_session, &args[1..]),
         "index-pack" => commands::pack::cmd_index_pack(cli_session, &args[1..]),

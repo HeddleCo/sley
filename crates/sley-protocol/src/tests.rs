@@ -6049,6 +6049,80 @@ fn fetch_response_header_skips_leading_advertisement_before_sideband_response() 
 }
 
 #[test]
+fn fetch_negotiation_validates_ready_section_boundaries() {
+    let ack = ObjectId::from_hex(
+        ObjectFormat::Sha1,
+        "1111111111111111111111111111111111111111",
+    )
+    .expect("test operation should succeed");
+    let ready = vec![
+        PktLineFrame::Data(b"acknowledgments\n".to_vec()),
+        PktLineFrame::Data(b"ACK 1111111111111111111111111111111111111111\n".to_vec()),
+        PktLineFrame::Data(b"ready\n".to_vec()),
+        PktLineFrame::Delimiter,
+        PktLineFrame::Data(b"packfile\n".to_vec()),
+    ];
+    let mut encoded = Vec::new();
+    write_pkt_line_frames(&mut encoded, &ready).expect("encode ready response");
+    let mut input = encoded.as_slice();
+    assert_eq!(
+        read_protocol_v2_fetch_negotiation_response(ObjectFormat::Sha1, &mut input, false, false,)
+            .expect("ready followed by delimiter"),
+        ProtocolV2FetchNegotiationResponse {
+            acknowledgments: vec![
+                ProtocolV2FetchAcknowledgment::Ack(ack),
+                ProtocolV2FetchAcknowledgment::Ready,
+            ],
+            has_following_sections: true,
+        }
+    );
+    assert_eq!(input, b"000dpackfile\n");
+
+    let ready_flush = b"0014acknowledgments\n000aready\n0000";
+    let error = read_protocol_v2_fetch_negotiation_response(
+        ObjectFormat::Sha1,
+        &mut ready_flush.as_slice(),
+        false,
+        false,
+    )
+    .expect_err("normal fetch requires pack after ready")
+    .to_string();
+    assert!(error.contains("expected packfile to be sent after 'ready'"));
+    assert!(
+        read_protocol_v2_fetch_negotiation_response(
+            ObjectFormat::Sha1,
+            &mut ready_flush.as_slice(),
+            false,
+            true,
+        )
+        .expect("wait-for-done permits ready followed by flush")
+        .acknowledgments
+        .contains(&ProtocolV2FetchAcknowledgment::Ready)
+    );
+
+    let not_ready_flush = b"0014acknowledgments\n0008NAK\n0000";
+    let response = read_protocol_v2_fetch_negotiation_response(
+        ObjectFormat::Sha1,
+        &mut not_ready_flush.as_slice(),
+        false,
+        false,
+    )
+    .expect("no ready ends the negotiation round with flush");
+    assert!(!response.has_following_sections);
+
+    let not_ready_delimiter = b"0014acknowledgments\n0008NAK\n0001";
+    let error = read_protocol_v2_fetch_negotiation_response(
+        ObjectFormat::Sha1,
+        &mut not_ready_delimiter.as_slice(),
+        false,
+        false,
+    )
+    .expect_err("no ready cannot be followed by another section")
+    .to_string();
+    assert!(error.contains("expected no other sections to be sent after no 'ready'"));
+}
+
+#[test]
 fn protocol_v2_fetch_sideband_all_response_parses_sections_and_progress() {
     let frames = vec![
         PktLineFrame::Data(

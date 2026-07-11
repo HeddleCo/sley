@@ -3,6 +3,8 @@
 use crate::*;
 use sley::plumbing::{sley_core, sley_index, sley_worktree};
 
+mod interactive;
+
 pub(crate) fn cmd_clean(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut dry_run = false;
     let mut force_count = 0u8;
@@ -88,11 +90,7 @@ pub(crate) fn cmd_clean(cli_session: &crate::session::CliSession, args: &[String
     let require_force = config
         .get_bool("clean", None, "requireForce")
         .unwrap_or(true);
-    if interactive {
-        print_clean_interactive_stub()?;
-        return Ok(());
-    }
-    if !dry_run && force_count == 0 && require_force {
+    if !dry_run && !interactive && force_count == 0 && require_force {
         if force_was_mentioned {
             eprintln!("fatal: clean.requireForce is true and -f not given: refusing to clean");
         } else {
@@ -111,7 +109,7 @@ pub(crate) fn cmd_clean(cli_session: &crate::session::CliSession, args: &[String
         &path_args,
         effective_pathspec_flags(cli_session),
     )?;
-    let paths = clean_targets(
+    let mut paths = clean_targets(
         &worktree_root,
         &git_dir,
         format,
@@ -120,12 +118,21 @@ pub(crate) fn cmd_clean(cli_session: &crate::session::CliSession, args: &[String
         &pathspec,
         &excludes,
     )?;
-    clean_trace2_directories_visited(1);
-    let mut stdout = io::stdout();
+    let mut eligible = Vec::with_capacity(paths.len());
     for target in paths {
         if force_count < 2 && clean_target_is_nested_repository(&worktree_root, &target)? {
             continue;
         }
+        eligible.push(target);
+    }
+    paths = if interactive {
+        interactive::select_clean_targets(eligible)?
+    } else {
+        eligible
+    };
+    clean_trace2_directories_visited(1);
+    let mut stdout = io::stdout();
+    for target in paths {
         let display = String::from_utf8_lossy(&target.display);
         if dry_run {
             writeln!(stdout, "Would remove {display}")?;
@@ -198,21 +205,6 @@ enum CleanIgnoreMode {
     Normal,
     Include,
     Only,
-}
-
-fn print_clean_interactive_stub() -> Result<()> {
-    let mut stdout = io::stdout().lock();
-    writeln!(stdout, "*** Commands ***")?;
-    writeln!(
-        stdout,
-        "    1: clean                2: filter by pattern    3: select by numbers"
-    )?;
-    writeln!(
-        stdout,
-        "    4: ask each             5: quit                 6: help"
-    )?;
-    stdout.flush()?;
-    Ok(())
 }
 
 fn clean_trace2_directories_visited(value: usize) {

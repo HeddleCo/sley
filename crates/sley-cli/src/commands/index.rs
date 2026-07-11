@@ -1050,6 +1050,7 @@ pub(crate) fn cmd_ls_files(
                 format,
                 index,
                 sparse && !(deleted || modified),
+                &pathspec,
             )?;
             let oid_candidates = ls_files_oid_candidates(&index);
             let ctx = LsFilesFormatContext {
@@ -1101,6 +1102,7 @@ pub(crate) fn cmd_ls_files(
                 format,
                 index,
                 sparse && !(deleted || modified),
+                &pathspec,
             )?;
             let oid_candidates = ls_files_oid_candidates(&index);
             if ignored && cached {
@@ -1162,6 +1164,7 @@ pub(crate) fn cmd_ls_files(
             format,
             index,
             sparse && !(deleted || modified),
+            &pathspec,
         )?;
         let oid_candidates = ls_files_oid_candidates(&index);
         if unmerged {
@@ -1268,7 +1271,7 @@ fn write_ls_files_with_tree(
 
     let index = if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
         // git ensures a full index before overlaying.
-        let index = ls_files_display_index(repo.object_database(), format, index, false)?;
+        let index = ls_files_display_index(repo.object_database(), format, index, false, pathspec)?;
         Some(index)
     } else {
         None
@@ -1313,7 +1316,7 @@ fn recurse_ls_files_submodules(
         return Ok(());
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let index = ls_files_display_index(&db, format, index, false)?;
+    let index = ls_files_display_index(&db, format, index, false, pathspec)?;
     let candidates = ls_files_oid_candidates(&index);
     let config = read_repo_config(git_dir)?;
     // git reads each (sub)repo's settings on index read and dies on a malformed
@@ -1584,11 +1587,73 @@ fn ls_files_display_index(
     format: ObjectFormat,
     mut index: Index,
     sparse: bool,
+    pathspec: &LsFilesPathspec,
 ) -> Result<Index> {
     if !sparse && index.entries.iter().any(IndexEntry::is_sparse_dir) {
-        sley_worktree::expand_sparse_index(&mut index, db, format)?;
+        if pathspec.filters.is_empty() {
+            sley_worktree::expand_sparse_index(&mut index, db, format)?;
+        } else {
+            sley_worktree::expand_sparse_index_directories(&mut index, db, format, |directory| {
+                ls_files_pathspec_may_match_sparse_directory(pathspec, directory)
+            })?;
+        }
     }
     Ok(index)
+}
+
+/// Conservative pathspec-prefix test for a collapsed sparse directory.
+/// Returning true may expand a directory unnecessarily; returning false must
+/// prove no positive pathspec can name a descendant hidden by it.
+fn ls_files_pathspec_may_match_sparse_directory(
+    pathspec: &LsFilesPathspec,
+    directory: &[u8],
+) -> bool {
+    let directory = directory.strip_suffix(b"/").unwrap_or(directory);
+    let includes = pathspec
+        .filters
+        .iter()
+        .filter(|filter| !filter.is_exclude())
+        .collect::<Vec<_>>();
+    if includes.is_empty() {
+        return true;
+    }
+    includes.into_iter().any(|filter| {
+        let pattern = filter.element.pattern();
+        let literal_prefix_end = if filter.is_glob {
+            pattern
+                .iter()
+                .position(|byte| matches!(byte, b'*' | b'?' | b'['))
+                .unwrap_or(pattern.len())
+        } else {
+            pattern.len()
+        };
+        let pattern_prefix = pattern[..literal_prefix_end]
+            .strip_suffix(b"/")
+            .unwrap_or(&pattern[..literal_prefix_end]);
+        if pattern_prefix.is_empty() {
+            return true;
+        }
+        let magic = filter.element.magic();
+        if magic.icase {
+            let pattern_prefix = pattern_prefix.to_ascii_lowercase();
+            let directory = directory.to_ascii_lowercase();
+            sparse_path_prefixes_intersect(&pattern_prefix, &directory)
+        } else {
+            sparse_path_prefixes_intersect(pattern_prefix, directory)
+        }
+    })
+}
+
+fn sparse_path_prefixes_intersect(pattern: &[u8], directory: &[u8]) -> bool {
+    pattern == directory
+        || pattern
+            .strip_prefix(directory)
+            .is_some_and(|rest| rest.first() == Some(&b'/'))
+        || directory
+            .strip_prefix(pattern)
+            .is_some_and(|rest| rest.first() == Some(&b'/'))
+        || pattern.starts_with(directory)
+        || directory.starts_with(pattern)
 }
 
 fn write_ls_files_resolve_undo(

@@ -19,6 +19,7 @@ pub(crate) mod cat_file;
 pub(crate) mod checkout;
 pub(crate) mod checkout_index;
 pub(crate) mod cli_options;
+pub(crate) mod column;
 pub(crate) mod combined;
 pub(crate) mod commit;
 pub(crate) mod config_cmd;

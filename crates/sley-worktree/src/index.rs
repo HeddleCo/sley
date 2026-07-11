@@ -594,6 +594,57 @@ pub fn add_update_all_tracked_filtered(
     Ok(actions)
 }
 
+/// Collect the worktree changes that a regular `add` invocation can stage,
+/// relative to a caller-owned index.
+///
+/// Unlike general status, this operation deliberately does not compare the
+/// index to `HEAD`: staged differences are irrelevant when deciding what a
+/// subsequent add can update. That distinction also lets a sparse index keep
+/// absent, out-of-cone trees collapsed. Their sparse-directory entries act as
+/// tracked boundaries for the untracked walk, while the tracked precheck treats
+/// an absent skip-worktree directory as clean.
+pub fn collect_add_worktree_status_with_index(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    index: &Index,
+) -> Result<Vec<ShortStatusEntry>> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let index_mtime = fs::metadata(index_path)
+        .ok()
+        .and_then(|metadata| file_mtime_parts(&metadata));
+    let stat_cache = IndexStatCache::from_index_mtime_only(index_mtime);
+    let sparse_checkout_active = sparse_checkout_active_for_status(git_dir, index);
+    let mut entries = short_status_tracked_only_head_matches_index_parallel(
+        worktree_root,
+        git_dir,
+        format,
+        index,
+        &stat_cache,
+        sparse_checkout_active,
+        StatusUntrackedMode::All,
+    )?;
+    let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+    let untracked = status_untracked_paths_from_index(
+        worktree_root,
+        git_dir,
+        index,
+        &stat_cache,
+        &mut ignores,
+        StatusUntrackedMode::All,
+        None,
+    )?;
+    append_untracked_status_entries(&mut entries, untracked);
+    entries.sort_by(|left, right| {
+        status_sort_category(left)
+            .cmp(&status_sort_category(right))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(entries)
+}
+
 pub fn add_exact_tracked_path_from_disk(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
@@ -1306,9 +1357,6 @@ pub(crate) fn update_index_paths_impl(
     let trust_symlinks = clean_config
         .map(trust_symlinks)
         .unwrap_or_else(|| trust_symlinks_from_git_dir(git_dir, None));
-    if options.allow_skip_worktree_entries {
-        expand_sparse_index(&mut index, &odb, format)?;
-    }
     let sparse_checkout_active = sparse_checkout_config_enabled(git_dir)
         || index.is_sparse()
         || index.entries.iter().any(IndexEntry::is_sparse_dir);
@@ -1353,7 +1401,9 @@ pub(crate) fn update_index_paths_impl(
         })?;
         let git_path = git_path_bytes(relative)?;
         if index_sparse_dir_contains_path(&index, &git_path) {
-            expand_sparse_index(&mut index, &odb, format)?;
+            expand_sparse_index_directories(&mut index, &odb, format, |directory| {
+                git_path.starts_with(directory)
+            })?;
         }
         let existing_range = index_entries_path_range(&index.entries, &git_path);
         if path_mode.force_remove {

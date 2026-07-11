@@ -1508,7 +1508,7 @@ fn resolve_add_regular_actions(
             actions.push(AddAction::Add(path));
         }
     }
-    sley_worktree::stream_short_status(worktree_root, git_dir, format, |entry| {
+    let mut collect_status_action = |entry: sley_worktree::ShortStatusRow<'_>| {
         let actionable = (entry.index == b'?' && entry.worktree == b'?')
             || entry.worktree == b'M'
             || entry.worktree == b'T'
@@ -1552,7 +1552,28 @@ fn resolve_add_regular_actions(
             actions.push(action);
         }
         Ok(sley_worktree::StreamControl::Continue)
-    })?;
+    };
+    if let Some(index) = reusable_index.as_ref().filter(|index| {
+        index.is_sparse()
+            || index
+                .entries
+                .iter()
+                .any(sley_index::IndexEntry::is_sparse_dir)
+    }) {
+        // General status must account for staged HEAD-to-index differences and
+        // may therefore need a full index. Add only needs index-to-worktree and
+        // untracked changes, so use the sparse-boundary-aware engine query.
+        for entry in sley_worktree::collect_add_worktree_status_with_index(
+            worktree_root,
+            git_dir,
+            format,
+            index,
+        )? {
+            collect_status_action(entry.as_row())?;
+        }
+    } else {
+        sley_worktree::stream_short_status(worktree_root, git_dir, format, collect_status_action)?;
+    }
     if options.chmod.is_some() || options.force {
         // `--force` stages paths the status walk never reports (gitignored
         // files; gitignored embedded repositories as gitlinks), so resolve the
@@ -1852,7 +1873,33 @@ fn resolve_add_regular_tracked_exact_actions(
         let git_path = add_git_path_bytes(relative)?;
         let range = add_index_entries_path_range(&index.entries, &git_path);
         if range.is_empty() {
-            return Ok(None);
+            let metadata = match fs::symlink_metadata(&absolute) {
+                Ok(metadata) => metadata,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let file_type = metadata.file_type();
+            if metadata.is_dir() || !(file_type.is_file() || file_type.is_symlink()) {
+                return Ok(None);
+            }
+            if sley_worktree::standard_ignore_match(worktree_root, &git_path, false)?
+                .is_some_and(|ignore_match| ignore_match.ignored)
+            {
+                return Ok(None);
+            }
+            // An exact, present, untracked file needs no whole-status walk to
+            // prove it is actionable. Return it directly and let the shared
+            // index mutation engine decide whether its path intersects a
+            // collapsed sparse directory.
+            actions.push(AddAction::Add(absolute));
+            continue;
         }
         if range.len() != 1 {
             return Ok(None);

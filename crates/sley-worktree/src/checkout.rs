@@ -2695,6 +2695,54 @@ pub(crate) fn expand_sparse_index_in_memory(
     expand_sparse_index_impl(index, db, format, false)
 }
 
+/// Expand only collapsed sparse directories selected by `should_expand`.
+///
+/// Commands with a restrictive pathspec can operate directly on in-cone
+/// entries while leaving unrelated sparse directories collapsed. A selected
+/// directory is expanded into skip-worktree leaves; unselected directories and
+/// the sparse-index extension remain intact. The expansion is observable in
+/// trace2 exactly once when at least one directory is selected.
+pub fn expand_sparse_index_directories(
+    index: &mut Index,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    mut should_expand: impl FnMut(&[u8]) -> bool,
+) -> Result<bool> {
+    if !index.entries.iter().any(IndexEntry::is_sparse_dir) {
+        return Ok(false);
+    }
+    let mut changed = false;
+    let mut expanded = Vec::with_capacity(index.entries.len());
+    for entry in std::mem::take(&mut index.entries) {
+        if !entry.is_sparse_dir() || !should_expand(entry.path.as_bytes()) {
+            expanded.push(entry);
+            continue;
+        }
+        changed = true;
+        let prefix = entry.path.as_bytes();
+        for (relative, (mode, oid)) in sley_diff_merge::flatten_tree(db, format, &entry.oid)? {
+            let mut path = prefix.to_vec();
+            path.extend_from_slice(&relative);
+            let mut leaf = blank_sparse_blob_entry(format, &path, mode, oid);
+            leaf.set_skip_worktree(true);
+            expanded.push(leaf);
+        }
+    }
+    expanded.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    index.entries = expanded;
+    if !changed {
+        return Ok(false);
+    }
+    if index.entries.iter().any(IndexEntry::is_sparse_dir) {
+        index.set_sparse_extension();
+    } else {
+        index.clear_sparse_extension()?;
+    }
+    normalize_index_version_for_extended_flags(index);
+    sley_core::trace2::region("index", "ensure_full_index");
+    Ok(true)
+}
+
 fn expand_sparse_index_impl(
     index: &mut Index,
     db: &FileObjectDatabase,
@@ -3215,4 +3263,60 @@ pub(crate) fn restore_worktree_paths_from_entries(
     Ok(RestoreResult {
         restored: restored.len(),
     })
+}
+
+#[cfg(test)]
+mod sparse_index_expansion_tests {
+    use super::*;
+
+    #[test]
+    fn selective_expansion_leaves_unmatched_sparse_directories_collapsed() {
+        let root = tempfile::tempdir().expect("temporary repository");
+        let git_dir = root.path().join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("object directory");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let blob = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"payload\n".to_vec()))
+            .expect("write blob");
+        let tree = db
+            .write_object(EncodedObject::new(
+                ObjectType::Tree,
+                Tree {
+                    entries: vec![TreeEntry {
+                        mode: 0o100644,
+                        name: BString::from("file"),
+                        oid: blob,
+                    }],
+                }
+                .write(),
+            ))
+            .expect("write tree");
+        let mut sparse =
+            blank_sparse_blob_entry(ObjectFormat::Sha1, b"outside/", SPARSE_DIR_MODE, tree);
+        sparse.set_skip_worktree(true);
+        let mut index = Index {
+            version: 3,
+            entries: vec![sparse],
+            extensions: Vec::new(),
+            checksum: None,
+        };
+        index.set_sparse_extension();
+
+        assert!(
+            !expand_sparse_index_directories(&mut index, &db, ObjectFormat::Sha1, |_| false,)
+                .expect("leave unrelated directory collapsed")
+        );
+        assert!(index.entries[0].is_sparse_dir());
+        assert!(index.is_sparse());
+
+        assert!(
+            expand_sparse_index_directories(&mut index, &db, ObjectFormat::Sha1, |path| path
+                == b"outside/",)
+            .expect("expand selected directory")
+        );
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].path.as_bytes(), b"outside/file");
+        assert!(index.entries[0].is_skip_worktree());
+        assert!(!index.is_sparse());
+    }
 }

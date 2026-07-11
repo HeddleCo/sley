@@ -247,9 +247,11 @@ pub(crate) fn cmd_upload_pack(
     // `--stateless-rpc`/`--advertise-refs`/`--timeout=<n>`. The repository is
     // the lone positional argument. Mirrors builtin/upload-pack.c's options.
     let mut repository: Option<&String> = None;
+    let mut stateless_rpc = false;
     for arg in args {
         match arg.as_str() {
-            "--strict" | "--stateless-rpc" | "--advertise-refs" | "--http-backend-info-refs" => {}
+            "--stateless-rpc" => stateless_rpc = true,
+            "--strict" | "--advertise-refs" | "--http-backend-info-refs" => {}
             value if value.starts_with("--timeout=") => {}
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!(
@@ -290,13 +292,23 @@ pub(crate) fn cmd_upload_pack(
         let mut stdin = stdin.lock();
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
-        return sley_remote::serve_upload_pack_v2_with_config(
-            &git_dir,
-            format,
-            &config,
-            &mut stdin,
-            &mut stdout,
-        );
+        return if stateless_rpc {
+            sley_remote::serve_upload_pack_v2_stateless_with_config(
+                &git_dir,
+                format,
+                &config,
+                &mut stdin,
+                &mut stdout,
+            )
+        } else {
+            sley_remote::serve_upload_pack_v2_with_config(
+                &git_dir,
+                format,
+                &config,
+                &mut stdin,
+                &mut stdout,
+            )
+        };
     }
     let features = sley_remote::upload_pack_features(&git_dir, format)?;
     let mut advertisements = sley_remote::local_fetch_advertisements(&git_dir, format)?;

@@ -120,9 +120,9 @@ pub use local::{
     install_fetch_pack_via_local_upload_pack, local_fetch_advertisements, local_have_oids,
     receive_pack_features, receive_pack_into_local_repository,
     receive_pack_request_uses_push_options, receive_pack_stream_into_local_repository,
-    serve_upload_pack_v2, serve_upload_pack_v2_with_config, upload_pack_features,
-    upload_pack_from_local_repository, upload_pack_request_uses_sideband,
-    upload_pack_sideband_response,
+    serve_upload_pack_v2, serve_upload_pack_v2_stateless_with_config,
+    serve_upload_pack_v2_with_config, upload_pack_features, upload_pack_from_local_repository,
+    upload_pack_request_uses_sideband, upload_pack_sideband_response,
 };
 
 mod filter;

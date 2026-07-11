@@ -30,17 +30,19 @@ use sley_core::{
 };
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
-    GitService, ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchRequest,
-    ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRequest,
-    ProtocolVersion, RefAdvertisement, RefAdvertisementSet, TransportHandshake, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackRequest, encode_protocol_v2_command_options,
-    parse_protocol_v2_fetch_features, parse_upload_pack_features, protocol_v2_object_format,
-    read_protocol_v2_fetch_response, read_protocol_v2_fetch_sideband_all_response,
+    GitService, ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchAcknowledgment,
+    ProtocolV2FetchRequest, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
+    ProtocolV2LsRefsRequest, ProtocolVersion, RefAdvertisement, RefAdvertisementSet,
+    TransportHandshake, UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRequest,
+    encode_protocol_v2_command_options, parse_protocol_v2_fetch_features,
+    parse_upload_pack_features, protocol_v2_object_format,
+    read_protocol_v2_fetch_negotiation_response, read_protocol_v2_fetch_response,
+    read_protocol_v2_fetch_sideband_all_response,
     read_protocol_v2_ls_refs_response_as_ref_advertisement_set,
     smart_http_advertisement_content_type, smart_http_rpc_request_content_type,
-    validate_protocol_v2_fetch_command_request, validate_protocol_v2_ls_refs_command_request,
-    write_protocol_v2_command_request, write_upload_pack_negotiation_request,
-    write_upload_pack_request,
+    trace_protocol_v2_advertisement_read, validate_protocol_v2_fetch_command_request,
+    validate_protocol_v2_ls_refs_command_request, write_protocol_v2_command_request,
+    write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_transport::{
     GitProtocolHeader, HttpClient, HttpResponse, RemoteTransport, RemoteUrl,
@@ -344,7 +346,9 @@ fn protocol_v2_fetch_request_from_upload_pack_semantics(
         include_tag: true,
         ofs_delta: true,
         done: true,
-        wait_for_done: v2_features.wait_for_done,
+        // Normal fetch negotiation expects the pack immediately after `ready`.
+        // `wait-for-done` is reserved for callers such as `--negotiate-only`.
+        wait_for_done: false,
         sideband_all: v2_features.sideband_all,
         ..ProtocolV2FetchRequest::default()
     })
@@ -835,6 +839,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
     if request.wants.is_empty() {
         return Ok(Vec::new());
     }
+    trace_protocol_v2_advertisement_read(handshake)?;
     let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
     if !request_replays_shallow_boundary(request.deepen, request.deepen_since, &request.deepen_not)
         && request.filter.is_none()
@@ -842,13 +847,13 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
     {
         return Ok(Vec::new());
     }
-    let haves = request_haves(
+    let haves = request_negotiation_haves(
         request.git_dir,
         request.format,
         request.omit_haves,
         request.haves.clone(),
     )?;
-    let fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
+    let mut fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
         request.wants,
         haves,
         request.shallow,
@@ -860,36 +865,77 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
         handshake,
     )?;
     let sideband_all = fetch.sideband_all;
-    let mut response = http_protocol_v2_fetch_post(
-        request.client,
-        request.remote,
-        request.format,
-        handshake,
-        fetch,
-        credentials,
-        HttpRpcOptions {
-            git_protocol: request.git_protocol,
-            post_buffer: request.post_buffer,
-        },
-    )?;
-    let (header, _install) = if request.promisor {
-        install_protocol_v2_fetch_promisor_response_from_reader(
+    let all_haves = std::mem::take(&mut fetch.haves);
+    const INITIAL_HAVE_BATCH: usize = 16;
+    let mut sent_haves = all_haves.len().min(INITIAL_HAVE_BATCH);
+    fetch.haves = all_haves[..sent_haves].to_vec();
+    fetch.done = all_haves.is_empty();
+
+    loop {
+        let sent_done = fetch.done;
+        let wait_for_done = fetch.wait_for_done;
+        let mut response = http_protocol_v2_fetch_post(
+            request.client,
+            request.remote,
             request.format,
-            &mut response.body,
-            sideband_all,
-            &local_db,
-            request.max_input_size,
-        )?
-    } else {
-        install_protocol_v2_fetch_response_from_reader(
-            request.format,
-            &mut response.body,
-            sideband_all,
-            &local_db,
-            request.max_input_size,
-        )?
-    };
-    Ok(shallow_info_from_protocol_v2_fetch_header(&header))
+            handshake,
+            fetch.clone(),
+            credentials,
+            HttpRpcOptions {
+                git_protocol: request.git_protocol,
+                post_buffer: request.post_buffer,
+            },
+        )?;
+
+        let has_packfile = if sent_done {
+            true
+        } else {
+            let negotiation = read_protocol_v2_fetch_negotiation_response(
+                request.format,
+                &mut response.body,
+                sideband_all,
+                wait_for_done,
+            )?;
+            if negotiation.has_following_sections {
+                true
+            } else {
+                let ready = negotiation
+                    .acknowledgments
+                    .iter()
+                    .any(|ack| matches!(ack, ProtocolV2FetchAcknowledgment::Ready));
+                if ready || sent_haves == all_haves.len() {
+                    fetch.done = true;
+                    fetch.haves = all_haves.clone();
+                } else {
+                    sent_haves = (sent_haves * 2).min(all_haves.len());
+                    fetch.haves = all_haves[..sent_haves].to_vec();
+                }
+                false
+            }
+        };
+        if !has_packfile {
+            continue;
+        }
+
+        let (header, _install) = if request.promisor {
+            install_protocol_v2_fetch_promisor_response_from_reader(
+                request.format,
+                &mut response.body,
+                sideband_all,
+                &local_db,
+                request.max_input_size,
+            )?
+        } else {
+            install_protocol_v2_fetch_response_from_reader(
+                request.format,
+                &mut response.body,
+                sideband_all,
+                &local_db,
+                request.max_input_size,
+            )?
+        };
+        return Ok(shallow_info_from_protocol_v2_fetch_header(&header));
+    }
 }
 
 pub(crate) fn http_post_buffer(config: Option<&GitConfig>) -> usize {
@@ -939,6 +985,21 @@ fn request_haves(
         Ok(haves)
     } else {
         crate::local::local_have_oids(git_dir, format)
+    }
+}
+
+fn request_negotiation_haves(
+    git_dir: &Path,
+    format: ObjectFormat,
+    omit_haves: bool,
+    custom_haves: Option<Vec<ObjectId>>,
+) -> Result<Vec<ObjectId>> {
+    if omit_haves {
+        Ok(Vec::new())
+    } else if let Some(haves) = custom_haves {
+        Ok(haves)
+    } else {
+        crate::local::local_negotiation_have_oids(git_dir, format)
     }
 }
 

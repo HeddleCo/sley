@@ -172,7 +172,7 @@ pub(crate) use sley::plumbing::sley_pretty::{
     format_log_commit_header_oid, format_log_oid, format_subst_for_commit,
     format_trailers_from_commit, git_color_name_to_ansi, git_color_spec_to_ansi,
     log_email_local_part, log_output_encoding, log_pick_utf8, log_reencode_message, log_rewrap,
-    log_sanitized_subject, presets,
+    log_sanitized_subject, presets, try_git_color_spec_to_ansi,
 };
 pub(crate) use sley::plumbing::sley_rev::diff_options::{
     DiffFilter, DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleIgnoreMode,

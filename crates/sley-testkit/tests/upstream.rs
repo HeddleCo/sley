@@ -487,6 +487,32 @@ include\tt[0-9][0-9][0-9][0-9]-*.sh\toracle\toracle\teligible\tupstream-declared
     }
 
     #[test]
+    fn tap_parser_recovers_results_joined_to_pkt_line_control_frames() {
+        let fixture = Fixture::new();
+        write_executable(
+            &fixture.upstream_t.join("t0004-unicode.sh"),
+            "#!/bin/sh\nprintf '%b' '0000ok 1 - joined after flush\\n'\nprintf '%s\\n' 'ok 2 - ordinary cell' '1..2'\n",
+        );
+        let output = fixture
+            .command("sley", "pkt-line-tap")
+            .arg("t0004-unicode.sh")
+            .output()
+            .expect("run pkt-line/TAP fixture");
+        assert!(
+            output.status.success(),
+            "runner lost joined TAP cell: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cells = fs::read_to_string(fixture.path("pkt-line-tap-cells.csv"))
+            .expect("read pkt-line TAP cells");
+        assert!(cells.contains("\"1\",\"PASS\",\"ok\",\"\",\"joined after flush\""));
+        assert!(cells.contains("\"2\",\"PASS\",\"ok\",\"\",\"ordinary cell\""));
+        let details = fs::read_to_string(fixture.path("pkt-line-tap-details.csv"))
+            .expect("read pkt-line TAP details");
+        assert!(details.contains("sley,t0004-unicode.sh,PASS,0,2,0,0,0,2,2,0,0,0,0"));
+    }
+
+    #[test]
     fn serial_runner_creates_fresh_artifact_directories() {
         let fixture = Fixture::new();
         let artifact_root = fixture.path("fresh/serial-artifacts");

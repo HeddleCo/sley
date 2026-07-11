@@ -9,7 +9,7 @@
 //! `cmd_receive_pack` stdio wrappers and the `fetch`/`push` orchestration can
 //! call them, and an embedder can drive them directly.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Cursor, ErrorKind, Read};
 use std::path::Path;
@@ -657,6 +657,48 @@ pub fn local_have_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<Objec
     for oid in db.object_ids()? {
         if seen.insert(oid) {
             haves.push(oid);
+        }
+    }
+    Ok(haves)
+}
+
+/// Commit haves ordered from advertised tips toward their ancestors for
+/// protocol negotiation. Unlike [`local_have_oids`], this intentionally omits
+/// trees and blobs: Git's negotiator advances through commit history in
+/// bounded batches, allowing the server to distinguish an immediately common
+/// tip from a common ancestor reached only in a later round.
+pub(crate) fn local_negotiation_have_oids(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<ObjectId>> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut seen = HashSet::new();
+    let mut queue = BinaryHeap::new();
+    let commit_time = |oid: &ObjectId| -> Result<i64> {
+        let object = db.read_object(oid)?;
+        Ok(Commit::parse_ref(format, &object.body)?
+            .committer_signature()
+            .map(|signature| signature.time.seconds)
+            .unwrap_or(0))
+    };
+    for advertisement in local_fetch_advertisements(git_dir, format)? {
+        if let Some(commit) = peel_to_commit(&db, format, &advertisement.oid)?
+            && seen.insert(commit)
+        {
+            queue.push((commit_time(&commit)?, commit));
+        }
+    }
+
+    let mut haves = Vec::new();
+    while let Some((_time, oid)) = queue.pop() {
+        haves.push(oid);
+        let object = db.read_object(&oid)?;
+        for parent in
+            sley_odb::grafted_parents(&db, &oid, Commit::parse_ref(format, &object.body)?.parents)
+        {
+            if seen.insert(parent) {
+                queue.push((commit_time(&parent)?, parent));
+            }
         }
     }
     Ok(haves)
@@ -1712,10 +1754,18 @@ fn local_fetch_v2_sections(
         if acks.is_empty() {
             acks.push(ProtocolV2FetchAcknowledgment::Nak);
         }
+        let ready = acks
+            .iter()
+            .any(|ack| matches!(ack, ProtocolV2FetchAcknowledgment::Ack(_)));
+        if ready {
+            acks.push(ProtocolV2FetchAcknowledgment::Ready);
+        }
         sections.push(ProtocolV2FetchResponseSection::Acknowledgments(acks));
-        // Without `done` and no `ready`, the server stops here to let the
-        // client continue negotiating; it would re-issue fetch with `done`.
-        if !request.wait_for_done {
+        // Without a common commit, stop after acknowledgments so the client can
+        // send its next batch. `wait-for-done` also stops after `ready`: the
+        // client explicitly asked the server not to start the pack until a
+        // subsequent request carries `done`.
+        if !ready || request.wait_for_done {
             return Ok(sections);
         }
     }
@@ -1751,6 +1801,14 @@ fn local_fetch_v2_sections(
         for w in wanted {
             wants.push(w.oid);
         }
+    }
+    // A capability-only fetch command (for example the upstream
+    // `packfile-uris` validation probe) has no pack request to answer. Git
+    // accepts the command and emits no response section after advertising its
+    // capabilities; emitting an empty `packfile` section is observably
+    // different and can also corrupt a surrounding TAP stream.
+    if wants.is_empty() {
+        return Ok(sections);
     }
 
     // Apply upload-pack's shallow request before constructing the pack. The
@@ -1920,12 +1978,39 @@ pub fn serve_upload_pack_v2_with_config(
     reader: &mut impl std::io::Read,
     writer: &mut impl std::io::Write,
 ) -> Result<()> {
+    serve_upload_pack_v2_inner(git_dir, format, config, reader, writer, true)
+}
+
+/// Serve a protocol-v2 stateless RPC request without re-advertising
+/// capabilities. Smart HTTP performs capability discovery in its preceding
+/// `info/refs` GET, so each upload-pack POST begins directly with the command
+/// response, matching `git upload-pack --stateless-rpc`.
+pub fn serve_upload_pack_v2_stateless_with_config(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    reader: &mut impl std::io::Read,
+    writer: &mut impl std::io::Write,
+) -> Result<()> {
+    serve_upload_pack_v2_inner(git_dir, format, config, reader, writer, false)
+}
+
+fn serve_upload_pack_v2_inner(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    reader: &mut impl std::io::Read,
+    writer: &mut impl std::io::Write,
+    advertise: bool,
+) -> Result<()> {
     let handshake = TransportHandshake {
         protocol: ProtocolVersion::V2,
         capabilities: upload_pack_v2_capabilities(format, config)?,
     };
-    write_protocol_v2_advertisement(writer, &handshake)?;
-    writer.flush()?;
+    if advertise {
+        write_protocol_v2_advertisement(writer, &handshake)?;
+        writer.flush()?;
+    }
 
     // EOF / a lone flush after the advertisement ends the session: the client
     // disconnected (e.g. `ls-remote` reads the refs and leaves). Malformed
@@ -1958,8 +2043,10 @@ pub fn serve_upload_pack_v2_with_config(
             }
             sley_protocol::ProtocolV2Command::Fetch(fetch) => {
                 let sections = local_fetch_v2_sections(git_dir, format, &fetch)?;
-                write_protocol_v2_fetch_response(writer, &sections)?;
-                writer.flush()?;
+                if !sections.is_empty() {
+                    write_protocol_v2_fetch_response(writer, &sections)?;
+                    writer.flush()?;
+                }
             }
             sley_protocol::ProtocolV2Command::ObjectInfo(_)
             | sley_protocol::ProtocolV2Command::Unknown(_) => {
@@ -2071,6 +2158,163 @@ mod tests {
             error
                 .to_string()
                 .contains("no commits selected for shallow requests")
+        );
+        fs::remove_dir_all(git_dir).expect("remove test repository");
+    }
+
+    #[test]
+    fn protocol_v2_upload_pack_negotiates_ready_before_pack() {
+        let git_dir = unique_local_test_dir("protocol-v2-negotiation");
+        fs::create_dir_all(git_dir.join("objects")).expect("test repository objects");
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("test repository HEAD");
+
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let tree_oid = write_test_object(&db, &test_tree(&[]));
+        let base = write_test_object(&db, &test_commit(tree_oid, &[], b"base\n"));
+        let tip = write_test_object(&db, &test_commit(tree_oid, &[base], b"tip\n"));
+        let sections = local_fetch_v2_sections(
+            &git_dir,
+            format,
+            &ProtocolV2FetchRequest {
+                wants: vec![tip],
+                haves: vec![base],
+                done: false,
+                ..ProtocolV2FetchRequest::default()
+            },
+        )
+        .expect("common have makes the server ready");
+        assert_eq!(
+            sections.first(),
+            Some(&ProtocolV2FetchResponseSection::Acknowledgments(vec![
+                ProtocolV2FetchAcknowledgment::Ack(base),
+                ProtocolV2FetchAcknowledgment::Ready,
+            ]))
+        );
+        assert!(matches!(
+            sections.last(),
+            Some(ProtocolV2FetchResponseSection::Packfile(_))
+        ));
+
+        let unknown = ObjectId::from_hex(format, "1111111111111111111111111111111111111111")
+            .expect("test object id");
+        let sections = local_fetch_v2_sections(
+            &git_dir,
+            format,
+            &ProtocolV2FetchRequest {
+                wants: vec![tip],
+                haves: vec![unknown],
+                done: false,
+                ..ProtocolV2FetchRequest::default()
+            },
+        )
+        .expect("unknown have continues negotiation");
+        assert_eq!(
+            sections,
+            vec![ProtocolV2FetchResponseSection::Acknowledgments(vec![
+                ProtocolV2FetchAcknowledgment::Nak,
+            ])]
+        );
+
+        fs::remove_dir_all(git_dir).expect("remove test repository");
+    }
+
+    #[test]
+    fn protocol_v2_fetch_without_wants_emits_no_empty_packfile_section() {
+        let git_dir = unique_local_test_dir("protocol-v2-no-wants");
+        fs::create_dir_all(git_dir.join("objects")).expect("test repository objects");
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("test repository HEAD");
+
+        let sections = local_fetch_v2_sections(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &ProtocolV2FetchRequest {
+                done: true,
+                packfile_uris: Some("https".into()),
+                ..ProtocolV2FetchRequest::default()
+            },
+        )
+        .expect("capability-only fetch request");
+        assert!(sections.is_empty());
+
+        let config = GitConfig::parse(b"[uploadpack]\n\tblobpackfileuri = anything\n")
+            .expect("packfile-uri config");
+        let request = ProtocolV2FetchRequest {
+            done: true,
+            packfile_uris: Some("https".into()),
+            ..ProtocolV2FetchRequest::default()
+        };
+        let mut request_bytes = Vec::new();
+        write_protocol_v2_fetch_request(&mut request_bytes, &request)
+            .expect("encode capability-only request");
+
+        let mut stateless_response = Vec::new();
+        serve_upload_pack_v2_stateless_with_config(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &config,
+            &mut request_bytes.as_slice(),
+            &mut stateless_response,
+        )
+        .expect("serve stateless capability-only request");
+        assert!(stateless_response.is_empty());
+
+        let mut long_lived_response = Vec::new();
+        serve_upload_pack_v2_with_config(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &config,
+            &mut request_bytes.as_slice(),
+            &mut long_lived_response,
+        )
+        .expect("serve long-lived capability-only request");
+        let handshake = TransportHandshake {
+            protocol: ProtocolVersion::V2,
+            capabilities: upload_pack_v2_capabilities(ObjectFormat::Sha1, &config)
+                .expect("test capabilities"),
+        };
+        let mut advertisement = Vec::new();
+        write_protocol_v2_advertisement(&mut advertisement, &handshake)
+            .expect("encode test advertisement");
+        assert_eq!(long_lived_response, advertisement);
+        fs::remove_dir_all(git_dir).expect("remove test repository");
+    }
+
+    #[test]
+    fn protocol_v2_stateless_upload_pack_does_not_readvertise() {
+        let git_dir = unique_local_test_dir("protocol-v2-stateless");
+        fs::create_dir_all(git_dir.join("objects")).expect("test repository objects");
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("test repository HEAD");
+
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let tree_oid = write_test_object(&db, &test_tree(&[]));
+        let tip = write_test_object(&db, &test_commit(tree_oid, &[], b"tip\n"));
+        let mut request = Vec::new();
+        write_protocol_v2_fetch_request(
+            &mut request,
+            &ProtocolV2FetchRequest {
+                wants: vec![tip],
+                done: true,
+                ..ProtocolV2FetchRequest::default()
+            },
+        )
+        .expect("encode fetch request");
+        let mut response = Vec::new();
+        serve_upload_pack_v2_stateless_with_config(
+            &git_dir,
+            format,
+            &GitConfig::default(),
+            &mut request.as_slice(),
+            &mut response,
+        )
+        .expect("serve stateless fetch");
+
+        assert_eq!(
+            sley_protocol::read_pkt_line_frame(&mut response.as_slice())
+                .expect("read response")
+                .expect("response frame"),
+            PktLineFrame::Data(b"packfile\n".to_vec())
         );
         fs::remove_dir_all(git_dir).expect("remove test repository");
     }

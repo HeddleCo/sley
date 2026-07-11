@@ -94,6 +94,91 @@ fn prepare_tracked_repo(root: &Path) {
     fs::write(root.join("new.txt"), b"new\n").expect("write untracked file");
 }
 
+#[test]
+fn add_exact_in_cone_file_keeps_sparse_index_collapsed() {
+    let root = unique_temp_dir("add-exact-in-cone-sparse-index");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    for repo in [&upstream, &rust] {
+        git(repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("deep")).expect("create in-cone directory");
+        fs::create_dir_all(repo.join("outside")).expect("create out-of-cone directory");
+        fs::write(repo.join("deep/file"), b"inside\n").expect("write in-cone file");
+        fs::write(repo.join("deep/gone"), b"delete me\n").expect("write deletion fixture");
+        fs::write(repo.join("outside/file"), b"outside\n").expect("write out-of-cone file");
+        fs::write(repo.join(".gitignore"), b"ignored.log\n").expect("write ignore file");
+        git(repo, &["add", "."]);
+        run_with_identity(repo, &["commit", "-m", "base", "-q"]);
+        git(
+            repo,
+            &["sparse-checkout", "init", "--cone", "--sparse-index"],
+        );
+        git(repo, &["sparse-checkout", "set", "deep"]);
+        fs::write(repo.join("extra.txt"), b"extra\n").expect("write new root file");
+    }
+
+    let args = ["add", "extra.txt"];
+    let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+    let trace = root.join("exact-trace.json");
+    let actual = Command::new(sley_testkit::sley_bin!())
+        .current_dir(&rust)
+        .args(args)
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .expect("run traced sley add");
+    assert_same_output(actual, expected, &args);
+    assert!(
+        !fs::read_to_string(&trace)
+            .expect("read add trace")
+            .contains("ensure_full_index"),
+        "adding an exact in-cone file must not expand sparse directories"
+    );
+    assert_eq!(
+        git(&rust, &["ls-files", "--sparse", "--stage"]),
+        git(&upstream, &["ls-files", "--sparse", "--stage"]),
+        "candidate index shape/content differed from Git"
+    );
+
+    for repo in [&upstream, &rust] {
+        fs::write(repo.join("deep/file"), b"modified\n").expect("modify in-cone file");
+        make_executable(&repo.join("deep/file"));
+        fs::remove_file(repo.join("deep/gone")).expect("delete in-cone file");
+        fs::write(repo.join("broad.txt"), b"untracked\n").expect("write untracked root file");
+        fs::write(repo.join("ignored.log"), b"ignored\n").expect("write ignored file");
+    }
+    let args = ["add", "."];
+    let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+    let trace = root.join("broad-trace.json");
+    let actual = Command::new(sley_testkit::sley_bin!())
+        .current_dir(&rust)
+        .args(args)
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .expect("run traced broad sley add");
+    assert_same_output(actual, expected, &args);
+    assert!(
+        !fs::read_to_string(&trace)
+            .expect("read broad add trace")
+            .contains("ensure_full_index"),
+        "adding a broad in-cone pathspec must keep out-of-cone directories collapsed"
+    );
+    assert_eq!(
+        git(&rust, &["ls-files", "--sparse", "--stage"]),
+        git(&upstream, &["ls-files", "--sparse", "--stage"]),
+        "candidate index differed after broad sparse add"
+    );
+    assert_eq!(
+        git(&rust, &["diff", "--cached", "--name-status"]),
+        git(&upstream, &["diff", "--cached", "--name-status"]),
+        "cached changes differed after broad sparse add"
+    );
+    assert!(!git(&rust, &["ls-files", "ignored.log"]).starts_with(b"ignored.log"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn make_executable(path: &Path) {
     let mut permissions = fs::metadata(path)
         .expect("read executable metadata")

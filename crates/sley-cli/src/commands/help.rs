@@ -20,6 +20,8 @@ const PARSEOPT_HELPER: CommandFlags = CommandFlags::from_bits(1 << 2);
 const RESERVED_CORE_HELPER: CommandFlags = CommandFlags::from_bits(1 << 3);
 const GIT_BUILTIN: CommandFlags = CommandFlags::from_bits(1 << 4);
 const USAGE_HELP: CommandFlags = CommandFlags::from_bits(1 << 5);
+const COMMAND_SPECIFIC_HELP: CommandFlags = CommandFlags::from_bits(1 << 6);
+const SETUP_BEFORE_HELP: CommandFlags = CommandFlags::from_bits(1 << 7);
 const BUILTIN: CommandFlags = NATIVE.union(GIT_BUILTIN);
 const BUILTIN_MAIN: CommandFlags = BUILTIN.union(MAIN_PORCELAIN);
 const BUILTIN_PARSEOPT: CommandFlags = BUILTIN.union(PARSEOPT_HELPER);
@@ -54,7 +56,7 @@ static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     CommandSpec::new("cherry-pick", BUILTIN_MAIN),
     CommandSpec::new("clean", BUILTIN_MAIN),
     CommandSpec::new("clone", BUILTIN_MAIN_PARSEOPT),
-    CommandSpec::new("column", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("column", BUILTIN),
     CommandSpec::new("commit", BUILTIN_MAIN),
     CommandSpec::new("commit-graph", BUILTIN),
     CommandSpec::new("commit-tree", BUILTIN),
@@ -71,8 +73,18 @@ static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     CommandSpec::new("describe", BUILTIN_MAIN),
     CommandSpec::new("diagnose", BUILTIN),
     CommandSpec::new("diff", BUILTIN_MAIN),
-    CommandSpec::new("diff-files", BUILTIN),
-    CommandSpec::new("diff-index", BUILTIN),
+    CommandSpec::new(
+        "diff-files",
+        BUILTIN
+            .union(COMMAND_SPECIFIC_HELP)
+            .union(SETUP_BEFORE_HELP),
+    ),
+    CommandSpec::new(
+        "diff-index",
+        BUILTIN
+            .union(COMMAND_SPECIFIC_HELP)
+            .union(SETUP_BEFORE_HELP),
+    ),
     CommandSpec::new("diff-pairs", GIT_BUILTIN_RESERVED),
     CommandSpec::new("diff-tree", BUILTIN),
     CommandSpec::new("difftool", BUILTIN),
@@ -106,7 +118,12 @@ static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     CommandSpec::new("init", BUILTIN),
     CommandSpec::new("init-db", GIT_BUILTIN_RESERVED),
     CommandSpec::new("instaweb", HELP_RESERVED),
-    CommandSpec::new("interpret-trailers", BUILTIN),
+    CommandSpec::new(
+        "interpret-trailers",
+        BUILTIN
+            .union(COMMAND_SPECIFIC_HELP)
+            .union(SETUP_BEFORE_HELP),
+    ),
     CommandSpec::new("last-modified", BUILTIN),
     CommandSpec::new("log", BUILTIN_MAIN),
     CommandSpec::new("ls-files", BUILTIN),
@@ -114,7 +131,12 @@ static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     CommandSpec::new("ls-tree", BUILTIN),
     CommandSpec::new("mailinfo", GIT_BUILTIN_RESERVED),
     CommandSpec::new("mailsplit", GIT_BUILTIN_RESERVED),
-    CommandSpec::new("maintenance", BUILTIN),
+    CommandSpec::new(
+        "maintenance",
+        BUILTIN
+            .union(COMMAND_SPECIFIC_HELP)
+            .union(SETUP_BEFORE_HELP),
+    ),
     CommandSpec::new("merge", BUILTIN_MAIN),
     CommandSpec::new("merge-base", BUILTIN),
     CommandSpec::new("merge-file", BUILTIN),
@@ -129,7 +151,7 @@ static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     CommandSpec::new("merge-subtree", GIT_BUILTIN_RESERVED),
     CommandSpec::new("merge-tree", BUILTIN),
     CommandSpec::new("mergetool", NATIVE_MAIN),
-    CommandSpec::new("mktag", BUILTIN),
+    CommandSpec::new("mktag", BUILTIN.union(COMMAND_SPECIFIC_HELP)),
     CommandSpec::new("mktree", BUILTIN),
     CommandSpec::new("multi-pack-index", BUILTIN),
     CommandSpec::new("mv", BUILTIN_MAIN),
@@ -139,7 +161,12 @@ static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     CommandSpec::new("pack-objects", BUILTIN),
     CommandSpec::new("pack-redundant", BUILTIN),
     CommandSpec::new("pack-refs", BUILTIN),
-    CommandSpec::new("patch-id", BUILTIN),
+    CommandSpec::new(
+        "patch-id",
+        BUILTIN
+            .union(COMMAND_SPECIFIC_HELP)
+            .union(SETUP_BEFORE_HELP),
+    ),
     CommandSpec::new("pickaxe", GIT_BUILTIN_RESERVED),
     CommandSpec::new("prune", BUILTIN),
     CommandSpec::new("prune-packed", BUILTIN),
@@ -161,7 +188,7 @@ static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     CommandSpec::new("remote-https", RESERVED_CORE_HELPER),
     CommandSpec::new("repack", BUILTIN),
     CommandSpec::new("replace", BUILTIN),
-    CommandSpec::new("replay", BUILTIN),
+    CommandSpec::new("replay", BUILTIN.union(COMMAND_SPECIFIC_HELP)),
     CommandSpec::new("repo", BUILTIN),
     CommandSpec::new("request-pull", HELP_RESERVED),
     CommandSpec::new("rerere", BUILTIN),
@@ -178,9 +205,19 @@ static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     #[cfg(not(feature = "git-compat-i18n"))]
     CommandSpec::new("sh-i18n--envsubst", RESERVED_CORE_HELPER),
     CommandSpec::new("shell", RESERVED_CORE_HELPER),
-    CommandSpec::new("shortlog", BUILTIN_MAIN),
+    CommandSpec::new(
+        "shortlog",
+        BUILTIN_MAIN
+            .union(COMMAND_SPECIFIC_HELP)
+            .union(SETUP_BEFORE_HELP),
+    ),
     CommandSpec::new("show", BUILTIN_MAIN),
-    CommandSpec::new("show-branch", BUILTIN),
+    CommandSpec::new(
+        "show-branch",
+        BUILTIN
+            .union(COMMAND_SPECIFIC_HELP)
+            .union(SETUP_BEFORE_HELP),
+    ),
     CommandSpec::new("show-index", BUILTIN),
     CommandSpec::new("show-ref", BUILTIN),
     CommandSpec::new("sparse-checkout", BUILTIN_MAIN),
@@ -188,7 +225,7 @@ static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     CommandSpec::new("stash", BUILTIN_MAIN),
     CommandSpec::new("status", BUILTIN_MAIN),
     CommandSpec::new("stripspace", BUILTIN),
-    CommandSpec::new("submodule", NATIVE_MAIN),
+    CommandSpec::new("submodule", NATIVE_MAIN.union(COMMAND_SPECIFIC_HELP)),
     CommandSpec::new("submodule--helper", GIT_BUILTIN_RESERVED),
     CommandSpec::new("svn", RESERVED_CORE_HELPER),
     CommandSpec::new("switch", BUILTIN_MAIN),
@@ -205,9 +242,19 @@ static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     CommandSpec::new("upload-pack", BUILTIN),
     CommandSpec::new("url-parse", GIT_BUILTIN_RESERVED),
     CommandSpec::new("var", BUILTIN),
-    CommandSpec::new("verify-commit", BUILTIN),
+    CommandSpec::new(
+        "verify-commit",
+        BUILTIN
+            .union(COMMAND_SPECIFIC_HELP)
+            .union(SETUP_BEFORE_HELP),
+    ),
     CommandSpec::new("verify-pack", BUILTIN),
-    CommandSpec::new("verify-tag", BUILTIN),
+    CommandSpec::new(
+        "verify-tag",
+        BUILTIN
+            .union(COMMAND_SPECIFIC_HELP)
+            .union(SETUP_BEFORE_HELP),
+    ),
     CommandSpec::new("version", BUILTIN_PARSEOPT),
     CommandSpec::new("web--browse", RESERVED_CORE_HELPER),
     CommandSpec::new("whatchanged", BUILTIN),
@@ -391,28 +438,11 @@ pub(crate) fn is_reserved_git_core_helper(command: &str) -> bool {
 }
 
 pub(crate) fn has_command_specific_help(command: &str) -> bool {
-    matches!(
-        command,
-        "diff-files"
-            | "diff-index"
-            | "interpret-trailers"
-            | "maintenance"
-            | "mktag"
-            | "patch-id"
-            // `replay` parses `-h` itself (run_git_replay prints the full
-            // EXPERIMENTAL usage + option list, exit 129). Once `replay` was
-            // enrolled as a builtin command, the generic `-h` short-circuit in
-            // dispatch_command would otherwise emit the bare "usage: git replay
-            // [<options>]" stub instead (t3650 "exactly one of --onto,
-            // --advance, or --revert is required" compares `replay -h` against
-            // that full usage).
-            | "replay"
-            | "shortlog"
-            | "show-branch"
-            | "submodule"
-            | "verify-commit"
-            | "verify-tag"
-    )
+    COMMAND_REGISTRY.contains_with(command, COMMAND_SPECIFIC_HELP)
+}
+
+pub(crate) fn runs_setup_before_command_help(command: &str) -> bool {
+    COMMAND_REGISTRY.contains_with(command, SETUP_BEFORE_HELP)
 }
 
 pub(crate) fn cmd_help(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
@@ -1338,9 +1368,9 @@ mod command_registry_tests {
         assert_eq!(
             COMMAND_REGISTRY.names_with(NATIVE).count(),
             if cfg!(feature = "git-compat-i18n") {
-                135
+                137
             } else {
-                134
+                136
             }
         );
         assert_eq!(COMMAND_REGISTRY.names_with(GIT_BUILTIN).count(), 149);
@@ -1378,6 +1408,45 @@ mod command_registry_tests {
                 .collect::<Vec<_>>()
                 .join(" "),
             "checkout clone config help ls-remote notes remote symbolic-ref version"
+        );
+    }
+
+    #[test]
+    fn command_specific_help_setup_is_declarative() {
+        assert_eq!(
+            COMMAND_REGISTRY
+                .names_with(COMMAND_SPECIFIC_HELP)
+                .collect::<Vec<_>>(),
+            [
+                "diff-files",
+                "diff-index",
+                "interpret-trailers",
+                "maintenance",
+                "mktag",
+                "patch-id",
+                "replay",
+                "shortlog",
+                "show-branch",
+                "submodule",
+                "verify-commit",
+                "verify-tag",
+            ]
+        );
+        assert_eq!(
+            COMMAND_REGISTRY
+                .names_with(SETUP_BEFORE_HELP)
+                .collect::<Vec<_>>(),
+            [
+                "diff-files",
+                "diff-index",
+                "interpret-trailers",
+                "maintenance",
+                "patch-id",
+                "shortlog",
+                "show-branch",
+                "verify-commit",
+                "verify-tag",
+            ]
         );
     }
 

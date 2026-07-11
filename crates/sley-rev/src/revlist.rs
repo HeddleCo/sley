@@ -218,9 +218,12 @@ fn rev_list_prio_emit<'a>(
 }
 
 /// Order a reachable commit set into the committer-date order git's traversal
-/// produces before it hands the list to `sort_in_topological_order`. Newest
-/// committer time first, ties broken by the SMALLER oid (matching git's
-/// `(commit_time, Reverse(oid))` priority during the limiting walk).
+/// produces before it hands the list to `sort_in_topological_order`.
+///
+/// Git's `commit_list_sort_by_date()` is stable: its comparator returns equal
+/// for equal timestamps, preserving the pending/ref traversal order. That
+/// input order is observable when `--graph` reverses the initial LIFO tip
+/// queue, so substituting an object-id tie-break flips equal-dated branches.
 pub fn rev_list_commit_date_input_order(records: Vec<&CommitRecord>) -> Result<Vec<&CommitRecord>> {
     let mut keyed = records
         .into_iter()
@@ -228,8 +231,10 @@ pub fn rev_list_commit_date_input_order(records: Vec<&CommitRecord>) -> Result<V
             commit_identity_timestamp_i64(&record.commit.committer).map(|ts| (ts, record))
         })
         .collect::<Result<Vec<_>>>()?;
-    // Newest first; for equal times the smaller oid first.
-    keyed.sort_by(|(ta, a), (tb, b)| tb.cmp(ta).then_with(|| a.oid.cmp(&b.oid)));
+    // `slice::sort_by` is stable, exactly matching commit_list_sort's equal-date
+    // behavior. The incoming order is deterministic (sorted ref enumeration,
+    // then parent order from commit objects).
+    keyed.sort_by(|(ta, _), (tb, _)| tb.cmp(ta));
     Ok(keyed.into_iter().map(|(_, record)| record).collect())
 }
 
@@ -754,4 +759,51 @@ pub fn commit_identity_timestamp_i64(raw: &[u8]) -> Result<i64> {
     // age filtering, and `--timestamp` output all see that epoch sentinel rather
     // than failing. Mirror that: never error, just fall back to 0.
     Ok(commit_identity_timestamp(raw).parse::<i64>().unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oid(byte: u8) -> ObjectId {
+        ObjectId::from_raw(ObjectFormat::Sha1, &[byte; 20]).expect("test oid")
+    }
+
+    fn record(id: ObjectId, parents: Vec<ObjectId>, timestamp: i64) -> CommitRecord {
+        CommitRecord {
+            oid: id,
+            parents: parents.clone(),
+            commit: Commit {
+                tree: oid(0),
+                parents,
+                author: format!("A <a@example.com> {timestamp} +0000").into_bytes(),
+                committer: format!("C <c@example.com> {timestamp} +0000").into_bytes(),
+                encoding: None,
+                message: b"subject\n".to_vec(),
+            },
+        }
+    }
+
+    #[test]
+    fn equal_date_input_order_is_stable_instead_of_oid_sorted() {
+        let high = record(oid(0xf0), Vec::new(), 100);
+        let low = record(oid(0x10), Vec::new(), 100);
+        let ordered = rev_list_commit_date_input_order(vec![&high, &low]).expect("order");
+        assert_eq!(
+            ordered.iter().map(|item| item.oid).collect::<Vec<_>>(),
+            vec![high.oid, low.oid]
+        );
+    }
+
+    #[test]
+    fn graph_order_preserves_equal_date_tip_enumeration() {
+        let root = record(oid(1), Vec::new(), 50);
+        let first_tip = record(oid(0xf0), vec![root.oid], 100);
+        let second_tip = record(oid(0x10), vec![root.oid], 100);
+        let ordered = rev_list_topo_order(vec![&first_tip, &second_tip, &root]).expect("topo");
+        assert_eq!(
+            ordered.iter().map(|item| item.oid).collect::<Vec<_>>(),
+            vec![first_tip.oid, second_tip.oid, root.oid]
+        );
+    }
 }

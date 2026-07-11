@@ -844,17 +844,30 @@ parse_tap_cells() {
             gsub(/[\t\r]/, " ", description)
             printf "%s\t%s\t%s\t%s\t%s\n", cell, status, raw, directive, description
         }
-        /^ok [0-9]+([[:space:]]+-|[[:space:]]+#|$)/ {
-            text = $0
-            sub(/^ok[[:space:]]+/, "", text)
-            emit("ok", text)
-            next
-        }
-        /^not ok [0-9]+([[:space:]]+-|[[:space:]]+#|$)/ {
-            text = $0
-            sub(/^not ok[[:space:]]+/, "", text)
-            emit("not_ok", text)
-            next
+        {
+            tap = $0
+            # A command under test may finish a raw pkt-line stream with a
+            # control frame and no newline. Upstream then writes its TAP result
+            # to the same captured stdout, producing e.g. `0000ok 60 - ...`.
+            # Strip only complete pkt-line control frames immediately followed
+            # by a syntactically valid TAP result; arbitrary diagnostics that
+            # merely begin with hexadecimal text remain untouched.
+            if (tap ~ /^(000[012])+(ok|not ok) [0-9]+([[:space:]]+-|[[:space:]]+#|$)/) {
+                while (tap ~ /^000[012]/)
+                    tap = substr(tap, 5)
+            }
+            if (tap ~ /^ok [0-9]+([[:space:]]+-|[[:space:]]+#|$)/) {
+                text = tap
+                sub(/^ok[[:space:]]+/, "", text)
+                emit("ok", text)
+                next
+            }
+            if (tap ~ /^not ok [0-9]+([[:space:]]+-|[[:space:]]+#|$)/) {
+                text = tap
+                sub(/^not ok[[:space:]]+/, "", text)
+                emit("not_ok", text)
+                next
+            }
         }
         /^1\.\.0([[:space:]]+#[[:space:]]*SKIP|[[:space:]]*$)/ {
             description = $0
