@@ -1349,11 +1349,12 @@ impl FileRefStore {
                 reflogs: Vec::new(),
             });
         }
-        let mut names = self
-            .list_reflog_names()?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        names.extend(refs.iter().map(|reference| reference.name.clone()));
+        // The files backend exposes the complete materialized reflog namespace
+        // by walking `logs/`. Do not probe every live ref for a corresponding
+        // log: large repositories commonly have thousands of refs but only a
+        // handful of reflogs, and one failed filesystem lookup per ref made
+        // migration time scale with refs twice.
+        let names = self.list_reflog_names()?;
         let mut reflogs = Vec::new();
         for name in names {
             let entries = self.read_reflog(&name)?;
@@ -8766,6 +8767,37 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             1
         );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn files_snapshot_exports_materialized_logs_without_probing_every_ref() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("valid oid");
+        let refs = vec![Ref {
+            name: "refs/heads/no-log".into(),
+            target: RefTarget::Direct(oid),
+        }];
+        store
+            .import_snapshot(&refs, &[], false)
+            .expect("import ref without reflog");
+        let deleted_log = vec![reflog_entry(&oid, 1, "deleted ref")];
+        store
+            .write_reflog("refs/heads/deleted", &deleted_log)
+            .expect("write materialized reflog without live ref");
+
+        assert_eq!(
+            store.export_snapshot(true).expect("export files snapshot"),
+            RefSnapshot {
+                refs,
+                reflogs: vec![("refs/heads/deleted".into(), deleted_log)],
+            }
+        );
+        fs::remove_dir_all(git_dir).expect("remove test repository");
     }
 
     #[test]
