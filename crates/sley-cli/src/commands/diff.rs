@@ -259,6 +259,164 @@ struct IndexBlobSpec {
     oid: ObjectId,
 }
 
+#[derive(Clone)]
+struct DirectBlobSpec {
+    path: Vec<u8>,
+    mode: u32,
+    oid: ObjectId,
+    content: Vec<u8>,
+    anonymous: bool,
+    file: bool,
+}
+
+fn diff_direct_blob_pair(
+    cwd: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    args: &[String],
+) -> Result<Option<(DirectBlobSpec, DirectBlobSpec)>> {
+    let pair = if args.len() == 1 {
+        let Some((left, right)) = args[0].split_once("..") else {
+            return Ok(None);
+        };
+        if left.is_empty() || right.is_empty() {
+            return Ok(None);
+        }
+        let Some(left) = resolve_direct_blob_source(cwd, git_dir, format, db, left, false)? else {
+            return Ok(None);
+        };
+        let Some(right) = resolve_direct_blob_source(cwd, git_dir, format, db, right, false)?
+        else {
+            return Ok(None);
+        };
+        (left, right)
+    } else if args.len() == 2 {
+        let Some(left) = resolve_direct_blob_source(cwd, git_dir, format, db, &args[0], true)?
+        else {
+            return Ok(None);
+        };
+        let Some(right) = resolve_direct_blob_source(cwd, git_dir, format, db, &args[1], true)?
+        else {
+            return Ok(None);
+        };
+        if left.file && right.file {
+            return Ok(None);
+        }
+        (left, right)
+    } else {
+        return Ok(None);
+    };
+
+    let (mut left, mut right) = pair;
+    if left.anonymous && right.file {
+        left.path.clone_from(&right.path);
+    } else if right.anonymous && left.file {
+        right.path.clone_from(&left.path);
+    }
+    Ok(Some((left, right)))
+}
+
+fn resolve_direct_blob_source(
+    cwd: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    spec: &str,
+    allow_file: bool,
+) -> Result<Option<DirectBlobSpec>> {
+    if let Some((revision, path)) = spec.split_once(':')
+        && !revision.is_empty()
+        && !path.is_empty()
+        && let Ok(entry) = sley_rev::resolve_rev_path_entry(git_dir, format, db, revision, path)
+        && entry.object_type == ObjectType::Blob
+    {
+        let object = db.read_object(&entry.oid)?;
+        return Ok(Some(DirectBlobSpec {
+            path: path.as_bytes().to_vec(),
+            mode: entry.mode.unwrap_or(0o100644),
+            oid: entry.oid,
+            content: object.body.clone(),
+            anonymous: false,
+            file: false,
+        }));
+    }
+
+    if let Ok(oid) = sley_rev::RevisionResolver::new(git_dir, format, db).resolve(spec)
+        && let Ok(object) = db.read_object(&oid)
+        && object.object_type == ObjectType::Blob
+    {
+        return Ok(Some(DirectBlobSpec {
+            path: spec.as_bytes().to_vec(),
+            mode: 0o100644,
+            oid,
+            content: object.body.clone(),
+            anonymous: true,
+            file: false,
+        }));
+    }
+
+    if !allow_file {
+        return Ok(None);
+    }
+    let absolute = cwd.join(spec);
+    if !absolute.is_file() {
+        return Ok(None);
+    }
+    let content = fs::read(&absolute)?;
+    let oid = sley_core::object_id_for_bytes(format, "blob", &content)?;
+    let mode = direct_blob_file_mode(git_dir, format, spec.as_bytes(), &absolute)?;
+    Ok(Some(DirectBlobSpec {
+        path: spec.as_bytes().to_vec(),
+        mode,
+        oid,
+        content,
+        anonymous: false,
+        file: true,
+    }))
+}
+
+fn direct_blob_file_mode(
+    git_dir: &Path,
+    format: ObjectFormat,
+    path: &[u8],
+    absolute: &Path,
+) -> Result<u32> {
+    let mode = sley_worktree::read_repository_index(git_dir, format)?
+        .and_then(|index| {
+            index
+                .entries
+                .into_iter()
+                .find(|entry| {
+                    entry.stage() == sley_index::Stage::Normal && entry.path.as_bytes() == path
+                })
+                .map(|entry| entry.mode)
+        })
+        .unwrap_or_else(|| direct_blob_filesystem_mode(absolute));
+    Ok(mode)
+}
+
+#[cfg(unix)]
+fn direct_blob_filesystem_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| {
+            if metadata.permissions().mode() & 0o111 == 0 {
+                0o100644
+            } else {
+                0o100755
+            }
+        })
+        .unwrap_or(0o100644)
+}
+
+#[cfg(not(unix))]
+fn direct_blob_filesystem_mode(_path: &Path) -> u32 {
+    0o100644
+}
+
 fn diff_index_blob_pair(
     git_dir: &Path,
     format: ObjectFormat,
@@ -1373,6 +1531,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
     let db = repo.repository().objects_mut();
     if !head
         && !merge_base
+        && !reverse
         && explicit_paths.is_empty()
         && let Some((left, right)) = diff_index_blob_pair(&git_dir, format, &path_args)?
     {
@@ -1512,6 +1671,67 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
             return Err(GitError::Exit(128));
         }
         *opts = base;
+    }
+    let direct_blob_patch = !head
+        && !cached
+        && !merge_base
+        && explicit_paths.is_empty()
+        && !quiet
+        && !color_always
+        && !patch_binary
+        && !raw
+        && !name_status
+        && !name_only
+        && !stat
+        && !numstat
+        && !shortstat
+        && !summary
+        && !check
+        && dirstat.is_none()
+        && !no_patch
+        && output.is_none()
+        && line_prefix.is_none()
+        && interhunk.unwrap_or(0) == 0
+        && color_moved.is_none()
+        && word_diff_mode.is_none()
+        && anchored.is_empty()
+        && ws_ignore.is_empty()
+        && ignore_regexes.is_empty()
+        && !ignore_blank_lines;
+    if direct_blob_patch
+        && let Some((left, right)) = diff_direct_blob_pair(&cwd, &git_dir, format, &db, &path_args)?
+    {
+        let mut stdout = io::stdout().lock();
+        sley_diff_merge::porcelain::render_blob_patch(
+            &mut stdout,
+            sley_diff_merge::porcelain::BlobDiffSide {
+                oid: left.oid,
+                mode: left.mode,
+                path: &left.path,
+                content: &left.content,
+            },
+            sley_diff_merge::porcelain::BlobDiffSide {
+                oid: right.oid,
+                mode: right.mode,
+                path: &right.path,
+                content: &right.content,
+            },
+            sley_diff_merge::porcelain::BlobPatchOptions {
+                object_format: format,
+                full_index: patch_full_index,
+                abbrev: patch_abbrev.unwrap_or(7),
+                src_prefix: src_prefix.as_bytes(),
+                dst_prefix: dst_prefix.as_bytes(),
+                context: patch_context,
+                algorithm: diff_algorithm,
+                indent_heuristic,
+            },
+        )
+        .map_err(|error| GitError::Io(error.to_string()))?;
+        if exit_code && (left.oid != right.oid || left.mode != right.mode) {
+            return Err(GitError::Exit(1));
+        }
+        return Ok(());
     }
     // Pull any leading `<rev>` / `<rev> <rev>` / `<rev>..<rev>` / `<rev>...<rev>`
     // out of the positional arguments; the remainder are pathspecs. Without this,

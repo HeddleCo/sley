@@ -5,7 +5,8 @@
 //! inject terminal display-width measurement while the engine retains Git's
 //! byte-level path quoting rules.
 
-use crate::{NameStatus, NameStatusEntry};
+use crate::render::{HunkRenderOptions, render_hunks};
+use crate::{DiffAlgorithm, NameStatus, NameStatusEntry};
 use sley_core::{ObjectFormat, ObjectId};
 use std::error::Error;
 use std::fmt;
@@ -159,6 +160,88 @@ impl From<io::Error> for RenderError {
 pub struct RenderOutcome {
     /// Number of logical output records written.
     pub records_written: usize,
+}
+
+/// One already-resolved side of a direct blob comparison.
+#[derive(Debug, Clone, Copy)]
+pub struct BlobDiffSide<'a> {
+    pub oid: ObjectId,
+    pub mode: u32,
+    pub path: &'a [u8],
+    pub content: &'a [u8],
+}
+
+/// Repository-independent rendering controls for a direct blob patch.
+#[derive(Debug, Clone, Copy)]
+pub struct BlobPatchOptions<'a> {
+    pub object_format: ObjectFormat,
+    pub full_index: bool,
+    pub abbrev: usize,
+    pub src_prefix: &'a [u8],
+    pub dst_prefix: &'a [u8],
+    pub context: usize,
+    pub algorithm: DiffAlgorithm,
+    pub indent_heuristic: bool,
+}
+
+/// Render the complete patch for two resolved blobs, including Git's per-file
+/// metadata header and the shared unified-diff hunk body.
+pub fn render_blob_patch(
+    out: &mut dyn Write,
+    old: BlobDiffSide<'_>,
+    new: BlobDiffSide<'_>,
+    options: BlobPatchOptions<'_>,
+) -> Result<RenderOutcome, RenderError> {
+    if old.oid == new.oid && old.mode == new.mode {
+        return Ok(RenderOutcome::default());
+    }
+
+    let old_name = prefixed_quoted_path(options.src_prefix, old.path);
+    let new_name = prefixed_quoted_path(options.dst_prefix, new.path);
+    writeln!(out, "diff --git {old_name} {new_name}")?;
+    if old.mode != new.mode {
+        writeln!(out, "old mode {:06o}", old.mode)?;
+        writeln!(out, "new mode {:06o}", new.mode)?;
+    }
+    if old.oid == new.oid {
+        return Ok(RenderOutcome { records_written: 1 });
+    }
+    let width = if options.full_index {
+        options.object_format.hex_len()
+    } else {
+        options.abbrev.min(options.object_format.hex_len())
+    };
+    let old_hex = old.oid.to_hex();
+    let new_hex = new.oid.to_hex();
+    write!(out, "index {}..{}", &old_hex[..width], &new_hex[..width])?;
+    if old.mode == new.mode {
+        write!(out, " {:06o}", old.mode)?;
+    }
+    writeln!(out)?;
+    writeln!(out, "--- {old_name}")?;
+    writeln!(out, "+++ {new_name}")?;
+
+    let mut body = Vec::new();
+    render_hunks(
+        &mut body,
+        Some(old.content),
+        Some(new.content),
+        &mut HunkRenderOptions {
+            context: options.context,
+            algorithm: options.algorithm,
+            indent_heuristic: options.indent_heuristic,
+            ..HunkRenderOptions::default()
+        },
+    );
+    out.write_all(&body)?;
+    Ok(RenderOutcome { records_written: 1 })
+}
+
+fn prefixed_quoted_path(prefix: &[u8], path: &[u8]) -> String {
+    let mut full = Vec::with_capacity(prefix.len() + path.len());
+    full.extend_from_slice(prefix);
+    full.extend_from_slice(path);
+    quote_path(&full, true)
 }
 
 /// Options for one `--raw` record.
@@ -870,6 +953,80 @@ mod tests {
                 ":100644 100644 1111111... 2222222... M\tsrc/lib.rs\n"
             );
         }
+    }
+
+    #[test]
+    fn direct_blob_patch_owns_metadata_and_hunk_rendering() {
+        let format = ObjectFormat::Sha1;
+        let old_oid =
+            sley_core::object_id_for_bytes(format, "blob", b"one\n").expect("old blob id");
+        let new_oid =
+            sley_core::object_id_for_bytes(format, "blob", b"two\n").expect("new blob id");
+        let mut output = Vec::new();
+        render_blob_patch(
+            &mut output,
+            BlobDiffSide {
+                oid: old_oid,
+                mode: 0o100644,
+                path: b"one",
+                content: b"one\n",
+            },
+            BlobDiffSide {
+                oid: new_oid,
+                mode: 0o100755,
+                path: b"two",
+                content: b"two\n",
+            },
+            BlobPatchOptions {
+                object_format: format,
+                full_index: true,
+                abbrev: 7,
+                src_prefix: b"a/",
+                dst_prefix: b"b/",
+                context: 3,
+                algorithm: DiffAlgorithm::Myers,
+                indent_heuristic: true,
+            },
+        )
+        .expect("blob patch rendering");
+        assert_eq!(
+            String::from_utf8(output).expect("utf8 patch"),
+            format!(
+                "diff --git a/one b/two\nold mode 100644\nnew mode 100755\nindex {old_oid}..{new_oid}\n--- a/one\n+++ b/two\n@@ -1 +1 @@\n-one\n+two\n"
+            )
+        );
+
+        let mut mode_only = Vec::new();
+        render_blob_patch(
+            &mut mode_only,
+            BlobDiffSide {
+                oid: old_oid,
+                mode: 0o100644,
+                path: b"script",
+                content: b"one\n",
+            },
+            BlobDiffSide {
+                oid: old_oid,
+                mode: 0o100755,
+                path: b"script",
+                content: b"one\n",
+            },
+            BlobPatchOptions {
+                object_format: format,
+                full_index: true,
+                abbrev: 7,
+                src_prefix: b"a/",
+                dst_prefix: b"b/",
+                context: 3,
+                algorithm: DiffAlgorithm::Myers,
+                indent_heuristic: true,
+            },
+        )
+        .expect("mode-only blob patch rendering");
+        assert_eq!(
+            mode_only,
+            b"diff --git a/script b/script\nold mode 100644\nnew mode 100755\n"
+        );
     }
 
     #[test]

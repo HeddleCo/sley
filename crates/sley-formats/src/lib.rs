@@ -3207,7 +3207,7 @@ impl RepositoryBootstrap {
                     })
                     .is_some();
             fs::write(
-                config_path,
+                &config_path,
                 build_init_config(
                     object_format,
                     options.bare,
@@ -3230,6 +3230,19 @@ impl RepositoryBootstrap {
             )?;
         }
 
+        // A command-line/reinit sharing mode overrides a template value and is
+        // persisted even when the repository config already existed.
+        if let Some(shared) = options.shared_repository.as_deref() {
+            upsert_shared_repository_config(&config_path, shared)?;
+        }
+        let effective_shared = GitConfig::read(&config_path).ok().and_then(|config| {
+            config
+                .get("core", None, "sharedRepository")
+                .map(str::to_owned)
+        });
+        apply_shared_file_mode(&head_path, effective_shared.as_deref())?;
+        apply_shared_file_mode(&config_path, effective_shared.as_deref())?;
+
         if write_git_link {
             let link_target = gitdir_link_path(&worktree, &git_dir)?;
             // Write through `git_link`: identical to `.git` in the common case, but
@@ -3248,6 +3261,38 @@ impl RepositoryBootstrap {
             reinitialized,
         })
     }
+}
+
+fn upsert_shared_repository_config(path: &Path, value: &str) -> Result<()> {
+    let mut config = GitConfig::read(path)?;
+    let canonical = shared_repository_config_value(value)
+        .ok_or_else(|| GitError::Command(format!("unknown sharing mode '{value}'")))?;
+    let section =
+        config.sections.iter_mut().rev().find(|section| {
+            section.name.eq_ignore_ascii_case("core") && section.subsection.is_none()
+        });
+    if let Some(section) = section {
+        if let Some(entry) = section
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.key.eq_ignore_ascii_case("sharedRepository"))
+        {
+            entry.value = Some(canonical);
+        } else {
+            section
+                .entries
+                .push(ConfigEntry::new("sharedRepository", Some(canonical)));
+        }
+    } else {
+        config.sections.push(ConfigSection::new(
+            "core",
+            None,
+            vec![ConfigEntry::new("sharedRepository", Some(canonical))],
+        ));
+    }
+    fs::write(path, config.to_canonical_bytes())?;
+    Ok(())
 }
 
 /// Read the object and ref storage formats recorded in an existing repository's config.
@@ -3659,6 +3704,33 @@ fn apply_shared_file_mode(path: &Path, shared_repository: Option<&str>) -> Resul
         let _ = (path, shared_repository);
     }
     Ok(())
+}
+
+/// Adjust an existing file using Git's `core.sharedRepository` permission
+/// rules. Engine crates call this after atomically publishing repository files.
+pub fn adjust_shared_repository_file(path: &Path, shared_repository: Option<&str>) -> Result<()> {
+    apply_shared_file_mode(path, shared_repository)
+}
+
+/// Validate and canonicalize a `core.sharedRepository` value as `git init`
+/// does. `Ok(None)` denotes the normal umask-controlled mode.
+pub fn canonical_shared_repository_value(value: &str) -> Result<Option<String>> {
+    if matches!(value, "false" | "no" | "off" | "0" | "umask") {
+        return Ok(None);
+    }
+    if let Some(value) = shared_repository_config_value(value) {
+        if value.starts_with('0') {
+            let mode = u32::from_str_radix(&value, 8)
+                .map_err(|_| GitError::Command(format!("unknown sharing mode '{value}'")))?;
+            if mode & 0o600 != 0o600 {
+                return Err(GitError::Command(
+                    "permission denied while setting up shared repository".into(),
+                ));
+            }
+        }
+        return Ok(Some(value));
+    }
+    Err(GitError::Command(format!("unknown sharing mode '{value}'")))
 }
 
 /// Canonical `core.sharedRepository` value written at init, matching git's
@@ -4988,6 +5060,54 @@ mod tests {
         let config = GitConfig::read(layout.git_dir.join("config")).expect("read config");
         assert_eq!(config.get("core", None, "sharedRepository"), Some("1"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shared_repository_values_are_canonical_and_owner_safe() {
+        assert_eq!(
+            canonical_shared_repository_value("group").expect("group is valid"),
+            Some("1".into())
+        );
+        assert_eq!(
+            canonical_shared_repository_value("all").expect("all is valid"),
+            Some("2".into())
+        );
+        assert_eq!(
+            canonical_shared_repository_value("0660").expect("owner rw mode is valid"),
+            Some("0660".into())
+        );
+        assert_eq!(
+            canonical_shared_repository_value("umask").expect("umask is valid"),
+            None
+        );
+        assert!(canonical_shared_repository_value("0400").is_err());
+        assert!(canonical_shared_repository_value("mystery").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_repository_file_adjustment_preserves_read_only_intent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_temp_dir("shared-file-mode");
+        fs::create_dir_all(&root).expect("create temp root");
+        let path = root.join("refs");
+        fs::write(&path, b"refs\n").expect("write refs");
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).expect("set read-only mode");
+        adjust_shared_repository_file(&path, Some("0660")).expect("adjust read-only mode");
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+            0o440
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("set writable mode");
+        adjust_shared_repository_file(&path, Some("0660")).expect("adjust writable mode");
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+            0o660
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     fn oid(hex: &str) -> ObjectId {

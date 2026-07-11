@@ -379,6 +379,10 @@ pub(crate) fn cmd_init(
         bare,
         init_config_git_dir.as_deref(),
     )?;
+    let shared_repository = match shared_repository {
+        Some(value) => sley::plumbing::sley_formats::canonical_shared_repository_value(&value)?,
+        None => None,
+    };
     let template_dir = resolve_init_template_dir(
         template,
         template_config,
@@ -631,7 +635,11 @@ fn resolve_init_shared_repository(
         return Ok(value);
     }
     if bare {
-        return Ok(None);
+        let existing_repository =
+            config_git_dir.is_some_and(|git_dir| git_dir.join("config").is_file());
+        if !existing_repository {
+            return Ok(None);
+        }
     }
     init_config_value("core.sharedRepository", global_config, config_git_dir)
 }

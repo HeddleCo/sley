@@ -1334,6 +1334,13 @@ pub(crate) fn update_server_info_at(git_dir: &Path, args: &[String]) -> Result<(
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let shared_repository = sley_config::GitConfig::read(common_git_dir.join("config"))
+        .ok()
+        .and_then(|config| {
+            config
+                .get("core", None, "sharedRepository")
+                .map(str::to_owned)
+        });
 
     let info_dir = common_git_dir.join("info");
     fs::create_dir_all(&info_dir)?;
@@ -1341,6 +1348,7 @@ pub(crate) fn update_server_info_at(git_dir: &Path, args: &[String]) -> Result<(
         &info_dir.join("refs"),
         &update_server_info_refs(&store, &db, format)?,
         force,
+        shared_repository.as_deref(),
     )?;
 
     let objects_info_dir = repository_objects_dir(&common_git_dir).join("info");
@@ -1352,6 +1360,7 @@ pub(crate) fn update_server_info_at(git_dir: &Path, args: &[String]) -> Result<(
             format,
         )?,
         force,
+        shared_repository.as_deref(),
     )?;
     Ok(())
 }
@@ -1392,7 +1401,12 @@ fn setup_update_server_info_options(args: &[String]) -> Result<bool> {
     Ok(parsed.last_bool("force", false))
 }
 
-fn update_server_info_file(path: &Path, content: &[u8], force: bool) -> Result<()> {
+fn update_server_info_file(
+    path: &Path,
+    content: &[u8],
+    force: bool,
+    shared_repository: Option<&str>,
+) -> Result<()> {
     if !force
         && let Ok(existing) = fs::read(path)
         && existing == content
@@ -1400,6 +1414,7 @@ fn update_server_info_file(path: &Path, content: &[u8], force: bool) -> Result<(
         return Ok(());
     }
     fs::write(path, content)?;
+    sley::plumbing::sley_formats::adjust_shared_repository_file(path, shared_repository)?;
     Ok(())
 }
 
