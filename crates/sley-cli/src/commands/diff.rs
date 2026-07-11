@@ -1231,6 +1231,27 @@ fn diff_arg_looks_outside_worktree(path: &str) -> bool {
         .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
+fn resolve_diff_interhunk_context(
+    cli_value: Option<usize>,
+    config: Option<&sley_config::GitConfig>,
+) -> Result<usize> {
+    let config_value = config.and_then(|config| config.get("diff", None, "interhunkcontext"));
+    match sley_diff_merge::render::resolve_interhunk_context(cli_value, config_value) {
+        Ok(value) => Ok(value),
+        Err(sley_diff_merge::render::InterHunkContextError::InvalidNumericValue) => {
+            let value = config_value.unwrap_or_default();
+            eprintln!(
+                "fatal: bad numeric config value '{value}' for 'diff.interhunkcontext': invalid unit"
+            );
+            Err(GitError::Exit(128))
+        }
+        Err(sley_diff_merge::render::InterHunkContextError::NegativeValue) => {
+            eprintln!("fatal: bad config variable 'diff.interhunkcontext'");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
 pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let lazy_fetch = cli_session.lazy_fetch();
     let sley_rev::diff_options::DiffOptions {
@@ -1365,6 +1386,10 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
     // every repository-backed mode must reuse one session-scoped facade.
     let repository = RepositoryContext::from_session(cli_session);
     let outside_repository = repository.is_err();
+    let interhunk = resolve_diff_interhunk_context(
+        interhunk,
+        repository.as_ref().ok().map(|repo| repo.config()),
+    )?;
     if !find_object_values.is_empty() && outside_repository {
         eprintln!("fatal: --find-object requires a git repository");
         return Err(GitError::Exit(128));
@@ -1423,7 +1448,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                 cli_src_prefix: cli_src_prefix.as_deref(),
                 cli_dst_prefix: cli_dst_prefix.as_deref(),
                 quiet,
-                interhunk: interhunk.unwrap_or(0),
+                interhunk,
                 ws_ignore,
                 diff_algorithm,
                 ignore_blank_lines,
@@ -1691,7 +1716,6 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         && !no_patch
         && output.is_none()
         && line_prefix.is_none()
-        && interhunk.unwrap_or(0) == 0
         && color_moved.is_none()
         && word_diff_mode.is_none()
         && anchored.is_empty()
@@ -1723,6 +1747,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                 src_prefix: src_prefix.as_bytes(),
                 dst_prefix: dst_prefix.as_bytes(),
                 context: patch_context,
+                interhunk,
                 algorithm: diff_algorithm,
                 indent_heuristic,
             },
@@ -2131,7 +2156,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                 worktree_root.as_deref(),
                 use_worktree_new,
                 worktree_clean.as_ref(),
-                interhunk.unwrap_or(0),
+                interhunk,
                 patch_context,
                 ws_ignore,
                 ignore_blank_lines,
@@ -2509,7 +2534,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                         submodule_dirt: Some(&dirty_submodules),
                         ws_error,
                         color_moved,
-                        interhunk: interhunk.unwrap_or(0),
+                        interhunk,
                         ws_ignore,
                         diff_algorithm,
                         ignore_blank_lines,

@@ -1794,6 +1794,65 @@ fn diff_patch_hunk_ranges_for_single_line_changes_match_upstream_git() {
 }
 
 #[test]
+fn diff_interhunk_context_config_matches_upstream_git() {
+    let root = unique_temp_dir("diff-interhunk-context-config");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("file"), b"A\n1\nB\n").expect("write base fixture");
+        git(&root, &["add", "file"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+        fs::write(root.join("file"), b"X\n1\nY\n").expect("write changed fixture");
+
+        git(&root, &["config", "diff.interHunkContext", "1"]);
+        for args in [
+            vec!["diff", "-U0", "file"],
+            vec!["diff", "-U0", "--inter-hunk-context=0", "file"],
+        ] {
+            assert_eq!(
+                sley(&root, &args),
+                git(&root, &args),
+                "sley output differed for {args:?}"
+            );
+        }
+
+        let old_oid = utf8_trimmed(git(&root, &["rev-parse", "HEAD:file"]));
+        let new_oid = utf8_trimmed(git(&root, &["hash-object", "-w", "file"]));
+        let blob_args = ["diff", "-U0", old_oid.as_str(), new_oid.as_str()];
+        assert_eq!(
+            sley(&root, &blob_args),
+            git(&root, &blob_args),
+            "configured inter-hunk context differed for direct blobs"
+        );
+
+        for invalid in ["invalid", "-1"] {
+            git(&root, &["config", "diff.interHunkContext", invalid]);
+            let expected = run_status(sley_testkit::oracle_git(), &root, &["diff"]);
+            let actual = run_status(sley_testkit::sley_bin!(), &root, &["diff"]);
+            assert_eq!(actual.0, expected.0, "exit code differed for {invalid:?}");
+            assert!(
+                String::from_utf8_lossy(&actual.2).contains("diff.interhunkcontext"),
+                "missing config name in stderr: {}",
+                String::from_utf8_lossy(&actual.2)
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn diff_patch_mode_changes_match_upstream_git() {
     let root = unique_temp_dir("diff-patch-mode-changes");
     fs::create_dir_all(&root).expect("create temp repo");

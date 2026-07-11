@@ -31,12 +31,54 @@ use crate::line_diff::{
     DiffAlgorithm, DiffLine, DiffOp, WsIgnore, line_is_blank, myers_diff_lines_ws,
     patience_diff_lines_anchored, split_lines,
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, error::Error, fmt};
 
 /// git's default hunk context (`-U3`).
 pub const DEFAULT_CONTEXT: usize = 3;
 const FUNCTION_CONTEXT_FLAG: usize = 1usize << (usize::BITS - 1);
 const CONTEXT_VALUE_MASK: usize = !FUNCTION_CONTEXT_FLAG;
+
+/// Why a configured `diff.interHunkContext` value could not be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterHunkContextError {
+    /// The value is not a Git integer, including an overflowing unit suffix.
+    InvalidNumericValue,
+    /// Inter-hunk context cannot be negative.
+    NegativeValue,
+}
+
+impl fmt::Display for InterHunkContextError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidNumericValue => f.write_str("invalid inter-hunk context integer"),
+            Self::NegativeValue => f.write_str("inter-hunk context cannot be negative"),
+        }
+    }
+}
+
+impl Error for InterHunkContextError {}
+
+/// Resolve CLI and configured inter-hunk context with Git's precedence.
+///
+/// Configuration is validated even when a CLI value is present because Git
+/// loads and validates `diff.interHunkContext` before parsing command options.
+pub fn resolve_interhunk_context(
+    cli_value: Option<usize>,
+    config_value: Option<&str>,
+) -> Result<usize, InterHunkContextError> {
+    let configured = match config_value {
+        Some(value) => {
+            let parsed = sley_config::parse_config_int(value)
+                .ok_or(InterHunkContextError::InvalidNumericValue)?;
+            if parsed < 0 {
+                return Err(InterHunkContextError::NegativeValue);
+            }
+            Some(usize::try_from(parsed).map_err(|_| InterHunkContextError::InvalidNumericValue)?)
+        }
+        None => None,
+    };
+    Ok(cli_value.or(configured).unwrap_or(0))
+}
 
 /// Encode `-W` / `--function-context` into the context field without changing
 /// the option shape used by the existing renderer call sites.
@@ -3267,6 +3309,44 @@ mod tests {
     #[test]
     fn identical_content_renders_nothing() {
         assert!(render_plain(Some(b"a\nb\n"), Some(b"a\nb\n")).is_empty());
+    }
+
+    #[test]
+    fn interhunk_context_resolution_validates_config_before_cli_precedence() {
+        assert_eq!(resolve_interhunk_context(None, None), Ok(0));
+        assert_eq!(resolve_interhunk_context(None, Some("2k")), Ok(2048));
+        assert_eq!(resolve_interhunk_context(Some(3), Some("2")), Ok(3));
+        assert_eq!(
+            resolve_interhunk_context(Some(3), Some("invalid")),
+            Err(InterHunkContextError::InvalidNumericValue)
+        );
+        assert_eq!(
+            resolve_interhunk_context(None, Some("-1")),
+            Err(InterHunkContextError::NegativeValue)
+        );
+    }
+
+    #[test]
+    fn interhunk_context_merges_complete_byte_rendering() {
+        let old = b"A\n1\nB\n";
+        let new = b"X\n1\nY\n";
+
+        let mut split = Vec::new();
+        let mut split_options = HunkRenderOptions {
+            context: 0,
+            ..Default::default()
+        };
+        render_hunks(&mut split, Some(old), Some(new), &mut split_options);
+        assert_eq!(split, b"@@ -1 +1 @@\n-A\n+X\n@@ -3 +3 @@\n-B\n+Y\n");
+
+        let mut merged = Vec::new();
+        let mut merged_options = HunkRenderOptions {
+            context: 0,
+            interhunk: 1,
+            ..Default::default()
+        };
+        render_hunks(&mut merged, Some(old), Some(new), &mut merged_options);
+        assert_eq!(merged, b"@@ -1,3 +1,3 @@\n-A\n+X\n 1\n-B\n+Y\n");
     }
 
     #[test]

@@ -180,6 +180,7 @@ pub struct BlobPatchOptions<'a> {
     pub src_prefix: &'a [u8],
     pub dst_prefix: &'a [u8],
     pub context: usize,
+    pub interhunk: usize,
     pub algorithm: DiffAlgorithm,
     pub indent_heuristic: bool,
 }
@@ -228,6 +229,7 @@ pub fn render_blob_patch(
         Some(new.content),
         &mut HunkRenderOptions {
             context: options.context,
+            interhunk: options.interhunk,
             algorithm: options.algorithm,
             indent_heuristic: options.indent_heuristic,
             ..HunkRenderOptions::default()
@@ -984,6 +986,7 @@ mod tests {
                 src_prefix: b"a/",
                 dst_prefix: b"b/",
                 context: 3,
+                interhunk: 0,
                 algorithm: DiffAlgorithm::Myers,
                 indent_heuristic: true,
             },
@@ -1018,6 +1021,7 @@ mod tests {
                 src_prefix: b"a/",
                 dst_prefix: b"b/",
                 context: 3,
+                interhunk: 0,
                 algorithm: DiffAlgorithm::Myers,
                 indent_heuristic: true,
             },
