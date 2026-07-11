@@ -19,6 +19,7 @@ use sley_grep::{
 use sley_pathspec::{parse_normalized_pathspec_element, pathspec_attrs_match_with};
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 /// Parsed command-line options for `git grep`.
 struct GrepOptions {
@@ -1812,8 +1813,31 @@ fn grep_tree_level(
         None
     };
 
-    let mut any = false;
+    // `grep_tree()` collects the object ids selected by the pathspec before it
+    // opens any blob. In a partial clone that lets the promisor machinery send
+    // one request containing every missing blob instead of lazily fetching one
+    // object per entry. Do this independently at each repository level: a
+    // submodule has its own object database and promisor configuration.
+    let mut candidate_blobs = Vec::new();
+    let mut eligible_paths = Vec::with_capacity(flat.len());
     for (path, (mode, oid)) in &flat {
+        let eligible = if *mode != 0o160000 {
+            let full = join_prefix(prefix, path);
+            plan.pathspec
+                .matches_tree(&full, source.db, source.format, source.tree_oid)?
+                && plan.pathspec.within_max_depth(&full, plan.opts.max_depth)
+        } else {
+            false
+        };
+        if eligible {
+            candidate_blobs.push(*oid);
+        }
+        eligible_paths.push(eligible);
+    }
+    grep_prefetch_promisor_objects(source.db, &candidate_blobs, source.lazy_fetch)?;
+
+    let mut any = false;
+    for ((path, (mode, oid)), eligible) in flat.iter().zip(eligible_paths) {
         let full = join_prefix(prefix, path);
         if *mode == 0o160000 {
             if let Some(submodules) = &submodules
@@ -1852,13 +1876,7 @@ fn grep_tree_level(
             }
             continue;
         }
-        if !plan
-            .pathspec
-            .matches_tree(&full, source.db, source.format, source.tree_oid)?
-        {
-            continue;
-        }
-        if !plan.pathspec.within_max_depth(&full, plan.opts.max_depth) {
+        if !eligible {
             continue;
         }
         let display = plan.pathspec.display(&full);
@@ -1877,6 +1895,115 @@ fn grep_tree_level(
         any = any || matched;
     }
     Ok(any)
+}
+
+/// Materialize the missing subset of `oids` in one request per configured
+/// local/file promisor. This is grep's equivalent of Git's
+/// `oidset_parse_file()` + `promisor_remote_get_direct()` batch boundary.
+///
+/// The shared single-object read seam remains the fallback for transports that
+/// cannot be resolved to an in-process local upload-pack (including custom
+/// `remote.<name>.uploadpack` commands). That preserves existing behavior while
+/// making the native local/file path both truthful and substantially cheaper.
+fn grep_prefetch_promisor_objects(
+    db: &FileObjectDatabase,
+    oids: &[ObjectId],
+    lazy_fetch: bool,
+) -> Result<()> {
+    if !lazy_fetch || oids.is_empty() {
+        return Ok(());
+    }
+
+    let mut seen = HashSet::new();
+    let mut missing = Vec::new();
+    for oid in oids {
+        if seen.insert(*oid) && !db.contains(oid)? {
+            missing.push(*oid);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let objects_dir = db.objects_dir();
+    let Some(git_dir) = (objects_dir.file_name() == Some(std::ffi::OsStr::new("objects")))
+        .then(|| objects_dir.parent().map(Path::to_path_buf))
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let Ok(config) = read_repo_config(&git_dir) else {
+        return Ok(());
+    };
+    let resolution_cwd =
+        sley_worktree::worktree_root_for_git_dir(&git_dir)?.unwrap_or_else(|| git_dir.clone());
+
+    for remote_name in promisor_remote_names(&config) {
+        if missing.is_empty() {
+            break;
+        }
+        // A configured upload-pack is an arbitrary shell protocol. The shared
+        // single-object seam owns that compatibility fallback; never invoke it
+        // speculatively here or borrow an installed Git executable.
+        if config
+            .get("remote", Some(&remote_name), "uploadpack")
+            .is_some()
+        {
+            continue;
+        }
+        let Some(url) = config.get("remote", Some(&remote_name), "url") else {
+            continue;
+        };
+        let resolution = sley_remote::RemoteResolutionContext {
+            cwd: &resolution_cwd,
+            local_git_dir: Some(&git_dir),
+            config: Some(&config),
+        };
+        let Ok(remote_git_dir) = sley_remote::resolve_local_remote_git_dir(resolution, url) else {
+            continue;
+        };
+        let filter = config
+            .get("remote", Some(&remote_name), "partialclonefilter")
+            .and_then(sley_remote::pack_filter_from_spec)
+            .or(Some(sley_odb::PackObjectFilter::BlobNone));
+        if sley_remote::install_fetch_pack_via_local_upload_pack(
+            &git_dir,
+            &remote_git_dir,
+            db.object_format(),
+            missing.clone(),
+            None,
+            true,
+            false,
+            filter,
+            None,
+            false,
+            None,
+        )
+        .is_err()
+        {
+            continue;
+        }
+
+        db.refresh_read_cache();
+        let before = missing.len();
+        let mut still_missing = Vec::with_capacity(before);
+        for oid in missing {
+            if !db.contains(&oid)? {
+                still_missing.push(oid);
+            }
+        }
+        missing = still_missing;
+        let hydrated = before - missing.len();
+        if hydrated > 0 {
+            // Upstream records the batch cardinality at the caller and the
+            // number of objects written by the pack producer. The in-process
+            // transport has no child trace stream, so publish both truthful
+            // engine outcomes in this process.
+            sley_core::trace2::data("promisor", "fetch_count", hydrated as u64);
+            sley_core::trace2::data("pack-objects", "written", hydrated as u64);
+        }
+    }
+    Ok(())
 }
 
 /// Read an object through the shared promisor boundary and record grep's

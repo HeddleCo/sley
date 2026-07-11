@@ -51,6 +51,30 @@ fn sley(cwd: &Path, args: &[&str]) -> Output {
     run_env(sley_testkit::sley_bin!(), cwd, args)
 }
 
+fn sley_with_trace(cwd: &Path, args: &[&str], trace: &Path) -> Output {
+    Command::new(sley_testkit::sley_bin!())
+        .current_dir(cwd)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Tester")
+        .env("GIT_AUTHOR_EMAIL", "tester@example.com")
+        .env("GIT_COMMITTER_NAME", "Tester")
+        .env("GIT_COMMITTER_EMAIL", "tester@example.com")
+        .env("GIT_AUTHOR_DATE", "@1790000000 -0500")
+        .env("GIT_COMMITTER_DATE", "@1790000000 -0500")
+        .env("GIT_TRACE2_EVENT", trace)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run sley {args:?}: {err}"))
+}
+
+fn assert_trace2_data(trace: &Path, category: &str, key: &str, value: usize) {
+    let contents = fs::read_to_string(trace).expect("read trace2 event file");
+    let expected = format!("\"category\":\"{category}\",\"key\":\"{key}\",\"value\":\"{value}\"");
+    assert!(
+        contents.lines().any(|line| line.contains(&expected)),
+        "missing trace2 data {category}/{key}={value}:\n{contents}"
+    );
+}
+
 fn git_available() -> bool {
     Command::new(sley_testkit::oracle_git())
         .arg("--version")
@@ -406,6 +430,73 @@ fn grep_historical_partial_submodule_lazy_fetch_matches_git() {
         String::from_utf8_lossy(&actual_grep.stdout),
         "HEAD^:sub/sub-file:Some content for sub-file\nHEAD^:super-file:Some content for super-file\n"
     );
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn grep_revision_batches_pathspec_selected_promisor_blobs() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("grep-promisor-batch");
+    let source = root.join("source");
+    let clone = root.join("clone");
+    git_ok(&root, &["init", "-q", source.to_str().unwrap_or("source")]);
+    fs::create_dir_all(source.join("a")).expect("create source a");
+    fs::create_dir_all(source.join("b")).expect("create source b");
+    fs::write(source.join("a/matches.txt"), "needle in haystack\n").expect("write match");
+    fs::write(source.join("a/nomatch.txt"), "nothing to see here\n").expect("write nonmatch");
+    fs::write(source.join("b/matches.md"), "needle again\n").expect("write second match");
+    git_ok(&source, &["add", "."]);
+    git_ok(&source, &["commit", "-qm", "initial"]);
+    git_ok(&source, &["config", "uploadpack.allowFilter", "true"]);
+    git_ok(
+        &source,
+        &["config", "uploadpack.allowAnySHA1InWant", "true"],
+    );
+
+    let source_url = format!("file://{}", source.display());
+    let cloned = sley(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--no-checkout",
+            "--filter=blob:none",
+            &source_url,
+            clone.to_str().unwrap_or("clone"),
+        ],
+    );
+    assert!(
+        cloned.status.success(),
+        "sley filtered clone failed: {}",
+        String::from_utf8_lossy(&cloned.stderr)
+    );
+
+    let pathspec_trace = root.join("pathspec.trace");
+    let pathspec = sley_with_trace(
+        &clone,
+        &["grep", "-c", "needle", "HEAD", "--", "a/*.txt"],
+        &pathspec_trace,
+    );
+    assert!(pathspec.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&pathspec.stdout),
+        "HEAD:a/matches.txt:1\n"
+    );
+    assert_trace2_data(&pathspec_trace, "promisor", "fetch_count", 2);
+    assert_trace2_data(&pathspec_trace, "pack-objects", "written", 2);
+
+    let all_trace = root.join("all.trace");
+    let all = sley_with_trace(&clone, &["grep", "-c", "needle", "HEAD"], &all_trace);
+    assert!(all.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&all.stdout),
+        "HEAD:a/matches.txt:1\nHEAD:b/matches.md:1\n"
+    );
+    assert_trace2_data(&all_trace, "promisor", "fetch_count", 1);
+    assert_trace2_data(&all_trace, "pack-objects", "written", 1);
+
     fs::remove_dir_all(&root).ok();
 }
 
