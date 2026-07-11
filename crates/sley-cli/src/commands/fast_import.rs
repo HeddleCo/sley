@@ -99,6 +99,7 @@ struct CommitBuild {
     author: Vec<u8>,
     committer: Vec<u8>,
     encoding: Option<Vec<u8>>,
+    signature_headers: Vec<Vec<u8>>,
     message: Vec<u8>,
 }
 
@@ -1188,6 +1189,7 @@ fn handle_commit(
     let mut author: Option<Vec<u8>> = None;
     let mut committer: Option<Vec<u8>> = None;
     let mut encoding: Option<Vec<u8>> = None;
+    let mut signature_headers = Vec::new();
     let mut message: Option<Vec<u8>> = None;
     let mut parents: Vec<ObjectId> = Vec::new();
     let mut tree: BTreeMap<Vec<u8>, TreeEntry> = BTreeMap::new();
@@ -1215,6 +1217,9 @@ fn handle_commit(
         } else if let Some(rest) = line_after(&line, b"committer ") {
             committer = Some(parse_fast_import_ident(rest, options.date_format)?);
             parser.next_command_line()?;
+        } else if let Some(rest) = line_after(&line, b"gpgsig ") {
+            parser.next_command_line()?;
+            signature_headers.push(read_fast_import_signature(parser, rest)?);
         } else if let Some(rest) = line_after(&line, b"encoding ") {
             encoding = Some(trim_ascii(rest).to_vec());
             parser.next_command_line()?;
@@ -1420,6 +1425,7 @@ fn handle_commit(
         author,
         committer,
         encoding,
+        signature_headers,
         message,
     };
     let oid = write_commit(db, pack_state, build, marks, commit_mark)?;
@@ -1563,6 +1569,89 @@ fn validate_fast_import_raw_date(date: &[u8], strict: bool) -> Result<()> {
     Ok(())
 }
 
+fn read_fast_import_signature(
+    parser: &mut StreamParser<impl BufRead>,
+    spec: &[u8],
+) -> Result<Vec<u8>> {
+    let (object_hash, format) = split_field(trim_ascii(spec));
+    let header = match object_hash {
+        b"sha1" => b"gpgsig".as_slice(),
+        b"sha256" => b"gpgsig-sha256".as_slice(),
+        _ => {
+            return Err(GitError::Command(format!(
+                "fast-import: unsupported signature hash {}",
+                String::from_utf8_lossy(object_hash)
+            )));
+        }
+    };
+    if trim_ascii(format).is_empty() {
+        return Err(GitError::Command(
+            "fast-import: gpgsig missing signature format".into(),
+        ));
+    }
+    let Some(data_line) = parser.next_non_comment_command_line()? else {
+        return Err(GitError::Command(
+            "fast-import: gpgsig missing data block".into(),
+        ));
+    };
+    if line_after(&data_line, b"data").is_none() {
+        return Err(GitError::Command(
+            "fast-import: gpgsig must be followed by data".into(),
+        ));
+    }
+    let signature = parser.read_data(&data_line)?;
+    Ok(fold_fast_import_signature_header(header, &signature))
+}
+
+fn fold_fast_import_signature_header(header: &[u8], signature: &[u8]) -> Vec<u8> {
+    let mut lines = signature.split(|byte| *byte == b'\n');
+    let first = lines.next().unwrap_or_default();
+    let mut out = Vec::with_capacity(header.len() + signature.len() + 4);
+    out.extend_from_slice(header);
+    out.push(b' ');
+    out.extend_from_slice(first);
+    out.push(b'\n');
+    for continuation in lines {
+        out.push(b' ');
+        out.extend_from_slice(continuation);
+        out.push(b'\n');
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_fast_import_commit_body(
+    tree: ObjectId,
+    parents: &[ObjectId],
+    author: &[u8],
+    committer: &[u8],
+    encoding: Option<&[u8]>,
+    signature_headers: &[Vec<u8>],
+    message: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("tree {tree}\n").as_bytes());
+    for parent in parents {
+        out.extend_from_slice(format!("parent {parent}\n").as_bytes());
+    }
+    out.extend_from_slice(b"author ");
+    out.extend_from_slice(author);
+    out.extend_from_slice(b"\ncommitter ");
+    out.extend_from_slice(committer);
+    out.push(b'\n');
+    for header in signature_headers {
+        out.extend_from_slice(header);
+    }
+    if let Some(encoding) = encoding {
+        out.extend_from_slice(b"encoding ");
+        out.extend_from_slice(encoding);
+        out.push(b'\n');
+    }
+    out.push(b'\n');
+    out.extend_from_slice(message);
+    out
+}
+
 fn write_commit(
     db: &mut FastImportDatabase,
     pack_state: &mut FastImportPackState,
@@ -1577,6 +1666,7 @@ fn write_commit(
         author,
         committer,
         encoding,
+        signature_headers,
         message,
     } = build;
     let tree = Arc::new(tree);
@@ -1586,18 +1676,19 @@ fn write_commit(
         Some(tree_oid) => tree_oid,
         None => write_tree_from_map(db, pack_state, tree.as_ref())?,
     };
-    let commit = Commit {
-        tree: tree_oid,
-        parents,
-        author,
-        committer,
-        encoding,
-        message,
-    };
+    let commit = write_fast_import_commit_body(
+        tree_oid,
+        &parents,
+        &author,
+        &committer,
+        encoding.as_deref(),
+        &signature_headers,
+        &message,
+    );
     let oid = write_fast_import_object(
         db,
         pack_state,
-        EncodedObject::new(ObjectType::Commit, commit.write()),
+        EncodedObject::new(ObjectType::Commit, commit),
     )?;
     if let Some(mark) = commit_mark {
         marks.insert(mark, oid);
@@ -3233,6 +3324,50 @@ mod tests {
         let mut out = Vec::new();
         write_progress(&mut out, b"progress checkpoint").expect("write progress");
         assert_eq!(out, b"progress checkpoint\n");
+    }
+
+    #[test]
+    fn signature_data_folds_into_raw_commit_header() {
+        let signature = b"-----BEGIN SSH SIGNATURE-----\nc2ln\n-----END SSH SIGNATURE-----";
+        let header = fold_fast_import_signature_header(b"gpgsig", signature);
+        assert_eq!(
+            header,
+            b"gpgsig -----BEGIN SSH SIGNATURE-----\n c2ln\n -----END SSH SIGNATURE-----\n"
+        );
+
+        let tree = ObjectId::empty_tree(ObjectFormat::Sha1);
+        let body = write_fast_import_commit_body(
+            tree,
+            &[],
+            b"A <a@example.com> 1 +0000",
+            b"C <c@example.com> 1 +0000",
+            None,
+            &[header],
+            b"signed\n",
+        );
+        assert!(body.windows(7).any(|window| window == b"gpgsig "));
+        assert!(body.ends_with(b"\nsigned\n"));
+
+        let canonical = Commit {
+            tree,
+            parents: Vec::new(),
+            author: b"A <a@example.com> 1 +0000".to_vec(),
+            committer: b"C <c@example.com> 1 +0000".to_vec(),
+            encoding: Some(b"ISO-8859-1".to_vec()),
+            message: b"ordinary\n".to_vec(),
+        };
+        assert_eq!(
+            write_fast_import_commit_body(
+                tree,
+                &[],
+                &canonical.author,
+                &canonical.committer,
+                canonical.encoding.as_deref(),
+                &[],
+                &canonical.message,
+            ),
+            canonical.write(),
+        );
     }
 
     #[test]

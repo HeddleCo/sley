@@ -111,6 +111,12 @@ struct ExportedCommitMessage {
     preserve_encoding: bool,
 }
 
+struct ExportedCommitSignature {
+    object_hash: &'static str,
+    format: &'static str,
+    bytes: Vec<u8>,
+}
+
 pub(crate) fn cmd_fast_export(
     cli_session: &crate::session::CliSession,
     args: &[String],
@@ -519,7 +525,16 @@ impl FastExporter {
         }
 
         let message = self.exported_commit_message(&record.commit, record.oid)?;
-        self.write_commit_identities(&record.commit, message.preserve_encoding)?;
+        let signatures = self.commit_signatures(record.oid)?;
+        self.write_commit_identities(&record.commit)?;
+        self.write_commit_signatures(record.oid, &signatures)?;
+        if message.preserve_encoding
+            && let Some(encoding) = &record.commit.encoding
+        {
+            self.out.write_all(b"encoding ")?;
+            self.out.write_all(encoding)?;
+            self.out.write_all(b"\n")?;
+        }
         self.write_commit_message(&message.bytes)?;
 
         for (index, parent) in record.parents.iter().enumerate() {
@@ -542,15 +557,56 @@ impl FastExporter {
         Ok(())
     }
 
-    fn write_commit_identities(&mut self, commit: &Commit, preserve_encoding: bool) -> Result<()> {
+    fn write_commit_identities(&mut self, commit: &Commit) -> Result<()> {
         self.out.write_all(b"author ")?;
         self.out.write_all(&commit.author)?;
         self.out.write_all(b"\ncommitter ")?;
         self.out.write_all(&commit.committer)?;
         self.out.write_all(b"\n")?;
-        if preserve_encoding && let Some(encoding) = &commit.encoding {
-            self.out.write_all(b"encoding ")?;
-            self.out.write_all(encoding)?;
+        Ok(())
+    }
+
+    fn commit_signatures(&self, oid: ObjectId) -> Result<Vec<ExportedCommitSignature>> {
+        let object = self.db.read_object(&oid)?;
+        Ok(extract_commit_signatures(&object.body))
+    }
+
+    fn write_commit_signatures(
+        &mut self,
+        oid: ObjectId,
+        signatures: &[ExportedCommitSignature],
+    ) -> Result<()> {
+        if signatures.is_empty() {
+            return Ok(());
+        }
+        match self.options.signed_commits {
+            SignMode::Abort => {
+                eprintln!(
+                    "fatal: encountered signed commit {oid}; use --signed-commits=<mode> to handle it"
+                );
+                return Err(GitError::Exit(128));
+            }
+            SignMode::Warn | SignMode::WarnVerbatim => {
+                eprintln!(
+                    "warning: exporting {} signature(s) for commit {oid}",
+                    signatures.len()
+                );
+            }
+            SignMode::WarnStrip => {
+                eprintln!("warning: stripping signature(s) from commit {oid}");
+                return Ok(());
+            }
+            SignMode::Strip => return Ok(()),
+            SignMode::Verbatim => {}
+        }
+        for signature in signatures {
+            writeln!(
+                self.out,
+                "gpgsig {} {}",
+                signature.object_hash, signature.format
+            )?;
+            writeln!(self.out, "data {}", signature.bytes.len())?;
+            self.out.write_all(&signature.bytes)?;
             self.out.write_all(b"\n")?;
         }
         Ok(())
@@ -1466,6 +1522,59 @@ fn reencode_commit_message(message: &[u8], from: &str, to: &str) -> Option<Vec<u
     Some(encoded.into_owned())
 }
 
+fn extract_commit_signatures(body: &[u8]) -> Vec<ExportedCommitSignature> {
+    let headers = body
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map_or(body, |end| &body[..end]);
+    let lines = headers.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+    let mut signatures = Vec::new();
+    // Git emits all SHA-1 signature headers before the SHA-256 headers even
+    // when both algorithms are present in one transition commit.
+    for (header, object_hash) in [
+        (b"gpgsig ".as_slice(), "sha1"),
+        (b"gpgsig-sha256 ".as_slice(), "sha256"),
+    ] {
+        let mut index = 0usize;
+        while index < lines.len() {
+            let Some(first) = lines[index].strip_prefix(header) else {
+                index += 1;
+                continue;
+            };
+            let mut bytes = first.to_vec();
+            index += 1;
+            while index < lines.len() {
+                let Some(continuation) = lines[index].strip_prefix(b" ") else {
+                    break;
+                };
+                bytes.push(b'\n');
+                bytes.extend_from_slice(continuation);
+                index += 1;
+            }
+            signatures.push(ExportedCommitSignature {
+                object_hash,
+                format: commit_signature_format(&bytes),
+                bytes,
+            });
+        }
+    }
+    signatures
+}
+
+fn commit_signature_format(signature: &[u8]) -> &'static str {
+    if signature.starts_with(b"-----BEGIN PGP SIGNATURE-----")
+        || signature.starts_with(b"-----BEGIN PGP MESSAGE-----")
+    {
+        "openpgp"
+    } else if signature.starts_with(b"-----BEGIN SIGNED MESSAGE-----") {
+        "x509"
+    } else if signature.starts_with(b"-----BEGIN SSH SIGNATURE-----") {
+        "ssh"
+    } else {
+        "unknown"
+    }
+}
+
 fn tag_signature_start(message: &[u8]) -> usize {
     const MARKERS: [&[u8]; 4] = [
         b"-----BEGIN PGP SIGNATURE-----",
@@ -1486,4 +1595,54 @@ fn tag_signature_start(message: &[u8]) -> usize {
         }
     }
     sig
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_folded_commit_signatures_in_fast_import_form() {
+        let body = concat!(
+            "tree 0123456789012345678901234567890123456789\n",
+            "author A <a@example.com> 1 +0000\n",
+            "committer C <c@example.com> 1 +0000\n",
+            "gpgsig -----BEGIN SSH SIGNATURE-----\n",
+            " c2lnbmF0dXJl\n",
+            " -----END SSH SIGNATURE-----\n",
+            "gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n",
+            " cGdw\n",
+            " -----END PGP SIGNATURE-----\n",
+            "\nmessage\n",
+        )
+        .as_bytes();
+
+        let signatures = extract_commit_signatures(body);
+        assert_eq!(signatures.len(), 2);
+        assert_eq!(signatures[0].object_hash, "sha1");
+        assert_eq!(signatures[0].format, "ssh");
+        assert_eq!(
+            signatures[0].bytes,
+            b"-----BEGIN SSH SIGNATURE-----\nc2lnbmF0dXJl\n-----END SSH SIGNATURE-----"
+        );
+        assert_eq!(signatures[1].object_hash, "sha256");
+        assert_eq!(signatures[1].format, "openpgp");
+        assert_eq!(
+            signatures[1].bytes,
+            b"-----BEGIN PGP SIGNATURE-----\ncGdw\n-----END PGP SIGNATURE-----"
+        );
+    }
+
+    #[test]
+    fn recognizes_all_fast_import_signature_formats() {
+        for (signature, expected) in [
+            (b"-----BEGIN PGP SIGNATURE-----".as_slice(), "openpgp"),
+            (b"-----BEGIN PGP MESSAGE-----".as_slice(), "openpgp"),
+            (b"-----BEGIN SIGNED MESSAGE-----".as_slice(), "x509"),
+            (b"-----BEGIN SSH SIGNATURE-----".as_slice(), "ssh"),
+            (b"opaque signature".as_slice(), "unknown"),
+        ] {
+            assert_eq!(commit_signature_format(signature), expected);
+        }
+    }
 }
