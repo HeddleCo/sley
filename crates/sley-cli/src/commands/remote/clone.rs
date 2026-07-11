@@ -1092,6 +1092,11 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
             if local_source {
                 apply_clone_source_alternates(git_dir, &source_alternates_git_dir)?;
             }
+            // Git persists clone `-c` entries before adding the generated
+            // origin section. Section order is observable through
+            // `git config --show-names --regexp` and establishes promisor
+            // priority before the default partial-clone remote is moved last.
+            apply_clone_config_overrides(git_dir, &config_overrides)?;
             configure_clone_remote(
                 git_dir,
                 &origin,
@@ -1101,7 +1106,6 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
                 tag_opt.as_deref(),
                 partial_clone_filter.as_deref(),
             )?;
-            apply_clone_config_overrides(git_dir, &config_overrides)?;
             apply_clone_default_submodule_path_config(git_dir)?;
             apply_clone_submodule_active(git_dir, &submodule_active)?;
             read_repo_config(git_dir)

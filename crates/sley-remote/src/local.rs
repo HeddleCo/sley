@@ -1337,6 +1337,7 @@ pub fn hydrate_objects_from_local_promisor_remotes(
         else {
             continue;
         };
+        crate::promisor::trace_promisor_remote_contact(&remote_name);
         for oid in missing.iter().copied() {
             let _ = install_fetch_pack_via_local_upload_pack(
                 git_dir,
@@ -1443,6 +1444,7 @@ fn hydrate_reachable_promised_objects(
             else {
                 continue;
             };
+            crate::promisor::trace_promisor_remote_contact(&remote_name);
             let remote_before = missing.len();
             for oid in missing.iter().copied() {
                 let _ = install_fetch_pack_via_local_upload_pack(

@@ -1,6 +1,8 @@
 //! Config policy for protocol-v2 promisor-remote advertisement and acceptance.
 
+use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use sley_config::GitConfig;
@@ -219,6 +221,50 @@ pub fn configured_promisor_remote_names(config: &GitConfig) -> Vec<String> {
         }
     }
     names
+}
+
+/// Emit the native equivalent of Git's lazy-promisor `run_command` trace.
+///
+/// Sley performs this contact in-process; the trace records the equivalent Git
+/// operation for `GIT_TRACE` consumers without spawning Git or a helper.
+pub(crate) fn trace_promisor_remote_contact(remote_name: &str) {
+    let Some(target) = env::var_os("GIT_TRACE") else {
+        return;
+    };
+    let value = target.to_string_lossy();
+    if matches!(value.to_ascii_lowercase().as_str(), "" | "0" | "false") {
+        return;
+    }
+    let line = promisor_remote_contact_trace_line(remote_name);
+    if matches!(value.to_ascii_lowercase().as_str(), "1" | "2" | "true") {
+        eprintln!("{line}");
+    } else if Path::new(target.as_os_str()).is_absolute()
+        && let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(target)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn promisor_remote_contact_trace_line(remote_name: &str) -> String {
+    format!(
+        "trace: run_command: git -c fetch.negotiationAlgorithm=noop fetch {} --no-tags --no-write-fetch-head --recurse-submodules=no --filter=blob:none --stdin",
+        trace_quote_argument(remote_name)
+    )
+}
+
+fn trace_quote_argument(value: &str) -> String {
+    const SAFE: &[u8] = b"+,-./:=@_^";
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || SAFE.contains(&byte))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn configured_fields(config: &GitConfig, key: &str) -> Vec<String> {
@@ -457,6 +503,18 @@ mod tests {
         assert_eq!(
             configured_promisor_remote_names(&config),
             vec!["lop", "archive", "origin"]
+        );
+    }
+
+    #[test]
+    fn native_promisor_contact_trace_matches_git_run_command_shape() {
+        assert_eq!(
+            promisor_remote_contact_trace_line("lop"),
+            "trace: run_command: git -c fetch.negotiationAlgorithm=noop fetch lop --no-tags --no-write-fetch-head --recurse-submodules=no --filter=blob:none --stdin"
+        );
+        assert!(
+            !promisor_remote_contact_trace_line("lop").contains("unused_lop"),
+            "the trace names only the remote actually selected"
         );
     }
 }

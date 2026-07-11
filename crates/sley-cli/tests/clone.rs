@@ -1298,6 +1298,54 @@ fn clone_local_repository_config_options_match_upstream_git() {
 }
 
 #[test]
+fn clone_config_promisors_precede_generated_origin_like_upstream_git() {
+    let root = unique_temp_dir("clone-promisor-config-order");
+    let source = root.join("source");
+    fs::create_dir_all(&source).expect("create source repo");
+    create_source_repo(&source);
+    let source_arg = source.to_str().expect("source path is utf8");
+    let expected_repo = root.join("expected");
+    let actual_repo = root.join("actual");
+    let expected_args = [
+        "clone",
+        "-q",
+        "--no-local",
+        "--filter=blob:none",
+        "-c",
+        "remote.unused_lop.promisor=true",
+        "-c",
+        "remote.lop.promisor=true",
+        source_arg,
+        expected_repo.to_str().expect("expected path is utf8"),
+    ];
+    let mut actual_args = expected_args;
+    actual_args[actual_args.len() - 1] = actual_repo.to_str().expect("actual path is utf8");
+    assert_same_output(
+        run(sley_testkit::oracle_git(), &root, &expected_args),
+        run(sley_testkit::sley_bin!(), &root, &actual_args),
+        &actual_args,
+    );
+
+    let query = [
+        "config",
+        "get",
+        "--all",
+        "--show-names",
+        "--regexp",
+        "^remote\\..*\\.promisor$",
+    ];
+    let expected = run_success(sley_testkit::oracle_git(), &expected_repo, &query);
+    let actual = run_success(sley_testkit::oracle_git(), &actual_repo, &query);
+    assert_eq!(actual, expected);
+    assert_eq!(
+        String::from_utf8(actual).expect("promisor config is utf8"),
+        "remote.unused_lop.promisor true\nremote.lop.promisor true\nremote.origin.promisor true\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn clone_local_repository_template_options_match_upstream_git() {
     let root = unique_temp_dir("clone-local-template-options");
     let source = root.join("source");

@@ -714,6 +714,9 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 sley_protocol::trace_packet_read_payload(advertised.as_bytes());
                 promisor_decision =
                     crate::decide_promisor_remote_reply(request.config, &capability)?;
+                if let Some(remote) = promisor_decision.accepted.first() {
+                    crate::promisor::trace_promisor_remote_contact(&remote.name);
+                }
                 if options.filter_auto {
                     options.filter = crate::promisor_remote_auto_filter(&promisor_decision);
                 }
