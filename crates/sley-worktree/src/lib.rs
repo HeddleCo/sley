@@ -40,6 +40,7 @@ pub mod admin;
 mod attributes;
 mod checkout;
 mod filter;
+mod fsmonitor;
 mod ignore;
 mod index;
 mod index_io;
@@ -55,6 +56,7 @@ mod types_admin;
 // re-export, which would re-export nothing and warn.
 pub use checkout::*;
 pub use filter::*;
+pub use fsmonitor::*;
 pub use ignore::*;
 pub use index::*;
 pub use index_io::{StatCleanFilterValidator, fill_index_entry_stat_cache};

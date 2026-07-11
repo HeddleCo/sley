@@ -101,7 +101,7 @@ static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     CommandSpec::new("format-rev", BUILTIN),
     CommandSpec::new("fsck", BUILTIN),
     CommandSpec::new("fsck-objects", GIT_BUILTIN_RESERVED),
-    CommandSpec::new("fsmonitor--daemon", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("fsmonitor--daemon", GIT_BUILTIN_RESERVED.union(NATIVE)),
     CommandSpec::new("gc", BUILTIN),
     CommandSpec::new("get-tar-commit-id", BUILTIN),
     CommandSpec::new("gitk", MAIN_RESERVED),

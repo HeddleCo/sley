@@ -401,6 +401,7 @@ fn dispatch_command(
         "for-each-ref" => commands::for_each_ref::cmd_for_each_ref(cli_session, &args[1..]),
         "for-each-repo" => commands::for_each_repo::cmd_for_each_repo(cli_session, &args[1..]),
         "refs" => commands::refs::cmd_refs(cli_session, &args[1..]),
+        "fsmonitor--daemon" => commands::fsmonitor::cmd_fsmonitor_daemon(cli_session, &args[1..]),
         "fsck" => commands::plumbing::cmd_fsck(cli_session, &args[1..]),
         "get-tar-commit-id" => commands::utility::cmd_get_tar_commit_id(&args[1..]),
         "ls-remote" => commands::remote::cmd_ls_remote(cli_session, &args[1..]),
