@@ -8,6 +8,14 @@ pub(super) struct ReflogWalkOptions<'a> {
     pub(super) reverse: bool,
     pub(super) date_mode: &'a DateMode,
     pub(super) replace_objects: bool,
+    pub(super) author_filter: Option<&'a sley_grep::GrepMatcher>,
+    pub(super) committer_filter: Option<&'a sley_grep::GrepMatcher>,
+    pub(super) message_filter: Option<&'a sley_grep::GrepMatcher>,
+    pub(super) reflog_filter: Option<&'a sley_grep::GrepMatcher>,
+    pub(super) grep_all_match: bool,
+    pub(super) invert_grep: bool,
+    pub(super) output_encoding: &'a str,
+    pub(super) use_mailmap: bool,
 }
 
 pub(super) fn log_walk_reflogs(
@@ -47,6 +55,9 @@ pub(super) fn log_walk_reflogs(
             selected.reverse();
         }
         for (index, entry) in selected {
+            if !reflog_entry_matches(&db, format, entry, &mailmap, &opts)? {
+                continue;
+            }
             if skipped < opts.skip {
                 skipped += 1;
                 continue;
@@ -103,6 +114,42 @@ pub(super) fn log_walk_reflogs(
     }
     stdout.flush()?;
     Ok(())
+}
+
+fn reflog_entry_matches(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    entry: &ReflogEntry,
+    mailmap: &commands::utility::Mailmap,
+    opts: &ReflogWalkOptions<'_>,
+) -> Result<bool> {
+    if opts
+        .reflog_filter
+        .is_some_and(|filter| !filter.matches_any(&entry.message))
+    {
+        return Ok(false);
+    }
+    if opts.author_filter.is_none()
+        && opts.committer_filter.is_none()
+        && opts.message_filter.is_none()
+    {
+        return Ok(true);
+    }
+    let Some(record) = reflog_walk_commit_record(db, format, entry)? else {
+        return Ok(false);
+    };
+    let filter_mailmap = opts.use_mailmap.then_some(mailmap);
+    Ok(
+        log_author_matcher_matches(&record, opts.author_filter, filter_mailmap)
+            && log_committer_matcher_matches(&record, opts.committer_filter, filter_mailmap)
+            && log_grep_matcher_matches(
+                &record,
+                opts.message_filter,
+                opts.grep_all_match,
+                opts.invert_grep,
+                opts.output_encoding,
+            ),
+    )
 }
 
 struct ReflogWalkTarget {

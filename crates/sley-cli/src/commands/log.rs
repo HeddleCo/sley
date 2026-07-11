@@ -964,6 +964,7 @@ fn cmd_log_impl(
     let mut author_patterns = Vec::new();
     let mut committer_patterns = Vec::new();
     let mut grep_patterns = Vec::new();
+    let mut reflog_patterns = Vec::new();
     let mut grep_all_match = false;
     let mut invert_grep = false;
     let mut regexp_ignore_case = false;
@@ -1175,6 +1176,15 @@ fn cmd_log_impl(
             }
             value if value.starts_with("--grep=") => {
                 grep_patterns.push(value["--grep=".len()..].to_string());
+            }
+            "--grep-reflog" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| log_option_requires_value_error("grep-reflog"))?;
+                reflog_patterns.push(value.to_string());
+            }
+            value if value.starts_with("--grep-reflog=") => {
+                reflog_patterns.push(value["--grep-reflog=".len()..].to_string());
             }
             "--all-match" => grep_all_match = true,
             "--invert-grep" => invert_grep = true,
@@ -2709,6 +2719,10 @@ fn cmd_log_impl(
             _ => pattern_kind,
         };
     }
+    if !walk_reflogs && !reflog_patterns.is_empty() {
+        eprintln!("fatal: the option '--grep-reflog' requires '--walk-reflogs'");
+        return Err(GitError::Exit(128));
+    }
     let author_filters =
         compile_log_filter_matcher(&author_patterns, pattern_kind, regexp_ignore_case, "header")?;
     let committer_filters = compile_log_filter_matcher(
@@ -2723,6 +2737,8 @@ fn cmd_log_impl(
         regexp_ignore_case,
         "command line",
     )?;
+    let reflog_filters =
+        compile_log_filter_matcher(&reflog_patterns, pattern_kind, regexp_ignore_case, "header")?;
     let grep_colors = LogGrepColors::from_config(&config, color_always);
     if walk_reflogs {
         let reflog_revisions = revision_options
@@ -2745,6 +2761,14 @@ fn cmd_log_impl(
                 reverse,
                 date_mode: &date_mode,
                 replace_objects: cli_session.replace_objects(),
+                author_filter: author_filters.as_ref(),
+                committer_filter: committer_filters.as_ref(),
+                message_filter: grep_filters.as_ref(),
+                reflog_filter: reflog_filters.as_ref(),
+                grep_all_match,
+                invert_grep,
+                output_encoding: &output_encoding,
+                use_mailmap,
             },
         );
     }
