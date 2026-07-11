@@ -735,3 +735,81 @@ fn reset_mixed_quiet_to_commit_suppresses_summary_like_upstream_git() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn reset_soft_rejects_pending_checkout_merge_like_upstream_git() {
+    let root = unique_temp_dir("reset-soft-checkout-merge");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+
+    for repo in [&upstream, &rust] {
+        prepare_repo(repo);
+        git(repo, &["branch", "branch3"]);
+        git(repo, &["branch", "branch4"]);
+        git(repo, &["checkout", "-q", "branch3"]);
+        fs::write(repo.join("file.txt"), b"base\nbranch3\n").expect("write branch3 file");
+        git(repo, &["add", "file.txt"]);
+        run_with_identity(repo, &["commit", "-m", "branch3", "-q"]);
+        git(repo, &["checkout", "-q", "branch4"]);
+        fs::write(repo.join("file.txt"), b"base\nbranch4 dirty\n")
+            .expect("write branch4 worktree file");
+        git(repo, &["checkout", "-m", "branch3"]);
+    }
+
+    let before_head = git(&rust, &["rev-parse", "HEAD"]);
+    let before_unmerged = git(&rust, &["ls-files", "--unmerged"]);
+    assert!(
+        !before_unmerged.is_empty(),
+        "checkout -m must leave unmerged entries"
+    );
+
+    let args = ["reset", "--soft"];
+    let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+    let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+    assert_same_output(actual, expected, &args);
+    assert_eq!(git(&rust, &["rev-parse", "HEAD"]), before_head);
+    assert_eq!(git(&rust, &["ls-files", "--unmerged"]), before_unmerged);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn reset_mixed_refresh_flag_controls_index_refresh_like_upstream_git() {
+    let root = unique_temp_dir("reset-mixed-refresh-flag");
+
+    for (case, flag, expect_clean) in [
+        ("refresh", "--refresh", true),
+        ("no-refresh", "--no-refresh", false),
+    ] {
+        let upstream = root.join(format!("upstream-{case}"));
+        let rust = root.join(format!("rust-{case}"));
+        fs::create_dir_all(&upstream).expect("create upstream repo");
+        fs::create_dir_all(&rust).expect("create rust repo");
+
+        for repo in [&upstream, &rust] {
+            prepare_repo(repo);
+            fs::write(repo.join("file2"), b"tracked\n").expect("write file2");
+            git(repo, &["add", "file2"]);
+            run_with_identity(repo, &["commit", "-m", "add file2", "-q"]);
+            git(repo, &["rm", "--cached", "file2"]);
+        }
+
+        let args = ["reset", flag, "--mixed", "HEAD"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+        assert_same_output(actual, expected, &args);
+
+        let expected_diff = git(&upstream, &["diff-files", "--name-status"]);
+        let actual_diff = git(&rust, &["diff-files", "--name-status"]);
+        assert_eq!(actual_diff, expected_diff, "diff-files differed for {flag}");
+        assert_eq!(
+            actual_diff.is_empty(),
+            expect_clean,
+            "wrong refresh state for {flag}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}

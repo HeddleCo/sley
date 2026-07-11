@@ -472,6 +472,41 @@ if [ "$test_target" = "sley" ]; then
         die "could not expose Sley as a direct installed git launcher"
     fi
     chmod +x "$installed_git"
+
+    # Apache's upstream test configuration passes GIT_EXEC_PATH into CGI
+    # programs but not SLEY_BIN. Sley's owned git-http-backend adapter needs
+    # the latter to call back into the selected candidate binary. Wrap only
+    # the test HTTP daemon and add a PassEnv directive on its command line;
+    # this keeps the upstream source/config untouched and remains isolated per
+    # wave runner.
+    sley_real_httpd=${LIB_HTTPD_PATH:-}
+    if [ -z "$sley_real_httpd" ]; then
+        for candidate in /usr/sbin/httpd /usr/sbin/apache2 \
+            "$(command -v httpd 2>/dev/null || true)" \
+            "$(command -v apache2 2>/dev/null || true)"
+        do
+            if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+                sley_real_httpd=$candidate
+                break
+            fi
+        done
+    fi
+    if [ -n "$sley_real_httpd" ] && [ -x "$sley_real_httpd" ]; then
+        sley_httpd_wrapper=$bindir/sley-httpd-with-cgi-env
+        cat > "$sley_httpd_wrapper" <<'EOF'
+#!/bin/sh
+if test -z "${SLEY_REAL_HTTPD-}"
+then
+	echo "fatal: SLEY_REAL_HTTPD is required by Sley's test HTTP wrapper" >&2
+	exit 127
+fi
+exec "$SLEY_REAL_HTTPD" -c 'PassEnv SLEY_BIN' "$@"
+EOF
+        chmod +x "$sley_httpd_wrapper"
+        SLEY_REAL_HTTPD=$sley_real_httpd
+        LIB_HTTPD_PATH=$sley_httpd_wrapper
+        export SLEY_REAL_HTTPD LIB_HTTPD_PATH
+    fi
 else
     bindir=$(dirname -- "$oracle_bin")
 fi

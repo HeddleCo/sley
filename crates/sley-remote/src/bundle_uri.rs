@@ -339,6 +339,7 @@ pub fn prefetch_advertised_bundle_uris_with_client(
         if uri.is_empty() {
             continue;
         }
+        trace2_bundle_uri_download(uri);
         match download_bundle_uri_to_temp(client, uri) {
             Ok(temp) => downloaded.push((entry.id.clone(), temp)),
             Err(_) => {
@@ -395,6 +396,21 @@ pub fn prefetch_advertised_bundle_uris_with_client(
     }
     let _ = applied_any;
     Ok(())
+}
+
+/// Record the compatibility child boundary Git exposes while downloading an
+/// advertised HTTP bundle. Sley performs the transfer in-process, but trace2 is
+/// a public observability surface: callers still expect the logical
+/// `git-remote-https <uri>` child in download order.
+fn trace2_bundle_uri_download(uri: &str) {
+    if let Some(argv) = bundle_uri_trace_argv(uri) {
+        sley_core::trace2::child_start("remote-https", &argv);
+    }
+}
+
+fn bundle_uri_trace_argv(uri: &str) -> Option<[String; 2]> {
+    (uri.starts_with("http://") || uri.starts_with("https://"))
+        .then(|| ["git-remote-https".to_string(), uri.to_string()])
 }
 
 /// Try to unbundle `path` into `db` and create its `refs/bundles/*` refs.
@@ -576,6 +592,25 @@ mod tests {
                 "http://127.0.0.1:18080/everything.bundle".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn bundle_uri_trace_models_only_http_remote_helper_boundaries() {
+        assert_eq!(
+            bundle_uri_trace_argv("http://example.test/repo.bundle"),
+            Some([
+                "git-remote-https".to_string(),
+                "http://example.test/repo.bundle".to_string(),
+            ])
+        );
+        assert_eq!(
+            bundle_uri_trace_argv("https://example.test/repo.bundle"),
+            Some([
+                "git-remote-https".to_string(),
+                "https://example.test/repo.bundle".to_string(),
+            ])
+        );
+        assert_eq!(bundle_uri_trace_argv("file:///tmp/repo.bundle"), None);
     }
 
     #[test]

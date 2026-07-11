@@ -2254,15 +2254,16 @@ pub fn reset_index_to_commit(
     let commit = read_commit(&db, format, commit_oid)?;
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
-    // git's `reset --mixed` preserves the skip-worktree bit on entries that survive
-    // the reset (t7102 "--mixed preserves skip-worktree"): carry it forward from the
-    // pre-reset index keyed by path, so reconstructed entries keep CE_SKIP_WORKTREE.
+    // git's `reset --mixed` reuses index entries that already match the target
+    // tree. In particular, their validated stat tuple survives `--no-refresh`;
+    // only newly introduced or object/mode-changed entries stay stat-dirty.
+    // It also preserves the skip-worktree bit on surviving entries.
     let sparse = active_sparse_checkout(git_dir)?;
     let sparse_matcher = sparse
         .as_ref()
         .map(|(spec, mode)| SparseMatcher::new(spec, *mode));
     let index_path = repository_index_path(git_dir);
-    let prior_skip_worktree: BTreeSet<Vec<u8>> = match fs::read(&index_path) {
+    let prior_entries: BTreeMap<Vec<u8>, IndexEntry> = match fs::read(&index_path) {
         Ok(bytes) => {
             let mut prior = Index::parse(&bytes, format)?;
             // A sparse-directory entry records only `folder/`; mixed reset
@@ -2273,18 +2274,34 @@ pub fn reset_index_to_commit(
             }
             prior
                 .entries
-                .iter()
-                .filter(|entry| entry.is_skip_worktree())
-                .map(|entry| entry.path.as_bytes().to_vec())
+                .into_iter()
+                .map(|entry| (entry.path.as_bytes().to_vec(), entry))
                 .collect()
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
         Err(err) => return Err(err.into()),
     };
     let mut index_entries = Vec::new();
     for (path, entry) in &target_entries {
         let mut restored = restored_head_index_entry(worktree_root, &db, path, entry)?;
-        if prior_skip_worktree.contains(path)
+        if let Some(prior) = prior_entries.get(path)
+            && prior.oid == restored.oid
+            && prior.mode == restored.mode
+            && prior.stage() == sley_index::Stage::Normal
+        {
+            restored.ctime_seconds = prior.ctime_seconds;
+            restored.ctime_nanoseconds = prior.ctime_nanoseconds;
+            restored.mtime_seconds = prior.mtime_seconds;
+            restored.mtime_nanoseconds = prior.mtime_nanoseconds;
+            restored.dev = prior.dev;
+            restored.ino = prior.ino;
+            restored.uid = prior.uid;
+            restored.gid = prior.gid;
+            restored.size = prior.size;
+        }
+        if prior_entries
+            .get(path)
+            .is_some_and(IndexEntry::is_skip_worktree)
             || sparse_matcher
                 .as_ref()
                 .is_some_and(|matcher| !matcher.includes_file(path))

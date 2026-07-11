@@ -162,8 +162,17 @@ mod runner_artifacts {
             );
 
             write_executable(
+                &root.join("httpd"),
+                "#!/bin/sh\nprintf 'sley=%s\\nargs=%s\\n' \"${SLEY_BIN-}\" \"$*\" >\"$SLEY_HTTPD_PROBE\"\nexit 0\n",
+            );
+
+            write_executable(
                 &upstream_t.join("t0001-init.sh"),
                 r#"#!/bin/sh
+if test -n "${SLEY_HTTPD_PROBE-}"
+then
+	"$LIB_HTTPD_PATH" -v || exit 98
+fi
 test "${GIT_TEST_EXT_CHAIN_LINT:-}" = 0 || {
     printf '%s\n' 'runner did not disable redundant external chainlint' >&2
     exit 99
@@ -523,6 +532,32 @@ include\tt[0-9][0-9][0-9][0-9]-*.sh\toracle\toracle\teligible\tupstream-declared
                 .and_then(|name| name.to_str()),
             Some("git"),
             "Sley must be invoked directly under the installed git name"
+        );
+    }
+
+    #[test]
+    fn sley_runner_passes_candidate_binary_into_http_cgi_environment() {
+        let fixture = Fixture::new();
+        let marker = fixture.path("httpd-probe.txt");
+        let output = fixture
+            .command("sley", "httpd-cgi-env")
+            .arg("t0001-init.sh")
+            .env("LIB_HTTPD_PATH", fixture.path("httpd"))
+            .env("SLEY_HTTPD_PROBE", &marker)
+            .output()
+            .expect("run HTTP CGI environment fixture");
+        assert!(
+            !output.status.success(),
+            "fixture still contains its intentional parity failure"
+        );
+        let probe = fs::read_to_string(marker).expect("read HTTP daemon probe");
+        assert!(
+            probe.contains(&format!("sley={}", fixture.sley.display())),
+            "HTTP daemon wrapper must inherit the selected SLEY_BIN: {probe}"
+        );
+        assert!(
+            probe.contains("args=-c PassEnv SLEY_BIN -v"),
+            "HTTP daemon wrapper must pass SLEY_BIN into CGI: {probe}"
         );
     }
 
