@@ -596,7 +596,8 @@ pub(crate) fn fsck_pack_objects(
     // while the full fsck walker above carries the tree-context checks.
     let mut had_error = false;
     for object in &pack.entries {
-        let findings = sley_fsck::content::check_object_content(
+        let findings = sley_fsck::content::check_object_content_with_format(
+            format,
             object.object.object_type,
             &object.object.body,
             &severity,
@@ -4249,7 +4250,11 @@ fn cmd_maintenance_start(cli_session: &crate::session::CliSession, args: &[Strin
     let scheduler = parse_maintenance_start_args(args)?;
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let scheduler = scheduler.unwrap_or(MaintenanceScheduler::Systemd);
+    let scheduler = resolve_maintenance_scheduler(scheduler)?;
+    validate_scheduler_available(scheduler)?;
+    // Git installs the schedule before registering the repository.  In
+    // particular, an unavailable scheduler must not leave maintenance.repo
+    // behind even though Scalar treats that failure as a warning.
     update_background_schedule(&common_git_dir, Some(scheduler))?;
     cmd_maintenance_register(cli_session, &[])
 }
@@ -4273,10 +4278,10 @@ fn parse_maintenance_start_args(args: &[String]) -> Result<Option<MaintenanceSch
                 let Some(value) = args.get(index) else {
                     return maintenance_subcommand_usage("start");
                 };
-                scheduler = Some(parse_scheduler(value)?);
+                scheduler = parse_scheduler_option(value)?;
             }
             value if let Some(name) = value.strip_prefix("--scheduler=") => {
-                scheduler = Some(parse_scheduler(name)?);
+                scheduler = parse_scheduler_option(name)?;
             }
             value if value.starts_with('-') => {
                 eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
@@ -4287,6 +4292,14 @@ fn parse_maintenance_start_args(args: &[String]) -> Result<Option<MaintenanceSch
         index += 1;
     }
     Ok(scheduler)
+}
+
+fn parse_scheduler_option(value: &str) -> Result<Option<MaintenanceScheduler>> {
+    if value.eq_ignore_ascii_case("auto") {
+        Ok(None)
+    } else {
+        parse_scheduler(value).map(Some)
+    }
 }
 
 fn parse_scheduler(value: &str) -> Result<MaintenanceScheduler> {
@@ -4311,6 +4324,36 @@ fn scheduler_name(scheduler: MaintenanceScheduler) -> &'static str {
     }
 }
 
+fn resolve_maintenance_scheduler(
+    scheduler: Option<MaintenanceScheduler>,
+) -> Result<MaintenanceScheduler> {
+    if let Some(scheduler) = scheduler {
+        return Ok(scheduler);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(MaintenanceScheduler::Launchctl);
+    }
+    #[cfg(windows)]
+    {
+        return Ok(MaintenanceScheduler::Schtasks);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if scheduler_available(MaintenanceScheduler::Systemd) {
+            return Ok(MaintenanceScheduler::Systemd);
+        }
+        if scheduler_available(MaintenanceScheduler::Cron) {
+            return Ok(MaintenanceScheduler::Cron);
+        }
+        eprintln!("fatal: neither systemd timers nor crontab are available");
+        return Err(GitError::Exit(128));
+    }
+    #[allow(unreachable_code)]
+    Ok(MaintenanceScheduler::Cron)
+}
+
 fn validate_scheduler_available(scheduler: MaintenanceScheduler) -> Result<()> {
     if scheduler_available(scheduler) {
         Ok(())
@@ -4330,11 +4373,21 @@ fn scheduler_available(scheduler: MaintenanceScheduler) -> bool {
     if env::var_os("GIT_TEST_MAINT_SCHEDULER").is_some() {
         return false;
     }
-    scheduler == MaintenanceScheduler::Systemd
-        && ProcessCommand::new("systemctl")
+    match scheduler {
+        MaintenanceScheduler::Cron => ProcessCommand::new("crontab").arg("-l").output().is_ok(),
+        MaintenanceScheduler::Systemd => ProcessCommand::new("systemctl")
             .args(["--user", "list-timers"])
             .status()
-            .is_ok_and(|status| status.success())
+            .is_ok_and(|status| status.success()),
+        MaintenanceScheduler::Launchctl => ProcessCommand::new("launchctl")
+            .arg("list")
+            .status()
+            .is_ok_and(|status| status.success()),
+        MaintenanceScheduler::Schtasks => ProcessCommand::new("schtasks")
+            .arg("/query")
+            .output()
+            .is_ok(),
+    }
 }
 
 fn scheduler_test_command(scheduler: MaintenanceScheduler) -> Option<(String, Vec<String>)> {

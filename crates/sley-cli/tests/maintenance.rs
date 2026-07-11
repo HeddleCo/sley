@@ -538,6 +538,87 @@ fn maintenance_run_quiet_accepted() {
 }
 
 #[test]
+fn maintenance_start_resolves_the_platform_scheduler_before_registering() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("maint-start-auto-scheduler");
+    let repo = root.join("repo");
+    let global_config = root.join("global-config");
+    git_ok(
+        &root,
+        &["init", "-q", repo.to_str().expect("utf8 repository path")],
+    );
+
+    let out = Command::new(sley_testkit::sley_bin!())
+        .current_dir(&repo)
+        .args(["maintenance", "start"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .env("HOME", &root)
+        .env("XDG_CONFIG_HOME", root.join("xdg"))
+        .env(
+            "GIT_TEST_MAINT_SCHEDULER",
+            "crontab:true,systemctl:true,launchctl:true,schtasks:true",
+        )
+        .output()
+        .expect("run maintenance start");
+    assert!(
+        out.status.success(),
+        "automatic scheduler resolution failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let global = fs::read_to_string(&global_config).expect("read global config");
+    assert!(global.contains("[maintenance]"), "{global}");
+    let registered_repo = fs::canonicalize(&repo).expect("canonical repository path");
+    assert!(
+        global.contains(&format!("repo = {}", registered_repo.display())),
+        "{global}"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn maintenance_start_does_not_register_when_auto_scheduler_is_unavailable() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("maint-start-unavailable-scheduler");
+    let repo = root.join("repo");
+    let global_config = root.join("global-config");
+    git_ok(
+        &root,
+        &["init", "-q", repo.to_str().expect("utf8 repository path")],
+    );
+
+    let out = Command::new(sley_testkit::sley_bin!())
+        .current_dir(&repo)
+        .args(["maintenance", "start"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .env("HOME", &root)
+        .env(
+            "GIT_TEST_MAINT_SCHEDULER",
+            "crontab:false,systemctl:false,launchctl:false,schtasks:false",
+        )
+        .output()
+        .expect("run maintenance start");
+    assert!(!out.status.success(), "unavailable scheduler succeeded");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("scheduler is not available"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !global_config.exists(),
+        "failed scheduling registered the repository"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn repack_d_keeps_repository_complete() {
     if !git_available() {
         return;
