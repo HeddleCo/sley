@@ -84,6 +84,7 @@ mod repo_path;
 mod repo_paths;
 mod repository;
 mod revision;
+mod scalar;
 mod session;
 mod session_globals;
 mod setup;
@@ -106,6 +107,7 @@ pub(crate) use global_options::{
     effective_config_parameters_env, global_config_value, injected_config_parameters,
 };
 pub(crate) use repo_paths::common_git_dir_for_git_dir;
+pub use scalar::run_scalar;
 pub(crate) use trace2_cli::{
     trace_reference_fsync_counter, trace2_emit_def_params_at_depth, trace2_emit_def_params_once,
     trace2_emit_process_ancestry_at_depth,

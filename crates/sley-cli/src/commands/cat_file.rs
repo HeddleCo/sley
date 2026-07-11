@@ -768,8 +768,31 @@ impl ObjectQuery<'_> {
     }
 
     fn print_typed_body(&self, object_type: ObjectType) -> Result<()> {
-        let oid = self.view.resolve(self.name)?;
+        let is_full_hex = self.name.len() == self.view.format().hex_len()
+            && self.name.bytes().all(|byte| byte.is_ascii_hexdigit());
+        let oid = if is_full_hex {
+            ObjectId::from_hex(self.view.format(), self.name)?
+        } else {
+            self.view.resolve(self.name)?
+        };
         let oid = self.view.replacement_oid(&oid)?;
+        if is_full_hex {
+            let object = match crate::read_object_maybe_prefetch_promisor(
+                self.view.db(),
+                &oid,
+                self.view.lazy_fetch,
+            ) {
+                Ok(object) => object,
+                Err(err) => return self.typed_body_read_error(err, &oid),
+            };
+            if object.object_type == object_type {
+                let mailmap = self.cat_file_mailmap()?;
+                let body = cat_file_apply_mailmap_body(&object.body, object.object_type, &mailmap);
+                io::stdout().write_all(&body)?;
+                io::stdout().flush()?;
+                return Ok(());
+            }
+        }
         let peeled = match object_type {
             ObjectType::Blob => sley_rev::peel_tags(self.view.db(), self.view.format(), &oid),
             ObjectType::Tree => sley_rev::peel_to_tree(self.view.db(), self.view.format(), &oid),

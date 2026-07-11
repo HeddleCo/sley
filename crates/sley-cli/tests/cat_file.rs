@@ -305,6 +305,61 @@ fn git_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn cat_file_typed_full_oid_lazily_hydrates_blob_none_promisor() {
+    let root = unique_temp_dir("cat-file-typed-promisor");
+    let origin = root.join("origin");
+    let client = root.join("client");
+    fs::create_dir_all(&root).expect("create fixture root");
+    run(
+        sley_testkit::sley_bin!(),
+        &root,
+        &["init", origin.to_str().expect("utf8 origin")],
+    );
+    run(
+        sley_testkit::sley_bin!(),
+        &root,
+        &["init", client.to_str().expect("utf8 client")],
+    );
+    let payload = b"promised typed blob\n";
+    let oid = String::from_utf8(run_with_stdin(
+        sley_testkit::sley_bin!(),
+        &origin,
+        &["hash-object", "-w", "--stdin"],
+        payload,
+    ))
+    .expect("utf8 oid");
+    let oid = oid.trim();
+    for args in [
+        vec!["config", "core.repositoryFormatVersion", "1"],
+        vec!["config", "extensions.partialClone", "origin"],
+        vec!["config", "remote.origin.promisor", "true"],
+        vec![
+            "config",
+            "remote.origin.url",
+            origin.to_str().expect("utf8 origin"),
+        ],
+        vec!["config", "remote.origin.partialCloneFilter", "blob:none"],
+    ] {
+        run(sley_testkit::sley_bin!(), &client, &args);
+    }
+
+    let actual = run_output_with_stdin(
+        sley_testkit::sley_bin!(),
+        &client,
+        &["cat-file", "blob", oid],
+        b"",
+    );
+    assert!(
+        actual.status.success(),
+        "typed lazy fetch failed: {}",
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert_eq!(actual.stdout, payload);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn cat_file_batch_modes_match_upstream_git() {
     let root = unique_temp_dir("cat-file-batch-check");
     fs::create_dir_all(&root).expect("create temp repo");

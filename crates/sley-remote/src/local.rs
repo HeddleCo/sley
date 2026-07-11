@@ -1148,9 +1148,20 @@ pub fn install_fetch_pack_via_local_upload_pack_with_promisor_decision(
         return Ok(Vec::new());
     }
 
+    // A lazy promisor request names the exact missing objects it needs. The
+    // repository's partial-clone filter describes ordinary traversal, but it
+    // must not remove an explicitly wanted blob from this direct response.
+    let direct_promisor_object_fetch = promisor && deepen.is_none() && !record_promisor_refs;
+    let transfer_filter = if direct_promisor_object_fetch {
+        None
+    } else {
+        filter
+    };
     let request = UploadPackRequest {
         wants,
-        filter: filter.as_ref().and_then(upload_pack_filter_protocol_spec),
+        filter: transfer_filter
+            .as_ref()
+            .and_then(upload_pack_filter_protocol_spec),
         // The `shallow` capability accompanies a deepen request on the wire
         // (mirrors the SSH path); a plain fetch keeps its existing wire form.
         capabilities: deepen
@@ -1174,7 +1185,6 @@ pub fn install_fetch_pack_via_local_upload_pack_with_promisor_decision(
 
     // Lazy promisor hydration asks for exact missing objects; negotiating local
     // haves would walk the partial client's intentionally-missing blobs.
-    let direct_promisor_object_fetch = promisor && deepen.is_none() && !record_promisor_refs;
     if direct_promisor_object_fetch && local_upload_pack_client_wants_v2(git_dir) {
         trace_local_upload_pack_v2_capabilities(remote_git_dir, format);
     }
@@ -1214,7 +1224,7 @@ pub fn install_fetch_pack_via_local_upload_pack_with_promisor_decision(
         deepen.map(|plan| plan.client_shallow.len()).unwrap_or(0),
         deepen.is_some_and(|plan| plan.deepen_since),
         deepen.map(|plan| plan.deepen_not).unwrap_or(0),
-        filter.as_ref(),
+        transfer_filter.as_ref(),
     );
     // With a deepen plan the haves walk is cut at the client's existing
     // boundary: having a commit inside the old shallow window must not imply
@@ -1275,7 +1285,7 @@ pub fn install_fetch_pack_via_local_upload_pack_with_promisor_decision(
             promisor,
             ..Default::default()
         },
-        filter.clone(),
+        transfer_filter,
         unpack_limit,
         missing_policy,
     )?;
@@ -2693,7 +2703,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_promisor_object_fetch_does_not_walk_missing_local_blobs() {
+    fn direct_promisor_object_fetch_ignores_blob_none_for_explicit_blob() {
         let root = unique_local_test_dir("direct-promisor-object-fetch");
         let remote_git = root.join("remote.git");
         let client_git = root.join("client.git");
@@ -2731,12 +2741,12 @@ mod tests {
             None,
             true,
             false,
-            None,
+            Some(sley_odb::PackObjectFilter::BlobNone),
             None,
             false,
             None,
         )
-        .expect("direct promisor blob fetch should not traverse missing local blobs");
+        .expect("direct promisor blob fetch must ignore blob:none for the explicit want");
 
         assert!(
             FileObjectDatabase::from_git_dir(&client_git, format)

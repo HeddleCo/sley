@@ -457,6 +457,27 @@ pub(crate) fn cmd_rev_list(
     {
         setup_args.push("--ignore-missing".to_string());
     }
+    // A bare full OID is accepted syntactically before object parsing. For the
+    // ordinary error mode, Git lets the promisor boundary hydrate that exact
+    // object before revision setup. Do not apply this to decorated revisions
+    // (`^{blob}`), ranges, pathspecs, or any `--missing=*` mode: those inputs
+    // deliberately control missing-object behavior themselves.
+    if matches!(missing_action, RevListMissingAction::Error)
+        && !exclude_promisor_objects
+        && cli_session.lazy_fetch()
+        && let [candidate] = setup_args.as_slice()
+        && candidate.len() == format.hex_len()
+        && candidate.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        let oid = ObjectId::from_hex(format, candidate)?;
+        if !db.contains(&oid)?
+            && let Err(err) =
+                crate::read_object_maybe_prefetch_promisor(&db, &oid, cli_session.lazy_fetch())
+            && !matches!(err, GitError::NotFound(_))
+        {
+            return Err(err);
+        }
+    }
     let setup = sley_rev::setup_revisions(
         &setup_args,
         &sley_rev::RevisionSetupContext {

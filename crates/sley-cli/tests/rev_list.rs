@@ -174,6 +174,62 @@ fn current_branch(root: &Path) -> String {
 }
 
 #[test]
+fn rev_list_bare_full_oid_hydrates_but_missing_expression_does_not() {
+    let root = unique_temp_dir("rev-list-bare-promisor-oid");
+    let origin = root.join("origin");
+    let client = root.join("client");
+    fs::create_dir_all(&root).expect("create fixture root");
+    sley(&root, &["init", origin.to_str().expect("utf8 origin")]);
+    sley(&root, &["init", client.to_str().expect("utf8 client")]);
+    let payload = b"rev-list promised blob\n";
+    let oid = String::from_utf8(sley_with_stdin(
+        &origin,
+        &["hash-object", "-w", "--stdin"],
+        payload,
+    ))
+    .expect("utf8 oid");
+    let oid = oid.trim();
+    for args in [
+        vec!["config", "core.repositoryFormatVersion", "1"],
+        vec!["config", "extensions.partialClone", "origin"],
+        vec!["config", "remote.origin.promisor", "true"],
+        vec![
+            "config",
+            "remote.origin.url",
+            origin.to_str().expect("utf8 origin"),
+        ],
+        vec!["config", "remote.origin.partialCloneFilter", "blob:none"],
+    ] {
+        sley(&client, &args);
+    }
+
+    let decorated = format!("{oid}^{{blob}}");
+    let missing = Command::new(sley_testkit::sley_bin!())
+        .current_dir(&client)
+        .args(["rev-list", "--missing=print", &decorated, "--"])
+        .output()
+        .expect("run missing-object rev-list");
+    assert!(!missing.status.success());
+    let absent = Command::new(sley_testkit::sley_bin!())
+        .current_dir(&client)
+        .args(["--no-lazy-fetch", "cat-file", "-e", oid])
+        .status()
+        .expect("probe missing object");
+    assert!(!absent.success(), "--missing expression hydrated the blob");
+
+    let output = sley(&client, &["rev-list", oid]);
+    assert!(output.is_empty(), "bare blob tip should not be printed");
+    let present = Command::new(sley_testkit::sley_bin!())
+        .current_dir(&client)
+        .args(["--no-lazy-fetch", "cat-file", "-e", oid])
+        .status()
+        .expect("probe hydrated object");
+    assert!(present.success(), "bare full OID was not hydrated");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn rev_list_linear_history_matches_upstream_git() {
     let root = unique_temp_dir("rev-list-linear");
     fs::create_dir_all(&root).expect("create temp repo");
