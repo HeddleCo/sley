@@ -29,7 +29,7 @@ use sley_core::{GitError, ObjectFormat, ObjectId, Result, redact_url_for_display
 use sley_object::ObjectType;
 use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, build_and_install_reachable_pack,
-    collect_reachable_object_ids,
+    collect_reachable_object_ids, collect_reachable_object_ids_tolerating_promised_missing,
 };
 #[cfg(feature = "http")]
 use sley_protocol::{
@@ -1167,9 +1167,13 @@ fn execute_push_local(
         remote_excluded_tip_roots(&remote_git_dir, request.format, &remote_refs)?;
     let starts = push_pack_roots(&commands, &pack_objects);
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
-    let remote_db = FileObjectDatabase::from_git_dir(&remote_common_git_dir, request.format);
-    let remote_excluded =
-        collect_reachable_object_ids(&remote_db, request.format, remote_excluded_tips)?;
+    let remote_config = sley_config::read_repo_config(&remote_git_dir, None).unwrap_or_default();
+    let remote_excluded = collect_remote_reachable_exclusions(
+        &remote_common_git_dir,
+        request.format,
+        remote_excluded_tips,
+        &remote_config,
+    )?;
 
     // git's `transfer.fsckObjects`: the receiving side fscks every object the
     // push introduces and rejects the push when one fails (most importantly a
@@ -1178,7 +1182,6 @@ fn execute_push_local(
     if remote_transfer_fsck_objects(&remote_common_git_dir) {
         fsck_pushed_objects(&local_db, request.format, &starts, &remote_excluded)?;
     }
-    let remote_config = sley_config::read_repo_config(&remote_git_dir, None).unwrap_or_default();
     let report = if push_local_uses_receive_pack_server(&remote_config, &remote_git_dir, &commands)
     {
         local_push_via_receive_pack_server(LocalPushViaReceivePackRequest {
@@ -1265,8 +1268,13 @@ pub fn stage_local_push_quarantine(
     }
     let remote_refs = crate::local::local_fetch_advertisements(remote_git_dir, format)?;
     let remote_excluded_tips = remote_excluded_tip_roots(remote_git_dir, format, &remote_refs)?;
-    let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, format);
-    let remote_excluded = collect_reachable_object_ids(&remote_db, format, remote_excluded_tips)?;
+    let remote_config = sley_config::read_repo_config(remote_git_dir, None).unwrap_or_default();
+    let remote_excluded = collect_remote_reachable_exclusions(
+        remote_common_git_dir,
+        format,
+        remote_excluded_tips,
+        &remote_config,
+    )?;
     let object_dir = create_push_quarantine_object_dir(remote_common_git_dir)?;
     let quarantine_db = FileObjectDatabase::new(object_dir.clone(), format);
     let installed = match build_and_install_reachable_pack(
@@ -1291,6 +1299,32 @@ pub fn stage_local_push_quarantine(
         return Ok(None);
     }
     Ok(Some(PushQuarantine { object_dir }))
+}
+
+/// Compute the object closure a local push may treat as present at its receiver.
+///
+/// A partial-clone receiver can legitimately advertise a ref whose reachable
+/// closure crosses an object it has promised to obtain from another remote.
+/// That promised gap is an end point in the receiver's `have` closure, not a
+/// reason to abort the push. Repositories without a configured promisor retain
+/// the strict walk, so a stray `.promisor` sidecar cannot hide corruption.
+fn collect_remote_reachable_exclusions<I>(
+    remote_common_git_dir: &Path,
+    format: ObjectFormat,
+    starts: I,
+    remote_config: &GitConfig,
+) -> Result<std::collections::HashSet<ObjectId>>
+where
+    I: IntoIterator<Item = ObjectId>,
+{
+    let remote_has_promisor = crate::promisor::config_has_promisor_remote(remote_config);
+    let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, format)
+        .with_promisor_remote_present(remote_has_promisor);
+    if remote_has_promisor {
+        collect_reachable_object_ids_tolerating_promised_missing(&remote_db, format, starts)
+    } else {
+        collect_reachable_object_ids(&remote_db, format, starts)
+    }
 }
 
 fn create_push_quarantine_object_dir(remote_common_git_dir: &Path) -> Result<PathBuf> {
@@ -1591,17 +1625,18 @@ pub fn push_local_with_report_and_objects(
             remote_excluded_tip_roots(request.remote_git_dir, format, &remote_refs)?;
         let pack_objects: Vec<ObjectId> = Vec::new();
         let starts = push_pack_roots(&send, &pack_objects);
-        let remote_db = FileObjectDatabase::from_git_dir(request.remote_common_git_dir, format);
-        let remote_excluded =
-            collect_reachable_object_ids(&remote_db, format, remote_excluded_tips)?;
+        let remote_excluded = collect_remote_reachable_exclusions(
+            request.remote_common_git_dir,
+            format,
+            remote_excluded_tips,
+            &remote_config,
+        )?;
         // git's `transfer.fsckObjects`: fsck the introduced objects on the
         // receiving side and reject the push on a content error (a disallowed
         // `.gitmodules` url, a malformed object, ...).
         if remote_transfer_fsck_objects(request.remote_common_git_dir) {
             fsck_pushed_objects(&local_db, format, &starts, &remote_excluded)?;
         }
-        let remote_config =
-            sley_config::read_repo_config(request.remote_git_dir, None).unwrap_or_default();
         let report =
             if push_local_uses_receive_pack_server(&remote_config, request.remote_git_dir, &send) {
                 local_push_via_receive_pack_server(LocalPushViaReceivePackRequest {
@@ -2920,7 +2955,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use sley_formats::RepositoryLayout;
-    use sley_object::{Commit, EncodedObject, ObjectType, Tree};
+    use sley_object::{BString, Commit, EncodedObject, ObjectType, Tree, TreeEntry};
     use sley_odb::{FileObjectDatabase, ObjectReplacements, ObjectWriter};
     use sley_protocol::{ReceivePackCommandStatus, ReceivePackUnpackStatus};
     use sley_refs::{RefTarget, RefUpdate};
@@ -2950,6 +2985,29 @@ mod tests {
                 Tree { entries: vec![] }.write(),
             ))
             .expect("tree should write");
+        let identity = b"Test User <test@example.invalid> 1 +0000".to_vec();
+        db.write_object(EncodedObject::new(
+            ObjectType::Commit,
+            Commit {
+                tree,
+                parents,
+                author: identity.clone(),
+                committer: identity,
+                encoding: None,
+                message: format!("{message}\n").into_bytes(),
+            }
+            .write(),
+        ))
+        .expect("commit should write")
+    }
+
+    fn write_commit_for_tree(
+        git_dir: &Path,
+        tree: ObjectId,
+        parents: Vec<ObjectId>,
+        message: &str,
+    ) -> ObjectId {
+        let db = FileObjectDatabase::from_git_dir(git_dir, ObjectFormat::Sha1);
         let identity = b"Test User <test@example.invalid> 1 +0000".to_vec();
         db.write_object(EncodedObject::new(
             ObjectType::Commit,
@@ -3348,6 +3406,113 @@ mod tests {
                 .read_ref("refs/heads/main")
                 .expect("remote ref should read"),
             Some(RefTarget::Direct(tip))
+        );
+    }
+
+    #[test]
+    fn local_push_accepts_promised_gap_in_remote_have_closure() {
+        let local = temp_repo("local-promisor-receiver");
+        let remote = temp_repo("remote-promisor-receiver");
+        let local_db = FileObjectDatabase::from_git_dir(&local, ObjectFormat::Sha1);
+        let remote_db = FileObjectDatabase::from_git_dir(&remote, ObjectFormat::Sha1);
+        let promised_blob = local_db
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"payload held by the receiver's promisor\n".to_vec(),
+            ))
+            .expect("blob should write");
+        let tree = local_db
+            .write_object(EncodedObject::new(
+                ObjectType::Tree,
+                Tree {
+                    entries: vec![TreeEntry {
+                        mode: 0o100644,
+                        name: BString::from("payload"),
+                        oid: promised_blob,
+                    }],
+                }
+                .write(),
+            ))
+            .expect("tree should write");
+        let base = write_commit_for_tree(&local, tree, Vec::new(), "base");
+        let tip = write_commit_for_tree(&local, tree, vec![base], "tip");
+        set_ref(&local, "refs/heads/main", RefTarget::Direct(tip));
+        set_ref(
+            &local,
+            "HEAD",
+            RefTarget::Symbolic("refs/heads/main".into()),
+        );
+
+        sley_odb::build_and_install_reachable_pack_filtered(
+            &local_db,
+            &remote_db,
+            ObjectFormat::Sha1,
+            vec![base],
+            &std::collections::HashSet::new(),
+            RawPackInstallOptions {
+                promisor: true,
+                ..Default::default()
+            },
+            Some(sley_odb::PackObjectFilter::BlobNone),
+            None,
+        )
+        .expect("filtered pack should build")
+        .expect("filtered pack should install");
+        set_ref(&remote, "refs/heads/main", RefTarget::Direct(base));
+        set_ref(
+            &remote,
+            "HEAD",
+            RefTarget::Symbolic("refs/heads/unborn".into()),
+        );
+        let mut config = fs::read(remote.join("config")).expect("remote config should read");
+        config.extend_from_slice(b"\n[remote \"lop\"]\n\tpromisor = true\n");
+        fs::write(remote.join("config"), config).expect("promisor config should write");
+        assert!(
+            !remote_db
+                .contains(&promised_blob)
+                .expect("remote object lookup")
+        );
+
+        let refspecs = ["refs/heads/main:refs/heads/main".to_string()];
+        let report = push_local_with_report(
+            PushReportRequest {
+                git_dir: &local,
+                common_git_dir: &local,
+                format: ObjectFormat::Sha1,
+                remote_git_dir: &remote,
+                remote_common_git_dir: &remote,
+                refspecs: &refspecs,
+                force: false,
+                atomic: false,
+                dry_run: false,
+                force_with_lease: &[],
+                force_with_lease_default: false,
+                force_if_includes: false,
+                receive_config_overrides: &[],
+                push_options: &[],
+                remote_stderr: None,
+                quiet: true,
+            },
+            &GitConfig::default(),
+        )
+        .expect("push into incomplete promisor receiver should succeed");
+
+        assert_eq!(report.refs.len(), 1, "unexpected push report: {report:#?}");
+        let reference = &report.refs[0];
+        assert_eq!(reference.dst, "refs/heads/main");
+        assert_eq!(reference.new_id, tip);
+        assert_eq!(reference.status, PushRefStatus::Ok);
+        assert_eq!(
+            FileRefStore::new(&remote, ObjectFormat::Sha1)
+                .read_ref("refs/heads/main")
+                .expect("remote ref should read"),
+            Some(RefTarget::Direct(tip))
+        );
+        remote_db.refresh_read_cache();
+        assert!(
+            !remote_db
+                .contains(&promised_blob)
+                .expect("receiver should retain promised gap")
         );
     }
 
