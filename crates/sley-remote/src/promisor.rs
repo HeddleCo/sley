@@ -1,8 +1,12 @@
 //! Config policy for protocol-v2 promisor-remote advertisement and acceptance.
 
+use std::fs;
+use std::path::Path;
+
 use sley_config::GitConfig;
+use sley_config::raw_edit::{ConfigFileWriteOptions, RawConfigEditor, write_config_file_locked};
 use sley_config::remotes::remote_names;
-use sley_core::{Capability, Result};
+use sley_core::{Capability, GitError, Result};
 use sley_protocol::{
     PromisorRemoteAdvertisement, encode_promisor_remote_advertisement,
     encode_promisor_remote_reply, parse_promisor_remote_advertisement,
@@ -23,6 +27,39 @@ pub struct PromisorRemoteDecision {
     pub accepted: Vec<PromisorRemoteAdvertisement>,
     /// Encoded client capability reply, absent when none were accepted.
     pub reply: Option<String>,
+    /// Accepted advertised fields that should be persisted in existing client
+    /// remote configuration.
+    pub stored_fields: Vec<PromisorRemoteFieldUpdate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromisorRemoteField {
+    PartialCloneFilter,
+    Token,
+}
+
+impl PromisorRemoteField {
+    pub const fn config_key(self) -> &'static str {
+        match self {
+            Self::PartialCloneFilter => "partialCloneFilter",
+            Self::Token => "token",
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::PartialCloneFilter => "filter",
+            Self::Token => "token",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromisorRemoteFieldUpdate {
+    pub remote_name: String,
+    pub field: PromisorRemoteField,
+    pub previous: Option<String>,
+    pub value: String,
 }
 
 /// Build the server's capability from configured promisor remotes.
@@ -70,10 +107,53 @@ pub fn decide_promisor_remote_reply(
         .iter()
         .map(|remote| remote.name.clone())
         .collect::<Vec<_>>();
+    let stored_fields = planned_stored_fields(config, &accepted);
     Ok(PromisorRemoteDecision {
         accepted,
         reply: encode_promisor_remote_reply(&names)?,
+        stored_fields,
     })
+}
+
+/// Persist planned accepted-field updates with git's lockfile config writer.
+pub fn apply_promisor_remote_field_updates(
+    git_dir: &Path,
+    updates: &[PromisorRemoteFieldUpdate],
+) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let path = git_dir.join("config");
+    let mut contents = match fs::read(&path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+    for update in updates {
+        let mut editor = RawConfigEditor::new(
+            contents,
+            "remote",
+            Some(&update.remote_name),
+            update.field.config_key(),
+        );
+        editor.set_multivar(Some(&update.value), None, None, true);
+        contents = editor.into_bytes();
+    }
+    write_config_file_locked(&path, &contents, ConfigFileWriteOptions::default())
+        .map_err(|err| GitError::Io(err.to_string()))
+}
+
+/// Construct the concrete partial-clone filter for `--filter=auto` from the
+/// filters carried by accepted promisor advertisements.
+pub fn promisor_remote_auto_filter(
+    decision: &PromisorRemoteDecision,
+) -> Option<sley_odb::PackObjectFilter> {
+    decision
+        .accepted
+        .iter()
+        .filter_map(|remote| remote.partial_clone_filter.as_deref())
+        .filter_map(crate::pack_filter_from_spec)
+        .reduce(crate::filter::combine_pack_filters)
 }
 
 pub fn promisor_accept_policy(config: &GitConfig) -> PromisorAcceptPolicy {
@@ -94,6 +174,9 @@ pub fn config_has_promisor_remote(config: &GitConfig) -> bool {
             config
                 .get_bool("remote", Some(&name), "promisor")
                 .unwrap_or(false)
+                || config
+                    .get("remote", Some(&name), "partialCloneFilter")
+                    .is_some_and(|value| !value.is_empty())
         })
 }
 
@@ -120,6 +203,9 @@ fn configured_promisor_remotes(
             config
                 .get_bool("remote", Some(name), "promisor")
                 .unwrap_or(false)
+                || config
+                    .get("remote", Some(name), "partialCloneFilter")
+                    .is_some_and(|value| !value.is_empty())
         })
         .filter_map(|name| {
             let url = config.get("remote", Some(&name), "url")?.to_string();
@@ -147,6 +233,60 @@ fn configured_promisor_remotes(
             })
         })
         .collect()
+}
+
+fn planned_stored_fields(
+    config: &GitConfig,
+    accepted: &[PromisorRemoteAdvertisement],
+) -> Vec<PromisorRemoteFieldUpdate> {
+    let fields = configured_fields(config, "storeFields");
+    if fields.is_empty() {
+        return Vec::new();
+    }
+    let configured = configured_promisor_remotes(config, &fields);
+    let mut updates = Vec::new();
+    for advertised in accepted {
+        let Some(current) = configured
+            .iter()
+            .find(|remote| remote.name == advertised.name)
+        else {
+            continue;
+        };
+        for field_name in &fields {
+            let (field, advertised_value, previous) =
+                if field_name.eq_ignore_ascii_case("partialCloneFilter") {
+                    (
+                        PromisorRemoteField::PartialCloneFilter,
+                        advertised.partial_clone_filter.as_deref(),
+                        current.partial_clone_filter.as_deref(),
+                    )
+                } else {
+                    (
+                        PromisorRemoteField::Token,
+                        advertised.token.as_deref(),
+                        current.token.as_deref(),
+                    )
+                };
+            let Some(value) = advertised_value else {
+                continue;
+            };
+            let valid = match field {
+                PromisorRemoteField::PartialCloneFilter => {
+                    crate::pack_filter_from_spec(value).is_some()
+                }
+                PromisorRemoteField::Token => !value.chars().any(char::is_control),
+            };
+            if valid && previous != Some(value) {
+                updates.push(PromisorRemoteFieldUpdate {
+                    remote_name: advertised.name.clone(),
+                    field,
+                    previous: previous.map(str::to_string),
+                    value: value.to_string(),
+                });
+            }
+        }
+    }
+    updates
 }
 
 fn should_accept(
@@ -233,5 +373,34 @@ mod tests {
         };
         let decision = decide_promisor_remote_reply(&config, &capability).expect("decision");
         assert_eq!(decision.reply.as_deref(), Some("first;second"));
+    }
+
+    #[test]
+    fn accepted_fields_plan_storage_and_resolve_auto_filter() {
+        let config = GitConfig::parse(
+            b"[promisor]\n\tacceptFromServer = All\n\tstoreFields = partialCloneFilter\n\
+              [remote \"lop\"]\n\tpromisor = true\n\turl = file:///lop\n\tpartialCloneFilter = blob:none\n",
+        )
+        .expect("config");
+        let capability = Capability {
+            name: "promisor-remote".into(),
+            value: Some(
+                "name=lop,url=file:///lop,partialCloneFilter=blob:limit=9500,token=secret".into(),
+            ),
+        };
+        let decision = decide_promisor_remote_reply(&config, &capability).expect("decision");
+        assert_eq!(
+            decision.stored_fields,
+            vec![PromisorRemoteFieldUpdate {
+                remote_name: "lop".into(),
+                field: PromisorRemoteField::PartialCloneFilter,
+                previous: Some("blob:none".into()),
+                value: "blob:limit=9500".into(),
+            }]
+        );
+        assert_eq!(
+            promisor_remote_auto_filter(&decision),
+            Some(sley_odb::PackObjectFilter::BlobLimit(9500))
+        );
     }
 }

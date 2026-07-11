@@ -191,8 +191,9 @@ pub use protocol::{
 
 mod promisor;
 pub use promisor::{
-    PromisorAcceptPolicy, PromisorRemoteDecision, config_has_promisor_remote,
-    decide_promisor_remote_reply, promisor_accept_policy, promisor_remote_server_capability,
+    PromisorAcceptPolicy, PromisorRemoteDecision, PromisorRemoteField, PromisorRemoteFieldUpdate,
+    apply_promisor_remote_field_updates, config_has_promisor_remote, decide_promisor_remote_reply,
+    promisor_accept_policy, promisor_remote_auto_filter, promisor_remote_server_capability,
 };
 
 mod resolve;
@@ -258,6 +259,11 @@ impl CredentialProvider for NoCredentials {
 pub trait ProgressSink {
     /// A free-form progress or summary line.
     fn message(&mut self, _message: &str) {}
+
+    /// A user-facing diagnostic that belongs on stderr in a CLI wrapper.
+    fn diagnostic(&mut self, message: &str) {
+        self.message(message);
+    }
 }
 
 /// A [`ProgressSink`] that discards every event.
@@ -351,6 +357,7 @@ mod tests {
             depth,
             merge_srcs: Vec::new(),
             filter: None,
+            filter_auto: false,
             refetch: false,
             cloning: false,
             record_promisor_refs: true,
@@ -651,6 +658,7 @@ mod tests {
             detached_head: None,
             checkout: true,
             filter: None,
+            filter_auto: false,
             // The live test clones a specific branch via --single-branch, so the
             // branch was explicitly requested (a missing remote tip is a hard error).
             branch_explicit: true,

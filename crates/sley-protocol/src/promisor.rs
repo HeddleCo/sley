@@ -32,10 +32,13 @@ pub fn encode_promisor_remote_advertisement(
                 format!("url={}", percent_encode(&remote.url)),
             ];
             if let Some(filter) = &remote.partial_clone_filter {
-                fields.push(format!("partialCloneFilter={}", percent_encode(filter)));
+                fields.push(format!(
+                    "partialCloneFilter={}",
+                    percent_encode_optional_field(filter)
+                ));
             }
             if let Some(token) = &remote.token {
-                fields.push(format!("token={}", percent_encode(token)));
+                fields.push(format!("token={}", percent_encode_optional_field(token)));
             }
             Ok(fields.join(","))
         })
@@ -125,9 +128,20 @@ pub fn parse_promisor_remote_reply(value: &str) -> Result<Vec<String>> {
 }
 
 fn percent_encode(value: &str) -> String {
+    percent_encode_with(value, false)
+}
+
+fn percent_encode_optional_field(value: &str) -> String {
+    percent_encode_with(value, true)
+}
+
+fn percent_encode_with(value: &str, allow_equals: bool) -> String {
     let mut out = String::new();
     for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || b"_.~/: -".contains(&byte) && byte != b' ' {
+        if byte.is_ascii_alphanumeric()
+            || b"_.~/:-".contains(&byte)
+            || (allow_equals && byte == b'=')
+        {
             out.push(byte as char);
         } else {
             out.push_str(&format!("%{byte:02X}"));
@@ -177,7 +191,7 @@ mod tests {
         let encoded = encode_promisor_remote_advertisement(&remotes).expect("encode");
         assert_eq!(
             encoded,
-            "name=large%2Cobjects,url=file:///tmp/space%20here%3Bobjects,partialCloneFilter=blob:limit%3D5k,token=a%25b"
+            "name=large%2Cobjects,url=file:///tmp/space%20here%3Bobjects,partialCloneFilter=blob:limit=5k,token=a%25b"
         );
         assert_eq!(
             parse_promisor_remote_advertisement(&encoded).expect("parse"),

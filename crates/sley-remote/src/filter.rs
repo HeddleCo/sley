@@ -78,7 +78,10 @@ fn sparse_filter_from_remote(
     Ok(PackObjectFilter::SparsePathSet(paths))
 }
 
-fn combine_pack_filters(left: PackObjectFilter, right: PackObjectFilter) -> PackObjectFilter {
+pub(crate) fn combine_pack_filters(
+    left: PackObjectFilter,
+    right: PackObjectFilter,
+) -> PackObjectFilter {
     match (left, right) {
         (PackObjectFilter::TreeDepth(a), PackObjectFilter::TreeDepth(b)) => {
             PackObjectFilter::TreeDepth(a.min(b))

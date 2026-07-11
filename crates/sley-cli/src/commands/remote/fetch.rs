@@ -65,6 +65,7 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
         depth: None,
         merge_srcs: Vec::new(),
         filter: None,
+        filter_auto: false,
         refetch: false,
         cloning: false,
         record_promisor_refs: true,
@@ -173,7 +174,12 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
                     .next()
                     .ok_or_else(|| GitError::Command("fetch --filter requires a value".into()))?;
                 let normalized = normalize_clone_filter(value)?;
-                options.filter = fetch_pack_filter_from_spec(&normalized);
+                options.filter_auto = normalized == "auto";
+                options.filter = if options.filter_auto {
+                    None
+                } else {
+                    fetch_pack_filter_from_spec(&normalized)
+                };
                 filter_spec = Some(normalized);
                 filter_option_explicit = true;
             }
@@ -182,12 +188,18 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
                     .strip_prefix("--filter=")
                     .ok_or_else(|| GitError::Command("fetch --filter requires a value".into()))?;
                 let normalized = normalize_clone_filter(value)?;
-                options.filter = fetch_pack_filter_from_spec(&normalized);
+                options.filter_auto = normalized == "auto";
+                options.filter = if options.filter_auto {
+                    None
+                } else {
+                    fetch_pack_filter_from_spec(&normalized)
+                };
                 filter_spec = Some(normalized);
                 filter_option_explicit = true;
             }
             "--no-filter" => {
                 options.filter = None;
+                options.filter_auto = false;
                 filter_spec = None;
                 filter_option_explicit = true;
             }
@@ -1913,6 +1925,10 @@ pub(crate) struct StdoutProgress;
 impl sley_remote::ProgressSink for StdoutProgress {
     fn message(&mut self, message: &str) {
         let _ = writeln!(io::stdout(), "{message}");
+    }
+
+    fn diagnostic(&mut self, message: &str) {
+        let _ = writeln!(io::stderr(), "{message}");
     }
 }
 

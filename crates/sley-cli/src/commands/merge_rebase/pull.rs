@@ -919,6 +919,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
         depth,
         merge_srcs: merge_srcs.clone(),
         filter: None,
+        filter_auto: false,
         refetch: false,
         cloning: false,
         record_promisor_refs: true,

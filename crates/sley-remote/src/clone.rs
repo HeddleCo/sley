@@ -115,6 +115,8 @@ pub struct CloneOptions<'a> {
     /// Partial-clone object filter (`--filter=blob:none`) to apply to the
     /// clone fetch. Only honored by the in-process local server.
     pub filter: Option<sley_odb::PackObjectFilter>,
+    /// Resolve `--filter=auto` from accepted promisor advertisements.
+    pub filter_auto: bool,
     /// Whether `checkout_branch` came from an explicit `--branch`. When set, a
     /// missing remote tip for that branch is a hard error ("Remote branch … not
     /// found"); when unset, a missing tip is an empty/unborn-repository clone.
@@ -260,6 +262,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         deepen_since: request.options.deepen_since,
         deepen_not: request.options.deepen_not.clone(),
         filter: request.options.filter.clone(),
+        filter_auto: request.options.filter_auto,
         record_promisor_refs: !request.options.checkout,
         reject_shallow: request.options.reject_shallow,
         ssh_options: request.options.ssh_options,
@@ -457,7 +460,7 @@ fn fetch_partial_clone_checkout_blobs(
     accepted_promisors: &[sley_protocol::PromisorRemoteAdvertisement],
     credentials: &mut dyn CredentialProvider,
 ) -> Result<()> {
-    if request.options.filter.is_none() {
+    if request.options.filter.is_none() && !request.options.filter_auto {
         return Ok(());
     }
     match request.source {
@@ -657,6 +660,7 @@ struct CloneFetchOptions<'a> {
     deepen_since: Option<i64>,
     deepen_not: Vec<String>,
     filter: Option<sley_odb::PackObjectFilter>,
+    filter_auto: bool,
     record_promisor_refs: bool,
     reject_shallow: bool,
     ssh_options: Option<crate::ssh::SshTransportOptions>,
@@ -669,6 +673,7 @@ fn clone_fetch_options(options: CloneFetchOptions<'_>) -> FetchOptions {
         deepen_since,
         deepen_not,
         filter,
+        filter_auto,
         record_promisor_refs,
         reject_shallow,
         ssh_options,
@@ -691,6 +696,7 @@ fn clone_fetch_options(options: CloneFetchOptions<'_>) -> FetchOptions {
         depth,
         merge_srcs: Vec::new(),
         filter,
+        filter_auto,
         refetch: false,
         cloning: true,
         record_promisor_refs,

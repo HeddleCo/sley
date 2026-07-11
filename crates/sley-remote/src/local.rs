@@ -1334,6 +1334,9 @@ fn hydrate_reachable_promised_objects(
                 config
                     .get_bool("remote", Some(name), "promisor")
                     .unwrap_or(false)
+                    || config
+                        .get("remote", Some(name), "partialCloneFilter")
+                        .is_some_and(|value| !value.is_empty())
             })
         {
             let Some(url) = config
@@ -1349,6 +1352,7 @@ fn hydrate_reachable_promised_objects(
             else {
                 continue;
             };
+            let remote_before = missing.len();
             for oid in missing.iter().copied() {
                 let _ = install_fetch_pack_via_local_upload_pack(
                     remote_git_dir,
@@ -1366,6 +1370,22 @@ fn hydrate_reachable_promised_objects(
             }
             remote_db.refresh_read_cache();
             missing.retain(|oid| !remote_db.contains(oid).unwrap_or(false));
+            if missing.len() < remote_before
+                && config.get("remote", Some(&remote_name), "partialCloneFilter")
+                    != Some("blob:none")
+            {
+                crate::apply_promisor_remote_field_updates(
+                    remote_git_dir,
+                    &[crate::PromisorRemoteFieldUpdate {
+                        remote_name: remote_name.clone(),
+                        field: crate::PromisorRemoteField::PartialCloneFilter,
+                        previous: config
+                            .get("remote", Some(&remote_name), "partialCloneFilter")
+                            .map(str::to_string),
+                        value: "blob:none".into(),
+                    }],
+                )?;
+            }
             if missing.is_empty() {
                 break;
             }
@@ -2717,6 +2737,7 @@ mod tests {
             &crate::PromisorRemoteDecision {
                 accepted: vec![advertisement],
                 reply: Some("lop".into()),
+                stored_fields: Vec::new(),
             },
         )
         .expect("accepted promisor transfer");

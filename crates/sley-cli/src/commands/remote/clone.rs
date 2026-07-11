@@ -959,6 +959,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
     // when the source advertises filtering (`uploadpack.allowFilter`),
     // otherwise warns exactly like a server without the capability.
     let mut fetch_filter = None::<sley_odb::PackObjectFilter>;
+    let mut fetch_filter_auto = false;
     if let Some(filter) = partial_clone_filter.as_deref() {
         if local_mechanism {
             eprintln!("warning: --filter is ignored in local clones; use file:// instead.");
@@ -968,17 +969,26 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
                 .as_ref()
                 .and_then(|config| config.get_bool("uploadpack", None, "allowfilter"))
                 .unwrap_or(false);
-            let parsed_filter = sley_remote::pack_filter_from_spec_for_clone(
-                filter,
-                &remote_common_git_dir,
-                format,
-            )?;
+            let parsed_filter = if filter.eq_ignore_ascii_case("auto") {
+                fetch_filter_auto = true;
+                None
+            } else {
+                sley_remote::pack_filter_from_spec_for_clone(
+                    filter,
+                    &remote_common_git_dir,
+                    format,
+                )?
+            };
             match (remote_allows_filter, remote_config.as_ref(), parsed_filter) {
                 (true, Some(config), Some(parsed)) => {
                     validate_server_filter_policy(config, filter)?;
                     fetch_filter = Some(parsed);
                 }
-                _ => eprintln!("warning: filtering not recognized by server, ignoring"),
+                (true, Some(_), None) if fetch_filter_auto => {}
+                _ => {
+                    fetch_filter_auto = false;
+                    eprintln!("warning: filtering not recognized by server, ignoring");
+                }
             }
         }
     }
@@ -1191,6 +1201,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
         },
         checkout,
         filter: fetch_filter,
+        filter_auto: fetch_filter_auto,
         // A `--branch=<tag>` is satisfied by the detached checkout, so the
         // remote-tracking-branch lookup (and its "Remote branch not found"
         // mapping) must be bypassed.
@@ -1470,6 +1481,7 @@ fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Resu
         depth: None,
         merge_srcs: Vec::new(),
         filter: None,
+        filter_auto: false,
         refetch: false,
         cloning: true,
         record_promisor_refs: false,
@@ -1689,6 +1701,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
             depth: None,
             merge_srcs: Vec::new(),
             filter: None,
+            filter_auto: false,
             refetch: false,
             cloning: true,
             record_promisor_refs: false,
@@ -2006,10 +2019,14 @@ fn clone_network_repository(
         )));
     }
     let mut fetch_filter = None::<sley_odb::PackObjectFilter>;
+    let mut fetch_filter_auto = false;
     let mut configured_partial_clone_filter = None::<&str>;
     if let Some(filter) = options.partial_clone_filter {
         if features.filter {
-            if let Some(parsed) = sley_remote::pack_filter_from_spec(filter) {
+            if filter.eq_ignore_ascii_case("auto") {
+                fetch_filter_auto = true;
+                configured_partial_clone_filter = Some(filter);
+            } else if let Some(parsed) = sley_remote::pack_filter_from_spec(filter) {
                 fetch_filter = Some(parsed);
                 configured_partial_clone_filter = Some(filter);
             }
@@ -2081,6 +2098,7 @@ fn clone_network_repository(
         detached_head: None,
         checkout: options.checkout,
         filter: fetch_filter,
+        filter_auto: fetch_filter_auto,
         branch_explicit,
         ref_storage: options.ref_storage,
         ssh_options: matches!(transport, CloneNetworkTransport::Ssh).then_some(options.ssh_options),
@@ -2325,6 +2343,7 @@ fn clone_bare_network_repository(
             depth: options.depth,
             merge_srcs: Vec::new(),
             filter: None,
+            filter_auto: false,
             cloning: true,
             update_shallow: false,
             reject_shallow: options.reject_shallow,
@@ -2493,6 +2512,9 @@ fn validate_clone_filter(value: &str) -> Result<()> {
 }
 
 pub(super) fn normalize_clone_filter(value: &str) -> Result<String> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok("auto".to_string());
+    }
     if value == "blob:none" {
         return Ok(value.to_string());
     }
@@ -2808,6 +2830,7 @@ fn clone_bare_or_mirror_local_repository(
             depth: options.depth,
             merge_srcs: Vec::new(),
             filter: options.fetch_filter,
+            filter_auto: false,
             refetch: false,
             cloning: true,
             record_promisor_refs: true,

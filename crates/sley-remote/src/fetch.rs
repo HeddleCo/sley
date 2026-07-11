@@ -121,6 +121,8 @@ pub struct FetchOptions {
     /// must gate that before calling [`fetch`]. Directly-wanted tips are always
     /// packed on the local path, mirroring upstream's filter traversal.
     pub filter: Option<sley_odb::PackObjectFilter>,
+    /// Resolve the transfer filter from accepted advertised promisor fields.
+    pub filter_auto: bool,
     /// `--refetch`: ignore local haves so existing reachable commits can be
     /// repacked under a newly requested partial-clone filter.
     pub refetch: bool,
@@ -198,6 +200,8 @@ pub struct FetchOutcome {
     pub wrote_fetch_head: bool,
     /// Promisor remotes accepted from the server, in advertised priority order.
     pub accepted_promisor_remotes: Vec<PromisorRemoteAdvertisement>,
+    /// Accepted advertised fields persisted into existing client remotes.
+    pub stored_promisor_fields: Vec<crate::PromisorRemoteFieldUpdate>,
 }
 
 /// Repository-derived defaults for one fetch invocation.
@@ -301,7 +305,8 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         .config
         .get_bool("remote", Some(request.remote_name), "promisor")
         .unwrap_or(false)
-        || request.options.filter.is_some();
+        || request.options.filter.is_some()
+        || request.options.filter_auto;
     let max_input_size = fetch_max_input_size(request.config);
     let configured_refspecs = if request.refspecs.is_empty() {
         remote_config_values(request.config, request.remote_name, "fetch")
@@ -709,7 +714,27 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 sley_protocol::trace_packet_read_payload(advertised.as_bytes());
                 promisor_decision =
                     crate::decide_promisor_remote_reply(request.config, &capability)?;
+                if options.filter_auto {
+                    options.filter = crate::promisor_remote_auto_filter(&promisor_decision);
+                }
                 outcome.accepted_promisor_remotes = promisor_decision.accepted.clone();
+                crate::apply_promisor_remote_field_updates(
+                    request.git_dir,
+                    &promisor_decision.stored_fields,
+                )?;
+                for update in &promisor_decision.stored_fields {
+                    services.progress.diagnostic(&format!(
+                        "Storing new {} from server for remote '{}'.",
+                        update.field.display_name(),
+                        update.remote_name
+                    ));
+                    services.progress.diagnostic(&format!(
+                        "    '{}' -> '{}'",
+                        update.previous.as_deref().unwrap_or(""),
+                        update.value
+                    ));
+                }
+                outcome.stored_promisor_fields = promisor_decision.stored_fields.clone();
                 if let Some(reply) = promisor_decision.reply.as_deref() {
                     sley_protocol::trace_packet_write_payload(
                         format!("promisor-remote={reply}\n").as_bytes(),
@@ -2137,7 +2162,12 @@ pub fn apply_configured_partial_clone_filter(
         .unwrap_or(false)
         && let Some(filter) = config.get("remote", Some(remote), "partialclonefilter")
     {
-        options.filter = crate::pack_filter_from_spec(filter);
+        options.filter_auto = filter.eq_ignore_ascii_case("auto");
+        options.filter = if options.filter_auto {
+            None
+        } else {
+            crate::pack_filter_from_spec(filter)
+        };
     }
 }
 
@@ -2769,6 +2799,7 @@ mod tests {
             depth: None,
             merge_srcs: Vec::new(),
             filter: None,
+            filter_auto: false,
             refetch: false,
             cloning: false,
             record_promisor_refs: true,
