@@ -28,15 +28,15 @@ use sley_config::remotes::{
 };
 use sley_core::{GitError, ObjectFormat, ObjectId, Result, redact_url_for_display};
 use sley_odb::{
-    FileObjectDatabase, ObjectReader, collect_reachable_object_ids,
-    collect_reachable_object_ids_excluding,
+    FileObjectDatabase, ObjectReader, collect_reachable_object_ids_excluding,
+    collect_reachable_object_ids_tolerating_promised_missing,
 };
 #[cfg(feature = "http")]
 use sley_protocol::ProtocolVersion;
 use sley_protocol::{
-    FetchHeadRecord, FetchRefUpdate, RefAdvertisement, RefSpec, encode_fetch_head,
-    fetch_ref_updates_to_fetch_head, parse_refspec, plan_fetch_ref_updates, refname_matches,
-    refspec_map_source,
+    FetchHeadRecord, FetchRefUpdate, PromisorRemoteAdvertisement, RefAdvertisement, RefSpec,
+    encode_fetch_head, fetch_ref_updates_to_fetch_head, parse_refspec, plan_fetch_ref_updates,
+    refname_matches, refspec_map_source,
 };
 use sley_refs::{FileRefStore, Ref, RefTarget, RefUpdate, ReflogEntry};
 use sley_transport::{RemoteTransport, RemoteUrl};
@@ -196,6 +196,8 @@ pub struct FetchOutcome {
     pub head_symref: Option<String>,
     /// Whether `FETCH_HEAD` was written.
     pub wrote_fetch_head: bool,
+    /// Promisor remotes accepted from the server, in advertised priority order.
+    pub accepted_promisor_remotes: Vec<PromisorRemoteAdvertisement>,
 }
 
 /// Repository-derived defaults for one fetch invocation.
@@ -696,6 +698,24 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             }
             let advertisements =
                 crate::local::local_fetch_advertisements(remote_git_dir, request.format)?;
+            let remote_config =
+                sley_config::read_repo_config(remote_common_git_dir, None).unwrap_or_default();
+            let mut promisor_decision = crate::PromisorRemoteDecision::default();
+            if let Some(capability) = crate::promisor_remote_server_capability(&remote_config)? {
+                let advertised = format!(
+                    "promisor-remote={}\n",
+                    capability.value.as_deref().unwrap_or("")
+                );
+                sley_protocol::trace_packet_read_payload(advertised.as_bytes());
+                promisor_decision =
+                    crate::decide_promisor_remote_reply(request.config, &capability)?;
+                outcome.accepted_promisor_remotes = promisor_decision.accepted.clone();
+                if let Some(reply) = promisor_decision.reply.as_deref() {
+                    sley_protocol::trace_packet_write_payload(
+                        format!("promisor-remote={reply}\n").as_bytes(),
+                    );
+                }
+            }
             // The remote's advertised HEAD symref target (e.g. `refs/heads/main`),
             // used by the CLI to create `refs/remotes/<remote>/HEAD` on a default
             // fetch — parity with the network transports' `head_symref`.
@@ -708,7 +728,8 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             {
                 outcome.head_symref = Some(target);
             }
-            let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, request.format);
+            let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, request.format)
+                .with_promisor_remote_present(crate::config_has_promisor_remote(&remote_config));
             // Shallow fetch: the in-process upload-pack needs its deepen plan up
             // front. The boundary walk starts from the primary planned tips
             // (upload-pack's `want_obj`) — auto-followed tags are this path's
@@ -937,7 +958,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 }
                 Vec::new()
             } else {
-                crate::local::install_fetch_pack_via_local_upload_pack(
+                crate::local::install_fetch_pack_via_local_upload_pack_with_promisor_decision(
                     request.git_dir,
                     remote_git_dir,
                     request.format,
@@ -949,6 +970,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     negotiation_haves.clone(),
                     options.refetch,
                     local_fetch_unpack_limit(request.git_dir, promisor_remote),
+                    &promisor_decision,
                 )?
             };
             if !options.dry_run {
@@ -2305,7 +2327,9 @@ pub fn append_reachable_auto_follow_tags(
         Some(excluded) => {
             collect_reachable_object_ids_excluding(remote_db, format, starts, excluded)?
         }
-        None => collect_reachable_object_ids(remote_db, format, starts)?,
+        None => {
+            collect_reachable_object_ids_tolerating_promised_missing(remote_db, format, starts)?
+        }
     };
     let fetched_srcs = updates
         .iter()

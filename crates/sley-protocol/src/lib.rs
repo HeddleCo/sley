@@ -3,6 +3,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod pktline;
+mod promisor;
 mod receive_pack;
 mod sideband;
 mod upload_pack;
@@ -14,6 +15,7 @@ mod v2;
 mod tests;
 
 pub use pktline::*;
+pub use promisor::*;
 pub use sideband::*;
 pub use v0::*;
 

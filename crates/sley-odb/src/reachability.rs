@@ -104,6 +104,21 @@ where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
 {
+    walk_reachable_objects_excluding_promised_missing(reader, format, starts, excluded, |_, _| {})
+}
+
+fn walk_reachable_objects_excluding_promised_missing<R, I, F>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    mut visit: F,
+) -> Result<HashSet<ObjectId>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+    F: FnMut(&ObjectId, &Arc<EncodedObject>),
+{
     let mut seen = HashSet::new();
     let mut pending: Vec<ObjectId> = starts.into_iter().collect();
     while let Some(oid) = pending.pop() {
@@ -121,10 +136,12 @@ where
         match object.object_type {
             ObjectType::Commit => {
                 let commit = Commit::parse_ref(format, &object.body)?;
+                visit(&oid, &object);
                 pending.extend(grafted_parents(reader, &oid, commit.parents));
                 pending.push(commit.tree);
             }
             ObjectType::Tree => {
+                visit(&oid, &object);
                 for entry in TreeEntries::new(format, &object.body) {
                     let entry = entry?;
                     if !entry.is_gitlink() {
@@ -134,9 +151,10 @@ where
             }
             ObjectType::Tag => {
                 let tag = Tag::parse_ref(format, &object.body)?;
+                visit(&oid, &object);
                 pending.push(tag.object);
             }
-            ObjectType::Blob => {}
+            ObjectType::Blob => visit(&oid, &object),
         }
     }
     Ok(seen)
@@ -194,6 +212,32 @@ where
             object: Arc::clone(object),
         });
     })?;
+    Ok(objects)
+}
+
+fn collect_reachable_pack_objects_tolerating_promised_missing<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+) -> Result<Vec<ReachablePackObject>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    let mut objects = Vec::new();
+    walk_reachable_objects_excluding_promised_missing(
+        reader,
+        format,
+        starts,
+        excluded,
+        |oid, object| {
+            objects.push(ReachablePackObject {
+                oid: *oid,
+                object: Arc::clone(object),
+            });
+        },
+    )?;
     Ok(objects)
 }
 
@@ -473,6 +517,16 @@ pub enum PackObjectFilter {
     SparsePathSet(Vec<String>),
 }
 
+/// How a transfer-pack walk treats objects promised by an incomplete source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReachablePackMissingPolicy {
+    /// Missing reachable objects are transfer errors.
+    #[default]
+    RequireComplete,
+    /// Omit only objects proven to be promised by the source repository.
+    OmitPromised,
+}
+
 /// [`build_and_install_reachable_pack`] with an optional partial-clone
 /// `filter`. With `Some(BlobNone)`, blobs are dropped from the pack unless
 /// they are directly wanted (named in `starts`).
@@ -578,9 +632,50 @@ where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
 {
+    build_and_install_reachable_pack_filtered_with_missing_policy(
+        source,
+        destination,
+        format,
+        starts,
+        excluded,
+        options,
+        filter,
+        unpack_limit,
+        ReachablePackMissingPolicy::RequireComplete,
+    )
+}
+
+/// Build and install a filtered transfer pack with an explicit promised-object
+/// policy. The omission mode is reserved for a server whose client accepted a
+/// protocol-v2 `promisor-remote` advertisement.
+#[allow(clippy::too_many_arguments)]
+pub fn build_and_install_reachable_pack_filtered_with_missing_policy<R, I>(
+    source: &R,
+    destination: &FileObjectDatabase,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    options: RawPackInstallOptions,
+    filter: Option<PackObjectFilter>,
+    unpack_limit: Option<usize>,
+    missing_policy: ReachablePackMissingPolicy,
+) -> Result<Option<PackInstallResult>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
     let starts: Vec<ObjectId> = starts.into_iter().collect();
     let wanted: HashSet<ObjectId> = starts.iter().copied().collect();
-    let mut objects = collect_reachable_pack_objects(source, format, starts, excluded)?;
+    let mut objects = match missing_policy {
+        ReachablePackMissingPolicy::RequireComplete => {
+            collect_reachable_pack_objects(source, format, starts, excluded)?
+        }
+        ReachablePackMissingPolicy::OmitPromised => {
+            collect_reachable_pack_objects_tolerating_promised_missing(
+                source, format, starts, excluded,
+            )?
+        }
+    };
     retain_filtered_pack_objects(&mut objects, filter.as_ref(), &wanted, source, format)?;
     if objects.is_empty() {
         return Ok(None);

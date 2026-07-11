@@ -265,7 +265,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         ssh_options: request.options.ssh_options,
         upload_pack_command: request.options.upload_pack_command,
     });
-    fetch(
+    let fetch_outcome = fetch(
         crate::fetch::FetchRequest {
             git_dir: &git_dir,
             format: request.format,
@@ -373,7 +373,14 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
     // not change the config `configure_branch` returns.
     let checkout_config = (services.configure_branch)(&git_dir, request.options.checkout_branch)?;
     if request.options.checkout {
-        fetch_partial_clone_checkout_blobs(&request, &git_dir, branch_oid, services.credentials)?;
+        fetch_partial_clone_checkout_blobs(
+            &request,
+            &git_dir,
+            branch_oid,
+            &config,
+            &fetch_outcome.accepted_promisor_remotes,
+            services.credentials,
+        )?;
     } else {
         let mut tx = store.transaction();
         tx.update(RefUpdate {
@@ -446,6 +453,8 @@ fn fetch_partial_clone_checkout_blobs(
     request: &CloneRequest<'_>,
     git_dir: &Path,
     commit_oid: ObjectId,
+    config: &GitConfig,
+    accepted_promisors: &[sley_protocol::PromisorRemoteAdvertisement],
     credentials: &mut dyn CredentialProvider,
 ) -> Result<()> {
     if request.options.filter.is_none() {
@@ -468,9 +477,25 @@ fn fetch_partial_clone_checkout_blobs(
                 &mut seen,
                 &mut wants,
             )?;
+            let relative_base = git_dir.parent().unwrap_or(git_dir);
+            let mut hydration_git_dir = remote_git_dir.clone();
+            for advertised in accepted_promisors {
+                let url = config
+                    .get("remote", Some(&advertised.name), "url")
+                    .filter(|url| !url.is_empty())
+                    .unwrap_or(&advertised.url);
+                if let Ok(crate::fetch::FetchSource::Local {
+                    git_dir: accepted_git_dir,
+                    ..
+                }) = crate::fetch_source_for_url(url, relative_base)
+                {
+                    hydration_git_dir = accepted_git_dir;
+                    break;
+                }
+            }
             crate::local::install_fetch_pack_via_local_upload_pack(
                 git_dir,
-                remote_git_dir,
+                &hydration_git_dir,
                 request.format,
                 wants,
                 None,

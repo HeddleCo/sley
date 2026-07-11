@@ -21,9 +21,11 @@ use sley_core::{
 };
 use sley_object::{Commit, ObjectType, Tag};
 use sley_odb::{
-    FileObjectDatabase, ObjectReader, RawPackInstallOptions, build_and_install_reachable_pack,
-    build_and_install_reachable_pack_filtered, build_reachable_pack, build_reachable_pack_filtered,
-    collect_reachable_object_ids,
+    FileObjectDatabase, ObjectReader, RawPackInstallOptions, ReachablePackMissingPolicy,
+    build_and_install_reachable_pack,
+    build_and_install_reachable_pack_filtered_with_missing_policy, build_reachable_pack,
+    build_reachable_pack_filtered, collect_reachable_object_ids,
+    collect_reachable_object_ids_tolerating_promised_missing,
 };
 use sley_protocol::{
     PKT_LINE_MAX_PAYLOAD_LEN, PktLineFrame, ProtocolV2FetchAcknowledgment, ProtocolV2FetchFeatures,
@@ -1092,6 +1094,41 @@ pub fn install_fetch_pack_via_local_upload_pack(
     refetch: bool,
     unpack_limit: Option<usize>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
+    install_fetch_pack_via_local_upload_pack_with_promisor_decision(
+        git_dir,
+        remote_git_dir,
+        format,
+        wants,
+        deepen,
+        promisor,
+        record_promisor_refs,
+        filter,
+        custom_haves,
+        refetch,
+        unpack_limit,
+        &crate::PromisorRemoteDecision::default(),
+    )
+}
+
+/// Local upload-pack with the typed protocol-v2 promisor decision carried into
+/// pack traversal. Accepted remotes allow promised gaps to be omitted; an empty
+/// decision requires the server to hydrate those gaps from its configured
+/// local/file promisors before constructing the transfer pack.
+#[allow(clippy::too_many_arguments)]
+pub fn install_fetch_pack_via_local_upload_pack_with_promisor_decision(
+    git_dir: &Path,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    wants: Vec<ObjectId>,
+    deepen: Option<&LocalDeepenPlan>,
+    promisor: bool,
+    record_promisor_refs: bool,
+    filter: Option<sley_odb::PackObjectFilter>,
+    custom_haves: Option<Vec<ObjectId>>,
+    refetch: bool,
+    unpack_limit: Option<usize>,
+    promisor_decision: &crate::PromisorRemoteDecision,
+) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if wants.is_empty() {
         return Ok(Vec::new());
     }
@@ -1156,14 +1193,9 @@ pub fn install_fetch_pack_via_local_upload_pack(
         read_upload_pack_negotiation_request(format, &mut encoded_negotiation.as_slice())?;
     sley_core::trace2::data("negotiation_v2", "total_rounds", 1);
 
-    let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
-    for want in &decoded_request.wants {
-        if !remote_db.contains(want)? {
-            return Err(GitError::InvalidObject(format!(
-                "upload-pack requested missing object {want}"
-            )));
-        }
-    }
+    let remote_has_promisor = repo_has_promisor_remote(remote_git_dir);
+    let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format)
+        .with_promisor_remote_present(remote_has_promisor);
     let known_haves = decoded_negotiation
         .haves
         .into_iter()
@@ -1217,7 +1249,24 @@ pub fn install_fetch_pack_via_local_upload_pack(
         excluded.extend(plan.excluded.iter().copied());
         starts.extend(plan.extra_wants.iter().copied());
     }
-    let install = build_and_install_reachable_pack_filtered(
+    if remote_has_promisor && promisor_decision.accepted.is_empty() {
+        hydrate_reachable_promised_objects(remote_git_dir, &remote_db, format, &starts)?;
+    }
+    for want in &starts {
+        if !remote_db.contains(want)?
+            && (promisor_decision.accepted.is_empty() || !remote_db.is_promised_object(want))
+        {
+            return Err(GitError::InvalidObject(format!(
+                "upload-pack requested missing object {want}"
+            )));
+        }
+    }
+    let missing_policy = if promisor_decision.accepted.is_empty() {
+        ReachablePackMissingPolicy::RequireComplete
+    } else {
+        ReachablePackMissingPolicy::OmitPromised
+    };
+    let install = build_and_install_reachable_pack_filtered_with_missing_policy(
         &remote_db,
         &local_db,
         format,
@@ -1229,6 +1278,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
         },
         filter.clone(),
         unpack_limit,
+        missing_policy,
     )?;
     if promisor
         && record_promisor_refs
@@ -1240,6 +1290,90 @@ pub fn install_fetch_pack_via_local_upload_pack(
     Ok(deepen
         .map(|plan| plan.shallow_info.clone())
         .unwrap_or_default())
+}
+
+fn hydrate_reachable_promised_objects(
+    remote_git_dir: &Path,
+    remote_db: &FileObjectDatabase,
+    format: ObjectFormat,
+    starts: &[ObjectId],
+) -> Result<()> {
+    let config = sley_config::read_repo_config(remote_git_dir, None).unwrap_or_default();
+    let relative_base = if remote_git_dir
+        .file_name()
+        .is_some_and(|name| name == ".git")
+    {
+        remote_git_dir.parent().unwrap_or(remote_git_dir)
+    } else {
+        remote_git_dir
+    };
+
+    loop {
+        let reachable = collect_reachable_object_ids_tolerating_promised_missing(
+            remote_db,
+            format,
+            starts.iter().copied(),
+        )?;
+        let mut missing = reachable
+            .into_iter()
+            .filter_map(|oid| match remote_db.contains(&oid) {
+                Ok(false) if remote_db.is_promised_object(&oid) => Some(Ok(oid)),
+                Ok(_) => None,
+                Err(err) => Some(Err(err)),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        missing.sort_by_key(ObjectId::to_hex);
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let before = missing.len();
+        for remote_name in sley_config::remotes::remote_names(&config)
+            .into_iter()
+            .filter(|name| {
+                config
+                    .get_bool("remote", Some(name), "promisor")
+                    .unwrap_or(false)
+            })
+        {
+            let Some(url) = config
+                .get("remote", Some(&remote_name), "url")
+                .filter(|url| !url.is_empty())
+            else {
+                continue;
+            };
+            let Ok(crate::fetch::FetchSource::Local {
+                git_dir: promisor_git_dir,
+                ..
+            }) = crate::fetch_source_for_url(url, relative_base)
+            else {
+                continue;
+            };
+            for oid in missing.iter().copied() {
+                let _ = install_fetch_pack_via_local_upload_pack(
+                    remote_git_dir,
+                    &promisor_git_dir,
+                    format,
+                    vec![oid],
+                    None,
+                    true,
+                    false,
+                    None,
+                    Some(Vec::new()),
+                    false,
+                    None,
+                );
+            }
+            remote_db.refresh_read_cache();
+            missing.retain(|oid| !remote_db.contains(oid).unwrap_or(false));
+            if missing.is_empty() {
+                break;
+            }
+        }
+        if missing.len() == before {
+            return Err(GitError::object_not_found(missing[0]));
+        }
+    }
 }
 
 /// Inputs for one in-process protocol-v2 fetch using `want-ref`.
@@ -1594,6 +1728,9 @@ fn upload_pack_v2_capabilities(
             name: "session-id".into(),
             value: Some("sley".into()),
         });
+    }
+    if let Some(capability) = crate::promisor_remote_server_capability(config)? {
+        capabilities.push(capability);
     }
     // Advertise the `bundle-uri` command when the server is configured to hand
     // out bundle URIs (upstream `bundle_uri_advertise` reads
@@ -2503,6 +2640,110 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn accepted_promisor_omits_gap_while_rejection_hydrates_server() {
+        let root = unique_local_test_dir("promisor-traversal-policy");
+        let origin_git = root.join("origin.git");
+        let server_git = root.join("server.git");
+        let lop_git = root.join("lop.git");
+        let accepted_git = root.join("accepted.git");
+        let rejected_git = root.join("rejected.git");
+        for git_dir in [
+            &origin_git,
+            &server_git,
+            &lop_git,
+            &accepted_git,
+            &rejected_git,
+        ] {
+            fs::create_dir_all(git_dir.join("objects")).expect("test repository objects");
+            fs::create_dir_all(git_dir.join("refs")).expect("test repository refs");
+            fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+                .expect("test repository HEAD");
+        }
+
+        let format = ObjectFormat::Sha1;
+        let origin_db = FileObjectDatabase::from_git_dir(&origin_git, format);
+        let blob = EncodedObject::new(ObjectType::Blob, b"promised payload\n".to_vec());
+        let blob_oid = write_test_object(&origin_db, &blob);
+        let tree_oid =
+            write_test_object(&origin_db, &test_tree(&[(0o100644, b"payload", blob_oid)]));
+        let commit_oid = write_test_object(&origin_db, &test_commit(tree_oid, &[], b"tip\n"));
+        write_test_object(&FileObjectDatabase::from_git_dir(&lop_git, format), &blob);
+
+        sley_odb::build_and_install_reachable_pack_filtered(
+            &origin_db,
+            &FileObjectDatabase::from_git_dir(&server_git, format),
+            format,
+            vec![commit_oid],
+            &HashSet::new(),
+            RawPackInstallOptions {
+                promisor: true,
+                ..Default::default()
+            },
+            Some(sley_odb::PackObjectFilter::BlobNone),
+            None,
+        )
+        .expect("create incomplete promisor server")
+        .expect("promisor pack");
+        fs::write(
+            server_git.join("config"),
+            format!(
+                "[remote \"lop\"]\n\tpromisor = true\n\turl = {}\n",
+                lop_git.display()
+            ),
+        )
+        .expect("server promisor config");
+
+        let advertisement = sley_protocol::PromisorRemoteAdvertisement {
+            name: "lop".into(),
+            url: lop_git.to_string_lossy().into_owned(),
+            partial_clone_filter: None,
+            token: None,
+        };
+        install_fetch_pack_via_local_upload_pack_with_promisor_decision(
+            &accepted_git,
+            &server_git,
+            format,
+            vec![commit_oid],
+            None,
+            true,
+            false,
+            Some(sley_odb::PackObjectFilter::BlobNone),
+            Some(Vec::new()),
+            false,
+            None,
+            &crate::PromisorRemoteDecision {
+                accepted: vec![advertisement],
+                reply: Some("lop".into()),
+            },
+        )
+        .expect("accepted promisor transfer");
+        let server_db = FileObjectDatabase::from_git_dir(&server_git, format);
+        assert!(!server_db.contains(&blob_oid).expect("server object lookup"));
+
+        install_fetch_pack_via_local_upload_pack(
+            &rejected_git,
+            &server_git,
+            format,
+            vec![commit_oid],
+            None,
+            true,
+            false,
+            Some(sley_odb::PackObjectFilter::BlobNone),
+            Some(Vec::new()),
+            false,
+            None,
+        )
+        .expect("rejected promisor transfer hydrates server");
+        server_db.refresh_read_cache();
+        assert!(
+            server_db
+                .contains(&blob_oid)
+                .expect("hydrated server lookup")
+        );
+        fs::remove_dir_all(root).expect("remove test repositories");
     }
 
     fn unique_local_test_dir(name: &str) -> std::path::PathBuf {

@@ -189,6 +189,12 @@ pub use protocol::{
     transport_scheme_for_remote, transport_scheme_for_url,
 };
 
+mod promisor;
+pub use promisor::{
+    PromisorAcceptPolicy, PromisorRemoteDecision, config_has_promisor_remote,
+    decide_promisor_remote_reply, promisor_accept_policy, promisor_remote_server_capability,
+};
+
 mod resolve;
 pub use resolve::{
     RemoteResolutionContext, ResolvedRemote, discover_local_git_dir, fetch_source_for_url,
