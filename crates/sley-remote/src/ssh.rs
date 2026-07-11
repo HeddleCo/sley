@@ -33,7 +33,7 @@ use crate::install::{
     install_upload_pack_raw_promisor_response_from_reader,
     install_upload_pack_raw_response_from_reader,
     install_upload_pack_shallow_raw_promisor_response_from_reader,
-    install_upload_pack_shallow_raw_response_from_reader,
+    install_upload_pack_shallow_raw_response_from_reader, ProgressInstaller,
 };
 use sley_odb::FileObjectDatabase;
 use sley_protocol::write_pkt_line_payload;
@@ -49,7 +49,7 @@ use sley_transport::{
     RemoteTransport, RemoteUrl, SshCommandVariant, SshIpVersion, ssh_process_args_with_ip,
 };
 
-use crate::{PushOutcome, PushRequest};
+use crate::{ProgressSink, PushOutcome, PushRequest};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SshTransportOptions {
@@ -885,6 +885,7 @@ pub struct SshFetchPackRequest<'a> {
 
 pub fn install_fetch_pack_via_ssh_upload_pack(
     request: SshFetchPackRequest<'_>,
+    progress: &mut dyn ProgressSink,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if request.wants.is_empty() {
         return Ok(Vec::new());
@@ -938,7 +939,7 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
             let (shallow_info, _) = install_upload_pack_shallow_raw_response_from_reader(
                 request.format,
                 &mut stdout,
-                &local_db,
+                &ProgressInstaller::new(&local_db, progress),
                 request.max_input_size,
             )?;
             shallow_info
@@ -952,7 +953,12 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
                 request.max_input_size,
             )?;
         } else {
-            install_upload_pack_raw_response_from_reader(request.format, &mut stdout, &local_db, request.max_input_size)?;
+            install_upload_pack_raw_response_from_reader(
+                request.format,
+                &mut stdout,
+                &ProgressInstaller::new(&local_db, progress),
+                request.max_input_size,
+            )?;
         }
         Vec::new()
     };

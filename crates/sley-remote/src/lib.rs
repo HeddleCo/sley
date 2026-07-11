@@ -216,6 +216,23 @@ impl CredentialProvider for NoCredentials {
     }
 }
 
+/// Structured transfer statistics during a fetch/clone pack receive+index.
+/// All monotonic within one operation; reset per operation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransferProgress {
+    /// Wire/pack bytes received so far. THE KB counter. No reliable total
+    /// (smart-HTTP doesn't announce pack size up front).
+    pub received_bytes: u64,
+    /// Objects received/parsed from the pack so far.
+    pub received_objects: u64,
+    /// Total objects the server announced (pack header), once known — the
+    /// denominator for an object-count percentage. `None` until the header
+    /// is read.
+    pub total_objects: Option<u64>,
+    /// Deltas resolved during the resolving-deltas phase (surface if cheap).
+    pub indexed_deltas: u64,
+}
+
 /// Receives human-facing progress and summary events from an operation (the
 /// "To <remote>" push summary, prune notices, "Cloning into…", etc.). The
 /// orchestration returns structured outcomes regardless; this is purely for
@@ -223,6 +240,8 @@ impl CredentialProvider for NoCredentials {
 pub trait ProgressSink {
     /// A free-form progress or summary line.
     fn message(&mut self, _message: &str) {}
+    /// Structured transfer progress. Default: ignore (keeps existing impls valid).
+    fn transfer(&mut self, _progress: TransferProgress) {}
 }
 
 /// A [`ProgressSink`] that discards every event.

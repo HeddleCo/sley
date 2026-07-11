@@ -2042,7 +2042,7 @@ fn run_push(
 ) -> Result<()> {
     let config = repo_config_with_transport_policy(git_dir).unwrap_or_default();
     let mut credentials = sley_remote::CredentialHelperProvider::new(Some(&config));
-    let mut progress = StdoutProgress;
+    let mut progress = StdoutProgress::default();
     let remote_options = sley_remote::PushOptions {
         quiet: options.quiet,
         force: options.force,

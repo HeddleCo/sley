@@ -1140,7 +1140,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         reject_shallow: reject_shallow_config.unwrap_or(false),
     };
     let mut credentials = sley_remote::NoCredentials;
-    let mut progress_sink = StdoutProgress;
+    let mut progress_sink = StdoutProgress::default();
     let outcome = sley_remote::clone(
         sley_remote::CloneRequest {
             destination: &checkout_destination,
@@ -1758,7 +1758,7 @@ fn clone_network_repository(
         reject_shallow: options.reject_shallow,
     };
     let mut credentials = sley_remote::NoCredentials;
-    let mut progress = StdoutProgress;
+    let mut progress = StdoutProgress::new(options.quiet);
     let http_client = matches!(transport, CloneNetworkTransport::Http)
         .then(sley_remote::new_http_client);
     let prefetch_handshake = v2_handshake.clone();

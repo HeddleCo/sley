@@ -436,11 +436,13 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     pack_request,
                     handshake,
                     services.credentials,
+                    services.progress,
                 )?
             } else {
                 crate::http::install_fetch_pack_via_http_upload_pack(
                     pack_request,
                     services.credentials,
+                    services.progress,
                 )?
             };
             reject_shallow_clone_fetch(&options, &shallow_info)?;
@@ -523,6 +525,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     command_options: ssh_options,
                     max_input_size,
                 },
+                services.progress,
             )?;
             reject_shallow_clone_fetch(&options, &shallow_info)?;
             if !options.dry_run {
@@ -591,6 +594,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     protocol_v2: discovered.protocol_v2,
                     max_input_size,
                 },
+                services.progress,
             )?;
             reject_shallow_clone_fetch(&options, &shallow_info)?;
             if !options.dry_run {

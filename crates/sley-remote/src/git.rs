@@ -17,7 +17,7 @@ use crate::install::{
     install_upload_pack_raw_response_from_reader,
     install_upload_pack_shallow_raw_promisor_response_from_reader,
     install_upload_pack_shallow_raw_response_from_reader,
-    shallow_info_from_protocol_v2_fetch_header,
+    shallow_info_from_protocol_v2_fetch_header, ProgressInstaller,
 };
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::FileObjectDatabase;
@@ -37,7 +37,7 @@ use sley_refs::FileRefStore;
 use sley_transport::{write_service_request, RemoteTransport, RemoteUrl, ServiceRequest};
 
 use crate::git_proxy::GitConnection;
-use crate::{PushOutcome, PushRequest};
+use crate::{ProgressSink, PushOutcome, PushRequest};
 
 const GIT_DAEMON_PORT: u16 = 9418;
 
@@ -205,6 +205,7 @@ pub fn git_upload_pack_advertisements_with_protocol(
 
 pub fn install_fetch_pack_via_git_upload_pack(
     request: GitFetchPackRequest<'_>,
+    progress: &mut dyn ProgressSink,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if request.wants.is_empty() {
         return Ok(Vec::new());
@@ -219,7 +220,7 @@ pub fn install_fetch_pack_via_git_upload_pack(
         .map(Ok)
         .unwrap_or_else(|| crate::local::local_have_oids(request.git_dir, request.format))?;
     if request.protocol_v2 {
-        return git_protocol_v2_fetch_into_repository(&request, haves, &local_db);
+        return git_protocol_v2_fetch_into_repository(&request, haves, &local_db, progress);
     }
 
     let upload_request = UploadPackRequest {
@@ -252,7 +253,7 @@ pub fn install_fetch_pack_via_git_upload_pack(
             let (shallow_info, _) = install_upload_pack_shallow_raw_response_from_reader(
                 request.format,
                 &mut stream,
-                &local_db,
+                &ProgressInstaller::new(&local_db, progress),
                 request.max_input_size,
             )?;
             shallow_info
@@ -270,7 +271,7 @@ pub fn install_fetch_pack_via_git_upload_pack(
         install_upload_pack_raw_response_from_reader(
             request.format,
             &mut stream,
-            &local_db,
+            &ProgressInstaller::new(&local_db, progress),
             request.max_input_size,
         )?;
     }
@@ -569,6 +570,7 @@ fn git_protocol_v2_fetch_into_repository(
     request: &GitFetchPackRequest<'_>,
     haves: Vec<ObjectId>,
     local_db: &FileObjectDatabase,
+    progress: &mut dyn ProgressSink,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     let mut stream = connect_git_service(
         request.remote,
@@ -608,7 +610,7 @@ fn git_protocol_v2_fetch_into_repository(
             request.format,
             &mut stream,
             v2_features.sideband_all,
-            local_db,
+            &ProgressInstaller::new(local_db, progress),
             request.max_input_size,
         )?
     };

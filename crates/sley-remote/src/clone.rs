@@ -554,14 +554,23 @@ fn fetch_http_partial_clone_checkout_blobs(
         // are explicitly requesting, so suppress haves for this top-up fetch.
         omit_haves: true,
     };
+    // This targeted blob top-up installs a `.promisor` pack (the promisor
+    // install path does not surface transfer progress), so a silent sink is
+    // sufficient here.
+    let mut progress = crate::SilentProgress;
     if let Some(handshake) = discovered.handshake.as_ref() {
         crate::http::install_fetch_pack_via_http_protocol_v2_fetch(
             pack_request,
             handshake,
             credentials,
+            &mut progress,
         )?;
     } else {
-        crate::http::install_fetch_pack_via_http_upload_pack(pack_request, credentials)?;
+        crate::http::install_fetch_pack_via_http_upload_pack(
+            pack_request,
+            credentials,
+            &mut progress,
+        )?;
     }
     Ok(())
 }
