@@ -553,6 +553,7 @@ fn fetch_http_partial_clone_checkout_blobs(
         deepen_not: Vec::new(),
         deepen_relative: false,
         git_protocol: git_protocol.as_deref(),
+        post_buffer: crate::http::http_post_buffer(None),
         // The client already has the checkout commit and its trees; advertising
         // them as haves would make the server omit the (filtered-out) blobs we
         // are explicitly requesting, so suppress haves for this top-up fetch.

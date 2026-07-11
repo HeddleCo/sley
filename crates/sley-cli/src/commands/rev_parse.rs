@@ -2176,7 +2176,9 @@ fn display_git_path(
     if let Some(path) = display_git_path_env_override(cwd, path_format, path)? {
         return Ok(path);
     }
-    if let Some(path) = display_git_path_hooks_override(cwd, git_dir, path_format, path)? {
+    if let Some(path) =
+        display_git_path_hooks_override(cli_session, cwd, git_dir, path_format, path)?
+    {
         return Ok(path);
     }
     let base = git_path_base_dir(cli_session, git_dir, path)?;
@@ -2194,6 +2196,7 @@ fn display_git_path(
 }
 
 fn display_git_path_hooks_override(
+    cli_session: &crate::session::CliSession,
     cwd: &Path,
     git_dir: &Path,
     path_format: RevParsePathFormat,
@@ -2212,18 +2215,27 @@ fn display_git_path_hooks_override(
     let Some(configured) = config.get("core", None, "hookspath") else {
         return Ok(None);
     };
-    let base = PathBuf::from(configured);
+    let configured_base = PathBuf::from(configured);
+    let base = if configured_base.is_absolute() {
+        configured_base.clone()
+    } else {
+        let repository_root = worktree_root_for_git_dir(cli_session, git_dir)
+            .or_else(|_| fs::canonicalize(git_dir).map_err(GitError::from))?;
+        repository_root.join(&configured_base)
+    };
+    let target = if suffix.is_empty() {
+        base
+    } else {
+        base.join(suffix)
+    };
     match path_format {
-        RevParsePathFormat::Default => Ok(Some(join_display_path(configured, suffix))),
-        RevParsePathFormat::Absolute => Ok(Some(
-            absolute_env_git_path(cwd, &base, suffix)?
-                .display()
-                .to_string(),
-        )),
-        RevParsePathFormat::Relative => {
-            let target = absolute_env_git_path(cwd, &base, suffix)?;
+        RevParsePathFormat::Default if configured_base.is_absolute() => {
+            Ok(Some(target.display().to_string()))
+        }
+        RevParsePathFormat::Default | RevParsePathFormat::Relative => {
             Ok(Some(relative_path_from_absolute(cwd, &target)?))
         }
+        RevParsePathFormat::Absolute => Ok(Some(target.display().to_string())),
     }
 }
 
@@ -2251,6 +2263,9 @@ fn git_path_base_dir(
 }
 
 fn git_path_is_common(path: &str) -> bool {
+    if git_path_normalized_components(path) == ["info", "sparse-checkout"] {
+        return false;
+    }
     if path == "config" || path == "packed-refs" || path == "shallow" {
         return true;
     }
@@ -2258,7 +2273,9 @@ fn git_path_is_common(path: &str) -> bool {
         || git_path_component_is(path, "hooks")
         || git_path_component_is(path, "info")
         || git_path_component_is(path, "objects")
+        || git_path_component_is(path, "remotes")
         || git_path_component_is(path, "worktrees")
+        || git_path_component_is(path, "common")
     {
         return true;
     }
@@ -2267,11 +2284,18 @@ fn git_path_is_common(path: &str) -> bool {
     }
     if let Some(logged) = path.strip_prefix("logs/") {
         return logged != "HEAD"
+            && logged != "HEAD.lock"
             && !logged
                 .strip_prefix("refs/")
                 .is_some_and(git_path_is_per_worktree_ref);
     }
     false
+}
+
+fn git_path_normalized_components(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|component| !component.is_empty())
+        .collect()
 }
 
 fn git_path_component_is(path: &str, component: &str) -> bool {
@@ -2289,6 +2313,11 @@ fn display_git_path_env_override(
     path_format: RevParsePathFormat,
     path: &str,
 ) -> Result<Option<String>> {
+    if git_path_normalized_components(path) == ["info", "grafts"]
+        && let Some(grafts) = env::var_os("GIT_GRAFT_FILE")
+    {
+        return display_env_git_path(cwd, path_format, PathBuf::from(grafts), "");
+    }
     if path == "index"
         && let Some(index) = env::var_os("GIT_INDEX_FILE")
     {
@@ -2303,6 +2332,11 @@ fn display_git_path_env_override(
         && let Some(objects) = env::var_os("GIT_OBJECT_DIRECTORY")
     {
         return display_env_git_path(cwd, path_format, PathBuf::from(objects), suffix);
+    }
+    if git_path_is_common(path)
+        && let Some(common) = env::var_os("GIT_COMMON_DIR")
+    {
+        return display_env_git_path(cwd, path_format, PathBuf::from(common), path);
     }
     Ok(None)
 }

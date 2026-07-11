@@ -365,6 +365,7 @@ fn dispatch_command(
         "branch" => commands::branch::cmd_branch(cli_session, &args[1..]),
         "bundle" => commands::plumbing::cmd_bundle(cli_session, &args[1..]),
         "hash-object" => commands::hash_object::cmd_hash_object(cli_session, &args[1..]),
+        "history" => commands::history::cmd_history(cli_session, &args[1..]),
         "index-pack" => commands::pack::cmd_index_pack(cli_session, &args[1..]),
         "pack-objects" => commands::pack_objects::cmd_pack_objects(cli_session, &args[1..]),
         "cat-file" => commands::cat_file::cmd_cat_file(cli_session, &args[1..]),

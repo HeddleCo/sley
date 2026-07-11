@@ -115,6 +115,10 @@ pub struct CacheEntry {
     /// git's `ce_stat_data`, carried forward from the source index on a kept
     /// entry. `None` when sourced from a tree or pending a worktree write.
     pub stat: Option<StatInfo>,
+    /// The logical entry is outside the sparse-checkout cone. Unpack-trees
+    /// still merges it in memory, but must not materialize or remove its
+    /// worktree path.
+    skip_worktree: bool,
     /// git's `o->df_conflict_entry` sentinel marker. When `true`, this slot is
     /// not a real entry: it is the directory/file (D/F) conflict placeholder
     /// that `unpack_trees` synthesizes for a tree slot whose path is a
@@ -134,6 +138,7 @@ impl CacheEntry {
             oid,
             stage: 0,
             stat: None,
+            skip_worktree: false,
             df_conflict: false,
         }
     }
@@ -145,6 +150,7 @@ impl CacheEntry {
             oid,
             stage: 0,
             stat,
+            skip_worktree: false,
             df_conflict: false,
         }
     }
@@ -156,6 +162,7 @@ impl CacheEntry {
             oid,
             stage,
             stat: None,
+            skip_worktree: false,
             df_conflict: false,
         }
     }
@@ -168,6 +175,7 @@ impl CacheEntry {
             oid: ObjectId::null(ObjectFormat::Sha1),
             stage: 0,
             stat: None,
+            skip_worktree: false,
             df_conflict: true,
         }
     }
@@ -176,6 +184,11 @@ impl CacheEntry {
     /// `ce == o->df_conflict_entry`).
     pub fn is_df_conflict(&self) -> bool {
         self.df_conflict
+    }
+
+    fn with_skip_worktree(mut self, skip_worktree: bool) -> Self {
+        self.skip_worktree = skip_worktree;
+        self
     }
 }
 
@@ -799,7 +812,8 @@ fn merged_entry<P: WorktreeProbe + ?Sized>(
     // filled by the apply phase's post-write `lstat`); the `same(old)` branch
     // below copies the old entry's stat over, mirroring git's
     // `copy_cache_entry(merge, old)`.
-    let mut merge = CacheEntry::stage0(ce.mode, ce.oid);
+    let mut merge = CacheEntry::stage0(ce.mode, ce.oid)
+        .with_skip_worktree(ce.skip_worktree || old.is_some_and(|entry| entry.skip_worktree));
 
     match old {
         None => {
@@ -839,7 +853,8 @@ fn merged_entry<P: WorktreeProbe + ?Sized>(
         }
     }
 
-    state.add_entry(path, merge, update && opts.update && !opts.index_only);
+    let update_worktree = update && opts.update && !opts.index_only && !merge.skip_worktree;
+    state.add_entry(path, merge, update_worktree);
     Ok(())
 }
 
@@ -869,7 +884,9 @@ fn deleted_entry<P: WorktreeProbe + ?Sized>(
             }
         }
     }
-    state.add_removal(path);
+    if !old.is_some_and(|entry| entry.skip_worktree) {
+        state.add_removal(path);
+    }
     Ok(())
 }
 
@@ -939,10 +956,62 @@ pub type FlatTree = BTreeMap<Vec<u8>, (u32, ObjectId)>;
 /// `intent-to-add`-style entry whose stat git stores as all-zero.
 pub type IndexInputEntry = (u32, ObjectId, Option<StatInfo>);
 
-/// The current index as a flat stage-0 map: path → `(mode, oid, stat)`.
-/// Consumers build this from the on-disk index's stage-0 entries, carrying
-/// each entry's cached `lstat` data so the merge preserves it.
-pub type FlatIndex = BTreeMap<Vec<u8>, IndexInputEntry>;
+/// The current index as a flat stage-0 map plus its sparse worktree policy.
+///
+/// Collapsed sparse directories are expanded only in this logical view. Their
+/// prefixes remain recorded here so entries changed or newly added below them
+/// participate in the merge without being materialized in the worktree.
+#[derive(Debug, Clone, Default)]
+pub struct FlatIndex {
+    entries: BTreeMap<Vec<u8>, IndexInputEntry>,
+    skip_worktree_paths: std::collections::BTreeSet<Vec<u8>>,
+    sparse_directory_prefixes: Vec<Vec<u8>>,
+}
+
+impl FlatIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, path: Vec<u8>, entry: IndexInputEntry) -> Option<IndexInputEntry> {
+        self.entries.insert(path, entry)
+    }
+
+    /// Record an ordinary full-index entry carrying CE_SKIP_WORKTREE.
+    pub fn mark_skip_worktree(&mut self, path: Vec<u8>) {
+        self.skip_worktree_paths.insert(path);
+    }
+
+    /// Record the trailing-slash prefix of a collapsed sparse directory.
+    pub fn mark_sparse_directory(&mut self, prefix: Vec<u8>) {
+        self.sparse_directory_prefixes.push(prefix);
+    }
+
+    fn is_skip_worktree(&self, path: &[u8]) -> bool {
+        self.skip_worktree_paths.contains(path)
+            || self
+                .sparse_directory_prefixes
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+    }
+}
+
+impl std::ops::Deref for FlatIndex {
+    type Target = BTreeMap<Vec<u8>, IndexInputEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl FromIterator<(Vec<u8>, IndexInputEntry)> for FlatIndex {
+    fn from_iter<T: IntoIterator<Item = (Vec<u8>, IndexInputEntry)>>(iter: T) -> Self {
+        Self {
+            entries: iter.into_iter().collect(),
+            ..Self::default()
+        }
+    }
+}
 
 /// Whether a tree slot for `path` should be git's `o->df_conflict_entry` marker.
 ///
@@ -1126,9 +1195,10 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
         // directory in the index is handled by descending into it, and
         // `find_cache_entry` returns nothing for a directory prefix, so the
         // index slot is simply absent when this path is not a real index leaf.
-        src[0] = index
-            .get(path)
-            .map(|(mode, oid, stat)| CacheEntry::stage0_with_stat(*mode, *oid, *stat));
+        src[0] = index.get(path).map(|(mode, oid, stat)| {
+            CacheEntry::stage0_with_stat(*mode, *oid, *stat)
+                .with_skip_worktree(index.is_skip_worktree(path))
+        });
         for (i, tree) in trees.iter().enumerate() {
             let slot = i + 1;
             let stage = if !opts.merge {
@@ -1142,7 +1212,10 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
             };
             src[i + 1] = match tree.get(path) {
                 // A real leaf in this tree: take it at its slot's stage.
-                Some((mode, oid)) => Some(CacheEntry::staged(*mode, *oid, stage)),
+                Some((mode, oid)) => Some(
+                    CacheEntry::staged(*mode, *oid, stage)
+                        .with_skip_worktree(index.is_skip_worktree(path)),
+                ),
                 // Not a leaf here. If this path is a *directory* in this tree
                 // (some `path/…` exists) — git's `dirmask` bit — or an *ancestor
                 // directory* of this path is a *file* leaf in this tree — git's
@@ -1268,6 +1341,41 @@ mod tests {
 
     fn opts() -> UnpackTreesOptions {
         UnpackTreesOptions::new(ObjectFormat::Sha1)
+    }
+
+    #[test]
+    fn sparse_descendants_merge_logically_without_worktree_updates() {
+        let mut index = idx(&[(b"outside/changed", 1), (b"outside/deleted", 2)]);
+        index.mark_sparse_directory(b"outside/".to_vec());
+        let old = flat(&[(b"outside/changed", 1), (b"outside/deleted", 2)]);
+        let new = flat(&[(b"outside/changed", 3), (b"outside/added", 4)]);
+        let mut options = opts();
+        options.update = true;
+
+        let result = unpack_trees(
+            &index,
+            &[old, new],
+            MergeFn::TwoWay,
+            &options,
+            &NullWorktree,
+        )
+        .expect("merge collapsed sparse-directory descendants");
+
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| (entry.path.as_slice(), entry.entry.oid, entry.wt_update))
+                .collect::<Vec<_>>(),
+            [
+                (b"outside/added".as_slice(), oid(4), false),
+                (b"outside/changed".as_slice(), oid(3), false),
+            ]
+        );
+        assert!(
+            result.removed_paths.is_empty(),
+            "an absent skip-worktree descendant must not schedule a worktree removal"
+        );
     }
 
     /// A `WorktreeWriter` that records the order of `write_blob` / `remove_path`

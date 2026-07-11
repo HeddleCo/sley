@@ -532,6 +532,7 @@ fn rev_parse_git_path_matches_upstream_git() {
         let index_dir = root.join("custom-index-dir");
         fs::create_dir_all(&object_dir).expect("create custom object dir");
         fs::create_dir_all(&index_dir).expect("create custom index dir");
+        git(&root, &["--git-dir=custom-common", "init", "-q"]);
         for (args, envs) in [
             (
                 vec!["rev-parse", "--git-path", "objects/aa/bb"],
@@ -571,6 +572,22 @@ fn rev_parse_git_path_matches_upstream_git() {
                 vec!["rev-parse", "--path-format=relative", "--git-path", "index"],
                 vec![("GIT_INDEX_FILE", "custom-index-dir/index")],
             ),
+            (
+                vec!["rev-parse", "--git-path", "info/////grafts"],
+                vec![("GIT_GRAFT_FILE", "custom-grafts")],
+            ),
+            (
+                vec!["rev-parse", "--git-path", "logs/refs/heads/main"],
+                vec![("GIT_COMMON_DIR", "custom-common")],
+            ),
+            (
+                vec!["rev-parse", "--git-path", "common/file"],
+                vec![("GIT_COMMON_DIR", "custom-common")],
+            ),
+            (
+                vec!["rev-parse", "--git-path", "info/sparse-checkout"],
+                vec![("GIT_COMMON_DIR", "custom-common")],
+            ),
         ] {
             let expected = run_status_with_env(sley_testkit::oracle_git(), &root, &args, &envs);
             let actual = run_status_with_env(sley_testkit::sley_bin!(), &root, &args, &envs);
@@ -587,6 +604,35 @@ fn rev_parse_git_path_matches_upstream_git() {
         let expected = run_status(sley_testkit::oracle_git(), &root, &args);
         let actual = run_status(sley_testkit::sley_bin!(), &root, &args);
         assert_eq!(actual, expected, "configured hooks path differed");
+
+        for args in [
+            vec!["rev-parse", "--git-path", "hooks/abc"],
+            vec![
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "hooks/abc",
+            ],
+        ] {
+            let expected = run_status(sley_testkit::oracle_git(), &nested, &args);
+            let actual = run_status(sley_testkit::sley_bin!(), &nested, &args);
+            assert_eq!(actual, expected, "nested configured hooks path differed");
+        }
+
+        fs::write(
+            root.join(".git").join("config.worktree"),
+            b"[core]\n\thooksPath = .git/worktree-hooks\n",
+        )
+        .expect("write per-worktree config");
+        git(&root, &["config", "extensions.worktreeConfig", "true"]);
+        let expected = run_status(sley_testkit::oracle_git(), &nested, &args);
+        let actual = run_status(sley_testkit::sley_bin!(), &nested, &args);
+        assert_eq!(actual, expected, "enabled worktree config differed");
+
+        git(&root, &["config", "extensions.worktreeConfig", "false"]);
+        let expected = run_status(sley_testkit::oracle_git(), &nested, &args);
+        let actual = run_status(sley_testkit::sley_bin!(), &nested, &args);
+        assert_eq!(actual, expected, "disabled worktree config was not ignored");
     };
     let _ = fs::remove_dir_all(&root);
 }

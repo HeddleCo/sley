@@ -466,6 +466,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 deepen_not,
                 deepen_relative: options.deepen_relative,
                 git_protocol: git_protocol.as_deref(),
+                post_buffer: crate::http::http_post_buffer(Some(request.config)),
                 omit_haves: false,
             };
             let shallow_info = if discovered.set.protocol == ProtocolVersion::V2 {

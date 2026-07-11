@@ -1753,6 +1753,56 @@ fn local_fetch_v2_sections(
         }
     }
 
+    // Apply upload-pack's shallow request before constructing the pack. The
+    // HTTP server reaches this same in-process path, so rejecting an empty
+    // `deepen-since` selection and cutting the pack at the computed boundary
+    // must happen here rather than in a transport-specific client.
+    let deepen_plan = if request.deepen_since.is_some() || !request.deepen_not.is_empty() {
+        let advertisements = local_fetch_advertisements(git_dir, format)?;
+        let mut deepen_not = Vec::with_capacity(request.deepen_not.len());
+        for name in &request.deepen_not {
+            let advertisement = advertisements
+                .iter()
+                .find(|advertisement| {
+                    advertisement.name == *name
+                        || advertisement.name == format!("refs/tags/{name}")
+                        || advertisement.name == format!("refs/heads/{name}")
+                        || advertisement.name == format!("refs/{name}")
+                })
+                .ok_or_else(|| {
+                    GitError::Command(format!("git upload-pack: deepen-not is not a ref: {name}"))
+                })?;
+            deepen_not.push(advertisement.oid);
+        }
+        let since = request
+            .deepen_since
+            .map(|value| {
+                i64::try_from(value).map_err(|_| {
+                    GitError::InvalidFormat(format!("invalid deepen-since timestamp {value}"))
+                })
+            })
+            .transpose()?;
+        Some(compute_local_deepen_by_rev_list(
+            &db,
+            format,
+            &wants,
+            request.shallow.clone(),
+            since,
+            &deepen_not,
+        )?)
+    } else if let Some(depth) = request.deepen {
+        Some(compute_local_deepen(
+            &db,
+            format,
+            &wants,
+            request.shallow.clone(),
+            depth,
+            request.deepen_relative,
+        )?)
+    } else {
+        None
+    };
+
     // Shallow-info: when the served repository is itself shallow and the client
     // did not request any deepening, report the shallow boundary commits that are
     // reachable from the wants (upstream `send_shallow_info`, which does an
@@ -1776,6 +1826,12 @@ fn local_fetch_v2_sections(
                 sections.push(ProtocolV2FetchResponseSection::ShallowInfo(shallow_lines));
             }
         }
+    } else if let Some(plan) = deepen_plan.as_ref()
+        && !plan.shallow_info.is_empty()
+    {
+        sections.push(ProtocolV2FetchResponseSection::ShallowInfo(
+            plan.shallow_info.clone(),
+        ));
     }
 
     // Packfile section: build the reachable pack excluding the client's haves.
@@ -1785,7 +1841,11 @@ fn local_fetch_v2_sections(
             known_haves.push(*have);
         }
     }
-    let excluded = collect_reachable_object_ids(&db, format, known_haves)?;
+    let mut excluded = collect_reachable_object_ids(&db, format, known_haves)?;
+    if let Some(plan) = deepen_plan {
+        wants.extend(plan.extra_wants);
+        excluded.extend(plan.excluded);
+    }
     // Honor a partial-clone `filter` (blob:none / blob:limit=<n> / tree:<depth>):
     // upstream upload-pack applies the filter to the objects it packs. Without
     // this, a `--filter=blob:limit=0` clone would receive every blob and the
@@ -1983,6 +2043,36 @@ mod tests {
                 .expect("client object lookup")
         );
         fs::remove_dir_all(root).expect("remove test repositories");
+    }
+
+    #[test]
+    fn protocol_v2_upload_pack_rejects_deepen_since_after_every_commit() {
+        let git_dir = unique_local_test_dir("protocol-v2-empty-deepen-since");
+        fs::create_dir_all(git_dir.join("objects")).expect("test repository objects");
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("test repository HEAD");
+
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let tree_oid = write_test_object(&db, &test_tree(&[]));
+        let commit_oid = write_test_object(&db, &test_commit(tree_oid, &[], b"tip\n"));
+        let error = local_fetch_v2_sections(
+            &git_dir,
+            format,
+            &ProtocolV2FetchRequest {
+                wants: vec![commit_oid],
+                deepen_since: Some(1),
+                done: true,
+                ..ProtocolV2FetchRequest::default()
+            },
+        )
+        .expect_err("a cutoff after every commit must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("no commits selected for shallow requests")
+        );
+        fs::remove_dir_all(git_dir).expect("remove test repository");
     }
 
     #[test]

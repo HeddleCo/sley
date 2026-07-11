@@ -1,6 +1,7 @@
 //! Repository-level index transitions used by `read-tree` and unpack-trees consumers.
 
 use super::*;
+use crate::attributes::SparseMatcher;
 
 type LeafMap = BTreeMap<Vec<u8>, (u32, ObjectId)>;
 
@@ -397,16 +398,34 @@ pub fn read_current_unpack_index(
 ) -> Result<sley_unpack_trees::FlatIndex> {
     let mut out = sley_unpack_trees::FlatIndex::new();
     if let Some(index) = read_repository_index(git_dir, format)? {
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
         for entry in &index.entries {
-            if index_entry_stage(entry) == 0 {
-                out.insert(
-                    entry.path.as_bytes().to_vec(),
-                    (
-                        entry.mode,
-                        entry.oid,
-                        Some(stat_info_from_index_entry(entry)),
-                    ),
-                );
+            if index_entry_stage(entry) != 0 {
+                continue;
+            }
+            if entry.is_sparse_dir() {
+                let prefix = entry.path.as_bytes().to_vec();
+                out.mark_sparse_directory(prefix.clone());
+                for (relative, (mode, oid)) in
+                    sley_diff_merge::flatten_tree(&db, format, &entry.oid)?
+                {
+                    let mut path = prefix.clone();
+                    path.extend_from_slice(&relative);
+                    out.insert(path, (mode, oid, None));
+                }
+                continue;
+            }
+            let path = entry.path.as_bytes().to_vec();
+            out.insert(
+                path.clone(),
+                (
+                    entry.mode,
+                    entry.oid,
+                    Some(stat_info_from_index_entry(entry)),
+                ),
+            );
+            if entry.is_skip_worktree() {
+                out.mark_skip_worktree(path);
             }
         }
     }
@@ -415,15 +434,24 @@ pub fn read_current_unpack_index(
 
 /// Snapshot all current index paths, across every stage.
 pub fn read_current_index_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet<Vec<u8>>> {
-    Ok(read_repository_index(git_dir, format)?
-        .map(|index| {
-            index
-                .entries
-                .into_iter()
-                .map(|entry| entry.path.into_bytes())
-                .collect()
-        })
-        .unwrap_or_default())
+    let Some(index) = read_repository_index(git_dir, format)? else {
+        return Ok(BTreeSet::new());
+    };
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut paths = BTreeSet::new();
+    for entry in index.entries {
+        if entry.is_sparse_dir() {
+            let prefix = entry.path.into_bytes();
+            for (relative, _) in sley_diff_merge::flatten_tree(&db, format, &entry.oid)? {
+                let mut path = prefix.clone();
+                path.extend_from_slice(&relative);
+                paths.insert(path);
+            }
+        } else {
+            paths.insert(entry.path.into_bytes());
+        }
+    }
+    Ok(paths)
 }
 
 fn stat_info_from_index_entry(entry: &IndexEntry) -> sley_unpack_trees::StatInfo {
@@ -532,6 +560,18 @@ fn persist_read_tree_index(
     refresh_cache_tree(&mut index, &db);
     if let Some(previous) = previous {
         preserve_checkout_index_extensions(previous, &mut index, format)?;
+        if (previous.is_sparse() || previous.entries.iter().any(IndexEntry::is_sparse_dir))
+            && let Some((sparse, mode)) = active_sparse_checkout(git_dir)?
+            && sparse.sparse_index
+        {
+            let matcher = SparseMatcher::new(&sparse, mode);
+            for entry in &mut index.entries {
+                if entry.stage() == Stage::Normal {
+                    entry.set_skip_worktree(!matcher.includes_file(entry.path.as_bytes()));
+                }
+            }
+            collapse_to_sparse_index(&mut index, &matcher, &db, format)?;
+        }
     }
     write_repository_index_ref(git_dir, format, &index)
 }

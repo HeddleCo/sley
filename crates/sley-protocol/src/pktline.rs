@@ -363,7 +363,9 @@ pub fn read_pkt_line_frame(reader: &mut impl Read) -> Result<Option<PktLineFrame
         match reader.read(&mut header[read..]) {
             Ok(0) if read == 0 => return Ok(None),
             Ok(0) => {
-                return Err(GitError::InvalidFormat("truncated pkt-line length".into()));
+                return Err(GitError::InvalidFormat(format!(
+                    "{read} bytes of length header were received"
+                )));
             }
             Ok(n) => read += n,
             Err(err) if err.kind() == ErrorKind::Interrupted => {}
@@ -383,7 +385,20 @@ pub fn read_pkt_line_frame(reader: &mut impl Read) -> Result<Option<PktLineFrame
         }
         4..=PKT_LINE_MAX_LEN => {
             let mut payload = vec![0; len - 4];
-            reader.read_exact(&mut payload)?;
+            let mut read = 0usize;
+            while read < payload.len() {
+                match reader.read(&mut payload[read..]) {
+                    Ok(0) => {
+                        return Err(GitError::InvalidFormat(format!(
+                            "{} bytes of body are still expected",
+                            payload.len() - read
+                        )));
+                    }
+                    Ok(n) => read += n,
+                    Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
             PktLineFrame::Data(payload)
         }
         _ => {

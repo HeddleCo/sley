@@ -26,6 +26,14 @@ pub(crate) fn read_effective_repo_config(git_dir: &Path, cwd: &Path) -> Result<G
         repo_current_branch_name(git_dir),
     );
     let mut config = sley_config::load_effective_config(&common_git_dir, &context)?;
+    if config
+        .get_bool("extensions", None, "worktreeconfig")
+        .unwrap_or(false)
+    {
+        let worktree =
+            sley_config::load_config_with_includes(&git_dir.join("config.worktree"), &context)?;
+        config.sections.extend(worktree.sections);
+    }
     let parameters = injected_config_parameters()?;
     sley_config::append_injected_config_sections_with_includes(
         &mut config,

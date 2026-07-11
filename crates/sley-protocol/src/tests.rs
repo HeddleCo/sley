@@ -118,6 +118,19 @@ fn pkt_line_rejects_invalid_lengths() {
 }
 
 #[test]
+fn pkt_line_stream_reports_partial_header_and_body_counts() {
+    let header_error = read_pkt_line_frame(&mut &b"00"[..])
+        .expect_err("partial length header must fail")
+        .to_string();
+    assert!(header_error.contains("2 bytes of length header were received"));
+
+    let body_error = read_pkt_line_frame(&mut &b"0008ab"[..])
+        .expect_err("partial body must fail")
+        .to_string();
+    assert!(body_error.contains("2 bytes of body are still expected"));
+}
+
+#[test]
 fn pkt_line_rejects_oversized_data() {
     let payload = vec![b'x'; PKT_LINE_MAX_PAYLOAD_LEN + 1];
     assert!(PktLineFrame::data(payload.clone()).is_err());

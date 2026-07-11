@@ -635,19 +635,7 @@ pub(crate) fn cmd_status(cli_session: &crate::session::CliSession, args: &[Strin
 fn status_sparse_index_enabled(git_dir: &Path, cwd: &Path) -> Result<bool> {
     let effective = commands::remote::read_effective_repo_config(git_dir, cwd)
         .map_err(report_config_setup_error)?;
-    let worktree = GitConfig::read(git_dir.join("config.worktree")).unwrap_or_default();
-    let mut enabled = worktree
-        .get_bool("index", None, "sparse")
-        .or_else(|| effective.get_bool("index", None, "sparse"))
-        .unwrap_or(false);
-    for parameter in crate::injected_config_parameters()? {
-        if parameter.split_key() == ("index", None, "sparse") {
-            enabled = parameter.value.as_deref().map_or(true, |value| {
-                sley_config::parse_config_bool(value).unwrap_or(false)
-            });
-        }
-    }
-    Ok(enabled)
+    Ok(effective.get_bool("index", None, "sparse").unwrap_or(false))
 }
 
 fn apply_status_split_index_config(

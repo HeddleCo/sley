@@ -2270,7 +2270,7 @@ pub fn reset_index_to_commit(
             // preserves skip-worktree per leaf. Expand first so every path
             // beneath the directory contributes its previous bit.
             if prior.entries.iter().any(IndexEntry::is_sparse_dir) {
-                expand_sparse_index(&mut prior, &db, format)?;
+                expand_sparse_index_in_memory(&mut prior, &db, format)?;
             }
             prior
                 .entries
@@ -2501,7 +2501,11 @@ pub fn apply_sparse_checkout_with_mode(
     // it must never see a sparse-dir entry. (Re-collapse happens at the end when
     // a sparse index is requested.)
     if index.entries.iter().any(IndexEntry::is_sparse_dir) {
-        expand_sparse_index(&mut index, &db, format)?;
+        if sparse.sparse_index {
+            expand_sparse_index_in_memory(&mut index, &db, format)?;
+        } else {
+            expand_sparse_index(&mut index, &db, format)?;
+        }
     }
     let mut materialized = Vec::new();
     let mut skipped = Vec::new();
@@ -2677,11 +2681,31 @@ pub fn expand_sparse_index(
     db: &FileObjectDatabase,
     format: ObjectFormat,
 ) -> Result<bool> {
+    expand_sparse_index_impl(index, db, format, true)
+}
+
+/// Expand a sparse index only as an internal semantic view. The caller either
+/// preserves the on-disk sparse layout or immediately re-collapses it, so this
+/// must not advertise Git's observable `ensure_full_index` transition.
+pub(crate) fn expand_sparse_index_in_memory(
+    index: &mut Index,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<bool> {
+    expand_sparse_index_impl(index, db, format, false)
+}
+
+fn expand_sparse_index_impl(
+    index: &mut Index,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    emit_trace: bool,
+) -> Result<bool> {
     if !index.entries.iter().any(IndexEntry::is_sparse_dir) {
         // Still strip a stray `sdir` marker so the written index is recorded full.
         let had_marker = index.is_sparse();
         index.clear_sparse_extension()?;
-        if had_marker {
+        if had_marker && emit_trace {
             sley_core::trace2::region("index", "ensure_full_index");
         }
         return Ok(had_marker);
@@ -2708,7 +2732,9 @@ pub fn expand_sparse_index(
     index.entries = expanded;
     index.clear_sparse_extension()?;
     normalize_index_version_for_extended_flags(index);
-    sley_core::trace2::region("index", "ensure_full_index");
+    if emit_trace {
+        sley_core::trace2::region("index", "ensure_full_index");
+    }
     Ok(true)
 }
 

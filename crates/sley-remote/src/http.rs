@@ -38,9 +38,9 @@ use sley_protocol::{
     read_protocol_v2_fetch_response, read_protocol_v2_fetch_sideband_all_response,
     read_protocol_v2_ls_refs_response_as_ref_advertisement_set,
     smart_http_advertisement_content_type, smart_http_rpc_request_content_type,
-    smart_http_rpc_result_content_type, validate_protocol_v2_fetch_command_request,
-    validate_protocol_v2_ls_refs_command_request, write_protocol_v2_command_request,
-    write_upload_pack_negotiation_request, write_upload_pack_request,
+    validate_protocol_v2_fetch_command_request, validate_protocol_v2_ls_refs_command_request,
+    write_protocol_v2_command_request, write_upload_pack_negotiation_request,
+    write_upload_pack_request,
 };
 use sley_transport::{
     GitProtocolHeader, HttpClient, HttpResponse, RemoteTransport, RemoteUrl,
@@ -437,7 +437,6 @@ fn http_protocol_v2_ls_refs_advertisements(
         )
     })?;
     http_check_status(&response, &url)?;
-    http_validate_content_type(&response, &smart_http_rpc_result_content_type(service)?)?;
     read_protocol_v2_ls_refs_response_as_ref_advertisement_set(format, &mut response.body)
 }
 
@@ -584,7 +583,8 @@ pub fn http_upload_pack_features(
 /// Post an upload-pack RPC `request` + `haves` and return the validated HTTP
 /// response with its body still unread, so the caller can parse the packfile
 /// stream (with or without a leading shallow-info section). Authenticates and
-/// validates status + content type.
+/// validates status; like Git's RPC path, the response body is parsed without
+/// enforcing a response content type.
 fn http_upload_pack_post(
     client: &UreqHttpClient,
     remote: &RemoteUrl,
@@ -592,6 +592,7 @@ fn http_upload_pack_post(
     haves: Vec<ObjectId>,
     credentials: &mut dyn CredentialProvider,
     git_protocol: Option<&str>,
+    post_buffer: usize,
 ) -> Result<HttpResponse> {
     let url = http_smart_rpc_url(remote, GitService::UploadPack)?;
     let mut body = Vec::new();
@@ -602,25 +603,28 @@ fn http_upload_pack_post(
     )?;
     let content_type = smart_http_rpc_request_content_type(GitService::UploadPack)?;
     let response = http_send_with_auth(remote, credentials, |auth| {
-        client.post(
+        http_post_rpc_body(
+            client,
             &url,
             &content_type,
             &http_request_headers(auth, git_protocol),
             &body,
+            post_buffer,
         )
     })?;
     http_check_status(&response, &url)?;
-    http_validate_content_type(
-        &response,
-        &smart_http_rpc_result_content_type(GitService::UploadPack)?,
-    )?;
+    // Git validates the discovery response's content type, but its stateless
+    // RPC path streams a successful POST body directly into the pkt-line
+    // parser. Preserve that distinction so malformed-response diagnostics
+    // report the wire truncation rather than being masked by an unusual CGI
+    // content type.
     Ok(response)
 }
 
 /// Post a protocol v2 `fetch` RPC with `wants`/`haves`/`shallow`/`deepen` and
-/// read back the sectioned response. Authenticates and validates status + content
-/// type. When the server advertises `sideband-all`, the request and response use
-/// the sideband-all wire form.
+/// read back the sectioned response. Authenticates and validates status. When
+/// the server advertises `sideband-all`, the request and response use the
+/// sideband-all wire form.
 pub fn http_protocol_v2_fetch_response(
     client: &UreqHttpClient,
     remote: &RemoteUrl,
@@ -631,6 +635,7 @@ pub fn http_protocol_v2_fetch_response(
     config: Option<&GitConfig>,
 ) -> Result<Vec<ProtocolV2FetchResponseSection>> {
     let git_protocol = http_git_protocol_header_value(config)?;
+    let post_buffer = http_post_buffer(config);
     let sideband_all = fetch.sideband_all;
     let mut response = http_protocol_v2_fetch_post(
         client,
@@ -639,13 +644,22 @@ pub fn http_protocol_v2_fetch_response(
         handshake,
         fetch,
         credentials,
-        git_protocol.as_deref(),
+        HttpRpcOptions {
+            git_protocol: git_protocol.as_deref(),
+            post_buffer,
+        },
     )?;
     if sideband_all {
         Ok(read_protocol_v2_fetch_sideband_all_response(format, &mut response.body)?.sections)
     } else {
         read_protocol_v2_fetch_response(format, &mut response.body)
     }
+}
+
+#[derive(Clone, Copy)]
+struct HttpRpcOptions<'a> {
+    git_protocol: Option<&'a str>,
+    post_buffer: usize,
 }
 
 fn http_protocol_v2_fetch_post(
@@ -655,7 +669,7 @@ fn http_protocol_v2_fetch_post(
     handshake: &TransportHandshake,
     fetch: ProtocolV2FetchRequest,
     credentials: &mut dyn CredentialProvider,
-    git_protocol: Option<&str>,
+    options: HttpRpcOptions<'_>,
 ) -> Result<HttpResponse> {
     let command = protocol_v2_fetch_command_request(format, handshake, &fetch)?;
     let url = http_smart_rpc_url(remote, GitService::UploadPack)?;
@@ -663,18 +677,16 @@ fn http_protocol_v2_fetch_post(
     write_protocol_v2_command_request(&mut body, &command)?;
     let content_type = smart_http_rpc_request_content_type(GitService::UploadPack)?;
     let response = http_send_with_auth(remote, credentials, |auth| {
-        client.post(
+        http_post_rpc_body(
+            client,
             &url,
             &content_type,
-            &http_request_headers(auth, git_protocol),
+            &http_request_headers(auth, options.git_protocol),
             &body,
+            options.post_buffer,
         )
     })?;
     http_check_status(&response, &url)?;
-    http_validate_content_type(
-        &response,
-        &smart_http_rpc_result_content_type(GitService::UploadPack)?,
-    )?;
     Ok(response)
 }
 
@@ -716,6 +728,9 @@ pub struct HttpFetchPackRequest<'a> {
     pub deepen_not: Vec<String>,
     pub deepen_relative: bool,
     pub git_protocol: Option<&'a str>,
+    /// Maximum buffered smart-HTTP request size (`http.postBuffer`). Larger
+    /// request bodies use chunked transfer encoding.
+    pub post_buffer: usize,
     /// Send no `have` lines. Used by a partial clone's checkout-blob top-up
     /// fetch: the client already has the commit whose tree references the wanted
     /// blob, so advertising it as a `have` would make the server treat the blob
@@ -763,6 +778,7 @@ pub fn install_fetch_pack_via_http_upload_pack(
             haves,
             credentials,
             request.git_protocol,
+            request.post_buffer,
         )?;
         if request.promisor {
             install_upload_pack_packfile_promisor_response_from_reader(
@@ -789,6 +805,7 @@ pub fn install_fetch_pack_via_http_upload_pack(
         haves,
         credentials,
         request.git_protocol,
+        request.post_buffer,
     )?;
     let shallow_info = if request.promisor {
         let (shallow_info, _) = install_upload_pack_shallow_packfile_promisor_response_from_reader(
@@ -850,7 +867,10 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
         handshake,
         fetch,
         credentials,
-        request.git_protocol,
+        HttpRpcOptions {
+            git_protocol: request.git_protocol,
+            post_buffer: request.post_buffer,
+        },
     )?;
     let (header, _install) = if request.promisor {
         install_protocol_v2_fetch_promisor_response_from_reader(
@@ -870,6 +890,32 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
         )?
     };
     Ok(shallow_info_from_protocol_v2_fetch_header(&header))
+}
+
+pub(crate) fn http_post_buffer(config: Option<&GitConfig>) -> usize {
+    const DEFAULT_HTTP_POST_BUFFER: usize = 1 << 20;
+    config
+        .and_then(|config| config.get("http", None, "postBuffer"))
+        .and_then(sley_config::parse_config_int)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(DEFAULT_HTTP_POST_BUFFER)
+}
+
+fn http_post_rpc_body(
+    client: &dyn HttpClient,
+    url: &str,
+    content_type: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    post_buffer: usize,
+) -> Result<HttpResponse> {
+    if body.len() > post_buffer {
+        let mut reader = std::io::Cursor::new(body);
+        client.post_reader(url, content_type, headers, &mut reader)
+    } else {
+        client.post(url, content_type, headers, body)
+    }
 }
 
 fn all_wants_present(db: &FileObjectDatabase, wants: &[ObjectId]) -> Result<bool> {
@@ -904,6 +950,7 @@ mod tests {
         ProtocolVersion, RefAdvertisement, read_protocol_v2_fetch_response,
         write_protocol_v2_fetch_response, write_protocol_v2_ls_refs_response,
     };
+    use std::sync::Mutex;
 
     #[test]
     fn protocol_v1_header_is_sent_for_upload_and_receive_discovery() {
@@ -927,6 +974,81 @@ mod tests {
                 .expect("receive-pack fallback"),
             None
         );
+    }
+
+    struct PostModeClient {
+        mode: Mutex<Option<&'static str>>,
+    }
+
+    impl PostModeClient {
+        fn response() -> Result<HttpResponse> {
+            Ok(HttpResponse {
+                status: 200,
+                content_type: None,
+                body: Box::new(std::io::empty()),
+            })
+        }
+    }
+
+    impl HttpClient for PostModeClient {
+        fn get(&self, _url: &str, _headers: &[(&str, &str)]) -> Result<HttpResponse> {
+            Self::response()
+        }
+
+        fn post(
+            &self,
+            _url: &str,
+            _content_type: &str,
+            _headers: &[(&str, &str)],
+            _body: &[u8],
+        ) -> Result<HttpResponse> {
+            *self.mode.lock().expect("post mode") = Some("buffered");
+            Self::response()
+        }
+
+        fn post_reader(
+            &self,
+            _url: &str,
+            _content_type: &str,
+            _headers: &[(&str, &str)],
+            body: &mut dyn Read,
+        ) -> Result<HttpResponse> {
+            let mut consumed = Vec::new();
+            body.read_to_end(&mut consumed)?;
+            *self.mode.lock().expect("post mode") = Some("chunked");
+            Self::response()
+        }
+    }
+
+    #[test]
+    fn http_post_buffer_selects_buffered_or_chunked_rpc_body() {
+        let config = GitConfig::parse(b"[http]\n\tpostBuffer = 64k\n").expect("config");
+        assert_eq!(http_post_buffer(Some(&config)), 64 * 1024);
+
+        let client = PostModeClient {
+            mode: Mutex::new(None),
+        };
+        http_post_rpc_body(
+            &client,
+            "http://example.test/rpc",
+            "request",
+            &[],
+            b"1234",
+            4,
+        )
+        .expect("buffered post");
+        assert_eq!(*client.mode.lock().expect("mode"), Some("buffered"));
+
+        http_post_rpc_body(
+            &client,
+            "http://example.test/rpc",
+            "request",
+            &[],
+            b"12345",
+            4,
+        )
+        .expect("chunked post");
+        assert_eq!(*client.mode.lock().expect("mode"), Some("chunked"));
     }
 
     #[test]

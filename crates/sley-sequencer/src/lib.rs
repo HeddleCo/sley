@@ -1,3 +1,4 @@
+pub mod history;
 pub mod rebase;
 pub mod replay;
 pub mod stash;

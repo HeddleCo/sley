@@ -1346,6 +1346,20 @@ fn parse_reflog_selector_date(value: &str) -> Option<i64> {
         let now = i64::try_from(now).ok()?;
         return Some(now.saturating_sub(years.saturating_mul(365 * 86_400)));
     }
+    parse_reflog_absolute_selector_date(value).or_else(|| {
+        // Git's approxidate scanner ignores unrecognised words and punctuation
+        // while retaining any date it can recognize later in the string (for
+        // example `3.hot.dogs.on.2001-09-17`). Preserve that useful fuzziness
+        // without accepting total nonsense: only a suffix which is itself one
+        // of the supported absolute forms is eligible.
+        value
+            .char_indices()
+            .skip(1)
+            .find_map(|(index, _)| parse_reflog_absolute_selector_date(&value[index..]))
+    })
+}
+
+fn parse_reflog_absolute_selector_date(value: &str) -> Option<i64> {
     parse_reflog_iso_selector_date(value)
         .or_else(|| parse_reflog_month_selector_date(value))
         .or_else(|| parse_reflog_rfc_selector_date(value))
@@ -9577,5 +9591,14 @@ mod tests {
         let got = walk_oids(walk);
         assert_eq!(got.len(), 3, "pathspec must not prune in STAGE-A");
         fs::remove_dir_all(git_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn reflog_approxidate_ignores_unknown_words_before_absolute_date() {
+        assert_eq!(
+            parse_reflog_selector_date("3.hot.dogs.on.2001-09-17"),
+            parse_reflog_selector_date("2001-09-17")
+        );
+        assert_eq!(parse_reflog_selector_date("utter.bogosity"), None);
     }
 }

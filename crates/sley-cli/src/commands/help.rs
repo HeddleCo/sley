@@ -96,7 +96,7 @@ static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     CommandSpec::new("grep", BUILTIN_MAIN),
     CommandSpec::new("hash-object", BUILTIN),
     CommandSpec::new("help", BUILTIN_PARSEOPT),
-    CommandSpec::new("history", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("history", BUILTIN),
     CommandSpec::new("hook", BUILTIN),
     CommandSpec::new("http-backend", NATIVE),
     CommandSpec::new("http-fetch", RESERVED_CORE_HELPER),
