@@ -1095,6 +1095,9 @@ fn run_diff_request(
             && context.options.output.stat
         {
             write!(stdout, "{}", header.text)?;
+        } else if context.options.z {
+            stdout.write_all(header.text.as_bytes())?;
+            stdout.write_all(b"\0")?;
         } else {
             writeln!(stdout, "{}", header.text)?;
         }
@@ -1302,11 +1305,17 @@ fn run_combined_request(
 ) -> Result<bool> {
     let format = context.format;
     let db = context.db;
-    let mut paths = commands::combined::combined_paths(
+    let mut paths = commands::combined::combined_paths_with_options(
         db,
         format,
         &combined.result_tree,
         &combined.parent_trees,
+        commands::combined::CombinedPathOptions {
+            detect_renames: context.options.detect_renames,
+            rename_empty: context.options.rename_empty,
+            rename_threshold: context.options.rename_threshold,
+            include_trees: context.options.show_trees,
+        },
     )?;
     if !context.find_objects.is_empty() {
         paths.retain(|path| {

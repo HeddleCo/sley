@@ -1,13 +1,10 @@
 //! Combined / merge-commit diff (`-c` / `--cc` / `--combined-all-paths`).
 //!
-//! This is the single CLI-side wiring of the combined-diff renderer
-//! ([`sley_diff_merge::render::render_combined_with`]) shared by `diff-tree`,
-//! `show`, `log`, and `whatchanged`. It owns the repository-coupled half of
-//! git's `combine-diff.c`: discovering the set of paths that EVERY parent
-//! touches (`intersect_paths` / `find_paths_multitree`), reading the result and
-//! per-parent blobs, and emitting the combined-raw (`::`) lines and the
-//! `diff --cc`/`diff --combined` metainfo header. The renderer crate produces
-//! the `@@@`-style hunk body; this module produces everything around it.
+//! This is the single CLI-side repository adapter shared by `diff-tree`,
+//! `show`, `log`, and `whatchanged`. It discovers the paths every parent
+//! touches (`intersect_paths` / `find_paths_multitree`) and resolves their blob
+//! contents. Typed metadata, raw records, patch headers, path quoting, and the
+//! `@@@` hunk body are all rendered by `sley-diff-merge::porcelain`.
 //!
 //! A glob of the crate root brings every shared helper/type into scope via
 //! descendant-privacy; see commands::stash for the rationale.
@@ -26,11 +23,34 @@ pub(crate) struct CombinedPath {
 }
 
 pub(crate) struct CombinedParentEntry {
+    /// Parent-side pathname. It differs from the result path for a rename and
+    /// is emitted by `--combined-all-paths`.
+    pub path: Vec<u8>,
     pub mode: u32,
     pub oid: Option<ObjectId>,
     /// The single-letter raw status (`M`, `A`, `D`, ...) of the result relative
     /// to this parent.
     pub status: char,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CombinedPathOptions {
+    pub detect_renames: bool,
+    pub rename_empty: bool,
+    pub rename_threshold: u8,
+    /// Include changed subtree entries (`diff-tree -t`) in addition to leaves.
+    pub include_trees: bool,
+}
+
+impl Default for CombinedPathOptions {
+    fn default() -> Self {
+        Self {
+            detect_renames: false,
+            rename_empty: true,
+            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            include_trees: false,
+        }
+    }
 }
 
 /// Compute the combined path set for a merge: the intersection of the per-parent
@@ -42,53 +62,92 @@ pub(crate) fn combined_paths(
     result_tree: &ObjectId,
     parent_trees: &[ObjectId],
 ) -> Result<Vec<CombinedPath>> {
-    let num_parent = parent_trees.len();
-    let Some(first_parent_tree) = parent_trees.first() else {
+    combined_paths_with_options(
+        db,
+        format,
+        result_tree,
+        parent_trees,
+        CombinedPathOptions::default(),
+    )
+}
+
+pub(crate) fn combined_paths_with_options(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    result_tree: &ObjectId,
+    parent_trees: &[ObjectId],
+    path_options: CombinedPathOptions,
+) -> Result<Vec<CombinedPath>> {
+    if parent_trees.is_empty() {
         return Ok(Vec::new());
-    };
+    }
     let options = sley_diff_merge::DiffNameStatusOptions {
-        detect_renames: false,
+        detect_renames: path_options.detect_renames,
         detect_copies: false,
         find_copies_harder: false,
-        rename_empty: true,
-        detect_inexact: false,
-        rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+        rename_empty: path_options.rename_empty,
+        detect_inexact: path_options.detect_renames,
+        rename_threshold: path_options.rename_threshold,
         copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
         rename_limit: 0,
         ..Default::default()
     };
 
-    let mut first_parent_entries = sley_diff_merge::diff_name_status_trees_with_options(
-        db,
-        format,
-        first_parent_tree,
-        result_tree,
-        options,
-    )?;
+    let mut per_parent = parent_trees
+        .iter()
+        .map(|parent_tree| {
+            sley_diff_merge::diff_name_status_trees_with_options(
+                db,
+                format,
+                parent_tree,
+                result_tree,
+                options,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut first_parent_entries = per_parent.remove(0);
     first_parent_entries.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    let other_parents = per_parent
+        .into_iter()
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| (entry.path.as_bytes().to_vec(), entry))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .collect::<Vec<_>>();
     let mut paths = Vec::new();
     'paths: for first_entry in first_parent_entries {
         let path = first_entry.path.as_bytes();
         let result_entry = TreePathEntry::from_new_side(&first_entry);
         let first_parent_entry = TreePathEntry::from_old_side(&first_entry);
-        let Some(first_status) = combined_parent_status(first_parent_entry, result_entry) else {
-            continue;
-        };
-        let mut parents = Vec::with_capacity(num_parent);
+        let mut parents = Vec::with_capacity(parent_trees.len());
         parents.push(CombinedParentEntry {
+            path: first_entry
+                .old_path
+                .as_ref()
+                .map(|path| path.as_bytes())
+                .unwrap_or(path)
+                .to_vec(),
             mode: first_parent_entry.map(|entry| entry.mode).unwrap_or(0),
             oid: first_parent_entry.map(|entry| entry.oid),
-            status: first_status,
+            status: first_entry.status.code(),
         });
-        for parent_tree in &parent_trees[1..] {
-            let parent_entry = tree_path_entry(db, format, parent_tree, path)?;
-            let Some(status) = combined_parent_status(parent_entry, result_entry) else {
+        for entries in &other_parents {
+            let Some(entry) = entries.get(path) else {
                 continue 'paths;
             };
+            let parent_entry = TreePathEntry::from_old_side(entry);
             parents.push(CombinedParentEntry {
+                path: entry
+                    .old_path
+                    .as_ref()
+                    .map(|path| path.as_bytes())
+                    .unwrap_or(path)
+                    .to_vec(),
                 mode: parent_entry.map(|entry| entry.mode).unwrap_or(0),
                 oid: parent_entry.map(|entry| entry.oid),
-                status,
+                status: entry.status.code(),
             });
         }
         paths.push(CombinedPath {
@@ -98,7 +157,86 @@ pub(crate) fn combined_paths(
             parents,
         });
     }
+    if path_options.include_trees {
+        let result_trees = collect_combined_subtrees(db, format, result_tree)?;
+        let parent_trees = parent_trees
+            .iter()
+            .map(|tree| collect_combined_subtrees(db, format, tree))
+            .collect::<Result<Vec<_>>>()?;
+        for (path, result_entry) in result_trees {
+            let mut parents = Vec::with_capacity(parent_trees.len());
+            let mut changed_from_every_parent = true;
+            for trees in &parent_trees {
+                let parent_entry = trees.get(&path).copied();
+                let status = match parent_entry {
+                    Some(parent) if parent != result_entry => 'M',
+                    None => 'A',
+                    _ => {
+                        changed_from_every_parent = false;
+                        break;
+                    }
+                };
+                parents.push(CombinedParentEntry {
+                    path: path.clone(),
+                    mode: parent_entry.map(|entry| entry.mode).unwrap_or(0),
+                    oid: parent_entry.map(|entry| entry.oid),
+                    status,
+                });
+            }
+            if !changed_from_every_parent {
+                continue;
+            }
+            paths.push(CombinedPath {
+                path,
+                result_mode: result_entry.mode,
+                result_oid: Some(result_entry.oid),
+                parents,
+            });
+        }
+        paths.sort_by(|left, right| left.path.cmp(&right.path));
+    }
     Ok(paths)
+}
+
+fn collect_combined_subtrees(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    root: &ObjectId,
+) -> Result<BTreeMap<Vec<u8>, TreePathEntry>> {
+    fn collect(
+        db: &FileObjectDatabase,
+        format: ObjectFormat,
+        tree: &ObjectId,
+        prefix: &[u8],
+        out: &mut BTreeMap<Vec<u8>, TreePathEntry>,
+    ) -> Result<()> {
+        let object = db.read_object(tree)?;
+        for entry in TreeEntries::new(format, &object.body) {
+            let entry = entry?;
+            if entry.mode != 0o040000 {
+                continue;
+            }
+            let mut path = Vec::with_capacity(prefix.len() + entry.name.len() + 1);
+            if !prefix.is_empty() {
+                path.extend_from_slice(prefix);
+                path.push(b'/');
+            }
+            path.extend_from_slice(&entry.name);
+            out.insert(
+                path.clone(),
+                TreePathEntry {
+                    mode: entry.mode,
+                    oid: entry.oid,
+                },
+            );
+            collect(db, format, &entry.oid, &path, out)?;
+        }
+        Ok(())
+    }
+
+    let mut out = BTreeMap::new();
+    collect(db, format, root, &[], &mut out)?;
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,68 +259,6 @@ impl TreePathEntry {
             oid: entry.new_oid?,
         })
     }
-}
-
-fn combined_parent_status(
-    parent: Option<TreePathEntry>,
-    result: Option<TreePathEntry>,
-) -> Option<char> {
-    match (parent, result) {
-        (None, Some(_)) => Some('A'),
-        (Some(_), None) => Some('D'),
-        (Some(parent), Some(result)) if parent != result => Some('M'),
-        _ => None,
-    }
-}
-
-fn tree_path_entry(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    tree_oid: &ObjectId,
-    path: &[u8],
-) -> Result<Option<TreePathEntry>> {
-    let mut current = *tree_oid;
-    let mut components = path
-        .split(|byte| *byte == b'/')
-        .filter(|part| !part.is_empty())
-        .peekable();
-    if components.peek().is_none() {
-        return Ok(Some(TreePathEntry {
-            mode: 0o040000,
-            oid: current,
-        }));
-    }
-    while let Some(component) = components.next() {
-        let object = db.read_object(&current)?;
-        if object.object_type != ObjectType::Tree {
-            return Err(GitError::InvalidObject(format!(
-                "expected tree {current}, found {}",
-                object.object_type.as_str()
-            )));
-        }
-        let mut found = None;
-        for entry in TreeEntries::new(format, &object.body) {
-            let entry = entry?;
-            if entry.name == component {
-                found = Some(TreePathEntry {
-                    mode: entry.mode,
-                    oid: entry.oid,
-                });
-                break;
-            }
-        }
-        let Some(entry) = found else {
-            return Ok(None);
-        };
-        if components.peek().is_none() {
-            return Ok(Some(entry));
-        }
-        if entry.mode != 0o040000 {
-            return Ok(None);
-        }
-        current = entry.oid;
-    }
-    Ok(None)
 }
 
 /// Options shared by the combined raw / patch writers.
@@ -214,44 +290,14 @@ pub(crate) fn write_combined_raw(
     path: &CombinedPath,
     z: bool,
 ) -> Result<()> {
-    let num_parent = path.parents.len();
-    for _ in 0..num_parent {
-        write!(stdout, ":")?;
-    }
-    for parent in &path.parents {
-        write!(stdout, "{:06o} ", parent.mode)?;
-    }
-    write!(stdout, "{:06o}", path.result_mode)?;
-    for parent in &path.parents {
-        write!(stdout, " {}", combined_raw_oid(parent.oid.as_ref(), ctx))?;
-    }
-    write!(
+    let parents = combined_engine_parents(path);
+    sley_diff_merge::porcelain::render_combined_raw_entry(
         stdout,
-        " {} ",
-        combined_raw_oid(path.result_oid.as_ref(), ctx)
-    )?;
-    for parent in &path.parents {
-        write!(stdout, "{}", parent.status)?;
-    }
-    if z {
-        stdout.write_all(b"\0")?;
-        if ctx.all_paths {
-            for _ in &path.parents {
-                stdout.write_all(&path.path)?;
-                stdout.write_all(b"\0")?;
-            }
-        }
-        stdout.write_all(&path.path)?;
-        stdout.write_all(b"\0")?;
-    } else {
-        write!(stdout, "\t")?;
-        if ctx.all_paths {
-            for _ in &path.parents {
-                write!(stdout, "{}\t", status_quote_path(&path.path, false))?;
-            }
-        }
-        writeln!(stdout, "{}", status_quote_path(&path.path, false))?;
-    }
+        combined_engine_entry(path, &parents),
+        combined_engine_options(ctx),
+        z,
+    )
+    .map_err(|error| GitError::Io(error.to_string()))?;
     Ok(())
 }
 
@@ -262,16 +308,13 @@ pub(crate) fn write_combined_name_status(
     path: &CombinedPath,
     z: bool,
 ) -> Result<()> {
-    for parent in &path.parents {
-        write!(stdout, "{}", parent.status)?;
-    }
-    if z {
-        stdout.write_all(b"\0")?;
-        stdout.write_all(&path.path)?;
-        stdout.write_all(b"\0")?;
-    } else {
-        writeln!(stdout, "\t{}", status_quote_path(&path.path, false))?;
-    }
+    let parents = combined_engine_parents(path);
+    sley_diff_merge::porcelain::render_combined_name_status_entry(
+        stdout,
+        combined_engine_entry(path, &parents),
+        z,
+    )
+    .map_err(|error| GitError::Io(error.to_string()))?;
     Ok(())
 }
 
@@ -290,23 +333,6 @@ pub(crate) fn combined_path_matches_find_objects(
         let new_has = path.result_oid.as_ref().is_some_and(|oid| oid == target);
         old_has != new_has
     })
-}
-
-fn combined_raw_oid(oid: Option<&ObjectId>, ctx: &CombinedRenderCtx<'_>) -> String {
-    let mut hex = match oid {
-        Some(oid) => {
-            let hex = oid.to_hex();
-            let width = ctx.raw_abbrev.unwrap_or(hex.len()).min(hex.len());
-            hex[..width].to_string()
-        }
-        None => "0".repeat(ctx.raw_abbrev.unwrap_or(ctx.format.hex_len())),
-    };
-    if hex.len() < ctx.format.hex_len()
-        && std::env::var("GIT_PRINT_SHA1_ELLIPSIS").is_ok_and(|value| value == "yes")
-    {
-        hex.push_str("...");
-    }
-    hex
 }
 
 /// Emit one combined-patch file — git's `show_patch_diff`. Returns `true` when a
@@ -336,117 +362,59 @@ pub(crate) fn write_combined_patch(
     }
     let parent_refs: Vec<&[u8]> = parent_blobs.iter().map(|b| b.as_slice()).collect();
 
-    let mode_differs = path.parents.iter().any(|p| p.mode != path.result_mode);
-
-    let mut body = Vec::new();
-    let render_options = sley_diff_merge::render::CombinedRenderOptions {
-        dense: ctx.dense,
-        context: ctx.context,
-        algorithm: ctx.diff_algorithm,
-        ws_ignore: ctx.ws_ignore,
-    };
-    let show_hunks = sley_diff_merge::render::render_combined_with(
-        &mut body,
+    let parents = combined_engine_parents(path);
+    let outcome = sley_diff_merge::porcelain::render_combined_patch(
+        stdout,
+        combined_engine_entry(path, &parents),
         &result_blob,
         &parent_refs,
-        &render_options,
-    );
-
-    if !show_hunks && !mode_differs {
-        return Ok(false);
-    }
-
-    let head = if ctx.dense {
-        "diff --cc "
-    } else {
-        "diff --combined "
-    };
-    writeln!(stdout, "{head}{}", status_quote_path(&path.path, false))?;
-
-    write!(stdout, "index ")?;
-    for (i, parent) in path.parents.iter().enumerate() {
-        if i > 0 {
-            write!(stdout, ",")?;
-        }
-        write!(
-            stdout,
-            "{}",
-            combined_patch_abbrev(parent.oid.as_ref(), ctx.patch_abbrev, ctx.format)
-        )?;
-    }
-    writeln!(
-        stdout,
-        "..{}",
-        combined_patch_abbrev(path.result_oid.as_ref(), ctx.patch_abbrev, ctx.format)
-    )?;
-
-    let deleted = path.result_mode == 0;
-    let added = !deleted && path.parents.iter().all(|p| p.status == 'A');
-    if mode_differs {
-        if added {
-            writeln!(stdout, "new file mode {:06o}", path.result_mode)?;
-        } else {
-            if deleted {
-                write!(stdout, "deleted file ")?;
-            }
-            write!(stdout, "mode ")?;
-            for (i, parent) in path.parents.iter().enumerate() {
-                if i > 0 {
-                    write!(stdout, ",")?;
-                }
-                write!(stdout, "{:06o}", parent.mode)?;
-            }
-            if path.result_mode != 0 {
-                write!(stdout, "..{:06o}", path.result_mode)?;
-            }
-            writeln!(stdout)?;
-        }
-    }
-
-    if ctx.all_paths {
-        for parent in &path.parents {
-            if parent.status == 'A' {
-                writeln!(stdout, "--- /dev/null")?;
-            } else {
-                writeln!(
-                    stdout,
-                    "--- {}{}",
-                    ctx.src_prefix,
-                    status_quote_path(&path.path, false)
-                )?;
-            }
-        }
-    } else if added {
-        writeln!(stdout, "--- /dev/null")?;
-    } else {
-        writeln!(
-            stdout,
-            "--- {}{}",
-            ctx.src_prefix,
-            status_quote_path(&path.path, false)
-        )?;
-    }
-    if deleted {
-        writeln!(stdout, "+++ /dev/null")?;
-    } else {
-        writeln!(
-            stdout,
-            "+++ {}{}",
-            ctx.dst_prefix,
-            status_quote_path(&path.path, false)
-        )?;
-    }
-
-    stdout.write_all(&body)?;
-    Ok(true)
+        combined_engine_options(ctx),
+    )
+    .map_err(|error| GitError::Io(error.to_string()))?;
+    Ok(outcome.records_written != 0)
 }
 
-fn combined_patch_abbrev(oid: Option<&ObjectId>, abbrev: usize, format: ObjectFormat) -> String {
-    match oid {
-        Some(oid) => {
-            let hex = oid.to_hex();
-            hex[..abbrev.min(hex.len())].to_string()
-        }
-        None => "0".repeat(abbrev.min(format.hex_len())),
+fn combined_engine_parents(
+    path: &CombinedPath,
+) -> Vec<sley_diff_merge::porcelain::CombinedDiffParent<'_>> {
+    path.parents
+        .iter()
+        .map(|parent| sley_diff_merge::porcelain::CombinedDiffParent {
+            path: &parent.path,
+            mode: parent.mode,
+            oid: parent.oid,
+            status: parent.status,
+        })
+        .collect()
+}
+
+fn combined_engine_entry<'a>(
+    path: &'a CombinedPath,
+    parents: &'a [sley_diff_merge::porcelain::CombinedDiffParent<'a>],
+) -> sley_diff_merge::porcelain::CombinedDiffEntry<'a> {
+    sley_diff_merge::porcelain::CombinedDiffEntry {
+        result_path: &path.path,
+        result_mode: path.result_mode,
+        result_oid: path.result_oid,
+        parents,
+    }
+}
+
+fn combined_engine_options<'a>(
+    ctx: &'a CombinedRenderCtx<'a>,
+) -> sley_diff_merge::porcelain::CombinedFormatOptions<'a> {
+    sley_diff_merge::porcelain::CombinedFormatOptions {
+        object_format: ctx.format,
+        dense: ctx.dense,
+        all_paths: ctx.all_paths,
+        context: ctx.context,
+        ws_ignore: ctx.ws_ignore,
+        algorithm: ctx.diff_algorithm,
+        src_prefix: ctx.src_prefix.as_bytes(),
+        dst_prefix: ctx.dst_prefix.as_bytes(),
+        patch_abbrev: ctx.patch_abbrev,
+        raw_abbrev: ctx.raw_abbrev,
+        print_hash_ellipsis: std::env::var("GIT_PRINT_SHA1_ELLIPSIS")
+            .is_ok_and(|value| value == "yes"),
     }
 }

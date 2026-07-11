@@ -5,8 +5,11 @@
 //! inject terminal display-width measurement while the engine retains Git's
 //! byte-level path quoting rules.
 
-use crate::render::{HunkRenderOptions, render_hunks};
-use crate::{DiffAlgorithm, NameStatus, NameStatusEntry};
+use crate::render::{
+    CombinedRenderOptions as CombinedHunkOptions, HunkRenderOptions, render_combined_with,
+    render_hunks,
+};
+use crate::{DiffAlgorithm, NameStatus, NameStatusEntry, WsIgnore};
 use sley_core::{ObjectFormat, ObjectId};
 use std::error::Error;
 use std::fmt;
@@ -244,6 +247,236 @@ fn prefixed_quoted_path(prefix: &[u8], path: &[u8]) -> String {
     full.extend_from_slice(prefix);
     full.extend_from_slice(path);
     quote_path(&full, true)
+}
+
+/// One parent side of an already-resolved combined diff entry.
+#[derive(Debug, Clone, Copy)]
+pub struct CombinedDiffParent<'a> {
+    pub path: &'a [u8],
+    pub mode: u32,
+    pub oid: Option<ObjectId>,
+    pub status: char,
+}
+
+/// Repository-independent metadata for one combined diff path.
+#[derive(Debug, Clone, Copy)]
+pub struct CombinedDiffEntry<'a> {
+    pub result_path: &'a [u8],
+    pub result_mode: u32,
+    pub result_oid: Option<ObjectId>,
+    pub parents: &'a [CombinedDiffParent<'a>],
+}
+
+/// Byte-rendering controls shared by combined raw and patch output.
+#[derive(Debug, Clone, Copy)]
+pub struct CombinedFormatOptions<'a> {
+    pub object_format: ObjectFormat,
+    pub dense: bool,
+    pub all_paths: bool,
+    pub context: usize,
+    pub ws_ignore: WsIgnore,
+    pub algorithm: DiffAlgorithm,
+    pub src_prefix: &'a [u8],
+    pub dst_prefix: &'a [u8],
+    pub patch_abbrev: usize,
+    pub raw_abbrev: Option<usize>,
+    pub print_hash_ellipsis: bool,
+}
+
+/// Render one combined `--raw` record, including per-parent paths.
+pub fn render_combined_raw_entry(
+    out: &mut dyn Write,
+    entry: CombinedDiffEntry<'_>,
+    options: CombinedFormatOptions<'_>,
+    nul_terminated: bool,
+) -> Result<RenderOutcome, RenderError> {
+    for _ in entry.parents {
+        write!(out, ":")?;
+    }
+    for parent in entry.parents {
+        write!(out, "{:06o} ", parent.mode)?;
+    }
+    write!(out, "{:06o}", entry.result_mode)?;
+    for parent in entry.parents {
+        write!(
+            out,
+            " {}",
+            raw_oid(
+                parent.oid.as_ref(),
+                false,
+                options.raw_abbrev,
+                options.object_format,
+                options.print_hash_ellipsis,
+            )
+        )?;
+    }
+    write!(
+        out,
+        " {} ",
+        raw_oid(
+            entry.result_oid.as_ref(),
+            false,
+            options.raw_abbrev,
+            options.object_format,
+            options.print_hash_ellipsis,
+        )
+    )?;
+    for parent in entry.parents {
+        write!(out, "{}", parent.status)?;
+    }
+    if nul_terminated {
+        out.write_all(b"\0")?;
+        if options.all_paths {
+            for parent in entry.parents {
+                out.write_all(parent.path)?;
+                out.write_all(b"\0")?;
+            }
+        }
+        out.write_all(entry.result_path)?;
+        out.write_all(b"\0")?;
+    } else {
+        write!(out, "\t")?;
+        if options.all_paths {
+            for parent in entry.parents {
+                write!(out, "{}\t", quote_path(parent.path, true))?;
+            }
+        }
+        writeln!(out, "{}", quote_path(entry.result_path, true))?;
+    }
+    Ok(RenderOutcome { records_written: 1 })
+}
+
+/// Render one combined name-status record.
+pub fn render_combined_name_status_entry(
+    out: &mut dyn Write,
+    entry: CombinedDiffEntry<'_>,
+    nul_terminated: bool,
+) -> Result<RenderOutcome, RenderError> {
+    for parent in entry.parents {
+        write!(out, "{}", parent.status)?;
+    }
+    if nul_terminated {
+        out.write_all(b"\0")?;
+        out.write_all(entry.result_path)?;
+        out.write_all(b"\0")?;
+    } else {
+        writeln!(out, "\t{}", quote_path(entry.result_path, true))?;
+    }
+    Ok(RenderOutcome { records_written: 1 })
+}
+
+/// Render one complete combined patch from already-resolved side contents.
+pub fn render_combined_patch(
+    out: &mut dyn Write,
+    entry: CombinedDiffEntry<'_>,
+    result_content: &[u8],
+    parent_contents: &[&[u8]],
+    options: CombinedFormatOptions<'_>,
+) -> Result<RenderOutcome, RenderError> {
+    let mode_differs = entry
+        .parents
+        .iter()
+        .any(|parent| parent.mode != entry.result_mode);
+    let mut body = Vec::new();
+    let show_hunks = render_combined_with(
+        &mut body,
+        result_content,
+        parent_contents,
+        &CombinedHunkOptions {
+            dense: options.dense,
+            context: options.context,
+            algorithm: options.algorithm,
+            ws_ignore: options.ws_ignore,
+        },
+    );
+    if !show_hunks && !mode_differs {
+        return Ok(RenderOutcome::default());
+    }
+
+    let head = if options.dense {
+        "diff --cc "
+    } else {
+        "diff --combined "
+    };
+    writeln!(out, "{head}{}", quote_path(entry.result_path, true))?;
+    write!(out, "index ")?;
+    for (index, parent) in entry.parents.iter().enumerate() {
+        if index > 0 {
+            write!(out, ",")?;
+        }
+        write!(out, "{}", combined_patch_oid(parent.oid.as_ref(), options))?;
+    }
+    writeln!(
+        out,
+        "..{}",
+        combined_patch_oid(entry.result_oid.as_ref(), options)
+    )?;
+
+    let deleted = entry.result_mode == 0;
+    let added = !deleted && entry.parents.iter().all(|parent| parent.status == 'A');
+    if mode_differs {
+        if added {
+            writeln!(out, "new file mode {:06o}", entry.result_mode)?;
+        } else {
+            if deleted {
+                write!(out, "deleted file ")?;
+            }
+            write!(out, "mode ")?;
+            for (index, parent) in entry.parents.iter().enumerate() {
+                if index > 0 {
+                    write!(out, ",")?;
+                }
+                write!(out, "{:06o}", parent.mode)?;
+            }
+            if !deleted {
+                write!(out, "..{:06o}", entry.result_mode)?;
+            }
+            writeln!(out)?;
+        }
+    }
+
+    if options.all_paths {
+        for parent in entry.parents {
+            if parent.status == 'A' {
+                writeln!(out, "--- /dev/null")?;
+            } else {
+                writeln!(
+                    out,
+                    "--- {}",
+                    prefixed_quoted_path(options.src_prefix, parent.path)
+                )?;
+            }
+        }
+    } else if added {
+        writeln!(out, "--- /dev/null")?;
+    } else {
+        writeln!(
+            out,
+            "--- {}",
+            prefixed_quoted_path(options.src_prefix, entry.result_path)
+        )?;
+    }
+    if deleted {
+        writeln!(out, "+++ /dev/null")?;
+    } else {
+        writeln!(
+            out,
+            "+++ {}",
+            prefixed_quoted_path(options.dst_prefix, entry.result_path)
+        )?;
+    }
+    out.write_all(&body)?;
+    Ok(RenderOutcome { records_written: 1 })
+}
+
+fn combined_patch_oid(oid: Option<&ObjectId>, options: CombinedFormatOptions<'_>) -> String {
+    match oid {
+        Some(oid) => {
+            let hex = oid.to_hex();
+            hex[..options.patch_abbrev.min(hex.len())].to_string()
+        }
+        None => "0".repeat(options.patch_abbrev.min(options.object_format.hex_len())),
+    }
 }
 
 /// Options for one `--raw` record.
@@ -1031,6 +1264,76 @@ mod tests {
             mode_only,
             b"diff --git a/script b/script\nold mode 100644\nnew mode 100755\n"
         );
+    }
+
+    #[test]
+    fn combined_renderers_own_parent_paths_metadata_and_hunks() {
+        let format = ObjectFormat::Sha1;
+        let first_oid =
+            sley_core::object_id_for_bytes(format, "blob", b"one\n").expect("first parent oid");
+        let second_oid =
+            sley_core::object_id_for_bytes(format, "blob", b"two\n").expect("second parent oid");
+        let result_oid =
+            sley_core::object_id_for_bytes(format, "blob", b"result\n").expect("result oid");
+        let parents = [
+            CombinedDiffParent {
+                path: b"old\tone",
+                mode: 0o100644,
+                oid: Some(first_oid),
+                status: 'R',
+            },
+            CombinedDiffParent {
+                path: b"old\ttwo",
+                mode: 0o100644,
+                oid: Some(second_oid),
+                status: 'R',
+            },
+        ];
+        let entry = CombinedDiffEntry {
+            result_path: b"new\tname",
+            result_mode: 0o100644,
+            result_oid: Some(result_oid),
+            parents: &parents,
+        };
+        let options = CombinedFormatOptions {
+            object_format: format,
+            dense: false,
+            all_paths: true,
+            context: 3,
+            ws_ignore: WsIgnore::default(),
+            algorithm: DiffAlgorithm::Myers,
+            src_prefix: b"a/",
+            dst_prefix: b"b/",
+            patch_abbrev: 7,
+            raw_abbrev: Some(7),
+            print_hash_ellipsis: false,
+        };
+
+        let mut raw = Vec::new();
+        render_combined_raw_entry(&mut raw, entry, options, false).expect("combined raw");
+        assert_eq!(
+            String::from_utf8(raw).expect("utf8 raw"),
+            format!(
+                "::100644 100644 100644 {} {} {} RR\t\"old\\tone\"\t\"old\\ttwo\"\t\"new\\tname\"\n",
+                &first_oid.to_hex()[..7],
+                &second_oid.to_hex()[..7],
+                &result_oid.to_hex()[..7],
+            )
+        );
+
+        let mut patch = Vec::new();
+        render_combined_patch(
+            &mut patch,
+            entry,
+            b"result\n",
+            &[b"one\n", b"two\n"],
+            options,
+        )
+        .expect("combined patch");
+        let patch = String::from_utf8(patch).expect("utf8 patch");
+        assert!(patch.starts_with("diff --combined \"new\\tname\"\nindex "));
+        assert!(patch.contains("--- \"a/old\\tone\"\n--- \"a/old\\ttwo\"\n"));
+        assert!(patch.contains("+++ \"b/new\\tname\"\n@@@"));
     }
 
     #[test]

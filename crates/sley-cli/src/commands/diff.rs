@@ -74,10 +74,38 @@ fn diff_split_revisions(
     format: ObjectFormat,
     db: &FileObjectDatabase,
     path_args: Vec<String>,
+    combined_requested: bool,
 ) -> Result<(Vec<ObjectId>, Vec<String>)> {
     let Some(first) = path_args.first() else {
         return Ok((Vec::new(), Vec::new()));
     };
+    // `<merge>^!` names the merge result while excluding each parent. For
+    // diff, that is the native combined selection: result tree first, then
+    // every parent tree in commit order. A non-merge keeps ordinary two-tree
+    // semantics (parent -> result).
+    if let Some(base) = first.strip_suffix("^!")
+        && !base.is_empty()
+        && let Ok(commit_oid) = diff_resolve_commit_arg(git_dir, format, db, base)
+    {
+        let object = db.read_object(&commit_oid)?;
+        let commit = Commit::parse_ref(format, &object.body)?;
+        let parent_trees = commit
+            .parents
+            .iter()
+            .map(|parent| sley_rev::peel_to_tree(db, format, parent))
+            .collect::<Result<Vec<_>>>()?;
+        let trees = match parent_trees.as_slice() {
+            [] => vec![ObjectId::empty_tree(format), commit.tree],
+            [parent] => vec![*parent, commit.tree],
+            _ => {
+                let mut trees = Vec::with_capacity(parent_trees.len() + 1);
+                trees.push(commit.tree);
+                trees.extend(parent_trees);
+                trees
+            }
+        };
+        return Ok((trees, path_args[1..].to_vec()));
+    }
     // Range forms name exactly two trees and consume only the first token. Check
     // `...` before `..` so `A...B` is not mis-split, and require both sides so a
     // relative path like `../x` (left side empty) is never taken as a range.
@@ -135,13 +163,14 @@ fn diff_split_revisions(
     {
         return diff_usage_error();
     }
-    // Otherwise peel up to three leading args that each resolve as a revision.
-    // The three-tree form is a combined diff: result parent1 parent2.
+    // Otherwise peel leading args that each resolve as a revision. Explicit
+    // `-c`/`--cc` accepts one result plus an arbitrary parent count; ordinary
+    // diff retains its historical three-tree cap (result parent1 parent2).
     let mut trees = Vec::new();
     let mut rest = Vec::new();
     let mut iter = path_args.into_iter();
     for token in iter.by_ref() {
-        if trees.len() < 3
+        if (combined_requested || trees.len() < 3)
             && let Ok(tree) = diff_peel_rev_tree(git_dir, format, db, &token)
         {
             trees.push(tree);
@@ -1773,7 +1802,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
     let (diff_trees, mut path_args) = if merge_base {
         diff_split_merge_base(&git_dir, format, &db, cached, path_args)?
     } else {
-        diff_split_revisions(&git_dir, format, &db, path_args)?
+        diff_split_revisions(&git_dir, format, &db, path_args, combined.is_some())?
     };
     path_args.extend(explicit_paths);
     let find_objects = resolve_diff_find_objects(&git_dir, format, &db, &find_object_values)?;
@@ -1837,8 +1866,8 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         };
         DiffPathspec::new(&cwd, worktree_root, &path_args, repo.pathspec_magic())?
     };
-    if diff_trees.len() == 3 {
-        let has_differences = write_diff_combined_three_tree(
+    if diff_trees.len() >= 3 {
+        let has_differences = write_diff_combined_trees(
             &db,
             format,
             &diff_trees,
@@ -2686,15 +2715,14 @@ struct CombinedDiffOptions<'a> {
     lazy_fetch: bool,
 }
 
-fn write_diff_combined_three_tree(
+fn write_diff_combined_trees(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     trees: &[ObjectId],
     pathspec: &DiffPathspec,
     options: CombinedDiffOptions<'_>,
 ) -> Result<bool> {
-    let parent_trees = [trees[1], trees[2]];
-    let mut paths = commands::combined::combined_paths(db, format, &trees[0], &parent_trees)?;
+    let mut paths = commands::combined::combined_paths(db, format, &trees[0], &trees[1..])?;
     paths.retain(|path| pathspec.matches(&path.path));
     if paths.is_empty() {
         return Ok(false);
