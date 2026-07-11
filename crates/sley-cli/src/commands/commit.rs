@@ -976,8 +976,9 @@ pub(crate) fn cmd_commit(
             .unwrap_or(0);
     }
     let commit_odb = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let commit_refs = FileRefStore::new(&git_dir, format);
     author_override = resolve_commit_author_nickname(
-        &git_dir,
+        &commit_refs,
         &commit_odb,
         format,
         author_override.as_deref(),
@@ -1035,7 +1036,7 @@ pub(crate) fn cmd_commit(
         (!encoding_is_utf8(&commit_encoding)).then(|| commit_encoding.clone().into_bytes());
     let committer = commit_identity_from_env("COMMITTER", &identity_config)?;
     let amended_old_oid = if amend {
-        commands::merge_rebase::head_commit_oid(&FileRefStore::new(&git_dir, format))?
+        commands::merge_rebase::head_commit_oid(&commit_refs)?
     } else {
         None
     };
@@ -3592,7 +3593,7 @@ fn build_commit_author_identity(
 /// commit, case-insensitively, after applying the repository mailmap and uses
 /// the newest matching canonical identity.
 fn resolve_commit_author_nickname(
-    git_dir: &Path,
+    refs: &FileRefStore,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     author: Option<&str>,
@@ -3612,7 +3613,6 @@ fn resolve_commit_author_nickname(
             eprintln!("fatal: invalid --author pattern '{author}': {error}");
             GitError::Exit(128)
         })?;
-    let refs = FileRefStore::new(git_dir, format);
     let mut tips = Vec::new();
     let head_oid = match refs.read_ref("HEAD")? {
         Some(RefTarget::Direct(oid)) => Some(oid),
@@ -3638,7 +3638,8 @@ fn resolve_commit_author_nickname(
     tips.sort_unstable();
     tips.dedup();
 
-    let mailmap = commands::utility::Mailmap::load_default(git_dir, format, replace_objects)?;
+    let mailmap =
+        commands::utility::Mailmap::load_default(refs.git_dir(), format, replace_objects)?;
     for record in rev_list_walk_commits(db, format, tips, false)? {
         let (name, email) = commit_identity_name_email(&record.commit.author);
         let (name, email) = mailmap.map_user(&name, &email);
