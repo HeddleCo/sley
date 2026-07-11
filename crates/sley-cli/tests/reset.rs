@@ -185,6 +185,63 @@ fn reset_in_cone_path_keeps_unrelated_sparse_directories_collapsed() {
 }
 
 #[test]
+fn reset_out_of_cone_directory_replaces_sparse_tree_without_expansion() {
+    let root = unique_temp_dir("reset-out-of-cone-sparse-directory");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    for repo in [&upstream, &rust] {
+        git(repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("deep")).expect("create in-cone directory");
+        fs::create_dir_all(repo.join("outside")).expect("create out-of-cone directory");
+        fs::write(repo.join("deep/a"), b"inside\n").expect("write in-cone file");
+        fs::write(repo.join("outside/a"), b"base\n").expect("write out-of-cone file");
+        git(repo, &["add", "."]);
+        run_with_identity(repo, &["commit", "-m", "base", "-q"]);
+        fs::write(repo.join("outside/a"), b"second\n").expect("update out-of-cone file");
+        git(repo, &["add", "outside/a"]);
+        run_with_identity(repo, &["commit", "-m", "second", "-q"]);
+        git(
+            repo,
+            &["sparse-checkout", "init", "--cone", "--sparse-index"],
+        );
+        git(repo, &["sparse-checkout", "set", "deep"]);
+        git(repo, &["config", "advice.sparseIndexExpanded", "false"]);
+    }
+
+    let args = ["reset", "HEAD~1", "--", "outside"];
+    let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+    let trace = root.join("reset-directory-trace.json");
+    let actual = Command::new(sley_testkit::sley_bin!())
+        .current_dir(&rust)
+        .args(args)
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .expect("run traced sparse-directory reset");
+    assert_same_output(actual, expected, &args);
+    assert!(
+        !fs::read_to_string(trace)
+            .expect("read sparse-directory reset trace")
+            .contains("ensure_full_index"),
+        "resetting an out-of-cone directory must replace its sparse tree directly"
+    );
+    assert_eq!(
+        git(&rust, &["ls-files", "--sparse", "--stage"]),
+        git(&upstream, &["ls-files", "--sparse", "--stage"]),
+        "candidate sparse tree entry differed after directory reset"
+    );
+    assert_eq!(
+        git(&rust, &["diff", "--cached", "--name-status"]),
+        git(&upstream, &["diff", "--cached", "--name-status"]),
+        "cached subtree changes differed after directory reset"
+    );
+    assert!(!rust.join("outside").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn reset_sha256_mixed_and_hard_match_upstream_git() {
     let root = unique_temp_dir("reset-sha256");
     let upstream_mixed = root.join("upstream-mixed");

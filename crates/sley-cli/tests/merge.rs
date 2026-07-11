@@ -156,6 +156,89 @@ fn default_branch(dir: &Path) -> String {
 }
 
 #[test]
+fn sequential_clean_merges_restore_sparse_index_between_operations() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("merge-sequential-sparse-index");
+    let reference = root.join("reference");
+    let candidate = root.join("candidate");
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            reference.to_str().expect("UTF-8 test repository path"),
+        ],
+    );
+    fs::create_dir_all(reference.join("deep")).expect("create in-cone directory");
+    fs::create_dir_all(reference.join("outside1")).expect("create first sparse directory");
+    fs::create_dir_all(reference.join("outside2")).expect("create second sparse directory");
+    write_file(&reference, "deep/a", "base\n");
+    write_file(&reference, "outside1/a", "base one\n");
+    write_file(&reference, "outside2/a", "base two\n");
+    git_ok(&reference, &["add", "."]);
+    git_ok(&reference, &["commit", "-qm", "base"]);
+
+    git_ok(&reference, &["checkout", "-q", "-b", "update-one"]);
+    write_file(&reference, "outside1/a", "updated one\n");
+    git_ok(&reference, &["commit", "-qam", "update one"]);
+    git_ok(&reference, &["checkout", "-q", "main"]);
+    git_ok(&reference, &["checkout", "-q", "-b", "update-two"]);
+    write_file(&reference, "outside2/a", "updated two\n");
+    git_ok(&reference, &["commit", "-qam", "update two"]);
+    git_ok(&reference, &["checkout", "-q", "main"]);
+    write_file(&reference, "deep/a", "main\n");
+    git_ok(&reference, &["commit", "-qam", "main"]);
+    git_ok(
+        &reference,
+        &["sparse-checkout", "init", "--cone", "--sparse-index"],
+    );
+    git_ok(&reference, &["sparse-checkout", "set", "deep"]);
+    copy_dir_all(&reference, &candidate);
+
+    for branch in ["update-one", "update-two"] {
+        let expected = git(&reference, &["merge", "-m", "merge", branch]);
+        let trace = root.join(format!("{branch}.trace.json"));
+        let actual = Command::new(sley_testkit::sley_bin!())
+            .current_dir(&candidate)
+            .args(["merge", "-m", "merge", branch])
+            .env("GIT_AUTHOR_NAME", "Tester")
+            .env("GIT_AUTHOR_EMAIL", "tester@example.com")
+            .env("GIT_COMMITTER_NAME", "Tester")
+            .env("GIT_COMMITTER_EMAIL", "tester@example.com")
+            .env("GIT_AUTHOR_DATE", "@1790000000 -0500")
+            .env("GIT_COMMITTER_DATE", "@1790000000 -0500")
+            .env("GIT_TRACE2_EVENT", &trace)
+            .output()
+            .expect("run traced sley merge");
+        assert_eq!(
+            actual.status.code(),
+            expected.status.code(),
+            "merge status differed for {branch}: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        assert!(
+            !fs::read_to_string(trace)
+                .expect("read merge trace")
+                .contains("ensure_full_index"),
+            "clean sparse merge must not advertise a full-index expansion"
+        );
+        assert_eq!(
+            git(&candidate, &["ls-files", "--sparse", "--stage"]).stdout,
+            git(&reference, &["ls-files", "--sparse", "--stage"]).stdout,
+            "sparse index differed after merging {branch}"
+        );
+        assert!(!candidate.join("outside1").exists());
+        assert!(!candidate.join("outside2").exists());
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn merge_previous_branch_with_ancestry_suffix_names_branch_like_git() {
     if !git_available() {
         return;

@@ -223,7 +223,14 @@ pub fn checkout_branch_filtered(
 /// checkout rules. A normal same-HEAD checkout remains a no-op; sparse checkout
 /// is the exception because `git checkout <current-branch>` is also the legacy
 /// command that applies `.git/info/sparse-checkout` to the index and worktree.
-fn reapply_active_sparse_checkout(
+/// Reconcile the current index and worktree with the repository's active
+/// sparse-checkout definition, if any.
+///
+/// Tree-producing operations such as a clean three-way merge may construct a
+/// temporary full stage-zero index. Calling this after materialization restores
+/// skip-worktree bits, removes clean out-of-cone files, and converts the index
+/// back to sparse form without advertising a full-index expansion.
+pub fn reapply_active_sparse_checkout(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -1504,6 +1511,10 @@ pub fn restore_index_paths_from_head(
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head_entries = head_tree_entries(git_dir, format, &db)?;
+    let head_directories = match resolve_head_tree_oid(git_dir, format, &db)? {
+        Some(tree_oid) => tree_directory_entries(&db, format, &tree_oid)?,
+        None => BTreeMap::new(),
+    };
     restore_index_paths_from_entries(
         worktree_root,
         git_dir,
@@ -1511,6 +1522,7 @@ pub fn restore_index_paths_from_head(
         &db,
         index,
         &head_entries,
+        &head_directories,
         paths,
         false,
     )
@@ -1538,6 +1550,7 @@ pub fn restore_index_paths_from_tree(
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let source_entries = tree_entries(&db, format, tree_oid)?;
+    let source_directories = tree_directory_entries(&db, format, tree_oid)?;
     restore_index_paths_from_entries(
         worktree_root,
         git_dir,
@@ -1545,6 +1558,7 @@ pub fn restore_index_paths_from_tree(
         &db,
         index,
         &source_entries,
+        &source_directories,
         paths,
         false,
     )
@@ -1572,6 +1586,7 @@ pub fn restore_index_paths_from_tree_allow_unmatched(
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let source_entries = tree_entries(&db, format, tree_oid)?;
+    let source_directories = tree_directory_entries(&db, format, tree_oid)?;
     restore_index_paths_from_entries(
         worktree_root,
         git_dir,
@@ -1579,6 +1594,7 @@ pub fn restore_index_paths_from_tree_allow_unmatched(
         &db,
         index,
         &source_entries,
+        &source_directories,
         paths,
         true,
     )
@@ -1591,6 +1607,7 @@ pub(crate) fn restore_index_paths_from_entries(
     db: &FileObjectDatabase,
     mut index: Index,
     source_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    source_directories: &BTreeMap<Vec<u8>, ObjectId>,
     paths: &[PathBuf],
     allow_unmatched: bool,
 ) -> Result<RestoreResult> {
@@ -1606,11 +1623,23 @@ pub(crate) fn restore_index_paths_from_entries(
             .entries
             .iter()
             .map(|entry| entry.path.as_bytes())
-            .chain(source_entries.keys().map(Vec::as_slice)),
+            .chain(source_entries.keys().map(Vec::as_slice))
+            .chain(source_directories.keys().map(Vec::as_slice)),
         allow_unmatched,
     )?;
+    let selected_sparse_boundaries = index
+        .entries
+        .iter()
+        .filter(|entry| entry.is_sparse_dir() && matched_paths.contains(entry.path.as_bytes()))
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect::<BTreeSet<_>>();
     let selected_inside_sparse_directory = matched_paths
         .iter()
+        .filter(|path| {
+            !selected_sparse_boundaries
+                .iter()
+                .any(|boundary| path.as_slice() != boundary && path.starts_with(boundary))
+        })
         .any(|path| index_sparse_dir_contains_path(&index, path));
     if selected_inside_sparse_directory {
         // The current per-leaf reset implementation needs the selected sparse
@@ -1631,7 +1660,25 @@ pub(crate) fn restore_index_paths_from_entries(
         .map(|(path, _)| path.clone())
         .collect::<BTreeSet<_>>();
     let mut restored = BTreeSet::new();
+    for boundary in &selected_sparse_boundaries {
+        if let Some(source_oid) = source_directories.get(boundary) {
+            if let Some(entry) = index_entries.get_mut(boundary) {
+                entry.mode = SPARSE_DIR_MODE;
+                entry.oid = *source_oid;
+                entry.set_skip_worktree(true);
+            }
+        } else {
+            index_entries.remove(boundary);
+        }
+        restored.insert(boundary.clone());
+    }
     for path in matched_paths {
+        if selected_sparse_boundaries
+            .iter()
+            .any(|boundary| path.as_slice() == boundary || path.as_slice().starts_with(boundary))
+        {
+            continue;
+        }
         if let Some(entry) = source_entries.get(&path) {
             // git's pathspec reset (`reset_index` → diff against the source
             // tree) only rewrites entries that actually CHANGE: an entry whose
@@ -1684,6 +1731,39 @@ pub(crate) fn restore_index_paths_from_entries(
     Ok(RestoreResult {
         restored: restored.len(),
     })
+}
+
+/// Return every directory entry in `tree_oid`, keyed with the trailing slash
+/// spelling used by sparse-index directory entries.
+fn tree_directory_entries(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<BTreeMap<Vec<u8>, ObjectId>> {
+    fn collect(
+        db: &FileObjectDatabase,
+        format: ObjectFormat,
+        tree_oid: &ObjectId,
+        prefix: &[u8],
+        directories: &mut BTreeMap<Vec<u8>, ObjectId>,
+    ) -> Result<()> {
+        let object = read_expected_object(db, tree_oid, ObjectType::Tree)?;
+        for entry in Tree::parse(format, &object.body)?.entries {
+            if tree_entry_object_type(entry.mode) != ObjectType::Tree {
+                continue;
+            }
+            let mut path = prefix.to_vec();
+            path.extend_from_slice(entry.name.as_bytes());
+            path.push(b'/');
+            directories.insert(path.clone(), entry.oid);
+            collect(db, format, &entry.oid, &path, directories)?;
+        }
+        Ok(())
+    }
+
+    let mut directories = BTreeMap::new();
+    collect(db, format, tree_oid, b"", &mut directories)?;
+    Ok(directories)
 }
 
 pub fn restore_index_and_worktree_paths_from_head(

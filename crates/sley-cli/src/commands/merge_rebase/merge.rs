@@ -3602,6 +3602,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
         if options.squash {
             write_merged_worktree()?;
             refresh_merged_index_stat(&git_dir, &worktree_root, format)?;
+            sley_worktree::reapply_active_sparse_checkout(&worktree_root, &git_dir, format)?;
             write_squash_message(&git_dir, &db, format, &head_oid, &other_oid)?;
             if !options.quiet {
                 println!("Automatic merge went well; stopped before committing as requested");
@@ -3627,6 +3628,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             }
             write_merged_worktree()?;
             refresh_merged_index_stat(&git_dir, &worktree_root, format)?;
+            sley_worktree::reapply_active_sparse_checkout(&worktree_root, &git_dir, format)?;
             if !options.quiet {
                 println!("Automatic merge went well; stopped before committing as requested");
             }
@@ -3703,6 +3705,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             )?;
         } else {
             refresh_merged_index_stat(&git_dir, &worktree_root, format)?;
+            sley_worktree::reapply_active_sparse_checkout(&worktree_root, &git_dir, format)?;
         }
         commands::hooks::run_hook_l_at(&git_dir, "post-merge", &["0"])?;
         if merge_autostash {
