@@ -1537,12 +1537,29 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
         }
     };
     let config = read_repo_config(&common_git_dir)?;
+    let repack_roots = if all {
+        Some(repack_traversal_roots(
+            &git_dir,
+            &common_git_dir,
+            format,
+            cli_session.replace_objects(),
+        )?)
+    } else {
+        None
+    };
     let update_server_info = update_server_info.unwrap_or_else(|| {
         config
             .get_bool("repack", None, "updateServerInfo")
             .unwrap_or(true)
     });
-    let has_promisor_packs = pack_dir_has_promisor_packs(&common_git_dir)?;
+    let mut has_promisor_packs = pack_dir_has_promisor_packs(&common_git_dir)?;
+    if let Some(roots) = repack_roots.as_deref()
+        && !has_promisor_packs
+        && sley_remote::config_has_promisor_remote(&config)
+    {
+        sley_remote::hydrate_reachable_from_local_promisor_remotes(&common_git_dir, format, roots)?;
+        has_promisor_packs = pack_dir_has_promisor_packs(&common_git_dir)?;
+    }
     let config_write_bitmaps = config.get_bool("repack", None, "writeBitmaps");
     let write_reverse_index = config
         .get_bool("pack", None, "writeReverseIndex")
@@ -1627,12 +1644,9 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
     // objects included, unreachable ones dropped). Without `-a`, pack only
     // loose objects and leave existing packs in place.
     let result = if all {
-        let roots = repack_traversal_roots(
-            &git_dir,
-            &common_git_dir,
-            format,
-            cli_session.replace_objects(),
-        )?;
+        let roots = repack_roots
+            .as_deref()
+            .expect("all-object repacks prepared traversal roots");
         let keep_pack_stems: HashSet<String> = keep_packs.iter().cloned().collect();
         let options = sley_odb::RepackOptions {
             local,
