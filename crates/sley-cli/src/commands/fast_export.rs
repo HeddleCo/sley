@@ -304,12 +304,23 @@ impl FastExporter {
                     });
                 }
                 ObjectType::Tag => {
-                    let commit = peel_to_commit(&self.db, self.format, &tip.oid)?;
                     let ref_name = self.export_ref_name_for_source(source_name)?;
                     if self.default_ref_name.is_none() {
                         self.default_ref_name = Some(ref_name.clone());
                     }
-                    self.note_revision_source(commit, ref_name.clone());
+                    let (target_oid, target_type) = self.peel_tag_target(tip.oid)?;
+                    match target_type {
+                        ObjectType::Commit => {
+                            self.note_revision_source(target_oid, ref_name.clone());
+                        }
+                        ObjectType::Blob => {
+                            if !self.options.no_data {
+                                self.export_blob(target_oid)?;
+                            }
+                        }
+                        ObjectType::Tree => {}
+                        ObjectType::Tag => unreachable!("tag peeling must reach a non-tag"),
+                    }
                     self.nested_tag_refs.push((ref_name, tip.oid));
                 }
                 ObjectType::Blob => {
@@ -319,6 +330,16 @@ impl FastExporter {
             }
         }
         Ok(())
+    }
+
+    fn peel_tag_target(&self, mut oid: ObjectId) -> Result<(ObjectId, ObjectType)> {
+        loop {
+            let object = self.db.read_object(&oid)?;
+            if object.object_type != ObjectType::Tag {
+                return Ok((oid, object.object_type));
+            }
+            oid = Tag::parse(self.format, &object.body)?.object;
+        }
     }
 
     fn note_revision_source(&mut self, commit: ObjectId, source_name: String) {
@@ -813,29 +834,33 @@ impl FastExporter {
             return Ok(());
         }
         let tag = Tag::parse(self.format, &object.body)?;
-        let mut tagged_oid = tag.object;
-        let mut tagged_type = tag.object_type;
-        while tagged_type == ObjectType::Tag {
-            let nested = self.db.read_object(&tagged_oid)?;
-            let nested_tag = Tag::parse(self.format, &nested.body)?;
-            tagged_oid = nested_tag.object;
-            tagged_type = nested_tag.object_type;
-        }
-        if tagged_type == ObjectType::Tree {
-            eprintln!(
-                "warning: omitting tag {tag_oid},\nsince tags of trees (or tags of tags of trees, etc.) are not supported."
-            );
+        let (_, terminal_type) = self.peel_tag_target(tag_oid)?;
+        if terminal_type == ObjectType::Tree {
+            self.warn_unsupported_tree_tag_chain(tag_oid)?;
             return Ok(());
         }
 
-        let tagged_mark = match tagged_type {
-            ObjectType::Commit => self.commit_marks.get(&tagged_oid).copied(),
-            ObjectType::Blob => self.blob_marks.get(&tagged_oid).copied(),
-            ObjectType::Tag => self.tag_marks.get(&tagged_oid).copied(),
+        if tag.object_type == ObjectType::Tag {
+            if !self.options.mark_tags {
+                eprintln!("fatal: cannot export nested tags unless --mark-tags is specified.");
+                return Err(GitError::Exit(128));
+            }
+            self.emit_tag_ref(full_name, tag.object)?;
+            write!(
+                self.out,
+                "reset {full_name}\nfrom {}\n\n",
+                ObjectId::null(self.format).to_hex()
+            )?;
+        }
+
+        let tagged_mark = match tag.object_type {
+            ObjectType::Commit => self.commit_marks.get(&tag.object).copied(),
+            ObjectType::Blob => self.blob_marks.get(&tag.object).copied(),
+            ObjectType::Tag => self.tag_marks.get(&tag.object).copied(),
             ObjectType::Tree => None,
         };
         if tagged_mark.is_none() {
-            return self.handle_filtered_tag(full_name, tag_oid, &tag, tagged_oid, tagged_type);
+            return self.handle_filtered_tag(full_name, tag_oid, &tag, tag.object, tag.object_type);
         }
 
         let display_name = full_name.strip_prefix("refs/tags/").unwrap_or(full_name);
@@ -848,7 +873,7 @@ impl FastExporter {
         if let Some(mark) = tagged_mark {
             writeln!(self.out, "from :{mark}")?;
         } else {
-            writeln!(self.out, "from {}", tagged_oid.to_hex())?;
+            writeln!(self.out, "from {}", tag.object.to_hex())?;
         }
         if self.options.show_original_ids {
             writeln!(self.out, "original-oid {}", tag_oid.to_hex())?;
@@ -867,6 +892,18 @@ impl FastExporter {
         writeln!(self.out, "data {}", message.len())?;
         self.out.write_all(&message)?;
         writeln!(self.out)?;
+        Ok(())
+    }
+
+    fn warn_unsupported_tree_tag_chain(&self, tag_oid: ObjectId) -> Result<()> {
+        let object = self.db.read_object(&tag_oid)?;
+        let tag = Tag::parse(self.format, &object.body)?;
+        if tag.object_type == ObjectType::Tag {
+            self.warn_unsupported_tree_tag_chain(tag.object)?;
+        }
+        eprintln!(
+            "warning: omitting tag {tag_oid},\nsince tags of trees (or tags of tags of trees, etc.) are not supported."
+        );
         Ok(())
     }
 
@@ -1110,7 +1147,12 @@ fn parse_fast_export_args(args: &[String]) -> Result<(FastExportOptions, Vec<Str
                 setup_args.push(arg.clone());
             }
             "--" => {
-                setup_args.push(arg.clone());
+                // parse_options() consumes fast-export's option separator
+                // before setup_revisions() sees the remaining argv. This is
+                // observable for `main -- --first-parent`: the latter token
+                // remains a revision-walk option rather than becoming a
+                // pathspec. Plain path arguments still fall back to pathspecs
+                // during revision setup when they do not resolve as revisions.
                 setup_args.extend(iter.cloned());
                 break;
             }
@@ -1400,8 +1442,12 @@ fn validate_fast_export_tag_refs(
         if object.object_type != ObjectType::Tag {
             continue;
         }
-        let findings =
-            sley_fsck::content::check_object_content(ObjectType::Tag, &object.body, &severity);
+        let findings = sley_fsck::content::check_object_content_with_format(
+            format,
+            ObjectType::Tag,
+            &object.body,
+            &severity,
+        );
         if findings.is_empty() {
             let tag = Tag::parse_ref(format, &object.body)?;
             let read_oid = apply_replace_object(replace_objects, store, &tag.object)?;

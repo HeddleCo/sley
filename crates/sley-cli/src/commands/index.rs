@@ -2522,7 +2522,7 @@ pub(crate) fn cmd_update_index(
         } else {
             let git_dir = cli_session.git_dir()?;
             let format = repository_object_format(&git_dir)?;
-            let records = parse_update_index_index_info(&input)?
+            let records = parse_update_index_index_info(&input, nul)?
                 .into_iter()
                 .map(|record| record.into_worktree_record(format))
                 .collect::<Result<Vec<_>>>()?;
@@ -3000,9 +3000,10 @@ fn parse_update_index_cacheinfo_split(
     })
 }
 
-fn parse_update_index_index_info(input: &[u8]) -> Result<Vec<CliIndexInfoRecord>> {
+fn parse_update_index_index_info(input: &[u8], nul: bool) -> Result<Vec<CliIndexInfoRecord>> {
     let mut records = Vec::new();
-    for line in input.split(|byte| *byte == b'\n') {
+    let terminator = if nul { b'\0' } else { b'\n' };
+    for line in input.split(|byte| *byte == terminator) {
         if line.is_empty() {
             continue;
         }

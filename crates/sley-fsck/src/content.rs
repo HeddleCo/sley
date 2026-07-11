@@ -7,6 +7,7 @@
 //! message id and detail string that git prints. The caller renders these as
 //! `error in <type> <oid>: <msgid>: <detail>` / `warning in <type> <oid>: ...`.
 
+use sley_core::ObjectFormat;
 use sley_object::ObjectType;
 
 /// Default severity of an fsck message id, before `fsck.<id>` config overrides.
@@ -551,10 +552,28 @@ pub fn check_object_content(
     body: &[u8],
     config: &SeverityConfig,
 ) -> Vec<ContentFinding> {
+    check_object_content_with_format(
+        infer_object_format(object_type, body),
+        object_type,
+        body,
+        config,
+    )
+}
+
+/// Validate a loaded object body using the repository's explicit object
+/// format. Commit, tag, and tree object ids have different widths under SHA-1
+/// and SHA-256, so callers that own repository context should always use this
+/// entry point.
+pub fn check_object_content_with_format(
+    format: ObjectFormat,
+    object_type: ObjectType,
+    body: &[u8],
+    config: &SeverityConfig,
+) -> Vec<ContentFinding> {
     let mut raw = match object_type {
-        ObjectType::Commit => check_commit(body),
-        ObjectType::Tag => check_tag(body),
-        ObjectType::Tree => check_tree(body, config.large_pathname_len),
+        ObjectType::Commit => check_commit(format, body),
+        ObjectType::Tag => check_tag(format, body),
+        ObjectType::Tree => check_tree(format, body, config.large_pathname_len),
         ObjectType::Blob => Vec::new(),
     };
     // Resolve severities, apply tag-specific report-overwrite masking, then drop
@@ -565,6 +584,31 @@ pub fn check_object_content(
     mask_tag_ident_error_if_extra_header_overwrites_return(object_type, &mut raw);
     raw.retain(|finding| finding.severity != Severity::Ignore);
     raw
+}
+
+/// Compatibility inference for content-only callers that do not own repository
+/// context. Valid commit/tag headers are unambiguous; malformed headers retain
+/// the historical SHA-1 default and still produce their existing fsck finding.
+/// Raw trees cannot reliably advertise their hash format, so their legacy path
+/// also remains SHA-1. Repository-aware callers use
+/// [`check_object_content_with_format`] instead.
+fn infer_object_format(object_type: ObjectType, body: &[u8]) -> ObjectFormat {
+    let prefix = match object_type {
+        ObjectType::Commit => b"tree ".as_slice(),
+        ObjectType::Tag => b"object ".as_slice(),
+        ObjectType::Tree | ObjectType::Blob => return ObjectFormat::Sha1,
+    };
+    let Some(value) = body.strip_prefix(prefix) else {
+        return ObjectFormat::Sha1;
+    };
+    let hex_len = value.iter().position(|byte| *byte == b'\n').unwrap_or(0);
+    if hex_len == ObjectFormat::Sha256.hex_len()
+        && value[..hex_len].iter().all(u8::is_ascii_hexdigit)
+    {
+        ObjectFormat::Sha256
+    } else {
+        ObjectFormat::Sha1
+    }
 }
 
 fn mask_tag_ident_error_if_extra_header_overwrites_return(
@@ -814,7 +858,7 @@ fn timestamp_overflows(digits: &[u8]) -> bool {
     }
 }
 
-fn check_commit(body: &[u8]) -> Vec<ContentFinding> {
+fn check_commit(format: ObjectFormat, body: &[u8]) -> Vec<ContentFinding> {
     let mut out = Vec::new();
     if let Some(f) = verify_headers(body) {
         out.push(f);
@@ -826,7 +870,7 @@ fn check_commit(body: &[u8]) -> Vec<ContentFinding> {
     match strip_line_prefix(body, pos, b"tree ") {
         Some(after) => {
             // Validate the sha1 + trailing newline.
-            if !valid_oid_line(body, after) {
+            if !valid_oid_line(format, body, after) {
                 out.push(finding(
                     MsgId::BadTreeSha1,
                     "invalid 'tree' line format - bad sha1",
@@ -848,7 +892,7 @@ fn check_commit(body: &[u8]) -> Vec<ContentFinding> {
 
     // zero or more parent lines
     while let Some(after) = strip_line_prefix(body, pos, b"parent ") {
-        if !valid_oid_line(body, after) {
+        if !valid_oid_line(format, body, after) {
             out.push(finding(
                 MsgId::BadParentSha1,
                 "invalid 'parent' line format - bad sha1",
@@ -918,7 +962,7 @@ fn check_commit(body: &[u8]) -> Vec<ContentFinding> {
     out
 }
 
-fn check_tag(body: &[u8]) -> Vec<ContentFinding> {
+fn check_tag(format: ObjectFormat, body: &[u8]) -> Vec<ContentFinding> {
     let mut out = Vec::new();
     if let Some(f) = verify_headers(body) {
         out.push(f);
@@ -929,7 +973,7 @@ fn check_tag(body: &[u8]) -> Vec<ContentFinding> {
     // object line
     match strip_line_prefix(body, pos, b"object ") {
         Some(after) => {
-            if !valid_oid_line(body, after) {
+            if !valid_oid_line(format, body, after) {
                 out.push(finding(
                     MsgId::BadObjectSha1,
                     "invalid 'object' line format - bad sha1",
@@ -1079,9 +1123,9 @@ fn check_tag(body: &[u8]) -> Vec<ContentFinding> {
     out
 }
 
-fn check_tree(body: &[u8], large_pathname_len: usize) -> Vec<ContentFinding> {
+fn check_tree(format: ObjectFormat, body: &[u8], large_pathname_len: usize) -> Vec<ContentFinding> {
     // Walk raw tree entries: "<mode> <name>\0<20-or-32-byte-oid>".
-    let oid_len = guess_oid_len(body);
+    let oid_len = format.raw_len();
     let mut out = Vec::new();
 
     let mut has_null_sha1 = false;
@@ -1310,29 +1354,10 @@ fn memchr(body: &[u8], from: usize, needle: u8) -> Option<usize> {
 
 /// A `<hex-oid>\n` line: hex chars of the right length followed immediately by
 /// a newline.
-fn valid_oid_line(body: &[u8], from: usize) -> bool {
-    let oid_hex_len = match guess_hex_len(body) {
-        Some(n) => n,
-        None => return false,
-    };
+fn valid_oid_line(format: ObjectFormat, body: &[u8], from: usize) -> bool {
+    let oid_hex_len = format.hex_len();
     let end = from + oid_hex_len;
     body.len() > end && body[from..end].iter().all(u8::is_ascii_hexdigit) && body[end] == b'\n'
-}
-
-/// Determine sha1 (40) vs sha256 (64) hex length from the object content. We
-/// look at the first oid-shaped run; default to sha1.
-fn guess_hex_len(body: &[u8]) -> Option<usize> {
-    // The "tree "/"object " line is followed by a hex oid then '\n'. Sniff the
-    // run of hex chars after the first space-prefixed header value.
-    let _ = body;
-    // sley currently runs sha1 in the upstream suite; 40 is the right default.
-    Some(40)
-}
-
-/// Tree oid length in bytes (20 sha1 / 32 sha256).
-fn guess_oid_len(body: &[u8]) -> usize {
-    let _ = body;
-    20
 }
 
 fn is_known_object_type(s: &[u8]) -> bool {
@@ -1546,6 +1571,59 @@ message\n"
             .to_vec();
         let f = check_object_content(ObjectType::Commit, &body, &cfg());
         assert!(f.is_empty(), "{f:?}");
+    }
+
+    fn valid_tag_with_object_hex(object_hex: &str) -> Vec<u8> {
+        format!(
+            "object {object_hex}\ntype commit\ntag valid\n\
+tagger T A Gger <tagger@example.com> 1234567890 +0000\n\nmessage\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn tag_object_header_width_follows_explicit_object_format() {
+        for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+            let body = valid_tag_with_object_hex(&"1".repeat(format.hex_len()));
+            let findings = check_object_content_with_format(format, ObjectType::Tag, &body, &cfg());
+            assert!(findings.is_empty(), "{format:?}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn tag_object_header_rejects_the_other_formats_width() {
+        let sha1_body = valid_tag_with_object_hex(&"1".repeat(ObjectFormat::Sha1.hex_len()));
+        let sha256_body = valid_tag_with_object_hex(&"2".repeat(ObjectFormat::Sha256.hex_len()));
+        let sha1_as_sha256 = check_object_content_with_format(
+            ObjectFormat::Sha256,
+            ObjectType::Tag,
+            &sha1_body,
+            &cfg(),
+        );
+        let sha256_as_sha1 = check_object_content_with_format(
+            ObjectFormat::Sha1,
+            ObjectType::Tag,
+            &sha256_body,
+            &cfg(),
+        );
+        assert_eq!(ids(&sha1_as_sha256), vec!["badObjectSha1"]);
+        assert_eq!(ids(&sha256_as_sha1), vec!["badObjectSha1"]);
+    }
+
+    #[test]
+    fn compatibility_content_api_infers_valid_sha256_tag_header() {
+        let body = valid_tag_with_object_hex(&"a".repeat(ObjectFormat::Sha256.hex_len()));
+        let findings = check_object_content(ObjectType::Tag, &body, &cfg());
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn sha256_tree_entries_use_32_byte_object_ids() {
+        let mut body = b"100644 file\0".to_vec();
+        body.extend_from_slice(&[0x42; 32]);
+        let findings =
+            check_object_content_with_format(ObjectFormat::Sha256, ObjectType::Tree, &body, &cfg());
+        assert!(findings.is_empty(), "{findings:?}");
     }
 
     #[test]

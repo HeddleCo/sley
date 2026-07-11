@@ -392,7 +392,12 @@ where
         let content_findings = if self.connectivity_only {
             Vec::new()
         } else {
-            content::check_object_content(object.object_type, &object.body, &self.severity)
+            content::check_object_content_with_format(
+                self.format,
+                object.object_type,
+                &object.body,
+                &self.severity,
+            )
         };
         let had_fatal = content_findings.iter().any(|f| f.fatal);
         for f in &content_findings {

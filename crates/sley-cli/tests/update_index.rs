@@ -2113,6 +2113,24 @@ fn update_index_index_info_matches_upstream_git() {
             assert_index_matches_for_label(&expected, &actual, label);
         }
 
+        let nul_terminated =
+            format!("100644 {one}\tpath with\nnewline\0100644 {two}\tpath with space\0");
+        let args = ["update-index", "-z", "--index-info"];
+        let expected_output = run_with_stdin(
+            sley_testkit::oracle_git(),
+            &expected,
+            &args,
+            nul_terminated.as_bytes(),
+        );
+        let actual_output = run_with_stdin(
+            sley_testkit::sley_bin!(),
+            &actual,
+            &args,
+            nul_terminated.as_bytes(),
+        );
+        assert_same_output(actual_output, expected_output, &args);
+        assert_index_matches_for_label(&expected, &actual, "nul-terminated-raw-paths");
+
         let args = ["update-index", "--index-info", "extra"];
         let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, b"");
         let actual_output = run_with_stdin(sley_testkit::sley_bin!(), &actual, &args, b"");
