@@ -79,7 +79,13 @@ fn cmd_bundle_create(cli_session: &crate::session::CliSession, args: &[String]) 
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let options = parse_bundle_revision_args(&rev_args)?;
-    let selection = bundle_create_selection(&git_dir, format, &db, &options)?;
+    let selection = bundle_create_selection(
+        &git_dir,
+        format,
+        &db,
+        cli_session.replace_objects(),
+        &options,
+    )?;
     if selection.references.is_empty() {
         eprintln!("fatal: Refusing to create empty bundle.");
         return Err(GitError::Exit(128));
@@ -392,7 +398,11 @@ fn parse_bundle_since(value: &str) -> Option<i64> {
     crate::commands::approxidate::parse_commit_date(value).map(|(timestamp, _)| timestamp)
 }
 
-fn bundle_all_references(git_dir: &Path, format: ObjectFormat) -> Result<Vec<BundleReference>> {
+fn bundle_all_references(
+    git_dir: &Path,
+    format: ObjectFormat,
+    replace_objects: bool,
+) -> Result<Vec<BundleReference>> {
     let store = FileRefStore::new(git_dir, format);
     let mut references = Vec::new();
     for reference in store.list_refs()? {
@@ -403,7 +413,7 @@ fn bundle_all_references(git_dir: &Path, format: ObjectFormat) -> Result<Vec<Bun
             });
         }
     }
-    if let Ok(oid) = resolve_revision(git_dir, format, "HEAD") {
+    if let Ok(oid) = resolve_revision(git_dir, format, "HEAD", replace_objects) {
         references.push(BundleReference {
             oid,
             name: "HEAD".into(),
@@ -430,10 +440,11 @@ fn bundle_create_selection(
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
+    replace_objects: bool,
     options: &BundleRevisionOptions,
 ) -> Result<BundleCreateSelection> {
     let mut includes = if options.all {
-        bundle_all_references(git_dir, format)?
+        bundle_all_references(git_dir, format, replace_objects)?
             .into_iter()
             .map(|reference| BundleSpec {
                 oid: reference.oid,
@@ -450,6 +461,7 @@ fn bundle_create_selection(
             git_dir,
             format,
             db,
+            replace_objects,
             spec,
             options.ignore_missing,
             &mut includes,
@@ -487,6 +499,7 @@ fn add_bundle_revision_spec(
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
+    replace_objects: bool,
     spec: &str,
     ignore_missing: bool,
     includes: &mut Vec<BundleSpec>,
@@ -498,7 +511,7 @@ fn add_bundle_revision_spec(
                 "bundle create excludes require a revision".into(),
             ));
         }
-        match resolve_revision(git_dir, format, excluded) {
+        match resolve_revision(git_dir, format, excluded, replace_objects) {
             Ok(oid) => excludes.push(oid),
             Err(err) if ignore_missing => {
                 let _ = err;
@@ -508,7 +521,7 @@ fn add_bundle_revision_spec(
         return Ok(());
     }
     if let Some(base) = spec.strip_suffix("^!") {
-        let oid = resolve_revision(git_dir, format, base)?;
+        let oid = resolve_revision(git_dir, format, base, replace_objects)?;
         includes.push(BundleSpec {
             oid,
             name: bundle_display_ref(git_dir, format, base, oid)?,
@@ -529,8 +542,8 @@ fn add_bundle_revision_spec(
     {
         let left = if left.is_empty() { "HEAD" } else { left };
         let right = if right.is_empty() { "HEAD" } else { right };
-        excludes.push(resolve_revision(git_dir, format, left)?);
-        let oid = resolve_revision(git_dir, format, right)?;
+        excludes.push(resolve_revision(git_dir, format, left, replace_objects)?);
+        let oid = resolve_revision(git_dir, format, right, replace_objects)?;
         includes.push(BundleSpec {
             oid,
             name: bundle_display_ref(git_dir, format, right, oid)?,
@@ -538,7 +551,7 @@ fn add_bundle_revision_spec(
         });
         return Ok(());
     }
-    let oid = match resolve_revision(git_dir, format, spec) {
+    let oid = match resolve_revision(git_dir, format, spec, replace_objects) {
         Ok(oid) => oid,
         Err(err) if ignore_missing => {
             let _ = err;

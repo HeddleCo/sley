@@ -231,6 +231,7 @@ fn cmd_commit_graph_write(cli_session: &crate::session::CliSession, args: &[Stri
                 split,
                 progress,
                 repo_config.as_ref(),
+                cli_session.replace_objects(),
             );
         }
         CommitGraphSource::AllPacks => commit_graph_packed_commit_starts(&db, &object_dir, format)?,
@@ -778,6 +779,7 @@ fn write_reachable_commit_graph(
     split: CommitGraphSplitOptions,
     progress: bool,
     repo_config: Option<&sley_config::GitConfig>,
+    replace_objects: bool,
 ) -> Result<()> {
     let graph = commit_graph_for_reachable_refs(
         git_dir,
@@ -789,6 +791,7 @@ fn write_reachable_commit_graph(
         max_new_filters,
         existing_filters,
         progress,
+        replace_objects,
     )?;
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
@@ -1630,6 +1633,7 @@ fn commit_graph_for_reachable_refs(
     max_new_filters: Option<usize>,
     existing_filters: &HashMap<ObjectId, CommitGraphExistingBloomFilter>,
     progress: bool,
+    replace_objects: bool,
 ) -> Result<Vec<u8>> {
     let store = FileRefStore::new(git_dir, format);
     let mut starts = Vec::new();
@@ -1644,7 +1648,7 @@ fn commit_graph_for_reachable_refs(
             starts.push(commit);
         }
     }
-    if let Ok(head) = resolve_revision(git_dir, format, "HEAD")
+    if let Ok(head) = resolve_revision(git_dir, format, "HEAD", replace_objects)
         && let Ok(commit) = sley_rev::peel_to_commit(db, format, &head)
         && seen_starts.insert(commit)
     {

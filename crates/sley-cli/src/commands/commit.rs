@@ -1037,11 +1037,19 @@ pub(crate) fn cmd_commit(
         .transpose()?;
     let reused_commit = reuse_message
         .as_deref()
-        .map(|rev| read_reused_commit(&git_dir, format, rev))
+        .map(|rev| read_reused_commit(&git_dir, format, rev, cli_session.replace_objects()))
         .transpose()?;
     let fixup_message = fixup_commit
         .as_ref()
-        .map(|fixup| read_fixup_commit_message(&git_dir, format, fixup, &commit_encoding))
+        .map(|fixup| {
+            read_fixup_commit_message(
+                &git_dir,
+                format,
+                fixup,
+                &commit_encoding,
+                cli_session.replace_objects(),
+            )
+        })
         .transpose()?;
     let fixup_reword_tree = if fixup_commit
         .as_ref()
@@ -1057,7 +1065,15 @@ pub(crate) fn cmd_commit(
     };
     let squash_message = squash_commit
         .as_deref()
-        .map(|rev| read_squash_commit_message(&git_dir, format, rev, &commit_encoding))
+        .map(|rev| {
+            read_squash_commit_message(
+                &git_dir,
+                format,
+                rev,
+                &commit_encoding,
+                cli_session.replace_objects(),
+            )
+        })
         .transpose()?;
     let author = if reset_author {
         build_commit_author_identity(
@@ -1415,6 +1431,7 @@ pub(crate) fn cmd_commit(
             quiet,
             allow_empty,
             cli_session.lazy_fetch(),
+            cli_session.replace_objects(),
         );
     }
     if in_merge {
@@ -1426,6 +1443,7 @@ pub(crate) fn cmd_commit(
             quiet,
             &identity_config,
             cli_session.lazy_fetch(),
+            cli_session.replace_objects(),
         );
     }
     if in_cherry_pick || in_revert {
@@ -2685,8 +2703,9 @@ fn read_fixup_commit_message(
     format: ObjectFormat,
     fixup: &CommitFixup,
     output_encoding: &str,
+    replace_objects: bool,
 ) -> Result<Vec<u8>> {
-    let commit = read_reused_commit(git_dir, format, fixup.rev())?;
+    let commit = read_reused_commit(git_dir, format, fixup.rev(), replace_objects)?;
     let message = commit_message_for_commit_encoding(&commit, output_encoding);
     let subject = commit_subject_bytes(&message);
     match fixup {
@@ -2716,8 +2735,9 @@ fn read_squash_commit_message(
     format: ObjectFormat,
     rev: &str,
     output_encoding: &str,
+    replace_objects: bool,
 ) -> Result<Vec<u8>> {
-    let commit = read_reused_commit(git_dir, format, rev)?;
+    let commit = read_reused_commit(git_dir, format, rev, replace_objects)?;
     let message = commit_message_for_commit_encoding(&commit, output_encoding);
     let subject = commit_subject_bytes(&message);
     let mut squash = b"squash! ".to_vec();

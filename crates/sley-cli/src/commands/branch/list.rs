@@ -73,6 +73,7 @@ pub(super) fn run_branch_verbose_list_options(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     options: BranchVerboseListOptions,
 ) -> Result<()> {
     if options.verbosity == 0 {
@@ -82,7 +83,7 @@ pub(super) fn run_branch_verbose_list_options(
             print_branch_list_matching(store, options.mode, &options.patterns, options.ignore_case)
         };
     }
-    print_branch_list_verbose(git_dir, format, store, options)
+    print_branch_list_verbose(git_dir, format, store, replace_objects, options)
 }
 #[derive(Clone, Copy)]
 pub(super) enum BranchListMode {
@@ -210,6 +211,7 @@ pub(super) fn run_branch_general_list_options(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     options: BranchGeneralListOptions,
 ) -> Result<()> {
     let mut refs = branch_sorted_refs(git_dir, format, store, options.mode, options.sort)?;
@@ -230,7 +232,14 @@ pub(super) fn run_branch_general_list_options(
             _ => {}
         }
     }
-    refs = branch_filter_refs_by_reachability(git_dir, format, store, refs, &options.filters)?;
+    refs = branch_filter_refs_by_reachability(
+        git_dir,
+        format,
+        store,
+        replace_objects,
+        refs,
+        &options.filters,
+    )?;
     if let Some(style) = options.column {
         let show_detached = options.patterns.is_empty();
         let rows = collect_branch_rows(
@@ -470,6 +479,7 @@ pub(super) fn branch_filter_refs_by_reachability(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     refs: Vec<sley_refs::Ref>,
     filters: &BranchListFilters,
 ) -> Result<Vec<sley_refs::Ref>> {
@@ -478,10 +488,14 @@ pub(super) fn branch_filter_refs_by_reachability(
     }
 
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let contains_oids = branch_resolve_filter_revs(git_dir, format, &filters.contains)?;
-    let no_contains_oids = branch_resolve_filter_revs(git_dir, format, &filters.no_contains)?;
-    let merged_oids = branch_resolve_filter_revs(git_dir, format, &filters.merged)?;
-    let no_merged_oids = branch_resolve_filter_revs(git_dir, format, &filters.no_merged)?;
+    let contains_oids =
+        branch_resolve_filter_revs(git_dir, format, replace_objects, &filters.contains)?;
+    let no_contains_oids =
+        branch_resolve_filter_revs(git_dir, format, replace_objects, &filters.no_contains)?;
+    let merged_oids =
+        branch_resolve_filter_revs(git_dir, format, replace_objects, &filters.merged)?;
+    let no_merged_oids =
+        branch_resolve_filter_revs(git_dir, format, replace_objects, &filters.no_merged)?;
     let contains_targets = branch_peel_filter_oids(&db, format, &filters.contains, &contains_oids)?;
     let no_contains_targets =
         branch_peel_filter_oids(&db, format, &filters.no_contains, &no_contains_oids)?;
@@ -524,10 +538,11 @@ pub(super) fn branch_filter_refs_by_reachability(
 pub(super) fn branch_resolve_filter_revs(
     git_dir: &Path,
     format: ObjectFormat,
+    replace_objects: bool,
     revs: &[String],
 ) -> Result<Vec<ObjectId>> {
     revs.iter()
-        .map(|rev| resolve_revision(git_dir, format, rev))
+        .map(|rev| resolve_revision(git_dir, format, rev, replace_objects))
         .collect()
 }
 
@@ -1102,6 +1117,7 @@ pub(super) fn print_branch_list_format(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     mode: BranchListMode,
     patterns: &[String],
     ignore_case: bool,
@@ -1111,6 +1127,7 @@ pub(super) fn print_branch_list_format(
         git_dir,
         format,
         store,
+        replace_objects,
         BranchFormatPrintOptions {
             mode,
             patterns,
@@ -1133,10 +1150,17 @@ pub(super) fn print_branch_list_format_omit_empty(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     options: BranchFormatPrintOptions<'_>,
 ) -> Result<()> {
     print_branch_list_format_omit_empty_with_sort_color(
-        git_dir, format, store, options, None, false,
+        git_dir,
+        format,
+        store,
+        replace_objects,
+        options,
+        None,
+        false,
     )
 }
 
@@ -1144,12 +1168,14 @@ pub(super) fn run_branch_format_list_options(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     options: BranchFormatListOptions,
 ) -> Result<()> {
     print_branch_list_format_omit_empty_with_sort_color(
         git_dir,
         format,
         store,
+        replace_objects,
         BranchFormatPrintOptions {
             mode: options.mode,
             patterns: &options.patterns,
@@ -1166,6 +1192,7 @@ pub(super) fn print_branch_list_format_omit_empty_with_sort_color(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     options: BranchFormatPrintOptions<'_>,
     sort: Option<BranchSort>,
     color: bool,
@@ -1177,7 +1204,7 @@ pub(super) fn print_branch_list_format_omit_empty_with_sort_color(
     let objectname_abbrev = repository_abbrev(git_dir, format)?;
     let objectname_candidates = cat_file_all_object_ids(git_dir, format)?;
     let deltabase = zero_oid(format)?;
-    let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
+    let mailmap = commands::utility::Mailmap::load_default(git_dir, format, replace_objects)?;
     let all_refs = branch_sorted_refs(git_dir, format, store, options.mode, sort)?;
     let ref_names: std::collections::HashSet<String> = all_refs
         .iter()
@@ -2135,6 +2162,7 @@ pub(super) fn print_branch_list_verbose(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     options: BranchVerboseListOptions,
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -2175,6 +2203,7 @@ pub(super) fn print_branch_list_verbose(
         git_dir,
         format,
         store,
+        replace_objects,
         branch_refs_for_mode(store, options.mode)?,
         &options.filters,
     )?;

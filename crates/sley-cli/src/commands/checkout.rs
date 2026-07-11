@@ -14,6 +14,7 @@ struct CheckoutContext {
     format: ObjectFormat,
     config: GitConfig,
     refs: FileRefStore,
+    replace_objects: bool,
 }
 
 impl CheckoutContext {
@@ -34,6 +35,7 @@ impl CheckoutContext {
             format,
             config,
             refs,
+            replace_objects: cli_session.replace_objects(),
         })
     }
 
@@ -412,7 +414,14 @@ pub(crate) fn cmd_checkout(
                     // `checkout <rev> <paths>...` — but if the first arg is not a
                     // revision, every positional is a pathspec (git's
                     // disambiguation for `checkout <path> <path>...`).
-                    if checkout_resolve_start_oid(&git_dir, format, &positional[0]).is_ok() {
+                    if checkout_resolve_start_oid(
+                        &git_dir,
+                        format,
+                        &positional[0],
+                        context.replace_objects,
+                    )
+                    .is_ok()
+                    {
                         (Some(positional[0].as_str()), &positional[1..])
                     } else {
                         (None, positional.as_slice())
@@ -427,7 +436,13 @@ pub(crate) fn cmd_checkout(
                         .and_then(|name| sley_refs::resolve_ref_peeled(store, &name).ok().flatten())
                         .is_some();
                     if !is_branch
-                        && checkout_resolve_start_oid(&git_dir, format, value).is_err()
+                        && checkout_resolve_start_oid(
+                            &git_dir,
+                            format,
+                            value,
+                            context.replace_objects,
+                        )
+                        .is_err()
                         && (cwd.join(value).exists()
                             || checkout_index_has_path(
                                 &git_dir,
@@ -475,7 +490,8 @@ pub(crate) fn cmd_checkout(
                         );
                         return Err(GitError::Exit(128));
                     }
-                    let oid = checkout_resolve_start_oid(&git_dir, format, rev)?;
+                    let oid =
+                        checkout_resolve_start_oid(&git_dir, format, rev, context.replace_objects)?;
                     let tree = sley_rev::peel_to_tree(db, format, &oid)?;
                     sley_worktree::restore_index_and_worktree_paths_from_tree(
                         worktree_root,
@@ -533,7 +549,8 @@ pub(crate) fn cmd_checkout(
     if force && matches!(branch_mode, CheckoutBranchMode::Existing) && positional.len() == 1 {
         let target = &positional[0];
         let head_commit = resolve_ref_peeled(store, "HEAD")?;
-        if let Ok(target_oid) = checkout_resolve_start_oid(&git_dir, format, target)
+        if let Ok(target_oid) =
+            checkout_resolve_start_oid(&git_dir, format, target, context.replace_objects)
             && head_commit == Some(target_oid)
         {
             let switches_to_other_branch = branch_ref_name(target)
@@ -628,7 +645,8 @@ pub(crate) fn cmd_checkout(
                 ));
             }
             let target = positional.first().map(String::as_str).unwrap_or("HEAD");
-            let target_oid = checkout_resolve_start_oid(&git_dir, format, target)?;
+            let target_oid =
+                checkout_resolve_start_oid(&git_dir, format, target, context.replace_objects)?;
             let target_oid = sley_rev::peel_to_commit(db, format, &target_oid)?;
             let from = checkout_reflog_from_name(store);
             let config = checkout_config;
@@ -749,7 +767,8 @@ pub(crate) fn cmd_checkout(
                     announce: true,
                 }
             } else if !is_branch
-                && let Ok(target_oid) = checkout_resolve_start_oid(&git_dir, format, branch)
+                && let Ok(target_oid) =
+                    checkout_resolve_start_oid(&git_dir, format, branch, context.replace_objects)
             {
                 // A tag (or other peelable object) detaches HEAD at the *commit*
                 // it points to; `resolve_revision` yields the tag object itself,
@@ -854,6 +873,7 @@ pub(crate) fn cmd_checkout(
                         &git_dir,
                         &git_dir,
                         format,
+                        context.replace_objects,
                         &branch_name,
                         &dwim.remote_ref,
                         false,
@@ -910,7 +930,12 @@ pub(crate) fn cmd_checkout(
                     return Err(GitError::Exit(128));
                 }
                 if let Some(start) = positional.first().map(String::as_str) {
-                    let Some(start_oid) = resolve_checkout_start_oid(&git_dir, format, start)?
+                    let Some(start_oid) = resolve_checkout_start_oid(
+                        &git_dir,
+                        format,
+                        start,
+                        context.replace_objects,
+                    )?
                     else {
                         eprintln!(
                             "fatal: '{start}' is not a commit and a branch '{branch}' cannot be created from it"
@@ -950,7 +975,8 @@ pub(crate) fn cmd_checkout(
                 );
                 return Err(GitError::Exit(128));
             }
-            if resolve_checkout_start_oid(&git_dir, format, start).is_err() {
+            if resolve_checkout_start_oid(&git_dir, format, start, context.replace_objects).is_err()
+            {
                 eprintln!(
                     "fatal: '{start}' is not a commit and a branch '{branch}' cannot be created from it"
                 );
@@ -962,6 +988,7 @@ pub(crate) fn cmd_checkout(
                 &git_dir,
                 &git_dir,
                 format,
+                context.replace_objects,
                 &branch,
                 start,
                 force,
@@ -1441,8 +1468,9 @@ fn checkout_resolve_start_oid(
     git_dir: &Path,
     format: ObjectFormat,
     start: &str,
+    replace_objects: bool,
 ) -> Result<ObjectId> {
-    resolve_checkout_start_oid(git_dir, format, start)?
+    resolve_checkout_start_oid(git_dir, format, start, replace_objects)?
         .ok_or_else(|| GitError::not_found(format!("revision {start}")))
 }
 
@@ -2025,7 +2053,7 @@ pub(crate) fn cmd_restore(cli_session: &crate::session::CliSession, args: &[Stri
         .collect::<Vec<_>>();
     let source_tree = if let Some(source) = source.as_deref() {
         let db = context.objects();
-        let oid = resolve_revision(git_dir, format, source)?;
+        let oid = resolve_revision(git_dir, format, source, context.replace_objects)?;
         Some(sley_rev::peel_to_tree(db, format, &oid)?)
     } else {
         None
@@ -2332,7 +2360,7 @@ fn checkout_merge_autostash_branch_switch(
             return Err(GitError::Exit(128));
         }
     };
-    let head = resolve_revision(git_dir, format, "HEAD")?;
+    let head = resolve_revision(git_dir, format, "HEAD", context.replace_objects)?;
     if recurse_submodules {
         commands::read_tree::reset_index_and_worktree_to_commit(
             worktree_root,
@@ -2564,11 +2592,12 @@ fn checkout_patch_resolve_revision(
     git_dir: &Path,
     format: ObjectFormat,
     rev: &str,
+    replace_objects: bool,
 ) -> Result<String> {
     if let Some((left, right)) = rev.split_once("...") {
         let left = if left.is_empty() { "HEAD" } else { left };
         let right = if right.is_empty() { "HEAD" } else { right };
-        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let db = crate::repository::open_object_database(git_dir, format, replace_objects)?;
         let left = commands::diff::diff_resolve_commit_arg(git_dir, format, &db, left)?;
         let right = commands::diff::diff_resolve_commit_arg(git_dir, format, &db, right)?;
         let base = commands::diff::diff_single_merge_base(git_dir, format, &db, &left, &right)?;
@@ -2580,13 +2609,21 @@ fn checkout_patch_resolve_revision(
 /// Whether `arg` should be treated as the tree-ish operand of a `checkout -p`
 /// (rather than a pathspec): an explicit `HEAD`/`@`, a `...` range, or anything
 /// that resolves to a commit/tree-ish.
-fn checkout_patch_arg_is_revision(git_dir: &Path, format: ObjectFormat, arg: &str) -> bool {
+fn checkout_patch_arg_is_revision(
+    git_dir: &Path,
+    format: ObjectFormat,
+    arg: &str,
+    replace_objects: bool,
+) -> bool {
     arg == "HEAD"
         || arg == "@"
         || arg.contains("...")
-        || checkout_resolve_start_oid(git_dir, format, arg).is_ok()
+        || checkout_resolve_start_oid(git_dir, format, arg, replace_objects).is_ok()
         || {
-            let db = FileObjectDatabase::from_git_dir(git_dir, format);
+            let Ok(db) = crate::repository::open_object_database(git_dir, format, replace_objects)
+            else {
+                return false;
+            };
             commands::diff::diff_resolve_commit_arg(git_dir, format, &db, arg).is_ok()
         }
 }
@@ -2618,7 +2655,12 @@ fn checkout_run_patch(
         }
         None => {
             if !positional.is_empty()
-                && checkout_patch_arg_is_revision(git_dir, format, &positional[0])
+                && checkout_patch_arg_is_revision(
+                    git_dir,
+                    format,
+                    &positional[0],
+                    cli_session.replace_objects(),
+                )
             {
                 (Some(positional[0].as_str()), &positional[1..])
             } else {
@@ -2635,7 +2677,12 @@ fn checkout_run_patch(
         ),
         Some(rev) => (
             commands::add_patch::PatchMode::CheckoutNothead,
-            Some(checkout_patch_resolve_revision(git_dir, format, rev)?),
+            Some(checkout_patch_resolve_revision(
+                git_dir,
+                format,
+                rev,
+                cli_session.replace_objects(),
+            )?),
         ),
     };
 
@@ -2688,7 +2735,12 @@ fn restore_run_patch(
                 (mode, Some("HEAD".to_string()))
             }
             Some(rev) => {
-                let resolved = checkout_patch_resolve_revision(git_dir, format, rev)?;
+                let resolved = checkout_patch_resolve_revision(
+                    git_dir,
+                    format,
+                    rev,
+                    cli_session.replace_objects(),
+                )?;
                 let mode = if touches_index {
                     commands::add_patch::PatchMode::CheckoutNothead
                 } else {

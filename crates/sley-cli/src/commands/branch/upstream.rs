@@ -19,6 +19,7 @@ pub(super) struct BranchUpstreamOptions {
 pub(super) fn run_branch_upstream_options(
     git_dir: &Path,
     store: &FileRefStore,
+    replace_objects: bool,
     options: BranchUpstreamOptions,
 ) -> Result<()> {
     let format = repository_object_format(git_dir)?;
@@ -37,7 +38,7 @@ pub(super) fn run_branch_upstream_options(
                 true,
                 &upstream,
             )?;
-            set_branch_upstream(git_dir, store, &branch, &upstream)
+            set_branch_upstream(git_dir, store, replace_objects, &branch, &upstream)
         }
         BranchUpstreamAction::Unset => {
             if options.branches.len() > 1 {
@@ -152,12 +153,13 @@ pub(super) fn branch_upstream_missing_branch(branch: &str, setting: bool) {
 pub(super) fn set_branch_upstream(
     git_dir: &Path,
     store: &FileRefStore,
+    replace_objects: bool,
     branch: &str,
     upstream: &str,
 ) -> Result<()> {
     let mut config = read_repo_config(git_dir)?;
     let format = repository_object_format(git_dir)?;
-    if branch_upstream_is_non_ref(git_dir, format, upstream)? {
+    if branch_upstream_is_non_ref(git_dir, format, replace_objects, upstream)? {
         eprintln!(
             "fatal: cannot set up tracking information; starting point '{upstream}' is not a branch"
         );
@@ -205,6 +207,7 @@ pub(super) fn set_branch_upstream(
 pub(super) fn branch_upstream_is_non_ref(
     git_dir: &Path,
     format: ObjectFormat,
+    replace_objects: bool,
     upstream: &str,
 ) -> Result<bool> {
     if sley_rev::resolve_revision_symbolic_full_name(git_dir, format, upstream)
@@ -214,7 +217,7 @@ pub(super) fn branch_upstream_is_non_ref(
     {
         return Ok(false);
     }
-    Ok(resolve_revision(git_dir, format, upstream).is_ok())
+    Ok(resolve_revision(git_dir, format, upstream, replace_objects).is_ok())
 }
 
 pub(super) struct ResolvedBranchUpstream {

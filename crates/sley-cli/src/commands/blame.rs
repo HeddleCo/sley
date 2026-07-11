@@ -499,6 +499,7 @@ fn run_blame(
         marks,
         &output_encoding,
         color_plan.as_ref(),
+        cli_session.replace_objects(),
     )
 }
 
@@ -3348,6 +3349,7 @@ fn render_blame(
     marks: BlameMarks,
     output_encoding: &str,
     color: Option<&ColorPlan>,
+    replace_objects: bool,
 ) -> Result<()> {
     if options.incremental {
         return render_incremental(
@@ -3379,7 +3381,7 @@ fn render_blame(
 
     // git blame *always* reads the mailmap (`read_mailmap`, no flag) and maps the
     // displayed author name/email through it.
-    let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
+    let mailmap = commands::utility::Mailmap::load_default(git_dir, format, replace_objects)?;
 
     // Column widths are computed over the displayed lines only, matching git
     // (e.g. `-L 2,2` does not pad the line number to the whole file's width).

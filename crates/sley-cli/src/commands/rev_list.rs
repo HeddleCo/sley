@@ -399,10 +399,12 @@ pub(crate) fn cmd_rev_list(
     let output_encoding = log_output_encoding(&config);
     // Mailmap engine for `--use-mailmap` custom-format atoms (the upper-case
     // `%aN`/… always map; lower-case map only under the flag).
-    let mailmap = commands::utility::Mailmap::load_default(&git_dir, format)?;
+    let mailmap =
+        commands::utility::Mailmap::load_default(&git_dir, format, cli_session.replace_objects())?;
     let has_promisor_remote = crate::commands::plumbing::repo_has_promisor_remote(&config);
-    let db = crate::repository::open_object_database(&git_dir, format)?
-        .with_promisor_remote_present(has_promisor_remote);
+    let db =
+        crate::repository::open_object_database(&git_dir, format, cli_session.replace_objects())?
+            .with_promisor_remote_present(has_promisor_remote);
     let traversal_missing_action = if exclude_promisor_objects {
         RevListMissingAction::ExcludePromisor
     } else {

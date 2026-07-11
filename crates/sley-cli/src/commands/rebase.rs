@@ -421,6 +421,7 @@ struct Ctx {
     reflog_action: String,
     recurse_submodules: bool,
     lazy_fetch: bool,
+    replace_objects: bool,
 }
 
 impl Ctx {
@@ -446,6 +447,7 @@ impl Ctx {
             reflog_action,
             recurse_submodules: false,
             lazy_fetch: cli_session.lazy_fetch(),
+            replace_objects: cli_session.replace_objects(),
         })
     }
 
@@ -522,7 +524,7 @@ fn make_resolver<'a>(
     db: &'a FileObjectDatabase,
 ) -> impl FnMut(&str) -> seq::TodoOidLookup + 'a {
     move |token: &str| {
-        let Ok(oid) = resolve_revision(&ctx.git_dir, ctx.format, token) else {
+        let Ok(oid) = resolve_revision(&ctx.git_dir, ctx.format, token, ctx.replace_objects) else {
             return seq::TodoOidLookup::Missing;
         };
         let Ok(peeled) = sley_rev::peel_to_commit(db, ctx.format, &oid) else {
@@ -960,8 +962,13 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     let mut upstream = if args.root {
         None
     } else {
-        let resolved = resolve_revision(&ctx.git_dir, ctx.format, &upstream_name)
-            .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid));
+        let resolved = resolve_revision(
+            &ctx.git_dir,
+            ctx.format,
+            &upstream_name,
+            ctx.replace_objects,
+        )
+        .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid));
         match resolved {
             Ok(oid) => Some(oid),
             Err(_) => {
@@ -979,8 +986,9 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             let full = format!("refs/heads/{branch}");
             if let Ok(Some(RefTarget::Direct(oid))) = refs.read_ref(&full) {
                 (branch.clone(), Some(full), oid, Some(branch.clone()))
-            } else if let Ok(oid) = resolve_revision(&ctx.git_dir, ctx.format, branch)
-                .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid))
+            } else if let Ok(oid) =
+                resolve_revision(&ctx.git_dir, ctx.format, branch, ctx.replace_objects)
+                    .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid))
             {
                 (branch.clone(), None, oid, Some(branch.clone()))
             } else {
@@ -1103,12 +1111,14 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             &ctx.git_dir,
             ctx.format,
             if left.is_empty() { "HEAD" } else { left },
+            ctx.replace_objects,
         )
         .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid));
         let right_oid = resolve_revision(
             &ctx.git_dir,
             ctx.format,
             if right.is_empty() { "HEAD" } else { right },
+            ctx.replace_objects,
         )
         .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid));
         match (left_oid, right_oid) {
@@ -1138,7 +1148,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             }
         }
     } else {
-        match resolve_revision(&ctx.git_dir, ctx.format, &onto_name)
+        match resolve_revision(&ctx.git_dir, ctx.format, &onto_name, ctx.replace_objects)
             .and_then(|oid| sley_rev::peel_to_commit(&db, ctx.format, &oid))
         {
             Ok(oid) => oid,
@@ -2711,7 +2721,7 @@ fn rearrange_squash(
                 // found by title
                 i2 = found as i64;
             } else if !p.contains(' ')
-                && let Ok(oid) = resolve_revision(&ctx.git_dir, ctx.format, p)
+                && let Ok(oid) = resolve_revision(&ctx.git_dir, ctx.format, p, ctx.replace_objects)
                 && let Ok(peeled) = sley_rev::peel_to_commit(db, ctx.format, &oid)
                 && let Some(&found) = commit2item.get(&peeled)
             {
@@ -4275,7 +4285,7 @@ fn looks_like_object_name(name: &str) -> bool {
 }
 
 fn resolve_reset_target(ctx: &Ctx, db: &FileObjectDatabase, name: &str) -> Result<ObjectId> {
-    let oid = match resolve_revision(&ctx.git_dir, ctx.format, name) {
+    let oid = match resolve_revision(&ctx.git_dir, ctx.format, name, ctx.replace_objects) {
         Ok(oid) => oid,
         Err(err) => return Err(err),
     };
@@ -4314,7 +4324,7 @@ fn resolve_merge_label(
     if let Some(RefTarget::Direct(oid)) = refs.read_ref(&rewritten)? {
         return Ok(Some(oid));
     }
-    match resolve_revision(&ctx.git_dir, ctx.format, label)
+    match resolve_revision(&ctx.git_dir, ctx.format, label, ctx.replace_objects)
         .and_then(|oid| sley_rev::peel_to_commit(db, ctx.format, &oid))
     {
         Ok(oid) => Ok(Some(oid)),

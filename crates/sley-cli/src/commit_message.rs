@@ -332,10 +332,11 @@ pub(crate) fn read_reused_commit(
     git_dir: &Path,
     format: ObjectFormat,
     rev: &str,
+    replace_objects: bool,
 ) -> Result<Commit> {
     let result = (|| {
-        let oid = resolve_revision(git_dir, format, rev)?;
-        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let db = crate::repository::open_object_database(git_dir, format, replace_objects)?;
+        let oid = sley_rev::RevisionResolver::new(git_dir, format, &db).resolve(rev)?;
         let commit_oid = sley_rev::peel_to_commit(&db, format, &oid)?;
         let object = db.read_object(&commit_oid)?;
         if object.object_type != ObjectType::Commit {

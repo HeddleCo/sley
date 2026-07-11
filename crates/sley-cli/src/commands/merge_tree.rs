@@ -434,7 +434,8 @@ fn compute_real_merge(
     let cwd = cli_session.cwd().to_path_buf();
     let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
-    let db = crate::repository::open_object_database(&git_dir, format)?;
+    let db =
+        crate::repository::open_object_database(&git_dir, format, cli_session.replace_objects())?;
 
     let branch1 = &options.positionals[0];
     let branch2 = &options.positionals[1];
@@ -755,7 +756,7 @@ fn resolve_commit_ish(
     format: ObjectFormat,
     rev: &str,
 ) -> Result<ObjectId> {
-    let oid = match resolve_revision(git_dir, format, rev) {
+    let oid = match sley_rev::RevisionResolver::new(git_dir, format, db).resolve(rev) {
         Ok(oid) => oid,
         Err(_) => return Err(not_something_we_can_merge(rev)),
     };
@@ -778,7 +779,7 @@ fn resolve_tree_ish(
     format: ObjectFormat,
     rev: &str,
 ) -> Result<ObjectId> {
-    let oid = match resolve_revision(git_dir, format, rev) {
+    let oid = match sley_rev::RevisionResolver::new(git_dir, format, db).resolve(rev) {
         Ok(oid) => oid,
         Err(_) => return Err(not_something_we_can_merge(rev)),
     };
@@ -1278,7 +1279,8 @@ fn run_trivial_merge(
 ) -> Result<()> {
     let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
-    let db = crate::repository::open_object_database(&git_dir, format)?;
+    let db =
+        crate::repository::open_object_database(&git_dir, format, cli_session.replace_objects())?;
 
     let base_tree = resolve_tree_ish(&git_dir, &db, format, &options.positionals[0])?;
     let ours_tree = resolve_tree_ish(&git_dir, &db, format, &options.positionals[1])?;

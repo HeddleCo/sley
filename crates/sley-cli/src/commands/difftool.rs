@@ -268,7 +268,7 @@ fn split_difftool_revs(
             continue;
         }
         if revs.len() < 2
-            && let Ok(oid) = resolve_revision(git_dir, format, arg)
+            && let Ok(oid) = sley_rev::RevisionResolver::new(git_dir, format, db).resolve(arg)
             && let Ok(tree) = sley_rev::peel_to_tree(db, format, &oid)
         {
             revs.push(tree);

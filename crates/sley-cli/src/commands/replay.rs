@@ -203,6 +203,7 @@ fn run_git_replay(cli_session: &crate::session::CliSession, args: &[String]) -> 
         format,
         config,
         lazy_fetch: cli_session.lazy_fetch(),
+        replace_objects: cli_session.replace_objects(),
     };
     let plan = build_git_replay_plan(&ctx, parsed)?;
     let new_oid = replay_commits_to_base(&ctx, &plan)?;
@@ -340,10 +341,11 @@ fn build_git_replay_plan(ctx: &ReplayCtx, parsed: GitReplayArgs) -> Result<GitRe
     let (action, base, default_target, old_oid, reflog_message) = match mode {
         ReplayModeKind::Onto => {
             let onto = parsed.onto.as_ref().expect("--onto mode has value");
-            let base = resolve_revision(&ctx.git_dir, ctx.format, onto).map_err(|_| {
-                eprintln!("fatal: '{onto}' is not a valid commit-ish for --onto");
-                GitError::Exit(128)
-            })?;
+            let base = resolve_revision(&ctx.git_dir, ctx.format, onto, ctx.replace_objects)
+                .map_err(|_| {
+                    eprintln!("fatal: '{onto}' is not a valid commit-ish for --onto");
+                    GitError::Exit(128)
+                })?;
             let target = replay_target_from_revision(&refs, &parsed.rev_args)?;
             let old_oid = read_direct_ref(&refs, ctx.format, &target)?;
             (
@@ -477,8 +479,8 @@ fn select_git_replay_commits(
         && !rev_args[0].contains("..")
         && !rev_args[0].starts_with('^')
     {
-        let tip = resolve_revision(&ctx.git_dir, ctx.format, &rev_args[0])?;
-        let db = ctx.db();
+        let tip = resolve_revision(&ctx.git_dir, ctx.format, &rev_args[0], ctx.replace_objects)?;
+        let db = ctx.db()?;
         let excluded = rev_list_walk_commits(&db, ctx.format, [*base], false)?
             .into_iter()
             .map(|record| record.oid)
@@ -511,7 +513,7 @@ fn replay_one_commit_to(
     head: &ObjectId,
     oid: &ObjectId,
 ) -> Result<ObjectId> {
-    let db = ctx.db();
+    let db = ctx.db()?;
     let object = db.read_object(oid)?;
     if object.object_type != ObjectType::Commit {
         return Err(GitError::InvalidObject(format!(
@@ -590,7 +592,7 @@ fn replay_one_commit_to(
             &ReplayOpts::default(),
         )?,
     };
-    let mut writer = ctx.db();
+    let mut writer = ctx.db()?;
     sley_sequencer::create_commit(
         &mut writer,
         sley_sequencer::CommitCreate {
@@ -930,11 +932,12 @@ struct ReplayCtx {
     format: ObjectFormat,
     config: GitConfig,
     lazy_fetch: bool,
+    replace_objects: bool,
 }
 
 impl ReplayCtx {
-    fn db(&self) -> FileObjectDatabase {
-        FileObjectDatabase::from_git_dir(&self.common_git_dir, self.format)
+    fn db(&self) -> Result<FileObjectDatabase> {
+        crate::repository::open_object_database(&self.git_dir, self.format, self.replace_objects)
     }
 
     fn refs(&self) -> FileRefStore {
@@ -966,6 +969,7 @@ fn run_replay(
         format,
         config,
         lazy_fetch: cli_session.lazy_fetch(),
+        replace_objects: cli_session.replace_objects(),
     };
 
     let me = action.name();
@@ -1089,7 +1093,7 @@ fn select_revisions(
     action: ReplayAction,
     rev_args: &[String],
 ) -> Result<RevSelection> {
-    let db = ctx.db();
+    let db = ctx.db()?;
     let config = read_repo_config(&ctx.git_dir)?;
     let cwd = env::current_dir()?;
     let setup_args = rev_args
@@ -1118,10 +1122,12 @@ fn select_revisions(
     }
     let mut options = setup.options;
     if !options.has_revisions() && options.max_count.is_some() {
-        let oid = resolve_revision(&ctx.git_dir, ctx.format, "HEAD").map_err(|_| {
-            eprintln!("fatal: bad revision 'HEAD'");
-            GitError::Exit(128)
-        })?;
+        let oid = resolve_revision(&ctx.git_dir, ctx.format, "HEAD", ctx.replace_objects).map_err(
+            |_| {
+                eprintln!("fatal: bad revision 'HEAD'");
+                GitError::Exit(128)
+            },
+        )?;
         options.positives.push(sley_rev::RevisionTip {
             oid,
             rev: "HEAD".to_string(),
@@ -1331,7 +1337,7 @@ fn check_no_unmerged(ctx: &ReplayCtx) -> std::result::Result<(), ReplayHalt> {
 }
 
 fn make_todo_item(ctx: &ReplayCtx, action: ReplayAction, oid: &ObjectId) -> Result<TodoItem> {
-    let db = ctx.db();
+    let db = ctx.db()?;
     let object = db.read_object(oid)?;
     let commit = Commit::parse(ctx.format, &object.body)?;
     let subject = commit_subject(&commit.message);
@@ -1398,7 +1404,10 @@ fn do_pick_commit(
     _is_single: bool,
 ) -> std::result::Result<PickFlow, ReplayHalt> {
     let action = item.action;
-    let db = ctx.db();
+    let db = ctx.db().map_err(|err| {
+        eprintln!("error: {err}");
+        ReplayHalt::Fatal
+    })?;
     let commit_object = read_object_or_fatal(ctx, &db, &item.oid)?;
     let commit = Commit::parse(ctx.format, &commit_object.body).map_err(|err| {
         eprintln!("error: {err}");
@@ -2418,7 +2427,7 @@ fn commit_and_advance_head(
     reflog_message: Vec<u8>,
     encoding: Option<Vec<u8>>,
 ) -> Result<ObjectId> {
-    let mut db = ctx.db();
+    let mut db = ctx.db()?;
     let new_oid = sley_sequencer::create_commit(
         &mut db,
         sley_sequencer::CommitCreate {
@@ -2521,7 +2530,12 @@ fn read_populate_todo(ctx: &ReplayCtx) -> Result<Vec<TodoItem>> {
             eprintln!("error: {message}");
             return Err(fatal_failed(ctx.action));
         }
-        let oid = match resolve_revision(&ctx.git_dir, ctx.format, &line.object_name) {
+        let oid = match resolve_revision(
+            &ctx.git_dir,
+            ctx.format,
+            &line.object_name,
+            ctx.replace_objects,
+        ) {
             Ok(oid) => oid,
             Err(_) => {
                 let errors = vec![
@@ -2582,7 +2596,7 @@ fn continue_single_pick(ctx: &ReplayCtx, opts: &ReplayOpts) -> Result<()> {
         }
     }
     let head = ctx.head_oid();
-    let db = ctx.db();
+    let db = ctx.db()?;
     let head_tree = match &head {
         Some(oid) => commit_tree_oid(&db, ctx.format, oid)?,
         None => ObjectId::empty_tree(ctx.format),

@@ -775,14 +775,18 @@ fn validate_reflog_write_object(
 fn cmd_reflog_expire(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let (options, refs) = parse_reflog_expire_options(args)?;
     let git_dir = cli_session.git_dir()?;
-    expire_reflogs_at(&git_dir, options, refs)
+    expire_reflogs_at(&git_dir, options, refs, cli_session.replace_objects())
 }
 
 /// Path-based reflog expiration for repository maintenance that already owns
 /// repository discovery and must not re-enter CLI global state.
-pub(crate) fn reflog_expire_at(git_dir: &Path, args: &[String]) -> Result<()> {
+pub(crate) fn reflog_expire_at(
+    git_dir: &Path,
+    args: &[String],
+    replace_objects: bool,
+) -> Result<()> {
     let (options, refs) = parse_reflog_expire_options(args)?;
-    expire_reflogs_at(git_dir, options, refs)
+    expire_reflogs_at(git_dir, options, refs, replace_objects)
 }
 
 fn parse_reflog_expire_options(args: &[String]) -> Result<(ReflogExpireOptions, Vec<String>)> {
@@ -857,6 +861,7 @@ fn expire_reflogs_at(
     git_dir: &Path,
     mut options: ReflogExpireOptions,
     refs: Vec<String>,
+    replace_objects: bool,
 ) -> Result<()> {
     let format = repository_object_format(git_dir)?;
     let store = FileRefStore::new(git_dir, format);
@@ -916,6 +921,7 @@ fn expire_reflogs_at(
             format,
             &reference,
             target_options,
+            replace_objects,
             &mut context,
         ) {
             exit_code = code;
@@ -941,6 +947,7 @@ fn expire_reflog_entries(
     format: ObjectFormat,
     reference: &str,
     options: ReflogExpireOptions,
+    replace_objects: bool,
     context: &mut ReflogExpireRunContext,
 ) -> Result<()> {
     let mut entries = store.read_reflog(reference)?;
@@ -967,7 +974,14 @@ fn expire_reflog_entries(
         if !prune && timestamp < options.expire_unreachable {
             if reachable.is_none() {
                 reachable = Some(reflog_reachable_oids(
-                    store, db, git_dir, format, reference, options, context,
+                    store,
+                    db,
+                    git_dir,
+                    format,
+                    reference,
+                    options,
+                    replace_objects,
+                    context,
                 )?);
             }
             let reachable_from_tip = reachable
@@ -1129,6 +1143,7 @@ fn reflog_reachable_oids(
     format: ObjectFormat,
     reference: &str,
     options: ReflogExpireOptions,
+    replace_objects: bool,
     context: &mut ReflogExpireRunContext,
 ) -> Result<Option<HashSet<ObjectId>>> {
     if options.expire_unreachable <= options.expire {
@@ -1143,7 +1158,7 @@ fn reflog_reachable_oids(
         }
     } else if let Some(tip) = resolve_ref_to_oid(store, reference)? {
         starts.push(tip);
-    } else if let Ok(tip) = resolve_revision(git_dir, format, reference) {
+    } else if let Ok(tip) = resolve_revision(git_dir, format, reference, replace_objects) {
         starts.push(tip);
     } else {
         return Ok(Some(HashSet::new()));
@@ -4804,7 +4819,8 @@ pub(crate) fn cmd_show_ref(
         }
         for filter in filters {
             if filter == "HEAD" {
-                let oid = resolve_revision(&git_dir, format, "HEAD")?;
+                let oid =
+                    resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects())?;
                 if !quiet {
                     print_show_ref(&oid, filter, hash_only, abbrev);
                     print_show_ref_deref(&db, format, &oid, filter, dereference, abbrev)?;
@@ -4840,7 +4856,9 @@ pub(crate) fn cmd_show_ref(
     }
     let mut matched = false;
     let refs = store.list_refs()?;
-    if include_head && let Ok(oid) = resolve_revision(&git_dir, format, "HEAD") {
+    if include_head
+        && let Ok(oid) = resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects())
+    {
         matched = true;
         if !quiet {
             print_show_ref(&oid, "HEAD", hash_only, abbrev);

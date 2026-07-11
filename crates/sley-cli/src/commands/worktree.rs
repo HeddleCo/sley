@@ -186,6 +186,7 @@ pub(crate) fn cmd_worktree_add(
         &path,
         &options,
         committer.clone(),
+        cli_session.replace_objects(),
     )?;
     if let Some(branch) = add_head.branch_name.as_ref() {
         let refname = branch_ref_name(branch)?;
@@ -1095,11 +1096,12 @@ fn can_use_local_refs(
     format: ObjectFormat,
     store: &FileRefStore,
     quiet: bool,
+    replace_objects: bool,
 ) -> Result<bool> {
     // HEAD is per-worktree: when `git worktree add` runs from inside a linked
     // worktree, its HEAD (and thus the implicit source commit) is that
     // worktree's, NOT the common dir's. Resolve against `worktree_git_dir`.
-    if resolve_revision(worktree_git_dir, format, "HEAD").is_ok() {
+    if resolve_revision(worktree_git_dir, format, "HEAD", replace_objects).is_ok() {
         return Ok(true);
     }
     for reference in store.list_refs()? {
@@ -1245,8 +1247,15 @@ fn dwim_orphan(
     store: &FileRefStore,
     options: &WorktreeAddOptions,
     remote: bool,
+    replace_objects: bool,
 ) -> Result<bool> {
-    if can_use_local_refs(worktree_git_dir, format, store, options.quiet)? {
+    if can_use_local_refs(
+        worktree_git_dir,
+        format,
+        store,
+        options.quiet,
+        replace_objects,
+    )? {
         return Ok(false);
     }
     if remote && can_use_remote_refs(common_git_dir, store, options)? {
@@ -1342,7 +1351,11 @@ fn worktree_add_resolve_head(
     path: &Path,
     options: &WorktreeAddOptions,
     committer: Vec<u8>,
+    replace_objects: bool,
 ) -> Result<WorktreeAddHead> {
+    let resolve_revision = |git_dir: &Path, format: ObjectFormat, rev: &str| {
+        crate::resolve_revision(git_dir, format, rev, replace_objects)
+    };
     // Explicit `--orphan` (the branch name was filled in by the caller): the new
     // worktree checks out an unborn branch with no source commit.
     if options.orphan {
@@ -1376,6 +1389,7 @@ fn worktree_add_resolve_head(
                 store,
                 options,
                 false,
+                replace_objects,
             )?
         {
             return worktree_add_inferred_orphan_head(branch.clone(), format);
@@ -1386,11 +1400,12 @@ fn worktree_add_resolve_head(
         // the invalid-reference error (with the `-b`-aware orphan hint) instead
         // of a lower-level failure from branch creation. The implicit "HEAD"
         // start resolves against the current worktree's HEAD.
-        worktree_add_resolve_commitish(worktree_git_dir, format, options, start)?;
+        worktree_add_resolve_commitish(worktree_git_dir, format, options, start, replace_objects)?;
         let was_reset = checkout_create_or_reset_branch(
             common_git_dir,
             worktree_git_dir,
             format,
+            replace_objects,
             branch,
             start,
             options.force_branch,
@@ -1433,9 +1448,21 @@ fn worktree_add_resolve_head(
         // Detaching at HEAD in a repo whose HEAD is dangling warns + dies via
         // can_use_local_refs (git: the `detach && branch == "HEAD"` arm).
         if commitish == "HEAD" {
-            can_use_local_refs(worktree_git_dir, format, store, options.quiet)?;
+            can_use_local_refs(
+                worktree_git_dir,
+                format,
+                store,
+                options.quiet,
+                replace_objects,
+            )?;
         }
-        let oid = worktree_add_resolve_commitish(worktree_git_dir, format, options, &commitish)?;
+        let oid = worktree_add_resolve_commitish(
+            worktree_git_dir,
+            format,
+            options,
+            &commitish,
+            replace_objects,
+        )?;
         return Ok(WorktreeAddHead {
             branch_name: None,
             oid,
@@ -1504,7 +1531,13 @@ fn worktree_add_resolve_head(
                 orphan: false,
             });
         }
-        let oid = worktree_add_resolve_commitish(worktree_git_dir, format, options, &commitish)?;
+        let oid = worktree_add_resolve_commitish(
+            worktree_git_dir,
+            format,
+            options,
+            &commitish,
+            replace_objects,
+        )?;
         return Ok(WorktreeAddHead {
             branch_name: None,
             oid,
@@ -1572,6 +1605,7 @@ fn worktree_add_resolve_head(
         store,
         options,
         true,
+        replace_objects,
     )? {
         return worktree_add_inferred_orphan_head(branch, format);
     }
@@ -1580,7 +1614,7 @@ fn worktree_add_resolve_head(
     // error (with the no-`-b` orphan hint) when HEAD is a dangling reference.
     // HEAD is per-worktree, so resolve + branch off the current worktree's HEAD,
     // but write the new branch into the common store.
-    worktree_add_resolve_commitish(worktree_git_dir, format, options, "HEAD")?;
+    worktree_add_resolve_commitish(worktree_git_dir, format, options, "HEAD", replace_objects)?;
     let head_oid = resolve_revision(worktree_git_dir, format, "HEAD")?;
     store.create_branch(
         &branch,
@@ -1608,8 +1642,9 @@ fn worktree_add_resolve_commitish(
     format: ObjectFormat,
     options: &WorktreeAddOptions,
     commitish: &str,
+    replace_objects: bool,
 ) -> Result<ObjectId> {
-    match resolve_revision(common_git_dir, format, commitish) {
+    match resolve_revision(common_git_dir, format, commitish, replace_objects) {
         Ok(oid) => Ok(oid),
         Err(_) => {
             let attempt_hint = !options.quiet && options.start.is_none();

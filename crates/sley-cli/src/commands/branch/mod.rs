@@ -19,6 +19,7 @@ pub(super) struct BranchCommandContext {
     pub(super) repository: sley::Repository,
     pub(super) refs: crate::FileRefStore,
     pub(super) config: crate::GitConfig,
+    pub(super) replace_objects: bool,
 }
 
 impl BranchCommandContext {
@@ -30,6 +31,7 @@ impl BranchCommandContext {
             repository,
             refs,
             config,
+            replace_objects: session.replace_objects(),
         })
     }
 

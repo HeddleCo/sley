@@ -52,14 +52,19 @@ pub(crate) fn cmd_replace(cli_session: &crate::session::CliSession, args: &[Stri
         ReplaceMode::List { pattern } => {
             replace_list(&store, &db, format, pattern.as_deref(), options.format)
         }
-        ReplaceMode::Delete { objects } => {
-            replace_delete(&store, &common_git_dir, format, &objects)
-        }
+        ReplaceMode::Delete { objects } => replace_delete(
+            &store,
+            &common_git_dir,
+            format,
+            cli_session.replace_objects(),
+            &objects,
+        ),
         ReplaceMode::Edit { object } => replace_edit(
             &store,
             &db,
             &common_git_dir,
             format,
+            cli_session.replace_objects(),
             &object,
             options.force,
             options.raw,
@@ -69,6 +74,7 @@ pub(crate) fn cmd_replace(cli_session: &crate::session::CliSession, args: &[Stri
             &db,
             &common_git_dir,
             format,
+            cli_session.replace_objects(),
             &object,
             &parents,
             options.force,
@@ -84,6 +90,7 @@ pub(crate) fn cmd_replace(cli_session: &crate::session::CliSession, args: &[Stri
             &db,
             &common_git_dir,
             format,
+            cli_session.replace_objects(),
             &object,
             &replacement,
             options.force,
@@ -128,13 +135,14 @@ fn replace_delete(
     store: &FileRefStore,
     git_dir: &Path,
     format: ObjectFormat,
+    replace_objects: bool,
     objects: &[String],
 ) -> Result<()> {
     let mut failed = false;
     for object in objects {
         let oid = match ObjectId::from_hex(format, object) {
             Ok(oid) => oid,
-            Err(_) => match resolve_revision(git_dir, format, object) {
+            Err(_) => match resolve_revision(git_dir, format, object, replace_objects) {
                 Ok(oid) => oid,
                 Err(_) => {
                     eprintln!("error: failed to resolve '{object}' as a valid ref");
@@ -164,12 +172,13 @@ fn replace_create(
     db: &FileObjectDatabase,
     git_dir: &Path,
     format: ObjectFormat,
+    replace_objects: bool,
     object: &str,
     replacement: &str,
     force: bool,
 ) -> Result<()> {
-    let object_oid = resolve_revision(git_dir, format, object)?;
-    let replacement_oid = resolve_revision(git_dir, format, replacement)?;
+    let object_oid = resolve_revision(git_dir, format, object, replace_objects)?;
+    let replacement_oid = resolve_revision(git_dir, format, replacement, replace_objects)?;
     let object_type = db
         .read_object_header(&object_oid)?
         .map(|(object_type, _)| object_type)
@@ -227,11 +236,12 @@ fn replace_edit(
     db: &FileObjectDatabase,
     git_dir: &Path,
     format: ObjectFormat,
+    replace_objects: bool,
     object: &str,
     force: bool,
     _raw: bool,
 ) -> Result<()> {
-    let object_oid = resolve_revision(git_dir, format, object)?;
+    let object_oid = resolve_revision(git_dir, format, object, replace_objects)?;
     let ref_name = format!("refs/replace/{object_oid}");
     let existing = store.read_ref(&ref_name)?;
     if existing.is_some() && !force {
@@ -264,15 +274,16 @@ fn replace_graft(
     db: &FileObjectDatabase,
     git_dir: &Path,
     format: ObjectFormat,
+    replace_objects: bool,
     object: &str,
     parents: &[String],
     force: bool,
 ) -> Result<()> {
-    let object_oid = resolve_revision(git_dir, format, object)?;
+    let object_oid = resolve_revision(git_dir, format, object, replace_objects)?;
     let commit_oid = sley_rev::peel_to_commit(db, format, &object_oid)?;
     let mut parent_oids = Vec::with_capacity(parents.len());
     for parent in parents {
-        let oid = resolve_revision(git_dir, format, parent)?;
+        let oid = resolve_revision(git_dir, format, parent, replace_objects)?;
         parent_oids.push(sley_rev::peel_to_commit(db, format, &oid)?);
     }
     replace_graft_oids(store, db, format, commit_oid, parent_oids, force)

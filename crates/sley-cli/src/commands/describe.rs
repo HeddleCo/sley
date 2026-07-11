@@ -1142,7 +1142,7 @@ fn describe_blob(
     tags: &DescribeTags,
     blob: &ObjectId,
 ) -> Result<()> {
-    let head = match resolve_revision(git_dir, format, "HEAD") {
+    let head = match sley_rev::RevisionResolver::new(git_dir, format, db).resolve("HEAD") {
         Ok(oid) => oid,
         Err(_) => {
             eprintln!(

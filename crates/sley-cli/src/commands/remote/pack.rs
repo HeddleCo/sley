@@ -563,6 +563,7 @@ pub(crate) fn cmd_send_pack(
         push_options: &[],
         force_with_lease: &force_with_lease,
         force_with_lease_default: false,
+        replace_objects: cli_session.replace_objects(),
         receive_pack_command: receive_pack_command.as_deref(),
         receive_config_overrides: &receive_config_overrides,
     })
@@ -934,6 +935,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
                     force_if_includes,
                     &receive_config_overrides,
                     &mut force_with_lease,
+                    cli_session.replace_objects(),
                 )?;
             }
             match recurse_submodules {
@@ -999,6 +1001,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
                 push_options: &push_options,
                 force_with_lease: &force_with_lease,
                 force_with_lease_default,
+                replace_objects: cli_session.replace_objects(),
                 receive_pack_command: receive_pack_command.as_deref(),
                 receive_config_overrides: &receive_config_overrides,
             });
@@ -1285,8 +1288,9 @@ fn expand_default_force_with_lease(
     force_if_includes: bool,
     receive_config_overrides: &[(String, String)],
     leases: &mut Vec<(String, Option<ObjectId>)>,
+    replace_objects: bool,
 ) -> Result<()> {
-    let source_db = crate::repository::open_object_database(git_dir, format)?;
+    let source_db = crate::repository::open_object_database(git_dir, format, replace_objects)?;
     let preview = sley_remote::push_local_with_report_and_objects(
         sley_remote::PushReportRequest {
             git_dir,
@@ -2356,6 +2360,7 @@ struct RunPushLocalReport<'a> {
     push_options: &'a [String],
     force_with_lease: &'a [(String, Option<ObjectId>)],
     force_with_lease_default: bool,
+    replace_objects: bool,
     receive_pack_command: Option<&'a str>,
     receive_config_overrides: &'a [(String, String)],
 }
@@ -2365,7 +2370,8 @@ struct RunPushLocalReport<'a> {
 /// and return the git exit code (1 when any ref was rejected).
 fn run_push_local_report(req: RunPushLocalReport<'_>) -> Result<()> {
     let config = read_repo_config(req.git_dir).unwrap_or_default();
-    let source_db = crate::repository::open_object_database(req.git_dir, req.format)?;
+    let source_db =
+        crate::repository::open_object_database(req.git_dir, req.format, req.replace_objects)?;
     trace_local_receive_pack_advertisement(req.remote_git_dir, req.format);
     let push_negotiate = config.get_bool("push", None, "negotiate").unwrap_or(false);
     let push_negotiation_failed =

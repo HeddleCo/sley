@@ -176,6 +176,7 @@ pub(super) fn force_update_branch(
     format: ObjectFormat,
     store: &FileRefStore,
     config: &GitConfig,
+    replace_objects: bool,
     branch: &str,
     start: Option<&String>,
 ) -> Result<String> {
@@ -194,7 +195,7 @@ pub(super) fn force_update_branch(
         return Err(GitError::Exit(128));
     }
     let start_rev = start.map_or("HEAD", String::as_str);
-    let new_oid = resolve_branch_start(git_dir, format, store, start_rev)?;
+    let new_oid = resolve_branch_start(git_dir, format, store, replace_objects, start_rev)?;
     let previous = store.read_ref(&name)?;
     let reflog = match previous {
         Some(RefTarget::Direct(old_oid)) if old_oid == new_oid => None,
@@ -236,6 +237,7 @@ pub(super) fn delete_merged_branches(
     format: ObjectFormat,
     db: &FileObjectDatabase,
     store: &FileRefStore,
+    replace_objects: bool,
     branches: &[String],
     quiet: bool,
 ) -> Result<()> {
@@ -245,7 +247,7 @@ pub(super) fn delete_merged_branches(
     }
 
     let config = read_repo_config(git_dir)?;
-    let head_reachable = resolve_revision(git_dir, format, "HEAD")
+    let head_reachable = resolve_revision(git_dir, format, "HEAD", replace_objects)
         .ok()
         .and_then(|head| sley_rev::peel_to_commit(db, format, &head).ok())
         .map(|head| sley_rev::reachable_commit_oids(git_dir, format, db, [head], false))

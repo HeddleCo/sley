@@ -7,6 +7,7 @@ pub(super) struct ReflogWalkOptions<'a> {
     pub(super) output: &'a LogOutput,
     pub(super) reverse: bool,
     pub(super) date_mode: &'a DateMode,
+    pub(super) replace_objects: bool,
 }
 
 pub(super) fn log_walk_reflogs(
@@ -16,9 +17,9 @@ pub(super) fn log_walk_reflogs(
     opts: ReflogWalkOptions<'_>,
 ) -> Result<()> {
     let store = FileRefStore::new(git_dir, format);
-    let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut db = crate::repository::open_object_database(git_dir, format, opts.replace_objects)?;
     let decorations = HashMap::new();
-    let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
+    let mailmap = commands::utility::Mailmap::load_default(git_dir, format, opts.replace_objects)?;
     let mut stdout = io::stdout();
     let references = if revisions.is_empty() {
         vec![ReflogWalkTarget::new(&store, git_dir, format, None)?]

@@ -166,7 +166,8 @@ pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[Stri
         cli_session.git_dir()?
     };
     let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let db =
+        crate::repository::open_object_database(&git_dir, format, cli_session.replace_objects())?;
     // A bare repo has no worktree, so the "current prefix" is empty (we are at
     // the repository root); upstream `git archive` works in a bare repo.
     let current_prefix = if remote.is_some() {
@@ -191,7 +192,7 @@ pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[Stri
         }
         Err(err) => return Err(err),
     };
-    let oid = resolve_revision(&git_dir, format, &treeish)?;
+    let oid = sley_rev::RevisionResolver::new(&git_dir, format, &db).resolve(&treeish)?;
     let config = read_repo_config(&git_dir)?;
     if remote.is_some()
         && !archive_remote_object_allowed(&git_dir, &db, format, &oid, &treeish, &config)?
@@ -457,7 +458,7 @@ fn archive_attr_tree_oid(
     let Some(attr_tree) = config.get("attr", None, "tree") else {
         return Ok(None);
     };
-    let oid = resolve_revision(git_dir, format, attr_tree)?;
+    let oid = sley_rev::RevisionResolver::new(git_dir, format, db).resolve(attr_tree)?;
     Ok(Some(sley_rev::peel_to_tree(db, format, &oid)?))
 }
 

@@ -1073,7 +1073,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
         }
         return Ok(());
     }
-    let ours_oid = resolve_revision(&git_dir, format, "HEAD")?;
+    let ours_oid = resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects())?;
     let merge_oids = merge_records
         .iter()
         .map(|record| sley_rev::peel_to_commit(&db, format, &record.oid))

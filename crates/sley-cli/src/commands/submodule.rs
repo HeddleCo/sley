@@ -1908,7 +1908,11 @@ fn cmd_submodule_summary(
     let mut commit: Option<String> = None;
     let mut positionals = options.positionals.clone();
     if let Some(candidate) = &options.commit {
-        if candidate == "HEAD" || resolve_revision(&git_dir, format, candidate).is_ok() {
+        if candidate == "HEAD"
+            || sley_rev::RevisionResolver::new(git_dir, format, db)
+                .resolve(candidate)
+                .is_ok()
+        {
             commit = Some(candidate.clone());
         } else {
             // Not a revision: it is the first pathspec.
@@ -1950,6 +1954,7 @@ fn cmd_submodule_summary(
             entry,
             options.cached,
             options.summary_limit,
+            cli_session.replace_objects(),
         )?;
     }
     Ok(())
@@ -1966,14 +1971,14 @@ fn summary_source_tree(
     commit: Option<&str>,
 ) -> Result<BTreeMap<String, (u32, ObjectId)>> {
     let tree_oid = match commit {
-        Some(rev) => match resolve_revision(git_dir, format, rev) {
+        Some(rev) => match sley_rev::RevisionResolver::new(git_dir, format, db).resolve(rev) {
             Ok(oid) => Some(commit_tree_oid(db, format, &oid)?),
             // git: a bad rev that isn't "HEAD" dies; "HEAD" before first commit
             // falls back to the empty tree. We treat an unresolvable rev as the
             // empty tree, which matches the no-commits-yet case the tests hit.
             Err(_) => None,
         },
-        None => match resolve_revision(git_dir, format, "HEAD") {
+        None => match sley_rev::RevisionResolver::new(git_dir, format, db).resolve("HEAD") {
             Ok(oid) => Some(commit_tree_oid(db, format, &oid)?),
             Err(_) => None,
         },
@@ -2887,6 +2892,7 @@ fn generate_submodule_summary(
     entry: &SubmoduleSummaryEntry,
     cached: bool,
     summary_limit: Option<isize>,
+    replace_objects: bool,
 ) -> Result<()> {
     let submodule_root = worktree_root.join(&entry.sm_path);
     let sub_repo = submodule_head(&submodule_root)
@@ -2901,7 +2907,7 @@ fn generate_submodule_summary(
     if !cached && entry.oid_dst.is_null() && entry.mod_dst == 0o160000 {
         if let Some(git_dir) = &sub_repo {
             let format = repository_object_format(git_dir)?;
-            if let Ok(head_oid) = resolve_revision(git_dir, format, "HEAD") {
+            if let Ok(head_oid) = resolve_revision(git_dir, format, "HEAD", replace_objects) {
                 oid_dst = head_oid;
             }
         }
@@ -3323,7 +3329,7 @@ fn gitmodules_oid_from_head(
     format: ObjectFormat,
     db: &FileObjectDatabase,
 ) -> Result<Option<ObjectId>> {
-    let Ok(head) = resolve_revision(git_dir, format, "HEAD") else {
+    let Ok(head) = sley_rev::RevisionResolver::new(git_dir, format, db).resolve("HEAD") else {
         return Ok(None);
     };
     let tree = commit_tree_oid(db, format, &head)?;

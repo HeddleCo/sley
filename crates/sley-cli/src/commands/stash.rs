@@ -318,6 +318,7 @@ fn cmd_stash_branch(cli_session: &crate::session::CliSession, args: &[String]) -
         &store,
         &db,
         args.get(1).map(String::as_str),
+        cli_session.replace_objects(),
     )?;
     let stash_object = db.read_object(&stash_oid)?;
     let stash_commit = Commit::parse(format, &stash_object.body)?;
@@ -425,7 +426,14 @@ fn apply_stash_entry(
         .as_deref()
         .filter(|_| options.explicit_selector)
     {
-        let oid = resolve_stash_argument(&common_git_dir, format, &store, &db, Some(spec))?;
+        let oid = resolve_stash_argument(
+            &common_git_dir,
+            format,
+            &store,
+            &db,
+            Some(spec),
+            cli_session.replace_objects(),
+        )?;
         if let Some((index, _entry)) = entries
             .iter()
             .enumerate()
@@ -2826,7 +2834,12 @@ fn cmd_stash_store(cli_session: &crate::session::CliSession, args: &[String]) ->
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    let stash_oid = match resolve_revision(&common_git_dir, format, commit) {
+    let stash_oid = match resolve_revision(
+        &common_git_dir,
+        format,
+        commit,
+        cli_session.replace_objects(),
+    ) {
         Ok(oid) => oid,
         Err(_) => {
             eprintln!("Cannot update refs/stash with {commit}");
@@ -2855,6 +2868,7 @@ fn resolve_stash_argument(
     store: &FileRefStore,
     db: &FileObjectDatabase,
     spec: Option<&str>,
+    replace_objects: bool,
 ) -> Result<ObjectId> {
     // git's `parse_stash_revision` expands to the FULL ref `refs/stash@{n}`
     // (`ref_stash`), so the reflog lookup resolves without depending on a `stash`
@@ -2872,7 +2886,7 @@ fn resolve_stash_argument(
         }
         Some(value) => value.to_string(),
     };
-    let oid = match resolve_revision(common_git_dir, format, &revision) {
+    let oid = match resolve_revision(common_git_dir, format, &revision, replace_objects) {
         Ok(oid) => oid,
         Err(err) => {
             // A reflog selector whose log is too short (`stash@{99}`) dies the way
@@ -3363,6 +3377,7 @@ fn cmd_stash_show(cli_session: &crate::session::CliSession, args: &[String]) -> 
         &store,
         &db,
         specs.first().map(String::as_str),
+        cli_session.replace_objects(),
     )?;
     let object = db.read_object(&stash_oid)?;
     if object.object_type != ObjectType::Commit {
@@ -4168,6 +4183,7 @@ fn cmd_stash_export(cli_session: &crate::session::CliSession, args: &[String]) -
                 &store,
                 &db,
                 Some(spec.as_str()),
+                cli_session.replace_objects(),
             ) {
                 Ok(oid) => oid,
                 Err(_) => {
@@ -4266,7 +4282,12 @@ fn cmd_stash_import(cli_session: &crate::session::CliSession, args: &[String]) -
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    let chain = match resolve_revision(&common_git_dir, format, &args[0]) {
+    let chain = match resolve_revision(
+        &common_git_dir,
+        format,
+        &args[0],
+        cli_session.replace_objects(),
+    ) {
         Ok(oid) => oid,
         Err(_) => {
             eprintln!("error: not a valid revision: {}", args[0]);

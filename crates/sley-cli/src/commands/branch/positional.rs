@@ -40,6 +40,40 @@ pub(super) fn dispatch_branch_positional_args(
     let git_dir = context.git_dir();
     let format = context.format();
     let store = &context.refs;
+    let resolve_revision = |git_dir: &Path, format: ObjectFormat, rev: &str| {
+        crate::resolve_revision(git_dir, format, rev, context.replace_objects)
+    };
+    let print_branch_list_format = |git_dir: &Path,
+                                    format: ObjectFormat,
+                                    store: &FileRefStore,
+                                    mode: BranchListMode,
+                                    patterns: &[String],
+                                    ignore_case: bool,
+                                    format_spec: &str| {
+        super::list::print_branch_list_format(
+            git_dir,
+            format,
+            store,
+            context.replace_objects,
+            mode,
+            patterns,
+            ignore_case,
+            format_spec,
+        )
+    };
+    let print_branch_list_format_omit_empty =
+        |git_dir: &Path,
+         format: ObjectFormat,
+         store: &FileRefStore,
+         options: BranchFormatPrintOptions<'_>| {
+            super::list::print_branch_list_format_omit_empty(
+                git_dir,
+                format,
+                store,
+                context.replace_objects,
+                options,
+            )
+        };
     match args {
         [] => print_branch_list(store, BranchListMode::Local),
         [flag] if flag == "--list" => print_branch_list(store, BranchListMode::Local),
@@ -5915,7 +5949,15 @@ pub(super) fn dispatch_branch_positional_args(
         [delete, no_delete, branch]
             if (delete == "-d" || delete == "--delete") && no_delete == "--no-delete" =>
         {
-            create_branch_from_start(git_dir, format, store, &context.config, branch, None)
+            create_branch_from_start(
+                git_dir,
+                format,
+                store,
+                &context.config,
+                context.replace_objects,
+                branch,
+                None,
+            )
         }
         [delete, no_delete, branch, start]
             if (delete == "-d" || delete == "--delete") && no_delete == "--no-delete" =>
@@ -5925,6 +5967,7 @@ pub(super) fn dispatch_branch_positional_args(
                 format,
                 store,
                 &context.config,
+                context.replace_objects,
                 branch,
                 Some(start),
             )
@@ -5944,10 +5987,27 @@ pub(super) fn dispatch_branch_positional_args(
             force_delete_branches(git_dir, format, store, branches, false)
         }
         [flag, branches @ ..] if flag == "-d" || flag == "--delete" => {
-            delete_merged_branches(git_dir, format, context.objects(), store, branches, false)
+            delete_merged_branches(
+                git_dir,
+                format,
+                context.objects(),
+                store,
+                context.replace_objects,
+                branches,
+                false,
+            )
         }
         [flag, branch] if flag == "-f" || flag == "--force" => {
-            force_update_branch(git_dir, format, store, &context.config, branch, None).map(|_| ())
+            force_update_branch(
+                git_dir,
+                format,
+                store,
+                &context.config,
+                context.replace_objects,
+                branch,
+                None,
+            )
+            .map(|_| ())
         }
         [flag, branch, start] if flag == "-f" || flag == "--force" => {
             force_update_branch(
@@ -5955,13 +6015,22 @@ pub(super) fn dispatch_branch_positional_args(
                 format,
                 store,
                 &context.config,
+                context.replace_objects,
                 branch,
                 Some(start),
             )
             .map(|_| ())
         }
         [branch] => {
-            create_branch_from_start(git_dir, format, store, &context.config, branch, None)?;
+            create_branch_from_start(
+                git_dir,
+                format,
+                store,
+                &context.config,
+                context.replace_objects,
+                branch,
+                None,
+            )?;
             branch_create_set_tracking(git_dir, store, branch, None, None, false)
         }
         [branch, start] => {
@@ -5970,6 +6039,7 @@ pub(super) fn dispatch_branch_positional_args(
                 format,
                 store,
                 &context.config,
+                context.replace_objects,
                 branch,
                 Some(start),
             )?;

@@ -107,12 +107,16 @@ pub(crate) fn cmd_fsck(cli_session: &crate::session::CliSession, args: &[String]
         for spec in &explicit_oids {
             match ObjectId::from_hex(format, spec) {
                 Ok(oid) => resolved.push((oid.to_hex(), oid)),
-                Err(_) => match resolve_revision(&git_dir, format, spec) {
-                    Ok(oid) => resolved.push((spec.clone(), oid)),
-                    Err(_) => {
-                        return Err(GitError::Command(format!("Invalid object name '{spec}'.")));
+                Err(_) => {
+                    match resolve_revision(&git_dir, format, spec, cli_session.replace_objects()) {
+                        Ok(oid) => resolved.push((spec.clone(), oid)),
+                        Err(_) => {
+                            return Err(GitError::Command(format!(
+                                "Invalid object name '{spec}'."
+                            )));
+                        }
                     }
-                },
+                }
             }
         }
         resolved

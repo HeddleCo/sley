@@ -168,13 +168,12 @@ impl RepositoryContext {
 pub(crate) fn open_object_database(
     git_dir: &Path,
     format: ObjectFormat,
+    replace_objects: bool,
 ) -> Result<FileObjectDatabase> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let config = read_repo_config(git_dir)?;
     let refs = FileRefStore::new(git_dir, format);
-    let replace_objects = session::cli_session()
-        .map(|session| session.replace_objects())
-        .unwrap_or(true)
+    let replace_objects = replace_objects
         && config
             .get_bool("core", None, "useReplaceRefs")
             .unwrap_or(true);

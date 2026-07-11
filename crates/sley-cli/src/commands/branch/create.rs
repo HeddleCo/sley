@@ -34,6 +34,7 @@ pub(super) fn run_branch_create_options(
     format: ObjectFormat,
     store: &FileRefStore,
     config: &GitConfig,
+    replace_objects: bool,
     options: BranchCreateOptions,
 ) -> Result<()> {
     if options.recurse_submodules {
@@ -54,7 +55,9 @@ pub(super) fn run_branch_create_options(
     match options.positionals.as_slice() {
         [] => print_branch_list(store, BranchListMode::Local),
         [branch] if options.force => {
-            let branch = force_update_branch(git_dir, format, store, config, branch, None)?;
+            let branch = force_update_branch(
+                git_dir, format, store, config, replace_objects, branch, None,
+            )?;
             branch_create_set_tracking(git_dir, store, &branch, None, options.track, options.quiet)
         }
         [branch] => {
@@ -63,6 +66,7 @@ pub(super) fn run_branch_create_options(
                 format,
                 store,
                 config,
+                replace_objects,
                 branch,
                 None,
                 options.create_reflog,
@@ -77,7 +81,15 @@ pub(super) fn run_branch_create_options(
             )
         }
         [branch, start] if options.force => {
-            let branch = force_update_branch(git_dir, format, store, config, branch, Some(start))?;
+            let branch = force_update_branch(
+                git_dir,
+                format,
+                store,
+                config,
+                replace_objects,
+                branch,
+                Some(start),
+            )?;
             branch_create_set_tracking(
                 git_dir,
                 store,
@@ -93,6 +105,7 @@ pub(super) fn run_branch_create_options(
                 format,
                 store,
                 config,
+                replace_objects,
                 branch,
                 Some(start),
                 options.create_reflog,
@@ -570,6 +583,7 @@ pub(super) fn resolve_branch_start(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     start: &str,
 ) -> Result<ObjectId> {
     let peel_branch_start = |oid: ObjectId| -> Result<ObjectId> {
@@ -582,7 +596,7 @@ pub(super) fn resolve_branch_start(
             ))
         })
     };
-    match resolve_revision(git_dir, format, start) {
+    match resolve_revision(git_dir, format, start, replace_objects) {
         Ok(oid) => peel_branch_start(oid),
         Err(err) => {
             // A trailing range operator with an empty other side (`main..`,
@@ -593,7 +607,7 @@ pub(super) fn resolve_branch_start(
                 .or_else(|| start.strip_suffix(".."))
                 && !base.is_empty()
                 && !base.contains("..")
-                && let Ok(oid) = resolve_revision(git_dir, format, base)
+                && let Ok(oid) = resolve_revision(git_dir, format, base, replace_objects)
             {
                 return peel_branch_start(oid);
             }
@@ -620,10 +634,20 @@ pub(crate) fn create_branch_from_start(
     format: ObjectFormat,
     store: &FileRefStore,
     config: &GitConfig,
+    replace_objects: bool,
     branch: &str,
     start: Option<&String>,
 ) -> Result<()> {
-    create_branch_from_start_with_reflog(git_dir, format, store, config, branch, start, false)
+    create_branch_from_start_with_reflog(
+        git_dir,
+        format,
+        store,
+        config,
+        replace_objects,
+        branch,
+        start,
+        false,
+    )
 }
 
 pub(super) fn create_branch_from_start_with_reflog(
@@ -631,6 +655,7 @@ pub(super) fn create_branch_from_start_with_reflog(
     format: ObjectFormat,
     store: &FileRefStore,
     config: &GitConfig,
+    replace_objects: bool,
     branch: &str,
     start: Option<&String>,
     create_reflog: bool,
@@ -641,7 +666,7 @@ pub(super) fn create_branch_from_start_with_reflog(
         return Err(GitError::Exit(128));
     }
     let start_rev = start.map_or("HEAD", String::as_str);
-    let start_oid = resolve_branch_start(git_dir, format, store, start_rev)?;
+    let start_oid = resolve_branch_start(git_dir, format, store, replace_objects, start_rev)?;
     let message = branch_create_reflog_message(store, start)?;
     let reflog = if branch_should_write_reflog(git_dir, &refname, create_reflog)? {
         Some(ReflogEntry {

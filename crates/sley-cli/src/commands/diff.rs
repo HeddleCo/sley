@@ -21,7 +21,7 @@ fn diff_peel_rev_tree(
     db: &FileObjectDatabase,
     rev: &str,
 ) -> Result<ObjectId> {
-    let oid = resolve_revision(git_dir, format, rev)?;
+    let oid = sley_rev::RevisionResolver::new(git_dir, format, db).resolve(rev)?;
     sley_rev::peel_to_tree(db, format, &oid)
 }
 
@@ -31,7 +31,7 @@ pub(crate) fn diff_resolve_commit_arg(
     db: &FileObjectDatabase,
     rev: &str,
 ) -> Result<ObjectId> {
-    let oid = resolve_revision(git_dir, format, rev)?;
+    let oid = sley_rev::RevisionResolver::new(git_dir, format, db).resolve(rev)?;
     match sley_rev::peel_to_commit(db, format, &oid) {
         Ok(commit) => Ok(commit),
         Err(err) => {
@@ -169,7 +169,11 @@ fn diff_split_merge_base(
             eprintln!("fatal: --merge-base does not work with ranges");
             return Err(GitError::Exit(128));
         }
-        if commits.len() < 2 && resolve_revision(git_dir, format, &token).is_ok() {
+        if commits.len() < 2
+            && sley_rev::RevisionResolver::new(git_dir, format, db)
+                .resolve(&token)
+                .is_ok()
+        {
             let commit = diff_resolve_commit_arg(git_dir, format, db, &token)?;
             commits.push((commit, token));
             continue;
@@ -1527,7 +1531,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         diff_split_revisions(&git_dir, format, &db, path_args)?
     };
     path_args.extend(explicit_paths);
-    let find_objects = resolve_diff_find_objects(&git_dir, format, &find_object_values)?;
+    let find_objects = resolve_diff_find_objects(&git_dir, format, &db, &find_object_values)?;
     let render_selection = sley_diff_merge::porcelain::select_render_formats(
         sley_diff_merge::porcelain::RenderSelectionOptions {
             default_output: sley_diff_merge::porcelain::DefaultDiffOutput::Patch,
@@ -2814,20 +2818,27 @@ fn diff_entry_matches_pickaxe(
 pub(crate) fn resolve_diff_find_objects(
     git_dir: &Path,
     format: ObjectFormat,
+    db: &FileObjectDatabase,
     values: &[String],
 ) -> Result<Vec<ObjectId>> {
     values
         .iter()
-        .map(|value| resolve_diff_find_object(git_dir, format, value))
+        .map(|value| resolve_diff_find_object(git_dir, format, db, value))
         .collect()
 }
 
-fn resolve_diff_find_object(git_dir: &Path, format: ObjectFormat, value: &str) -> Result<ObjectId> {
+fn resolve_diff_find_object(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    value: &str,
+) -> Result<ObjectId> {
     if value.len() == format.hex_len() && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return ObjectId::from_hex(format, value)
             .map_err(|_| diff_find_object_unable_to_resolve_error(value));
     }
-    resolve_revision(git_dir, format, value)
+    sley_rev::RevisionResolver::new(git_dir, format, db)
+        .resolve(value)
         .map_err(|_| diff_find_object_unable_to_resolve_error(value))
 }
 

@@ -40,8 +40,16 @@ pub(crate) fn cmd_branch(cli_session: &crate::session::CliSession, args: &[Strin
         );
         return Err(GitError::Exit(129));
     }
-    if let Some(format_options) = setup_branch_format_list_options(git_dir, format, args)? {
-        return run_branch_format_list_options(git_dir, format, store, format_options);
+    if let Some(format_options) =
+        setup_branch_format_list_options(git_dir, format, context.replace_objects, args)?
+    {
+        return run_branch_format_list_options(
+            git_dir,
+            format,
+            store,
+            context.replace_objects,
+            format_options,
+        );
     }
     if let Some(show_current) = setup_branch_show_current_options(args)? {
         if show_current {
@@ -56,14 +64,20 @@ pub(crate) fn cmd_branch(cli_session: &crate::session::CliSession, args: &[Strin
         return run_branch_move_options(git_dir, store, &context.config, move_options);
     }
     if let Some(upstream) = setup_branch_upstream_options(args)? {
-        return run_branch_upstream_options(git_dir, store, upstream);
+        return run_branch_upstream_options(git_dir, store, context.replace_objects, upstream);
     }
     if branch_has_conflicting_action_modes(args) {
         eprintln!("fatal: options are incompatible");
         return Err(GitError::Exit(128));
     }
     if let Some(verbose) = setup_branch_verbose_list_options(args)? {
-        return run_branch_verbose_list_options(git_dir, format, store, verbose);
+        return run_branch_verbose_list_options(
+            git_dir,
+            format,
+            store,
+            context.replace_objects,
+            verbose,
+        );
     }
     if let Some(delete) = setup_branch_delete_options(args)? {
         let BranchDeleteOptions {
@@ -80,14 +94,35 @@ pub(crate) fn cmd_branch(cli_session: &crate::session::CliSession, args: &[Strin
         } else if force {
             force_delete_branches(git_dir, format, store, &branches, quiet)
         } else {
-            delete_merged_branches(git_dir, format, context.objects(), store, &branches, quiet)
+            delete_merged_branches(
+                git_dir,
+                format,
+                context.objects(),
+                store,
+                context.replace_objects,
+                &branches,
+                quiet,
+            )
         };
     }
     if let Some(create) = setup_branch_create_options(args)? {
-        return run_branch_create_options(git_dir, format, store, &context.config, create);
+        return run_branch_create_options(
+            git_dir,
+            format,
+            store,
+            &context.config,
+            context.replace_objects,
+            create,
+        );
     }
-    if let Some(list) = setup_branch_general_list_options(git_dir, args)? {
-        return run_branch_general_list_options(git_dir, format, store, list);
+    if let Some(list) = setup_branch_general_list_options(git_dir, context.replace_objects, args)? {
+        return run_branch_general_list_options(
+            git_dir,
+            format,
+            store,
+            context.replace_objects,
+            list,
+        );
     }
     dispatch_branch_positional_args(&context, args)
 }

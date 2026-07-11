@@ -298,8 +298,12 @@ pub(crate) fn cmd_pack_objects(
         .get_bool("pack", None, "writeReverseIndex")
         .unwrap_or(false);
     let database = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    options.object_filter =
-        std::mem::take(&mut options.object_filter).resolve(&git_dir, &database, format)?;
+    options.object_filter = std::mem::take(&mut options.object_filter).resolve(
+        &git_dir,
+        &database,
+        format,
+        cli_session.replace_objects(),
+    )?;
     let progress = options
         .progress
         .unwrap_or_else(|| io::stderr().is_terminal());
@@ -329,6 +333,7 @@ pub(crate) fn cmd_pack_objects(
             format,
             &options,
             cli_session.lazy_fetch(),
+            cli_session.replace_objects(),
         )?
     } else {
         let oids = read_pack_objects_stdin(format)?;
@@ -1182,6 +1187,7 @@ fn collect_traversal_objects(
     format: ObjectFormat,
     options: &PackObjectsOptions,
     lazy_fetch: bool,
+    replace_objects: bool,
 ) -> Result<TraversalPackObjects> {
     let mut wants: Vec<ObjectId> = Vec::new();
     let mut haves: Vec<ObjectId> = Vec::new();
@@ -1192,7 +1198,7 @@ fn collect_traversal_objects(
                 wants.push(oid);
             }
         }
-        if let Ok(head) = resolve_revision(git_dir, format, "HEAD") {
+        if let Ok(head) = resolve_revision(git_dir, format, "HEAD", replace_objects) {
             wants.push(head);
         }
     }
@@ -1214,14 +1220,16 @@ fn collect_traversal_objects(
             if let Some(range) = sley_rev::parse_revision_range(rev) {
                 match range {
                     sley_rev::RevisionRange::Asymmetric { start, end } => {
-                        let start_oid = match resolve_revision(git_dir, format, &start) {
-                            Ok(oid) => oid,
-                            Err(_) => {
-                                eprintln!("fatal: bad revision '{start}'");
-                                return Err(GitError::Exit(128));
-                            }
-                        };
-                        let end_oid = match resolve_revision(git_dir, format, &end) {
+                        let start_oid =
+                            match resolve_revision(git_dir, format, &start, replace_objects) {
+                                Ok(oid) => oid,
+                                Err(_) => {
+                                    eprintln!("fatal: bad revision '{start}'");
+                                    return Err(GitError::Exit(128));
+                                }
+                            };
+                        let end_oid = match resolve_revision(git_dir, format, &end, replace_objects)
+                        {
                             Ok(oid) => oid,
                             Err(_) => {
                                 eprintln!("fatal: bad revision '{end}'");
@@ -1242,7 +1250,7 @@ fn collect_traversal_objects(
                 Some(rest) => (true, rest),
                 None => (false, rev),
             };
-            let oid = match resolve_revision(git_dir, format, rev) {
+            let oid = match resolve_revision(git_dir, format, rev, replace_objects) {
                 Ok(oid) => oid,
                 Err(_) => {
                     eprintln!("fatal: bad revision '{rev}'");
@@ -1413,13 +1421,14 @@ impl PackObjectFilter {
         git_dir: &Path,
         database: &FileObjectDatabase,
         format: ObjectFormat,
+        replace_objects: bool,
     ) -> Result<Self> {
         match self {
             Self::SparseOid(value) => {
                 let oid = if let Some((rev, path)) = value.split_once(':') {
                     sley_rev::resolve_rev_path(git_dir, format, database, rev, path)?
                 } else {
-                    resolve_revision(git_dir, format, &value)?
+                    resolve_revision(git_dir, format, &value, replace_objects)?
                 };
                 let object = database.read_object(&oid)?;
                 if object.object_type != ObjectType::Blob {
@@ -1437,7 +1446,7 @@ impl PackObjectFilter {
             }
             Self::Combine(filters) => filters
                 .into_iter()
-                .map(|filter| filter.resolve(git_dir, database, format))
+                .map(|filter| filter.resolve(git_dir, database, format, replace_objects))
                 .collect::<Result<Vec<_>>>()
                 .map(Self::Combine),
             filter => Ok(filter),

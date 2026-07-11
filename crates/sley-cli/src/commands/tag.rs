@@ -50,7 +50,7 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
     let format = repo.object_format();
     let store = repo.references();
     if args.is_empty() {
-        return print_default_tag_list(&repo, &store);
+        return print_default_tag_list(&repo, &store, cli_session.replace_objects());
     }
 
     let mut annotated = false;
@@ -571,7 +571,7 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
         && !edit
         && !edit_disabled
     {
-        return print_default_tag_list(&repo, &store);
+        return print_default_tag_list(&repo, &store, cli_session.replace_objects());
     }
     // A ref-filter (`--contains`/`--no-contains`/`--points-at`/`--merged`/
     // `--no-merged`) or `-n` is "only allowed in list mode": when an explicit
@@ -659,6 +659,7 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
         print_tag_list(
             &repo,
             &store,
+            cli_session.replace_objects(),
             TagListOptions {
                 patterns: &positional,
                 ignore_case,
@@ -698,7 +699,7 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
             return Err(GitError::Exit(128));
         }
     };
-    let target_oid = resolve_tag_target(&git_dir, format, target)?;
+    let target_oid = resolve_tag_target(&repo, target)?;
     if annotated {
         let has_message_source = !messages.is_empty() || file_message.is_some();
         let use_editor = edit || (!edit_disabled && !has_message_source);
@@ -805,10 +806,15 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
     Ok(())
 }
 
-fn print_default_tag_list(repo: &sley::Repository, store: &FileRefStore) -> Result<()> {
+fn print_default_tag_list(
+    repo: &sley::Repository,
+    store: &FileRefStore,
+    replace_objects: bool,
+) -> Result<()> {
     print_tag_list(
         repo,
         store,
+        replace_objects,
         TagListOptions {
             patterns: &[],
             ignore_case: false,
@@ -937,8 +943,14 @@ fn verify_tag(
     Ok(true)
 }
 
-fn resolve_tag_target(git_dir: &Path, format: ObjectFormat, target: &str) -> Result<ObjectId> {
-    match resolve_revision(git_dir, format, target) {
+fn resolve_tag_target(repo: &sley::Repository, target: &str) -> Result<ObjectId> {
+    match sley_rev::RevisionResolver::new(
+        repo.git_dir(),
+        repo.object_format(),
+        repo.object_database(),
+    )
+    .resolve(target)
+    {
         Ok(oid) => Ok(oid),
         Err(GitError::NotFound(_)) => {
             eprintln!("fatal: Failed to resolve '{target}' as a valid ref.");
@@ -2154,6 +2166,7 @@ impl TagListSort {
 fn print_tag_list(
     repo: &sley::Repository,
     store: &FileRefStore,
+    replace_objects: bool,
     options: TagListOptions<'_>,
 ) -> Result<()> {
     let git_dir = repo.git_dir();
@@ -2221,7 +2234,7 @@ fn print_tag_list(
         };
         let deltabase = zero_oid(format)?;
         let mailmap = if tag_format_needs_mailmap(format_spec) {
-            commands::utility::Mailmap::load_default(git_dir, format)?
+            commands::utility::Mailmap::load_default(git_dir, format, replace_objects)?
         } else {
             commands::utility::Mailmap::default()
         };

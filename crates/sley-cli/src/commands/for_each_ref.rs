@@ -326,13 +326,14 @@ pub(crate) fn for_each_ref_core_with_config(
     let needs = ForEachRefNeeds::analyze(&format_spec);
     let format = repository_object_format(&git_dir)?;
     let objectname_abbrev = repository_abbrev(&git_dir, format)?;
+    let db =
+        crate::repository::open_object_database(&git_dir, format, cli_session.replace_objects())?;
     let points_at = points_at_revs
         .iter()
-        .map(|rev| resolve_revision(&git_dir, format, rev))
+        .map(|rev| for_each_ref_resolve_revision(&git_dir, format, &db, rev))
         .collect::<Result<Vec<_>>>()?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let mut reachability = sley_rev::CommitReachability::new(&git_dir, format, &db);
-    for_each_ref_validate_ahead_behind(&format_spec, &git_dir, format)?;
+    for_each_ref_validate_ahead_behind(&format_spec, &git_dir, format, &db)?;
     for_each_ref_validate_describe(&format_spec)?;
     // The abbreviation candidate set is only needed by `%(objectname:short...)`;
     // enumerating every object id is otherwise pure overhead.
@@ -344,14 +345,14 @@ pub(crate) fn for_each_ref_core_with_config(
     let contains_targets = contains_revs
         .iter()
         .map(|rev| {
-            let oid = resolve_revision(&git_dir, format, rev)?;
+            let oid = for_each_ref_resolve_revision(&git_dir, format, &db, rev)?;
             sley_rev::peel_to_commit(&db, format, &oid)
         })
         .collect::<Result<Vec<_>>>()?;
     let no_contains_targets = no_contains_revs
         .iter()
         .map(|rev| {
-            let oid = resolve_revision(&git_dir, format, rev)?;
+            let oid = for_each_ref_resolve_revision(&git_dir, format, &db, rev)?;
             sley_rev::peel_to_commit(&db, format, &oid)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -359,7 +360,7 @@ pub(crate) fn for_each_ref_core_with_config(
     let no_contains_target_set = no_contains_targets.iter().copied().collect::<HashSet<_>>();
     let merged_filter = merged_filter
         .map(|(rev, include)| {
-            let oid = resolve_revision(&git_dir, format, &rev)?;
+            let oid = for_each_ref_resolve_revision(&git_dir, format, &db, &rev)?;
             let commit = sley_rev::peel_to_commit(&db, format, &oid)?;
             let reachable = reachability.reachable_oids([commit], false)?;
             Ok::<_, GitError>((reachable, include))
@@ -388,7 +389,12 @@ pub(crate) fn for_each_ref_core_with_config(
     // mailmap.{file,blob} config. Avoid probing those paths for formats that
     // never request mailmap rewriting.
     let mailmap = if needs.mailmap {
-        commands::utility::Mailmap::load_default_with_config(&git_dir, format, effective_config)?
+        commands::utility::Mailmap::load_default_with_config(
+            &git_dir,
+            format,
+            effective_config,
+            cli_session.replace_objects(),
+        )?
     } else {
         commands::utility::Mailmap::default()
     };
@@ -898,10 +904,21 @@ fn for_each_ref_validate_describe(format_spec: &ForEachRefFormat) -> Result<()> 
     Ok(())
 }
 
+fn for_each_ref_resolve_revision(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    rev: &str,
+) -> Result<ObjectId> {
+    warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
+    sley_rev::RevisionResolver::new(git_dir, format, db).resolve(rev)
+}
+
 fn for_each_ref_validate_ahead_behind(
     format_spec: &ForEachRefFormat,
     git_dir: &Path,
     format: ObjectFormat,
+    db: &FileObjectDatabase,
 ) -> Result<()> {
     for segment in format_spec.segments() {
         let ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw(placeholder)) = segment else {
@@ -919,7 +936,7 @@ fn for_each_ref_validate_ahead_behind(
             eprintln!("fatal: expected format: %(ahead-behind:<committish>)");
             return Err(GitError::Exit(128));
         };
-        if resolve_revision(git_dir, format, base).is_err() {
+        if for_each_ref_resolve_revision(git_dir, format, db, base).is_err() {
             eprintln!("fatal: failed to find '{base}'");
             return Err(GitError::Exit(128));
         }
@@ -977,7 +994,7 @@ fn for_each_ref_compute_is_base_refs(
 
     let mut selected = HashMap::new();
     for target in targets {
-        let tip = resolve_revision(git_dir, format, target)
+        let tip = for_each_ref_resolve_revision(git_dir, format, db, target)
             .and_then(|oid| sley_rev::peel_to_commit(db, format, &oid));
         let tip = match tip {
             Ok(tip) => tip,

@@ -1264,6 +1264,7 @@ fn repack_traversal_roots(
     git_dir: &Path,
     common_git_dir: &Path,
     format: ObjectFormat,
+    replace_objects: bool,
 ) -> Result<Vec<ObjectId>> {
     let mut roots = Vec::new();
     let store = FileRefStore::new(git_dir, format);
@@ -1272,7 +1273,7 @@ fn repack_traversal_roots(
             roots.push(oid);
         }
     }
-    if let Ok(head) = resolve_revision(git_dir, format, "HEAD") {
+    if let Ok(head) = resolve_revision(git_dir, format, "HEAD", replace_objects) {
         roots.push(head);
     }
     roots.extend(reflog_traversal_roots(git_dir, common_git_dir, format)?);
@@ -1591,7 +1592,12 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
     // objects included, unreachable ones dropped). Without `-a`, pack only
     // loose objects and leave existing packs in place.
     let result = if all {
-        let roots = repack_traversal_roots(&git_dir, &common_git_dir, format)?;
+        let roots = repack_traversal_roots(
+            &git_dir,
+            &common_git_dir,
+            format,
+            cli_session.replace_objects(),
+        )?;
         let keep_pack_stems: HashSet<String> = keep_packs.iter().cloned().collect();
         let options = sley_odb::RepackOptions {
             local,
@@ -1836,7 +1842,12 @@ fn cmd_repack_cruft(
     keep_packs: &[String],
     pack_kept_objects: bool,
 ) -> Result<()> {
-    let roots = repack_traversal_roots(git_dir, common_git_dir, format)?;
+    let roots = repack_traversal_roots(
+        git_dir,
+        common_git_dir,
+        format,
+        cli_session.replace_objects(),
+    )?;
     let keep_pack_stems: HashSet<String> = keep_packs.iter().cloned().collect();
     let options = sley_odb::RepackOptions {
         local: false,
@@ -2176,7 +2187,12 @@ fn gc_run_locked(
         gc_before_repack(cli_session, git_dir, common_git_dir, format, config)?;
     }
 
-    let roots = repack_traversal_roots(&git_dir, &common_git_dir, format)?;
+    let roots = repack_traversal_roots(
+        &git_dir,
+        &common_git_dir,
+        format,
+        cli_session.replace_objects(),
+    )?;
     let keep_pack_stems = gc_keep_pack_stems(common_git_dir, config, options)?;
 
     // builtin/gc.c add_repack_all_option: pick the repack flavour in the ODB
@@ -2578,7 +2594,8 @@ fn gc_before_repack(
                 expire_args.join(" ")
             ),
         );
-        let _ = commands::refs::reflog_expire_at(git_dir, &expire_args);
+        let _ =
+            commands::refs::reflog_expire_at(git_dir, &expire_args, cli_session.replace_objects());
     }
     let _ = (git_dir, format);
     Ok(())
@@ -5439,7 +5456,13 @@ pub(crate) fn cmd_prune(cli_session: &crate::session::CliSession, args: &[String
     let common_git_dir = repository.common_dir();
     let format = repository.object_format();
     let db = repository.object_database();
-    let mut roots = prune_roots(&git_dir, &common_git_dir, format, &options.heads)?;
+    let mut roots = prune_roots(
+        &git_dir,
+        &common_git_dir,
+        format,
+        cli_session.replace_objects(),
+        &options.heads,
+    )?;
     roots.extend(prune_recent_object_roots(
         db,
         common_git_dir,
@@ -5582,6 +5605,7 @@ fn prune_roots(
     git_dir: &Path,
     common_git_dir: &Path,
     format: ObjectFormat,
+    replace_objects: bool,
     heads: &[String],
 ) -> Result<Vec<ObjectId>> {
     let store = FileRefStore::new(common_git_dir, format);
@@ -5606,7 +5630,12 @@ fn prune_roots(
         }
     }
     for head in heads {
-        roots.insert(resolve_revision(common_git_dir, format, head)?);
+        roots.insert(resolve_revision(
+            common_git_dir,
+            format,
+            head,
+            replace_objects,
+        )?);
     }
     roots.extend(reflog_roots_from_dir(&common_git_dir.join("logs"), format)?);
     Ok(roots.into_iter().collect())

@@ -1,12 +1,11 @@
 //! Per-invocation CLI context (replaces process-global `GLOBAL_*` statics).
 //!
-//! Built once in [`crate::run`] after global option parsing; command code reads
-//! overrides through [`cli_session`] and the `global_*` accessors in `lib.rs`.
+//! Built once in [`crate::run`] after global option parsing and passed through
+//! dispatch explicitly.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use sley::{GitConfig, GitError, OpenOptions, Repository, Result};
 
@@ -31,21 +30,9 @@ pub(crate) struct CliEnv {
 pub(crate) struct CliSession {
     pub cwd: PathBuf,
     pub env: CliEnv,
-    /// When set, `global_git_dir` / `explicit_git_dir` return `None` (local
-    /// transport subprocess isolation).
+    /// When set, repository environment overrides are hidden from a child
+    /// invocation (local transport subprocess isolation).
     pub local_repo_env_hidden: bool,
-}
-
-static CLI_SESSION: Mutex<Option<CliSession>> = Mutex::new(None);
-
-pub(crate) fn install_cli_session(session: CliSession) {
-    if let Ok(mut slot) = CLI_SESSION.lock() {
-        *slot = Some(session);
-    }
-}
-
-pub(crate) fn cli_session() -> Option<CliSession> {
-    CLI_SESSION.lock().ok()?.clone()
 }
 
 /// Apply alias-expanded leading global options onto the active session.
@@ -60,21 +47,6 @@ pub(crate) fn merge_global_overrides(
 ) {
     apply_global_overrides(
         session,
-        git_dir.clone(),
-        work_tree.clone(),
-        attr_source.clone(),
-        bare,
-        lazy_fetch,
-        pathspec_flags,
-    );
-    let Ok(mut slot) = CLI_SESSION.lock() else {
-        return;
-    };
-    let Some(installed) = slot.as_mut() else {
-        return;
-    };
-    apply_global_overrides(
-        installed,
         git_dir,
         work_tree,
         attr_source,
@@ -252,12 +224,7 @@ impl CliSession {
         let Ok(cwd) = env::current_dir() else {
             return;
         };
-        self.cwd = cwd.clone();
-        if let Ok(mut slot) = CLI_SESSION.lock()
-            && let Some(installed) = slot.as_mut()
-        {
-            installed.cwd = cwd;
-        }
+        self.cwd = cwd;
     }
 
     /// Open a facade repository using the CLI's resolved git-directory rules.

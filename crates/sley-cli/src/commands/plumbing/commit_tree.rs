@@ -86,7 +86,8 @@ pub(crate) fn cmd_commit_tree(
     let tree = match ObjectId::from_hex(format, &tree) {
         Ok(oid) => oid,
         Err(_) => {
-            let tree_rev = resolve_revision_treeish(&git_dir, format, &tree)?;
+            let tree_rev =
+                resolve_revision_treeish(&git_dir, format, &tree, cli_session.replace_objects())?;
             sley_rev::peel_to_tree(&db_resolve, format, &tree_rev)?
         }
     };
@@ -95,7 +96,12 @@ pub(crate) fn cmd_commit_tree(
         .map(|parent| match ObjectId::from_hex(format, parent) {
             Ok(oid) => Ok(oid),
             Err(_) => {
-                let resolved = resolve_revision_commitish(&git_dir, format, parent)?;
+                let resolved = resolve_revision_commitish(
+                    &git_dir,
+                    format,
+                    parent,
+                    cli_session.replace_objects(),
+                )?;
                 sley_rev::peel_to_commit(&db_resolve, format, &resolved)
             }
         })

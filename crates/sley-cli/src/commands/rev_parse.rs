@@ -17,15 +17,17 @@ enum RevParsePathFormat {
 struct RevParseRepository<'a> {
     git_dir: &'a Path,
     format: ObjectFormat,
+    replace_objects: bool,
     objects: OnceLock<FileObjectDatabase>,
     refs: OnceLock<FileRefStore>,
 }
 
 impl<'a> RevParseRepository<'a> {
-    fn new(git_dir: &'a Path, format: ObjectFormat) -> Self {
+    fn new(git_dir: &'a Path, format: ObjectFormat, replace_objects: bool) -> Self {
         Self {
             git_dir,
             format,
+            replace_objects,
             objects: OnceLock::new(),
             refs: OnceLock::new(),
         }
@@ -35,7 +37,11 @@ impl<'a> RevParseRepository<'a> {
         if let Some(objects) = self.objects.get() {
             return Ok(objects);
         }
-        let objects = crate::repository::open_object_database(self.git_dir, self.format)?;
+        let objects = crate::repository::open_object_database(
+            self.git_dir,
+            self.format,
+            self.replace_objects,
+        )?;
         let _ = self.objects.set(objects);
         Ok(self
             .objects
@@ -76,7 +82,7 @@ pub(crate) fn cmd_rev_parse(
     // in a malformed repository must still die (t0001 #60/#62/#64).
     let format = verify_repository_format(cli_session, &git_dir)?;
     let repo_config = read_repo_config(&git_dir).ok();
-    let repository = RevParseRepository::new(&git_dir, format);
+    let repository = RevParseRepository::new(&git_dir, format, cli_session.replace_objects());
     if args.is_empty() {
         validate_bare_rev_parse_setup(cli_session, &setup)?;
         return Err(GitError::Command("rev-parse requires <rev>...".into()));
@@ -487,7 +493,12 @@ pub(crate) fn cmd_rev_parse(
         && verified_revs == 0
         && let Some(default_rev) = default_rev
     {
-        let oid = match resolve_revision(&git_dir, format, &default_rev) {
+        let oid = match resolve_revision(
+            &git_dir,
+            format,
+            &default_rev,
+            cli_session.replace_objects(),
+        ) {
             Ok(oid) => oid,
             Err(_) if quiet => return Err(GitError::Exit(1)),
             Err(_) => return rev_parse_needed_single_revision(false),
@@ -1048,7 +1059,13 @@ fn rev_parse_tree_path_error(
         return Err(GitError::Exit(128));
     }
     if let Some(prefixed) = rev_parse_prefixed_path(cli_session, cwd, git_dir, original_path)?
-        && rev_parse_tree_contains(git_dir, format, base, &prefixed)
+        && rev_parse_tree_contains(
+            git_dir,
+            format,
+            base,
+            &prefixed,
+            cli_session.replace_objects(),
+        )
     {
         eprintln!("fatal: path '{prefixed}' exists, but not '{original_path}'");
         eprintln!("hint: Did you mean '{base}:{prefixed}' aka '{base}:./{original_path}'?");
@@ -1141,8 +1158,14 @@ fn rev_parse_prefixed_path(
     Ok(Some(format!("{prefix}{path}")))
 }
 
-fn rev_parse_tree_contains(git_dir: &Path, format: ObjectFormat, base: &str, path: &str) -> bool {
-    let Ok(db) = crate::repository::open_object_database(git_dir, format) else {
+fn rev_parse_tree_contains(
+    git_dir: &Path,
+    format: ObjectFormat,
+    base: &str,
+    path: &str,
+    replace_objects: bool,
+) -> bool {
+    let Ok(db) = crate::repository::open_object_database(git_dir, format, replace_objects) else {
         return false;
     };
     sley_rev::resolve_rev_path(git_dir, format, &db, base, path).is_ok()

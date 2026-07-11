@@ -664,9 +664,14 @@ fn log_cached_mailmap<'a>(
     cache: &'a mut Option<commands::utility::Mailmap>,
     git_dir: &Path,
     format: ObjectFormat,
+    replace_objects: bool,
 ) -> Result<&'a commands::utility::Mailmap> {
     if cache.is_none() {
-        *cache = Some(commands::utility::Mailmap::load_default(git_dir, format)?);
+        *cache = Some(commands::utility::Mailmap::load_default(
+            git_dir,
+            format,
+            replace_objects,
+        )?);
     }
     Ok(cache.as_ref().expect("mailmap cache was just initialized"))
 }
@@ -2215,13 +2220,14 @@ fn cmd_log_impl(
     let worktree_root = repository.worktree_root().ok().map(Path::to_path_buf);
     for rev in end_of_options_revs {
         if rev.starts_with('-') {
-            match resolve_revision(&git_dir, format, &rev) {
+            match repository.resolve_revision(&rev) {
                 Ok(oid) => setup_args.push(oid.to_hex()),
                 Err(_) => {
                     let head_ref = format!("refs/heads/{rev}");
                     let tag_ref = format!("refs/tags/{rev}");
-                    match resolve_revision(&git_dir, format, &head_ref)
-                        .or_else(|_| resolve_revision(&git_dir, format, &tag_ref))
+                    match repository
+                        .resolve_revision(&head_ref)
+                        .or_else(|_| repository.resolve_revision(&tag_ref))
                     {
                         Ok(oid) => setup_args.push(oid.to_hex()),
                         Err(_) => setup_args.push(rev),
@@ -2340,7 +2346,7 @@ fn cmd_log_impl(
     ) {
         Ok(setup) => setup,
         Err(err) if inserted_default_head => {
-            if resolve_revision(&git_dir, format, "HEAD").is_err()
+            if repository.resolve_revision("HEAD").is_err()
                 && let Some(branch) = log_unborn_head_branch(&git_dir)
             {
                 eprintln!("fatal: your current branch '{branch}' does not have any commits yet");
@@ -2433,7 +2439,7 @@ fn cmd_log_impl(
     let compiled_pickaxe = if has_find_object {
         let mut oids = HashSet::new();
         for pat in &find_object_patterns {
-            let oid = resolve_revision(&git_dir, format, pat).map_err(|_| {
+            let oid = repository.resolve_revision(pat).map_err(|_| {
                 eprintln!("error: unable to resolve '{pat}'");
                 GitError::Exit(128)
             })?;
@@ -2710,6 +2716,7 @@ fn cmd_log_impl(
                 output: &output,
                 reverse,
                 date_mode: &date_mode,
+                replace_objects: cli_session.replace_objects(),
             },
         );
     }
@@ -2783,6 +2790,7 @@ fn cmd_log_impl(
             git_dir: &git_dir,
             db: &db,
             lazy_fetch,
+            replace_objects: cli_session.replace_objects(),
             format,
             config: &config,
             tip: starts[0],
@@ -3106,7 +3114,12 @@ fn cmd_log_impl(
     let mut selected = Vec::new();
     let filter_mailmap = if use_mailmap && (author_filters.is_some() || committer_filters.is_some())
     {
-        Some(log_cached_mailmap(&mut mailmap_cache, &git_dir, format)?)
+        Some(log_cached_mailmap(
+            &mut mailmap_cache,
+            &git_dir,
+            format,
+            cli_session.replace_objects(),
+        )?)
     } else {
         None
     };
@@ -3475,7 +3488,12 @@ fn cmd_log_impl(
         None
     };
     let output_mailmap = if log_output_needs_mailmap(&output, use_mailmap) {
-        log_cached_mailmap(&mut mailmap_cache, &git_dir, format)?
+        log_cached_mailmap(
+            &mut mailmap_cache,
+            &git_dir,
+            format,
+            cli_session.replace_objects(),
+        )?
     } else {
         &empty_mailmap
     };

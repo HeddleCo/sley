@@ -381,7 +381,11 @@ fn read_shortlog_from_revisions(
     }
 
     // git's shortlog *always* mailmaps the grouping identity (no flag needed).
-    let mailmap = commands::utility::Mailmap::load_default(repo.git_dir(), format)?;
+    let mailmap = commands::utility::Mailmap::load_default(
+        repo.git_dir(),
+        format,
+        cli_session.replace_objects(),
+    )?;
 
     let author_filters = parse_log_filter_patterns(&options.author_patterns, options.regexp_mode)?;
     let grep_filters = parse_log_filter_patterns(&options.grep_patterns, options.regexp_mode)?;
@@ -471,7 +475,11 @@ fn read_shortlog_from_stdin(
     let mailmap = match RepositoryContext::from_session(cli_session) {
         Ok(repo) => {
             let format = repo.format();
-            commands::utility::Mailmap::load_default(repo.git_dir(), format)?
+            commands::utility::Mailmap::load_default(
+                repo.git_dir(),
+                format,
+                cli_session.replace_objects(),
+            )?
         }
         Err(_) => commands::utility::Mailmap::load_cwd()?,
     };

@@ -621,8 +621,12 @@ pub(crate) fn cmd_diff_tree(
     } else {
         None
     };
-    let find_objects =
-        commands::diff::resolve_diff_find_objects(git_dir, format, &options.find_object_values)?;
+    let find_objects = commands::diff::resolve_diff_find_objects(
+        git_dir,
+        format,
+        db,
+        &options.find_object_values,
+    )?;
     // `--indent-heuristic` / `--no-indent-heuristic` win over the
     // `diff.indentHeuristic` config (which defaults to git's enabled behavior).
     let indent_heuristic = options.indent_heuristic.unwrap_or_else(|| {

@@ -38,6 +38,7 @@ pub(super) struct LineLogOutputCtx<'a> {
     /// pruned). `None` == no upper bound.
     pub(super) min_age: Option<i64>,
     pub(super) lazy_fetch: bool,
+    pub(super) replace_objects: bool,
     /// `-S`/`-G`/`--find-object` pickaxe: like upstream's `-L` + pickaxe, this
     /// suppresses the *diff pairs* of a commit whose whole-file diff does not
     /// match (the commit header still prints, matching git's pipeline where
@@ -97,12 +98,13 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
         userdiff,
         output_path,
         lazy_fetch,
+        replace_objects,
     } = ctx;
 
     // `-L` line-log shares git's `log.mailmap` default (true) and the default
     // pretty-format identity mapping.
     let use_mailmap = config.get_bool("log", None, "mailmap").unwrap_or(true);
-    let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
+    let mailmap = commands::utility::Mailmap::load_default(git_dir, format, replace_objects)?;
 
     // Reachable commits from the tip, in topological order (child before
     // parent) — git forces `topo_order` for `-L`. The line-log engine walks the

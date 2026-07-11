@@ -75,6 +75,7 @@ struct BisectRepo {
     db: FileObjectDatabase,
     config: GitConfig,
     lazy_fetch: bool,
+    replace_objects: bool,
 }
 
 impl BisectRepo {
@@ -82,7 +83,11 @@ impl BisectRepo {
         let git_dir = cli_session.git_dir()?;
         let worktree_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?;
         let format = repository_object_format(&git_dir)?;
-        let db = crate::repository::open_object_database(&git_dir, format)?;
+        let db = crate::repository::open_object_database(
+            &git_dir,
+            format,
+            cli_session.replace_objects(),
+        )?;
         let config = read_repo_config(&git_dir)?;
         Ok(Self {
             git_dir,
@@ -91,6 +96,7 @@ impl BisectRepo {
             db,
             config,
             lazy_fetch: cli_session.lazy_fetch(),
+            replace_objects: cli_session.replace_objects(),
         })
     }
 
@@ -411,7 +417,7 @@ fn bisect_write(
         eprintln!("error: Bad bisect_write argument: {state}");
         return Ok(-1);
     };
-    let oid = match resolve_revision(&repo.git_dir, repo.format, rev) {
+    let oid = match resolve_revision(&repo.git_dir, repo.format, rev, repo.replace_objects) {
         Ok(oid) => oid,
         Err(_) => {
             eprintln!("error: couldn't get the oid of the rev '{rev}'");
@@ -577,7 +583,7 @@ fn current_bisect_oid(repo: &BisectRepo) -> Result<ObjectId> {
             return ObjectId::from_hex(repo.format, trimmed);
         }
     }
-    resolve_revision(&repo.git_dir, repo.format, "HEAD")
+    resolve_revision(&repo.git_dir, repo.format, "HEAD", repo.replace_objects)
 }
 
 /// Upstream `bisect_state`: argv[0] is the state word, the rest are revs.
@@ -623,7 +629,7 @@ fn bisect_state(
     }
     // All input revs are checked before any write so junk revs leave no state.
     for arg in rev_args {
-        let oid = match resolve_revision(&repo.git_dir, repo.format, arg) {
+        let oid = match resolve_revision(&repo.git_dir, repo.format, arg, repo.replace_objects) {
             Ok(oid) => oid,
             Err(_) => {
                 eprintln!("error: Bad rev input: {arg}");
@@ -673,10 +679,11 @@ fn cmd_bisect_skip(cli_session: &crate::session::CliSession, args: &[String]) ->
             let (left, right) = arg.split_once("..").unwrap_or(("", ""));
             let left = if left.is_empty() { "HEAD" } else { left };
             let right = if right.is_empty() { "HEAD" } else { right };
-            let left_oid = resolve_revision(&repo.git_dir, repo.format, left)
+            let left_oid = resolve_revision(&repo.git_dir, repo.format, left, repo.replace_objects)
                 .and_then(|oid| sley_rev::peel_to_commit(&db, repo.format, &oid));
-            let right_oid = resolve_revision(&repo.git_dir, repo.format, right)
-                .and_then(|oid| sley_rev::peel_to_commit(&db, repo.format, &oid));
+            let right_oid =
+                resolve_revision(&repo.git_dir, repo.format, right, repo.replace_objects)
+                    .and_then(|oid| sley_rev::peel_to_commit(&db, repo.format, &oid));
             let (Ok(left_oid), Ok(right_oid)) = (left_oid, right_oid) else {
                 eprintln!("fatal: Bad rev input: {arg}");
                 return Err(GitError::Exit(128));
@@ -859,8 +866,9 @@ fn bisect_start(
         } else if arg.starts_with("--") {
             eprintln!("error: unrecognized option: '{arg}'");
             return Ok(BISECT_FAILED);
-        } else if let Ok(oid) = resolve_revision(&repo.git_dir, repo.format, arg)
-            .and_then(|oid| sley_rev::peel_to_commit(&db, repo.format, &oid))
+        } else if let Ok(oid) =
+            resolve_revision(&repo.git_dir, repo.format, arg, repo.replace_objects)
+                .and_then(|oid| sley_rev::peel_to_commit(&db, repo.format, &oid))
         {
             revs.push(oid);
         } else if has_double_dash {
@@ -941,7 +949,12 @@ fn bisect_start(
             fs::write(repo.state_path("BISECT_FIRST_PARENT"), "\n")?;
         }
         if no_checkout {
-            let oid = match resolve_revision(&repo.git_dir, repo.format, &start_head) {
+            let oid = match resolve_revision(
+                &repo.git_dir,
+                repo.format,
+                &start_head,
+                repo.replace_objects,
+            ) {
                 Ok(oid) => oid,
                 Err(_) => {
                     eprintln!("error: invalid ref: '{start_head}'");
@@ -1028,7 +1041,7 @@ fn bisect_reset(
         }
         Some(commit) => {
             let db = repo.db();
-            if resolve_revision(&repo.git_dir, repo.format, commit)
+            if resolve_revision(&repo.git_dir, repo.format, commit, repo.replace_objects)
                 .and_then(|oid| sley_rev::peel_to_commit(&db, repo.format, &oid))
                 .is_err()
             {
@@ -1586,7 +1599,7 @@ fn bisect_checkout(
             return Ok(BISECT_FAILED);
         };
         let committer = commit_identity_from_env("COMMITTER", &repo.config)?;
-        let old = resolve_revision(&repo.git_dir, repo.format, "HEAD")
+        let old = resolve_revision(&repo.git_dir, repo.format, "HEAD", repo.replace_objects)
             .map(|oid| oid.to_hex())
             .unwrap_or_else(|_| "HEAD".to_string());
         let message = format!("checkout: moving from {old} to {}", rev.to_hex());

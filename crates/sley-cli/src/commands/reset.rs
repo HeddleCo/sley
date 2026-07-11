@@ -238,11 +238,13 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
             return Err(GitError::Exit(128));
         }
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let old_head = match resolve_revision(&git_dir, format, "HEAD") {
-            Ok(oid) => oid,
-            Err(_) => zero_oid(format)?,
-        };
-        let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
+        let old_head =
+            match resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects()) {
+                Ok(oid) => oid,
+                Err(_) => zero_oid(format)?,
+            };
+        let target_oid =
+            resolve_revision_commitish(&git_dir, format, target, cli_session.replace_objects())?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         write_reset_orig_head(&git_dir, &old_head, format)?;
         update_reset_head_ref(
@@ -271,7 +273,8 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
             }
         };
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
+        let target_oid =
+            resolve_revision_commitish(&git_dir, format, target, cli_session.replace_objects())?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         return commands::replay::reset_merge_in(
             &git_dir,
@@ -314,13 +317,15 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
             return Err(GitError::Exit(128));
         }
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let head_oid = resolve_revision(&git_dir, format, "HEAD").map_err(|_| {
-            eprintln!("fatal: You do not have a valid HEAD.");
-            GitError::Exit(128)
-        })?;
+        let head_oid = resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects())
+            .map_err(|_| {
+                eprintln!("fatal: You do not have a valid HEAD.");
+                GitError::Exit(128)
+            })?;
         let old_head = head_oid;
         let head_tree = commands::merge_rebase::commit_tree_oid(&db, format, &head_oid)?;
-        let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
+        let target_oid =
+            resolve_revision_commitish(&git_dir, format, target, cli_session.replace_objects())?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         let target_tree = commands::merge_rebase::commit_tree_oid(&db, format, &target_commit)?;
         write_reset_orig_head(&git_dir, &old_head, format)?;
@@ -380,11 +385,14 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
             }
         };
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let old_head = match resolve_revision(&git_dir, format, "HEAD") {
-            Ok(oid) => oid,
-            Err(_) => zero_oid(format)?,
-        };
-        if target == "HEAD" && resolve_revision(&git_dir, format, "HEAD").is_err() {
+        let old_head =
+            match resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects()) {
+                Ok(oid) => oid,
+                Err(_) => zero_oid(format)?,
+            };
+        if target == "HEAD"
+            && resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects()).is_err()
+        {
             // `git reset --hard` on an unborn branch: empty the index and
             // remove the (previously tracked) worktree files.
             let index_path = sley_worktree::repository_index_path(&git_dir);
@@ -410,7 +418,8 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
             sley_sequencer::replay::remove_branch_state(&git_dir);
             return Ok(());
         }
-        let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
+        let target_oid =
+            resolve_revision_commitish(&git_dir, format, target, cli_session.replace_objects())?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         let target_tree = commands::merge_rebase::commit_tree_oid(&db, format, &target_commit)?;
         if reset_check_cache_tree()
@@ -473,13 +482,19 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
 
     if !saw_separator
         && positionals.len() == 1
-        && let Ok(target_oid) = resolve_revision_commitish(&git_dir, format, &positionals[0])
+        && let Ok(target_oid) = resolve_revision_commitish(
+            &git_dir,
+            format,
+            &positionals[0],
+            cli_session.replace_objects(),
+        )
     {
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let old_head = match resolve_revision(&git_dir, format, "HEAD") {
-            Ok(oid) => oid,
-            Err(_) => zero_oid(format)?,
-        };
+        let old_head =
+            match resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects()) {
+                Ok(oid) => oid,
+                Err(_) => zero_oid(format)?,
+            };
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         // For `git reset -N` capture the paths the *current* index tracks that the
         // target tree does NOT, so they can be re-recorded as intent-to-add after
@@ -530,7 +545,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
     if !saw_separator
         && positionals.is_empty()
         && !pathspec_from_file_provided
-        && resolve_revision(&git_dir, format, "HEAD").is_err()
+        && resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects()).is_err()
     {
         fs::write(
             sley_worktree::repository_index_path(&git_dir),
@@ -557,10 +572,12 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
     if !saw_separator
         && positionals.is_empty()
         && !pathspec_from_file_provided
-        && let Ok(head_oid) = resolve_revision_commitish(&git_dir, format, "HEAD")
+        && let Ok(head_oid) =
+            resolve_revision_commitish(&git_dir, format, "HEAD", cli_session.replace_objects())
     {
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let old_head = resolve_revision(&git_dir, format, "HEAD").unwrap_or(head_oid);
+        let old_head = resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects())
+            .unwrap_or(head_oid);
         let target_commit = sley_rev::peel_to_commit(&db, format, &head_oid)?;
         let ita_candidates = if intent_to_add {
             reset_intent_to_add_candidates(&git_dir, &db, format, &target_commit)?
@@ -595,7 +612,12 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
             [] => {}
             [target] => {
                 let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-                let target_oid = resolve_revision_treeish(&git_dir, format, target)?;
+                let target_oid = resolve_revision_treeish(
+                    &git_dir,
+                    format,
+                    target,
+                    cli_session.replace_objects(),
+                )?;
                 source_tree = Some(sley_rev::peel_to_tree(&db, format, &target_oid)?);
             }
             _ => {
@@ -610,7 +632,12 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
     } else {
         let mut values = positionals;
         if values.len() > 1
-            && let Ok(target_oid) = resolve_revision_treeish(&git_dir, format, &values[0])
+            && let Ok(target_oid) = resolve_revision_treeish(
+                &git_dir,
+                format,
+                &values[0],
+                cli_session.replace_objects(),
+            )
         {
             let db = FileObjectDatabase::from_git_dir(&git_dir, format);
             source_tree = Some(sley_rev::peel_to_tree(&db, format, &target_oid)?);
@@ -676,7 +703,9 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
     if no_explicit_paths {
         // A bare `git reset` (whole-tree mixed reset to HEAD) records ORIG_HEAD
         // just like the explicit-commit whole-tree paths. Pathspec resets do not.
-        if let Ok(old_head) = resolve_revision(&git_dir, format, "HEAD") {
+        if let Ok(old_head) =
+            resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects())
+        {
             write_reset_orig_head(&git_dir, &old_head, format)?;
         }
         // Whole-tree `--mixed` refreshes the stat-cache by default (see the

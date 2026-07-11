@@ -418,6 +418,7 @@ struct RepositoryObjectView {
     db: Arc<FileObjectDatabase>,
     refs: FileRefStore,
     lazy_fetch: bool,
+    replace_objects: bool,
 }
 
 impl RepositoryObjectView {
@@ -435,6 +436,7 @@ impl RepositoryObjectView {
             worktree_root,
             format,
             lazy_fetch: cli_session.lazy_fetch(),
+            replace_objects: cli_session.replace_objects(),
         })
     }
 
@@ -452,6 +454,10 @@ impl RepositoryObjectView {
 
     fn format(&self) -> ObjectFormat {
         self.format
+    }
+
+    fn replace_objects(&self) -> bool {
+        self.replace_objects
     }
 
     /// Peel `rev` to a tree id (commit/tag/tree all accepted). Used to tell a
@@ -751,7 +757,11 @@ impl ObjectQuery<'_> {
     /// Load the mailmap when `--use-mailmap` is in effect (else an empty one).
     fn cat_file_mailmap(&self) -> Result<commands::utility::Mailmap> {
         if self.use_mailmap {
-            commands::utility::Mailmap::load_default(self.view.git_dir(), self.view.format())
+            commands::utility::Mailmap::load_default(
+                self.view.git_dir(),
+                self.view.format(),
+                self.view.replace_objects(),
+            )
         } else {
             Ok(commands::utility::Mailmap::default())
         }
@@ -902,7 +912,11 @@ fn batch_record_mailmap(
     use_mailmap: bool,
 ) -> Result<commands::utility::Mailmap> {
     if use_mailmap {
-        commands::utility::Mailmap::load_default(view.git_dir(), view.format())
+        commands::utility::Mailmap::load_default(
+            view.git_dir(),
+            view.format(),
+            view.replace_objects(),
+        )
     } else {
         Ok(commands::utility::Mailmap::default())
     }

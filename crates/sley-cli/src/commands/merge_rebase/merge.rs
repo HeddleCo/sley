@@ -11,6 +11,7 @@ struct MergeCommandContext {
     config: GitConfig,
     worktree_root: PathBuf,
     lazy_fetch: bool,
+    replace_objects: bool,
 }
 
 impl MergeCommandContext {
@@ -30,6 +31,7 @@ impl MergeCommandContext {
             config,
             worktree_root,
             lazy_fetch: cli_session.lazy_fetch(),
+            replace_objects: cli_session.replace_objects(),
         })
     }
 
@@ -395,7 +397,7 @@ fn reduce_merge_targets(
         let oid = peel_merge_target_to_commit(
             db,
             format,
-            resolve_merge_target_revision(git_dir, format, target)?,
+            resolve_merge_target_revision(git_dir, db, format, target)?,
         )?;
         heads.push((target.clone(), oid));
     }
@@ -951,7 +953,7 @@ fn classify_merge_target_for_message(
     if kind != MergeRefKind::Commit {
         return Ok(kind);
     }
-    if let Ok(oid) = resolve_revision(git_dir, format, target)
+    if let Ok(oid) = sley_rev::RevisionResolver::new(git_dir, format, db).resolve(target)
         && let Ok(object) = db.read_object(&oid)
         && object.object_type == ObjectType::Tag
     {
@@ -1303,7 +1305,7 @@ fn append_merge_target_tag_messages(
 ) -> Result<()> {
     let mut blocks = Vec::new();
     for target in targets {
-        let Ok(oid) = resolve_revision(git_dir, format, target) else {
+        let Ok(oid) = sley_rev::RevisionResolver::new(git_dir, format, db).resolve(target) else {
             continue;
         };
         let object = db.read_object(&oid)?;
@@ -2552,10 +2554,11 @@ fn apply_merge_strategy_option(value: &str, options: &mut MergeOptions) -> Resul
 
 fn resolve_merge_target_revision(
     git_dir: &Path,
+    db: &FileObjectDatabase,
     format: ObjectFormat,
     target: &str,
 ) -> Result<ObjectId> {
-    match resolve_revision(git_dir, format, target) {
+    match sley_rev::RevisionResolver::new(git_dir, format, db).resolve(target) {
         Ok(oid) => Ok(oid),
         Err(err) => {
             if let Some(suggestion) = matching_remote_ref_suggestion(git_dir, format, target) {
@@ -3072,7 +3075,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
 
     let mut merge_autostash = false;
     if options.autostash == Some(true) {
-        merge_autostash = create_merge_autostash(&git_dir, &worktree_root, format)?;
+        merge_autostash = create_merge_autostash(&git_dir, &worktree_root, &db, format)?;
     }
 
     // git's `collect_parents` + `reduce_heads`: drop heads already reachable
@@ -3151,7 +3154,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             object.object_type == ObjectType::Tag,
         )
     } else {
-        let oid = resolve_merge_target_revision(&git_dir, format, &target)?;
+        let oid = resolve_merge_target_revision(&git_dir, &db, format, &target)?;
         (peel_merge_target_to_commit(&db, format, oid)?, false)
     };
     let head_oid = match refs.read_ref("HEAD")? {
@@ -4119,13 +4122,14 @@ pub(crate) fn cmd_merge_recursive(
     } else {
         let bases = base_revs
             .iter()
-            .map(|rev| resolve_revision(&git_dir, format, rev))
+            .map(|rev| sley_rev::RevisionResolver::new(&git_dir, format, db).resolve(rev))
             .collect::<Result<Vec<_>>>()?;
         virtual_ancestor_entry_map(&db, format, &bases, &common_git_dir)?
     };
 
-    let head_oid = resolve_revision(&git_dir, format, head)?;
-    let remote_oid = resolve_revision(&git_dir, format, remote)?;
+    let resolver = sley_rev::RevisionResolver::new(&git_dir, format, db);
+    let head_oid = resolver.resolve(head)?;
+    let remote_oid = resolver.resolve(remote)?;
     let head_tree = commit_tree_oid(&db, format, &head_oid)?;
     let remote_tree = commit_tree_oid(&db, format, &remote_oid)?;
     let ours_map = sley_diff_merge::flatten_tree(db, format, &head_tree)?;
@@ -5292,7 +5296,7 @@ fn reset_merge_to_head(
     db: &FileObjectDatabase,
     lazy_fetch: bool,
 ) -> Result<()> {
-    let head_oid = resolve_revision(git_dir, format, "HEAD")?;
+    let head_oid = sley_rev::RevisionResolver::new(git_dir, format, db).resolve("HEAD")?;
     let head_tree = commit_tree_oid(&db, format, &head_oid)?;
     let head_map = sley_diff_merge::flatten_tree(db, format, &head_tree)?;
     let populated_head_gitlink_prefixes =
@@ -5388,9 +5392,9 @@ pub(crate) fn conclude_in_progress_merge(
     quiet: bool,
     config: &GitConfig,
     lazy_fetch: bool,
+    replace_objects: bool,
 ) -> Result<()> {
-    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
-    let mut writer = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let mut writer = crate::repository::open_object_database(git_dir, format, replace_objects)?;
     conclude_in_progress_merge_with_writer(
         git_dir,
         worktree_root,
@@ -5425,7 +5429,7 @@ fn conclude_in_progress_merge_with_writer(
         return report_unmerged_merge_continue(&unmerged_paths);
     }
 
-    let ours_oid = resolve_revision(git_dir, format, "HEAD")?;
+    let ours_oid = sley_rev::RevisionResolver::new(git_dir, format, writer).resolve("HEAD")?;
     let merge_head_contents = fs::read_to_string(&merge_head_path)?;
     let theirs_oid = ObjectId::from_hex(format, merge_head_contents.trim()).map_err(|_| {
         GitError::InvalidObject(format!(
@@ -5544,6 +5548,7 @@ pub(crate) fn conclude_rebase_step_via_commit(
     quiet: bool,
     allow_empty: bool,
     lazy_fetch: bool,
+    replace_objects: bool,
 ) -> Result<()> {
     let index = read_worktree_index(git_dir, format)?;
     let unmerged_paths = index_unmerged_paths(&index);
@@ -5551,8 +5556,8 @@ pub(crate) fn conclude_rebase_step_via_commit(
         return report_unmerged_merge_continue(&unmerged_paths);
     }
 
-    let parent_oid = resolve_revision(git_dir, format, "HEAD")?;
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut db = crate::repository::open_object_database(git_dir, format, replace_objects)?;
+    let parent_oid = sley_rev::RevisionResolver::new(git_dir, format, &db).resolve("HEAD")?;
     let parent_tree = read_commit_tree(&db, format, &parent_oid)?;
     let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
     if !allow_empty && tree == parent_tree {
@@ -5563,9 +5568,8 @@ pub(crate) fn conclude_rebase_step_via_commit(
         author = script_author;
     }
     let encoding = commit_encoding_header_from_config(git_dir);
-    let mut writer = FileObjectDatabase::from_git_dir(git_dir, format);
     let commit_oid = sley_sequencer::create_commit(
-        &mut writer,
+        &mut db,
         sley_sequencer::CommitCreate {
             tree,
             parents: vec![parent_oid],
@@ -5628,6 +5632,7 @@ fn peel_merge_target_to_commit(
 fn create_merge_autostash(
     git_dir: &Path,
     worktree_root: &Path,
+    db: &FileObjectDatabase,
     format: ObjectFormat,
 ) -> Result<bool> {
     let status = crate::collect_short_status(worktree_root, git_dir, format)?;
@@ -5643,7 +5648,7 @@ fn create_merge_autostash(
     };
     fs::write(git_dir.join("MERGE_AUTOSTASH"), format!("{oid}\n"))?;
     println!("Created autostash: {}", format_log_abbrev_oid(&oid));
-    let head = resolve_revision(git_dir, format, "HEAD")?;
+    let head = sley_rev::RevisionResolver::new(git_dir, format, db).resolve("HEAD")?;
     sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &head)?;
     Ok(true)
 }

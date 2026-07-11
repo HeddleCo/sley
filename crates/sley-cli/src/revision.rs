@@ -20,9 +20,10 @@ pub(crate) fn resolve_revision(
     git_dir: &Path,
     format: ObjectFormat,
     rev: &str,
+    replace_objects: bool,
 ) -> Result<ObjectId> {
     warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
-    let db = crate::repository::open_object_database(git_dir, format)?;
+    let db = crate::repository::open_object_database(git_dir, format, replace_objects)?;
     sley_rev::RevisionResolver::new(git_dir, format, &db).resolve(rev)
 }
 
@@ -30,6 +31,7 @@ pub(crate) fn resolve_revision_commitish(
     git_dir: &Path,
     format: ObjectFormat,
     rev: &str,
+    replace_objects: bool,
 ) -> Result<ObjectId> {
     warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
     if is_short_hex_object_prefix(format, rev) {
@@ -41,7 +43,7 @@ pub(crate) fn resolve_revision_commitish(
         )?
         .into_result(rev);
     }
-    let db = crate::repository::open_object_database(git_dir, format)?;
+    let db = crate::repository::open_object_database(git_dir, format, replace_objects)?;
     sley_rev::RevisionResolver::new(git_dir, format, &db).resolve(rev)
 }
 
@@ -49,6 +51,7 @@ pub(crate) fn resolve_revision_treeish(
     git_dir: &Path,
     format: ObjectFormat,
     rev: &str,
+    replace_objects: bool,
 ) -> Result<ObjectId> {
     warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
     if is_short_hex_object_prefix(format, rev) {
@@ -60,7 +63,7 @@ pub(crate) fn resolve_revision_treeish(
         )?
         .into_result(rev);
     }
-    let db = crate::repository::open_object_database(git_dir, format)?;
+    let db = crate::repository::open_object_database(git_dir, format, replace_objects)?;
     sley_rev::RevisionResolver::new(git_dir, format, &db).resolve(rev)
 }
 

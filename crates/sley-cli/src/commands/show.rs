@@ -215,6 +215,7 @@ struct ShowContext<'a> {
     diff_pathspec: Option<&'a DiffPathspec>,
     mailmap: RefCell<Option<commands::utility::Mailmap>>,
     lazy_fetch: bool,
+    replace_objects: bool,
 }
 
 impl ShowContext<'_> {
@@ -224,6 +225,7 @@ impl ShowContext<'_> {
             *self.mailmap.borrow_mut() = Some(commands::utility::Mailmap::load_default(
                 self.git_dir,
                 self.format,
+                self.replace_objects,
             )?);
         }
         Ok(Ref::map(self.mailmap.borrow(), |mailmap| {
@@ -537,6 +539,7 @@ pub(crate) fn cmd_show(cli_session: &crate::session::CliSession, args: &[String]
         diff_pathspec: diff_pathspec.as_ref(),
         mailmap: RefCell::new(None),
         lazy_fetch: cli_session.lazy_fetch(),
+        replace_objects: cli_session.replace_objects(),
     };
     let grep_kind = log_grep_pattern_kind_from_config(
         config,

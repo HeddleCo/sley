@@ -91,13 +91,14 @@ pub(crate) fn cmd_merge_base(
     }
     let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let db =
+        crate::repository::open_object_database(&git_dir, format, cli_session.replace_objects())?;
     if fork_point {
         let commit = if let Some(commit) = revs.get(1) {
-            let oid = resolve_revision(&git_dir, format, commit)?;
+            let oid = resolve_revision(&git_dir, format, commit, cli_session.replace_objects())?;
             sley_rev::peel_to_commit(&db, format, &oid)?
         } else {
-            let oid = resolve_revision(&git_dir, format, "HEAD")?;
+            let oid = resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects())?;
             sley_rev::peel_to_commit(&db, format, &oid)?
         };
         if let Some(base) = merge_base_fork_point(&git_dir, format, &db, revs[0], &commit)? {
@@ -108,7 +109,7 @@ pub(crate) fn cmd_merge_base(
     }
     let mut commits = Vec::with_capacity(revs.len());
     for rev in &revs {
-        let oid = resolve_revision(&git_dir, format, rev)?;
+        let oid = resolve_revision(&git_dir, format, rev, cli_session.replace_objects())?;
         commits.push(sley_rev::peel_to_commit(&db, format, &oid)?);
     }
     if is_ancestor {

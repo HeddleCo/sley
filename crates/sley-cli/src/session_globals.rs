@@ -2,12 +2,10 @@
 
 use std::collections::HashSet;
 use std::env;
-use std::path::PathBuf;
 
 use sley::{ObjectId, ReferenceTarget as RefTarget, Result};
 use sley_pathspec::{PathspecAttributeCheck, PathspecAttributeState};
 
-use crate::session;
 use crate::sley_refs::FileRefStore;
 use crate::sley_worktree;
 
@@ -63,52 +61,8 @@ pub(crate) fn git_env_bool(name: &str) -> bool {
     }
 }
 
-fn global_git_dir() -> Option<PathBuf> {
-    session::cli_session().and_then(|session| session.git_dir_override())
-}
-
-fn global_work_tree() -> Option<PathBuf> {
-    session::cli_session().and_then(|session| session.work_tree_override())
-}
-
 pub(crate) fn global_attr_source(cli_session: &crate::session::CliSession) -> Option<String> {
     cli_session.attr_source()
-}
-
-pub(crate) fn environment_git_dir() -> Option<PathBuf> {
-    if local_repo_env_hidden() {
-        return None;
-    }
-    env::var_os("GIT_DIR").map(PathBuf::from)
-}
-
-pub(crate) fn explicit_git_dir() -> Option<PathBuf> {
-    global_git_dir().or_else(environment_git_dir)
-}
-
-fn environment_work_tree() -> Option<PathBuf> {
-    if local_repo_env_hidden() {
-        return None;
-    }
-    env::var_os("GIT_WORK_TREE").map(PathBuf::from)
-}
-
-pub(crate) fn explicit_work_tree() -> Option<PathBuf> {
-    global_work_tree().or_else(environment_work_tree)
-}
-
-pub(crate) fn global_bare() -> bool {
-    let Some(session) = session::cli_session() else {
-        return false;
-    };
-    if session.local_repo_env_hidden() {
-        return false;
-    }
-    session.bare()
-}
-
-fn local_repo_env_hidden() -> bool {
-    session::cli_session().is_some_and(|session| session.local_repo_env_hidden())
 }
 
 pub(crate) fn apply_replace_object(

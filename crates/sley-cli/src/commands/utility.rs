@@ -901,6 +901,7 @@ pub(crate) fn cmd_check_mailmap(
         repository.format(),
         &source_specs,
         repository.config(),
+        cli_session.replace_objects(),
     )?;
     for contact in contacts {
         println!("{}", mailmap.resolve_contact(&contact).display());
@@ -970,9 +971,13 @@ impl Mailmap {
     /// Load only the repository `.mailmap` plus any `mailmap.file`/`mailmap.blob`
     /// config sources — the set git consults when resolving `%(...:mailmap)`
     /// atoms in for-each-ref / log / etc.
-    pub(crate) fn load_default(git_dir: &Path, format: ObjectFormat) -> Result<Self> {
+    pub(crate) fn load_default(
+        git_dir: &Path,
+        format: ObjectFormat,
+        replace_objects: bool,
+    ) -> Result<Self> {
         let config = read_repo_config(git_dir).unwrap_or_default();
-        Self::load_default_with_config(git_dir, format, &config)
+        Self::load_default_with_config(git_dir, format, &config, replace_objects)
     }
 
     /// Load repository mailmap sources using an already-resolved effective
@@ -981,8 +986,9 @@ impl Mailmap {
         git_dir: &Path,
         format: ObjectFormat,
         config: &GitConfig,
+        replace_objects: bool,
     ) -> Result<Self> {
-        Self::load(git_dir, format, &[], config)
+        Self::load(git_dir, format, &[], config, replace_objects)
     }
 
     /// Load the mailmap when there may be no repository (git's `read_mailmap`
@@ -1045,6 +1051,7 @@ impl Mailmap {
         format: ObjectFormat,
         source_specs: &[MailmapSourceSpec],
         config: &GitConfig,
+        replace_objects: bool,
     ) -> Result<Self> {
         // git's `read_mailmap` order (mailmap.c): `.mailmap` (worktree only) →
         // `mailmap.blob` → `mailmap.file` (last, so it overrides). A bare repo
@@ -1064,7 +1071,7 @@ impl Mailmap {
         }
         // `mailmap.blob` (config value, or the bare-repo default).
         if let Some(blob) = &mailmap_blob {
-            mailmap.add_blob(git_dir, format, blob)?;
+            mailmap.add_blob(git_dir, format, blob, replace_objects)?;
         }
         // `mailmap.file` last — overrides the blob/`.mailmap` for matching keys.
         if let Some(path) = &mailmap_file {
@@ -1076,7 +1083,9 @@ impl Mailmap {
         for source in source_specs {
             match source {
                 MailmapSourceSpec::File(path) => mailmap.add_file(path)?,
-                MailmapSourceSpec::Blob(rev) => mailmap.add_blob(git_dir, format, rev)?,
+                MailmapSourceSpec::Blob(rev) => {
+                    mailmap.add_blob(git_dir, format, rev, replace_objects)?
+                }
             }
         }
         Ok(mailmap)
@@ -1094,12 +1103,21 @@ impl Mailmap {
     /// unreadable object or a non-blob type prints an `error:` to stderr but does
     /// NOT abort the command (git's `error()` returns nonzero, the caller
     /// accumulates it and still runs).
-    fn add_blob(&mut self, git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<()> {
+    fn add_blob(
+        &mut self,
+        git_dir: &Path,
+        format: ObjectFormat,
+        rev: &str,
+        replace_objects: bool,
+    ) -> Result<()> {
         // `repo_get_oid(...) < 0` → return 0 (silent skip of a missing blob/rev).
-        let Ok(oid) = resolve_revision(git_dir, format, rev) else {
+        let Ok(db) = crate::repository::open_object_database(git_dir, format, replace_objects)
+        else {
             return Ok(());
         };
-        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let Ok(oid) = sley_rev::RevisionResolver::new(git_dir, format, &db).resolve(rev) else {
+            return Ok(());
+        };
         let object = match db.read_object(&oid) {
             Ok(object) => object,
             Err(_) => {

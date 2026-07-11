@@ -1582,7 +1582,12 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                             write!(stdout, "({target})")?;
                         }
                     } else if let Some(rev) = other.strip_prefix("ahead-behind:") {
-                        let target = resolve_revision(context.git_dir, context.format, rev)?;
+                        let target = sley_rev::RevisionResolver::new(
+                            context.git_dir,
+                            context.format,
+                            context.db,
+                        )
+                        .resolve(rev)?;
                         if let Some(track) = for_each_ref_ahead_behind_with_diagnostic(
                             context.git_dir,
                             context.db,
