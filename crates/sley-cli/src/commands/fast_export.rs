@@ -10,7 +10,7 @@ use sley::plumbing::sley_rev::{
     CommitRecord, SimplifyOptions, ancestry_path_on_set, peel_to_commit,
     simplify_history_with_bottoms,
 };
-use sley_pathspec::normalized_revwalk_pathspec;
+use sley_pathspec::{Pathspec, normalized_revwalk_pathspec};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SignMode {
@@ -192,7 +192,18 @@ pub(crate) fn cmd_fast_export(
         }
     }
 
-    let shown: HashSet<ObjectId> = imported_commit_marks.keys().copied().collect();
+    let imported_commits: HashSet<ObjectId> = imported_commit_marks.keys().copied().collect();
+    let shown = imported_commits.clone();
+    let export_pathspec = if setup.pathspecs.is_empty() {
+        Pathspec::default()
+    } else {
+        normalized_revwalk_pathspec(
+            &cwd,
+            worktree_root.as_deref(),
+            &setup.pathspecs,
+            effective_pathspec_flags(cli_session),
+        )?
+    };
     let mut exporter = FastExporter {
         db,
         store,
@@ -203,11 +214,12 @@ pub(crate) fn cmd_fast_export(
         blob_marks: HashMap::new(),
         tag_marks: HashMap::new(),
         shown,
+        imported_commits,
         revision_sources: HashMap::new(),
         default_ref_name: None,
         initialized_refs: HashSet::new(),
-        path_limited: !setup.pathspecs.is_empty(),
-        pathspec_magic: effective_pathspec_flags(cli_session),
+        path_limited: !export_pathspec.is_empty(),
+        pathspec: export_pathspec,
         pending_refs: Vec::new(),
         nested_tag_refs: Vec::new(),
         progress_counter: 0,
@@ -220,8 +232,7 @@ pub(crate) fn cmd_fast_export(
 
     exporter.seed_pending_refs(&revision_options.positives)?;
 
-    let commits =
-        exporter.collect_commits(&revision_options, &setup.pathspecs, &worktree_root, &cwd)?;
+    let commits = exporter.collect_commits(&revision_options)?;
 
     for record in commits {
         exporter.export_commit(&record)?;
@@ -261,11 +272,12 @@ struct FastExporter {
     blob_marks: HashMap<ObjectId, u64>,
     tag_marks: HashMap<ObjectId, u64>,
     shown: HashSet<ObjectId>,
+    imported_commits: HashSet<ObjectId>,
     revision_sources: HashMap<ObjectId, String>,
     default_ref_name: Option<String>,
     initialized_refs: HashSet<String>,
     path_limited: bool,
-    pathspec_magic: sley_worktree::PathspecMatchMagic,
+    pathspec: Pathspec,
     pending_refs: Vec<PendingRef>,
     nested_tag_refs: Vec<(String, ObjectId)>,
     progress_counter: usize,
@@ -360,9 +372,6 @@ impl FastExporter {
     fn collect_commits(
         &self,
         revision_options: &sley_rev::RevisionOptions,
-        pathspecs: &[String],
-        worktree_root: &Option<PathBuf>,
-        cwd: &Path,
     ) -> Result<Vec<CommitRecord>> {
         let mut include = Vec::new();
         for tip in &revision_options.positives {
@@ -412,16 +421,7 @@ impl FastExporter {
             selected.retain(|record| on_path.contains(&record.oid));
         }
 
-        if !pathspecs.is_empty()
-            || revision_options.full_history
-            || revision_options.simplify_merges
-        {
-            let pathspec = normalized_revwalk_pathspec(
-                cwd,
-                worktree_root.as_deref(),
-                pathspecs,
-                self.pathspec_magic,
-            )?;
+        if self.path_limited || revision_options.full_history || revision_options.simplify_merges {
             let simplify = SimplifyOptions {
                 full_history: revision_options.full_history,
                 first_parent: revision_options.first_parent,
@@ -435,7 +435,7 @@ impl FastExporter {
                 &self.db,
                 self.format,
                 selected,
-                &pathspec,
+                &self.pathspec,
                 simplify,
                 &bottoms,
             )?;
@@ -469,11 +469,22 @@ impl FastExporter {
                 .map(|commit| commit.tree)
         });
 
+        // An imported mark may describe a tree produced by an earlier
+        // path-limited export, not the repository's complete parent tree. On
+        // the first descendant exported with a (possibly expanded) pathspec,
+        // re-state the selected tree so newly selected but unchanged paths are
+        // not lost by the importer.
+        let restate_path_limited_tree = self.path_limited
+            && record
+                .parents
+                .first()
+                .is_some_and(|parent| self.imported_commits.contains(parent));
         let use_parent_diff = record.parents.first().is_some_and(|parent| {
             self.commit_marks.contains_key(parent) || self.options.reference_excluded_parents
-        }) && !self.options.full_tree;
+        }) && !self.options.full_tree
+            && !restate_path_limited_tree;
 
-        let changes = if use_parent_diff {
+        let mut changes = if use_parent_diff {
             let parent_tree = parent_tree.ok_or_else(|| {
                 GitError::Command(format!(
                     "fast-export: missing parent tree for {}",
@@ -495,6 +506,9 @@ impl FastExporter {
                 self.options.diff,
             )?
         };
+        if self.path_limited {
+            changes.retain(|entry| fast_export_change_matches_pathspec(entry, &self.pathspec));
+        }
 
         for entry in &changes {
             if let Some(oid) = entry.new_oid {
@@ -546,7 +560,7 @@ impl FastExporter {
             }
         }
 
-        if self.options.full_tree {
+        if self.options.full_tree || restate_path_limited_tree {
             writeln!(self.out, "deleteall")?;
         }
 
@@ -1502,6 +1516,14 @@ fn same_blob_and_mode(entry: &NameStatusEntry) -> bool {
         && entry.old_mode == entry.new_mode
 }
 
+fn fast_export_change_matches_pathspec(entry: &NameStatusEntry, pathspec: &Pathspec) -> bool {
+    pathspec.matches(entry.path.as_bytes())
+        || entry
+            .old_path
+            .as_ref()
+            .is_some_and(|path| pathspec.matches(path.as_bytes()))
+}
+
 fn reencode_commit_message(message: &[u8], from: &str, to: &str) -> Option<Vec<u8>> {
     if encoding_is_none(to) || from.trim().eq_ignore_ascii_case(to.trim()) {
         return Some(message.to_vec());
@@ -1644,5 +1666,32 @@ mod tests {
         ] {
             assert_eq!(commit_signature_format(signature), expected);
         }
+    }
+
+    #[test]
+    fn path_limited_changes_match_new_or_old_name() {
+        let pathspec = Pathspec::parse([b"selected"], Default::default()).expect("pathspec");
+        let entry = |path: &[u8], old_path: Option<&[u8]>| NameStatusEntry {
+            status: NameStatus::Modified,
+            path: path.into(),
+            old_path: old_path.map(Into::into),
+            old_mode: Some(0o100644),
+            new_mode: Some(0o100644),
+            old_oid: None,
+            new_oid: None,
+        };
+
+        assert!(fast_export_change_matches_pathspec(
+            &entry(b"selected", None),
+            &pathspec
+        ));
+        assert!(fast_export_change_matches_pathspec(
+            &entry(b"renamed", Some(b"selected")),
+            &pathspec
+        ));
+        assert!(!fast_export_change_matches_pathspec(
+            &entry(b"unrelated", None),
+            &pathspec
+        ));
     }
 }
