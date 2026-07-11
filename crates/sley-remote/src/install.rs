@@ -793,6 +793,138 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct RecordingProgress {
+        samples: Vec<TransferProgress>,
+    }
+
+    impl ProgressSink for RecordingProgress {
+        fn transfer(&mut self, progress: TransferProgress) {
+            self.samples.push(progress);
+        }
+    }
+
+    fn multi_object_raw_pack(format: ObjectFormat, count: usize) -> Vec<u8> {
+        let objects: Vec<EncodedObject> = (0..count)
+            .map(|i| {
+                EncodedObject::new(
+                    ObjectType::Blob,
+                    format!("sley#146 progress fixture object {i}\n").into_bytes(),
+                )
+            })
+            .collect();
+        let pack = PackFile::write_undeltified(&objects, format)
+            .expect("test operation should succeed");
+        let response = UploadPackRawPackfileResponse {
+            acknowledgments: Vec::new(),
+            packfile: pack.pack,
+        };
+        encode_upload_pack_raw_packfile_response(&response).expect("response should encode")
+    }
+
+    #[test]
+    fn progress_installer_reports_monotonic_transfer() {
+        let root = test_temp_root("sley-remote-install-progress");
+        let format = ObjectFormat::Sha1;
+        let object_count = 24usize;
+        let encoded = multi_object_raw_pack(format, object_count);
+        let destination = FileObjectDatabase::new(root.join("objects"), format);
+
+        let mut sink = RecordingProgress::default();
+        {
+            let installer = ProgressInstaller::new(&destination, &mut sink);
+            let mut reader = encoded.as_slice();
+            install_upload_pack_raw_response_from_reader(format, &mut reader, &installer, None)
+                .expect("test operation should succeed");
+        }
+
+        let samples = sink.samples;
+        assert!(
+            !samples.is_empty(),
+            "transfer() should be called at least once"
+        );
+        let total = object_count as u64;
+
+        // total_objects is announced from the pack header on every sample.
+        for sample in &samples {
+            assert_eq!(sample.total_objects, Some(total));
+        }
+
+        // Monotonically non-decreasing byte and object counters.
+        for window in samples.windows(2) {
+            assert!(
+                window[1].received_bytes >= window[0].received_bytes,
+                "received_bytes regressed: {} -> {}",
+                window[0].received_bytes,
+                window[1].received_bytes
+            );
+            assert!(
+                window[1].received_objects >= window[0].received_objects,
+                "received_objects regressed: {} -> {}",
+                window[0].received_objects,
+                window[1].received_objects
+            );
+        }
+
+        let first_nonzero = samples
+            .iter()
+            .find(|sample| sample.received_bytes > 0)
+            .expect("at least one sample should have received_bytes > 0");
+        let last = samples.last().expect("samples is non-empty");
+
+        // Bytes advanced incrementally, not in one final jump.
+        assert!(last.received_bytes > 0);
+        assert!(
+            last.received_bytes > first_nonzero.received_bytes,
+            "received_bytes did not advance: first {} vs last {}",
+            first_nonzero.received_bytes,
+            last.received_bytes
+        );
+
+        // Objects advanced incrementally to the announced total.
+        assert!(
+            samples.iter().any(|sample| sample.received_objects > 0
+                && sample.received_objects < total),
+            "expected at least one intermediate object sample"
+        );
+        assert_eq!(last.received_objects, total);
+        assert_eq!(last.total_objects, Some(total));
+        assert_eq!(last.total_objects, Some(last.received_objects));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn silent_progress_install_uses_default_no_op_path() {
+        let root = test_temp_root("sley-remote-install-progress-silent");
+        let format = ObjectFormat::Sha1;
+        let encoded = multi_object_raw_pack(format, 8);
+        let destination = FileObjectDatabase::new(root.join("objects"), format);
+
+        // The default `ProgressSink::transfer` is a no-op; installing through a
+        // ProgressInstaller wrapping SilentProgress must still succeed.
+        let mut sink = crate::SilentProgress;
+        let result = {
+            let installer = ProgressInstaller::new(&destination, &mut sink);
+            let mut reader = encoded.as_slice();
+            install_upload_pack_raw_response_from_reader(format, &mut reader, &installer, None)
+                .expect("test operation should succeed")
+        };
+        assert_eq!(result.object_ids.len(), 8);
+
+        // And installing directly (no wrapper at all) via the default trait
+        // method is unaffected.
+        let plain_root = test_temp_root("sley-remote-install-progress-plain");
+        let plain_db = FileObjectDatabase::new(plain_root.join("objects"), format);
+        let mut reader = encoded.as_slice();
+        let plain = install_upload_pack_raw_response_from_reader(format, &mut reader, &plain_db, None)
+            .expect("test operation should succeed");
+        assert_eq!(plain.object_ids.len(), 8);
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&plain_root);
+    }
+
     fn test_temp_root(prefix: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
             "{prefix}-{}-{}",
