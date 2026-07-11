@@ -1420,6 +1420,8 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
     let mut cruft = false;
     let mut cruft_expiration: Option<Option<u32>> = None;
     let mut expire_to: Option<String> = None;
+    let mut filter: Option<String> = None;
+    let mut filter_to: Option<String> = None;
     let mut iter = expand_repack_short_clusters(args).into_iter().peekable();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1453,6 +1455,12 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             }
             value if value.starts_with("--expire-to=") => {
                 expire_to = Some(value["--expire-to=".len()..].to_string());
+            }
+            value if value.starts_with("--filter=") => {
+                filter = Some(value["--filter=".len()..].to_string());
+            }
+            value if value.starts_with("--filter-to=") => {
+                filter_to = Some(value["--filter-to=".len()..].to_string());
             }
             "-k" | "--keep-unreachable" => {}
             "--pack-kept-objects" => pack_kept_objects = true,
@@ -1501,6 +1509,24 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
+    let blob_limit_filter = match (filter.as_deref(), filter_to.as_deref()) {
+        (None, None) => None,
+        (Some(spec), Some(prefix)) => {
+            let Some(sley_odb::PackObjectFilter::BlobLimit(limit)) =
+                sley_remote::pack_filter_from_spec(spec)
+            else {
+                return Err(GitError::Command(format!(
+                    "unsupported repack filter '{spec}'"
+                )));
+            };
+            Some((limit, PathBuf::from(prefix)))
+        }
+        _ => {
+            return Err(GitError::Command(
+                "repack --filter and --filter-to must be used together".into(),
+            ));
+        }
+    };
     let config = read_repo_config(&common_git_dir)?;
     let update_server_info = update_server_info.unwrap_or_else(|| {
         config
@@ -1605,7 +1631,22 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             pack_kept_objects: include_kept_objects,
             keep_pack_stems,
         };
-        sley_odb::repack_reachable_objects_with_options(&common_git_dir, format, &roots, &options)?
+        match blob_limit_filter.as_ref() {
+            Some((limit, prefix)) => sley_odb::repack_reachable_objects_with_blob_limit_to(
+                &common_git_dir,
+                format,
+                &roots,
+                &options,
+                *limit,
+                prefix,
+            )?,
+            None => sley_odb::repack_reachable_objects_with_options(
+                &common_git_dir,
+                format,
+                &roots,
+                &options,
+            )?,
+        }
     } else {
         sley_odb::repack_loose_objects(&common_git_dir, format)?
     };

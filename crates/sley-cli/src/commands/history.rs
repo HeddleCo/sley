@@ -5,24 +5,154 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 
 use sley::plumbing::sley_sequencer::history::{
-    HistoryRefScope, HistorySplitAnalysis, HistorySplitRequest, HistorySplitSelection,
-    analyze_history_split, execute_history_split, validate_history_split_targets,
-    write_history_split_tree,
+    HistoryRefScope, HistoryRewordAnalysis, HistoryRewordRequest, HistorySplitAnalysis,
+    HistorySplitRequest, HistorySplitSelection, analyze_history_reword, analyze_history_split,
+    execute_history_reword, execute_history_split, validate_history_reword_targets,
+    validate_history_split_targets, write_history_split_tree,
 };
 
 use crate::*;
 
 const SPLIT_USAGE: &str =
     "git history split <commit> [--dry-run] [--update-refs=(branches|head)] [--] [<pathspec>...]";
+const REWORD_USAGE: &str =
+    "git history reword <commit> [--dry-run] [--update-refs=(branches|head)]";
 
 pub(crate) fn cmd_history(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("split") => cmd_history_split(cli_session, &args[1..]),
+        Some("reword") => cmd_history_reword(cli_session, &args[1..]),
         _ => {
-            eprintln!("usage: {SPLIT_USAGE}");
+            eprintln!("usage: {REWORD_USAGE}");
+            eprintln!("   or: {SPLIT_USAGE}");
             Err(GitError::Exit(129))
         }
     }
+}
+
+fn cmd_history_reword(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    let mut dry_run = false;
+    let mut scope = HistoryRefScope::Branches;
+    let mut commit = None;
+    for arg in args {
+        match arg.as_str() {
+            "-n" | "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
+            "--update-refs=branches" => scope = HistoryRefScope::Branches,
+            "--update-refs=head" => scope = HistoryRefScope::Head,
+            value if value.starts_with("--update-refs=") => {
+                return history_error("--update-refs expects one of 'branches' or 'head'");
+            }
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown option `{value}`");
+                eprintln!("usage: {REWORD_USAGE}");
+                return Err(GitError::Exit(129));
+            }
+            value if commit.is_none() => commit = Some(value.to_string()),
+            _ => {
+                eprintln!("usage: {REWORD_USAGE}");
+                return Err(GitError::Exit(129));
+            }
+        }
+    }
+    let Some(commit_name) = commit else {
+        return history_error("command expects a committish");
+    };
+
+    let context = crate::repository::RepositoryContext::from_session(cli_session)?;
+    let oid = match context.resolve_revision(&commit_name) {
+        Ok(oid) => match sley_rev::peel_to_commit(context.objects(), context.format(), &oid) {
+            Ok(commit) => commit,
+            Err(_) => return history_error(&format!("commit cannot be found: {commit_name}")),
+        },
+        Err(_) => return history_error(&format!("commit cannot be found: {commit_name}")),
+    };
+    let analysis = analyze_history_reword(context.objects(), context.format(), oid)?;
+    if let Err(error) = validate_history_reword_targets(
+        context.git_dir(),
+        context.format(),
+        context.objects(),
+        oid,
+        scope,
+    ) {
+        return match error {
+            GitError::Command(message) => history_error(&message),
+            error => Err(error),
+        };
+    }
+    let message = edit_reword_message(context.git_dir(), &analysis)?;
+    let effective_config = crate::identity_effective_config_for(cli_session).unwrap_or_default();
+    let committer = crate::commit_identity_from_env("COMMITTER", &effective_config)?;
+    let request = HistoryRewordRequest {
+        analysis,
+        message,
+        committer,
+        reflog_message: b"reword: updating HEAD".to_vec(),
+        scope,
+        dry_run,
+    };
+    match execute_history_reword(
+        context.git_dir(),
+        context.format(),
+        context.objects(),
+        request,
+    ) {
+        Ok(outcome) => {
+            if dry_run {
+                for (name, old, new) in outcome.updated_refs {
+                    println!("update {name} {new} {old}");
+                }
+            }
+            Ok(())
+        }
+        Err(GitError::Command(message)) => history_error(&message),
+        Err(error) => Err(error),
+    }
+}
+
+fn edit_reword_message(git_dir: &Path, analysis: &HistoryRewordAnalysis) -> Result<Vec<u8>> {
+    let path = git_dir.join("COMMIT_EDITMSG");
+    let comment = commands::replay::comment_char(git_dir);
+    let mut template = analysis.original.message.clone();
+    while template.last().is_some_and(u8::is_ascii_whitespace) {
+        template.pop();
+    }
+    template.extend_from_slice(b"\n\n");
+    template.push(comment);
+    template.extend_from_slice(
+        b" Please enter the commit message for the reworded changes. Lines starting\n",
+    );
+    template.push(comment);
+    template.extend_from_slice(b" with '");
+    template.push(comment);
+    template.extend_from_slice(b"' will be ignored, and an empty message aborts the commit.\n");
+    template.push(comment);
+    template.extend_from_slice(b" Changes to be committed:\n");
+    for changed in &analysis.changed_paths {
+        let kind = match (
+            analysis.parent_entries.get(changed),
+            analysis.original_entries.get(changed),
+        ) {
+            (None, Some(_)) => "new file:   ",
+            (Some(_), None) => "deleted:    ",
+            _ => "modified:   ",
+        };
+        template.push(comment);
+        template.push(b'\t');
+        template.extend_from_slice(kind.as_bytes());
+        template.extend_from_slice(changed);
+        template.push(b'\n');
+    }
+    template.push(comment);
+    template.push(b'\n');
+    fs::write(&path, template)?;
+    commands::replay::launch_editor(git_dir, &path)?;
+    let message = commands::replay::strip_comment_lines(&fs::read(&path)?, comment);
+    if message.is_empty() {
+        eprintln!("Aborting commit due to empty commit message.");
+        return Err(GitError::Exit(1));
+    }
+    Ok(message)
 }
 
 fn cmd_history_split(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {

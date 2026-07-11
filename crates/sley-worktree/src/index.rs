@@ -603,7 +603,7 @@ pub fn add_update_all_tracked_filtered(
 /// absent, out-of-cone trees collapsed. Their sparse-directory entries act as
 /// tracked boundaries for the untracked walk, while the tracked precheck treats
 /// an absent skip-worktree directory as clean.
-pub fn collect_add_worktree_status_with_index(
+pub fn collect_index_worktree_status_with_index(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -643,6 +643,17 @@ pub fn collect_add_worktree_status_with_index(
             .then_with(|| left.path.cmp(&right.path))
     });
     Ok(entries)
+}
+
+/// Add-specific name retained for callers that use the index/worktree query to
+/// resolve staging actions.
+pub fn collect_add_worktree_status_with_index(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    index: &Index,
+) -> Result<Vec<ShortStatusEntry>> {
+    collect_index_worktree_status_with_index(worktree_root, git_dir, format, index)
 }
 
 pub fn add_exact_tracked_path_from_disk(

@@ -130,6 +130,61 @@ fn reset_path_unstages_modified_file_like_upstream_git() {
 }
 
 #[test]
+fn reset_in_cone_path_keeps_unrelated_sparse_directories_collapsed() {
+    let root = unique_temp_dir("reset-in-cone-sparse-index");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    for repo in [&upstream, &rust] {
+        git(repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("deep")).expect("create in-cone directory");
+        fs::create_dir_all(repo.join("outside")).expect("create out-of-cone directory");
+        fs::write(repo.join("deep/a"), b"base\n").expect("write in-cone file");
+        fs::write(repo.join("outside/a"), b"outside\n").expect("write out-of-cone file");
+        git(repo, &["add", "."]);
+        run_with_identity(repo, &["commit", "-m", "base", "-q"]);
+        fs::write(repo.join("deep/a"), b"second\n").expect("write second revision");
+        git(repo, &["add", "deep/a"]);
+        run_with_identity(repo, &["commit", "-m", "second", "-q"]);
+        git(
+            repo,
+            &["sparse-checkout", "init", "--cone", "--sparse-index"],
+        );
+        git(repo, &["sparse-checkout", "set", "deep"]);
+    }
+
+    let args = ["reset", "HEAD~1", "--", "deep/a"];
+    let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+    let trace = root.join("reset-trace.json");
+    let actual = Command::new(sley_testkit::sley_bin!())
+        .current_dir(&rust)
+        .args(args)
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .expect("run traced sley reset");
+    assert_same_output(actual, expected, &args);
+    assert!(
+        !fs::read_to_string(trace)
+            .expect("read reset trace")
+            .contains("ensure_full_index"),
+        "resetting an explicit in-cone leaf must not expand sparse directories"
+    );
+    assert_eq!(
+        git(&rust, &["ls-files", "--sparse", "--stage"]),
+        git(&upstream, &["ls-files", "--sparse", "--stage"]),
+        "candidate sparse index differed after pathspec reset"
+    );
+    assert_eq!(
+        git(&rust, &["diff", "--cached", "--name-status"]),
+        git(&upstream, &["diff", "--cached", "--name-status"]),
+        "cached changes differed after pathspec reset"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn reset_sha256_mixed_and_hard_match_upstream_git() {
     let root = unique_temp_dir("reset-sha256");
     let upstream_mixed = root.join("upstream-mixed");

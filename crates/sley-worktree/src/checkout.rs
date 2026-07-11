@@ -1595,7 +1595,27 @@ pub(crate) fn restore_index_paths_from_entries(
     allow_unmatched: bool,
 ) -> Result<RestoreResult> {
     let sparse = active_sparse_checkout(git_dir)?;
-    if index.is_sparse() {
+    // Select against both the sparse index boundaries and the flattened source
+    // tree before deciding whether any collapsed directory must be opened. An
+    // in-cone path such as `deep/a` is already an explicit index entry, so a
+    // reset of that path must not inflate unrelated out-of-cone directories.
+    let matched_paths = checkout_selected_paths(
+        worktree_root,
+        paths,
+        index
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_bytes())
+            .chain(source_entries.keys().map(Vec::as_slice)),
+        allow_unmatched,
+    )?;
+    let selected_inside_sparse_directory = matched_paths
+        .iter()
+        .any(|path| index_sparse_dir_contains_path(&index, path));
+    if selected_inside_sparse_directory {
+        // The current per-leaf reset implementation needs the selected sparse
+        // subtree in full. Keep the conservative fallback for those pathspecs;
+        // restrictive in-cone pathspecs avoid it entirely.
         expand_sparse_index(&mut index, db, format)?;
     }
     let index_version = index.version;
@@ -1611,15 +1631,6 @@ pub(crate) fn restore_index_paths_from_entries(
         .map(|(path, _)| path.clone())
         .collect::<BTreeSet<_>>();
     let mut restored = BTreeSet::new();
-    let matched_paths = checkout_selected_paths(
-        worktree_root,
-        paths,
-        index_entries
-            .keys()
-            .chain(source_entries.keys())
-            .map(Vec::as_slice),
-        allow_unmatched,
-    )?;
     for path in matched_paths {
         if let Some(entry) = source_entries.get(&path) {
             // git's pathspec reset (`reset_index` → diff against the source
@@ -1658,8 +1669,16 @@ pub(crate) fn restore_index_paths_from_entries(
     if let Some((sparse, mode)) = sparse
         && sparse.sparse_index
     {
-        let matcher = SparseMatcher::new(&sparse, mode);
-        collapse_to_sparse_index(&mut index, &matcher, db, format)?;
+        if index.entries.iter().any(IndexEntry::is_sparse_dir) {
+            // No selected path entered a collapsed boundary, so the existing
+            // sparse-directory entries remain authoritative. Preserve that
+            // layout directly instead of expanding merely to re-collapse it.
+            index.set_sparse_extension();
+            normalize_index_version_for_extended_flags(&mut index);
+        } else {
+            let matcher = SparseMatcher::new(&sparse, mode);
+            collapse_to_sparse_index(&mut index, &matcher, db, format)?;
+        }
     }
     write_repository_index_ref(git_dir, format, &index)?;
     Ok(RestoreResult {

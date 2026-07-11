@@ -59,6 +59,60 @@ pub struct HistorySplitOutcome {
     pub updated_refs: Vec<(String, ObjectId, ObjectId)>,
 }
 
+#[derive(Debug, Clone)]
+pub struct HistoryRewordAnalysis {
+    pub original_oid: ObjectId,
+    pub original: Commit,
+    pub parent_entries: BTreeMap<Vec<u8>, HistoryTreeEntry>,
+    pub original_entries: BTreeMap<Vec<u8>, HistoryTreeEntry>,
+    pub changed_paths: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoryRewordRequest {
+    pub analysis: HistoryRewordAnalysis,
+    pub message: Vec<u8>,
+    pub committer: Vec<u8>,
+    pub reflog_message: Vec<u8>,
+    pub scope: HistoryRefScope,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryRewordOutcome {
+    pub rewritten_commit: ObjectId,
+    pub updated_refs: Vec<(String, ObjectId, ObjectId)>,
+}
+
+pub fn analyze_history_reword(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    original_oid: ObjectId,
+) -> Result<HistoryRewordAnalysis> {
+    let original = read_commit(db, format, &original_oid)?;
+    let parent_tree = match original.parents.first() {
+        Some(parent) => read_commit(db, format, parent)?.tree,
+        None => empty_tree_oid(format)?,
+    };
+    let parent_entries = flatten_tree(db, format, &parent_tree)?;
+    let original_entries = flatten_tree(db, format, &original.tree)?;
+    let changed_paths = parent_entries
+        .keys()
+        .chain(original_entries.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|path| parent_entries.get(path) != original_entries.get(path))
+        .collect();
+    Ok(HistoryRewordAnalysis {
+        original_oid,
+        original,
+        parent_entries,
+        original_entries,
+        changed_paths,
+    })
+}
+
 pub fn analyze_history_split(
     db: &FileObjectDatabase,
     format: ObjectFormat,
@@ -143,31 +197,52 @@ pub fn validate_history_split_targets(
     analysis: &HistorySplitAnalysis,
     scope: HistoryRefScope,
 ) -> Result<()> {
+    validate_history_rewrite_targets(git_dir, format, db, analysis.original_oid, scope)
+}
+
+pub fn validate_history_reword_targets(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    original_oid: ObjectId,
+    scope: HistoryRefScope,
+) -> Result<()> {
+    validate_history_rewrite_targets(git_dir, format, db, original_oid, scope)
+}
+
+fn validate_history_rewrite_targets(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    original_oid: ObjectId,
+    scope: HistoryRefScope,
+) -> Result<()> {
     let refs = FileRefStore::new(git_dir, format);
     let tips = reference_tips(&refs, scope)?;
     if scope == HistoryRefScope::Head
-        && !tips.first().is_some_and(|(_, tip)| {
-            is_ancestor(db, format, analysis.original_oid, *tip).unwrap_or(false)
-        })
+        && !tips
+            .first()
+            .is_some_and(|(_, tip)| is_ancestor(db, format, original_oid, *tip).unwrap_or(false))
     {
         return Err(GitError::Command(
             "rewritten commit must be an ancestor of HEAD when using --update-refs=head".into(),
         ));
     }
     for (_, tip) in tips {
-        if !is_ancestor(db, format, analysis.original_oid, tip)? {
+        if !is_ancestor(db, format, original_oid, tip)? {
             continue;
         }
         let mut pending = vec![tip];
         let mut seen = HashSet::new();
         while let Some(oid) = pending.pop() {
-            if oid == analysis.original_oid || !seen.insert(oid) {
+            if oid == original_oid || !seen.insert(oid) {
                 continue;
             }
             let commit = read_commit(db, format, &oid)?;
-            let on_rewrite_path = commit.parents.iter().any(|parent| {
-                is_ancestor(db, format, analysis.original_oid, *parent).unwrap_or(false)
-            });
+            let on_rewrite_path = commit
+                .parents
+                .iter()
+                .any(|parent| is_ancestor(db, format, original_oid, *parent).unwrap_or(false));
             if on_rewrite_path && commit.parents.len() > 1 {
                 return Err(GitError::Command(
                     "replaying merge commits is not supported yet!".into(),
@@ -177,6 +252,83 @@ pub fn validate_history_split_targets(
         }
     }
     Ok(())
+}
+
+pub fn execute_history_reword(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    request: HistoryRewordRequest,
+) -> Result<HistoryRewordOutcome> {
+    validate_history_reword_targets(
+        git_dir,
+        format,
+        db,
+        request.analysis.original_oid,
+        request.scope,
+    )?;
+
+    let mut writer = db.clone();
+    let replacement = create_commit(
+        &mut writer,
+        CommitCreate {
+            tree: request.analysis.original.tree,
+            parents: request.analysis.original.parents.clone(),
+            author: request.analysis.original.author.clone(),
+            committer: request.committer.clone(),
+            message: request.message,
+            encoding: request.analysis.original.encoding.clone(),
+            signature: None,
+        },
+    )?;
+
+    let refs = FileRefStore::new(git_dir, format);
+    let mut tips = reference_tips(&refs, request.scope)?;
+    let mut memo = HashMap::from([(request.analysis.original_oid, replacement)]);
+    let mut updated = Vec::new();
+    let mut rewriter = DescendantRewriter {
+        db,
+        format,
+        writer: &mut writer,
+        original: request.analysis.original_oid,
+        committer: &request.committer,
+        memo: &mut memo,
+    };
+    for (name, old) in tips.drain(..) {
+        let mut visiting = HashSet::new();
+        if let Some(new) = rewriter.rewrite(old, &mut visiting)? {
+            updated.push((name, old, new));
+        }
+    }
+    if updated.is_empty() {
+        return Err(GitError::Command("failed replaying descendants".into()));
+    }
+
+    if !request.dry_run {
+        let mut transaction = refs.transaction();
+        for (name, old, new) in &updated {
+            let reflog = refs
+                .should_write_reflog_for_update(name, false)?
+                .then(|| ReflogEntry {
+                    old_oid: *old,
+                    new_oid: *new,
+                    committer: request.committer.clone(),
+                    message: request.reflog_message.clone(),
+                });
+            transaction.update(RefUpdate {
+                name: name.clone(),
+                expected: Some(RefTarget::Direct(*old)),
+                new: RefTarget::Direct(*new),
+                reflog,
+            });
+        }
+        transaction.commit()?;
+    }
+
+    Ok(HistoryRewordOutcome {
+        rewritten_commit: replacement,
+        updated_refs: updated,
+    })
 }
 
 pub fn execute_history_split(

@@ -302,6 +302,36 @@ pub fn repack_reachable_objects_with_options(
     roots: &[ObjectId],
     options: &RepackOptions,
 ) -> Result<Option<RepackResult>> {
+    repack_reachable_objects_with_filter_to(git_dir, format, roots, options, None)
+}
+
+/// Repack reachable objects while moving blobs at least `limit` bytes into a
+/// separate pack named `<filter_to>-<checksum>.{pack,idx}`. This is the native
+/// engine seam for `repack --filter=blob:limit=<n> --filter-to=<prefix>`.
+pub fn repack_reachable_objects_with_blob_limit_to(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    options: &RepackOptions,
+    limit: u64,
+    filter_to: &Path,
+) -> Result<Option<RepackResult>> {
+    repack_reachable_objects_with_filter_to(
+        git_dir,
+        format,
+        roots,
+        options,
+        Some((limit, filter_to)),
+    )
+}
+
+fn repack_reachable_objects_with_filter_to(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    options: &RepackOptions,
+    filter_to: Option<(u64, &Path)>,
+) -> Result<Option<RepackResult>> {
     let objects_dir = repository_objects_dir(git_dir);
     let database = if options.local {
         FileObjectDatabase::without_alternates(objects_dir.clone(), format)
@@ -379,11 +409,32 @@ pub fn repack_reachable_objects_with_options(
         }
     }
 
+    let mut filtered_out = Vec::new();
+    if let Some((limit, _)) = filter_to {
+        let wanted = roots.iter().copied().collect::<HashSet<_>>();
+        objects.retain(|entry| {
+            let omit = entry.object.object_type == ObjectType::Blob
+                && !wanted.contains(&entry.oid)
+                && entry.object.body.len() as u64 >= limit;
+            if omit {
+                filtered_out.push(entry.clone());
+            }
+            !omit
+        });
+    }
+
+    if let Some((_, prefix)) = filter_to
+        && !filtered_out.is_empty()
+    {
+        write_filtered_repack(&filtered_out, format, prefix)?;
+    }
+
     if objects.is_empty() {
         return Ok(None);
     }
 
-    if !options.force_rewrite
+    if filter_to.is_none()
+        && !options.force_rewrite
         && let Some(mut reused) =
             reuse_exact_single_pack(&objects_dir, format, &objects, &retained_pack_stems)?
     {
@@ -432,6 +483,22 @@ pub fn repack_reachable_objects_with_options(
         bitmap_cache: bitmap_object_cache(&objects),
         loose_prune_outcome,
     }))
+}
+
+fn write_filtered_repack(
+    objects: &[ReachablePackObject],
+    format: ObjectFormat,
+    prefix: &Path,
+) -> Result<()> {
+    let written = PackFile::write_packed_with_known_ids(&pack_inputs(objects), format)?;
+    let component_path = |extension: &str| {
+        let mut path = prefix.as_os_str().to_os_string();
+        path.push(format!("-{}.{}", written.checksum.to_hex(), extension));
+        PathBuf::from(path)
+    };
+    write_pack_component(&component_path("pack"), &written.pack)?;
+    write_pack_component(&component_path("idx"), &written.index)?;
+    Ok(())
 }
 
 fn repack_retained_pack_stems(

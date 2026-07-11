@@ -1015,7 +1015,27 @@ fn print_reset_unstaged_changes(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<()> {
-    let mut entries = crate::collect_short_status(worktree_root, git_dir, format)?;
+    let parsed_index = sley_worktree::read_repository_index(git_dir, format)?;
+    let mut entries = if let Some(index) = parsed_index.as_ref().filter(|index| {
+        index.is_sparse()
+            || index
+                .entries
+                .iter()
+                .any(sley_index::IndexEntry::is_sparse_dir)
+    }) {
+        // The post-reset summary is an index-to-worktree report. General status
+        // also compares HEAD to the newly reset index and can unnecessarily
+        // inflate a sparse index; use the engine query that computes exactly
+        // the worktree side this summary renders.
+        sley_worktree::collect_index_worktree_status_with_index(
+            worktree_root,
+            git_dir,
+            format,
+            index,
+        )?
+    } else {
+        crate::collect_short_status(worktree_root, git_dir, format)?
+    };
     entries.retain(|entry| matches!(entry.worktree, b'M' | b'T' | b'D'));
     // git's post-reset summary omits skip-worktree paths: `update_index_refresh`
     // never marks a CE_SKIP_WORKTREE entry stat-dirty, so it never appears in the
