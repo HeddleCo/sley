@@ -5,6 +5,7 @@ use sley_odb::ObjectReader;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 mod connectivity;
 pub mod content;
@@ -372,6 +373,8 @@ where
         reader,
         format,
         checked: HashSet::new(),
+        object_reads: HashMap::new(),
+        deferred_bodies: HashMap::new(),
         issues: Vec::new(),
         severity: options.severity.clone(),
         skip_objects: options.skip_objects.clone(),
@@ -415,6 +418,16 @@ struct FsckChecker<'a, R> {
     reader: &'a R,
     format: ObjectFormat,
     checked: HashSet<ObjectId>,
+    /// Typed read results scoped to one validation. Link checking may encounter
+    /// the same tree or blob through hundreds of historical trees; retaining a
+    /// compact result avoids reopening and rescanning the object database while
+    /// still checking every link's expected type and emitting its diagnostics.
+    object_reads: HashMap<ObjectId, CachedObjectRead>,
+    /// Bodies needed by the deferred `.gitmodules` / `.gitattributes` security
+    /// pass. Ordinary object bodies are deliberately not retained, keeping the
+    /// validation cache proportional to object count rather than repository
+    /// payload size.
+    deferred_bodies: HashMap<ObjectId, Arc<EncodedObject>>,
     issues: Vec<FsckIssue>,
     severity: SeverityConfig,
     skip_objects: HashSet<ObjectId>,
@@ -432,14 +445,68 @@ struct FsckChecker<'a, R> {
     gitattributes_found: HashSet<ObjectId>,
 }
 
+#[derive(Clone)]
+enum CachedObjectRead {
+    Present(ObjectType),
+    Missing(String),
+}
+
+enum ObjectRead {
+    Fresh(Arc<EncodedObject>),
+    Seen(ObjectType),
+    Missing(String),
+}
+
 impl<R> FsckChecker<'_, R>
 where
     R: ObjectReader,
 {
+    fn read_object_cached(&mut self, oid: ObjectId) -> ObjectRead {
+        if let Some(cached) = self.object_reads.get(&oid) {
+            return match cached {
+                CachedObjectRead::Present(object_type) => ObjectRead::Seen(*object_type),
+                CachedObjectRead::Missing(err) => ObjectRead::Missing(err.clone()),
+            };
+        }
+        match self.reader.read_object(&oid) {
+            Ok(object) => {
+                self.object_reads
+                    .insert(oid, CachedObjectRead::Present(object.object_type));
+                if self.gitmodules_found.contains(&oid) || self.gitattributes_found.contains(&oid) {
+                    self.deferred_bodies.insert(oid, Arc::clone(&object));
+                }
+                ObjectRead::Fresh(object)
+            }
+            Err(err) => {
+                let err = err.to_string();
+                self.object_reads
+                    .insert(oid, CachedObjectRead::Missing(err.clone()));
+                ObjectRead::Missing(err)
+            }
+        }
+    }
+
+    fn report_link_type_mismatch(&mut self, link: &ObjectLink, actual: ObjectType) {
+        if actual == link.object_type {
+            return;
+        }
+        self.error_bits |= ERROR_OBJECT;
+        self.issues.push(FsckIssue::error(format!(
+            "{} is a {}, not a {}",
+            link.oid,
+            actual.as_str(),
+            link.object_type.as_str()
+        )));
+    }
+
     fn check_object_link(&mut self, source: Option<ObjectLink>, link: ObjectLink) {
-        let object = match self.reader.read_object(&link.oid) {
-            Ok(object) => object,
-            Err(_) => {
+        let object = match self.read_object_cached(link.oid) {
+            ObjectRead::Fresh(object) => object,
+            ObjectRead::Seen(object_type) => {
+                self.report_link_type_mismatch(&link, object_type);
+                return;
+            }
+            ObjectRead::Missing(_) => {
                 if self.reader.is_promised_object(&link.oid) {
                     return;
                 }
@@ -447,24 +514,15 @@ where
                 return;
             }
         };
-        if object.object_type != link.object_type {
-            // git: "<oid>: object is a <actual>, not a <expected>" — an object
-            // error (ERROR_OBJECT).
-            self.error_bits |= ERROR_OBJECT;
-            self.issues.push(FsckIssue::error(format!(
-                "{} is a {}, not a {}",
-                link.oid,
-                object.object_type.as_str(),
-                link.object_type.as_str()
-            )));
-        }
+        self.report_link_type_mismatch(&link, object.object_type);
         self.check_loaded_object(link.oid, &object);
     }
 
     fn check_object(&mut self, oid: ObjectId) {
-        let object = match self.reader.read_object(&oid) {
-            Ok(object) => object,
-            Err(err) => {
+        let object = match self.read_object_cached(oid) {
+            ObjectRead::Fresh(object) => object,
+            ObjectRead::Seen(_) => return,
+            ObjectRead::Missing(err) => {
                 self.issues
                     .push(FsckIssue::error(format!("missing object {oid}: {err}")));
                 self.error_bits |= ERROR_REACHABLE;
@@ -478,9 +536,10 @@ where
         if !self.checked.insert(oid) {
             return;
         }
-        let object = match self.reader.read_object(&oid) {
-            Ok(object) => object,
-            Err(err) => {
+        let object = match self.read_object_cached(oid) {
+            ObjectRead::Fresh(object) => object,
+            ObjectRead::Seen(_) => return,
+            ObjectRead::Missing(err) => {
                 self.issues
                     .push(FsckIssue::error(format!("missing object {oid}: {err}")));
                 self.error_bits |= ERROR_REACHABLE;
@@ -833,7 +892,12 @@ where
         let mut oids: Vec<ObjectId> = self.gitmodules_found.iter().cloned().collect();
         oids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         for oid in oids {
-            let Ok(object) = self.reader.read_object(&oid) else {
+            let object = self
+                .deferred_bodies
+                .get(&oid)
+                .cloned()
+                .or_else(|| self.reader.read_object(&oid).ok());
+            let Some(object) = object else {
                 self.report_content(
                     ObjectType::Blob,
                     oid,
@@ -924,7 +988,12 @@ where
         let mut oids: Vec<ObjectId> = self.gitattributes_found.iter().cloned().collect();
         oids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         for oid in oids {
-            let Ok(object) = self.reader.read_object(&oid) else {
+            let object = self
+                .deferred_bodies
+                .get(&oid)
+                .cloned()
+                .or_else(|| self.reader.read_object(&oid).ok());
+            let Some(object) = object else {
                 self.report_content(
                     ObjectType::Blob,
                     oid,
@@ -1184,6 +1253,19 @@ mod tests {
     use sley_core::BString;
     use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry};
     use sley_odb::{ObjectDatabase, ObjectWriter};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingReader<'a> {
+        inner: &'a ObjectDatabase,
+        reads: AtomicUsize,
+    }
+
+    impl ObjectReader for CountingReader<'_> {
+        fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.read_object(oid)
+        }
+    }
 
     fn policy_temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1368,6 +1450,60 @@ mod tests {
 
         let report = fsck_objects(&db, format, [commit.clone()], [commit]);
         assert!(report.is_ok(), "{report:?}");
+    }
+
+    #[test]
+    fn fsck_reads_each_object_once_across_deep_shared_history() {
+        const COMMIT_COUNT: usize = 256;
+        let format = ObjectFormat::Sha1;
+        let db = ObjectDatabase::new(format);
+        let blob = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"shared\n".to_vec()))
+            .expect("write shared blob");
+        let tree = db
+            .write_object(EncodedObject::new(
+                ObjectType::Tree,
+                Tree {
+                    entries: vec![TreeEntry {
+                        mode: 0o100644,
+                        name: BString::from(b"shared.txt"),
+                        oid: blob,
+                    }],
+                }
+                .write(),
+            ))
+            .expect("write shared tree");
+        let mut tip = None;
+        for index in 0..COMMIT_COUNT {
+            let commit = db
+                .write_object(EncodedObject::new(
+                    ObjectType::Commit,
+                    Commit {
+                        tree,
+                        parents: tip.into_iter().collect(),
+                        author: b"A <a@example.invalid> 0 +0000".to_vec(),
+                        committer: b"A <a@example.invalid> 0 +0000".to_vec(),
+                        encoding: None,
+                        message: format!("commit {index}\n").into_bytes(),
+                    }
+                    .write(),
+                ))
+                .expect("write history commit");
+            tip = Some(commit);
+        }
+        let reader = CountingReader {
+            inner: &db,
+            reads: AtomicUsize::new(0),
+        };
+
+        let report = fsck_objects(&reader, format, [tip.expect("history has a tip")], []);
+
+        assert!(report.is_ok(), "{report:?}");
+        assert_eq!(
+            reader.reads.load(Ordering::Relaxed),
+            COMMIT_COUNT + 2,
+            "every commit plus the shared tree and blob must be read exactly once"
+        );
     }
 
     #[test]
