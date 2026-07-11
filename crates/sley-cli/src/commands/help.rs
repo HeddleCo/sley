@@ -4,7 +4,7 @@ use sley::plumbing::sley_config::ConfigIncludeContext;
 use sley::{GitError, Result};
 use sley_options::{
     CommandFlags, CommandRegistry, CommandSpec, OptFlags, OptValue, OptionSpec,
-    completion_helper_options,
+    completion_helper_options, usage_with_options,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -30,6 +30,60 @@ const NATIVE_MAIN: CommandFlags = NATIVE.union(MAIN_PORCELAIN);
 const GIT_BUILTIN_RESERVED: CommandFlags = GIT_BUILTIN.union(RESERVED_CORE_HELPER);
 const HELP_RESERVED: CommandFlags = USAGE_HELP.union(RESERVED_CORE_HELPER);
 const MAIN_RESERVED: CommandFlags = MAIN_PORCELAIN.union(RESERVED_CORE_HELPER);
+
+/// Command help that cannot be generated from Documentation's modern
+/// `[synopsis]`/`[verse]` blocks. These legacy credential pages describe helper
+/// configuration rather than the builtins' parse-options usage, so keep Git's
+/// actual command metadata explicitly and render it through the same option
+/// table machinery as migrated commands.
+struct CommandUsageSpec<'a> {
+    command: &'a str,
+    usage: &'a [&'a str],
+    options: &'a [OptionSpec<'a>],
+}
+
+const CREDENTIAL_CACHE_OPTIONS: &[OptionSpec<'static>] = &[
+    OptionSpec {
+        short: None,
+        long: Some("timeout"),
+        value: OptValue::Str("n"),
+        flags: OptFlags::NONE,
+        help: "number of seconds to cache credentials",
+    },
+    OptionSpec {
+        short: None,
+        long: Some("socket"),
+        value: OptValue::Str("path"),
+        flags: OptFlags::NONE,
+        help: "path of cache-daemon socket",
+    },
+];
+
+const CREDENTIAL_STORE_OPTIONS: &[OptionSpec<'static>] = &[OptionSpec {
+    short: None,
+    long: Some("file"),
+    value: OptValue::Str("path"),
+    flags: OptFlags::NONE,
+    help: "fetch and store credentials in <path>",
+}];
+
+const COMMAND_USAGE_OVERRIDES: &[CommandUsageSpec<'static>] = &[
+    CommandUsageSpec {
+        command: "credential",
+        usage: &["git credential (fill|approve|reject)"],
+        options: &[],
+    },
+    CommandUsageSpec {
+        command: "credential-cache",
+        usage: &["git credential-cache [<options>] <action>"],
+        options: CREDENTIAL_CACHE_OPTIONS,
+    },
+    CommandUsageSpec {
+        command: "credential-store",
+        usage: &["git credential-store [<options>] <action>"],
+        options: CREDENTIAL_STORE_OPTIONS,
+    },
+];
 
 static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     CommandSpec::new("add", BUILTIN_MAIN),
@@ -791,7 +845,31 @@ pub(crate) fn unknown_command(command: &str, code: i32) -> Result<()> {
 }
 
 pub(crate) fn print_command_usage(command: &str) {
+    if let Some(usage) = command_usage_override(command) {
+        print!("{usage}");
+        return;
+    }
     crate::command_synopsis::print_command_synopsis(command);
+}
+
+fn command_usage_override(command: &str) -> Option<String> {
+    let spec = COMMAND_USAGE_OVERRIDES
+        .iter()
+        .find(|spec| spec.command == command)?;
+    if !spec.options.is_empty() {
+        return Some(usage_with_options(spec.options, spec.usage));
+    }
+    let mut out = String::new();
+    for (index, line) in spec.usage.iter().enumerate() {
+        if index == 0 {
+            out.push_str("usage: ");
+        } else {
+            out.push_str("   or: ");
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
 }
 
 fn set_mode(current: HelpMode, next: HelpMode) -> Result<HelpMode> {
@@ -1408,6 +1486,29 @@ mod command_registry_tests {
                 .collect::<Vec<_>>()
                 .join(" "),
             "checkout clone config help ls-remote notes remote symbolic-ref version"
+        );
+    }
+
+    #[test]
+    fn credential_usage_overrides_match_git_parse_options_help() {
+        assert_eq!(
+            command_usage_override("credential").as_deref(),
+            Some("usage: git credential (fill|approve|reject)\n")
+        );
+        assert_eq!(
+            command_usage_override("credential-cache").as_deref(),
+            Some(
+                "usage: git credential-cache [<options>] <action>\n\n\
+                 \x20   --[no-]timeout <n>    number of seconds to cache credentials\n\
+                 \x20   --[no-]socket <path>  path of cache-daemon socket\n\n"
+            )
+        );
+        assert_eq!(
+            command_usage_override("credential-store").as_deref(),
+            Some(
+                "usage: git credential-store [<options>] <action>\n\n\
+                 \x20   --[no-]file <path>    fetch and store credentials in <path>\n\n"
+            )
         );
     }
 
