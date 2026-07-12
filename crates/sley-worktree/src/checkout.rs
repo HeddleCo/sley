@@ -750,11 +750,29 @@ fn prepare_index_checkout_entry(
     let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
     if let Some(stat_cache) = stat_cache
         && let Ok(metadata) = fs::symlink_metadata(&file_path)
-        && stat_cache
+    {
+        if stat_cache
             .reuse_index_entry_for_checkout(entry, &metadata)
             .is_some()
-    {
-        return Ok(None);
+        {
+            return Ok(None);
+        }
+        if stat_cache.is_racy_checkout_stat_match(entry, &metadata)
+            && worktree_entry_for_git_path(
+                worktree_root,
+                git_dir,
+                format,
+                entry.path.as_bytes(),
+                &entry.oid,
+                entry.mode,
+                Some(stat_cache),
+            )?
+            .is_some_and(|worktree_entry| {
+                worktree_entry.mode == entry.mode && worktree_entry.oid == entry.oid
+            })
+        {
+            return Ok(None);
+        }
     }
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let body = match smudge_config {

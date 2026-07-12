@@ -589,6 +589,22 @@ impl IndexStatCache {
         })
     }
 
+    /// Whether checkout's cheap stat comparison matched but the entry is racy.
+    ///
+    /// Git's `ie_match_stat` resolves this case with a content comparison. It
+    /// must not be treated like an ordinary stat mismatch: doing so rewrites and
+    /// counts an already-clean path when the worktree and index mtimes happen to
+    /// be identical.
+    pub(crate) fn is_racy_checkout_stat_match(
+        &self,
+        entry: &IndexEntry,
+        worktree_metadata: &fs::Metadata,
+    ) -> bool {
+        entry.mode == worktree_entry_mode(worktree_metadata)
+            && worktree_entry_is_uptodate(entry, worktree_metadata)
+            && self.is_racily_clean(entry)
+    }
+
     pub(crate) fn reuse_index_entry_ref(
         &self,
         entry: &IndexEntryRef<'_>,
