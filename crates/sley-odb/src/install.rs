@@ -2,7 +2,8 @@ use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 use sley_formats::{Bundle, BundleReference};
 use sley_object::{EncodedObject, ObjectType};
 use sley_pack::{
-    PackFile, PackIndex, PackInput, PackStreamIndexBuild, PackWrite, PackWriteOptions,
+    PackFile, PackIndex, PackInput, PackStreamIndexBuild, PackStreamProgress, PackWrite,
+    PackWriteOptions,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -321,6 +322,27 @@ pub trait RawPackInstaller {
     {
         self.install_raw_pack_from_reader_with_options(reader, RawPackInstallOptions::default())
     }
+
+    /// Install a raw pack while reporting streaming pack progress via `progress`.
+    ///
+    /// The default implementation ignores `progress` and delegates to
+    /// [`install_raw_pack_from_reader_with_options`], so installers that do not
+    /// stream through the pack indexer (e.g. the in-memory store) keep working
+    /// unchanged. [`FileObjectDatabase`] overrides this to thread real counters.
+    ///
+    /// [`install_raw_pack_from_reader_with_options`]: RawPackInstaller::install_raw_pack_from_reader_with_options
+    fn install_raw_pack_from_reader_with_progress<R, F>(
+        &self,
+        reader: &mut R,
+        options: RawPackInstallOptions,
+        _progress: F,
+    ) -> Result<RawPackInstallResult>
+    where
+        R: Read,
+        F: FnMut(PackStreamProgress),
+    {
+        self.install_raw_pack_from_reader_with_options(reader, options)
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +374,24 @@ impl RawPackInstaller for FileObjectDatabase {
     {
         let result =
             FileObjectDatabase::install_raw_pack_from_reader_with_options(self, reader, options)?;
+        Ok(RawPackInstallResult {
+            object_ids: result.object_ids,
+        })
+    }
+
+    fn install_raw_pack_from_reader_with_progress<R, F>(
+        &self,
+        reader: &mut R,
+        options: RawPackInstallOptions,
+        progress: F,
+    ) -> Result<RawPackInstallResult>
+    where
+        R: Read,
+        F: FnMut(PackStreamProgress),
+    {
+        let result = FileObjectDatabase::install_raw_pack_from_reader_with_progress(
+            self, reader, options, progress,
+        )?;
         Ok(RawPackInstallResult {
             object_ids: result.object_ids,
         })
@@ -1037,6 +1077,25 @@ impl FileObjectDatabase {
     where
         R: Read,
     {
+        self.install_raw_pack_from_reader_with_progress(reader, options, |_| {})
+    }
+
+    /// [`install_raw_pack_from_reader_with_options`] that reports streaming pack
+    /// progress. `progress` is threaded to the pack indexer, so it advances as
+    /// the pack is received off `reader` (during download for streaming
+    /// transports; during the index walk for already-buffered ones).
+    ///
+    /// [`install_raw_pack_from_reader_with_options`]: FileObjectDatabase::install_raw_pack_from_reader_with_options
+    pub fn install_raw_pack_from_reader_with_progress<R, F>(
+        &self,
+        reader: &mut R,
+        options: RawPackInstallOptions,
+        progress: F,
+    ) -> Result<PackInstallResult>
+    where
+        R: Read,
+        F: FnMut(PackStreamProgress),
+    {
         let pack_dir = self.objects_dir.join("pack");
         fs::create_dir_all(&pack_dir)?;
         let temp_pack_path = unique_temp_path(&pack_dir);
@@ -1054,7 +1113,11 @@ impl FileObjectDatabase {
                     max_input_size: options.max_input_size,
                     written: 0,
                 };
-                PackIndex::write_v2_for_pack_reader_to_trailer(&mut tee, self.format)?
+                PackIndex::write_v2_for_pack_reader_to_trailer_with_progress(
+                    &mut tee,
+                    self.format,
+                    progress,
+                )?
             };
             file.flush()?;
             file.sync_all()?;

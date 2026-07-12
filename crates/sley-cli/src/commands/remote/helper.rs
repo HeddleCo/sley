@@ -33,7 +33,7 @@ pub(crate) fn fetch_with_remote_helper(
     trace_remote_helper(&spec);
     let ref_hook = crate::commands::refs::ReferenceTransactionHookRunner::new(git_dir);
     let mut credentials = sley_remote::NoCredentials;
-    let mut progress = StdoutProgress;
+    let mut progress = StdoutProgress::default();
     let mut plumbing = NativeRemoteHelperPlumbing;
     let mut events = CliRemoteHelperEvents;
     sley_remote::fetch_via_remote_helper(
@@ -87,7 +87,7 @@ pub(crate) fn fetch_with_discovered_remote_helper(
     let config = repo_config_with_transport_policy(context, git_dir)?;
     let ref_hook = crate::commands::refs::ReferenceTransactionHookRunner::new(git_dir);
     let mut credentials = sley_remote::NoCredentials;
-    let mut progress = StdoutProgress;
+    let mut progress = StdoutProgress::default();
     let mut plumbing = NativeRemoteHelperPlumbing;
     let mut events = CliRemoteHelperEvents;
     sley_remote::fetch_via_discovered_remote_helper(

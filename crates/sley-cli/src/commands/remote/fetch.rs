@@ -21,7 +21,9 @@ use crate::remote::{
 };
 use crate::*;
 use sley::plumbing::sley_odb::ObjectReader;
-use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord, TransferProgress};
+use sley::plumbing::sley_remote::{
+    FetchOptions, LsRemoteRecord, PackGenerationProgress, TransferProgress,
+};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
@@ -1929,11 +1931,21 @@ pub(crate) fn fetch_local_repository_with_outcome(
 /// A [`sley_remote::ProgressSink`] that prints each progress/summary line to
 /// stdout, reproducing the CLI's fetch prune output. Write errors are ignored,
 /// matching how progress output is otherwise best-effort.
-pub(crate) struct StdoutProgress;
+#[derive(Default)]
+pub(crate) struct StdoutProgress {
+    /// Suppress the transfer progress line (git's `--quiet`).
+    quiet: bool,
+}
+
+impl StdoutProgress {
+    pub(crate) fn new(quiet: bool) -> Self {
+        Self { quiet }
+    }
+}
 
 impl sley_remote::ProgressSink for StdoutProgress {
-    fn transfer(&mut self, progress: &TransferProgress) {
-        let _ = io::stderr().write_all(&render_transfer_progress(progress));
+    fn pack_generation(&mut self, progress: &PackGenerationProgress) {
+        let _ = io::stderr().write_all(&render_pack_generation_progress(progress));
     }
 
     fn message(&mut self, message: &str) {
@@ -1943,9 +1955,41 @@ impl sley_remote::ProgressSink for StdoutProgress {
     fn diagnostic(&mut self, message: &str) {
         let _ = writeln!(io::stderr(), "{message}");
     }
+    fn transfer(&mut self, progress: TransferProgress) {
+        use std::io::{IsTerminal, Write};
+        // Match git's "Receiving objects": rendered only to an interactive
+        // stderr (so piped/scripted stdout stays clean), and suppressed by
+        // `--quiet`. A single `\r`-prefixed line rewrites in place.
+        if self.quiet || !std::io::stderr().is_terminal() {
+            return;
+        }
+        let mib = progress.received_bytes as f64 / (1024.0 * 1024.0);
+        let mut stderr = std::io::stderr();
+        match progress.total_objects {
+            Some(total) if total > 0 => {
+                let pct = progress.received_objects.saturating_mul(100) / total;
+                let done = progress.received_objects >= total;
+                let _ = write!(
+                    stderr,
+                    "\rReceiving objects: {pct}% ({}/{}), {mib:.2} MiB{}",
+                    progress.received_objects,
+                    total,
+                    if done { ", done.\n" } else { "" },
+                );
+            }
+            _ => {
+                let _ = write!(
+                    stderr,
+                    "\rReceiving objects: {} ({mib:.2} MiB)",
+                    progress.received_objects,
+                );
+            }
+        }
+        let _ = stderr.flush();
+    }
 }
 
-fn render_transfer_progress(progress: &TransferProgress) -> Vec<u8> {
+fn render_pack_generation_progress(progress: &PackGenerationProgress) -> Vec<u8> {
     let mut out = Vec::new();
     if progress.total_objects == 0 {
         return out;
@@ -1956,9 +2000,9 @@ fn render_transfer_progress(progress: &TransferProgress) -> Vec<u8> {
         progress.total_objects
     )
     .expect("write to Vec cannot fail");
-    render_transfer_progress_phase(&mut out, "Counting objects", progress.total_objects);
+    render_pack_generation_progress_phase(&mut out, "Counting objects", progress.total_objects);
     if progress.compression_objects > 1 {
-        render_transfer_progress_phase(
+        render_pack_generation_progress_phase(
             &mut out,
             "Compressing objects",
             progress.compression_objects,
@@ -1973,7 +2017,7 @@ fn render_transfer_progress(progress: &TransferProgress) -> Vec<u8> {
     out
 }
 
-fn render_transfer_progress_phase(out: &mut Vec<u8>, label: &str, total: usize) {
+fn render_pack_generation_progress_phase(out: &mut Vec<u8>, label: &str, total: usize) {
     for current in 1..=total {
         let percent = current.saturating_mul(100) / total;
         write!(
@@ -1991,11 +2035,11 @@ fn render_transfer_progress_phase(out: &mut Vec<u8>, label: &str, total: usize) 
 
 #[cfg(test)]
 mod transfer_progress_tests {
-    use super::{TransferProgress, render_transfer_progress};
+    use super::{PackGenerationProgress, render_pack_generation_progress};
 
     #[test]
     fn zero_delta_progress_bytes_match_git_sideband_rendering() {
-        let rendered = render_transfer_progress(&TransferProgress {
+        let rendered = render_pack_generation_progress(&PackGenerationProgress {
             total_objects: 3,
             compression_objects: 1,
             delta_objects: 0,
@@ -2013,7 +2057,7 @@ remote: Total 3 (delta 0), reused 0 (delta 0), pack-reused 0 (from 0)        \n"
 
     #[test]
     fn delta_progress_includes_compression_phase_with_exact_padding() {
-        let rendered = render_transfer_progress(&TransferProgress {
+        let rendered = render_pack_generation_progress(&PackGenerationProgress {
             total_objects: 4,
             compression_objects: 3,
             delta_objects: 1,
@@ -2056,7 +2100,7 @@ pub(super) fn run_fetch(
         eprintln!("{diagnostic}");
     }
     let mut credentials = sley_remote::CredentialHelperProvider::new(Some(config));
-    let mut progress = StdoutProgress;
+    let mut progress = StdoutProgress::new(options.quiet);
     if matches!(
         fetch_source,
         sley_remote::FetchSource::Local { .. } | sley_remote::FetchSource::Ssh(_)

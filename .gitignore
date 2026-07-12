@@ -1,5 +1,6 @@
 /target/
 /tmp-*/
 /.heddle/
-__pycache__/
+/bench-results/
+**/__pycache__/
 *.pyc

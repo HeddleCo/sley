@@ -1467,6 +1467,13 @@ pub struct HttpResponse {
 
 /// Minimal byte-transport over HTTP(S) used to drive smart-HTTP git transport.
 ///
+/// This is the injectable seam through which a host enforces network policy: an
+/// implementation owns the entire dial (DNS resolution, connect, TLS) for each
+/// `url`, so a host mirroring attacker-controlled public URLs can supply a client
+/// that validates the resolved IP and pins the connection to it, guarding against
+/// SSRF. The default fetch/clone path uses [`UreqHttpClient`]; see
+/// `sley_remote::fetch_with_http_client` / `clone_with_http_client` to inject one.
+///
 /// Implementations must surface HTTP error statuses (401/403/404/5xx) as
 /// `Ok(HttpResponse { status, .. })` so callers can react to them (for example,
 /// retrying a 401 with credentials). Only genuine transport failures

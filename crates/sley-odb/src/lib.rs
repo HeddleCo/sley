@@ -21,10 +21,13 @@ pub use gc::*;
 pub use install::*;
 pub use loose::*;
 pub use midx::*;
+// Re-exported so callers of the progress-aware installer can name the counter
+// struct without depending on `sley-pack` directly.
 pub use pack::*;
 pub use reachability::*;
 pub use registry::*;
 pub use repack::*;
+pub use sley_pack::PackStreamProgress;
 
 static TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 

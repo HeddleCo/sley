@@ -27,6 +27,22 @@ pub struct PackIndexedObject {
     pub offset: u64,
 }
 
+/// Streaming pack-receive counters emitted while [`index_pack_from_stream`]
+/// parses a pack off a reader. All fields are monotonically non-decreasing
+/// within one indexing pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PackStreamProgress {
+    /// Pack bytes consumed from the reader so far (header + object entries),
+    /// i.e. the streaming pack offset. Advances during download for streaming
+    /// transports; during the index walk for already-buffered ones.
+    pub received_bytes: u64,
+    /// Objects parsed from the pack so far.
+    pub received_objects: u64,
+    /// Total objects declared by the pack header (known once the 12-byte header
+    /// is read).
+    pub total_objects: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackIndex {
     pub version: u32,
@@ -854,6 +870,22 @@ impl PackIndex {
         R: Read,
     {
         index_pack_from_reader_to_trailer(reader, format)
+    }
+
+    /// [`write_v2_for_pack_reader_to_trailer`] that reports streaming pack
+    /// progress. `progress` is invoked on a throttled cadence with the pack byte
+    /// offset, objects parsed so far, and the header-declared total, then once
+    /// more at completion with `received_objects == total_objects`.
+    pub fn write_v2_for_pack_reader_to_trailer_with_progress<R, F>(
+        reader: &mut R,
+        format: ObjectFormat,
+        progress: F,
+    ) -> Result<PackStreamIndexBuild>
+    where
+        R: Read,
+        F: FnMut(PackStreamProgress),
+    {
+        index_pack_from_reader_to_trailer_with_progress(reader, format, progress)
     }
 
     pub fn write_v2_for_pack_reader_with_len<R>(

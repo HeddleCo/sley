@@ -39,9 +39,11 @@ use sley_protocol::{
     refname_matches, refspec_map_source,
 };
 use sley_refs::{FileRefStore, Ref, RefTarget, RefUpdate, ReflogEntry};
+#[cfg(feature = "http")]
+use sley_transport::{HttpClient, UreqHttpClient};
 use sley_transport::{RemoteTransport, RemoteUrl};
 
-use crate::{CredentialProvider, ProgressSink, TransferProgress};
+use crate::{CredentialProvider, PackGenerationProgress, ProgressSink};
 
 /// How a fetch obtains refs and objects from the remote.
 ///
@@ -209,7 +211,7 @@ pub struct FetchOutcome {
     /// Equal-work counts for the object transfer, when this transport exposes
     /// truthful native counts. `None` means no objects moved or the transport
     /// did not provide trustworthy progress metadata.
-    pub transfer_progress: Option<TransferProgress>,
+    pub pack_generation_progress: Option<PackGenerationProgress>,
 }
 
 /// Repository-derived defaults for one fetch invocation.
@@ -298,7 +300,43 @@ pub struct FetchServices<'a> {
 ///
 /// Emits prune notices through `progress` and returns the structured
 /// [`FetchOutcome`]; never prints or returns `GitError::Exit`.
+///
+/// The smart-HTTP transport constructs a default [`UreqHttpClient`]. Hosts that
+/// must enforce network policy on the dial (e.g. SSRF-guard a public mirror URL)
+/// call [`fetch_with_http_client`] instead to inject their own [`HttpClient`].
 pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<FetchOutcome> {
+    #[cfg(feature = "http")]
+    {
+        fetch_impl(request, services, None)
+    }
+    #[cfg(not(feature = "http"))]
+    {
+        fetch_impl(request, services)
+    }
+}
+
+/// Like [`fetch`], but drives the smart-HTTP transport through a caller-provided
+/// [`HttpClient`] when `http_client` is `Some`.
+///
+/// `None` is exactly [`fetch`] (a default [`UreqHttpClient`]). A `Some` client
+/// owns the entire dial (DNS→connect→TLS) for every smart-HTTP request, letting a
+/// host enforce network policy such as SSRF validation on the resolved IP. Only
+/// the HTTP transport consults the injected client; SSH/git/local sources ignore
+/// it.
+#[cfg(feature = "http")]
+pub fn fetch_with_http_client(
+    request: FetchRequest<'_>,
+    services: FetchServices<'_>,
+    http_client: Option<&dyn HttpClient>,
+) -> Result<FetchOutcome> {
+    fetch_impl(request, services, http_client)
+}
+
+fn fetch_impl(
+    request: FetchRequest<'_>,
+    services: FetchServices<'_>,
+    #[cfg(feature = "http")] http_client: Option<&dyn HttpClient>,
+) -> Result<FetchOutcome> {
     let ref_hook = services.ref_hook;
     let mut options = request.options.clone();
     apply_configured_remote_tag_option(request.config, request.remote_name, &mut options);
@@ -454,8 +492,16 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
         }
         #[cfg(feature = "http")]
         FetchSource::Http(remote) => {
-            let http_batch = crate::http::HttpOperationBatch::new();
-            let client = http_batch.client();
+            // Use the caller-injected client when present (host network policy /
+            // SSRF guard); otherwise construct the default ureq-backed client.
+            let default_client;
+            let client: &dyn HttpClient = match http_client {
+                Some(client) => client,
+                None => {
+                    default_client = UreqHttpClient::new();
+                    &default_client
+                }
+            };
             let git_protocol = crate::http::http_git_protocol_header_value(Some(request.config))?;
             let discovered = crate::http::http_service_advertisements(
                 client,
@@ -521,11 +567,13 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     pack_request,
                     handshake,
                     services.credentials,
+                    services.progress,
                 )?
             } else {
                 crate::http::install_fetch_pack_via_http_upload_pack(
                     pack_request,
                     services.credentials,
+                    services.progress,
                 )?
             };
             reject_shallow_clone_fetch(&options, &shallow_info)?;
@@ -610,6 +658,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     upload_pack_command: options.upload_pack_command.as_deref(),
                     max_input_size,
                 },
+                services.progress,
             )?;
             reject_shallow_clone_fetch(&options, &shallow_info)?;
             finalize_fetch(
@@ -702,6 +751,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     protocol_v2: discovered.protocol_v2,
                     max_input_size,
                 },
+                services.progress,
             )?;
             reject_shallow_clone_fetch(&options, &shallow_info)?;
             finalize_fetch(
@@ -1050,16 +1100,17 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                     transfer.delta_count,
                 )
             };
-            outcome.transfer_progress = (transferred_objects > 0).then_some(TransferProgress {
-                total_objects: transferred_objects,
-                compression_objects: transferred_compression_objects,
-                delta_objects: transferred_deltas,
-            });
+            outcome.pack_generation_progress =
+                (transferred_objects > 0).then_some(PackGenerationProgress {
+                    total_objects: transferred_objects,
+                    compression_objects: transferred_compression_objects,
+                    delta_objects: transferred_deltas,
+                });
             if options.progress == Some(true)
                 && !options.quiet
-                && let Some(progress) = outcome.transfer_progress.as_ref()
+                && let Some(progress) = outcome.pack_generation_progress.as_ref()
             {
-                services.progress.transfer(progress);
+                services.progress.pack_generation(progress);
             }
             finalize_fetch(
                 FetchFinalize {
@@ -3043,11 +3094,11 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingProgress {
-        transfers: Vec<TransferProgress>,
+        transfers: Vec<PackGenerationProgress>,
     }
 
     impl ProgressSink for RecordingProgress {
-        fn transfer(&mut self, progress: &TransferProgress) {
+        fn pack_generation(&mut self, progress: &PackGenerationProgress) {
             self.transfers.push(*progress);
         }
     }
@@ -3088,11 +3139,11 @@ mod tests {
         .expect("fetch should succeed");
 
         let transfer = outcome
-            .transfer_progress
+            .pack_generation_progress
             .expect("non-empty local fetch should report equal-work counts");
         assert_eq!(
             transfer,
-            TransferProgress {
+            PackGenerationProgress {
                 total_objects: 2,
                 compression_objects: 1,
                 delta_objects: 0,
@@ -3291,6 +3342,142 @@ mod tests {
         );
         let fetch_head = fs::read_to_string(local.join("FETCH_HEAD")).expect("FETCH_HEAD exists");
         assert!(fetch_head.contains("origin"));
+    }
+
+    /// An [`HttpClient`] test double that records how many times it was dialed and
+    /// serves a fixed smart-HTTP `info/refs` advertisement. Standing in for a
+    /// host's SSRF-guarding client, it proves the fetch/clone HTTP path routes the
+    /// dial through the injected client rather than constructing a fresh ureq one.
+    struct RecordingHttpClient {
+        advertisement: Vec<u8>,
+        content_type: String,
+        get_calls: std::sync::atomic::AtomicUsize,
+        post_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HttpClient for RecordingHttpClient {
+        fn get(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> Result<sley_transport::HttpResponse> {
+            self.get_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(sley_transport::HttpResponse {
+                status: 200,
+                content_type: Some(self.content_type.clone()),
+                body: Box::new(std::io::Cursor::new(self.advertisement.clone())),
+            })
+        }
+
+        fn post(
+            &self,
+            _url: &str,
+            _content_type: &str,
+            _headers: &[(&str, &str)],
+            _body: &[u8],
+        ) -> Result<sley_transport::HttpResponse> {
+            self.post_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(GitError::Command(
+                "recording client received an unexpected POST".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn fetch_with_http_client_dials_injected_client() {
+        use sley_protocol::{
+            GitService, ProtocolVersion, RefAdvertisement, RefAdvertisementSet,
+            smart_http_advertisement_content_type,
+        };
+        use sley_transport::{
+            ServiceAnnouncement, ServiceDiscoveryPayload, ServiceDiscoveryResponse,
+            parse_remote_url, write_service_discovery_response,
+        };
+
+        let local = temp_repo("http-inject");
+        // Commit the advertised tip locally so the negotiated `want` is already
+        // present: the fetch then completes after the ref-advertisement GET
+        // without any pack POST, keeping the test to a single dial.
+        let tip = commit_on(&local, "main", "already-present tip");
+
+        // A protocol-v0 upload-pack advertisement announcing refs/heads/main = tip.
+        let advertisement = {
+            let response = ServiceDiscoveryResponse {
+                announcement: ServiceAnnouncement {
+                    service: GitService::UploadPack,
+                },
+                payload: ServiceDiscoveryPayload::AdvertisedRefs(RefAdvertisementSet {
+                    protocol: ProtocolVersion::V0,
+                    refs: vec![RefAdvertisement {
+                        oid: tip.clone(),
+                        name: "refs/heads/main".into(),
+                        capabilities: Vec::new(),
+                    }],
+                    shallow: Vec::new(),
+                }),
+            };
+            let mut body = Vec::new();
+            write_service_discovery_response(&mut body, &response)
+                .expect("advertisement should encode");
+            body
+        };
+
+        let client = RecordingHttpClient {
+            advertisement,
+            content_type: smart_http_advertisement_content_type(GitService::UploadPack)
+                .expect("content type"),
+            get_calls: std::sync::atomic::AtomicUsize::new(0),
+            post_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let source =
+            FetchSource::Http(parse_remote_url("http://example.invalid/repo.git").expect("url"));
+        let options = default_options();
+        let mut credentials = NoCredentials;
+        let mut progress = SilentProgress;
+
+        let outcome = fetch_with_http_client(
+            FetchRequest {
+                git_dir: &local,
+                format: ObjectFormat::Sha1,
+                config: &GitConfig::default(),
+                remote_name: "origin",
+                source: &source,
+                refspecs: &["refs/heads/main:refs/remotes/origin/main".to_string()],
+                options: &options,
+                validation: None,
+            },
+            FetchServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+                ref_hook: None,
+            },
+            Some(&client),
+        )
+        .expect("fetch via injected client should succeed");
+
+        // The injected client owned the dial — a fresh ureq client would instead
+        // have tried to resolve example.invalid and never touched this recorder.
+        assert_eq!(
+            client.get_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "sley must dial through the injected client"
+        );
+        assert_eq!(
+            client.post_calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "no pack POST expected when the want is already present"
+        );
+        // The advertisement still drove a real ref-map update.
+        assert_eq!(outcome.ref_updates.len(), 1);
+        let refs = FileRefStore::new(&local, ObjectFormat::Sha1);
+        assert_eq!(
+            refs.read_ref("refs/remotes/origin/main")
+                .expect("ref should read"),
+            Some(RefTarget::Direct(tip))
+        );
     }
 
     #[test]
