@@ -306,12 +306,14 @@ pub(crate) fn write_combined_raw(
 pub(crate) fn write_combined_name_status(
     stdout: &mut dyn Write,
     path: &CombinedPath,
+    all_paths: bool,
     z: bool,
 ) -> Result<()> {
     let parents = combined_engine_parents(path);
     sley_diff_merge::porcelain::render_combined_name_status_entry(
         stdout,
         combined_engine_entry(path, &parents),
+        all_paths,
         z,
     )
     .map_err(|error| GitError::Io(error.to_string()))?;

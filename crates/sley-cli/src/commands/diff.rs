@@ -332,16 +332,27 @@ fn diff_direct_blob_pair(
         if left.file && right.file {
             return Ok(None);
         }
+        if left.file {
+            eprintln!("fatal: {}: no such path in the working tree.", args[1]);
+            eprintln!(
+                "Use 'git <command> -- <path>...' to specify paths that do not exist locally."
+            );
+            return Err(GitError::Exit(128));
+        }
         (left, right)
     } else {
         return Ok(None);
     };
 
     let (mut left, mut right) = pair;
+    // `builtin_diff_b_f` treats the parsed object as the old side and borrows
+    // the worktree path/mode for an anonymous blob.
     if left.anonymous && right.file {
         left.path.clone_from(&right.path);
+        left.mode = right.mode;
     } else if right.anonymous && left.file {
         right.path.clone_from(&left.path);
+        right.mode = left.mode;
     }
     Ok(Some((left, right)))
 }
@@ -389,12 +400,30 @@ fn resolve_direct_blob_source(
         return Ok(None);
     }
     let absolute = cwd.join(spec);
-    if !absolute.is_file() {
-        return Ok(None);
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    let file_type = metadata.file_type();
+    if !file_type.is_file() && !file_type.is_symlink() {
+        eprintln!("fatal: '{spec}': not a regular file or symlink");
+        return Err(GitError::Exit(128));
     }
-    let content = fs::read(&absolute)?;
+    let content = if file_type.is_symlink() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            fs::read_link(&absolute)?.as_os_str().as_bytes().to_vec()
+        }
+        #[cfg(not(unix))]
+        {
+            fs::read(&absolute)?
+        }
+    } else {
+        fs::read(&absolute)?
+    };
     let oid = sley_core::object_id_for_bytes(format, "blob", &content)?;
-    let mode = direct_blob_file_mode(git_dir, format, spec.as_bytes(), &absolute)?;
+    let mode = direct_blob_filesystem_mode(&absolute);
     Ok(Some(DirectBlobSpec {
         path: spec.as_bytes().to_vec(),
         mode,
@@ -405,37 +434,26 @@ fn resolve_direct_blob_source(
     }))
 }
 
-fn direct_blob_file_mode(
-    git_dir: &Path,
-    format: ObjectFormat,
-    path: &[u8],
-    absolute: &Path,
-) -> Result<u32> {
-    let mode = sley_worktree::read_repository_index(git_dir, format)?
-        .and_then(|index| {
-            index
-                .entries
-                .into_iter()
-                .find(|entry| {
-                    entry.stage() == sley_index::Stage::Normal && entry.path.as_bytes() == path
-                })
-                .map(|entry| entry.mode)
-        })
-        .unwrap_or_else(|| direct_blob_filesystem_mode(absolute));
-    Ok(mode)
-}
-
 #[cfg(unix)]
 fn direct_blob_filesystem_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::FileTypeExt;
     use std::os::unix::fs::PermissionsExt;
 
-    fs::metadata(path)
+    fs::symlink_metadata(path)
         .ok()
         .map(|metadata| {
-            if metadata.permissions().mode() & 0o111 == 0 {
+            if metadata.file_type().is_symlink() {
+                0o120000
+            } else if metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 == 0 {
                 0o100644
-            } else {
+            } else if metadata.file_type().is_file() {
                 0o100755
+            } else if metadata.file_type().is_dir() {
+                0o040000
+            } else if metadata.file_type().is_fifo() {
+                0o010000
+            } else {
+                0
             }
         })
         .unwrap_or(0o100644)
@@ -1260,25 +1278,90 @@ fn diff_arg_looks_outside_worktree(path: &str) -> bool {
         .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
-fn resolve_diff_interhunk_context(
+pub(crate) fn resolve_diff_interhunk_context(
     cli_value: Option<usize>,
-    config: Option<&sley_config::GitConfig>,
+    repository: Option<&RepositoryContext>,
+    cli_session: &crate::session::CliSession,
 ) -> Result<usize> {
+    let config = repository.map(RepositoryContext::config);
     let config_value = config.and_then(|config| config.get("diff", None, "interhunkcontext"));
     match sley_diff_merge::render::resolve_interhunk_context(cli_value, config_value) {
         Ok(value) => Ok(value),
-        Err(sley_diff_merge::render::InterHunkContextError::InvalidNumericValue) => {
+        Err(
+            error @ (sley_diff_merge::render::InterHunkContextError::InvalidNumericValue
+            | sley_diff_merge::render::InterHunkContextError::OutOfRange),
+        ) => {
             let value = config_value.unwrap_or_default();
+            let location = diff_interhunk_config_entry(repository, cli_session)?
+                .and_then(|entry| match entry.origin.kind {
+                    sley_config::ConfigOriginKind::File => {
+                        Some(format!(" in file {}", entry.origin.name))
+                    }
+                    sley_config::ConfigOriginKind::Blob => {
+                        Some(format!(" in blob {}", entry.origin.name))
+                    }
+                    sley_config::ConfigOriginKind::Stdin => Some(" in standard input".to_string()),
+                    sley_config::ConfigOriginKind::CommandLine => None,
+                })
+                .unwrap_or_default();
+            let kind = if matches!(
+                error,
+                sley_diff_merge::render::InterHunkContextError::OutOfRange
+            ) {
+                "out of range"
+            } else {
+                "invalid unit"
+            };
             eprintln!(
-                "fatal: bad numeric config value '{value}' for 'diff.interhunkcontext': invalid unit"
+                "fatal: bad numeric config value '{value}' for 'diff.interhunkcontext'{location}: {kind}"
             );
             Err(GitError::Exit(128))
         }
         Err(sley_diff_merge::render::InterHunkContextError::NegativeValue) => {
-            eprintln!("fatal: bad config variable 'diff.interhunkcontext'");
+            let entry = diff_interhunk_config_entry(repository, cli_session)?;
+            match entry {
+                Some(entry) if entry.origin.kind == sley_config::ConfigOriginKind::File => {
+                    eprintln!(
+                        "fatal: bad config variable 'diff.interhunkcontext' in file '{}' at line {}",
+                        entry.origin.name,
+                        entry.line_number.unwrap_or(0)
+                    );
+                }
+                _ => eprintln!(
+                    "fatal: unable to parse 'diff.interhunkcontext' from command-line config"
+                ),
+            }
             Err(GitError::Exit(128))
         }
     }
+}
+
+fn diff_interhunk_config_entry(
+    repository: Option<&RepositoryContext>,
+    cli_session: &crate::session::CliSession,
+) -> Result<Option<sley_config::ConfigStackEntry>> {
+    let Some(repository) = repository else {
+        return Ok(None);
+    };
+    let git_dir = repository.git_dir();
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(sley_config::git_dir_for_include_context(git_dir)),
+        crate::repo_current_branch_name(git_dir),
+    );
+    let config_path = git_dir.join("config");
+    let display_path = config_path
+        .strip_prefix(cli_session.cwd())
+        .unwrap_or(&config_path);
+    let mut stack = sley_config::ConfigStack::new();
+    stack.push_file(
+        display_path,
+        sley_config::ConfigScope::Local,
+        true,
+        &context,
+    )?;
+    let parameters = crate::injected_config_parameters()?;
+    stack.push_parameters_with_includes(&parameters, &context)?;
+    Ok(stack.get("diff", None, "interhunkcontext").cloned())
 }
 
 pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
@@ -1415,10 +1498,8 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
     // every repository-backed mode must reuse one session-scoped facade.
     let repository = RepositoryContext::from_session(cli_session);
     let outside_repository = repository.is_err();
-    let interhunk = resolve_diff_interhunk_context(
-        interhunk,
-        repository.as_ref().ok().map(|repo| repo.config()),
-    )?;
+    let interhunk =
+        resolve_diff_interhunk_context(interhunk, repository.as_ref().ok(), cli_session)?;
     if !find_object_values.is_empty() && outside_repository {
         eprintln!("fatal: --find-object requires a git repository");
         return Err(GitError::Exit(128));
@@ -1752,8 +1833,12 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         && ignore_regexes.is_empty()
         && !ignore_blank_lines;
     if direct_blob_patch
-        && let Some((left, right)) = diff_direct_blob_pair(&cwd, &git_dir, format, &db, &path_args)?
+        && let Some((mut left, mut right)) =
+            diff_direct_blob_pair(&cwd, &git_dir, format, &db, &path_args)?
     {
+        if reverse {
+            std::mem::swap(&mut left, &mut right);
+        }
         let mut stdout = io::stdout().lock();
         sley_diff_merge::porcelain::render_blob_patch(
             &mut stdout,
@@ -1773,8 +1858,16 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                 object_format: format,
                 full_index: patch_full_index,
                 abbrev: patch_abbrev.unwrap_or(7),
-                src_prefix: src_prefix.as_bytes(),
-                dst_prefix: dst_prefix.as_bytes(),
+                src_prefix: if reverse {
+                    dst_prefix.as_bytes()
+                } else {
+                    src_prefix.as_bytes()
+                },
+                dst_prefix: if reverse {
+                    src_prefix.as_bytes()
+                } else {
+                    dst_prefix.as_bytes()
+                },
                 context: patch_context,
                 interhunk,
                 algorithm: diff_algorithm,
@@ -2786,7 +2879,7 @@ fn write_diff_combined_trees(
     }
     if selection.name_status {
         for path in &paths {
-            commands::combined::write_combined_name_status(&mut out, path, options.z)?;
+            commands::combined::write_combined_name_status(&mut out, path, false, options.z)?;
         }
     }
     if selection.name_only {

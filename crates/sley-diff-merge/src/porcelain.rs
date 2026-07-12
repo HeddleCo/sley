@@ -222,6 +222,10 @@ pub fn render_blob_patch(
         write!(out, " {:06o}", old.mode)?;
     }
     writeln!(out)?;
+    if blob_is_binary(old.content) || blob_is_binary(new.content) {
+        writeln!(out, "Binary files {old_name} and {new_name} differ")?;
+        return Ok(RenderOutcome { records_written: 1 });
+    }
     writeln!(out, "--- {old_name}")?;
     writeln!(out, "+++ {new_name}")?;
 
@@ -240,6 +244,10 @@ pub fn render_blob_patch(
     );
     out.write_all(&body)?;
     Ok(RenderOutcome { records_written: 1 })
+}
+
+fn blob_is_binary(content: &[u8]) -> bool {
+    content.iter().take(8000).any(|byte| *byte == 0)
 }
 
 fn prefixed_quoted_path(prefix: &[u8], path: &[u8]) -> String {
@@ -350,6 +358,7 @@ pub fn render_combined_raw_entry(
 pub fn render_combined_name_status_entry(
     out: &mut dyn Write,
     entry: CombinedDiffEntry<'_>,
+    all_paths: bool,
     nul_terminated: bool,
 ) -> Result<RenderOutcome, RenderError> {
     for parent in entry.parents {
@@ -357,10 +366,22 @@ pub fn render_combined_name_status_entry(
     }
     if nul_terminated {
         out.write_all(b"\0")?;
+        if all_paths {
+            for parent in entry.parents {
+                out.write_all(parent.path)?;
+                out.write_all(b"\0")?;
+            }
+        }
         out.write_all(entry.result_path)?;
         out.write_all(b"\0")?;
     } else {
-        writeln!(out, "\t{}", quote_path(entry.result_path, true))?;
+        write!(out, "\t")?;
+        if all_paths {
+            for parent in entry.parents {
+                write!(out, "{}\t", quote_path(parent.path, true))?;
+            }
+        }
+        writeln!(out, "{}", quote_path(entry.result_path, true))?;
     }
     Ok(RenderOutcome { records_written: 1 })
 }

@@ -48,7 +48,7 @@ pub struct ConfigSection {
     pub entries: Vec<ConfigEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ConfigEntry {
     /// Comments and blank lines immediately preceding this entry within its section.
     pub preamble: Vec<ConfigPreambleLine>,
@@ -57,7 +57,21 @@ pub struct ConfigEntry {
     pub key: String,
     pub value: Option<String>,
     pub comment: Option<String>,
+    /// 1-based physical source line; absent for programmatically-created entries.
+    pub line_number: Option<usize>,
 }
+
+impl PartialEq for ConfigEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.preamble == other.preamble
+            && self.indent == other.indent
+            && self.key == other.key
+            && self.value == other.value
+            && self.comment == other.comment
+    }
+}
+
+impl Eq for ConfigEntry {}
 
 impl ConfigEntry {
     /// Build a programmatic entry (no preserved preamble/comment).
@@ -68,6 +82,7 @@ impl ConfigEntry {
             key: key.into(),
             value,
             comment: None,
+            line_number: None,
         }
     }
 }
@@ -882,6 +897,7 @@ pub struct ConfigStackEntry {
     pub scope: ConfigScope,
     pub origin: ConfigOrigin,
     pub included_from: Option<ConfigOrigin>,
+    pub line_number: Option<usize>,
 }
 
 impl ConfigStackEntry {
@@ -973,6 +989,7 @@ impl ConfigStack {
                 scope: ConfigScope::Command,
                 origin: ConfigOrigin::command_line(),
                 included_from: None,
+                line_number: None,
             });
         }
     }
@@ -1148,6 +1165,7 @@ fn emit_parsed_config(
                 scope,
                 origin: origin.clone(),
                 included_from: included_from.clone(),
+                line_number: entry.line_number,
             });
             let Some(kind) = &include_kind else { continue };
             if !eq_ignore_ascii_case(&entry.key, "path") {
@@ -1796,6 +1814,7 @@ impl<'a> ConfigParser<'a> {
     /// Parse a `name` or `name = value` entry. The first character of the name is
     /// the next character.
     fn parse_entry(&mut self) -> Result<ConfigEntry> {
+        let line_number = self.line;
         let mut indent = String::new();
         while matches!(self.peek(), Some(' ') | Some('\t')) {
             if let Some(ch) = self.bump() {
@@ -1826,6 +1845,7 @@ impl<'a> ConfigParser<'a> {
                 key,
                 value: None,
                 comment: None,
+                line_number: Some(line_number),
             }),
             Some('\n') => {
                 self.bump();
@@ -1835,6 +1855,7 @@ impl<'a> ConfigParser<'a> {
                     key,
                     value: None,
                     comment: None,
+                    line_number: Some(line_number),
                 })
             }
             Some('=') => {
@@ -1846,6 +1867,7 @@ impl<'a> ConfigParser<'a> {
                     key,
                     value: Some(value),
                     comment,
+                    line_number: Some(line_number),
                 })
             }
             Some(ch) => Err(self.err(format!("expected '=' after variable name, found {ch:?}"))),

@@ -37,6 +37,23 @@ fn run_env(program: &str, cwd: &Path, args: &[&str]) -> Output {
         .env("GIT_COMMITTER_EMAIL", "tester@example.com")
         .env("GIT_AUTHOR_DATE", "@1790000000 -0500")
         .env("GIT_COMMITTER_DATE", "@1790000000 -0500")
+        // The am suite runs in parallel. Never inherit the developer/runner's
+        // global config (maintenance, filters, autocrlf, hooks, and fsmonitor
+        // settings can otherwise leak into one side of a parity fixture).
+        .env("HOME", cwd)
+        .env("XDG_CONFIG_HOME", cwd.join(".xdg-config"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        // A just-built oracle invokes nested `git` commands (notably automatic
+        // maintenance). Keep those on the same 2.55 binary instead of falling
+        // through to an older system Git on PATH.
+        .env(
+            "GIT_EXEC_PATH",
+            Path::new(sley_testkit::oracle_git())
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        )
         .output()
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
@@ -770,6 +787,12 @@ fn am_reject_partially_applies_and_writes_reject_like_git() {
         fs::read(git_target.join("file.txt.rej")).expect("Git reject file"),
         "reject-file bytes differ"
     );
+    // Both implementations may materialize a byte-identical result within the
+    // index timestamp's racy-clean window. Refresh cached stat data before the
+    // plumbing comparison so `diff-files` continues to assert real index versus
+    // worktree content/mode separation instead of transient timestamp metadata.
+    let _ = git(&rs_target, &["update-index", "-q", "--refresh"]);
+    let _ = git(&git_target, &["update-index", "-q", "--refresh"]);
     assert_eq!(
         git_ok(&rs_target, &["diff-files", "--name-only"]),
         git_ok(&git_target, &["diff-files", "--name-only"]),

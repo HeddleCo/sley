@@ -1344,6 +1344,17 @@ fn run_combined_request(
 
     if output.name_only {
         for path in &paths {
+            if context.options.combined_all_paths {
+                for parent in &path.parents {
+                    let parent_path = &parent.path;
+                    if context.options.z {
+                        stdout.write_all(parent_path)?;
+                        stdout.write_all(b"\0")?;
+                    } else {
+                        write!(stdout, "{}\t", status_quote_path(parent_path, false))?;
+                    }
+                }
+            }
             if context.options.z {
                 stdout.write_all(&path.path)?;
                 stdout.write_all(b"\0")?;
@@ -1355,7 +1366,12 @@ fn run_combined_request(
     }
     if output.name_status {
         for path in &paths {
-            commands::combined::write_combined_name_status(stdout, path, context.options.z)?;
+            commands::combined::write_combined_name_status(
+                stdout,
+                path,
+                context.options.combined_all_paths,
+                context.options.z,
+            )?;
         }
         wrote_block |= !paths.is_empty();
     }

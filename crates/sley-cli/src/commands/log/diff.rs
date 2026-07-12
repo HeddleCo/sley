@@ -524,7 +524,7 @@ impl LogDiffContext<'_> {
         }
         if opts.name_status {
             for path in &paths {
-                commands::combined::write_combined_name_status(out, path, false)?;
+                commands::combined::write_combined_name_status(out, path, false, false)?;
             }
         }
         if opts.name_only {

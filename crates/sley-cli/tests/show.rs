@@ -21,6 +21,26 @@ fn unique_temp_dir(name: &str) -> PathBuf {
     path
 }
 
+#[test]
+fn show_uses_diff_interhunk_context_config() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("show-interhunk-context");
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    git_ok(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("file"), b"A\n1\n2\n3\n4\n5\n6\n7\nB\n").expect("write base");
+    git_ok(&repo, &["add", "file"]);
+    git_ok(&repo, &["commit", "-qm", "base"]);
+    fs::write(repo.join("file"), b"X\n1\n2\n3\n4\n5\n6\n7\nY\n").expect("write change");
+    git_ok(&repo, &["commit", "-qam", "change"]);
+    git_ok(&repo, &["config", "diff.interHunkContext", "1"]);
+
+    assert_same(&repo, &["show", "HEAD"]);
+    fs::remove_dir_all(&root).ok();
+}
+
 /// Run a program with the fixed author/committer identity and date the task
 /// mandates, so object ids and dates are reproducible across both binaries.
 fn run_env(program: &str, cwd: &Path, args: &[&str]) -> Output {

@@ -87,6 +87,8 @@ struct ShowOptions {
     first_parent: bool,
     /// `--combined-all-paths` (only meaningful with `-c`/`--cc`).
     combined_all_paths: bool,
+    /// Configured `diff.interHunkContext` used by patch rendering.
+    interhunk: usize,
     /// Whether the `commit <oid>` line (medium/full-oneline) uses an abbreviated
     /// oid. `--oneline` always abbreviates regardless of this flag.
     abbrev_commit: bool,
@@ -292,6 +294,7 @@ impl Default for ShowOptions {
             merge_mode: None,
             first_parent: false,
             combined_all_paths: false,
+            interhunk: 0,
             abbrev_commit: false,
             abbrev_len: Some(7),
             stat: false,
@@ -422,6 +425,8 @@ pub(crate) fn cmd_show(cli_session: &crate::session::CliSession, args: &[String]
     let git_dir = repository.git_dir();
     let format = repository.object_format();
     let config = repo.config();
+    options.interhunk =
+        super::diff::resolve_diff_interhunk_context(None, Some(&repo), cli_session)?;
     let db = repository.object_database();
     show_profile_mark(
         profile_enabled,
@@ -1371,13 +1376,23 @@ fn write_show_combined(
     match options.diff_mode {
         ShowDiffMode::NameOnly => {
             for path in &paths {
+                if options.combined_all_paths {
+                    for parent in &path.parents {
+                        write!(stdout, "{}\t", status_quote_path(&parent.path, false))?;
+                    }
+                }
                 writeln!(stdout, "{}", status_quote_path(&path.path, false))?;
             }
             return Ok(());
         }
         ShowDiffMode::NameStatus => {
             for path in &paths {
-                commands::combined::write_combined_name_status(stdout, path, false)?;
+                commands::combined::write_combined_name_status(
+                    stdout,
+                    path,
+                    options.combined_all_paths,
+                    false,
+                )?;
             }
             return Ok(());
         }
@@ -1638,7 +1653,7 @@ fn write_commit_diff_patch(
                     submodule_dirt: None,
                     ws_error: None,
                     color_moved: None,
-                    interhunk: 0,
+                    interhunk: options.interhunk,
                     ws_ignore: options.ws_ignore,
                     diff_algorithm: options.diff_algorithm,
                     ignore_blank_lines: options.ignore_blank_lines,

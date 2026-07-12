@@ -43,6 +43,8 @@ const CONTEXT_VALUE_MASK: usize = !FUNCTION_CONTEXT_FLAG;
 pub enum InterHunkContextError {
     /// The value is not a Git integer, including an overflowing unit suffix.
     InvalidNumericValue,
+    /// The value is numeric but does not fit Git's C `int` config type.
+    OutOfRange,
     /// Inter-hunk context cannot be negative.
     NegativeValue,
 }
@@ -51,6 +53,7 @@ impl fmt::Display for InterHunkContextError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidNumericValue => f.write_str("invalid inter-hunk context integer"),
+            Self::OutOfRange => f.write_str("inter-hunk context integer is out of range"),
             Self::NegativeValue => f.write_str("inter-hunk context cannot be negative"),
         }
     }
@@ -68,8 +71,16 @@ pub fn resolve_interhunk_context(
 ) -> Result<usize, InterHunkContextError> {
     let configured = match config_value {
         Some(value) => {
-            let parsed = sley_config::parse_config_int(value)
-                .ok_or(InterHunkContextError::InvalidNumericValue)?;
+            let parsed = sley_config::parse_config_int(value).ok_or_else(|| {
+                if config_int_looks_numeric(value) {
+                    InterHunkContextError::OutOfRange
+                } else {
+                    InterHunkContextError::InvalidNumericValue
+                }
+            })?;
+            if i32::try_from(parsed).is_err() {
+                return Err(InterHunkContextError::OutOfRange);
+            }
             if parsed < 0 {
                 return Err(InterHunkContextError::NegativeValue);
             }
@@ -78,6 +89,27 @@ pub fn resolve_interhunk_context(
         None => None,
     };
     Ok(cli_value.or(configured).unwrap_or(0))
+}
+
+fn config_int_looks_numeric(value: &str) -> bool {
+    let trimmed = value.trim();
+    let digits = match trimmed.as_bytes().last() {
+        Some(b'k' | b'K' | b'm' | b'M' | b'g' | b'G') => {
+            &trimmed[..trimmed.len().saturating_sub(1)]
+        }
+        _ => trimmed,
+    };
+    let digits = digits.strip_prefix(['+', '-']).unwrap_or(digits);
+    if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        digits.bytes().all(|byte| matches!(byte, b'0'..=b'7'))
+    } else {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    }
 }
 
 /// Encode `-W` / `--function-context` into the context field without changing
