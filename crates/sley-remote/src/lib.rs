@@ -58,6 +58,12 @@ pub use http::{
     new_http_client, HttpOperationBatch,
     remote_url_is_http,
 };
+// Re-export the smart-HTTP client seam so out-of-crate hosts (e.g. weft) can
+// implement [`HttpClient`] to enforce network policy on the dial without a
+// direct `sley-transport` dependency. See `fetch_with_http_client` /
+// `clone_with_http_client`.
+#[cfg(feature = "http")]
+pub use sley_transport::{HttpClient, HttpResponse, UreqHttpClient};
 
 mod ssh;
 pub use ssh::{
@@ -115,6 +121,8 @@ pub use fetch::{
     retain_missing_auto_follow_tags, write_default_fetch_head, write_fetch_head,
     write_fetch_head_records,
 };
+#[cfg(feature = "http")]
+pub use fetch::fetch_with_http_client;
 
 mod pack;
 pub use pack::{
@@ -140,6 +148,8 @@ pub use ls_remote::{LsRemoteFilter, LsRemoteRecord, LsRemoteSource, ls_remote};
 
 mod clone;
 pub use clone::{CloneOptions, CloneOutcome, CloneRequest, CloneServices, CloneSource, clone};
+#[cfg(feature = "http")]
+pub use clone::clone_with_http_client;
 
 mod bundle;
 pub use bundle::{FetchBundleRequest, fetch_bundle};

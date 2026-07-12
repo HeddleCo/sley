@@ -414,8 +414,8 @@ fn request_replays_shallow_boundary(
     deepen.is_some() || deepen_since.is_some() || !deepen_not.is_empty()
 }
 
-fn http_protocol_v2_ls_refs_advertisements(
-    client: &UreqHttpClient,
+fn http_protocol_v2_ls_refs_advertisements<C: HttpClient + ?Sized>(
+    client: &C,
     remote: &RemoteUrl,
     format: ObjectFormat,
     service: GitService,
@@ -443,8 +443,8 @@ fn http_protocol_v2_ls_refs_advertisements(
 
 /// Fetch and parse the ref advertisements for `service` from the smart-HTTP
 /// info/refs endpoint, authenticating and validating status + content type.
-pub fn http_service_advertisements(
-    client: &UreqHttpClient,
+pub fn http_service_advertisements<C: HttpClient + ?Sized>(
+    client: &C,
     remote: &RemoteUrl,
     format: ObjectFormat,
     service: GitService,
@@ -483,8 +483,8 @@ pub fn http_service_advertisements(
 }
 
 /// The upload-pack ref advertisements and parsed features for `remote`.
-pub fn http_upload_pack_advertisements(
-    client: &UreqHttpClient,
+pub fn http_upload_pack_advertisements<C: HttpClient + ?Sized>(
+    client: &C,
     remote: &RemoteUrl,
     format: ObjectFormat,
     credentials: &mut dyn CredentialProvider,
@@ -535,8 +535,8 @@ pub fn http_upload_pack_features(
 /// response with its body still unread, so the caller can parse the packfile
 /// stream (with or without a leading shallow-info section). Authenticates and
 /// validates status + content type.
-fn http_upload_pack_post(
-    client: &UreqHttpClient,
+fn http_upload_pack_post<C: HttpClient + ?Sized>(
+    client: &C,
     remote: &RemoteUrl,
     request: &UploadPackRequest,
     haves: Vec<ObjectId>,
@@ -571,8 +571,8 @@ fn http_upload_pack_post(
 /// read back the sectioned response. Authenticates and validates status + content
 /// type. When the server advertises `sideband-all`, the request and response use
 /// the sideband-all wire form.
-pub fn http_protocol_v2_fetch_response(
-    client: &UreqHttpClient,
+pub fn http_protocol_v2_fetch_response<C: HttpClient + ?Sized>(
+    client: &C,
     remote: &RemoteUrl,
     format: ObjectFormat,
     handshake: &TransportHandshake,
@@ -598,8 +598,8 @@ pub fn http_protocol_v2_fetch_response(
     }
 }
 
-fn http_protocol_v2_fetch_post(
-    client: &UreqHttpClient,
+fn http_protocol_v2_fetch_post<C: HttpClient + ?Sized>(
+    client: &C,
     remote: &RemoteUrl,
     format: ObjectFormat,
     handshake: &TransportHandshake,
@@ -638,9 +638,11 @@ fn http_protocol_v2_fetch_post(
 /// entries are the server's shallow-info updates the caller must fold into
 /// `$GIT_DIR/shallow` (see [`crate::apply_shallow_info`]); they are empty for a
 /// non-deepen fetch.
-pub struct HttpFetchPackRequest<'a> {
-    /// HTTP client used for smart-HTTP RPCs.
-    pub client: &'a UreqHttpClient,
+pub struct HttpFetchPackRequest<'a, C: HttpClient + ?Sized> {
+    /// HTTP client used for smart-HTTP RPCs. Generic over [`HttpClient`] so a host
+    /// can inject a network-policy-enforcing client (e.g. an SSRF guard); the
+    /// default fetch/clone path uses [`UreqHttpClient`].
+    pub client: &'a C,
     /// Local repository `$GIT_DIR`.
     pub git_dir: &'a Path,
     /// Local repository object format.
@@ -674,8 +676,8 @@ pub struct HttpFetchPackRequest<'a> {
     pub omit_haves: bool,
 }
 
-pub fn install_fetch_pack_via_http_upload_pack(
-    request: HttpFetchPackRequest<'_>,
+pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
+    request: HttpFetchPackRequest<'_, C>,
     credentials: &mut dyn CredentialProvider,
     progress: &mut dyn ProgressSink,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
@@ -761,8 +763,8 @@ pub fn install_fetch_pack_via_http_upload_pack(
     Ok(shallow_info)
 }
 
-pub fn install_fetch_pack_via_http_protocol_v2_fetch(
-    request: HttpFetchPackRequest<'_>,
+pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
+    request: HttpFetchPackRequest<'_, C>,
     handshake: &TransportHandshake,
     credentials: &mut dyn CredentialProvider,
     progress: &mut dyn ProgressSink,
@@ -856,6 +858,78 @@ mod tests {
         write_protocol_v2_ls_refs_response, ProtocolV2FetchResponseSection,
         ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRecord, ProtocolVersion, RefAdvertisement,
     };
+
+    /// An [`HttpClient`] double that records POST dials and returns a canned
+    /// upload-pack RPC result. Proves the smart-HTTP pack-fetch POST is driven by
+    /// the injected client, not a crate-constructed ureq one.
+    struct PostRecorder {
+        result_content_type: String,
+        post_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HttpClient for PostRecorder {
+        fn get(&self, _url: &str, _headers: &[(&str, &str)]) -> Result<HttpResponse> {
+            Err(GitError::Command("recording client received an unexpected GET".into()))
+        }
+
+        fn post(
+            &self,
+            _url: &str,
+            _content_type: &str,
+            _headers: &[(&str, &str)],
+            _body: &[u8],
+        ) -> Result<HttpResponse> {
+            self.post_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(HttpResponse {
+                status: 200,
+                content_type: Some(self.result_content_type.clone()),
+                body: Box::new(std::io::Cursor::new(Vec::new())),
+            })
+        }
+    }
+
+    #[test]
+    fn http_upload_pack_post_uses_injected_client() {
+        let recorder = PostRecorder {
+            result_content_type: smart_http_rpc_result_content_type(GitService::UploadPack)
+                .expect("content type"),
+            post_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let remote = parse_remote_url("http://example.invalid/repo.git").expect("url");
+        let want = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("oid");
+        let request = UploadPackRequest {
+            wants: vec![want],
+            capabilities: Vec::new(),
+            shallow: Vec::new(),
+            deepen: None,
+            deepen_since: None,
+            deepen_not: Vec::new(),
+            filter: None,
+        };
+        let mut credentials = crate::NoCredentials;
+        let response = http_upload_pack_post(
+            &recorder,
+            &remote,
+            &request,
+            Vec::new(),
+            &mut credentials,
+            None,
+        )
+        .expect("post via injected client should succeed");
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            recorder
+                .post_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the injected client must own the pack-fetch POST dial"
+        );
+    }
 
     fn sample_v2_handshake() -> TransportHandshake {
         TransportHandshake {
