@@ -1,10 +1,11 @@
 [package]
 name = "sley-unpack-trees"
-publish = false
+description = "Native-Rust unpack-trees engine for sley: N-way tree merge and index/worktree materialization (checkout, read-tree, sparse-checkout)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 sley-core.workspace = true
