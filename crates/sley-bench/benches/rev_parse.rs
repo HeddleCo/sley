@@ -1,5 +1,6 @@
-use criterion::{BenchmarkId, Criterion, SamplingMode, Throughput, black_box, criterion_group, criterion_main};
-use std::time::Duration;
+use criterion::{
+    BenchmarkId, Criterion, SamplingMode, Throughput, black_box, criterion_group, criterion_main,
+};
 use sley_bench::{
     BenchFixture, FIXTURE_OBJECT_COUNT, LARGE_FIXTURE_OBJECT_COUNT, MEDIUM_FIXTURE_OBJECT_COUNT,
     create_fixture, create_fixture_with_count,
@@ -10,6 +11,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 fn run_sley(cwd: &Path, args: &[&str], stdin: &[u8]) -> Result<Vec<u8>> {
     let mut child = Command::new(env!("SLEY_BENCH_BIN"))
@@ -52,18 +54,22 @@ fn fixture() -> &'static BenchFixture {
 
 fn medium_fixture() -> &'static BenchFixture {
     static FIXTURE: OnceLock<BenchFixture> = OnceLock::new();
-    FIXTURE.get_or_init(|| match create_fixture_with_count(MEDIUM_FIXTURE_OBJECT_COUNT) {
-        Ok(fixture) => fixture,
-        Err(err) => panic!("medium benchmark fixture setup failed: {err}"),
-    })
+    FIXTURE.get_or_init(
+        || match create_fixture_with_count(MEDIUM_FIXTURE_OBJECT_COUNT) {
+            Ok(fixture) => fixture,
+            Err(err) => panic!("medium benchmark fixture setup failed: {err}"),
+        },
+    )
 }
 
 fn large_fixture() -> &'static BenchFixture {
     static FIXTURE: OnceLock<BenchFixture> = OnceLock::new();
-    FIXTURE.get_or_init(|| match create_fixture_with_count(LARGE_FIXTURE_OBJECT_COUNT) {
-        Ok(fixture) => fixture,
-        Err(err) => panic!("large benchmark fixture setup failed: {err}"),
-    })
+    FIXTURE.get_or_init(
+        || match create_fixture_with_count(LARGE_FIXTURE_OBJECT_COUNT) {
+            Ok(fixture) => fixture,
+            Err(err) => panic!("large benchmark fixture setup failed: {err}"),
+        },
+    )
 }
 
 fn rev_parse_oid_resolve(c: &mut Criterion) {

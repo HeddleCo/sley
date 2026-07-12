@@ -118,6 +118,19 @@ fn pkt_line_rejects_invalid_lengths() {
 }
 
 #[test]
+fn pkt_line_stream_reports_partial_header_and_body_counts() {
+    let header_error = read_pkt_line_frame(&mut &b"00"[..])
+        .expect_err("partial length header must fail")
+        .to_string();
+    assert!(header_error.contains("2 bytes of length header were received"));
+
+    let body_error = read_pkt_line_frame(&mut &b"0008ab"[..])
+        .expect_err("partial body must fail")
+        .to_string();
+    assert!(body_error.contains("2 bytes of body are still expected"));
+}
+
+#[test]
 fn pkt_line_rejects_oversized_data() {
     let payload = vec![b'x'; PKT_LINE_MAX_PAYLOAD_LEN + 1];
     assert!(PktLineFrame::data(payload.clone()).is_err());
@@ -171,10 +184,12 @@ fn protocol_error_lines_reject_malformed_messages() {
     assert!(parse_error_line(b"ERR \n").is_err());
     assert!(parse_error_line(b"ERR bad\0message\n").is_err());
     assert!(parse_error_line(b"NAK\n").is_err());
-    assert!(encode_error_line(&ProtocolErrorLine {
-        message: "bad\nmessage".into(),
-    })
-    .is_err());
+    assert!(
+        encode_error_line(&ProtocolErrorLine {
+            message: "bad\nmessage".into(),
+        })
+        .is_err()
+    );
     assert!(read_error_line(&mut &b"0000"[..]).is_err());
 }
 
@@ -289,14 +304,16 @@ fn refspec_parser_rejects_malformed_values() {
     assert!(parse_refspec("refs/heads/**:refs/remotes/origin/*").is_err());
     assert!(parse_refspec("refs/heads/main:refs/remotes/origin/main:extra").is_err());
     assert!(parse_refspec("refs/heads/main\n").is_err());
-    assert!(encode_refspec(&RefSpec {
-        force: false,
-        negative: false,
-        src: Some("refs/heads/*".into()),
-        dst: Some("refs/remotes/origin/main".into()),
-        pattern: true,
-    })
-    .is_err());
+    assert!(
+        encode_refspec(&RefSpec {
+            force: false,
+            negative: false,
+            src: Some("refs/heads/*".into()),
+            dst: Some("refs/remotes/origin/main".into()),
+            pattern: true,
+        })
+        .is_err()
+    );
 }
 
 #[test]
@@ -378,27 +395,33 @@ fn fetch_head_records_streams_round_trip() {
 
 #[test]
 fn fetch_head_records_reject_malformed_lines() {
-    assert!(parse_fetch_head(
-        ObjectFormat::Sha1,
-        b"1111111111111111111111111111111111111111\t\tbranch 'main'"
-    )
-    .is_err());
-    assert!(parse_fetch_head(
-        ObjectFormat::Sha1,
-        b"1111111111111111111111111111111111111111\tfor-merge\tbranch 'main'\n"
-    )
-    .is_err());
-    assert!(parse_fetch_head(ObjectFormat::Sha1, b"not-a-hash\t\tbranch 'main'\n").is_err());
-    assert!(encode_fetch_head(&[FetchHeadRecord {
-        oid: ObjectId::from_hex(
+    assert!(
+        parse_fetch_head(
             ObjectFormat::Sha1,
-            "1111111111111111111111111111111111111111"
+            b"1111111111111111111111111111111111111111\t\tbranch 'main'"
         )
-        .expect("test operation should succeed"),
-        not_for_merge: false,
-        description: "bad\ndescription".into(),
-    }])
-    .is_err());
+        .is_err()
+    );
+    assert!(
+        parse_fetch_head(
+            ObjectFormat::Sha1,
+            b"1111111111111111111111111111111111111111\tfor-merge\tbranch 'main'\n"
+        )
+        .is_err()
+    );
+    assert!(parse_fetch_head(ObjectFormat::Sha1, b"not-a-hash\t\tbranch 'main'\n").is_err());
+    assert!(
+        encode_fetch_head(&[FetchHeadRecord {
+            oid: ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111"
+            )
+            .expect("test operation should succeed"),
+            not_for_merge: false,
+            description: "bad\ndescription".into(),
+        }])
+        .is_err()
+    );
 }
 
 #[test]
@@ -431,7 +454,8 @@ fn fetch_planner_maps_direct_pattern_and_negative_refspecs() {
         parse_refspec("^refs/heads/tmp").expect("test operation should succeed"),
     ];
     assert_eq!(
-        plan_fetch_ref_updates(&refs, &refspecs, false).expect("test operation should succeed"),
+        plan_fetch_ref_updates(ObjectFormat::Sha1, &refs, &refspecs, false)
+            .expect("test operation should succeed"),
         vec![FetchRefUpdate {
             src: "refs/heads/main".into(),
             dst: Some("refs/remotes/origin/main".into()),
@@ -461,11 +485,11 @@ fn fetch_planner_autofollows_tags_and_builds_fetch_head_records() {
             capabilities: Vec::new(),
         },
     ];
-    let refspecs =
-        vec![parse_refspec("refs/heads/main:refs/heads/main")
-            .expect("test operation should succeed")];
-    let updates =
-        plan_fetch_ref_updates(&refs, &refspecs, true).expect("test operation should succeed");
+    let refspecs = vec![
+        parse_refspec("refs/heads/main:refs/heads/main").expect("test operation should succeed"),
+    ];
+    let updates = plan_fetch_ref_updates(ObjectFormat::Sha1, &refs, &refspecs, true)
+        .expect("test operation should succeed");
     assert_eq!(
         updates,
         vec![
@@ -514,18 +538,24 @@ fn fetch_planner_rejects_missing_or_sourceless_refspecs() {
         name: "refs/heads/main".into(),
         capabilities: Vec::new(),
     }];
-    assert!(plan_fetch_ref_updates(
-        &refs,
-        &[parse_refspec("refs/heads/missing").expect("test operation should succeed")],
-        false
-    )
-    .is_err());
-    assert!(plan_fetch_ref_updates(
-        &refs,
-        &[parse_refspec(":refs/heads/main").expect("test operation should succeed")],
-        false
-    )
-    .is_err());
+    assert!(
+        plan_fetch_ref_updates(
+            ObjectFormat::Sha1,
+            &refs,
+            &[parse_refspec("refs/heads/missing").expect("test operation should succeed")],
+            false
+        )
+        .is_err()
+    );
+    assert!(
+        plan_fetch_ref_updates(
+            ObjectFormat::Sha1,
+            &refs,
+            &[parse_refspec(":refs/heads/main").expect("test operation should succeed")],
+            false
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -550,7 +580,7 @@ fn fetch_planner_sourceless_positive_refspec_returns_err_not_panic() {
         dst: Some("refs/heads/main".into()),
         pattern: false,
     };
-    let result = plan_fetch_ref_updates(&refs, &[malformed], false);
+    let result = plan_fetch_ref_updates(ObjectFormat::Sha1, &refs, &[malformed], false);
     assert!(
         result.is_err(),
         "sourceless positive refspec must yield Err, got {result:?}"
@@ -680,13 +710,15 @@ fn push_planner_builds_wildcard_commands_and_rejects_bad_refspecs() {
             name: "refs/heads/review/topic".into(),
         }]
     );
-    assert!(plan_push_commands(
-        ObjectFormat::Sha1,
-        &local_refs,
-        &[],
-        &[parse_refspec("^refs/heads/topic").expect("test operation should succeed")],
-    )
-    .is_err());
+    assert!(
+        plan_push_commands(
+            ObjectFormat::Sha1,
+            &local_refs,
+            &[],
+            &[parse_refspec("^refs/heads/topic").expect("test operation should succeed")],
+        )
+        .is_err()
+    );
     assert_eq!(
         plan_push_commands(
             ObjectFormat::Sha1,
@@ -820,30 +852,36 @@ fn receive_pack_push_request_builder_handles_delete_only_and_rejects_unadvertise
     );
     assert!(request.packfile.is_empty());
 
-    assert!(build_receive_pack_push_request(
-        &ReceivePackFeatures::default(),
-        request.commands.commands.clone(),
-        Vec::new(),
-        ReceivePackPushRequestOptions::default(),
-    )
-    .is_err());
-    assert!(build_receive_pack_push_request(
-        &features,
-        request.commands.commands,
-        b"PACK".to_vec(),
-        ReceivePackPushRequestOptions::default(),
-    )
-    .is_err());
-    assert!(build_receive_pack_push_request(
-        &features,
-        Vec::new(),
-        Vec::new(),
-        ReceivePackPushRequestOptions {
-            push_options: vec!["ci.skip".into()],
-            ..ReceivePackPushRequestOptions::default()
-        },
-    )
-    .is_err());
+    assert!(
+        build_receive_pack_push_request(
+            &ReceivePackFeatures::default(),
+            request.commands.commands.clone(),
+            Vec::new(),
+            ReceivePackPushRequestOptions::default(),
+        )
+        .is_err()
+    );
+    assert!(
+        build_receive_pack_push_request(
+            &features,
+            request.commands.commands,
+            b"PACK".to_vec(),
+            ReceivePackPushRequestOptions::default(),
+        )
+        .is_err()
+    );
+    assert!(
+        build_receive_pack_push_request(
+            &features,
+            Vec::new(),
+            Vec::new(),
+            ReceivePackPushRequestOptions {
+                push_options: vec!["ci.skip".into()],
+                ..ReceivePackPushRequestOptions::default()
+            },
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -945,17 +983,21 @@ fn smart_http_helpers_reject_invalid_services_paths_and_content_types() {
     assert!(dumb_http_pack_index_path("/repo.git?query", &oid).is_err());
     assert!(smart_http_info_refs_path("/repo.git", GitService::UploadArchive).is_err());
     assert!(smart_http_advertisement_content_type(GitService::UploadArchive).is_err());
-    assert!(parse_smart_http_advertisement_content_type(
-        "application/x-git-upload-archive-advertisement"
-    )
-    .is_err());
+    assert!(
+        parse_smart_http_advertisement_content_type(
+            "application/x-git-upload-archive-advertisement"
+        )
+        .is_err()
+    );
     assert!(
         parse_smart_http_rpc_request_content_type("application/x-git-upload-pack-result").is_err()
     );
-    assert!(parse_smart_http_rpc_result_content_type(
-        "application/x-git-receive-pack-result; charset=utf-8"
-    )
-    .is_err());
+    assert!(
+        parse_smart_http_rpc_result_content_type(
+            "application/x-git-receive-pack-result; charset=utf-8"
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1085,28 +1127,36 @@ fn sideband_packets_reject_bad_channels_and_oversize_payloads() {
     assert!(parse_sideband_packet(b"\x04bad").is_err());
     assert!(parse_sideband_stream(&[PktLineFrame::Data(vec![1, b'P', b'A', b'C', b'K'])]).is_err());
     assert!(parse_sideband_stream(&[PktLineFrame::Delimiter, PktLineFrame::Flush]).is_err());
-    assert!(parse_sideband_stream(&[
-        PktLineFrame::Data(vec![1, b'P', b'A']),
-        PktLineFrame::Flush,
-        PktLineFrame::Data(vec![1, b'C', b'K']),
-    ])
-    .is_err());
-    assert!(parse_sideband_stream(&[
-        PktLineFrame::Data(vec![1, b'P', b'A']),
-        PktLineFrame::Data(b"\x04bad".to_vec()),
-        PktLineFrame::Flush,
-    ])
-    .is_err());
-    assert!(encode_sideband_packet(&SideBandPacket {
-        channel: SideBandChannel::Data,
-        data: vec![0; PKT_LINE_MAX_PAYLOAD_LEN],
-    })
-    .is_err());
-    assert!(demux_sideband_packets(&[SideBandPacket {
-        channel: SideBandChannel::Fatal,
-        data: b"remote died\n".to_vec(),
-    }])
-    .is_err());
+    assert!(
+        parse_sideband_stream(&[
+            PktLineFrame::Data(vec![1, b'P', b'A']),
+            PktLineFrame::Flush,
+            PktLineFrame::Data(vec![1, b'C', b'K']),
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_sideband_stream(&[
+            PktLineFrame::Data(vec![1, b'P', b'A']),
+            PktLineFrame::Data(b"\x04bad".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err()
+    );
+    assert!(
+        encode_sideband_packet(&SideBandPacket {
+            channel: SideBandChannel::Data,
+            data: vec![0; PKT_LINE_MAX_PAYLOAD_LEN],
+        })
+        .is_err()
+    );
+    assert!(
+        demux_sideband_packets(&[SideBandPacket {
+            channel: SideBandChannel::Fatal,
+            data: b"remote died\n".to_vec(),
+        }])
+        .is_err()
+    );
 }
 
 #[test]
@@ -1149,21 +1199,27 @@ fn upload_archive_request_streams_round_trip() {
 #[test]
 fn upload_archive_request_rejects_malformed_streams() {
     assert!(parse_upload_archive_request(&[PktLineFrame::Flush]).is_err());
-    assert!(parse_upload_archive_request(&[
-        PktLineFrame::Data(b"--format=tar\n".to_vec()),
-        PktLineFrame::Flush,
-    ])
-    .is_err());
-    assert!(parse_upload_archive_request(&[
-        PktLineFrame::Data(b"argument HEAD\n".to_vec()),
-        PktLineFrame::Delimiter,
-        PktLineFrame::Flush,
-    ])
-    .is_err());
-    assert!(encode_upload_archive_request(&UploadArchiveRequest {
-        arguments: vec!["bad\narg".into()],
-    })
-    .is_err());
+    assert!(
+        parse_upload_archive_request(&[
+            PktLineFrame::Data(b"--format=tar\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_upload_archive_request(&[
+            PktLineFrame::Data(b"argument HEAD\n".to_vec()),
+            PktLineFrame::Delimiter,
+            PktLineFrame::Flush,
+        ])
+        .is_err()
+    );
+    assert!(
+        encode_upload_archive_request(&UploadArchiveRequest {
+            arguments: vec!["bad\narg".into()],
+        })
+        .is_err()
+    );
 }
 
 #[test]
@@ -1244,23 +1300,29 @@ fn upload_archive_response_streams_round_trip() {
 #[test]
 fn upload_archive_response_rejects_malformed_streams() {
     assert!(parse_upload_archive_response(&[]).is_err());
-    assert!(parse_upload_archive_response(&[
-        PktLineFrame::Data(b"ACK\n".to_vec()),
-        PktLineFrame::Flush,
-        PktLineFrame::Data(b"\x01tail".to_vec()),
-    ])
-    .is_err());
-    assert!(parse_upload_archive_response(&[
-        PktLineFrame::Data(b"NACK\n".to_vec()),
-        PktLineFrame::Flush,
-    ])
-    .is_err());
-    assert!(parse_upload_archive_response(&[
-        PktLineFrame::Data(b"NACK denied\n".to_vec()),
-        PktLineFrame::Data(b"\x02extra\n".to_vec()),
-        PktLineFrame::Flush,
-    ])
-    .is_err());
+    assert!(
+        parse_upload_archive_response(&[
+            PktLineFrame::Data(b"ACK\n".to_vec()),
+            PktLineFrame::Flush,
+            PktLineFrame::Data(b"\x01tail".to_vec()),
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_upload_archive_response(&[
+            PktLineFrame::Data(b"NACK\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_upload_archive_response(&[
+            PktLineFrame::Data(b"NACK denied\n".to_vec()),
+            PktLineFrame::Data(b"\x02extra\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err()
+    );
     assert!(
         encode_upload_archive_response(&UploadArchiveResponse::Nack {
             message: "bad\nmessage".into(),
@@ -1306,11 +1368,13 @@ fn capabilities_reject_empty_or_delimited_fields() {
     assert!(parse_capabilities(b"multi_ack  thin-pack").is_err());
     assert!(parse_capabilities(b"agent=").is_err());
     assert!(parse_capabilities(b"symref=HEAD:refs/heads/main\nbad").is_err());
-    assert!(encode_capabilities(&[Capability {
-        name: "bad name".into(),
-        value: None,
-    }])
-    .is_err());
+    assert!(
+        encode_capabilities(&[Capability {
+            name: "bad name".into(),
+            value: None,
+        }])
+        .is_err()
+    );
 }
 
 #[test]
@@ -1327,27 +1391,33 @@ fn protocol_v2_object_format_uses_capability_or_defaults_to_sha1() {
         .expect("test operation should succeed"),
         ObjectFormat::Sha256
     );
-    assert!(protocol_v2_object_format(&[Capability {
-        name: "object-format".into(),
-        value: None,
-    }])
-    .is_err());
-    assert!(protocol_v2_object_format(&[
-        Capability {
+    assert!(
+        protocol_v2_object_format(&[Capability {
             name: "object-format".into(),
-            value: Some("sha1".into()),
-        },
-        Capability {
+            value: None,
+        }])
+        .is_err()
+    );
+    assert!(
+        protocol_v2_object_format(&[
+            Capability {
+                name: "object-format".into(),
+                value: Some("sha1".into()),
+            },
+            Capability {
+                name: "object-format".into(),
+                value: Some("sha256".into()),
+            },
+        ])
+        .is_err()
+    );
+    assert!(
+        protocol_v2_object_format(&[Capability {
             name: "object-format".into(),
-            value: Some("sha256".into()),
-        },
-    ])
-    .is_err());
-    assert!(protocol_v2_object_format(&[Capability {
-        name: "object-format".into(),
-        value: Some("unknown".into()),
-    }])
-    .is_err());
+            value: Some("unknown".into()),
+        }])
+        .is_err()
+    );
 }
 
 #[test]
@@ -1387,51 +1457,59 @@ fn protocol_v2_command_request_capabilities_validate_against_handshake() {
         },
     )
     .expect("test operation should succeed");
-    assert!(validate_protocol_v2_command_request_capabilities(
-        &handshake,
-        &ProtocolV2CommandRequest {
-            command: "ls-refs".into(),
-            capabilities: Vec::new(),
-            arguments: Vec::new(),
-        },
-    )
-    .is_err());
-    assert!(validate_protocol_v2_command_request_capabilities(
-        &handshake,
-        &ProtocolV2CommandRequest {
-            command: "fetch".into(),
-            capabilities: vec![Capability {
-                name: "server-option".into(),
-                value: None,
-            }],
-            arguments: Vec::new(),
-        },
-    )
-    .is_err());
-    assert!(validate_protocol_v2_command_request_capabilities(
-        &handshake,
-        &ProtocolV2CommandRequest {
-            command: "fetch".into(),
-            capabilities: vec![Capability {
-                name: "object-format".into(),
-                value: Some("sha256".into()),
-            }],
-            arguments: Vec::new(),
-        },
-    )
-    .is_err());
-    assert!(validate_protocol_v2_command_request_capabilities(
-        &handshake,
-        &ProtocolV2CommandRequest {
-            command: "fetch".into(),
-            capabilities: vec![Capability {
-                name: "agent".into(),
-                value: None,
-            }],
-            arguments: Vec::new(),
-        },
-    )
-    .is_err());
+    assert!(
+        validate_protocol_v2_command_request_capabilities(
+            &handshake,
+            &ProtocolV2CommandRequest {
+                command: "ls-refs".into(),
+                capabilities: Vec::new(),
+                arguments: Vec::new(),
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        validate_protocol_v2_command_request_capabilities(
+            &handshake,
+            &ProtocolV2CommandRequest {
+                command: "fetch".into(),
+                capabilities: vec![Capability {
+                    name: "server-option".into(),
+                    value: None,
+                }],
+                arguments: Vec::new(),
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        validate_protocol_v2_command_request_capabilities(
+            &handshake,
+            &ProtocolV2CommandRequest {
+                command: "fetch".into(),
+                capabilities: vec![Capability {
+                    name: "object-format".into(),
+                    value: Some("sha256".into()),
+                }],
+                arguments: Vec::new(),
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        validate_protocol_v2_command_request_capabilities(
+            &handshake,
+            &ProtocolV2CommandRequest {
+                command: "fetch".into(),
+                capabilities: vec![Capability {
+                    name: "agent".into(),
+                    value: None,
+                }],
+                arguments: Vec::new(),
+            },
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1480,27 +1558,33 @@ fn protocol_v2_command_options_parse_and_encode_known_capabilities() {
 
 #[test]
 fn protocol_v2_command_options_reject_malformed_known_capabilities() {
-    assert!(parse_protocol_v2_command_options(&[
-        Capability {
-            name: "agent".into(),
-            value: Some("sley/0".into()),
-        },
-        Capability {
-            name: "agent".into(),
-            value: Some("sley/1".into()),
-        },
-    ])
-    .is_err());
-    assert!(parse_protocol_v2_command_options(&[Capability {
-        name: "object-format".into(),
-        value: Some("sha512".into()),
-    }])
-    .is_err());
-    assert!(parse_protocol_v2_command_options(&[Capability {
-        name: "server-option".into(),
-        value: None,
-    }])
-    .is_err());
+    assert!(
+        parse_protocol_v2_command_options(&[
+            Capability {
+                name: "agent".into(),
+                value: Some("sley/0".into()),
+            },
+            Capability {
+                name: "agent".into(),
+                value: Some("sley/1".into()),
+            },
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_protocol_v2_command_options(&[Capability {
+            name: "object-format".into(),
+            value: Some("sha512".into()),
+        }])
+        .is_err()
+    );
+    assert!(
+        parse_protocol_v2_command_options(&[Capability {
+            name: "server-option".into(),
+            value: None,
+        }])
+        .is_err()
+    );
     assert!(
         encode_protocol_v2_command_options(&ProtocolV2CommandOptions {
             extra: vec![Capability {
@@ -1542,32 +1626,38 @@ fn protocol_v2_ls_refs_features_parse_and_encode_advertisement() {
         .expect("test operation should succeed"),
         ProtocolV2LsRefsFeatures::default()
     );
-    assert!(parse_protocol_v2_ls_refs_features(&[Capability {
-        name: "fetch".into(),
-        value: Some("filter".into()),
-    }])
-    .expect("test operation should succeed")
-    .is_none());
+    assert!(
+        parse_protocol_v2_ls_refs_features(&[Capability {
+            name: "fetch".into(),
+            value: Some("filter".into()),
+        }])
+        .expect("test operation should succeed")
+        .is_none()
+    );
 }
 
 #[test]
 fn protocol_v2_ls_refs_features_reject_malformed_advertisements() {
-    assert!(parse_protocol_v2_ls_refs_features(&[
-        Capability {
+    assert!(
+        parse_protocol_v2_ls_refs_features(&[
+            Capability {
+                name: "ls-refs".into(),
+                value: None,
+            },
+            Capability {
+                name: "ls-refs".into(),
+                value: None,
+            },
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_protocol_v2_ls_refs_features(&[Capability {
             name: "ls-refs".into(),
-            value: None,
-        },
-        Capability {
-            name: "ls-refs".into(),
-            value: None,
-        },
-    ])
-    .is_err());
-    assert!(parse_protocol_v2_ls_refs_features(&[Capability {
-        name: "ls-refs".into(),
-        value: Some("unborn  custom".into()),
-    }])
-    .is_err());
+            value: Some("unborn  custom".into()),
+        }])
+        .is_err()
+    );
     assert!(
         encode_protocol_v2_ls_refs_capability(&ProtocolV2LsRefsFeatures {
             unknown: vec!["unborn".into()],
@@ -1642,29 +1732,35 @@ fn protocol_v2_fetch_features_parse_and_encode_advertisement() {
         .expect("test operation should succeed"),
         ProtocolV2FetchFeatures::default()
     );
-    assert!(parse_protocol_v2_fetch_features(&[])
-        .expect("test operation should succeed")
-        .is_none());
+    assert!(
+        parse_protocol_v2_fetch_features(&[])
+            .expect("test operation should succeed")
+            .is_none()
+    );
 }
 
 #[test]
 fn protocol_v2_fetch_features_reject_malformed_advertisements() {
-    assert!(parse_protocol_v2_fetch_features(&[
-        Capability {
+    assert!(
+        parse_protocol_v2_fetch_features(&[
+            Capability {
+                name: "fetch".into(),
+                value: None,
+            },
+            Capability {
+                name: "fetch".into(),
+                value: None,
+            },
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_protocol_v2_fetch_features(&[Capability {
             name: "fetch".into(),
-            value: None,
-        },
-        Capability {
-            name: "fetch".into(),
-            value: None,
-        },
-    ])
-    .is_err());
-    assert!(parse_protocol_v2_fetch_features(&[Capability {
-        name: "fetch".into(),
-        value: Some("filter  shallow".into()),
-    }])
-    .is_err());
+            value: Some("filter  shallow".into()),
+        }])
+        .is_err()
+    );
     assert!(
         encode_protocol_v2_fetch_capability(&ProtocolV2FetchFeatures {
             unknown: vec!["filter".into()],
@@ -1689,11 +1785,13 @@ fn protocol_v2_fetch_request_features_validate_feature_gated_arguments() {
         &features,
         &ProtocolV2FetchRequest {
             want_refs: vec!["refs/heads/main".into()],
-            shallow: vec![ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "1111111111111111111111111111111111111111",
-            )
-            .expect("test operation should succeed")],
+            shallow: vec![
+                ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .expect("test operation should succeed"),
+            ],
             deepen: Some(1),
             filter: Some("blob:none".into()),
             packfile_uris: Some("https".into()),
@@ -1710,20 +1808,21 @@ fn protocol_v2_fetch_request_features_validate_feature_gated_arguments() {
         sideband_all: true,
         ..ProtocolV2FetchRequest::default()
     };
-    assert!(validate_protocol_v2_fetch_request_features(
-        &ProtocolV2FetchFeatures::default(),
-        &request,
-    )
-    .is_err());
-    assert!(validate_protocol_v2_fetch_request_features(
-        &ProtocolV2FetchFeatures {
-            ref_in_want: true,
-            filter: true,
-            ..ProtocolV2FetchFeatures::default()
-        },
-        &request,
-    )
-    .is_err());
+    assert!(
+        validate_protocol_v2_fetch_request_features(&ProtocolV2FetchFeatures::default(), &request,)
+            .is_err()
+    );
+    assert!(
+        validate_protocol_v2_fetch_request_features(
+            &ProtocolV2FetchFeatures {
+                ref_in_want: true,
+                filter: true,
+                ..ProtocolV2FetchFeatures::default()
+            },
+            &request,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1814,11 +1913,13 @@ fn protocol_v2_object_info_request_parses_encodes_and_validates() {
 fn protocol_v2_object_info_request_streams_round_trip() {
     let request = ProtocolV2ObjectInfoRequest {
         size: true,
-        oids: vec![ObjectId::from_hex(
-            ObjectFormat::Sha1,
-            "1111111111111111111111111111111111111111",
-        )
-        .expect("test operation should succeed")],
+        oids: vec![
+            ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111",
+            )
+            .expect("test operation should succeed"),
+        ],
     };
     let mut encoded = Vec::new();
     write_protocol_v2_object_info_request(&mut encoded, &request)
@@ -1836,58 +1937,68 @@ fn protocol_v2_object_info_request_streams_round_trip() {
 
 #[test]
 fn protocol_v2_object_info_request_rejects_malformed_arguments() {
-    assert!(ProtocolV2ObjectInfoRequest::from_command_request(
-        ObjectFormat::Sha1,
-        &ProtocolV2CommandRequest {
-            command: "object-info".into(),
-            capabilities: Vec::new(),
-            arguments: vec![b"oid 1111111111111111111111111111111111111111".to_vec()],
-        },
-    )
-    .is_err());
-    assert!(ProtocolV2ObjectInfoRequest::from_command_request(
-        ObjectFormat::Sha1,
-        &ProtocolV2CommandRequest {
-            command: "object-info".into(),
-            capabilities: Vec::new(),
-            arguments: vec![b"size".to_vec(), b"size".to_vec()],
-        },
-    )
-    .is_err());
-    assert!(ProtocolV2ObjectInfoRequest::from_command_request(
-        ObjectFormat::Sha1,
-        &ProtocolV2CommandRequest {
-            command: "object-info".into(),
-            capabilities: Vec::new(),
-            arguments: vec![b"size".to_vec()],
-        },
-    )
-    .is_err());
-    assert!(ProtocolV2ObjectInfoRequest::from_command_request(
-        ObjectFormat::Sha1,
-        &ProtocolV2CommandRequest {
-            command: "object-info".into(),
-            capabilities: Vec::new(),
-            arguments: vec![b"size".to_vec(), b"oid not-an-oid".to_vec()],
-        },
-    )
-    .is_err());
-    assert!(validate_protocol_v2_object_info_command_request(
-        &TransportHandshake {
-            protocol: ProtocolVersion::V2,
-            capabilities: Vec::new(),
-        },
-        ObjectFormat::Sha1,
-        &ProtocolV2CommandRequest {
-            command: "object-info".into(),
-            capabilities: Vec::new(),
-            arguments: vec![
-                b"size".to_vec(),
-                b"oid 1111111111111111111111111111111111111111".to_vec(),
-            ],
-        },
-    )
-    .is_err());
+    assert!(
+        ProtocolV2ObjectInfoRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "object-info".into(),
+                capabilities: Vec::new(),
+                arguments: vec![b"oid 1111111111111111111111111111111111111111".to_vec()],
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        ProtocolV2ObjectInfoRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "object-info".into(),
+                capabilities: Vec::new(),
+                arguments: vec![b"size".to_vec(), b"size".to_vec()],
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        ProtocolV2ObjectInfoRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "object-info".into(),
+                capabilities: Vec::new(),
+                arguments: vec![b"size".to_vec()],
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        ProtocolV2ObjectInfoRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "object-info".into(),
+                capabilities: Vec::new(),
+                arguments: vec![b"size".to_vec(), b"oid not-an-oid".to_vec()],
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        validate_protocol_v2_object_info_command_request(
+            &TransportHandshake {
+                protocol: ProtocolVersion::V2,
+                capabilities: Vec::new(),
+            },
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "object-info".into(),
+                capabilities: Vec::new(),
+                arguments: vec![
+                    b"size".to_vec(),
+                    b"oid 1111111111111111111111111111111111111111".to_vec(),
+                ],
+            },
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1969,11 +2080,13 @@ fn protocol_v2_command_request_classifies_known_and_unknown_commands() {
         .expect("test operation should succeed"),
         ProtocolV2Command::ObjectInfo(ProtocolV2ObjectInfoRequest {
             size: true,
-            oids: vec![ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "1111111111111111111111111111111111111111",
-            )
-            .expect("test operation should succeed")],
+            oids: vec![
+                ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .expect("test operation should succeed")
+            ],
         })
     );
 
@@ -1990,16 +2103,18 @@ fn protocol_v2_command_request_classifies_known_and_unknown_commands() {
             .expect("test operation should succeed"),
         ProtocolV2Command::Unknown(unknown)
     );
-    assert!(classify_protocol_v2_command_request(
-        &handshake,
-        ObjectFormat::Sha1,
-        &ProtocolV2CommandRequest {
-            command: "not-advertised".into(),
-            capabilities: Vec::new(),
-            arguments: Vec::new(),
-        },
-    )
-    .is_err());
+    assert!(
+        classify_protocol_v2_command_request(
+            &handshake,
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "not-advertised".into(),
+                capabilities: Vec::new(),
+                arguments: Vec::new(),
+            },
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -2103,11 +2218,13 @@ fn advertised_ref_parses_lines_without_capabilities() {
 #[test]
 fn advertised_ref_rejects_malformed_payloads() {
     assert!(parse_ref_advertisement(ObjectFormat::Sha1, b"not-an-oid refs/heads/main\n").is_err());
-    assert!(parse_ref_advertisement(
-        ObjectFormat::Sha1,
-        b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\n"
-    )
-    .is_err());
+    assert!(
+        parse_ref_advertisement(
+            ObjectFormat::Sha1,
+            b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\n"
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -2285,11 +2402,13 @@ fn advertised_ref_set_streams_round_trip() {
                 value: Some("HEAD:refs/heads/main".into()),
             }],
         }],
-        shallow: vec![ObjectId::from_hex(
-            ObjectFormat::Sha1,
-            "2222222222222222222222222222222222222222",
-        )
-        .expect("test operation should succeed")],
+        shallow: vec![
+            ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "2222222222222222222222222222222222222222",
+            )
+            .expect("test operation should succeed"),
+        ],
     };
     let mut encoded = Vec::new();
     write_ref_advertisement_set(&mut encoded, &set).expect("test operation should succeed");
@@ -2306,125 +2425,152 @@ fn advertised_ref_set_streams_round_trip() {
 
 #[test]
 fn advertised_refs_reject_malformed_streams() {
-    assert!(parse_ref_advertisements(
-        ObjectFormat::Sha1,
-        &[PktLineFrame::Data(
-            b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),
-        )],
-    )
-    .is_err());
-    assert!(parse_ref_advertisements(
-        ObjectFormat::Sha1,
-        &[PktLineFrame::Delimiter, PktLineFrame::Flush],
-    )
-    .is_err());
-    assert!(parse_ref_advertisements(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),),
-            PktLineFrame::Data(
-                b"2222222222222222222222222222222222222222 refs/heads/main\0thin-pack\n".to_vec(),
-            ),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_ref_advertisement_set(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),),
-            PktLineFrame::Data(b"version 1\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_ref_advertisement_set(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"version 2\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_ref_advertisement_set(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"shallow 1111111111111111111111111111111111111111\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_ref_advertisement_set(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),),
-            PktLineFrame::Data(b"shallow not-an-oid\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_ref_advertisement_set(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),),
-            PktLineFrame::Data(b"shallow 2222222222222222222222222222222222222222\n".to_vec()),
-            PktLineFrame::Data(
-                b"3333333333333333333333333333333333333333 refs/heads/main\n".to_vec(),
-            ),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(encode_ref_advertisements(&[
-        RefAdvertisement {
+    assert!(
+        parse_ref_advertisements(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(
+                b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),
+            )],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_ref_advertisements(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Delimiter, PktLineFrame::Flush],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_ref_advertisements(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),),
+                PktLineFrame::Data(
+                    b"2222222222222222222222222222222222222222 refs/heads/main\0thin-pack\n"
+                        .to_vec(),
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_ref_advertisement_set(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),),
+                PktLineFrame::Data(b"version 1\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_ref_advertisement_set(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"version 2\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_ref_advertisement_set(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"shallow 1111111111111111111111111111111111111111\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_ref_advertisement_set(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),),
+                PktLineFrame::Data(b"shallow not-an-oid\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_ref_advertisement_set(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),),
+                PktLineFrame::Data(b"shallow 2222222222222222222222222222222222222222\n".to_vec()),
+                PktLineFrame::Data(
+                    b"3333333333333333333333333333333333333333 refs/heads/main\n".to_vec(),
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        encode_ref_advertisements(&[
+            RefAdvertisement {
+                oid: ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .expect("test operation should succeed"),
+                name: "HEAD".into(),
+                capabilities: Vec::new(),
+            },
+            RefAdvertisement {
+                oid: ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "2222222222222222222222222222222222222222",
+                )
+                .expect("test operation should succeed"),
+                name: "refs/heads/main".into(),
+                capabilities: vec![Capability {
+                    name: "thin-pack".into(),
+                    value: None,
+                }],
+            },
+        ])
+        .is_err()
+    );
+    assert!(
+        encode_ref_advertisement(&RefAdvertisement {
             oid: ObjectId::from_hex(
                 ObjectFormat::Sha1,
                 "1111111111111111111111111111111111111111",
             )
             .expect("test operation should succeed"),
-            name: "HEAD".into(),
+            name: "bad ref".into(),
             capabilities: Vec::new(),
-        },
-        RefAdvertisement {
-            oid: ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "2222222222222222222222222222222222222222",
-            )
-            .expect("test operation should succeed"),
-            name: "refs/heads/main".into(),
-            capabilities: vec![Capability {
-                name: "thin-pack".into(),
-                value: None,
-            }],
-        },
-    ])
-    .is_err());
-    assert!(encode_ref_advertisement(&RefAdvertisement {
-        oid: ObjectId::from_hex(
-            ObjectFormat::Sha1,
-            "1111111111111111111111111111111111111111",
-        )
-        .expect("test operation should succeed"),
-        name: "bad ref".into(),
-        capabilities: Vec::new(),
-    })
-    .is_err());
-    assert!(encode_ref_advertisement_set(&RefAdvertisementSet {
-        protocol: ProtocolVersion::V2,
-        refs: Vec::new(),
-        shallow: Vec::new(),
-    })
-    .is_err());
-    assert!(encode_ref_advertisement_set(&RefAdvertisementSet {
-        protocol: ProtocolVersion::V0,
-        refs: Vec::new(),
-        shallow: vec![ObjectId::from_hex(
-            ObjectFormat::Sha1,
-            "1111111111111111111111111111111111111111",
-        )
-        .expect("test operation should succeed")],
-    })
-    .is_err());
+        })
+        .is_err()
+    );
+    assert!(
+        encode_ref_advertisement_set(&RefAdvertisementSet {
+            protocol: ProtocolVersion::V2,
+            refs: Vec::new(),
+            shallow: Vec::new(),
+        })
+        .is_err()
+    );
+    assert!(
+        encode_ref_advertisement_set(&RefAdvertisementSet {
+            protocol: ProtocolVersion::V0,
+            refs: Vec::new(),
+            shallow: vec![
+                ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .expect("test operation should succeed")
+            ],
+        })
+        .is_err()
+    );
 }
 
 #[test]
@@ -2502,34 +2648,42 @@ fn dumb_http_info_refs_streams_round_trip() {
 
 #[test]
 fn dumb_http_info_refs_reject_malformed_records() {
-    assert!(parse_dumb_http_info_refs(
-        ObjectFormat::Sha1,
-        b"1111111111111111111111111111111111111111 refs/heads/main\n",
-    )
-    .is_err());
-    assert!(parse_dumb_http_info_refs(
-        ObjectFormat::Sha1,
-        b"1111111111111111111111111111111111111111\trefs/heads/main",
-    )
-    .is_err());
+    assert!(
+        parse_dumb_http_info_refs(
+            ObjectFormat::Sha1,
+            b"1111111111111111111111111111111111111111 refs/heads/main\n",
+        )
+        .is_err()
+    );
+    assert!(
+        parse_dumb_http_info_refs(
+            ObjectFormat::Sha1,
+            b"1111111111111111111111111111111111111111\trefs/heads/main",
+        )
+        .is_err()
+    );
     assert!(
         parse_dumb_http_info_refs(ObjectFormat::Sha1, b"not-an-oid\trefs/heads/main\n").is_err()
     );
-    assert!(parse_dumb_http_info_refs(
-        ObjectFormat::Sha1,
-        b"1111111111111111111111111111111111111111\tbad ref\n",
-    )
-    .is_err());
-    assert!(encode_dumb_http_info_refs(&[DumbHttpRefRecord {
-        oid: ObjectId::from_hex(
+    assert!(
+        parse_dumb_http_info_refs(
             ObjectFormat::Sha1,
-            "1111111111111111111111111111111111111111",
+            b"1111111111111111111111111111111111111111\tbad ref\n",
         )
-        .expect("test operation should succeed"),
-        name: "refs/tags/v1.0^{}".into(),
-        peeled: false,
-    }])
-    .is_err());
+        .is_err()
+    );
+    assert!(
+        encode_dumb_http_info_refs(&[DumbHttpRefRecord {
+            oid: ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111",
+            )
+            .expect("test operation should succeed"),
+            name: "refs/tags/v1.0^{}".into(),
+            peeled: false,
+        }])
+        .is_err()
+    );
 }
 
 #[test]
@@ -2628,22 +2782,28 @@ fn dumb_http_packs_streams_round_trip() {
 
 #[test]
 fn dumb_http_packs_reject_malformed_records() {
-    assert!(parse_dumb_http_packs(
-        ObjectFormat::Sha1,
-        b"P pack-1111111111111111111111111111111111111111.pack",
-    )
-    .is_err());
-    assert!(parse_dumb_http_packs(
-        ObjectFormat::Sha1,
-        b"pack-1111111111111111111111111111111111111111.pack\n",
-    )
-    .is_err());
+    assert!(
+        parse_dumb_http_packs(
+            ObjectFormat::Sha1,
+            b"P pack-1111111111111111111111111111111111111111.pack",
+        )
+        .is_err()
+    );
+    assert!(
+        parse_dumb_http_packs(
+            ObjectFormat::Sha1,
+            b"pack-1111111111111111111111111111111111111111.pack\n",
+        )
+        .is_err()
+    );
     assert!(parse_dumb_http_packs(ObjectFormat::Sha1, b"P pack-not-a-hash.pack\n",).is_err());
-    assert!(parse_dumb_http_packs(
-        ObjectFormat::Sha1,
-        b"P pack-1111111111111111111111111111111111111111.idx\n",
-    )
-    .is_err());
+    assert!(
+        parse_dumb_http_packs(
+            ObjectFormat::Sha1,
+            b"P pack-1111111111111111111111111111111111111111.idx\n",
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -2747,11 +2907,13 @@ fn upload_pack_features_parse_encode_and_validate_request() {
     );
 
     let request = UploadPackRequest {
-        wants: vec![ObjectId::from_hex(
-            ObjectFormat::Sha1,
-            "1111111111111111111111111111111111111111",
-        )
-        .expect("test operation should succeed")],
+        wants: vec![
+            ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111",
+            )
+            .expect("test operation should succeed"),
+        ],
         capabilities: vec![
             Capability {
                 name: "multi_ack_detailed".into(),
@@ -2778,11 +2940,13 @@ fn upload_pack_features_parse_encode_and_validate_request() {
                 value: Some("sley".into()),
             },
         ],
-        shallow: vec![ObjectId::from_hex(
-            ObjectFormat::Sha1,
-            "2222222222222222222222222222222222222222",
-        )
-        .expect("test operation should succeed")],
+        shallow: vec![
+            ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "2222222222222222222222222222222222222222",
+            )
+            .expect("test operation should succeed"),
+        ],
         deepen: Some(5),
         deepen_since: Some(1_710_000_000),
         deepen_not: vec!["refs/tags/base".into()],
@@ -2805,78 +2969,90 @@ fn upload_pack_features_reject_invalid_requests() {
         ..UploadPackFeatures::default()
     };
 
-    assert!(validate_upload_pack_request_features(
-        &features,
-        &UploadPackRequest {
-            wants: vec![want],
-            capabilities: vec![Capability {
-                name: "ofs-delta".into(),
+    assert!(
+        validate_upload_pack_request_features(
+            &features,
+            &UploadPackRequest {
+                wants: vec![want],
+                capabilities: vec![Capability {
+                    name: "ofs-delta".into(),
+                    value: None,
+                }],
+                ..UploadPackRequest::default()
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        validate_upload_pack_request_features(
+            &features,
+            &UploadPackRequest {
+                wants: vec![want],
+                shallow: vec![want],
+                ..UploadPackRequest::default()
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        validate_upload_pack_request_features(
+            &features,
+            &UploadPackRequest {
+                wants: vec![want],
+                filter: Some("blob:none".into()),
+                ..UploadPackRequest::default()
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        validate_upload_pack_request_features(
+            &UploadPackFeatures {
+                side_band: true,
+                side_band_64k: true,
+                ..UploadPackFeatures::default()
+            },
+            &UploadPackRequest {
+                wants: vec![want],
+                capabilities: vec![
+                    Capability {
+                        name: "side-band".into(),
+                        value: None,
+                    },
+                    Capability {
+                        name: "side-band-64k".into(),
+                        value: None,
+                    },
+                ],
+                ..UploadPackRequest::default()
+            },
+        )
+        .is_err()
+    );
+
+    assert!(
+        parse_upload_pack_features(&[
+            Capability {
+                name: "thin-pack".into(),
+                value: None,
+            },
+            Capability {
+                name: "thin-pack".into(),
+                value: None,
+            },
+        ])
+        .is_err()
+    );
+    assert!(
+        encode_upload_pack_features(&UploadPackFeatures {
+            unknown: vec![Capability {
+                name: "filter".into(),
                 value: None,
             }],
-            ..UploadPackRequest::default()
-        },
-    )
-    .is_err());
-    assert!(validate_upload_pack_request_features(
-        &features,
-        &UploadPackRequest {
-            wants: vec![want],
-            shallow: vec![want],
-            ..UploadPackRequest::default()
-        },
-    )
-    .is_err());
-    assert!(validate_upload_pack_request_features(
-        &features,
-        &UploadPackRequest {
-            wants: vec![want],
-            filter: Some("blob:none".into()),
-            ..UploadPackRequest::default()
-        },
-    )
-    .is_err());
-    assert!(validate_upload_pack_request_features(
-        &UploadPackFeatures {
-            side_band: true,
-            side_band_64k: true,
             ..UploadPackFeatures::default()
-        },
-        &UploadPackRequest {
-            wants: vec![want],
-            capabilities: vec![
-                Capability {
-                    name: "side-band".into(),
-                    value: None,
-                },
-                Capability {
-                    name: "side-band-64k".into(),
-                    value: None,
-                },
-            ],
-            ..UploadPackRequest::default()
-        },
-    )
-    .is_err());
-
-    assert!(parse_upload_pack_features(&[
-        Capability {
-            name: "thin-pack".into(),
-            value: None,
-        },
-        Capability {
-            name: "thin-pack".into(),
-            value: None,
-        },
-    ])
-    .is_err());
-    assert!(encode_upload_pack_features(&UploadPackFeatures {
-        unknown: vec![Capability {
-            name: "filter".into(),
-            value: None,
-        }],
-        ..UploadPackFeatures::default()
-    })
-    .is_err());
+        })
+        .is_err()
+    );
 }
 
 #[test]
@@ -2929,29 +3105,33 @@ fn upload_pack_raw_response_builder_rejects_missing_want_and_empty_pack() {
     )
     .expect("test operation should succeed");
 
-    assert!(build_upload_pack_raw_packfile_response(
-        &UploadPackFeatures::default(),
-        UploadPackRequest {
-            wants: vec![want],
-            ..UploadPackRequest::default()
-        },
-        Vec::<ObjectId>::new(),
-        |_| Ok(false),
-        |_, _| Ok(Some(b"PACKmock".to_vec())),
-    )
-    .is_err());
+    assert!(
+        build_upload_pack_raw_packfile_response(
+            &UploadPackFeatures::default(),
+            UploadPackRequest {
+                wants: vec![want],
+                ..UploadPackRequest::default()
+            },
+            Vec::<ObjectId>::new(),
+            |_| Ok(false),
+            |_, _| Ok(Some(b"PACKmock".to_vec())),
+        )
+        .is_err()
+    );
 
-    assert!(build_upload_pack_raw_packfile_response(
-        &UploadPackFeatures::default(),
-        UploadPackRequest {
-            wants: vec![want],
-            ..UploadPackRequest::default()
-        },
-        Vec::<ObjectId>::new(),
-        |_| Ok(true),
-        |_, _| Ok(None),
-    )
-    .is_err());
+    assert!(
+        build_upload_pack_raw_packfile_response(
+            &UploadPackFeatures::default(),
+            UploadPackRequest {
+                wants: vec![want],
+                ..UploadPackRequest::default()
+            },
+            Vec::<ObjectId>::new(),
+            |_| Ok(true),
+            |_, _| Ok(None),
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -3029,11 +3209,13 @@ fn upload_pack_request_parses_and_encodes_initial_fetch_request() {
 #[test]
 fn upload_pack_request_streams_round_trip() {
     let request = UploadPackRequest {
-        wants: vec![ObjectId::from_hex(
-            ObjectFormat::Sha1,
-            "1111111111111111111111111111111111111111",
-        )
-        .expect("test operation should succeed")],
+        wants: vec![
+            ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111",
+            )
+            .expect("test operation should succeed"),
+        ],
         capabilities: vec![Capability {
             name: "ofs-delta".into(),
             value: None,
@@ -3056,65 +3238,79 @@ fn upload_pack_request_streams_round_trip() {
 
 #[test]
 fn upload_pack_request_rejects_malformed_requests() {
-    assert!(parse_upload_pack_request(
-        ObjectFormat::Sha1,
-        &[PktLineFrame::Data(
-            b"want 1111111111111111111111111111111111111111\n".to_vec(),
-        )],
-    )
-    .is_err());
-    assert!(parse_upload_pack_request(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"shallow 1111111111111111111111111111111111111111\n".to_vec(),),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_upload_pack_request(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(
-                b"want 1111111111111111111111111111111111111111 thin-pack\n".to_vec(),
-            ),
-            PktLineFrame::Data(
-                b"want 2222222222222222222222222222222222222222 ofs-delta\n".to_vec(),
-            ),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_upload_pack_request(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"want 1111111111111111111111111111111111111111\n".to_vec(),),
-            PktLineFrame::Data(b"deepen 1\n".to_vec()),
-            PktLineFrame::Data(b"want 2222222222222222222222222222222222222222\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_upload_pack_request(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"want 1111111111111111111111111111111111111111\n".to_vec(),),
-            PktLineFrame::Data(b"filter blob:none\n".to_vec()),
-            PktLineFrame::Data(b"filter tree:0\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(encode_upload_pack_request(Some(&UploadPackRequest::default())).is_err());
-    assert!(encode_upload_pack_request(Some(&UploadPackRequest {
-        wants: vec![ObjectId::from_hex(
+    assert!(
+        parse_upload_pack_request(
             ObjectFormat::Sha1,
-            "1111111111111111111111111111111111111111",
+            &[PktLineFrame::Data(
+                b"want 1111111111111111111111111111111111111111\n".to_vec(),
+            )],
         )
-        .expect("test operation should succeed")],
-        deepen: Some(0),
-        ..UploadPackRequest::default()
-    }))
-    .is_err());
+        .is_err()
+    );
+    assert!(
+        parse_upload_pack_request(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"shallow 1111111111111111111111111111111111111111\n".to_vec(),),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_upload_pack_request(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(
+                    b"want 1111111111111111111111111111111111111111 thin-pack\n".to_vec(),
+                ),
+                PktLineFrame::Data(
+                    b"want 2222222222222222222222222222222222222222 ofs-delta\n".to_vec(),
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_upload_pack_request(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"want 1111111111111111111111111111111111111111\n".to_vec(),),
+                PktLineFrame::Data(b"deepen 1\n".to_vec()),
+                PktLineFrame::Data(b"want 2222222222222222222222222222222222222222\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_upload_pack_request(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"want 1111111111111111111111111111111111111111\n".to_vec(),),
+                PktLineFrame::Data(b"filter blob:none\n".to_vec()),
+                PktLineFrame::Data(b"filter tree:0\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(encode_upload_pack_request(Some(&UploadPackRequest::default())).is_err());
+    assert!(
+        encode_upload_pack_request(Some(&UploadPackRequest {
+            wants: vec![
+                ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .expect("test operation should succeed")
+            ],
+            deepen: Some(0),
+            ..UploadPackRequest::default()
+        }))
+        .is_err()
+    );
 }
 
 #[test]
@@ -3179,35 +3375,47 @@ fn upload_pack_shallow_update_streams_round_trip() {
 
 #[test]
 fn upload_pack_shallow_update_rejects_malformed_records() {
-    assert!(parse_upload_pack_shallow_update(
-        ObjectFormat::Sha1,
-        &[PktLineFrame::Data(
-            b"shallow 1111111111111111111111111111111111111111\n".to_vec(),
-        )],
-    )
-    .is_err());
-    assert!(parse_upload_pack_shallow_update(
-        ObjectFormat::Sha1,
-        &[PktLineFrame::Delimiter, PktLineFrame::Flush],
-    )
-    .is_err());
-    assert!(parse_upload_pack_shallow_update(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"shallow 1111111111111111111111111111111111111111\n".to_vec(),),
-            PktLineFrame::Flush,
-            PktLineFrame::Data(b"unshallow 2222222222222222222222222222222222222222\n".to_vec(),),
-        ],
-    )
-    .is_err());
-    assert!(parse_upload_pack_shallow_update(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"unsupported 1111111111111111111111111111111111111111\n".to_vec(),),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
+    assert!(
+        parse_upload_pack_shallow_update(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(
+                b"shallow 1111111111111111111111111111111111111111\n".to_vec(),
+            )],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_upload_pack_shallow_update(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Delimiter, PktLineFrame::Flush],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_upload_pack_shallow_update(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"shallow 1111111111111111111111111111111111111111\n".to_vec(),),
+                PktLineFrame::Flush,
+                PktLineFrame::Data(
+                    b"unshallow 2222222222222222222222222222222222222222\n".to_vec(),
+                ),
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_upload_pack_shallow_update(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(
+                    b"unsupported 1111111111111111111111111111111111111111\n".to_vec(),
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -3263,11 +3471,13 @@ fn upload_pack_negotiation_request_parses_flush_and_done_rounds() {
 #[test]
 fn upload_pack_negotiation_request_streams_round_trip() {
     let first = UploadPackNegotiationRequest {
-        haves: vec![ObjectId::from_hex(
-            ObjectFormat::Sha1,
-            "1111111111111111111111111111111111111111",
-        )
-        .expect("test operation should succeed")],
+        haves: vec![
+            ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111",
+            )
+            .expect("test operation should succeed"),
+        ],
         done: false,
     };
     let second = UploadPackNegotiationRequest {
@@ -3297,33 +3507,41 @@ fn upload_pack_negotiation_request_streams_round_trip() {
 
 #[test]
 fn upload_pack_negotiation_request_rejects_malformed_rounds() {
-    assert!(parse_upload_pack_negotiation_request(
-        ObjectFormat::Sha1,
-        &[PktLineFrame::Data(
-            b"have 1111111111111111111111111111111111111111\n".to_vec(),
-        )],
-    )
-    .is_err());
-    assert!(parse_upload_pack_negotiation_request(
-        ObjectFormat::Sha1,
-        &[PktLineFrame::Data(
-            b"want 1111111111111111111111111111111111111111\n".to_vec(),
-        )],
-    )
-    .is_err());
-    assert!(parse_upload_pack_negotiation_request(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"done\n".to_vec()),
-            PktLineFrame::Data(b"have 1111111111111111111111111111111111111111\n".to_vec(),),
-        ],
-    )
-    .is_err());
-    assert!(parse_upload_pack_negotiation_request(
-        ObjectFormat::Sha1,
-        &[PktLineFrame::Delimiter, PktLineFrame::Flush],
-    )
-    .is_err());
+    assert!(
+        parse_upload_pack_negotiation_request(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(
+                b"have 1111111111111111111111111111111111111111\n".to_vec(),
+            )],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_upload_pack_negotiation_request(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(
+                b"want 1111111111111111111111111111111111111111\n".to_vec(),
+            )],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_upload_pack_negotiation_request(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"done\n".to_vec()),
+                PktLineFrame::Data(b"have 1111111111111111111111111111111111111111\n".to_vec(),),
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_upload_pack_negotiation_request(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Delimiter, PktLineFrame::Flush],
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -3393,16 +3611,20 @@ fn upload_pack_acknowledgments_stream_round_trip_and_reject_bad_lines() {
     );
     assert_eq!(input, b"tail");
     assert!(parse_upload_pack_acknowledgment(ObjectFormat::Sha1, b"ACK not-an-oid\n").is_err());
-    assert!(parse_upload_pack_acknowledgment(
-        ObjectFormat::Sha1,
-        b"ACK 1111111111111111111111111111111111111111 unknown\n",
-    )
-    .is_err());
-    assert!(parse_upload_pack_acknowledgment(
-        ObjectFormat::Sha1,
-        b"ACK 1111111111111111111111111111111111111111 ready extra\n",
-    )
-    .is_err());
+    assert!(
+        parse_upload_pack_acknowledgment(
+            ObjectFormat::Sha1,
+            b"ACK 1111111111111111111111111111111111111111 unknown\n",
+        )
+        .is_err()
+    );
+    assert!(
+        parse_upload_pack_acknowledgment(
+            ObjectFormat::Sha1,
+            b"ACK 1111111111111111111111111111111111111111 ready extra\n",
+        )
+        .is_err()
+    );
     assert!(parse_upload_pack_acknowledgment(ObjectFormat::Sha1, b"ERR remote died\n").is_err());
     assert!(read_upload_pack_acknowledgment(ObjectFormat::Sha1, &mut &b"0000"[..]).is_err());
 }
@@ -3488,43 +3710,55 @@ fn upload_pack_packfile_response_streams_round_trip() {
 
 #[test]
 fn upload_pack_packfile_response_rejects_malformed_streams() {
-    assert!(parse_upload_pack_packfile_response(
-        ObjectFormat::Sha1,
-        &[PktLineFrame::Data(b"NAK\n".to_vec())],
-    )
-    .is_err());
-    assert!(parse_upload_pack_packfile_response(
-        ObjectFormat::Sha1,
-        &[PktLineFrame::Delimiter, PktLineFrame::Flush],
-    )
-    .is_err());
-    assert!(parse_upload_pack_packfile_response(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"\x01PACK".to_vec()),
-            PktLineFrame::Data(b"ACK 1111111111111111111111111111111111111111 common\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_upload_pack_packfile_response(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"NAK\n".to_vec()),
-            PktLineFrame::Flush,
-            PktLineFrame::Data(b"\x01PACK".to_vec()),
-        ],
-    )
-    .is_err());
-    assert!(parse_upload_pack_packfile_response(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"NAK\n".to_vec()),
-            PktLineFrame::Data(b"\x04bad".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
+    assert!(
+        parse_upload_pack_packfile_response(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(b"NAK\n".to_vec())],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_upload_pack_packfile_response(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Delimiter, PktLineFrame::Flush],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_upload_pack_packfile_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"\x01PACK".to_vec()),
+                PktLineFrame::Data(
+                    b"ACK 1111111111111111111111111111111111111111 common\n".to_vec()
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_upload_pack_packfile_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"NAK\n".to_vec()),
+                PktLineFrame::Flush,
+                PktLineFrame::Data(b"\x01PACK".to_vec()),
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_upload_pack_packfile_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"NAK\n".to_vec()),
+                PktLineFrame::Data(b"\x04bad".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -3726,11 +3960,10 @@ fn upload_pack_shallow_info_response_handles_empty_shallow_section() {
 fn upload_pack_shallow_info_response_rejects_malformed_sections() {
     // Truncated section (no terminating flush before EOF).
     let truncated = b"0035shallow 1111111111111111111111111111111111111111\n".to_vec();
-    assert!(parse_upload_pack_shallow_info_and_raw_packfile_response(
-        ObjectFormat::Sha1,
-        &truncated
-    )
-    .is_err());
+    assert!(
+        parse_upload_pack_shallow_info_and_raw_packfile_response(ObjectFormat::Sha1, &truncated)
+            .is_err()
+    );
     // A non-flush control packet inside the shallow-info section.
     let mut delimiter_section = Vec::new();
     delimiter_section.extend_from_slice(b"0001"); // delimiter, not a flush
@@ -3915,42 +4148,50 @@ fn receive_pack_request_rejects_malformed_commands() {
             )
             .is_err()
         );
-    assert!(parse_receive_pack_request(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(
-                b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec(),
-            ),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(encode_receive_pack_request(&ReceivePackRequest {
-        shallow: vec![ObjectId::from_hex(
+    assert!(
+        parse_receive_pack_request(
             ObjectFormat::Sha1,
-            "1111111111111111111111111111111111111111",
+            &[
+                PktLineFrame::Data(
+                    b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec(),
+                ),
+                PktLineFrame::Flush,
+            ],
         )
-        .expect("test operation should succeed")],
-        ..ReceivePackRequest::default()
-    })
-    .is_err());
-    assert!(encode_receive_pack_request(&ReceivePackRequest {
-        commands: vec![ReceivePackCommand {
-            old_id: ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "1111111111111111111111111111111111111111",
-            )
-            .expect("test operation should succeed"),
-            new_id: ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "2222222222222222222222222222222222222222",
-            )
-            .expect("test operation should succeed"),
-            name: "bad ref".into(),
-        }],
-        ..ReceivePackRequest::default()
-    })
-    .is_err());
+        .is_err()
+    );
+    assert!(
+        encode_receive_pack_request(&ReceivePackRequest {
+            shallow: vec![
+                ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .expect("test operation should succeed")
+            ],
+            ..ReceivePackRequest::default()
+        })
+        .is_err()
+    );
+    assert!(
+        encode_receive_pack_request(&ReceivePackRequest {
+            commands: vec![ReceivePackCommand {
+                old_id: ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .expect("test operation should succeed"),
+                new_id: ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "2222222222222222222222222222222222222222",
+                )
+                .expect("test operation should succeed"),
+                name: "bad ref".into(),
+            }],
+            ..ReceivePackRequest::default()
+        })
+        .is_err()
+    );
 }
 
 #[test]
@@ -4106,50 +4347,56 @@ fn receive_pack_features_reject_invalid_push_requests() {
         name: "refs/heads/main".into(),
     };
 
-    assert!(validate_receive_pack_push_request_features(
-        &features,
-        &ReceivePackPushRequest {
-            commands: ReceivePackRequest {
-                commands: vec![update.clone()],
-                capabilities: vec![Capability {
-                    name: "push-options".into(),
-                    value: None,
-                }],
-                ..ReceivePackRequest::default()
+    assert!(
+        validate_receive_pack_push_request_features(
+            &features,
+            &ReceivePackPushRequest {
+                commands: ReceivePackRequest {
+                    commands: vec![update.clone()],
+                    capabilities: vec![Capability {
+                        name: "push-options".into(),
+                        value: None,
+                    }],
+                    ..ReceivePackRequest::default()
+                },
+                push_options: None,
+                packfile: b"PACKpayload".to_vec(),
             },
-            push_options: None,
-            packfile: b"PACKpayload".to_vec(),
-        },
-    )
-    .is_err());
-    assert!(validate_receive_pack_push_request_features(
-        &features,
-        &ReceivePackPushRequest {
-            commands: ReceivePackRequest {
-                commands: vec![update.clone()],
-                ..ReceivePackRequest::default()
+        )
+        .is_err()
+    );
+    assert!(
+        validate_receive_pack_push_request_features(
+            &features,
+            &ReceivePackPushRequest {
+                commands: ReceivePackRequest {
+                    commands: vec![update.clone()],
+                    ..ReceivePackRequest::default()
+                },
+                push_options: Some(Vec::new()),
+                packfile: b"PACKpayload".to_vec(),
             },
-            push_options: Some(Vec::new()),
-            packfile: b"PACKpayload".to_vec(),
-        },
-    )
-    .is_err());
-    assert!(validate_receive_pack_push_request_features(
-        &features,
-        &ReceivePackPushRequest {
-            commands: ReceivePackRequest {
-                commands: vec![ReceivePackCommand {
-                    old_id: old_id.clone(),
-                    new_id: zero.clone(),
-                    name: "refs/heads/main".into(),
-                }],
-                ..ReceivePackRequest::default()
+        )
+        .is_err()
+    );
+    assert!(
+        validate_receive_pack_push_request_features(
+            &features,
+            &ReceivePackPushRequest {
+                commands: ReceivePackRequest {
+                    commands: vec![ReceivePackCommand {
+                        old_id: old_id.clone(),
+                        new_id: zero.clone(),
+                        name: "refs/heads/main".into(),
+                    }],
+                    ..ReceivePackRequest::default()
+                },
+                push_options: None,
+                packfile: Vec::new(),
             },
-            push_options: None,
-            packfile: Vec::new(),
-        },
-    )
-    .is_err());
+        )
+        .is_err()
+    );
     validate_receive_pack_push_request_features(
         &features,
         &ReceivePackPushRequest {
@@ -4162,61 +4409,69 @@ fn receive_pack_features_reject_invalid_push_requests() {
         },
     )
     .expect("updates to already-present objects may omit a packfile");
-    assert!(validate_receive_pack_push_request_features(
-        &ReceivePackFeatures {
-            delete_refs: true,
-            ..ReceivePackFeatures::default()
-        },
-        &ReceivePackPushRequest {
-            commands: ReceivePackRequest {
-                commands: vec![ReceivePackCommand {
-                    old_id,
-                    new_id: zero,
-                    name: "refs/heads/main".into(),
-                }],
-                ..ReceivePackRequest::default()
+    assert!(
+        validate_receive_pack_push_request_features(
+            &ReceivePackFeatures {
+                delete_refs: true,
+                ..ReceivePackFeatures::default()
             },
-            push_options: None,
-            packfile: b"PACKpayload".to_vec(),
-        },
-    )
-    .is_err());
-    assert!(validate_receive_pack_push_request_features(
-        &features,
-        &ReceivePackPushRequest {
-            commands: ReceivePackRequest {
-                commands: vec![update],
-                capabilities: vec![Capability {
-                    name: "atomic".into(),
-                    value: None,
-                }],
-                ..ReceivePackRequest::default()
+            &ReceivePackPushRequest {
+                commands: ReceivePackRequest {
+                    commands: vec![ReceivePackCommand {
+                        old_id,
+                        new_id: zero,
+                        name: "refs/heads/main".into(),
+                    }],
+                    ..ReceivePackRequest::default()
+                },
+                push_options: None,
+                packfile: b"PACKpayload".to_vec(),
             },
-            push_options: None,
-            packfile: b"PACKpayload".to_vec(),
-        },
-    )
-    .is_err());
+        )
+        .is_err()
+    );
+    assert!(
+        validate_receive_pack_push_request_features(
+            &features,
+            &ReceivePackPushRequest {
+                commands: ReceivePackRequest {
+                    commands: vec![update],
+                    capabilities: vec![Capability {
+                        name: "atomic".into(),
+                        value: None,
+                    }],
+                    ..ReceivePackRequest::default()
+                },
+                push_options: None,
+                packfile: b"PACKpayload".to_vec(),
+            },
+        )
+        .is_err()
+    );
 
-    assert!(parse_receive_pack_features(&[
-        Capability {
-            name: "push-options".into(),
-            value: None,
-        },
-        Capability {
-            name: "push-options".into(),
-            value: None,
-        },
-    ])
-    .is_err());
-    assert!(encode_receive_pack_features(&ReceivePackFeatures {
-        unknown: vec![Capability {
-            name: "atomic".into(),
-            value: None,
-        }],
-        ..ReceivePackFeatures::default()
-    })
-    .is_err());
+    assert!(
+        parse_receive_pack_features(&[
+            Capability {
+                name: "push-options".into(),
+                value: None,
+            },
+            Capability {
+                name: "push-options".into(),
+                value: None,
+            },
+        ])
+        .is_err()
+    );
+    assert!(
+        encode_receive_pack_features(&ReceivePackFeatures {
+            unknown: vec![Capability {
+                name: "atomic".into(),
+                value: None,
+            }],
+            ..ReceivePackFeatures::default()
+        })
+        .is_err()
+    );
 }
 
 #[test]
@@ -4374,16 +4629,18 @@ fn receive_pack_apply_helper_preserves_delete_only_and_stale_delete_rules() {
     assert!(!installed.get());
     assert_eq!(deleted.into_inner(), vec!["refs/heads/main"]);
     assert_eq!(report.unpack, ReceivePackUnpackStatus::Ok);
-    assert!(apply_receive_pack_push_request(
-        &features,
-        &request,
-        |_| Ok(Some(other_id.clone())),
-        |_| Ok(()),
-        |_| Ok(false),
-        |_| Ok(()),
-        |_| Ok(()),
-    )
-    .is_err());
+    assert!(
+        apply_receive_pack_push_request(
+            &features,
+            &request,
+            |_| Ok(Some(other_id.clone())),
+            |_| Ok(()),
+            |_| Ok(false),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -4499,12 +4756,10 @@ fn receive_pack_push_request_streams_round_trip() {
 
 #[test]
 fn receive_pack_push_request_rejects_malformed_sections() {
-    assert!(parse_receive_pack_push_request(
-        ObjectFormat::Sha1,
-        b"0014not-a-command\n0000PACK",
-        false,
-    )
-    .is_err());
+    assert!(
+        parse_receive_pack_push_request(ObjectFormat::Sha1, b"0014not-a-command\n0000PACK", false,)
+            .is_err()
+    );
 
     let request = ReceivePackPushRequest {
         commands: ReceivePackRequest {
@@ -4530,19 +4785,23 @@ fn receive_pack_push_request_rejects_malformed_sections() {
         encode_receive_pack_push_request(&request).expect("test operation should succeed");
     assert!(parse_receive_pack_push_request(ObjectFormat::Sha1, &encoded, true).is_err());
 
-    assert!(encode_receive_pack_push_request(&ReceivePackPushRequest {
-        commands: ReceivePackRequest {
-            shallow: vec![ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "1111111111111111111111111111111111111111",
-            )
-            .expect("test operation should succeed")],
-            ..ReceivePackRequest::default()
-        },
-        push_options: None,
-        packfile: Vec::new(),
-    })
-    .is_err());
+    assert!(
+        encode_receive_pack_push_request(&ReceivePackPushRequest {
+            commands: ReceivePackRequest {
+                shallow: vec![
+                    ObjectId::from_hex(
+                        ObjectFormat::Sha1,
+                        "1111111111111111111111111111111111111111",
+                    )
+                    .expect("test operation should succeed")
+                ],
+                ..ReceivePackRequest::default()
+            },
+            push_options: None,
+            packfile: Vec::new(),
+        })
+        .is_err()
+    );
 }
 
 #[test]
@@ -4610,40 +4869,52 @@ fn receive_pack_report_status_streams_round_trip() {
 #[test]
 fn receive_pack_report_status_rejects_malformed_status_lines() {
     assert!(parse_receive_pack_report_status(&[]).is_err());
-    assert!(parse_receive_pack_report_status(&[
-        PktLineFrame::Data(b"unpack ok\n".to_vec()),
-        PktLineFrame::Data(b"ok refs/heads/main\n".to_vec()),
-    ])
-    .is_err());
-    assert!(parse_receive_pack_report_status(&[
-        PktLineFrame::Flush,
-        PktLineFrame::Data(b"ok refs/heads/main\n".to_vec()),
-    ])
-    .is_err());
-    assert!(parse_receive_pack_report_status(&[
-        PktLineFrame::Data(b"unpack ok\n".to_vec()),
-        PktLineFrame::Data(b"bad refs/heads/main\n".to_vec()),
-        PktLineFrame::Flush,
-    ])
-    .is_err());
-    assert!(parse_receive_pack_report_status(&[
-        PktLineFrame::Data(b"unpack ok\n".to_vec()),
-        PktLineFrame::Data(b"ng refs/heads/main\n".to_vec()),
-        PktLineFrame::Flush,
-    ])
-    .is_err());
-    assert!(encode_receive_pack_report_status(&ReceivePackReportStatus {
-        unpack: ReceivePackUnpackStatus::Error("".into()),
-        commands: Vec::new(),
-    })
-    .is_err());
-    assert!(encode_receive_pack_report_status(&ReceivePackReportStatus {
-        unpack: ReceivePackUnpackStatus::Ok,
-        commands: vec![ReceivePackCommandStatus::Ok {
-            name: "bad ref".into(),
-        }],
-    })
-    .is_err());
+    assert!(
+        parse_receive_pack_report_status(&[
+            PktLineFrame::Data(b"unpack ok\n".to_vec()),
+            PktLineFrame::Data(b"ok refs/heads/main\n".to_vec()),
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_receive_pack_report_status(&[
+            PktLineFrame::Flush,
+            PktLineFrame::Data(b"ok refs/heads/main\n".to_vec()),
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_receive_pack_report_status(&[
+            PktLineFrame::Data(b"unpack ok\n".to_vec()),
+            PktLineFrame::Data(b"bad refs/heads/main\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_receive_pack_report_status(&[
+            PktLineFrame::Data(b"unpack ok\n".to_vec()),
+            PktLineFrame::Data(b"ng refs/heads/main\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err()
+    );
+    assert!(
+        encode_receive_pack_report_status(&ReceivePackReportStatus {
+            unpack: ReceivePackUnpackStatus::Error("".into()),
+            commands: Vec::new(),
+        })
+        .is_err()
+    );
+    assert!(
+        encode_receive_pack_report_status(&ReceivePackReportStatus {
+            unpack: ReceivePackUnpackStatus::Ok,
+            commands: vec![ReceivePackCommandStatus::Ok {
+                name: "bad ref".into(),
+            }],
+        })
+        .is_err()
+    );
 }
 
 #[test]
@@ -4728,46 +4999,54 @@ fn receive_pack_report_status_v2_streams_round_trip() {
 #[test]
 fn receive_pack_report_status_v2_rejects_malformed_options() {
     assert!(parse_receive_pack_report_status_v2(ObjectFormat::Sha1, &[]).is_err());
-    assert!(parse_receive_pack_report_status_v2(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"unpack ok\n".to_vec()),
-            PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_receive_pack_report_status_v2(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"unpack ok\n".to_vec()),
-            PktLineFrame::Data(b"ng refs/heads/main rejected\n".to_vec()),
-            PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_receive_pack_report_status_v2(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"unpack ok\n".to_vec()),
-            PktLineFrame::Data(b"ok refs/for/main\n".to_vec()),
-            PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
-            PktLineFrame::Data(b"option refname refs/heads/next\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_receive_pack_report_status_v2(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"unpack ok\n".to_vec()),
-            PktLineFrame::Data(b"ok refs/for/main\n".to_vec()),
-            PktLineFrame::Data(b"option old-oid not-an-oid\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
+    assert!(
+        parse_receive_pack_report_status_v2(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"unpack ok\n".to_vec()),
+                PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_receive_pack_report_status_v2(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"unpack ok\n".to_vec()),
+                PktLineFrame::Data(b"ng refs/heads/main rejected\n".to_vec()),
+                PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_receive_pack_report_status_v2(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"unpack ok\n".to_vec()),
+                PktLineFrame::Data(b"ok refs/for/main\n".to_vec()),
+                PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
+                PktLineFrame::Data(b"option refname refs/heads/next\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_receive_pack_report_status_v2(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"unpack ok\n".to_vec()),
+                PktLineFrame::Data(b"ok refs/for/main\n".to_vec()),
+                PktLineFrame::Data(b"option old-oid not-an-oid\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
     assert!(
         encode_receive_pack_report_status_v2(&ReceivePackReportStatusV2 {
             unpack: ReceivePackUnpackStatus::Ok,
@@ -4832,17 +5111,21 @@ fn receive_pack_push_options_reject_malformed_streams() {
     assert!(
         parse_receive_pack_push_options(&[PktLineFrame::Delimiter, PktLineFrame::Flush]).is_err()
     );
-    assert!(parse_receive_pack_push_options(&[
-        PktLineFrame::Data(b"ci.skip\n".to_vec()),
-        PktLineFrame::Flush,
-        PktLineFrame::Data(b"after\n".to_vec()),
-    ])
-    .is_err());
-    assert!(parse_receive_pack_push_options(&[
-        PktLineFrame::Data(b"bad\0option\n".to_vec()),
-        PktLineFrame::Flush,
-    ])
-    .is_err());
+    assert!(
+        parse_receive_pack_push_options(&[
+            PktLineFrame::Data(b"ci.skip\n".to_vec()),
+            PktLineFrame::Flush,
+            PktLineFrame::Data(b"after\n".to_vec()),
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_receive_pack_push_options(&[
+            PktLineFrame::Data(b"bad\0option\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err()
+    );
     assert!(encode_receive_pack_push_options(&["bad\noption".to_string()]).is_err());
 }
 
@@ -4922,35 +5205,43 @@ fn protocol_v2_advertisement_writes_stream() {
         handshake
     );
     assert!(input.is_empty());
-    assert!(encode_protocol_v2_advertisement(&TransportHandshake {
-        protocol: ProtocolVersion::V1,
-        capabilities: Vec::new(),
-    })
-    .is_err());
+    assert!(
+        encode_protocol_v2_advertisement(&TransportHandshake {
+            protocol: ProtocolVersion::V1,
+            capabilities: Vec::new(),
+        })
+        .is_err()
+    );
 }
 
 #[test]
 fn protocol_v2_advertisement_rejects_malformed_sequences() {
     assert!(parse_protocol_v2_advertisement(&[]).is_err());
-    assert!(parse_protocol_v2_advertisement(&[
-        PktLineFrame::Data(b"version 1\n".to_vec()),
-        PktLineFrame::Flush,
-    ])
-    .is_err());
+    assert!(
+        parse_protocol_v2_advertisement(&[
+            PktLineFrame::Data(b"version 1\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err()
+    );
     assert!(
         parse_protocol_v2_advertisement(&[PktLineFrame::Data(b"version 2\n".to_vec())]).is_err()
     );
-    assert!(parse_protocol_v2_advertisement(&[
-        PktLineFrame::Data(b"version 2\n".to_vec()),
-        PktLineFrame::Delimiter,
-    ])
-    .is_err());
-    assert!(parse_protocol_v2_advertisement(&[
-        PktLineFrame::Data(b"version 2\n".to_vec()),
-        PktLineFrame::Data(b"fetch=\n".to_vec()),
-        PktLineFrame::Flush,
-    ])
-    .is_err());
+    assert!(
+        parse_protocol_v2_advertisement(&[
+            PktLineFrame::Data(b"version 2\n".to_vec()),
+            PktLineFrame::Delimiter,
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_protocol_v2_advertisement(&[
+            PktLineFrame::Data(b"version 2\n".to_vec()),
+            PktLineFrame::Data(b"fetch=\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err()
+    );
 }
 
 #[test]
@@ -5081,25 +5372,31 @@ fn protocol_v2_command_request_streams_round_trip() {
 #[test]
 fn protocol_v2_command_request_rejects_malformed_sequences() {
     assert!(parse_protocol_v2_command_request(&[]).is_err());
-    assert!(parse_protocol_v2_command_request(&[
-        PktLineFrame::Data(b"agent=sley/0\n".to_vec()),
-        PktLineFrame::Flush,
-    ])
-    .is_err());
-    assert!(parse_protocol_v2_command_request(&[
-        PktLineFrame::Data(b"command=ls-refs\n".to_vec()),
-        PktLineFrame::Delimiter,
-        PktLineFrame::Delimiter,
-        PktLineFrame::Flush,
-    ])
-    .is_err());
-    assert!(parse_protocol_v2_command_request(&[
-        PktLineFrame::Data(b"command=ls-refs\n".to_vec()),
-        PktLineFrame::Delimiter,
-        PktLineFrame::Data(b"\n".to_vec()),
-        PktLineFrame::Flush,
-    ])
-    .is_err());
+    assert!(
+        parse_protocol_v2_command_request(&[
+            PktLineFrame::Data(b"agent=sley/0\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_protocol_v2_command_request(&[
+            PktLineFrame::Data(b"command=ls-refs\n".to_vec()),
+            PktLineFrame::Delimiter,
+            PktLineFrame::Delimiter,
+            PktLineFrame::Flush,
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_protocol_v2_command_request(&[
+            PktLineFrame::Data(b"command=ls-refs\n".to_vec()),
+            PktLineFrame::Delimiter,
+            PktLineFrame::Data(b"\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err()
+    );
     assert!(
         encode_protocol_v2_command_request(&ProtocolV2CommandRequest {
             command: "bad command".into(),
@@ -5278,16 +5575,18 @@ fn protocol_v2_ls_refs_response_reads_stateless_response_end() {
         records
     );
     assert_eq!(input, b"tail");
-    assert!(parse_protocol_v2_ls_refs_response(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(
-                b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec()
-            ),
-            PktLineFrame::ResponseEnd
-        ],
-    )
-    .is_err());
+    assert!(
+        parse_protocol_v2_ls_refs_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(
+                    b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec()
+                ),
+                PktLineFrame::ResponseEnd
+            ],
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -5331,13 +5630,15 @@ fn protocol_v2_ls_refs_exchange_writes_request_and_reads_response() {
 
 #[test]
 fn protocol_v2_ls_refs_response_rejects_malformed_records() {
-    assert!(parse_protocol_v2_ls_refs_response(
-        ObjectFormat::Sha1,
-        &[PktLineFrame::Data(
-            b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec()
-        )],
-    )
-    .is_err());
+    assert!(
+        parse_protocol_v2_ls_refs_response(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(
+                b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec()
+            )],
+        )
+        .is_err()
+    );
     assert!(
             parse_protocol_v2_ls_refs_response(
                 ObjectFormat::Sha1,
@@ -5351,16 +5652,18 @@ fn protocol_v2_ls_refs_response_rejects_malformed_records() {
             )
             .is_err()
         );
-    assert!(parse_protocol_v2_ls_refs_response(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(
-                b"unborn HEAD peeled:2222222222222222222222222222222222222222\n".to_vec()
-            ),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
+    assert!(
+        parse_protocol_v2_ls_refs_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(
+                    b"unborn HEAD peeled:2222222222222222222222222222222222222222\n".to_vec()
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
     assert!(
         encode_protocol_v2_ls_refs_response(&[ProtocolV2LsRefsRecord::Ref(ProtocolV2LsRefsRef {
             oid: ObjectId::from_hex(
@@ -5451,48 +5754,58 @@ fn protocol_v2_fetch_request_parses_and_encodes_arguments() {
 
 #[test]
 fn protocol_v2_fetch_request_rejects_malformed_arguments() {
-    assert!(ProtocolV2FetchRequest::from_command_request(
-        ObjectFormat::Sha1,
-        &ProtocolV2CommandRequest {
-            command: "ls-refs".into(),
-            capabilities: Vec::new(),
-            arguments: Vec::new(),
-        },
-    )
-    .is_err());
-    assert!(ProtocolV2FetchRequest::from_command_request(
-        ObjectFormat::Sha1,
-        &ProtocolV2CommandRequest {
-            command: "fetch".into(),
-            capabilities: Vec::new(),
-            arguments: vec![b"want not-an-oid".to_vec()],
-        },
-    )
-    .is_err());
-    assert!(ProtocolV2FetchRequest::from_command_request(
-        ObjectFormat::Sha1,
-        &ProtocolV2CommandRequest {
-            command: "fetch".into(),
-            capabilities: Vec::new(),
-            arguments: vec![b"deepen 0".to_vec()],
-        },
-    )
-    .is_err());
-    assert!(ProtocolV2FetchRequest::from_command_request(
-        ObjectFormat::Sha1,
-        &ProtocolV2CommandRequest {
-            command: "fetch".into(),
-            capabilities: Vec::new(),
-            arguments: vec![b"filter blob:none".to_vec(), b"filter tree:0".to_vec()],
-        },
-    )
-    .is_err());
-    assert!(ProtocolV2FetchRequest {
-        deepen: Some(0),
-        ..ProtocolV2FetchRequest::default()
-    }
-    .to_command_request()
-    .is_err());
+    assert!(
+        ProtocolV2FetchRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "ls-refs".into(),
+                capabilities: Vec::new(),
+                arguments: Vec::new(),
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        ProtocolV2FetchRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "fetch".into(),
+                capabilities: Vec::new(),
+                arguments: vec![b"want not-an-oid".to_vec()],
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        ProtocolV2FetchRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "fetch".into(),
+                capabilities: Vec::new(),
+                arguments: vec![b"deepen 0".to_vec()],
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        ProtocolV2FetchRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "fetch".into(),
+                capabilities: Vec::new(),
+                arguments: vec![b"filter blob:none".to_vec(), b"filter tree:0".to_vec()],
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        ProtocolV2FetchRequest {
+            deepen: Some(0),
+            ..ProtocolV2FetchRequest::default()
+        }
+        .to_command_request()
+        .is_err()
+    );
 }
 
 #[test]
@@ -5557,7 +5870,7 @@ fn protocol_v2_fetch_response_parses_and_encodes_sections() {
         PktLineFrame::Data(b"ready\n".to_vec()),
         PktLineFrame::Delimiter,
         PktLineFrame::Data(b"shallow-info\n".to_vec()),
-        PktLineFrame::Data(b"shallow 2222222222222222222222222222222222222222\n".to_vec()),
+        PktLineFrame::Data(b"shallow 2222222222222222222222222222222222222222".to_vec()),
         PktLineFrame::Delimiter,
         PktLineFrame::Data(b"wanted-refs\n".to_vec()),
         PktLineFrame::Data(b"3333333333333333333333333333333333333333 refs/heads/main\n".to_vec()),
@@ -5599,6 +5912,56 @@ fn protocol_v2_fetch_response_parses_and_encodes_sections() {
         encode_protocol_v2_fetch_response(&sections).expect("test operation should succeed"),
         frames
     );
+}
+
+#[test]
+fn protocol_v2_fetch_shallow_info_encoding_matches_git_wire_bytes() {
+    let sha1 = ObjectId::from_hex(
+        ObjectFormat::Sha1,
+        "1111111111111111111111111111111111111111",
+    )
+    .expect("valid SHA-1 object id");
+    let sha256 = ObjectId::from_hex(
+        ObjectFormat::Sha256,
+        "2222222222222222222222222222222222222222222222222222222222222222",
+    )
+    .expect("valid SHA-256 object id");
+
+    for (oid, shallow_wire, unshallow_wire) in [
+        (
+            sha1,
+            b"0011shallow-info\n0034shallow 11111111111111111111111111111111111111110000".as_slice(),
+            b"0011shallow-info\n0036unshallow 11111111111111111111111111111111111111110000"
+                .as_slice(),
+        ),
+        (
+            sha256,
+            b"0011shallow-info\n004cshallow 22222222222222222222222222222222222222222222222222222222222222220000"
+                .as_slice(),
+            b"0011shallow-info\n004eunshallow 22222222222222222222222222222222222222222222222222222222222222220000"
+                .as_slice(),
+        ),
+    ] {
+        let mut encoded = Vec::new();
+        write_protocol_v2_fetch_response(
+            &mut encoded,
+            &[ProtocolV2FetchResponseSection::ShallowInfo(vec![
+                ProtocolV2FetchShallowInfo::Shallow(oid),
+            ])],
+        )
+        .expect("encode shallow response");
+        assert_eq!(encoded, shallow_wire);
+
+        encoded.clear();
+        write_protocol_v2_fetch_response(
+            &mut encoded,
+            &[ProtocolV2FetchResponseSection::ShallowInfo(vec![
+                ProtocolV2FetchShallowInfo::Unshallow(oid),
+            ])],
+        )
+        .expect("encode unshallow response");
+        assert_eq!(encoded, unshallow_wire);
+    }
 }
 
 #[test]
@@ -5736,6 +6099,80 @@ fn fetch_response_header_skips_leading_advertisement_before_sideband_response() 
 }
 
 #[test]
+fn fetch_negotiation_validates_ready_section_boundaries() {
+    let ack = ObjectId::from_hex(
+        ObjectFormat::Sha1,
+        "1111111111111111111111111111111111111111",
+    )
+    .expect("test operation should succeed");
+    let ready = vec![
+        PktLineFrame::Data(b"acknowledgments\n".to_vec()),
+        PktLineFrame::Data(b"ACK 1111111111111111111111111111111111111111\n".to_vec()),
+        PktLineFrame::Data(b"ready\n".to_vec()),
+        PktLineFrame::Delimiter,
+        PktLineFrame::Data(b"packfile\n".to_vec()),
+    ];
+    let mut encoded = Vec::new();
+    write_pkt_line_frames(&mut encoded, &ready).expect("encode ready response");
+    let mut input = encoded.as_slice();
+    assert_eq!(
+        read_protocol_v2_fetch_negotiation_response(ObjectFormat::Sha1, &mut input, false, false,)
+            .expect("ready followed by delimiter"),
+        ProtocolV2FetchNegotiationResponse {
+            acknowledgments: vec![
+                ProtocolV2FetchAcknowledgment::Ack(ack),
+                ProtocolV2FetchAcknowledgment::Ready,
+            ],
+            has_following_sections: true,
+        }
+    );
+    assert_eq!(input, b"000dpackfile\n");
+
+    let ready_flush = b"0014acknowledgments\n000aready\n0000";
+    let error = read_protocol_v2_fetch_negotiation_response(
+        ObjectFormat::Sha1,
+        &mut ready_flush.as_slice(),
+        false,
+        false,
+    )
+    .expect_err("normal fetch requires pack after ready")
+    .to_string();
+    assert!(error.contains("expected packfile to be sent after 'ready'"));
+    assert!(
+        read_protocol_v2_fetch_negotiation_response(
+            ObjectFormat::Sha1,
+            &mut ready_flush.as_slice(),
+            false,
+            true,
+        )
+        .expect("wait-for-done permits ready followed by flush")
+        .acknowledgments
+        .contains(&ProtocolV2FetchAcknowledgment::Ready)
+    );
+
+    let not_ready_flush = b"0014acknowledgments\n0008NAK\n0000";
+    let response = read_protocol_v2_fetch_negotiation_response(
+        ObjectFormat::Sha1,
+        &mut not_ready_flush.as_slice(),
+        false,
+        false,
+    )
+    .expect("no ready ends the negotiation round with flush");
+    assert!(!response.has_following_sections);
+
+    let not_ready_delimiter = b"0014acknowledgments\n0008NAK\n0001";
+    let error = read_protocol_v2_fetch_negotiation_response(
+        ObjectFormat::Sha1,
+        &mut not_ready_delimiter.as_slice(),
+        false,
+        false,
+    )
+    .expect_err("no ready cannot be followed by another section")
+    .to_string();
+    assert!(error.contains("expected no other sections to be sent after no 'ready'"));
+}
+
+#[test]
 fn protocol_v2_fetch_sideband_all_response_parses_sections_and_progress() {
     let frames = vec![
         PktLineFrame::Data(
@@ -5841,28 +6278,32 @@ fn protocol_v2_fetch_sideband_all_response_streams_round_trip() {
 
 #[test]
 fn protocol_v2_fetch_sideband_all_response_rejects_malformed_sideband() {
-    assert!(parse_protocol_v2_fetch_sideband_all_response(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"acknowledgments\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_protocol_v2_fetch_sideband_all_response(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(
-                encode_sideband_packet(&SideBandPacket {
-                    channel: SideBandChannel::Fatal,
-                    data: b"remote died\n".to_vec(),
-                })
-                .expect("test operation should succeed"),
-            ),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
+    assert!(
+        parse_protocol_v2_fetch_sideband_all_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"acknowledgments\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_protocol_v2_fetch_sideband_all_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(
+                    encode_sideband_packet(&SideBandPacket {
+                        channel: SideBandChannel::Fatal,
+                        data: b"remote died\n".to_vec(),
+                    })
+                    .expect("test operation should succeed"),
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -5896,11 +6337,13 @@ fn protocol_v2_object_info_response_parses_and_encodes_size_records() {
 fn protocol_v2_object_info_response_streams_and_exchanges() {
     let request = ProtocolV2ObjectInfoRequest {
         size: true,
-        oids: vec![ObjectId::from_hex(
-            ObjectFormat::Sha1,
-            "1111111111111111111111111111111111111111",
-        )
-        .expect("test operation should succeed")],
+        oids: vec![
+            ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111",
+            )
+            .expect("test operation should succeed"),
+        ],
     };
     let response = ProtocolV2ObjectInfoResponse {
         size: true,
@@ -5944,34 +6387,44 @@ fn protocol_v2_object_info_response_streams_and_exchanges() {
 #[test]
 fn protocol_v2_object_info_response_rejects_malformed_records() {
     assert!(parse_protocol_v2_object_info_response(ObjectFormat::Sha1, &[]).is_err());
-    assert!(parse_protocol_v2_object_info_response(
-        ObjectFormat::Sha1,
-        &[PktLineFrame::Data(b"size\n".to_vec())],
-    )
-    .is_err());
-    assert!(parse_protocol_v2_object_info_response(
-        ObjectFormat::Sha1,
-        &[PktLineFrame::Data(b"type\n".to_vec()), PktLineFrame::Flush,],
-    )
-    .is_err());
-    assert!(parse_protocol_v2_object_info_response(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"size\n".to_vec()),
-            PktLineFrame::Data(b"1111111111111111111111111111111111111111 not-a-size\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_protocol_v2_object_info_response(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"size\n".to_vec()),
-            PktLineFrame::Delimiter,
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
+    assert!(
+        parse_protocol_v2_object_info_response(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(b"size\n".to_vec())],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_protocol_v2_object_info_response(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(b"type\n".to_vec()), PktLineFrame::Flush,],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_protocol_v2_object_info_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"size\n".to_vec()),
+                PktLineFrame::Data(
+                    b"1111111111111111111111111111111111111111 not-a-size\n".to_vec()
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_protocol_v2_object_info_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"size\n".to_vec()),
+                PktLineFrame::Delimiter,
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
     assert!(
         encode_protocol_v2_object_info_response(&ProtocolV2ObjectInfoResponse {
             size: false,
@@ -5998,14 +6451,16 @@ fn protocol_v2_fetch_response_reads_stateless_response_end() {
         sections
     );
     assert_eq!(input, b"tail");
-    assert!(parse_protocol_v2_fetch_response(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"acknowledgments\n".to_vec()),
-            PktLineFrame::ResponseEnd,
-        ],
-    )
-    .is_err());
+    assert!(
+        parse_protocol_v2_fetch_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"acknowledgments\n".to_vec()),
+                PktLineFrame::ResponseEnd,
+            ],
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -6074,11 +6529,13 @@ fn protocol_v2_fetch_packfile_demuxes_sideband_section() {
 
 #[test]
 fn protocol_v2_fetch_packfile_demux_rejects_duplicate_or_bad_sideband() {
-    assert!(demux_protocol_v2_fetch_packfile(&[
-        ProtocolV2FetchResponseSection::Packfile(vec![b"\x01PACK".to_vec()]),
-        ProtocolV2FetchResponseSection::Packfile(vec![b"\x01more".to_vec()]),
-    ])
-    .is_err());
+    assert!(
+        demux_protocol_v2_fetch_packfile(&[
+            ProtocolV2FetchResponseSection::Packfile(vec![b"\x01PACK".to_vec()]),
+            ProtocolV2FetchResponseSection::Packfile(vec![b"\x01more".to_vec()]),
+        ])
+        .is_err()
+    );
     assert!(
         demux_protocol_v2_fetch_packfile(&[ProtocolV2FetchResponseSection::Packfile(vec![
             b"\x03remote died\n".to_vec()
@@ -6095,43 +6552,53 @@ fn protocol_v2_fetch_packfile_demux_rejects_duplicate_or_bad_sideband() {
 
 #[test]
 fn protocol_v2_fetch_response_rejects_malformed_sections() {
-    assert!(parse_protocol_v2_fetch_response(
-        ObjectFormat::Sha1,
-        &[PktLineFrame::Data(b"acknowledgments\n".to_vec())],
-    )
-    .is_err());
-    assert!(parse_protocol_v2_fetch_response(
-        ObjectFormat::Sha1,
-        &[PktLineFrame::Delimiter, PktLineFrame::Flush],
-    )
-    .is_err());
-    assert!(parse_protocol_v2_fetch_response(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"acknowledgments\n".to_vec()),
-            PktLineFrame::Data(b"ACK not-an-oid\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_protocol_v2_fetch_response(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"packfile-uris\n".to_vec()),
-            PktLineFrame::Data(b"https://example.invalid/pack-a.pack\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
-    assert!(parse_protocol_v2_fetch_response(
-        ObjectFormat::Sha1,
-        &[
-            PktLineFrame::Data(b"packfile-uris\n".to_vec()),
-            PktLineFrame::Data(b"not-a-hash https://example.invalid/pack-a.pack\n".to_vec()),
-            PktLineFrame::Flush,
-        ],
-    )
-    .is_err());
+    assert!(
+        parse_protocol_v2_fetch_response(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(b"acknowledgments\n".to_vec())],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_protocol_v2_fetch_response(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Delimiter, PktLineFrame::Flush],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_protocol_v2_fetch_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"acknowledgments\n".to_vec()),
+                PktLineFrame::Data(b"ACK not-an-oid\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_protocol_v2_fetch_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"packfile-uris\n".to_vec()),
+                PktLineFrame::Data(b"https://example.invalid/pack-a.pack\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        parse_protocol_v2_fetch_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"packfile-uris\n".to_vec()),
+                PktLineFrame::Data(b"not-a-hash https://example.invalid/pack-a.pack\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err()
+    );
     assert!(
         encode_protocol_v2_fetch_response(&[ProtocolV2FetchResponseSection::WantedRefs(vec![
             ProtocolV2FetchWantedRef {

@@ -5,11 +5,12 @@ use crate::*;
 use sley::plumbing::sley_diff_merge::{ConflictStyle, MergeBlobOptions, merge_blobs};
 use sley_notes::{
     NotesCommitIdentity, NotesMergeConflict, NotesMergeOutcome, NotesMergeStrategy, NotesRef,
-    finalize_notes_merge, list_notes, merge_notes, notes_ref_expected, read_note,
-    read_note_from_tree, remove_note, resolve_notes_ref_with_config, upsert_note, write_notes,
+    UpsertNoteOptions, finalize_notes_merge, list_notes, merge_notes, notes_ref_expected,
+    read_note, read_note_from_tree, remove_note, remove_note_for, resolve_notes_ref_with_config,
+    upsert_note, upsert_note_for_with_options, write_notes,
 };
 
-pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_notes(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     // Parse the global `--ref <ref>` / `--no-ref` option, which may appear
     // before the subcommand. Everything after the (optional) subcommand is
     // handed to that subcommand's own parser.
@@ -52,12 +53,13 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
         None => ("list", &[][..]),
     };
 
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
+    let replace_objects = cli_session.replace_objects();
     // Resolve the notes ref against the effective config (includes + `-c` /
     // `GIT_CONFIG_*` overrides) so `core.notesRef` honours the same config the
     // rest of the command sees.
-    let effective_config = read_repo_config(&git_dir).unwrap_or_default();
+    let effective_config = identity_effective_config_for(cli_session).unwrap_or_default();
     let notes_ref =
         resolve_notes_ref_with_config(&git_dir, ref_override.as_deref(), &effective_config)?
             .as_str()
@@ -83,31 +85,59 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
     // refused for every writable subcommand: the expanded name resolves as a
     // tree-ish/reflog but is not a real ref, so writing through it is rejected.
     let refuse_non_ref = |verb: &str| -> Result<()> {
-        guard_writable_notes_ref(&git_dir, format, &raw_write_ref, verb)
+        guard_writable_notes_ref(&git_dir, format, &raw_write_ref, verb, replace_objects)
     };
 
     match subcommand {
-        "list" => notes_list(&git_dir, format, &notes_ref, sub_args),
+        "list" => notes_list(&git_dir, format, &notes_ref, sub_args, replace_objects),
         "add" => {
             refuse_outside("add")?;
             refuse_non_ref("add")?;
-            notes_add(&git_dir, format, &notes_ref, sub_args)
+            notes_add(
+                &git_dir,
+                format,
+                &notes_ref,
+                sub_args,
+                &effective_config,
+                replace_objects,
+            )
         }
         "edit" => {
             refuse_outside("edit")?;
             refuse_non_ref("edit")?;
-            notes_edit(&git_dir, format, &notes_ref, sub_args)
+            notes_edit(
+                &git_dir,
+                format,
+                &notes_ref,
+                sub_args,
+                &effective_config,
+                replace_objects,
+            )
         }
         "append" => {
             refuse_outside("append")?;
             refuse_non_ref("append")?;
-            notes_append(&git_dir, format, &notes_ref, sub_args)
+            notes_append(
+                &git_dir,
+                format,
+                &notes_ref,
+                sub_args,
+                &effective_config,
+                replace_objects,
+            )
         }
-        "show" => notes_show(&git_dir, format, &notes_ref, sub_args),
+        "show" => notes_show(&git_dir, format, &notes_ref, sub_args, replace_objects),
         "remove" => {
             refuse_outside("remove")?;
             refuse_non_ref("remove")?;
-            notes_remove(&git_dir, format, &notes_ref, sub_args)
+            notes_remove(
+                &git_dir,
+                format,
+                &notes_ref,
+                sub_args,
+                &effective_config,
+                replace_objects,
+            )
         }
         "copy" => {
             // `copy` validates its positional <from>/<to> arguments before
@@ -115,17 +145,31 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
             // non-ref guard runs *inside* `notes_copy` after that parse to keep
             // the "too few arguments" usage error taking precedence like git.
             refuse_outside("copy")?;
-            notes_copy(&git_dir, format, &notes_ref, sub_args)
+            notes_copy(
+                &git_dir,
+                format,
+                &notes_ref,
+                sub_args,
+                &effective_config,
+                replace_objects,
+            )
         }
         "merge" => {
             refuse_outside("merge")?;
             refuse_non_ref("merge")?;
-            notes_merge_cmd(&git_dir, format, &notes_ref, sub_args)
+            notes_merge_cmd(
+                cli_session,
+                &git_dir,
+                format,
+                &notes_ref,
+                sub_args,
+                &effective_config,
+            )
         }
         "prune" => {
             refuse_outside("prune")?;
             refuse_non_ref("prune")?;
-            notes_prune(&git_dir, format, &notes_ref, sub_args)
+            notes_prune(&git_dir, format, &notes_ref, sub_args, &effective_config)
         }
         "get-ref" => notes_get_ref(&notes_ref, sub_args),
         other => notes_unknown_subcommand_error(other),
@@ -140,8 +184,13 @@ fn notes_ref_handle(notes_ref: &str) -> NotesRef {
 /// it already resolves to an object (e.g. `refs/remote-notes/origin/x`, an
 /// existing ref outside refs/notes/); otherwise it is expanded under
 /// refs/notes/ like any notes-ref name (`x` -> `refs/notes/x`).
-fn expand_loose_notes_ref(git_dir: &Path, format: ObjectFormat, spec: &str) -> NotesRef {
-    if resolve_revision(git_dir, format, spec).is_ok() {
+fn expand_loose_notes_ref(
+    git_dir: &Path,
+    format: ObjectFormat,
+    spec: &str,
+    replace_objects: bool,
+) -> NotesRef {
+    if resolve_revision(git_dir, format, spec, replace_objects).is_ok() {
         NotesRef(spec.to_string())
     } else {
         notes_ref_handle(spec)
@@ -187,8 +236,9 @@ fn guard_writable_notes_ref(
     format: ObjectFormat,
     notes_ref: &str,
     _verb: &str,
+    replace_objects: bool,
 ) -> Result<()> {
-    match resolve_revision(git_dir, format, notes_ref) {
+    match resolve_revision(git_dir, format, notes_ref, replace_objects) {
         // The expanded ref resolved as a tree-ish. It is only usable for writing
         // if it also names a literal ref (git's `refs_read_ref`); a peel like
         // `^{tree}` or a reflog selector like `@{0}` resolves but is not a ref.
@@ -211,26 +261,24 @@ fn guard_writable_notes_ref(
     }
 }
 
-fn notes_commit_identity() -> Result<NotesCommitIdentity> {
+fn notes_commit_identity(config: &GitConfig) -> Result<NotesCommitIdentity> {
     Ok(NotesCommitIdentity {
-        author: commit_identity_from_env("AUTHOR")?,
-        committer: commit_identity_from_env("COMMITTER")?,
+        author: commit_identity_from_env("AUTHOR", config)?,
+        committer: commit_identity_from_env("COMMITTER", config)?,
     })
 }
 
 /// Resolve `git`'s editor command for `git notes`, mirroring git's precedence:
 /// `GIT_EDITOR`, then `core.editor`, then `VISUAL`/`EDITOR`, then the built-in
 /// default. `false`/empty disables editing (handled by the caller).
-fn note_editor_command() -> Option<String> {
+fn note_editor_command(config: &GitConfig) -> Option<String> {
     if let Ok(value) = env::var("GIT_EDITOR") {
         return Some(value);
     }
     if let Ok(Some(value)) = global_config_value("core.editor") {
         return Some(value);
     }
-    if let Some(config) = identity_effective_config()
-        && let Some(value) = config.get("core", None, "editor")
-    {
+    if let Some(value) = config.get("core", None, "editor") {
         return Some(value.to_string());
     }
     if let Ok(value) = env::var("VISUAL")
@@ -262,6 +310,7 @@ fn launch_note_editor(
     seed: &[u8],
     old_note: Option<&[u8]>,
     stripspace: NotesStripspace,
+    config: &GitConfig,
 ) -> Result<Vec<u8>> {
     let edit_path = git_dir.join("NOTES_EDITMSG");
 
@@ -284,7 +333,7 @@ fn launch_note_editor(
     }
     fs::write(&edit_path, &template)?;
 
-    let Some(editor) = note_editor_command() else {
+    let Some(editor) = note_editor_command(config) else {
         let _ = fs::remove_file(&edit_path);
         eprintln!("fatal: please supply the note contents using either -m or -F option");
         return Err(GitError::Exit(128));
@@ -414,8 +463,13 @@ fn build_note_body(
 
 /// Read a blob object's bytes for `-c`/`-C`. Non-blob objects are rejected the
 /// way git does, echoing the user's original spelling of the object.
-fn read_note_blob_content(git_dir: &Path, format: ObjectFormat, spec: &str) -> Result<Vec<u8>> {
-    let oid = resolve_note_object(git_dir, format, spec)?;
+fn read_note_blob_content(
+    git_dir: &Path,
+    format: ObjectFormat,
+    spec: &str,
+    replace_objects: bool,
+) -> Result<Vec<u8>> {
+    let oid = resolve_note_object(git_dir, format, spec, replace_objects)?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let object = db.read_object(&oid)?;
     if object.object_type != ObjectType::Blob {
@@ -444,6 +498,7 @@ struct EditOptions {
 fn setup_edit_options(
     git_dir: &Path,
     format: ObjectFormat,
+    replace_objects: bool,
     args: &[String],
     allow_force: bool,
     usage: NotesUsage,
@@ -499,7 +554,10 @@ fn setup_edit_options(
                     return notes_message_requires_value_error(arg);
                 };
                 contents.push(NoteContent::reuse(read_note_blob_content(
-                    git_dir, format, value,
+                    git_dir,
+                    format,
+                    value,
+                    replace_objects,
                 )?));
             }
             "-c" | "--reedit-message" => {
@@ -508,7 +566,10 @@ fn setup_edit_options(
                 };
                 use_editor = true;
                 contents.push(NoteContent::reuse(read_note_blob_content(
-                    git_dir, format, value,
+                    git_dir,
+                    format,
+                    value,
+                    replace_objects,
                 )?));
             }
             value if value.starts_with("-C") && value.len() > 2 => {
@@ -516,6 +577,7 @@ fn setup_edit_options(
                     git_dir,
                     format,
                     &value[2..],
+                    replace_objects,
                 )?));
             }
             value if value.starts_with("-c") && value.len() > 2 => {
@@ -524,6 +586,7 @@ fn setup_edit_options(
                     git_dir,
                     format,
                     &value[2..],
+                    replace_objects,
                 )?));
             }
             value if value.starts_with("--reuse-message=") => {
@@ -531,6 +594,7 @@ fn setup_edit_options(
                     git_dir,
                     format,
                     &value["--reuse-message=".len()..],
+                    replace_objects,
                 )?));
             }
             value if value.starts_with("--reedit-message=") => {
@@ -539,6 +603,7 @@ fn setup_edit_options(
                     git_dir,
                     format,
                     &value["--reedit-message=".len()..],
+                    replace_objects,
                 )?));
             }
             "-f" | "--force" if allow_force => force = true,
@@ -595,12 +660,13 @@ fn notes_list(
     format: ObjectFormat,
     notes_ref: &str,
     args: &[String],
+    replace_objects: bool,
 ) -> Result<()> {
     let object = parse_optional_single_object(args, NotesUsage::List)?;
     let store = FileRefStore::new(git_dir, format);
     if let Some(spec) = object {
         // `list <object>` prints just the note blob oid, or errors if absent.
-        let target = resolve_note_object(git_dir, format, &spec)?;
+        let target = resolve_note_object(git_dir, format, &spec, replace_objects)?;
         match read_note(
             git_dir,
             format,
@@ -631,13 +697,14 @@ fn notes_show(
     format: ObjectFormat,
     notes_ref: &str,
     args: &[String],
+    replace_objects: bool,
 ) -> Result<()> {
     let spec =
         parse_optional_single_object(args, NotesUsage::Show)?.unwrap_or_else(|| "HEAD".to_string());
-    let target = resolve_note_object(git_dir, format, &spec)?;
+    let target = resolve_note_object(git_dir, format, &spec, replace_objects)?;
     let store = FileRefStore::new(git_dir, format);
     let blob = if notes_ref_contains_revision_syntax(notes_ref) {
-        match notes_tree_from_revision(git_dir, format, notes_ref)? {
+        match notes_tree_from_revision(git_dir, format, notes_ref, replace_objects)? {
             Some(tree_oid) => read_note_from_tree(git_dir, format, &tree_oid, &target)?,
             None => None,
         }
@@ -669,8 +736,9 @@ fn notes_tree_from_revision(
     git_dir: &Path,
     format: ObjectFormat,
     notes_ref: &str,
+    replace_objects: bool,
 ) -> Result<Option<ObjectId>> {
-    let oid = resolve_revision(git_dir, format, notes_ref)?;
+    let oid = resolve_revision(git_dir, format, notes_ref, replace_objects)?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let object = db.read_object(&oid)?;
     match object.object_type {
@@ -680,11 +748,25 @@ fn notes_tree_from_revision(
     }
 }
 
-fn notes_add(git_dir: &Path, format: ObjectFormat, notes_ref: &str, args: &[String]) -> Result<()> {
-    let options = setup_edit_options(git_dir, format, args, true, NotesUsage::Add)?;
+fn notes_add(
+    git_dir: &Path,
+    format: ObjectFormat,
+    notes_ref: &str,
+    args: &[String],
+    config: &GitConfig,
+    replace_objects: bool,
+) -> Result<()> {
+    let options = setup_edit_options(
+        git_dir,
+        format,
+        replace_objects,
+        args,
+        true,
+        NotesUsage::Add,
+    )?;
     let has_messages = !options.contents.is_empty();
     let spec = options.object.clone().unwrap_or_else(|| "HEAD".to_string());
-    let target = resolve_note_object(git_dir, format, &spec)?;
+    let target = resolve_note_object(git_dir, format, &spec, replace_objects)?;
     let store = FileRefStore::new(git_dir, format);
 
     let existing = read_note(
@@ -703,7 +785,7 @@ fn notes_add(git_dir: &Path, format: ObjectFormat, notes_ref: &str, args: &[Stri
             return Err(GitError::Exit(1));
         }
         // No -m/-F/-c/-C and no -f: git redirects to the `edit` subcommand.
-        return notes_edit(git_dir, format, notes_ref, args);
+        return notes_edit(git_dir, format, notes_ref, args, config, replace_objects);
     }
     if existing.is_some() && options.force {
         eprintln!("Overwriting existing notes for object {}", target.to_hex());
@@ -714,7 +796,7 @@ fn notes_add(git_dir: &Path, format: ObjectFormat, notes_ref: &str, args: &[Stri
     let mut body = build_note_body(&options.contents, &options.separator, options.stripspace)
         .unwrap_or_default();
     if options.use_editor || !has_messages {
-        body = launch_note_editor(git_dir, &body, None, options.stripspace)?;
+        body = launch_note_editor(git_dir, &body, None, options.stripspace, config)?;
     }
 
     write_note_or_remove(
@@ -728,6 +810,7 @@ fn notes_add(git_dir: &Path, format: ObjectFormat, notes_ref: &str, args: &[Stri
         options.allow_empty,
         existing.is_some(),
         "add",
+        config,
     )
 }
 
@@ -747,21 +830,20 @@ fn write_note_or_remove(
     allow_empty: bool,
     had_existing: bool,
     verb: &str,
+    config: &GitConfig,
 ) -> Result<()> {
     let handle = notes_ref_handle(notes_ref);
     if body.is_empty() && !allow_empty {
         eprintln!("Removing note for object {spec}");
         if had_existing {
-            let mut notes = list_notes(git_dir, format, store, &handle)?;
-            remove_note(&mut notes, target);
-            write_notes(
+            remove_note_for(
                 git_dir,
                 format,
                 store,
                 &handle,
-                &notes,
+                target,
                 &format!("Notes removed by 'git notes {verb}'"),
-                &notes_commit_identity()?,
+                &notes_commit_identity(config)?,
                 notes_ref_expected(store, &handle)?,
             )?;
         }
@@ -769,18 +851,21 @@ fn write_note_or_remove(
     }
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let blob = db.write_object(EncodedObject::new(ObjectType::Blob, body))?;
-    let mut notes = list_notes(git_dir, format, store, &handle)?;
-    upsert_note(&mut notes, target, blob);
-    write_notes(
+    upsert_note_for_with_options(
         git_dir,
         format,
         store,
         &handle,
-        &notes,
+        target,
+        blob,
         &format!("Notes added by 'git notes {verb}'"),
-        &notes_commit_identity()?,
+        &notes_commit_identity(config)?,
         notes_ref_expected(store, &handle)?,
-    )
+        UpsertNoteOptions {
+            commit_if_unchanged: true,
+        },
+    )?;
+    Ok(())
 }
 
 /// `git notes edit [<object>]`: replace the note for `<object>` with the result
@@ -790,8 +875,17 @@ fn notes_edit(
     format: ObjectFormat,
     notes_ref: &str,
     args: &[String],
+    config: &GitConfig,
+    replace_objects: bool,
 ) -> Result<()> {
-    let options = setup_edit_options(git_dir, format, args, false, NotesUsage::Edit)?;
+    let options = setup_edit_options(
+        git_dir,
+        format,
+        replace_objects,
+        args,
+        false,
+        NotesUsage::Edit,
+    )?;
     let has_messages = !options.contents.is_empty();
     if has_messages {
         eprintln!(
@@ -799,7 +893,7 @@ fn notes_edit(
         );
     }
     let spec = options.object.clone().unwrap_or_else(|| "HEAD".to_string());
-    let target = resolve_note_object(git_dir, format, &spec)?;
+    let target = resolve_note_object(git_dir, format, &spec, replace_objects)?;
     let store = FileRefStore::new(git_dir, format);
     let existing = read_note(
         git_dir,
@@ -819,7 +913,13 @@ fn notes_edit(
         Some(blob) => Some(db.read_object(blob)?.body.clone()),
         None => None,
     };
-    let body = launch_note_editor(git_dir, &seed, old_note.as_deref(), options.stripspace)?;
+    let body = launch_note_editor(
+        git_dir,
+        &seed,
+        old_note.as_deref(),
+        options.stripspace,
+        config,
+    )?;
 
     write_note_or_remove(
         git_dir,
@@ -832,6 +932,7 @@ fn notes_edit(
         options.allow_empty,
         existing.is_some(),
         "edit",
+        config,
     )
 }
 
@@ -840,11 +941,20 @@ fn notes_append(
     format: ObjectFormat,
     notes_ref: &str,
     args: &[String],
+    config: &GitConfig,
+    replace_objects: bool,
 ) -> Result<()> {
-    let options = setup_edit_options(git_dir, format, args, false, NotesUsage::Append)?;
+    let options = setup_edit_options(
+        git_dir,
+        format,
+        replace_objects,
+        args,
+        false,
+        NotesUsage::Append,
+    )?;
     let has_messages = !options.contents.is_empty();
     let spec = options.object.clone().unwrap_or_else(|| "HEAD".to_string());
-    let target = resolve_note_object(git_dir, format, &spec)?;
+    let target = resolve_note_object(git_dir, format, &spec, replace_objects)?;
     let store = FileRefStore::new(git_dir, format);
 
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -862,7 +972,7 @@ fn notes_append(
     let mut appended = build_note_body(&options.contents, &options.separator, options.stripspace)
         .unwrap_or_default();
     if options.use_editor || !has_messages {
-        appended = launch_note_editor(git_dir, &appended, None, options.stripspace)?;
+        appended = launch_note_editor(git_dir, &appended, None, options.stripspace, config)?;
     }
 
     // Prepend the existing note, separated from the new content with the
@@ -888,6 +998,7 @@ fn notes_append(
         options.allow_empty,
         existing.is_some(),
         "append",
+        config,
     )
 }
 
@@ -896,6 +1007,8 @@ fn notes_remove(
     format: ObjectFormat,
     notes_ref: &str,
     args: &[String],
+    config: &GitConfig,
+    replace_objects: bool,
 ) -> Result<()> {
     let mut ignore_missing = false;
     let mut from_stdin = false;
@@ -934,7 +1047,7 @@ fn notes_remove(
     let mut any_missing = false;
     let mut removed_any = false;
     for spec in &specs {
-        let target = resolve_note_object(git_dir, format, spec)?;
+        let target = resolve_note_object(git_dir, format, spec, replace_objects)?;
         let target_hex = target.to_hex();
         let had_note = notes
             .iter()
@@ -965,7 +1078,7 @@ fn notes_remove(
             &notes_ref_handle(notes_ref),
             &notes,
             "Notes removed by 'git notes remove'",
-            &notes_commit_identity()?,
+            &notes_commit_identity(config)?,
             notes_ref_expected(&store, &notes_ref_handle(notes_ref))?,
         )?;
     }
@@ -982,6 +1095,7 @@ fn notes_prune(
     format: ObjectFormat,
     notes_ref: &str,
     args: &[String],
+    config: &GitConfig,
 ) -> Result<()> {
     let mut show_only = false;
     let mut verbose = false;
@@ -1051,7 +1165,7 @@ fn notes_prune(
             &handle,
             &notes,
             "Notes removed by 'git notes prune'",
-            &notes_commit_identity()?,
+            &notes_commit_identity(config)?,
             notes_ref_expected(&store, &handle)?,
         )?;
     }
@@ -1063,6 +1177,8 @@ fn notes_copy(
     format: ObjectFormat,
     notes_ref: &str,
     args: &[String],
+    config: &GitConfig,
+    replace_objects: bool,
 ) -> Result<()> {
     let mut force = false;
     let mut from_stdin = false;
@@ -1104,7 +1220,15 @@ fn notes_copy(
         if !positionals.is_empty() {
             return Err(notes_too_many_arguments(NotesUsage::Copy));
         }
-        return notes_copy_from_stdin(git_dir, format, notes_ref, force, rewrite_cmd.as_deref());
+        return notes_copy_from_stdin(
+            git_dir,
+            format,
+            notes_ref,
+            force,
+            rewrite_cmd.as_deref(),
+            config,
+            replace_objects,
+        );
     }
 
     // 0 args is a usage error; 1 arg copies onto HEAD; 2 args copy from->to;
@@ -1123,10 +1247,10 @@ fn notes_copy(
     // After argument validation (matching git's option-parse-then-init order),
     // refuse a notes ref that resolves to a tree-ish/reflog rather than a real
     // ref — the same writable-ref guard the other mutating subcommands apply.
-    guard_writable_notes_ref(git_dir, format, notes_ref, "copy")?;
+    guard_writable_notes_ref(git_dir, format, notes_ref, "copy", replace_objects)?;
 
-    let from = resolve_note_object(git_dir, format, &from_spec)?;
-    let to = resolve_note_object(git_dir, format, &to_spec)?;
+    let from = resolve_note_object(git_dir, format, &from_spec, replace_objects)?;
+    let to = resolve_note_object(git_dir, format, &to_spec, replace_objects)?;
     let store = FileRefStore::new(git_dir, format);
 
     // git checks the destination's existing-note guard before reading the
@@ -1161,7 +1285,7 @@ fn notes_copy(
         &notes_ref_handle(notes_ref),
         &notes,
         "Notes added by 'git notes copy'",
-        &notes_commit_identity()?,
+        &notes_commit_identity(config)?,
         notes_ref_expected(&store, &notes_ref_handle(notes_ref))?,
     )
 }
@@ -1223,9 +1347,8 @@ fn combine_notes(mode: CombineMode, cur: Option<&[u8]>, new: &[u8]) -> Vec<u8> {
 fn resolve_rewrite_config(
     store: &FileRefStore,
     cmd: &str,
+    config: &GitConfig,
 ) -> Result<Option<(CombineMode, Vec<String>)>> {
-    let config = identity_effective_config();
-
     // Mode: env wins, then config, then concatenate.
     let mode_from_env;
     let mut mode = CombineMode::Concatenate;
@@ -1238,7 +1361,6 @@ fn resolve_rewrite_config(
         mode_from_env = false;
     }
     if !mode_from_env
-        && let Some(config) = &config
         && let Some(value) = config.get("notes", None, "rewriteMode")
         && let Some(parsed) = CombineMode::parse(value)
     {
@@ -1248,9 +1370,7 @@ fn resolve_rewrite_config(
     // Enabled: notes.rewrite.<cmd> bool (default true). git reads the flattened
     // key `notes.rewrite.<cmd>` (section `notes`, dotted key `rewrite.<cmd>`).
     let mut enabled = true;
-    if let Some(config) = &config
-        && let Some(value) = config.get("notes", None, &format!("rewrite.{cmd}"))
-    {
+    if let Some(value) = config.get("notes", None, &format!("rewrite.{cmd}")) {
         enabled = value != "false" && value != "0" && value != "no" && value != "off";
     }
     if !enabled {
@@ -1261,7 +1381,7 @@ fn resolve_rewrite_config(
     let mut ref_globs: Vec<String> = Vec::new();
     if let Ok(value) = env::var("GIT_NOTES_REWRITE_REF") {
         ref_globs.extend(value.split(':').filter(|s| !s.is_empty()).map(String::from));
-    } else if let Some(config) = &config {
+    } else {
         for value in config
             .get_all("notes", None, "rewriteRef")
             .into_iter()
@@ -1312,13 +1432,15 @@ fn notes_copy_from_stdin(
     notes_ref: &str,
     force: bool,
     rewrite_cmd: Option<&str>,
+    config: &GitConfig,
+    replace_objects: bool,
 ) -> Result<()> {
     let store = FileRefStore::new(git_dir, format);
 
     // Determine the (mode, refs) set. `--stdin` uses overwrite on the single
     // current ref (honouring -f); `--for-rewrite` reads config.
     let (mode, refs) = if let Some(cmd) = rewrite_cmd {
-        match resolve_rewrite_config(&store, cmd)? {
+        match resolve_rewrite_config(&store, cmd, config)? {
             Some(resolved) => resolved,
             // Disabled or no configured refs: a silent no-op (git returns 0).
             None => return Ok(()),
@@ -1348,8 +1470,8 @@ fn notes_copy_from_stdin(
                 eprintln!("fatal: malformed input line: '{line}'.");
                 return Err(GitError::Exit(128));
             };
-            let from = resolve_note_object(git_dir, format, from_spec)?;
-            let to = resolve_note_object(git_dir, format, to_spec)?;
+            let from = resolve_note_object(git_dir, format, from_spec, replace_objects)?;
+            let to = resolve_note_object(git_dir, format, to_spec, replace_objects)?;
 
             // Read both source and destination notes from the in-progress tree
             // (the in-memory `notes` set), so multiple lines targeting the same
@@ -1396,7 +1518,7 @@ fn notes_copy_from_stdin(
                 &handle,
                 &notes,
                 "Notes added by 'git notes copy'",
-                &notes_commit_identity()?,
+                &notes_commit_identity(config)?,
                 notes_ref_expected(&store, &handle)?,
             )?;
         }
@@ -1415,10 +1537,12 @@ struct NotesMergeArgs {
 }
 
 fn notes_merge_cmd(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     format: ObjectFormat,
     notes_ref: &str,
     args: &[String],
+    config: &GitConfig,
 ) -> Result<()> {
     let parsed = parse_notes_merge_args(args)?;
     let do_merge = parsed.strategy.is_some() || (!parsed.commit && !parsed.abort);
@@ -1442,20 +1566,21 @@ fn notes_merge_cmd(
         return Ok(());
     }
     if parsed.commit {
-        return commit_notes_merge_state(git_dir, format);
+        return commit_notes_merge_state(git_dir, format, config);
     }
 
     let store = FileRefStore::new(git_dir, format);
     let local_ref = notes_ref_handle(notes_ref);
     let remote_arg = parsed.remote.as_deref().unwrap_or_default();
-    let remote_ref = expand_loose_notes_ref(git_dir, format, remote_arg);
-    let strategy = resolve_notes_merge_strategy(notes_ref, parsed.strategy.as_deref())?;
+    let remote_ref =
+        expand_loose_notes_ref(git_dir, format, remote_arg, cli_session.replace_objects());
+    let strategy = resolve_notes_merge_strategy(notes_ref, parsed.strategy.as_deref(), config)?;
     let message = format!(
         "Merged notes from {} into {}",
         remote_ref.as_str(),
         local_ref.as_str()
     );
-    let identity = notes_commit_identity()?;
+    let identity = notes_commit_identity(config)?;
 
     match merge_notes(
         git_dir,
@@ -1481,7 +1606,7 @@ fn notes_merge_cmd(
         }
         NotesMergeOutcome::Merged { .. } => Ok(()),
         NotesMergeOutcome::Conflicted { partial, conflicts } => {
-            ensure_no_shared_notes_merge(git_dir, local_ref.as_str())?;
+            ensure_no_shared_notes_merge(cli_session, git_dir, local_ref.as_str())?;
             write_notes_merge_conflicts(
                 git_dir,
                 format,
@@ -1559,22 +1684,20 @@ fn parse_notes_merge_args(args: &[String]) -> Result<NotesMergeArgs> {
 fn resolve_notes_merge_strategy(
     notes_ref: &str,
     explicit: Option<&str>,
+    config: &GitConfig,
 ) -> Result<NotesMergeStrategy> {
     if let Some(value) = explicit {
         return parse_notes_merge_strategy_option(value);
     }
-    let config = identity_effective_config();
     let short_ref = notes_ref.strip_prefix("refs/notes/").unwrap_or(notes_ref);
-    if let Some(config) = &config {
-        if let Some(value) = config.get("notes", Some(short_ref), "mergeStrategy") {
-            return parse_notes_merge_strategy_config(
-                &format!("notes.{short_ref}.mergeStrategy"),
-                value,
-            );
-        }
-        if let Some(value) = config.get("notes", None, "mergeStrategy") {
-            return parse_notes_merge_strategy_config("notes.mergeStrategy", value);
-        }
+    if let Some(value) = config.get("notes", Some(short_ref), "mergeStrategy") {
+        return parse_notes_merge_strategy_config(
+            &format!("notes.{short_ref}.mergeStrategy"),
+            value,
+        );
+    }
+    if let Some(value) = config.get("notes", None, "mergeStrategy") {
+        return parse_notes_merge_strategy_config("notes.mergeStrategy", value);
     }
     Ok(NotesMergeStrategy::Manual)
 }
@@ -1704,8 +1827,12 @@ fn conflict_note_body(
     }
 }
 
-fn ensure_no_shared_notes_merge(git_dir: &Path, notes_ref: &str) -> Result<()> {
-    if let Some(path) = find_shared_notes_merge(git_dir, notes_ref)? {
+fn ensure_no_shared_notes_merge(
+    cli_session: &crate::session::CliSession,
+    git_dir: &Path,
+    notes_ref: &str,
+) -> Result<()> {
+    if let Some(path) = find_shared_notes_merge(cli_session, git_dir, notes_ref)? {
         eprintln!(
             "fatal: a notes merge into {notes_ref} is already in-progress at {}",
             path.display()
@@ -1715,7 +1842,11 @@ fn ensure_no_shared_notes_merge(git_dir: &Path, notes_ref: &str) -> Result<()> {
     Ok(())
 }
 
-fn find_shared_notes_merge(git_dir: &Path, notes_ref: &str) -> Result<Option<PathBuf>> {
+fn find_shared_notes_merge(
+    cli_session: &crate::session::CliSession,
+    git_dir: &Path,
+    notes_ref: &str,
+) -> Result<Option<PathBuf>> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     for state_git_dir in notes_merge_state_git_dirs(&common_git_dir)? {
         if paths_refer_to_same_dir(&state_git_dir, git_dir) {
@@ -1726,6 +1857,7 @@ fn find_shared_notes_merge(git_dir: &Path, notes_ref: &str) -> Result<Option<Pat
         };
         if active_ref == notes_ref {
             return Ok(Some(notes_merge_worktree_path(
+                cli_session,
                 &common_git_dir,
                 &state_git_dir,
             )));
@@ -1765,9 +1897,13 @@ fn read_notes_merge_ref_at(git_dir: &Path) -> Result<Option<String>> {
     ))
 }
 
-fn notes_merge_worktree_path(common_git_dir: &Path, state_git_dir: &Path) -> PathBuf {
+fn notes_merge_worktree_path(
+    cli_session: &crate::session::CliSession,
+    common_git_dir: &Path,
+    state_git_dir: &Path,
+) -> PathBuf {
     if paths_refer_to_same_dir(common_git_dir, state_git_dir)
-        && let Ok(root) = worktree_root_for_git_dir(common_git_dir)
+        && let Ok(root) = worktree_root_for_git_dir(cli_session, common_git_dir)
     {
         return root;
     }
@@ -1824,7 +1960,11 @@ fn read_notes_merge_state(git_dir: &Path, format: ObjectFormat) -> Result<(Objec
     Ok((partial, NotesRef::expand(target)))
 }
 
-fn commit_notes_merge_state(git_dir: &Path, format: ObjectFormat) -> Result<()> {
+fn commit_notes_merge_state(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+) -> Result<()> {
     let (partial, notes_ref) = read_notes_merge_state(git_dir, format)?;
     let store = FileRefStore::new(git_dir, format);
 
@@ -1876,7 +2016,7 @@ fn commit_notes_merge_state(git_dir: &Path, format: ObjectFormat) -> Result<()> 
         &notes_ref,
         partial,
         &resolved,
-        &notes_commit_identity()?,
+        &notes_commit_identity(config)?,
     )?;
     abort_notes_merge_state(git_dir)
 }
@@ -1946,8 +2086,13 @@ fn parse_optional_single_object(args: &[String], usage: NotesUsage) -> Result<Op
 
 /// Resolve an object spec for notes, mapping resolution failures to git's
 /// notes-specific lowercase `failed to resolve` message (exit 128).
-fn resolve_note_object(git_dir: &Path, format: ObjectFormat, spec: &str) -> Result<ObjectId> {
-    match resolve_revision(git_dir, format, spec) {
+fn resolve_note_object(
+    git_dir: &Path,
+    format: ObjectFormat,
+    spec: &str,
+    replace_objects: bool,
+) -> Result<ObjectId> {
+    match resolve_revision(git_dir, format, spec, replace_objects) {
         Ok(oid) => Ok(oid),
         Err(
             GitError::NotFound(_)

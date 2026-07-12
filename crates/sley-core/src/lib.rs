@@ -437,25 +437,42 @@ pub mod trace2 {
         out
     }
 
-    fn trace_target(var: &str) -> Option<String> {
+    enum TraceTarget {
+        Stderr,
+        Path(String),
+    }
+
+    fn trace_target(var: &str) -> Option<TraceTarget> {
         let target = std::env::var_os(var)?.to_string_lossy().into_owned();
-        // Upstream accepts fd and socket target spellings too; sley only honors
-        // absolute path targets in the test harness.
-        target.starts_with('/').then_some(target)
+        match target.as_str() {
+            "1" | "true" => Some(TraceTarget::Stderr),
+            _ if target.starts_with('/') => Some(TraceTarget::Path(target)),
+            _ => None,
+        }
+    }
+
+    fn write_target(target: &TraceTarget, bytes: &[u8]) {
+        match target {
+            TraceTarget::Stderr => {
+                let _ = std::io::stderr().write_all(bytes);
+            }
+            TraceTarget::Path(path) => {
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    let _ = file.write_all(bytes);
+                }
+            }
+        }
     }
 
     fn append_to_target(var: &str, line: &str) {
         let Some(target) = trace_target(var) else {
             return;
         };
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(target)
-        {
-            let _ = file.write_all(line.as_bytes());
-            let _ = file.write_all(b"\n");
-        }
+        write_target(&target, format!("{line}\n").as_bytes());
     }
 
     fn redact_enabled() -> bool {
@@ -532,10 +549,12 @@ pub mod trace2 {
             let Some(target) = trace_target(var) else {
                 continue;
             };
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(target);
+            if let TraceTarget::Path(path) = target {
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path);
+            }
         }
     }
 
@@ -591,13 +610,23 @@ pub mod trace2 {
     }
 
     pub fn child_start(class: &str, argv: &[String]) {
+        child_start_with_id(class, 0, argv);
+    }
+
+    /// Record the start of a particular child/worker queue consumer.
+    ///
+    /// Checkout uses stable ids for each real materialization worker.  The
+    /// normal target intentionally includes Git's `child_start[N]` spelling;
+    /// upstream's parallel-checkout probes use that record to count workers.
+    pub fn child_start_with_id(class: &str, child_id: usize, argv: &[String]) {
         let redacted: Vec<String> = argv.iter().map(|arg| maybe_redact(arg)).collect();
         let joined = redacted.join(" ");
         perf_line(
             depth(),
             "child_start",
-            &format!("child_id:0 class:{class} argv:[{joined}]"),
+            &format!("child_id:{child_id} class:{class} argv:[{joined}]"),
         );
+        append_to_target("GIT_TRACE2", &format!("child_start[{child_id}] {joined}"));
         if let Some(target) = trace_target("GIT_TRACE2_EVENT") {
             let json_argv = redacted
                 .iter()
@@ -605,16 +634,10 @@ pub mod trace2 {
                 .collect::<Vec<_>>()
                 .join(",");
             let line = format!(
-                "{{\"event\":\"child_start\",\"sid\":\"sley\",\"thread\":\"main\",\"child_id\":0,\"child_class\":\"{}\",\"use_shell\":false,\"argv\":[{json_argv}]}}\n",
-                escape_json(class),
+                "{{\"event\":\"child_start\",\"sid\":\"sley\",\"thread\":\"main\",\"child_id\":{child_id},\"child_class\":\"{}\",\"use_shell\":false,\"argv\":[{json_argv}]}}\n",
+                escape_json(class)
             );
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&target)
-            {
-                let _ = file.write_all(line.as_bytes());
-            }
+            write_target(&target, line.as_bytes());
         }
     }
 
@@ -653,13 +676,7 @@ pub mod trace2 {
             escape_json(key),
             escape_json(&value.to_string()),
         );
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&target)
-        {
-            let _ = file.write_all(line.as_bytes());
-        }
+        write_target(&target, line.as_bytes());
     }
 
     /// Emit a trace2 `counter` event. Git writes these for accumulated counters
@@ -674,13 +691,7 @@ pub mod trace2 {
             escape_json(name),
             count,
         );
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&target)
-        {
-            let _ = file.write_all(line.as_bytes());
-        }
+        write_target(&target, line.as_bytes());
     }
 
     /// Emit a trace2 region enter/leave pair. This is the minimal event shape
@@ -701,13 +712,7 @@ pub mod trace2 {
             escape_json(category),
             escape_json(label),
         );
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&target)
-        {
-            let _ = file.write_all(line.as_bytes());
-        }
+        write_target(&target, line.as_bytes());
     }
 
     /// Emit the trace2 perf payload used by Git's changed-path Bloom filter
@@ -724,13 +729,7 @@ pub mod trace2 {
         let line = format!(
             "statistics:{{\"filter_not_present\":{filter_not_present},\"maybe\":{maybe},\"definitely_not\":{definitely_not},\"false_positive\":{false_positive}}}\n"
         );
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&target)
-        {
-            let _ = file.write_all(line.as_bytes());
-        }
+        write_target(&target, line.as_bytes());
     }
 
     /// Emit a compact trace2 perf `data` row for tests that extract the
@@ -742,13 +741,7 @@ pub mod trace2 {
         let line = format!(
             "19:00:00.000000 file.c:1 | d0 | main | data | r1 | ? | ? | read_directory | ....{key}:{value}\n"
         );
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&target)
-        {
-            let _ = file.write_all(line.as_bytes());
-        }
+        write_target(&target, line.as_bytes());
     }
 
     /// Emit a trace2 perf `data` row tagged to the `setup` category (git's
@@ -762,13 +755,7 @@ pub mod trace2 {
         let line = format!(
             "19:00:00.000000 setup.c:1 | d0 | main | data | r0 | ? | ? | setup | ....{key}:{value}\n"
         );
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&target)
-        {
-            let _ = file.write_all(line.as_bytes());
-        }
+        write_target(&target, line.as_bytes());
     }
 }
 
@@ -1649,6 +1636,10 @@ pub enum NotFoundKind {
     Reference {
         name: String,
     },
+    BrokenReference {
+        name: String,
+        target: String,
+    },
     Repository {
         path: String,
     },
@@ -1666,6 +1657,9 @@ impl fmt::Display for NotFoundKind {
             } => write!(f, "object {oid}"),
             Self::Object { oid, kind, .. } => write!(f, "{kind} object {oid}"),
             Self::Reference { name } => write!(f, "{name}"),
+            Self::BrokenReference { name, target } => {
+                write!(f, "broken reference {name} -> {target}")
+            }
             Self::Repository { path } => write!(f, "{path}"),
         }
     }
@@ -1812,6 +1806,13 @@ impl GitError {
 
     pub fn reference_not_found(name: impl Into<String>) -> Self {
         Self::NotFound(NotFoundKind::Reference { name: name.into() })
+    }
+
+    pub fn broken_reference(name: impl Into<String>, target: impl Into<String>) -> Self {
+        Self::NotFound(NotFoundKind::BrokenReference {
+            name: name.into(),
+            target: target.into(),
+        })
     }
 
     pub fn repository_not_found(path: impl Into<String>) -> Self {

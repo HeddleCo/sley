@@ -1,18 +1,18 @@
 //! Repository layout helpers (object format, abbrev width, worktree root, pack counts).
 
-use crate::{
-    common_git_dir_for_git_dir, explicit_git_dir, explicit_work_tree, global_config_value,
-    paths_refer_to_same_dir, resolve_cli_path, setup, sley_worktree,
-};
+use crate::{common_git_dir_for_git_dir, global_config_value, session};
 use sley::plumbing::sley_odb::repository_objects_dir;
 use sley::{GitConfig, GitError, ObjectFormat, Result};
-use std::env;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-pub(crate) fn worktree_prefix(cwd: &Path, git_dir: &Path) -> Result<String> {
-    let root = fs::canonicalize(worktree_root_for_git_dir(git_dir)?)?;
+pub(crate) fn worktree_prefix(
+    cli_session: &session::CliSession,
+    cwd: &Path,
+    git_dir: &Path,
+) -> Result<String> {
+    let root = fs::canonicalize(worktree_root_for_git_dir(cli_session, git_dir)?)?;
     let cwd = fs::canonicalize(cwd)?;
     let prefix = cwd.strip_prefix(&root).map_err(|_| {
         GitError::InvalidPath(format!(
@@ -214,41 +214,9 @@ fn pack_index_object_count(path: &Path) -> Result<u32> {
         header[offset + 3],
     ]))
 }
-pub(crate) fn worktree_root_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
-    // CLI/process-level overrides take precedence over anything recorded in the
-    // repository (these are not part of the repository-intrinsic resolution).
-    if let Some(work_tree) = explicit_work_tree() {
-        let work_tree =
-            resolve_cli_path(&env::current_dir()?, work_tree.to_string_lossy().as_ref());
-        return fs::canonicalize(work_tree).map_err(|err| GitError::Io(err.to_string()));
-    }
-    if let Some(setup) = setup::setup_git_directory()
-        && let Some(worktree) = setup.worktree.as_ref()
-        && (explicit_git_dir().is_some()
-            || explicit_work_tree().is_some()
-            || setup_matches_git_dir(&setup, git_dir))
-    {
-        return Ok(worktree.clone());
-    }
-    if explicit_git_dir().is_some() {
-        return env::current_dir().map_err(|err| GitError::Io(err.to_string()));
-    }
-    // The rest (core.worktree, linked worktrees, parent-of-.git) is shared with
-    // the library; a bare repository (None) is unsupported here.
-    match sley_worktree::worktree_root_for_git_dir(git_dir)? {
-        Some(root) => Ok(root),
-        None => Err(GitError::Unsupported(
-            "update-index currently requires a non-bare worktree".into(),
-        )),
-    }
-}
-
-fn setup_matches_git_dir(setup: &setup::SetupResult, git_dir: &Path) -> bool {
-    let setup_git_dir = Path::new(&setup.git_dir);
-    let setup_git_dir = if setup_git_dir.is_absolute() {
-        setup_git_dir.to_path_buf()
-    } else {
-        setup.cwd.join(setup_git_dir)
-    };
-    paths_refer_to_same_dir(&setup_git_dir, git_dir)
+pub(crate) fn worktree_root_for_git_dir(
+    cli_session: &session::CliSession,
+    git_dir: &Path,
+) -> Result<PathBuf> {
+    cli_session.worktree_root_for_git_dir(git_dir)
 }

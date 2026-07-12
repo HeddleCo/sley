@@ -47,7 +47,9 @@ where
     {
         self.inner
             .install_raw_pack_from_reader_with_progress(reader, options, |progress| {
-                self.sink.borrow_mut().transfer(transfer_from_pack(progress));
+                self.sink
+                    .borrow_mut()
+                    .transfer(transfer_from_pack(progress));
             })
     }
 }
@@ -68,15 +70,12 @@ use sley_protocol::{
     ProtocolV2FetchShallowInfo, SideBandChannel, demux_upload_pack_packfile_response,
     parse_sideband_packet, read_pkt_line_frame, read_protocol_v2_fetch_response_header,
     read_upload_pack_packfile_response, read_upload_pack_raw_packfile_response_header,
-    read_upload_pack_shallow_info_section,
     read_upload_pack_shallow_info_and_raw_packfile_response_header,
+    read_upload_pack_shallow_info_section,
 };
 use std::io::{Cursor, ErrorKind, Read};
 
-fn raw_pack_install_options(
-    promisor: bool,
-    max_input_size: Option<u64>,
-) -> RawPackInstallOptions {
+fn raw_pack_install_options(promisor: bool, max_input_size: Option<u64>) -> RawPackInstallOptions {
     RawPackInstallOptions {
         promisor,
         max_input_size,
@@ -115,7 +114,13 @@ where
     I: RawPackInstaller,
     R: Read,
 {
-    install_upload_pack_sideband_response_from_reader(format, reader, destination, false, max_input_size)
+    install_upload_pack_sideband_response_from_reader(
+        format,
+        reader,
+        destination,
+        false,
+        max_input_size,
+    )
 }
 
 pub fn install_upload_pack_packfile_promisor_response_from_reader<R>(
@@ -127,7 +132,13 @@ pub fn install_upload_pack_packfile_promisor_response_from_reader<R>(
 where
     R: Read,
 {
-    install_upload_pack_sideband_response_from_reader(format, reader, destination, true, max_input_size)
+    install_upload_pack_sideband_response_from_reader(
+        format,
+        reader,
+        destination,
+        true,
+        max_input_size,
+    )
 }
 
 fn install_upload_pack_sideband_response_from_reader<I, R>(
@@ -229,8 +240,13 @@ where
     R: Read,
 {
     let shallow = read_upload_pack_shallow_info_section(format, reader)?;
-    let result =
-        install_upload_pack_sideband_response_from_reader(format, reader, destination, promisor, max_input_size)?;
+    let result = install_upload_pack_sideband_response_from_reader(
+        format,
+        reader,
+        destination,
+        promisor,
+        max_input_size,
+    )?;
     Ok((shallow, result))
 }
 
@@ -513,9 +529,13 @@ mod tests {
         let destination = FileObjectDatabase::new(root.join("objects"), format);
         let mut reader = encoded.as_slice();
 
-        let (shallow, result) =
-            install_upload_pack_shallow_raw_response_from_reader(format, &mut reader, &destination, None)
-                .expect("test operation should succeed");
+        let (shallow, result) = install_upload_pack_shallow_raw_response_from_reader(
+            format,
+            &mut reader,
+            &destination,
+            None,
+        )
+        .expect("test operation should succeed");
 
         assert_eq!(
             shallow,
@@ -696,7 +716,8 @@ mod tests {
         .expect_err("oversized pack should be rejected");
 
         assert!(
-            err.to_string().contains("pack exceeds maximum allowed size"),
+            err.to_string()
+                .contains("pack exceeds maximum allowed size"),
             "unexpected error: {err}"
         );
         let pack_dir = root.join("objects").join("pack");
@@ -705,11 +726,7 @@ mod tests {
                 entries
                     .filter_map(|entry| entry.ok())
                     .filter(|entry| {
-                        entry
-                            .path()
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            == Some("pack")
+                        entry.path().extension().and_then(|ext| ext.to_str()) == Some("pack")
                     })
                     .count()
             })
@@ -754,7 +771,10 @@ mod tests {
 
         let result = install_upload_pack_raw_response_from_reader(
             ObjectFormat::Sha1,
-            &mut reader, &installer, None)
+            &mut reader,
+            &installer,
+            None,
+        )
         .expect("test operation should succeed");
 
         assert!(result.object_ids.is_empty());
@@ -813,8 +833,8 @@ mod tests {
                 )
             })
             .collect();
-        let pack = PackFile::write_undeltified(&objects, format)
-            .expect("test operation should succeed");
+        let pack =
+            PackFile::write_undeltified(&objects, format).expect("test operation should succeed");
         let response = UploadPackRawPackfileResponse {
             acknowledgments: Vec::new(),
             packfile: pack.pack,
@@ -883,8 +903,9 @@ mod tests {
 
         // Objects advanced incrementally to the announced total.
         assert!(
-            samples.iter().any(|sample| sample.received_objects > 0
-                && sample.received_objects < total),
+            samples
+                .iter()
+                .any(|sample| sample.received_objects > 0 && sample.received_objects < total),
             "expected at least one intermediate object sample"
         );
         assert_eq!(last.received_objects, total);
@@ -917,8 +938,9 @@ mod tests {
         let plain_root = test_temp_root("sley-remote-install-progress-plain");
         let plain_db = FileObjectDatabase::new(plain_root.join("objects"), format);
         let mut reader = encoded.as_slice();
-        let plain = install_upload_pack_raw_response_from_reader(format, &mut reader, &plain_db, None)
-            .expect("test operation should succeed");
+        let plain =
+            install_upload_pack_raw_response_from_reader(format, &mut reader, &plain_db, None)
+                .expect("test operation should succeed");
         assert_eq!(plain.object_ids.len(), 8);
 
         let _ = fs::remove_dir_all(&root);

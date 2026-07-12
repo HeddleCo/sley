@@ -1235,7 +1235,13 @@ pub(crate) fn collect_attribute_patterns_from_index(
     if !index_path.exists() {
         return Ok(());
     }
-    let mut entries = Index::parse(&fs::read(index_path)?, format)?.entries;
+    // Attribute lookup needs the logical index contents, including
+    // `.gitattributes` files represented by collapsed sparse directories. Use
+    // an in-memory view: observable index expansion and on-disk mutation would
+    // violate `check-attr`'s sparse-index contract.
+    let mut index = Index::parse(&fs::read(index_path)?, format)?;
+    expand_sparse_index_view(&mut index, db, format)?;
+    let mut entries = index.entries;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     for entry in entries {
         let is_attributes_file =

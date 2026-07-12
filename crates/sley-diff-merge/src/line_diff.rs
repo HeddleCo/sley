@@ -397,7 +397,7 @@ pub(crate) fn line_is_blank(line: &[u8], ignore: WsIgnore) -> bool {
 /// still index the *original* lines position-for-position.
 ///
 /// When `ignore.is_empty()`, this is identical to [`myers_diff_lines`]. With
-/// flags, lines are canonicalized (see [`canonicalize_line`]) for the equality
+/// flags, lines are canonicalized (see `canonicalize_line`) for the equality
 /// test only; the ops consume the same number of old/new lines as the originals
 /// so the caller can render the original bytes.
 pub fn myers_diff_lines_ws(

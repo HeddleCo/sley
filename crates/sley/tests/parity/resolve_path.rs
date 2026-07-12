@@ -1,7 +1,7 @@
 //! `<rev>:<path>` engine parity via [`Repository::resolve_path`].
 
 use sley::Repository;
-use sley_testkit::engine_parity::{git_oid_line, EngineOutput, EngineParityCase};
+use sley_testkit::engine_parity::{EngineOutput, EngineParityCase, git_oid_line};
 
 fn resolve_path_oid_output(repo: &Repository, rev: &str, path: &str) -> EngineOutput {
     let entry = repo.resolve_path(rev, path).expect("resolve_path");

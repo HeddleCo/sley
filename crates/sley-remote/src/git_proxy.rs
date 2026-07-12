@@ -5,6 +5,7 @@
 //! daemon protocol over the proxy's stdin/stdout instead of opening a TCP socket.
 
 use std::env;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -108,9 +109,16 @@ pub(crate) fn connect_git_transport(
 }
 
 fn spawn_git_proxy(command: &str, host: &str, port: &str) -> Result<GitConnection> {
-    let mut child = Command::new(command)
-        .arg(host)
-        .arg(port)
+    let mut process = Command::new(command);
+    process.arg(host).arg(port);
+    if let Some(path) = proxy_path_with_git_exec_path() {
+        // A proxy commonly decodes the daemon request and executes
+        // `git-upload-pack` by name. An installed Git exposes that helper from
+        // its own exec path; make the same guarantee for Sley so a caller's
+        // unrelated Git installation cannot be selected from PATH instead.
+        process.env("PATH", path);
+    }
+    let mut child = process
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Upstream git inherits stderr; piping without draining deadlocks when the
@@ -118,12 +126,14 @@ fn spawn_git_proxy(command: &str, host: &str, port: &str) -> Result<GitConnectio
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|err| GitError::Command(format!("cannot start proxy {command}: {err}")))?;
-    let stdin = child.stdin.take().ok_or_else(|| {
-        GitError::Command(format!("proxy {command} stdin was not piped"))
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        GitError::Command(format!("proxy {command} stdout was not piped"))
-    })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| GitError::Command(format!("proxy {command} stdin was not piped")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitError::Command(format!("proxy {command} stdout was not piped")))?;
     Ok(GitConnection {
         inner: GitConnectionInner::Proxy {
             child,
@@ -133,11 +143,43 @@ fn spawn_git_proxy(command: &str, host: &str, port: &str) -> Result<GitConnectio
     })
 }
 
+fn proxy_path_with_git_exec_path() -> Option<OsString> {
+    let exec_path = env::var_os("GIT_EXEC_PATH")?;
+    let exec_dir = std::path::PathBuf::from(&exec_path);
+    if !sley_owned_helper_dir(&exec_dir) {
+        return None;
+    }
+    prepend_git_exec_path(exec_path, env::var_os("PATH"))
+}
+
+fn sley_owned_helper_dir(exec_dir: &std::path::Path) -> bool {
+    let provenance = exec_dir.join(".sley-helper-provenance");
+    let upload_pack = exec_dir.join("git-upload-pack");
+    let regular_file = |path: &std::path::Path| {
+        std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+            .unwrap_or(false)
+    };
+    regular_file(&provenance)
+        && regular_file(&upload_pack)
+        && std::fs::read_to_string(provenance)
+            .map(|contents| contents.lines().any(|line| line == "owner=sley"))
+            .unwrap_or(false)
+}
+
+fn prepend_git_exec_path(exec_path: OsString, path: Option<OsString>) -> Option<OsString> {
+    if exec_path.is_empty() {
+        return None;
+    }
+    let mut paths = vec![std::path::PathBuf::from(exec_path)];
+    if let Some(path) = path {
+        paths.extend(env::split_paths(&path));
+    }
+    env::join_paths(paths).ok()
+}
+
 /// Resolve the proxy executable for `host`, mirroring `git_use_proxy`.
-pub(crate) fn resolve_git_proxy_command(
-    config: Option<&GitConfig>,
-    host: &str,
-) -> Option<String> {
+pub(crate) fn resolve_git_proxy_command(config: Option<&GitConfig>, host: &str) -> Option<String> {
     if let Ok(command) = env::var("GIT_PROXY_COMMAND")
         && !command.is_empty()
     {
@@ -182,8 +224,7 @@ fn host_matches_git_proxy_pattern(host: &str, pattern: &str) -> bool {
     if &host[host.len() - pattern_len..] != pattern {
         return false;
     }
-    host.len() == pattern_len
-        || host.as_bytes().get(host.len() - pattern_len - 1) == Some(&b'.')
+    host.len() == pattern_len || host.as_bytes().get(host.len() - pattern_len - 1) == Some(&b'.')
 }
 
 fn validate_git_daemon_host(host: &str) -> Result<()> {
@@ -263,5 +304,35 @@ mod tests {
             resolve_git_proxy_command(Some(&config), "git.example.com").as_deref(),
             Some("host-proxy")
         );
+    }
+
+    #[test]
+    fn proxy_path_places_git_exec_path_first() {
+        let path = prepend_git_exec_path(
+            OsString::from("/native/sley/helpers"),
+            Some(OsString::from("/usr/local/bin:/usr/bin")),
+        )
+        .expect("proxy path");
+        let parts = env::split_paths(&path).collect::<Vec<_>>();
+        assert_eq!(
+            parts.first().expect("prepended path entry"),
+            &std::path::PathBuf::from("/native/sley/helpers")
+        );
+    }
+
+    #[test]
+    fn helper_provenance_rejects_unowned_directories() {
+        let root =
+            std::env::temp_dir().join(format!("sley-proxy-provenance-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create helper directory");
+        std::fs::write(root.join("git-upload-pack"), b"#!/bin/sh\n").expect("write helper");
+        std::fs::write(root.join(".sley-helper-provenance"), b"owner=other\n")
+            .expect("write foreign provenance");
+        assert!(!sley_owned_helper_dir(&root));
+        std::fs::write(root.join(".sley-helper-provenance"), b"owner=sley\n")
+            .expect("write sley provenance");
+        assert!(sley_owned_helper_dir(&root));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

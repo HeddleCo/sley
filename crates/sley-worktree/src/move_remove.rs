@@ -23,7 +23,7 @@ pub fn remove_index_and_worktree_paths(
     let worktree_root = worktree_root.as_path();
     let git_dir = git_dir.as_path();
     let index_path = repository_index_path(git_dir);
-    let index = if index_path.exists() {
+    let mut index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
@@ -35,6 +35,42 @@ pub fn remove_index_and_worktree_paths(
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head_entries = head_tree_entries(git_dir, format, &db)?;
+    let original_sparse_dir_paths = index
+        .entries
+        .iter()
+        .filter(|entry| entry.is_sparse_dir())
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect::<BTreeSet<_>>();
+    let needs_sparse_expansion = !original_sparse_dir_paths.is_empty()
+        && paths.iter().any(|path| {
+            remove_pathspec_intersects_sparse_directory(
+                worktree_root,
+                path,
+                &original_sparse_dir_paths,
+            )
+            .unwrap_or(true)
+        });
+    if needs_sparse_expansion {
+        expand_sparse_index(&mut index, &db, format)?;
+    }
+    let original_sparse_descendants = original_sparse_dir_paths
+        .iter()
+        .map(|directory| {
+            let descendants = index
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .path
+                        .as_bytes()
+                        .strip_prefix(directory.as_slice())
+                        .is_some_and(|suffix| !suffix.is_empty())
+                })
+                .map(|entry| entry.path.as_bytes().to_vec())
+                .collect::<BTreeSet<_>>();
+            (directory.clone(), descendants)
+        })
+        .collect::<BTreeMap<_, _>>();
     // Stat cache for the local-modification check (git's `ie_match_stat`):
     // proves a path unchanged from the cached stat without reading its blob, so
     // a `git rm --cached` of an untouched path whose blob was removed still
@@ -179,6 +215,56 @@ pub fn remove_index_and_worktree_paths(
             selected.extend(matched);
         }
     }
+
+    // A full sparse index and an expanded sparse index must reject the same
+    // out-of-cone pathspecs unless `--sparse` explicitly opts in. Expansion is
+    // an implementation detail; decide from the selected leaves' actual
+    // CE_SKIP_WORKTREE bits so both layouts share one semantic path.
+    if !options.sparse {
+        let rejected = index_entry_list
+            .iter()
+            .filter(|entry| {
+                entry.stage() == Stage::Normal
+                    && entry.is_skip_worktree()
+                    && selected.contains(entry.path.as_bytes())
+            })
+            .map(|entry| String::from_utf8_lossy(entry.path.as_bytes()).into_owned())
+            .collect::<Vec<_>>();
+        if !rejected.is_empty() {
+            eprintln!("The following paths and/or pathspecs matched paths that exist");
+            eprintln!("outside of your sparse-checkout definition, so will not be");
+            eprintln!("updated in the index:");
+            for path in &rejected {
+                eprintln!("{path}");
+            }
+            let show_hints = sley_config::read_repo_config(git_dir, config_parameters_env)
+                .ok()
+                .and_then(|config| config.get_bool("advice", None, "updateSparsePath"))
+                .unwrap_or(true);
+            if show_hints {
+                eprintln!("hint: If you intend to update such entries, try one of the following:");
+                eprintln!("hint: * Use the --sparse option.");
+                eprintln!("hint: * Disable or modify the sparsity rules.");
+                eprintln!(
+                    "hint: Disable this message with \"git config set advice.updateSparsePath false\""
+                );
+            }
+            return Err(GitError::Exit(1));
+        }
+    }
+
+    let display_removed_paths = || {
+        let mut display = selected.clone();
+        for (directory, descendants) in &original_sparse_descendants {
+            if !descendants.is_empty() && descendants.iter().all(|path| selected.contains(path)) {
+                for path in descendants {
+                    display.remove(path);
+                }
+                display.insert(directory.clone());
+            }
+        }
+        display.into_iter().collect::<Vec<_>>()
+    };
 
     // `git rm` runs the local-modification safety check unless `-f` is given —
     // even for `--cached`. The check (a faithful port of builtin/rm.c's
@@ -335,7 +421,7 @@ pub fn remove_index_and_worktree_paths(
 
     if options.dry_run {
         return Ok(RemoveResult {
-            removed: selected.into_iter().collect(),
+            removed: display_removed_paths(),
         });
     }
     let selected_gitlinks = selected
@@ -424,9 +510,18 @@ pub fn remove_index_and_worktree_paths(
     };
     update_cache_tree_for_git_paths(&mut index, format, &db, &selected_paths)?;
     invalidate_untracked_cache_for_git_paths(&mut index, format, &selected_paths)?;
-    fs::write(index_path, index.write(format)?)?;
+    fs::write(&index_path, index.write(format)?)?;
+    // A pathspec may have expanded a sparse-directory entry to select one or
+    // more leaves. Convert the result back to the configured sparse layout so
+    // `git rm --sparse folder/a` does not permanently densify the index.
+    if needs_sparse_expansion
+        && let Some((sparse, mode)) = active_sparse_checkout(git_dir)?
+        && sparse.sparse_index
+    {
+        apply_sparse_checkout_with_mode(worktree_root, git_dir, format, &sparse, mode)?;
+    }
     Ok(RemoveResult {
-        removed: selected.into_iter().collect(),
+        removed: display_removed_paths(),
     })
 }
 
@@ -557,6 +652,56 @@ fn remove_path_under_prefix(path: &[u8], prefix: &[u8]) -> bool {
         || path
             .strip_prefix(prefix)
             .is_some_and(|rest| rest.starts_with(b"/"))
+}
+
+/// Whether a remove pathspec can name a leaf represented by a collapsed
+/// sparse-directory entry. The literal prefix before the first wildcard is
+/// enough to avoid expanding for in-cone specs such as `deep/deep*`, while
+/// conservatively expanding for broad globs such as `*/a` and `**a`.
+fn remove_pathspec_intersects_sparse_directory(
+    worktree_root: &Path,
+    path: &Path,
+    sparse_directories: &BTreeSet<Vec<u8>>,
+) -> Result<bool> {
+    let parsed = remove_pathspec_parts(worktree_root, path)?;
+    if parsed.from_magic {
+        return Ok(true);
+    }
+    let pattern = parsed.raw.as_bytes();
+    // `git rm -r .` deliberately operates on the sparse index as-is: it drops
+    // the visible/in-cone entries and leaves collapsed out-of-cone directories
+    // untouched. Treat the repository-root pathspec as an index-level match,
+    // not a request to expand every sparse directory.
+    if pattern.is_empty() {
+        return Ok(false);
+    }
+    let wildcard = pattern
+        .iter()
+        .position(|byte| matches!(byte, b'*' | b'?' | b'['));
+    let literal_prefix = wildcard.map_or(pattern, |position| &pattern[..position]);
+    for directory in sparse_directories {
+        let directory = directory.strip_suffix(b"/").unwrap_or(directory);
+        if wildcard.is_none() {
+            if pattern == directory
+                || pattern
+                    .strip_prefix(directory)
+                    .is_some_and(|suffix| suffix.starts_with(b"/"))
+                || directory
+                    .strip_prefix(pattern)
+                    .is_some_and(|suffix| pattern.is_empty() || suffix.starts_with(b"/"))
+            {
+                return Ok(true);
+            }
+        } else if literal_prefix.is_empty()
+            || directory.starts_with(literal_prefix)
+            || literal_prefix
+                .strip_prefix(directory)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(b"/"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Remove a tracked path from the working tree, mirroring builtin/rm.c's
@@ -1117,6 +1262,28 @@ pub fn move_index_and_worktree_path(
             checksum: None,
         }
     };
+    // A sparse-index directory row is only a compact representation of the
+    // tracked leaves below it. `git mv --sparse dir …` operates on those leaves
+    // individually so their destination cone membership can be recomputed.
+    // Expand the semantic view before source/destination classification; the
+    // resulting index is persisted only when the move itself succeeds.
+    //
+    // Older index readers may expose the `sdir` extension and 040000 `/` row
+    // before decoding its extended skip-worktree bit. Normalize that redundant
+    // representation at this engine boundary so the shared expansion primitive
+    // still recognizes the row. A fully decoded index already has the bit and
+    // this loop is a no-op.
+    if options.sparse && index.is_sparse() {
+        for entry in &mut index.entries {
+            if entry.mode == sley_index::SPARSE_DIR_MODE && entry.path.as_bytes().ends_with(b"/") {
+                entry.set_skip_worktree(true);
+            }
+        }
+    }
+    if options.sparse && index.entries.iter().any(IndexEntry::is_sparse_dir) {
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        crate::checkout::expand_sparse_index_view(&mut index, &db, format)?;
+    }
     let source_absolute = if source.is_absolute() {
         source.to_path_buf()
     } else {

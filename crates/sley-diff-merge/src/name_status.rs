@@ -1,18 +1,14 @@
 //! Tree/index/worktree name-status diff and rename detection.
 
-use sley_core::{
-    object_id_for_bytes, BString, GitError, ObjectFormat, ObjectId, RepoPath, Result,
-};
+use sley_core::{BString, GitError, ObjectFormat, ObjectId, RepoPath, Result, object_id_for_bytes};
 use sley_index::{BorrowedIndex, Index, IndexStatCache};
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntries, TreeEntry};
-use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
+use sley_odb::{FileObjectDatabase, ObjectReader};
 use sley_refs::{FileRefStore, RefTarget};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-use crate::line_diff::DiffAlgorithm;
 
 // ===========================================================================
 // Gitlink (submodule) resolution helpers.
@@ -392,16 +388,17 @@ pub fn diff_name_status_head_index_with_options(
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
     if options.detect_inexact {
-        return Ok(
-            diff_name_status_head_index_with_options_and_diagnostics(git_dir, format, options)?
-                .entries,
-        );
+        return Ok(diff_name_status_head_index_with_options_and_diagnostics(
+            git_dir, format, options,
+        )?
+        .entries);
     }
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head = head_tree_entries(git_dir, format, &db)?;
     let index = read_index_entries(git_dir, format)?;
-    diff_name_status_maps(&head, &index, head.keys().chain(index.keys()), options)
+    let entries = diff_name_status_maps(&head, &index, head.keys().chain(index.keys()), options)?;
+    mark_index_unmerged_entries(entries, git_dir, format)
 }
 
 pub fn diff_name_status_head_index_with_options_and_diagnostics(
@@ -413,13 +410,15 @@ pub fn diff_name_status_head_index_with_options_and_diagnostics(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head = head_tree_entries(git_dir, format, &db)?;
     let index = read_index_entries(git_dir, format)?;
-    diff_name_status_maps_with_renames_and_diagnostics(
+    let mut outcome = diff_name_status_maps_with_renames_and_diagnostics(
         &head,
         &index,
         head.keys().chain(index.keys()),
         options,
         |oid| read_blob_bytes(&db, oid),
-    )
+    )?;
+    outcome.entries = mark_index_unmerged_entries(outcome.entries, git_dir, format)?;
+    Ok(outcome)
 }
 
 /// Read an arbitrary tree object's flattened blob entries (recursively) keyed by
@@ -460,18 +459,17 @@ pub fn diff_name_status_tree_index_with_options(
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
     if options.detect_inexact {
-        return Ok(
-            diff_name_status_tree_index_with_options_and_diagnostics(
-                git_dir, format, tree_oid, options,
-            )?
-            .entries,
-        );
+        return Ok(diff_name_status_tree_index_with_options_and_diagnostics(
+            git_dir, format, tree_oid, options,
+        )?
+        .entries);
     }
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let tree = tree_entries(tree_oid, format, &db)?;
     let index = read_index_entries(git_dir, format)?;
-    diff_name_status_maps(&tree, &index, tree.keys().chain(index.keys()), options)
+    let entries = diff_name_status_maps(&tree, &index, tree.keys().chain(index.keys()), options)?;
+    mark_index_unmerged_entries(entries, git_dir, format)
 }
 
 pub fn diff_name_status_tree_index_with_options_and_diagnostics(
@@ -484,13 +482,66 @@ pub fn diff_name_status_tree_index_with_options_and_diagnostics(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let tree = tree_entries(tree_oid, format, &db)?;
     let index = read_index_entries(git_dir, format)?;
-    diff_name_status_maps_with_renames_and_diagnostics(
+    let mut outcome = diff_name_status_maps_with_renames_and_diagnostics(
         &tree,
         &index,
         tree.keys().chain(index.keys()),
         options,
         |oid| read_blob_bytes(&db, oid),
-    )
+    )?;
+    outcome.entries = mark_index_unmerged_entries(outcome.entries, git_dir, format)?;
+    Ok(outcome)
+}
+
+/// Replace the tree-vs-index placeholder pair for each conflicted path with a
+/// true `U` record. Stage-zero index maps necessarily omit unmerged paths, so a
+/// naïve comparison classifies an existing conflict as deleted; that also makes
+/// lowercase `--diff-filter=u` fail to exclude it before porcelain rendering.
+fn mark_index_unmerged_entries(
+    entries: Vec<NameStatusEntry>,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<NameStatusEntry>> {
+    let index_path = sley_index::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(entries);
+    }
+    let index = sley_index::read_repository_index(git_dir, format)?;
+    let unmerged = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() != sley_index::Stage::Normal)
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect::<BTreeSet<_>>();
+    if unmerged.is_empty() {
+        return Ok(entries);
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut marked = Vec::with_capacity(entries.len() + unmerged.len());
+    for mut entry in entries {
+        if unmerged.contains(entry.path.as_bytes()) {
+            seen.insert(entry.path.as_bytes().to_vec());
+            entry.status = NameStatus::Unmerged;
+            entry.old_path = None;
+            entry.old_oid = None;
+            entry.new_oid = None;
+        }
+        marked.push(entry);
+    }
+    for path in unmerged.difference(&seen) {
+        marked.push(NameStatusEntry {
+            status: NameStatus::Unmerged,
+            path: path.clone().into(),
+            old_path: None,
+            old_mode: None,
+            new_mode: None,
+            old_oid: None,
+            new_oid: None,
+        });
+    }
+    marked.sort_by(|left, right| diff_entry_sort_path(left).cmp(diff_entry_sort_path(right)));
+    Ok(marked)
 }
 
 /// Name-status diff of an arbitrary tree against the working tree, the engine
@@ -689,7 +740,7 @@ fn diff_name_status_index_worktree_changes(
         format,
         &index.entries,
         &stat_cache,
-        stat_clean_validator.as_deref_mut(),
+        stat_clean_validator,
     )?;
     Ok(IndexWorktreeDiff {
         entries,
@@ -926,7 +977,8 @@ fn diff_name_status_index_worktree_changes_from_snapshot(
     let IndexSnapshot {
         entries: index,
         stat_cache,
-        ..
+        missing_skip_worktree_entries,
+        present_skip_worktree_entries,
     } = read_index_snapshot(git_dir, format)?;
     // Intent-to-add (`git add -N`) paths are placeholders: git's `run_diff_files`
     // diffs them as a brand-new file (`/dev/null` → worktree), never loading the
@@ -960,8 +1012,8 @@ fn diff_name_status_index_worktree_changes_from_snapshot(
             git_path,
             &index_gitlinks,
             Some(&stat_cache),
-            None,
-            None,
+            Some(&missing_skip_worktree_entries),
+            Some(&present_skip_worktree_entries),
         )?;
         if conflict_stages.is_some() {
             // git's `diff_unmerge` makes a pair with a null old side and the
@@ -1119,8 +1171,14 @@ fn detect_exact_renames_from_changes(
         };
         let mut best: Option<usize> = None;
         let mut best_score = -1i32;
-        for (source_idx, (_, src_path, src_oid, _)) in sources.iter().enumerate() {
-            if src_used[source_idx] || *src_oid != right_oid {
+        for (source_idx, (_, src_path, src_oid, source_mode)) in sources.iter().enumerate() {
+            if src_used[source_idx]
+                || *src_oid != right_oid
+                || matches!(
+                    (*source_mode, changes[*idx].new_mode),
+                    (Some(old), Some(new)) if is_type_change(old, new)
+                )
+            {
                 continue;
             }
             let score = 1 + i32::from(path_basename(src_path) == path_basename(new_path));
@@ -1184,7 +1242,7 @@ fn detect_exact_renames_from_changes(
 /// content diff already catches adds/deletes/genuine-content modifies (with
 /// rename detection), and we then append a `Modified` entry for any stage-0 path
 /// whose worktree file is present and whose cached stat is dirty per
-/// [`IndexStatCache::index_entry_worktree_stat_dirty`] but which the content diff
+/// `IndexStatCache::index_entry_worktree_stat_dirty` but which the content diff
 /// did not already report. Content-identical stat-dirty entries cannot be rename
 /// sources/targets (their content is unchanged), so they never interact with the
 /// rename machinery — they are plain `M`.
@@ -1332,12 +1390,10 @@ pub fn diff_name_status_trees_with_options(
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
     if options.detect_inexact {
-        return Ok(
-            diff_name_status_trees_with_options_and_diagnostics(
-                db, format, left_tree, right_tree, options,
-            )?
-            .entries,
-        );
+        return Ok(diff_name_status_trees_with_options_and_diagnostics(
+            db, format, left_tree, right_tree, options,
+        )?
+        .entries);
     }
     if !options.detect_copies {
         let mut changes = changed_tree_name_status_entries(db, format, left_tree, right_tree)?;
@@ -1393,7 +1449,7 @@ pub fn diff_name_status_trees_with_options_and_diagnostics(
     right_tree: &ObjectId,
     options: DiffNameStatusOptions,
 ) -> Result<NameStatusWithRenameDiagnostics> {
-        if !options.detect_copies {
+    if !options.detect_copies {
         let mut diagnostics = RenameLimitDiagnostics::default();
         let mut changes = changed_tree_name_status_entries(db, format, left_tree, right_tree)?;
         if options.detect_renames {
@@ -1518,6 +1574,9 @@ fn diff_name_status_maps_for_unique_paths<'a>(
             options.rename_empty,
         );
     }
+    if options.detect_renames && options.detect_copies {
+        relabel_copy_rename_families(&mut changes);
+    }
     Ok(changes)
 }
 
@@ -1605,7 +1664,7 @@ fn diff_name_status_maps_with_renames_for_unique_paths_and_diagnostics<'a>(
     options: DiffNameStatusOptions,
     fetch_blob: impl Fn(&ObjectId) -> Option<Arc<[u8]>>,
 ) -> Result<NameStatusWithRenameDiagnostics> {
-        let mut diagnostics = RenameLimitDiagnostics::default();
+    let mut diagnostics = RenameLimitDiagnostics::default();
     let mut changes =
         raw_name_status_changes_for_unique_paths(left_entries, right_entries, candidate_paths);
     if options.detect_renames {
@@ -1638,6 +1697,9 @@ fn diff_name_status_maps_with_renames_for_unique_paths_and_diagnostics<'a>(
             }
         }
         changes = detect_inexact_copies(changes, left_entries, &options, &fetch_blob);
+    }
+    if options.detect_renames && options.detect_copies {
+        relabel_copy_rename_families(&mut changes);
     }
     Ok(NameStatusWithRenameDiagnostics {
         entries: changes,
@@ -1942,7 +2004,13 @@ fn detect_exact_renames(
         let mut best: Option<usize> = None;
         let mut best_score = -1i32;
         for (si, (src_path, src_oid)) in sources.iter().enumerate() {
-            if src_used[si] || *src_oid != right.oid {
+            let source_mode = left_entries
+                .get(src_path.as_bytes())
+                .map(|entry| entry.mode);
+            if src_used[si]
+                || *src_oid != right.oid
+                || source_mode.is_some_and(|mode| is_type_change(mode, right.mode))
+            {
                 continue;
             }
             let score = 1 + i32::from(path_basename(src_path) == path_basename(new_path));
@@ -1992,11 +2060,7 @@ fn detect_exact_copies(
     find_copies_harder: bool,
     rename_empty: bool,
 ) -> Vec<NameStatusEntry> {
-    let changed_sources = changes
-        .iter()
-        .filter(|entry| matches!(entry.status, NameStatus::Deleted | NameStatus::Modified))
-        .map(|entry| entry.path.clone())
-        .collect::<BTreeSet<_>>();
+    let changed_sources = changed_copy_sources(&changes);
     let source_paths = left_entries
         .keys()
         .filter(|path| find_copies_harder || changed_sources.contains(path.as_slice()))
@@ -2016,7 +2080,9 @@ fn detect_exact_copies(
         if let Some(old_path) = source_paths.iter().find(|old_path| {
             old_path.as_slice() != entry.path.as_bytes()
                 && left_entries.get(*old_path).is_some_and(|left| {
-                    left.oid == right.oid && (rename_empty || !is_empty_blob_oid(&left.oid))
+                    left.oid == right.oid
+                        && !is_type_change(left.mode, right.mode)
+                        && (rename_empty || !is_empty_blob_oid(&left.oid))
                 })
         }) {
             result.push(NameStatusEntry {
@@ -2089,14 +2155,13 @@ fn inexact_rename_candidates(
                     deleted += 1;
                 }
             }
-            NameStatus::Added => {
+            NameStatus::Added
                 if entry
                     .new_oid
                     .as_ref()
-                    .is_some_and(|oid| options.rename_empty || !is_empty_blob_oid(oid))
-                {
-                    added += 1;
-                }
+                    .is_some_and(|oid| options.rename_empty || !is_empty_blob_oid(oid)) =>
+            {
+                added += 1;
             }
             _ => {}
         }
@@ -2113,11 +2178,63 @@ fn inexact_rename_limit_exceeded(
 }
 
 fn changed_copy_sources(changes: &[NameStatusEntry]) -> BTreeSet<BString> {
-    changes
-        .iter()
-        .filter(|entry| matches!(entry.status, NameStatus::Deleted | NameStatus::Modified))
-        .map(|entry| entry.path.clone())
-        .collect()
+    let mut sources = BTreeSet::new();
+    for entry in changes {
+        match entry.status {
+            NameStatus::Deleted | NameStatus::Modified => {
+                sources.insert(entry.path.clone());
+            }
+            // Rename detection consumes the delete pair before copy detection,
+            // but `-C` still treats that deleted pre-image as a changed copy
+            // source. Keep the source alive through its old path.
+            NameStatus::Renamed(_) => {
+                if let Some(old_path) = &entry.old_path {
+                    sources.insert(old_path.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    sources
+}
+
+/// Reproduce diffcore-rename's source-use countdown for `-C`: when one deleted
+/// source feeds several destinations, every earlier destination is a copy and
+/// the final destination in diff queue order consumes the source as the rename.
+///
+/// The rename pass runs before the copy pass in this implementation, so it
+/// initially labels the first destination `R`. Copy detection then discovers
+/// the remaining destinations. Relabeling the completed family here preserves
+/// each destination's independently-computed similarity score while matching
+/// Git's `C, ..., R` ownership of the source.
+fn relabel_copy_rename_families(changes: &mut [NameStatusEntry]) {
+    let mut families: BTreeMap<BString, (Option<usize>, Vec<usize>)> = BTreeMap::new();
+    for (index, entry) in changes.iter().enumerate() {
+        let Some(old_path) = entry.old_path.as_ref() else {
+            continue;
+        };
+        let family = families.entry(old_path.clone()).or_default();
+        match entry.status {
+            NameStatus::Renamed(_) => family.0 = Some(index),
+            NameStatus::Copied(_) => family.1.push(index),
+            _ => {}
+        }
+    }
+    for (_, (renamed, copies)) in families {
+        let (Some(renamed), Some(&last_copy)) = (renamed, copies.last()) else {
+            continue;
+        };
+        let rename_score = match changes[renamed].status {
+            NameStatus::Renamed(score) => score,
+            _ => continue,
+        };
+        let copy_score = match changes[last_copy].status {
+            NameStatus::Copied(score) => score,
+            _ => continue,
+        };
+        changes[renamed].status = NameStatus::Copied(rename_score);
+        changes[last_copy].status = NameStatus::Renamed(copy_score);
+    }
 }
 
 fn inexact_copy_source_count(
@@ -2283,7 +2400,19 @@ fn detect_inexact_renames(
             &src_used,
             &dst_used,
             threshold,
-            |si, di| Some(blob_similarity(&deleted[si].1, &added[di].1)),
+            |si, di| {
+                if matches!(
+                    (
+                        changes[deleted[si].0].old_mode,
+                        changes[added[di].0].new_mode,
+                    ),
+                    (Some(old), Some(new)) if is_type_change(old, new)
+                ) {
+                    None
+                } else {
+                    Some(blob_similarity(&deleted[si].1, &added[di].1))
+                }
+            },
         );
         for (si, di, score) in basename_pairs {
             src_used[si] = true;
@@ -2301,6 +2430,15 @@ fn detect_inexact_renames(
         }
         for (di, (_, dst_bytes)) in added.iter().enumerate() {
             if dst_used[di] {
+                continue;
+            }
+            if matches!(
+                (
+                    changes[deleted[si].0].old_mode,
+                    changes[added[di].0].new_mode,
+                ),
+                (Some(old), Some(new)) if is_type_change(old, new)
+            ) {
                 continue;
             }
             let score = blob_similarity(src_bytes, dst_bytes);
@@ -2407,6 +2545,8 @@ fn detect_inexact_copies(
     options: &DiffNameStatusOptions,
     fetch_blob: &impl Fn(&ObjectId) -> Option<Arc<[u8]>>,
 ) -> Vec<NameStatusEntry> {
+    type CopySource<'a> = (Vec<u8>, &'a TrackedEntry, Arc<[u8]>);
+
     let threshold = options.copy_threshold;
     if threshold > 100 {
         return changes;
@@ -2433,7 +2573,7 @@ fn detect_inexact_copies(
         return changes;
     }
 
-    let mut sources: Vec<(Vec<u8>, &TrackedEntry, Arc<[u8]>)> = Vec::new();
+    let mut sources: Vec<CopySource<'_>> = Vec::new();
     for (path, tracked) in source_candidates {
         if let Some(bytes) = fetch_blob(&tracked.oid) {
             sources.push((path, tracked, bytes));
@@ -2464,6 +2604,12 @@ fn detect_inexact_copies(
         let mut best: Option<(usize, u8)> = None;
         for (i, (src_path, _, src_bytes)) in sources.iter().enumerate() {
             if src_path.as_slice() == entry.path.as_bytes() {
+                continue;
+            }
+            if entry
+                .new_mode
+                .is_some_and(|new_mode| is_type_change(sources[i].1.mode, new_mode))
+            {
                 continue;
             }
             let score = blob_similarity(src_bytes, &dst_bytes);
@@ -3539,7 +3685,7 @@ fn worktree_blob_cache_for_unique_paths<'a>(
     if !options.detect_inexact || !(options.detect_renames || options.detect_copies) {
         return Ok(HashMap::new());
     }
-        let mut changes =
+    let mut changes =
         raw_name_status_changes_for_unique_paths(left_entries, right_entries, candidate_paths);
     if options.detect_renames {
         changes = detect_exact_renames(changes, left_entries, right_entries, options.rename_empty);
@@ -3563,9 +3709,12 @@ fn worktree_blob_cache_for_unique_paths<'a>(
         });
     let has_copy_source = options.detect_copies
         && (options.find_copies_harder
-            || changes
-                .iter()
-                .any(|entry| matches!(entry.status, NameStatus::Deleted | NameStatus::Modified)));
+            || changes.iter().any(|entry| {
+                matches!(
+                    entry.status,
+                    NameStatus::Deleted | NameStatus::Modified | NameStatus::Renamed(_)
+                )
+            }));
     if !has_rename_source && !has_copy_source {
         return Ok(HashMap::new());
     }

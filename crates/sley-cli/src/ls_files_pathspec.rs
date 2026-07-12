@@ -10,7 +10,7 @@ use sley_pathspec::{
     pathspec_filters_have_include, pathspec_filters_match_with,
 };
 
-use crate::session_globals::{attribute_checks_for_matching, effective_pathspec_flags};
+use crate::session_globals::attribute_checks_for_matching;
 use crate::sley_index;
 use crate::sley_worktree;
 
@@ -31,6 +31,7 @@ impl LsFilesPathspec {
         worktree_root: &Path,
         full_name: bool,
         path_args: &[String],
+        magic: sley_worktree::PathspecMatchMagic,
     ) -> Result<Self> {
         let root = fs::canonicalize(worktree_root)?;
         let cwd = fs::canonicalize(cwd)?;
@@ -39,7 +40,6 @@ impl LsFilesPathspec {
             Err(_) => (Path::new(""), root.as_path()),
         };
         let prefix = relative.to_string_lossy().replace('\\', "/").into_bytes();
-        let magic = effective_pathspec_flags();
         let mut filters = Vec::new();
         for arg in path_args {
             if arg.is_empty() {
@@ -160,7 +160,11 @@ impl LsFilesPathspec {
     }
 }
 
-pub(crate) fn normalize_absolute_cli_pathspec(root: &Path, cwd: &Path, arg: &str) -> Result<String> {
+pub(crate) fn normalize_absolute_cli_pathspec(
+    root: &Path,
+    cwd: &Path,
+    arg: &str,
+) -> Result<String> {
     let path = Path::new(arg);
     if !path.is_absolute() {
         return Ok(arg.to_string());

@@ -36,14 +36,18 @@ use std::{env, fs};
 // the crate-root scope in via `use super::*` and is re-exported below so every
 // `sley_worktree::X` path (public API and intra-crate) resolves unchanged.
 // This is a pure code move: no function body was altered.
+pub mod admin;
 mod attributes;
 mod checkout;
 mod filter;
+mod fsmonitor;
 mod ignore;
 mod index;
 mod index_io;
 mod move_remove;
+mod read_tree;
 mod status;
+mod status_plan;
 mod types_admin;
 
 // `attributes` and `index_io` hold only crate-internal helpers (no `pub`
@@ -52,11 +56,14 @@ mod types_admin;
 // re-export, which would re-export nothing and warn.
 pub use checkout::*;
 pub use filter::*;
+pub use fsmonitor::*;
 pub use ignore::*;
 pub use index::*;
 pub use index_io::{StatCleanFilterValidator, fill_index_entry_stat_cache};
 pub use move_remove::*;
+pub use read_tree::*;
 pub use status::*;
+pub use status_plan::*;
 pub use types_admin::*;
 
 #[cfg(test)]
@@ -789,6 +796,130 @@ mod tests {
     }
 
     #[test]
+    fn checkout_index_paths_uses_injected_replacement_content() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        fs::write(root.join("file"), b"original\n").expect("write original");
+        add_paths_to_index(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &[PathBuf::from("file")],
+        )
+        .expect("stage original");
+        let original_oid = index_entry_for(&read_index(&git_dir), b"file").oid;
+        let raw_db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let replacement_oid = raw_db
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"replacement\n".to_vec(),
+            ))
+            .expect("write replacement");
+        let db = raw_db.with_replacements(sley_odb::ObjectReplacements::new([(
+            original_oid,
+            replacement_oid,
+        )]));
+        fs::remove_file(root.join("file")).expect("remove worktree copy");
+
+        checkout_index_paths_with_database(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &[root.join("file")],
+            &db,
+            CheckoutIndexPathOptions {
+                force: false,
+                merge: false,
+                overlay: true,
+                stage: None,
+                conflict_style: CheckoutConflictStyle::Merge,
+                smudge_config: None,
+            },
+        )
+        .expect("restore replacement content");
+
+        assert_eq!(
+            fs::read(root.join("file")).expect("read file"),
+            b"replacement\n"
+        );
+        assert_eq!(
+            index_entry_for(&read_index(&git_dir), b"file").oid,
+            original_oid
+        );
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[test]
+    fn path_checkout_honors_and_can_explicitly_clear_skip_worktree() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        fs::create_dir_all(root.join("sub")).expect("create selected directory");
+        fs::write(root.join("outside"), b"outside\n").expect("write outside file");
+        fs::write(root.join("sub/file"), b"selected\n").expect("write selected file");
+        build_commit(&root, &git_dir, &["outside", "sub/file"]);
+
+        apply_sparse_checkout_with_mode(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &full_sparse(&[b"/sub/"]),
+            SparseCheckoutMode::Full,
+        )
+        .expect("apply sparse checkout");
+        assert!(!root.join("outside").exists());
+        assert!(index_entry_for(&read_index(&git_dir), b"outside").is_skip_worktree());
+
+        fs::write(root.join("sub/file"), b"dirty\n").expect("dirty selected file");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let options = CheckoutIndexPathOptions {
+            force: false,
+            merge: false,
+            overlay: true,
+            stage: None,
+            conflict_style: CheckoutConflictStyle::Merge,
+            smudge_config: None,
+        };
+        let outcome = checkout_index_paths_with_database_outcome_sparse(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &[root.join(".")],
+            &db,
+            CheckoutIndexSparsePolicy::Honor,
+            options,
+        )
+        .expect("honor sparse path checkout");
+        assert_eq!(outcome.restored, 1);
+        assert!(!root.join("outside").exists());
+        assert_eq!(
+            fs::read(root.join("sub/file")).expect("selected file"),
+            b"selected\n"
+        );
+        assert!(index_entry_for(&read_index(&git_dir), b"outside").is_skip_worktree());
+
+        let outcome = checkout_index_paths_with_database_outcome_sparse(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &[root.join(".")],
+            &db,
+            CheckoutIndexSparsePolicy::Ignore,
+            options,
+        )
+        .expect("override sparse path checkout");
+        assert_eq!(outcome.restored, 1);
+        assert_eq!(
+            fs::read(root.join("outside")).expect("outside file"),
+            b"outside\n"
+        );
+        assert!(!index_entry_for(&read_index(&git_dir), b"outside").is_skip_worktree());
+
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[test]
     fn apply_sparse_checkout_full_mode_skips_out_of_cone_paths() {
         let root = temp_root();
         let git_dir = root.join(".git");
@@ -834,6 +965,40 @@ mod tests {
         )));
         // Out-of-cone entries are preserved in the index, just not on disk.
         assert_eq!(index.entries.len(), 3);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn apply_sparse_checkout_reports_unmerged_paths_once() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("out")).expect("test operation should succeed");
+        fs::write(root.join("out").join("conflicted.txt"), b"conflict\n")
+            .expect("test operation should succeed");
+        build_commit(&root, &git_dir, &["out/conflicted.txt"]);
+
+        let mut index = read_index(&git_dir);
+        let entry = index
+            .entries
+            .iter_mut()
+            .find(|entry| entry.path.as_bytes() == b"out/conflicted.txt")
+            .expect("fixture index entry");
+        entry.flags = (entry.flags & !sley_index::INDEX_FLAG_STAGE_MASK) | 0x1000;
+        write_repository_index_ref(&git_dir, ObjectFormat::Sha1, &index)
+            .expect("write conflicted fixture index");
+
+        let result = apply_sparse_checkout_with_mode(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &full_sparse(&[b"/kept/"]),
+            SparseCheckoutMode::Full,
+        )
+        .expect("apply sparse checkout");
+
+        assert_eq!(result.unmerged, vec![b"out/conflicted.txt".to_vec()]);
+        assert!(root.join("out").join("conflicted.txt").exists());
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
@@ -1051,6 +1216,384 @@ mod tests {
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
+    fn configure_cone_sparse_index(root: &Path, git_dir: &Path, _commit: &ObjectId) {
+        fs::create_dir_all(git_dir.join("info")).expect("create sparse info directory");
+        fs::write(
+            git_dir.join("config"),
+            b"[core]\n\tsparseCheckout = true\n\tsparseCheckoutCone = true\n[index]\n\tsparse = true\n",
+        )
+        .expect("write sparse config");
+        fs::write(git_dir.join("info/sparse-checkout"), b"/*\n!/*/\n/keep/\n")
+            .expect("write cone patterns");
+        let sparse = SparseCheckout {
+            patterns: vec![b"/*".to_vec(), b"!/*/".to_vec(), b"/keep/".to_vec()],
+            sparse_index: true,
+        };
+        apply_sparse_checkout_with_mode(
+            root,
+            git_dir,
+            ObjectFormat::Sha1,
+            &sparse,
+            SparseCheckoutMode::Cone,
+        )
+        .expect("seed sparse index through explicit sparse-checkout application");
+    }
+
+    #[test]
+    fn sparse_reapply_distinguishes_clean_and_dirty_files_after_index_expansion() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        fs::create_dir_all(root.join("keep")).expect("create included directory");
+        fs::create_dir_all(root.join("skip")).expect("create excluded directory");
+        fs::write(root.join("keep/a"), b"keep\n").expect("write included file");
+        fs::write(root.join("skip/b"), b"skip\n").expect("write excluded file");
+        let commit = build_commit(&root, &git_dir, &["keep/a", "skip/b"]);
+        configure_cone_sparse_index(&root, &git_dir, &commit);
+
+        let before = read_index(&git_dir);
+        assert!(before.is_sparse());
+        assert!(before.entries.iter().any(|entry| entry.path == b"skip/"));
+        assert!(!root.join("skip/b").exists());
+        let (sparse, mode) = active_sparse_checkout(&git_dir)
+            .expect("read sparse checkout")
+            .expect("active sparse checkout");
+
+        // A clean file may be materialized by a preceding transition while the
+        // sparse index still represents its directory as one collapsed entry.
+        // Expansion gives the leaf a blank stat cache, so content identity must
+        // decide whether it is safe to evict.
+        fs::create_dir_all(root.join("skip")).expect("recreate excluded directory");
+        fs::write(root.join("skip/b"), b"skip\n").expect("recreate clean excluded file");
+        let clean =
+            apply_sparse_checkout_with_mode(&root, &git_dir, ObjectFormat::Sha1, &sparse, mode)
+                .expect("reapply sparse checkout to clean file");
+        assert!(clean.not_up_to_date.is_empty());
+        assert!(!root.join("skip/b").exists());
+        assert!(
+            read_index(&git_dir)
+                .entries
+                .iter()
+                .any(|entry| entry.path == b"skip/")
+        );
+
+        fs::create_dir_all(root.join("skip")).expect("recreate excluded directory");
+        fs::write(root.join("skip/b"), b"modified\n").expect("write dirty excluded file");
+        let dirty =
+            apply_sparse_checkout_with_mode(&root, &git_dir, ObjectFormat::Sha1, &sparse, mode)
+                .expect("reapply sparse checkout to dirty file");
+        assert_eq!(dirty.not_up_to_date, vec![b"skip/b".to_vec()]);
+        assert_eq!(
+            fs::read(root.join("skip/b")).expect("read dirty file"),
+            b"modified\n"
+        );
+
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[test]
+    fn tree_path_checkout_replaces_expanded_sparse_leaf_without_duplicate_stage_zero() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        fs::create_dir_all(root.join("keep")).expect("create included directory");
+        fs::create_dir_all(root.join("skip/dir")).expect("create excluded directory");
+        fs::write(root.join("keep/a"), b"keep\n").expect("write included file");
+        fs::write(root.join("skip/b"), b"old\n").expect("write excluded file");
+        fs::write(root.join("skip/dir/child"), b"child\n").expect("write excluded child");
+        let commit = build_commit(&root, &git_dir, &["keep/a", "skip/b", "skip/dir/child"]);
+        configure_cone_sparse_index(&root, &git_dir, &commit);
+
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let replacement_oid = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"new\n".to_vec()))
+            .expect("write replacement blob");
+        let replacement_dir_oid = db
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"directory became a file\n".to_vec(),
+            ))
+            .expect("write directory replacement blob");
+        let source_entries = BTreeMap::from([
+            (
+                b"skip/b".to_vec(),
+                TrackedEntry {
+                    mode: 0o100644,
+                    oid: replacement_oid,
+                },
+            ),
+            (
+                b"skip/dir".to_vec(),
+                TrackedEntry {
+                    mode: 0o100644,
+                    oid: replacement_dir_oid,
+                },
+            ),
+        ]);
+        restore_index_and_worktree_paths_from_entries(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &db,
+            read_index(&git_dir),
+            &source_entries,
+            &[PathBuf::from(".")],
+            true,
+        )
+        .expect("restore path from replacement tree");
+
+        let mut expanded = read_index(&git_dir);
+        // Both out-of-cone replacements were explicitly materialized by this
+        // path checkout. Their cleared skip-worktree bits keep the directory
+        // physically expanded until an explicit sparse-checkout reapply.
+        assert!(!expanded.is_sparse());
+        assert!(!expanded.entries.iter().any(IndexEntry::is_sparse_dir));
+        expand_sparse_index_in_memory(&mut expanded, &db, ObjectFormat::Sha1)
+            .expect("expand resulting sparse index");
+        let matching = expanded
+            .entries
+            .iter()
+            .filter(|entry| entry.path == b"skip/b")
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].stage(), Stage::Normal);
+        assert_eq!(matching[0].oid, replacement_oid);
+        assert!(
+            !expanded
+                .entries
+                .iter()
+                .any(|entry| entry.path == b"skip/dir/child")
+        );
+        assert_eq!(
+            index_entry_for(&expanded, b"skip/dir").oid,
+            replacement_dir_oid
+        );
+        assert_eq!(
+            fs::read(root.join("skip/b")).expect("read restored file"),
+            b"new\n"
+        );
+
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[test]
+    fn tree_path_checkout_preserves_unselected_conflict_stages() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        fs::write(root.join("selected"), b"old\n").expect("write selected file");
+        build_commit(&root, &git_dir, &["selected"]);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let conflict_two = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"ours\n".to_vec()))
+            .expect("write stage two blob");
+        let conflict_three = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"theirs\n".to_vec()))
+            .expect("write stage three blob");
+        let mut index = read_index(&git_dir);
+        index.entries.push(resolve_undo_index_entry(
+            b"conflict".to_vec(),
+            0o100644,
+            conflict_two,
+            2,
+        ));
+        index.entries.push(resolve_undo_index_entry(
+            b"conflict".to_vec(),
+            0o100644,
+            conflict_three,
+            3,
+        ));
+        index.entries.sort_by(compare_index_key);
+
+        let replacement_oid = db
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"replacement\n".to_vec(),
+            ))
+            .expect("write selected replacement blob");
+        let source_entries = BTreeMap::from([(
+            b"selected".to_vec(),
+            TrackedEntry {
+                mode: 0o100644,
+                oid: replacement_oid,
+            },
+        )]);
+        restore_index_and_worktree_paths_from_entries(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &db,
+            index,
+            &source_entries,
+            &[PathBuf::from("selected")],
+            true,
+        )
+        .expect("restore selected path");
+
+        let result = read_index(&git_dir);
+        let conflicts = result
+            .entries
+            .iter()
+            .filter(|entry| entry.path == b"conflict")
+            .collect::<Vec<_>>();
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].stage(), Stage::Ours);
+        assert_eq!(conflicts[0].oid, conflict_two);
+        assert_eq!(conflicts[1].stage(), Stage::Theirs);
+        assert_eq!(conflicts[1].oid, conflict_three);
+        assert_eq!(index_entry_for(&result, b"selected").oid, replacement_oid);
+
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[test]
+    fn checkout_change_summary_reports_sparse_index_changes() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        fs::create_dir_all(root.join("keep")).expect("create included directory");
+        fs::create_dir_all(root.join("skip")).expect("create excluded directory");
+        fs::write(root.join("keep/a"), b"keep\n").expect("write included file");
+        fs::write(root.join("skip/b"), b"old\n").expect("write excluded file");
+        let base = build_commit(&root, &git_dir, &["keep/a", "skip/b"]);
+        configure_cone_sparse_index(&root, &git_dir, &base);
+
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let replacement_oid = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"new\n".to_vec()))
+            .expect("write replacement blob");
+        let source_entries = BTreeMap::from([(
+            b"skip/b".to_vec(),
+            TrackedEntry {
+                mode: 0o100644,
+                oid: replacement_oid,
+            },
+        )]);
+        restore_index_and_worktree_paths_from_entries(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &db,
+            read_index(&git_dir),
+            &source_entries,
+            &[PathBuf::from(".")],
+            true,
+        )
+        .expect("restore sparse path");
+        let (sparse, mode) = active_sparse_checkout(&git_dir)
+            .expect("read sparse checkout")
+            .expect("active sparse checkout");
+        apply_sparse_checkout_with_mode(&root, &git_dir, ObjectFormat::Sha1, &sparse, mode)
+            .expect("reapply sparse checkout");
+
+        let summary = checkout_change_summary(&root, &git_dir, ObjectFormat::Sha1, &base)
+            .expect("compute checkout summary");
+        assert_eq!(summary.changes.len(), 1);
+        assert_eq!(
+            summary.changes[0].status,
+            sley_diff_merge::NameStatus::Modified
+        );
+        assert_eq!(summary.changes[0].path, b"skip/b");
+
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[test]
+    fn mixed_reset_preserves_collapsed_out_of_cone_directory() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        fs::create_dir_all(root.join("keep")).expect("create included directory");
+        fs::create_dir_all(root.join("skip")).expect("create excluded directory");
+        fs::write(root.join("keep/a"), b"keep\n").expect("write included file");
+        fs::write(root.join("skip/b"), b"skip\n").expect("write excluded file");
+        let commit = build_commit(&root, &git_dir, &["keep/a", "skip/b"]);
+        configure_cone_sparse_index(&root, &git_dir, &commit);
+
+        let before = read_index(&git_dir);
+        assert!(before.is_sparse());
+        assert!(before.entries.iter().any(|entry| entry.path == b"skip/"));
+        reset_index_to_commit(&root, &git_dir, ObjectFormat::Sha1, &commit)
+            .expect("mixed reset sparse index");
+
+        let after = read_index(&git_dir);
+        assert!(after.is_sparse());
+        assert!(after.entries.iter().any(|entry| entry.path == b"skip/"));
+        assert!(!after.entries.iter().any(|entry| entry.path == b"skip/b"));
+        assert!(!root.join("skip/b").exists());
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[test]
+    fn hard_reset_recreates_removed_sparse_directory_entry_without_materializing_it() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        fs::create_dir_all(root.join("keep")).expect("create included directory");
+        fs::create_dir_all(root.join("skip")).expect("create excluded directory");
+        fs::write(root.join("keep/a"), b"keep\n").expect("write included file");
+        fs::write(root.join("skip/b"), b"skip\n").expect("write excluded file");
+        let commit = build_commit(&root, &git_dir, &["keep/a", "skip/b"]);
+        configure_cone_sparse_index(&root, &git_dir, &commit);
+
+        let mut removed = read_index(&git_dir);
+        removed.entries.retain(|entry| entry.path != b"skip/");
+        removed
+            .clear_sparse_extension()
+            .expect("clear stale sparse marker");
+        write_repository_index_ref(&git_dir, ObjectFormat::Sha1, &removed)
+            .expect("write index with staged sparse directory deletion");
+        reset_index_and_worktree_to_commit(&root, &git_dir, ObjectFormat::Sha1, &commit)
+            .expect("hard reset sparse index");
+
+        let restored = read_index(&git_dir);
+        assert!(restored.is_sparse());
+        assert!(restored.entries.iter().any(|entry| entry.path == b"skip/"));
+        assert!(!restored.entries.iter().any(|entry| entry.path == b"skip/b"));
+        assert!(!root.join("skip/b").exists());
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[test]
+    fn remove_sparse_directory_expands_selects_leaves_and_recollapses_result() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        fs::create_dir_all(root.join("keep")).expect("create included directory");
+        fs::create_dir_all(root.join("skip")).expect("create excluded directory");
+        fs::write(root.join("keep/a"), b"keep\n").expect("write included file");
+        fs::write(root.join("skip/b"), b"skip\n").expect("write excluded file");
+        fs::write(root.join("skip/c"), b"skip too\n").expect("write second excluded file");
+        let commit = build_commit(&root, &git_dir, &["keep/a", "skip/b", "skip/c"]);
+        configure_cone_sparse_index(&root, &git_dir, &commit);
+
+        let result = remove_index_and_worktree_paths(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &[root.join("skip")],
+            RemoveOptions {
+                recursive: true,
+                cached: false,
+                force: false,
+                dry_run: false,
+                ignore_unmatch: false,
+                sparse: true,
+            },
+            None,
+        )
+        .expect("remove collapsed sparse directory");
+
+        assert_eq!(result.removed, vec![b"skip/".to_vec()]);
+        let after = read_index(&git_dir);
+        assert!(after.entries.iter().all(|entry| {
+            entry.path != b"skip/" && !entry.path.as_bytes().starts_with(b"skip/")
+        }));
+        assert!(root.join("keep/a").exists());
+        assert!(!root.join("skip").exists());
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
     #[test]
     fn checkout_detached_sparse_only_writes_in_cone_paths() {
         let root = temp_root();
@@ -1095,6 +1638,298 @@ mod tests {
         // The skipped entry still carries the committed blob id and mode.
         assert_eq!(skipped.mode, 0o100644);
         fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn checkout_current_branch_reapplies_active_sparse_rules() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        fs::create_dir_all(git_dir.join("info")).expect("create info directory");
+        fs::create_dir_all(root.join("done")).expect("create tracked directory");
+        fs::write(root.join("done/.gitignore"), b"ignored\n").expect("write dotfile");
+        fs::write(root.join("done/one"), b"one\n").expect("write included file");
+        build_commit(&root, &git_dir, &["done/.gitignore", "done/one"]);
+        fs::write(git_dir.join("config"), b"[core]\n\tsparseCheckout = true\n")
+            .expect("enable sparse checkout");
+        fs::write(git_dir.join("info/sparse-checkout"), b"done/[a-z]*\n")
+            .expect("write sparse patterns");
+        let config = GitConfig::read(git_dir.join("config")).expect("read config");
+
+        let result = checkout_branch_filtered(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            "main",
+            b"Test <test@example.com> 0 +0000".to_vec(),
+            &config,
+        )
+        .expect("checkout current branch");
+
+        assert_eq!(result.files, 0, "same-HEAD checkout remains a ref no-op");
+        assert!(!root.join("done/.gitignore").exists());
+        assert!(root.join("done/one").is_file());
+        let index = read_index(&git_dir);
+        assert!(index_entry_skip_worktree(index_entry_for(
+            &index,
+            b"done/.gitignore"
+        )));
+        assert!(!index_entry_skip_worktree(index_entry_for(
+            &index,
+            b"done/one"
+        )));
+        let ignore_oid = index_entry_for(&index, b"done/.gitignore").oid;
+        let primed_cache = build_untracked_cache(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &index,
+            StatusUntrackedMode::Normal,
+        )
+        .expect("prime sparse untracked cache");
+        let primed_done = primed_cache
+            .root
+            .as_ref()
+            .and_then(|root| root.dirs.iter().find(|dir| dir.name == b"done"))
+            .expect("primed done cache node");
+        assert_eq!(
+            primed_done.exclude_oid, None,
+            "skip-worktree ignore OID stays lazy without untracked content"
+        );
+        fs::write(root.join("done/ignored"), b"ignored\n").expect("write ignored file");
+        fs::write(root.join("done/visible"), b"visible\n").expect("write visible file");
+        let status =
+            short_status(&root, &git_dir, ObjectFormat::Sha1).expect("scan sparse worktree status");
+        assert!(
+            status.iter().all(|entry| entry.path != b"done/ignored"),
+            "skip-worktree .gitignore blob still supplies ignore patterns"
+        );
+        assert!(status.iter().any(|entry| entry.path == b"done/visible"));
+        let cache = build_untracked_cache(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &index,
+            StatusUntrackedMode::Normal,
+        )
+        .expect("build sparse untracked cache");
+        let done = cache
+            .root
+            .as_ref()
+            .and_then(|root| root.dirs.iter().find(|dir| dir.name == b"done"))
+            .expect("done cache node");
+        assert_eq!(done.exclude_oid, Some(ignore_oid));
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modified_entries_ignore_executable_bit_when_core_filemode_is_false() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        fs::write(root.join("script.sh"), b"true\n").expect("write script");
+        fs::set_permissions(root.join("script.sh"), fs::Permissions::from_mode(0o755))
+            .expect("make script executable");
+        build_commit(&root, &git_dir, &["script.sh"]);
+        fs::write(git_dir.join("config"), b"[core]\n\tfilemode = false\n")
+            .expect("disable filemode trust");
+        fs::set_permissions(root.join("script.sh"), fs::Permissions::from_mode(0o644))
+            .expect("remove physical executable bit");
+
+        let entry = index_entry_for(&read_index(&git_dir), b"script.sh").clone();
+        assert_eq!(
+            worktree_entry_state_by_git_path(
+                &root,
+                &git_dir,
+                ObjectFormat::Sha1,
+                b"script.sh",
+                &entry.oid,
+                entry.mode,
+                None,
+            )
+            .expect("probe worktree state with untrusted executable bit"),
+            WorktreeEntryState::Clean
+        );
+        assert!(
+            modified_index_entries(&root, &git_dir, ObjectFormat::Sha1)
+                .expect("inspect worktree with untrusted executable bit")
+                .is_empty()
+        );
+
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_replaces_symlink_with_tracked_directory() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        fs::create_dir_all(root.join("one")).expect("create first directory");
+        fs::create_dir_all(root.join("two")).expect("create second directory");
+        fs::write(root.join("one/file"), b"").expect("write first file");
+        fs::write(root.join("two/file"), b"").expect("write second file");
+        let directory_commit = build_commit(&root, &git_dir, &["one/file", "two/file"]);
+
+        fs::remove_dir_all(root.join("one")).expect("remove first directory");
+        std::os::unix::fs::symlink("two", root.join("one")).expect("create symlink");
+        add_paths_to_index(&root, &git_dir, ObjectFormat::Sha1, &[PathBuf::from("one")])
+            .expect("stage symlink type change");
+        let symlink_commit = build_commit(&root, &git_dir, &[]);
+        assert_ne!(directory_commit, symlink_commit);
+        assert!(
+            modified_index_entries(&root, &git_dir, ObjectFormat::Sha1)
+                .expect("inspect clean symlink worktree")
+                .is_empty()
+        );
+        let config = GitConfig::default();
+
+        checkout_detached_filtered(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &directory_commit,
+            b"Test <test@example.com> 0 +0000".to_vec(),
+            b"checkout".to_vec(),
+            &config,
+        )
+        .expect("checkout directory commit over symlink");
+
+        assert!(root.join("one").is_dir());
+        assert!(root.join("one/file").is_file());
+        assert!(
+            !fs::symlink_metadata(root.join("one"))
+                .expect("one metadata")
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[test]
+    fn checkout_extension_preservation_keeps_only_valid_untracked_cache() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        fs::write(root.join("tracked"), b"tracked\n").expect("write tracked file");
+        build_commit(&root, &git_dir, &["tracked"]);
+        let mut previous = read_index(&git_dir);
+        let mut cache = UntrackedCache::new(
+            ObjectFormat::Sha1,
+            b"test-ident\0".to_vec(),
+            sley_index::untracked_cache_normal_flags(),
+        );
+        cache.root = Some(UntrackedCacheDir {
+            valid: true,
+            recurse: true,
+            untracked: vec![b"cached-untracked".to_vec()],
+            ..UntrackedCacheDir::default()
+        });
+        previous
+            .set_untracked_cache(ObjectFormat::Sha1, Some(&cache))
+            .expect("attach untracked cache");
+        previous.extensions.extend_from_slice(b"FSMN\0\0\0\0");
+
+        let mut next = previous.clone();
+        next.entries.clear();
+        next.extensions.clear();
+        preserve_checkout_index_extensions(&previous, &mut next, ObjectFormat::Sha1)
+            .expect("preserve checkout-safe extensions");
+
+        let cache = next
+            .untracked_cache(ObjectFormat::Sha1)
+            .expect("parse preserved cache")
+            .expect("UNTR remains present");
+        let cache_root = cache.root.expect("cache root");
+        assert!(
+            !cache_root.valid,
+            "changed tracked path invalidates cache root"
+        );
+        assert!(cache_root.untracked.is_empty());
+        assert!(
+            next.extension(b"FSMN").expect("parse extensions").is_none(),
+            "entry-table fsmonitor state must not be copied blindly"
+        );
+        fs::remove_dir_all(root).expect("clean fixture");
+    }
+
+    #[test]
+    fn normal_untracked_rollup_descends_below_tracked_parent() {
+        let mut index = BTreeMap::new();
+        index.insert(
+            b"done/tracked".to_vec(),
+            TrackedEntry {
+                mode: 0o100644,
+                oid: ObjectId::empty_blob(ObjectFormat::Sha1),
+            },
+        );
+        let ignores = IgnoreMatcher::default();
+
+        assert_eq!(
+            untracked_normal_rollup_path(b"done/sub/sub/file", &index, &ignores),
+            b"done/sub/"
+        );
+    }
+
+    #[test]
+    fn untracked_cache_trace_events_follow_changed_nodes() {
+        let done = UntrackedCacheDir {
+            name: b"done".to_vec(),
+            valid: true,
+            recurse: true,
+            ..UntrackedCacheDir::default()
+        };
+        let old = UntrackedCacheDir {
+            valid: true,
+            recurse: true,
+            dirs: vec![done.clone()],
+            ..UntrackedCacheDir::default()
+        };
+        let mut new = old.clone();
+        new.stat.mtime_seconds = 1;
+        new.dirs[0].stat.mtime_seconds = 1;
+        new.dirs[0].exclude_oid = Some(ObjectId::empty_blob(ObjectFormat::Sha1));
+        let mut events = UntrackedCacheTraversalEvents::default();
+        collect_untracked_cache_traversal_events(Some(&old), &new, false, true, &mut events);
+        assert_eq!(
+            events,
+            UntrackedCacheTraversalEvents {
+                node_creation: 0,
+                gitignore_invalidation: 1,
+                directory_invalidation: 2,
+                opendir: 2,
+            }
+        );
+
+        let old = new;
+        let mut new = old.clone();
+        new.dirs[0].stat.mtime_seconds = 2;
+        new.dirs[0].dirs.push(UntrackedCacheDir {
+            name: b"sub".to_vec(),
+            valid: true,
+            recurse: true,
+            dirs: vec![UntrackedCacheDir {
+                name: b"sub".to_vec(),
+                valid: true,
+                recurse: true,
+                ..UntrackedCacheDir::default()
+            }],
+            ..UntrackedCacheDir::default()
+        });
+        let mut events = UntrackedCacheTraversalEvents::default();
+        collect_untracked_cache_traversal_events(Some(&old), &new, false, true, &mut events);
+        assert_eq!(
+            events,
+            UntrackedCacheTraversalEvents {
+                node_creation: 2,
+                gitignore_invalidation: 0,
+                directory_invalidation: 1,
+                opendir: 3,
+            }
+        );
     }
 
     #[test]
@@ -1750,6 +2585,82 @@ mod tests {
     }
 
     #[test]
+    fn normal_add_preserves_auto_crlf_index_blob_until_renormalize() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        let path = PathBuf::from("legacy.txt");
+        let crlf = b"alpha\r\nbeta\r\n";
+        fs::write(root.join(&path), crlf).expect("write CRLF worktree file");
+
+        // Seed a legacy CRLF blob without conversion. A subsequent normal add
+        // under auto text must preserve it (git's safer-autocrlf rule).
+        add_paths_to_index(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            std::slice::from_ref(&path),
+        )
+        .expect("seed unfiltered index entry");
+        let config_text = "[core]\n\tautocrlf = true\n\tsafecrlf = false\n";
+        fs::write(git_dir.join("config"), config_text).expect("write repository config");
+        let config = config_from(config_text);
+        update_index_paths_filtered(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            std::slice::from_ref(&path),
+            UpdateIndexOptions {
+                add: true,
+                remove: false,
+                force_remove: false,
+                chmod: None,
+                info_only: false,
+                ignore_skip_worktree_entries: false,
+                allow_skip_worktree_entries: false,
+            },
+            &config,
+        )
+        .expect("normal filtered add");
+        let odb = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let index = read_index(&git_dir);
+        let entry = index_entry_for(&index, b"legacy.txt");
+        assert_eq!(odb.read_object(&entry.oid).expect("read blob").body, crlf);
+        assert_eq!(
+            worktree_entry_state(
+                &root,
+                &git_dir,
+                ObjectFormat::Sha1,
+                &path,
+                &entry.oid,
+                entry.mode,
+                None,
+            )
+            .expect("compare legacy CRLF worktree file"),
+            WorktreeEntryState::Clean,
+        );
+
+        renormalize_index_paths_filtered(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            std::slice::from_ref(&path),
+            &config,
+        )
+        .expect("renormalize tracked path");
+        let index = read_index(&git_dir);
+        let entry = index_entry_for(&index, b"legacy.txt");
+        assert_eq!(
+            odb.read_object(&entry.oid)
+                .expect("read normalized blob")
+                .body,
+            b"alpha\nbeta\n"
+        );
+
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
     fn driver_filter_clean_and_smudge_transform_both_directions() {
         // filter=case: clean upper-cases (worktree -> blob), smudge lower-cases
         // (blob -> worktree).
@@ -1975,6 +2886,14 @@ mod tests {
             mode_cache.reuse_tracked_entry(b"f.txt", &metadata),
             None,
             "a mode mismatch must fall through to hashing"
+        );
+        assert_eq!(
+            mode_cache.reuse_tracked_entry_with_filemode(b"f.txt", &metadata, false),
+            Some(TrackedEntry {
+                mode: 0o100755,
+                oid,
+            }),
+            "an untrusted executable bit must retain the cached oid"
         );
 
         // Racily clean (index mtime not strictly after the entry mtime) -> hash.

@@ -1,5 +1,5 @@
-use sley::plumbing::sley_core::cli_exit_code;
 use sley::GitError;
+use sley::plumbing::sley_core::cli_exit_code;
 fn main() {
     // Use args_os rather than env::args(), which panics (Result::unwrap) on any
     // argument that is not valid UTF-8. Git accepts arbitrary bytes on the

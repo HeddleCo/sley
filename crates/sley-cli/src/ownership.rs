@@ -8,9 +8,9 @@
 //! own config). `GIT_TEST_ASSUME_DIFFERENT_OWNER=1` forces the not-owned path so
 //! the check can be exercised regardless of real on-disk ownership.
 
-use std::path::{Component, Path, PathBuf};
 use crate::sley_config;
 use sley::plumbing::sley_core;
+use std::path::{Component, Path, PathBuf};
 
 use sley::plumbing::sley_config::ConfigIncludeContext;
 use sley::{GitError, Result};

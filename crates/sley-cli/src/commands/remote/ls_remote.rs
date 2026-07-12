@@ -4,24 +4,19 @@
 #[path = "ls_remote_options.rs"]
 mod ls_remote_options;
 use ls_remote_options::setup_ls_remote_options;
-use sley::plumbing::{sley_config};
+use sley::plumbing::sley_config;
 
-use super::config::{read_repo_config, remote_exists};
 use super::fetch::{
-    check_transport_allowed_url, configured_server_options, default_fetch_remote,
-    ls_remote_resolved_url, repo_config_with_transport_policy, transport_policy_config_for_cwd,
+    check_transport_allowed_url, configured_server_options, transport_policy_config_for_context,
 };
 use super::pack::{
-    configured_legacy_protocol, configured_protocol_version, trace_configured_local_protocol_version,
-    trace_protocol_v2_ls_refs_request, trace_protocol_v2_upload_pack_capabilities,
+    configured_legacy_protocol, configured_protocol_version,
+    trace_configured_local_protocol_version, trace_protocol_v2_ls_refs_request,
+    trace_protocol_v2_upload_pack_capabilities,
 };
-use super::resolve::ls_remote_git_dir;
+use super::resolve::{RemoteCommandContext, ls_remote_git_dir};
 use crate::commands::config_cmd::{
     ConfigKey, SimpleConfigRegex, config_set_value, parse_config_key,
-};
-use crate::remote::{
-    remote_config_values, resolve_remote_fetch_url, resolve_remote_push_url,
-    rewrite_url_with_config,
 };
 use crate::*;
 use sley::plumbing::sley_odb::ObjectReader;
@@ -30,11 +25,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 
 fn ls_remote_http_records(
+    context: &RemoteCommandContext,
     repository: &str,
     options: &LsRemoteOptions,
     transport_config: &GitConfig,
 ) -> Result<Option<(Vec<LsRemoteRecord>, ObjectFormat)>> {
-    let remote_url = ls_remote_resolved_url(repository)?;
+    let remote_url = context.resolved_remote(repository)?.url;
     let parsed = parse_remote_url(&remote_url)?;
     if !matches!(
         parsed.transport,
@@ -42,19 +38,20 @@ fn ls_remote_http_records(
     ) {
         return Ok(None);
     }
-    let config = crate::session::cli_git_dir()
-        .ok()
-        .and_then(|git_dir| read_repo_config(&git_dir).ok());
-    let mut credentials = sley_remote::CredentialHelperProvider::new(config.as_ref());
-    let records = sley_remote::ls_remote(
-        &sley_remote::LsRemoteSource::Http(parsed),
-        ObjectFormat::Sha1,
-        &ls_remote_filter(options),
+    let mut credentials = sley_remote::CredentialHelperProvider::new(context.config());
+    let source = sley_remote::LsRemoteSource::Http(parsed);
+    let filter = ls_remote_filter(options);
+    let outcome = sley_remote::ls_remote_with(
+        sley_remote::LsRemoteRequest {
+            source: &source,
+            format: ObjectFormat::Sha1,
+            filter: &filter,
+            config: Some(transport_config),
+        },
         &|name| ls_remote_ref_matches(name, &options.patterns),
-        Some(transport_config),
         &mut credentials,
     )?;
-    Ok(Some(records))
+    Ok(Some((outcome.records, outcome.format)))
 }
 
 /// The library ref-class filter for the parsed ls-remote `options`.
@@ -260,12 +257,8 @@ fn configured_refspec_valid(refspec: &str, fetch: bool) -> bool {
 /// Mirror git's `remote_get` validating every configured `remote.<name>.fetch`
 /// and `remote.<name>.push` refspec via `refspec_append` (which dies on the
 /// first invalid value). Only runs when `repository` names a configured remote.
-fn validate_configured_remote_refspecs(repository: &str) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let Ok(git_dir) = crate::session::cli_git_dir_from(&cwd) else {
-        return Ok(());
-    };
-    let Ok(config) = read_repo_config(&git_dir) else {
+fn validate_configured_remote_refspecs(config: Option<&GitConfig>, repository: &str) -> Result<()> {
+    let Some(config) = config else {
         return Ok(());
     };
     for (key, fetch) in [("fetch", true), ("push", false)] {
@@ -281,31 +274,39 @@ fn validate_configured_remote_refspecs(repository: &str) -> Result<()> {
     Ok(())
 }
 
-fn default_ls_remote_remote() -> Result<String> {
-    let git_dir = crate::session::cli_git_dir()?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let format = repository_object_format(&common_git_dir)?;
-    default_fetch_remote(&git_dir, format)
+fn default_ls_remote_remote(context: &RemoteCommandContext) -> Result<String> {
+    let repository = context.required_repository()?;
+    let current_branch = repository.references().current_branch()?;
+    Ok(sley_remote::plan_fetch_repository(
+        context.required_config()?,
+        current_branch.as_deref(),
+        None,
+    )
+    .remote)
 }
 
-pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_ls_remote(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let context = RemoteCommandContext::from_session(cli_session);
     let mut options = setup_ls_remote_options(args)?;
     let implicit_repository = options.repository.is_none();
     let repository = match options.repository.as_deref() {
         Some(repository) => repository.to_string(),
-        None => default_ls_remote_remote()?,
+        None => default_ls_remote_remote(&context)?,
     };
-    validate_configured_remote_refspecs(&repository)?;
+    validate_configured_remote_refspecs(context.config(), &repository)?;
     if options.get_url {
-        println!("{}", ls_remote_display_url(&repository)?);
+        println!("{}", ls_remote_display_url(&context, &repository)?);
         return Ok(());
     }
-    let local_sort_git_dir = validate_ls_remote_sort_context(options.sort)?;
+    let local_sort_git_dir = validate_ls_remote_sort_context(&context, options.sort)?;
     let local_sort_format = local_sort_git_dir
         .as_deref()
         .map(repository_object_format)
         .transpose()?;
-    let transport_config = transport_policy_config_for_cwd()?;
+    let transport_config = transport_policy_config_for_context(&context)?;
     if options.server_options.is_empty() {
         options.server_options = configured_server_options(&transport_config, &repository)?;
     } else if configured_legacy_protocol(Some(&transport_config)) {
@@ -313,15 +314,15 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
         eprintln!("fatal: see protocol.version in 'git help config' for more details");
         return Err(GitError::Exit(128));
     }
-    let resolved_repository = ls_remote_resolved_url(&repository)?;
+    let resolved_repository = context.resolved_remote(&repository)?.url;
     check_transport_allowed_url(&resolved_repository, Some(&transport_config))?;
 
     if implicit_repository && !options.quiet {
-        eprintln!("From {}", ls_remote_display_url(&repository)?);
+        eprintln!("From {}", ls_remote_display_url(&context, &repository)?);
     }
 
     if let Some((mut records, format)) =
-        ls_remote_ssh_records(&repository, &options, &transport_config)?
+        ls_remote_ssh_records(&context, &repository, &options, &transport_config)?
     {
         if options.exit_code && records.is_empty() {
             return Err(GitError::Exit(2));
@@ -339,7 +340,7 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
     }
 
     if let Some((mut records, format)) =
-        ls_remote_git_records(&repository, &options, &transport_config)?
+        ls_remote_git_records(&context, &repository, &options, &transport_config)?
     {
         if options.exit_code && records.is_empty() {
             return Err(GitError::Exit(2));
@@ -357,7 +358,7 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
     }
 
     if let Some((mut records, format)) =
-        ls_remote_http_records(&repository, &options, &transport_config)?
+        ls_remote_http_records(&context, &repository, &options, &transport_config)?
     {
         if options.exit_code && records.is_empty() {
             return Err(GitError::Exit(2));
@@ -398,7 +399,7 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
     ) {
         trace_configured_local_protocol_version(Some(&transport_config));
         if configured_protocol_version(Some(&transport_config)) == Some(ProtocolVersion::V2) {
-            if let Ok(remote_git_dir) = ls_remote_git_dir(&repository)
+            if let Ok(remote_git_dir) = ls_remote_git_dir(&context, &repository)
                 && let Ok(remote_common_git_dir) = common_git_dir_for_git_dir(&remote_git_dir)
                 && let Ok(format) = repository_object_format(&remote_common_git_dir)
             {
@@ -408,20 +409,26 @@ pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
         }
     }
 
-    let git_dir = match ls_remote_git_dir(&repository) {
+    let git_dir = match ls_remote_git_dir(&context, &repository) {
         Ok(git_dir) => git_dir,
         Err(_) => return ls_remote_repository_not_found(&repository),
     };
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let (mut records, format) = sley_remote::ls_remote(
-        &sley_remote::LsRemoteSource::Local { git_dir },
-        format,
-        &ls_remote_filter(&options),
+    let source = sley_remote::LsRemoteSource::Local { git_dir };
+    let filter = ls_remote_filter(&options);
+    let outcome = sley_remote::ls_remote_with(
+        sley_remote::LsRemoteRequest {
+            source: &source,
+            format,
+            filter: &filter,
+            config: Some(&transport_config),
+        },
         &|name| ls_remote_ref_matches(name, &options.patterns),
-        Some(&transport_config),
         &mut sley_remote::NoCredentials,
     )?;
+    let mut records = outcome.records;
+    let format = outcome.format;
 
     if options.exit_code && records.is_empty() {
         return Err(GitError::Exit(2));
@@ -506,9 +513,10 @@ fn ls_remote_upload_pack_command_records(
     Ok(records)
 }
 
-
-
-fn validate_ls_remote_sort_context(sort: Option<LsRemoteSort>) -> Result<Option<PathBuf>> {
+fn validate_ls_remote_sort_context(
+    context: &RemoteCommandContext,
+    sort: Option<LsRemoteSort>,
+) -> Result<Option<PathBuf>> {
     if !matches!(
         sort,
         Some(
@@ -547,8 +555,8 @@ fn validate_ls_remote_sort_context(sort: Option<LsRemoteSort>) -> Result<Option<
         Some(LsRemoteSort::CreatorDate | LsRemoteSort::CreatorDateDescending) => "creatordate",
         _ => unreachable!("guard checked object-data sort"),
     };
-    if let Ok(git_dir) = crate::session::cli_git_dir() {
-        return Ok(Some(git_dir));
+    if let Some(git_dir) = context.git_dir() {
+        return Ok(Some(git_dir.to_path_buf()));
     }
     eprintln!(
         "fatal: not a git repository, but the field '{field}' requires access to object data"
@@ -562,65 +570,60 @@ fn validate_ls_remote_sort_context(sort: Option<LsRemoteSort>) -> Result<Option<
 /// listing and class filtering live in the library, shared with the HTTP path. SSH
 /// does not authenticate at this layer, so no credential provider is supplied.
 fn ls_remote_ssh_records(
+    context: &RemoteCommandContext,
     repository: &str,
     options: &LsRemoteOptions,
     transport_config: &GitConfig,
 ) -> Result<Option<(Vec<LsRemoteRecord>, ObjectFormat)>> {
-    let parsed = parse_remote_url(&ls_remote_resolved_url(repository)?)?;
+    let parsed = parse_remote_url(&context.resolved_remote(repository)?.url)?;
     if !matches!(
         parsed.transport,
         RemoteTransport::Ssh | RemoteTransport::Ext
     ) {
         return Ok(None);
     }
-    let records = sley_remote::ls_remote(
-        &sley_remote::LsRemoteSource::Ssh(parsed),
-        ObjectFormat::Sha1,
-        &ls_remote_filter(options),
+    let source = sley_remote::LsRemoteSource::Ssh(parsed);
+    let filter = ls_remote_filter(options);
+    let outcome = sley_remote::ls_remote_with(
+        sley_remote::LsRemoteRequest {
+            source: &source,
+            format: ObjectFormat::Sha1,
+            filter: &filter,
+            config: Some(transport_config),
+        },
         &|name| ls_remote_ref_matches(name, &options.patterns),
-        Some(transport_config),
         &mut sley_remote::NoCredentials,
     )?;
-    Ok(Some(records))
+    Ok(Some((outcome.records, outcome.format)))
 }
 
 fn ls_remote_git_records(
+    context: &RemoteCommandContext,
     repository: &str,
     options: &LsRemoteOptions,
     transport_config: &GitConfig,
 ) -> Result<Option<(Vec<LsRemoteRecord>, ObjectFormat)>> {
-    let parsed = parse_remote_url(&ls_remote_resolved_url(repository)?)?;
+    let parsed = parse_remote_url(&context.resolved_remote(repository)?.url)?;
     if parsed.transport != RemoteTransport::Git {
         return Ok(None);
     }
-    let records = sley_remote::ls_remote(
-        &sley_remote::LsRemoteSource::Git(parsed),
-        ObjectFormat::Sha1,
-        &ls_remote_filter(options),
+    let source = sley_remote::LsRemoteSource::Git(parsed);
+    let filter = ls_remote_filter(options);
+    let outcome = sley_remote::ls_remote_with(
+        sley_remote::LsRemoteRequest {
+            source: &source,
+            format: ObjectFormat::Sha1,
+            filter: &filter,
+            config: Some(transport_config),
+        },
         &|name| ls_remote_ref_matches(name, &options.patterns),
-        Some(transport_config),
         &mut sley_remote::NoCredentials,
     )?;
-    Ok(Some(records))
+    Ok(Some((outcome.records, outcome.format)))
 }
 
-fn ls_remote_display_url(repository: &str) -> Result<String> {
-    let cwd = env::current_dir()?;
-    let config = crate::session::cli_git_dir_from(&cwd)
-        .ok()
-        .and_then(|git_dir| read_repo_config(&git_dir).ok());
-    let url = config
-        .as_ref()
-        .and_then(|config| {
-            remote_config_values(config, repository, "url")
-                .into_iter()
-                .next()
-        })
-        .unwrap_or_else(|| repository.to_string());
-    Ok(config
-        .as_ref()
-        .map(|config| rewrite_url_with_config(config, &url, false))
-        .unwrap_or(url))
+fn ls_remote_display_url(context: &RemoteCommandContext, repository: &str) -> Result<String> {
+    Ok(context.resolved_remote(repository)?.url)
 }
 
 fn ls_remote_ref_matches(name: &str, patterns: &[String]) -> bool {

@@ -1,14 +1,14 @@
 //! Attribute and ignore inspection commands (`check-attr`, `check-ignore`).
 
+use crate::sley_object;
+use sley::plumbing::{sley_core, sley_index, sley_rev, sley_worktree};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use crate::sley_object;
-use sley::plumbing::{sley_core, sley_index, sley_rev, sley_worktree};
 
-use sley::{GitError, Result};
 use sley::plumbing::sley_object::tree_entry_object_type;
+use sley::{GitError, Result};
 use sley_pathspec::normalize_ls_files_pathspec;
 
 use crate::{
@@ -16,7 +16,10 @@ use crate::{
     resolve_cli_path, status_quote_path, worktree_prefix, write_check_attr_state,
 };
 
-pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_check_ignore(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut read_stdin = false;
     let mut quiet = false;
     let mut verbose = false;
@@ -99,12 +102,12 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
-    let worktree_root = &require_work_tree(git_dir)?;
-    let prefix = worktree_prefix(cwd, git_dir)?;
+    let worktree_root = &require_work_tree(cli_session, git_dir)?;
+    let prefix = worktree_prefix(cli_session, cwd, git_dir)?;
     let (tracked_paths, gitlink_paths) = if no_index {
         (BTreeSet::new(), Vec::new())
     } else {
@@ -290,7 +293,10 @@ fn write_check_ignore_quoted(stdout: &mut impl Write, path: &[u8]) -> Result<()>
     Ok(())
 }
 
-pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_check_attr(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut read_stdin = false;
     let mut all = false;
     let mut z = false;
@@ -379,7 +385,7 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
         ));
     }
 
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
@@ -390,12 +396,12 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
         .or(sley_worktree::worktree_root_for_git_dir(git_dir)?);
     let attr_root = worktree_root.as_deref().unwrap_or(git_dir);
     let prefix = if worktree_root.is_some() {
-        worktree_prefix(cwd, git_dir).unwrap_or_default()
+        worktree_prefix(cli_session, cwd, git_dir).unwrap_or_default()
     } else {
         String::new()
     };
     let attr_source = source
-        .or_else(global_attr_source)
+        .or_else(|| global_attr_source(cli_session))
         .or_else(|| std::env::var("GIT_ATTR_SOURCE").ok());
     let attr_tree_config = repo.config().get("attr", None, "tree").map(str::to_string);
     let source_tree = if let Some(source) = attr_source.as_deref() {

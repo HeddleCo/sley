@@ -1,16 +1,13 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-use sley::{GitConfig, Result};
 use crate::sley_config::{ConfigEntry, ConfigSection};
+use sley::{GitConfig, Result};
 use std::env;
-use std::sync::Mutex;
 
 use crate::commands::remote::repo_current_branch_name;
 use crate::global_options::injected_config_parameters;
 use crate::repo_paths::common_git_dir_for_git_dir;
 use crate::session;
 use crate::sley_core;
-
-static TRACE2_DEF_PARAMS_EMITTED: Mutex<bool> = Mutex::new(false);
 
 fn trace2_target_enabled() -> bool {
     env::var_os("GIT_TRACE2").is_some()
@@ -69,9 +66,9 @@ fn trace2_config_param_matches(pattern: &str, key: &str) -> bool {
     true
 }
 
-fn trace2_dispatch_config() -> Result<GitConfig> {
-    let cwd = env::current_dir()?;
-    let git_dir = session::cli_git_dir_from(&cwd).ok();
+fn trace2_dispatch_config(cli_session: &session::CliSession) -> Result<GitConfig> {
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir().ok();
     let common_git_dir = git_dir
         .as_deref()
         .and_then(|git_dir| common_git_dir_for_git_dir(git_dir).ok());
@@ -128,11 +125,11 @@ fn trace2_requested_config_patterns(config: &GitConfig) -> Vec<String> {
     out
 }
 
-pub(crate) fn trace2_emit_def_params_at_depth(depth: usize) {
+pub(crate) fn trace2_emit_def_params_at_depth(cli_session: &session::CliSession, depth: usize) {
     if !trace2_target_enabled() {
         return;
     }
-    let Ok(config) = trace2_dispatch_config() else {
+    let Ok(config) = trace2_dispatch_config(cli_session) else {
         return;
     };
     let patterns = trace2_requested_config_patterns(&config);
@@ -172,14 +169,8 @@ pub(crate) fn trace2_emit_def_params_at_depth(depth: usize) {
     }
 }
 
-pub(crate) fn trace2_emit_def_params_once() {
-    let mut emitted = TRACE2_DEF_PARAMS_EMITTED.lock().unwrap();
-    if *emitted {
-        return;
-    }
-    *emitted = true;
-    drop(emitted);
-    trace2_emit_def_params_at_depth(sley_core::trace2::depth());
+pub(crate) fn trace2_emit_def_params_once(cli_session: &session::CliSession) {
+    trace2_emit_def_params_at_depth(cli_session, sley_core::trace2::depth());
 }
 
 pub(crate) fn trace_reference_fsync_counter(count: usize) {

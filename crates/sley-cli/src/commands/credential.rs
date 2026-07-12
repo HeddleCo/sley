@@ -3,23 +3,25 @@
 use std::env;
 use std::fs;
 use std::io::{self, BufRead};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use sley::plumbing::sley_config;
 use sley::{GitError, Result};
 use sley_transport::{
-    cmd_credential_cache as transport_cmd_credential_cache,
+    CredentialOpType, GitCredential, cmd_credential_cache as transport_cmd_credential_cache,
     cmd_credential_cache_daemon as transport_cmd_credential_cache_daemon,
-    cmd_credential_store as transport_cmd_credential_store,
-    credential_announce_capabilities, credential_approve, credential_fill, credential_next_state,
-    credential_read, credential_reject, credential_set_all_capabilities, credential_write,
-    CredentialOpType, GitCredential,
+    cmd_credential_store as transport_cmd_credential_store, credential_announce_capabilities,
+    credential_approve, credential_fill, credential_next_state, credential_read, credential_reject,
+    credential_set_all_capabilities, credential_write,
 };
 
 use crate::injected_config_parameters;
 use crate::repo_paths::common_git_dir_for_git_dir;
 
-pub(crate) fn cmd_credential(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_credential(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     if args.len() != 1 {
         eprintln!("usage: git credential (fill|approve|reject)");
         return Err(GitError::Exit(129));
@@ -31,7 +33,7 @@ pub(crate) fn cmd_credential(args: &[String]) -> Result<()> {
         credential_announce_capabilities(&credential, &mut io::stdout().lock())?;
         return Ok(());
     }
-    let stack = load_credential_config_stack()?;
+    let stack = load_credential_config_stack(cli_session)?;
     let mut credential = GitCredential::default();
     credential_read(
         &mut credential,
@@ -76,32 +78,27 @@ pub(crate) fn cmd_credential_cache_daemon(args: &[String]) -> Result<()> {
     transport_cmd_credential_cache_daemon(args)
 }
 
-fn load_credential_config_stack() -> Result<sley_config::ConfigStack> {
-    let context = credential_include_context();
+fn load_credential_config_stack(
+    cli_session: &crate::session::CliSession,
+) -> Result<sley_config::ConfigStack> {
+    let context = credential_include_context(cli_session);
     let mut stack = sley_config::ConfigStack::new();
     for (path, scope) in sley_config::default_config_layer_paths() {
         let _ = stack.push_file(&path, scope, true, &context);
     }
-    if let Ok(cwd) = env::current_dir() {
-        if let Ok(git_dir) = crate::session::cli_git_dir_from(&cwd) {
-            if let Ok(common) = common_git_dir_for_git_dir(&git_dir) {
-                let local_path = config_display_path(common.join("config"));
-                let _ = stack.push_file(
-                    &local_path,
-                    sley_config::ConfigScope::Local,
-                    true,
-                    &context,
-                );
-                if worktree_config_extension_enabled(&common) {
-                    let worktree_path = config_display_path(git_dir.join("config.worktree"));
-                    let _ = stack.push_file(
-                        &worktree_path,
-                        sley_config::ConfigScope::Worktree,
-                        true,
-                        &context,
-                    );
-                }
-            }
+    if let Ok(git_dir) = cli_session.git_dir()
+        && let Ok(common) = common_git_dir_for_git_dir(&git_dir)
+    {
+        let local_path = config_display_path(common.join("config"));
+        let _ = stack.push_file(&local_path, sley_config::ConfigScope::Local, true, &context);
+        if worktree_config_extension_enabled(&common) {
+            let worktree_path = config_display_path(git_dir.join("config.worktree"));
+            let _ = stack.push_file(
+                &worktree_path,
+                sley_config::ConfigScope::Worktree,
+                true,
+                &context,
+            );
         }
     }
     if let Ok(parameters) = injected_config_parameters() {
@@ -110,12 +107,12 @@ fn load_credential_config_stack() -> Result<sley_config::ConfigStack> {
     Ok(stack)
 }
 
-fn credential_include_context() -> sley_config::ConfigIncludeContext {
-    let Ok(cwd) = env::current_dir() else {
-        return sley_config::ConfigIncludeContext::default();
-    };
-    let start = logical_cwd_for_include_context(&cwd);
-    match crate::session::cli_git_dir_from(&start) {
+fn credential_include_context(
+    cli_session: &crate::session::CliSession,
+) -> sley_config::ConfigIncludeContext {
+    let cwd = cli_session.cwd();
+    let start = logical_cwd_for_include_context(cwd);
+    match cli_session.git_dir() {
         Ok(git_dir) => sley_config::ConfigIncludeContext::new(
             Some(sley_config::git_dir_for_include_context(&git_dir)),
             repo_current_branch_name(&git_dir),
@@ -124,16 +121,16 @@ fn credential_include_context() -> sley_config::ConfigIncludeContext {
     }
 }
 
-fn logical_cwd_for_include_context(cwd: &PathBuf) -> PathBuf {
+fn logical_cwd_for_include_context(cwd: &Path) -> PathBuf {
     let Some(pwd) = env::var_os("PWD").map(PathBuf::from) else {
-        return cwd.clone();
+        return cwd.to_path_buf();
     };
     if !pwd.is_absolute() {
-        return cwd.clone();
+        return cwd.to_path_buf();
     }
     match (fs::canonicalize(&pwd), fs::canonicalize(cwd)) {
         (Ok(pwd_real), Ok(cwd_real)) if pwd_real == cwd_real => pwd,
-        _ => cwd.clone(),
+        _ => cwd.to_path_buf(),
     }
 }
 

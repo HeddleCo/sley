@@ -7,8 +7,8 @@ use std::process::{Command, Stdio};
 use sley_config::{ConfigStack, GitConfig};
 use sley_core::{GitError, Result};
 
-use super::url::{credential_describe, credential_format};
 use super::GitCredential;
+use super::url::{credential_describe, credential_format};
 
 pub(crate) fn credential_getpass(
     config: Option<&GitConfig>,
@@ -27,20 +27,12 @@ pub(crate) fn credential_getpass(
     }
     if credential.username.is_none() {
         credential.username = Some(credential_ask_one(
-            "Username",
-            credential,
-            true,
-            config,
-            stack,
+            "Username", credential, true, config, stack,
         )?);
     }
     if credential.password.is_none() {
         credential.password = Some(credential_ask_one(
-            "Password",
-            credential,
-            false,
-            config,
-            stack,
+            "Password", credential, false, config, stack,
         )?);
     }
     Ok(false)
@@ -110,14 +102,15 @@ fn read_prompt_output(command: &mut Command) -> Result<String> {
     let mut child = command
         .spawn()
         .map_err(|err| GitError::Io(err.to_string()))?;
-    let mut stdout = child.stdout.take().expect("piped");
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitError::Io("askpass stdout was not piped".into()))?;
     let mut output = String::new();
     stdout
         .read_to_string(&mut output)
         .map_err(|err| GitError::Io(err.to_string()))?;
-    let status = child
-        .wait()
-        .map_err(|err| GitError::Io(err.to_string()))?;
+    let status = child.wait().map_err(|err| GitError::Io(err.to_string()))?;
     if !status.success() {
         return Err(GitError::Command("askpass failed".into()));
     }

@@ -1,19 +1,19 @@
 #![allow(clippy::expect_used)]
 use super::{
-    branch_ahead_behind_sort_value, branch_contains_eq_value, branch_date_sort_value,
-    branch_merged_eq_value, branch_no_contains_eq_value, branch_no_merged_eq_value,
-    branch_objectname_sort_value, branch_objectsize_sort_value, branch_objecttype_sort_value,
-    branch_push_sort_value, branch_upstream_sort_value,
-    branch_version_sort_value, BranchColumnStyle, BranchCreateOptions, BranchDeleteMode,
-    BranchDeleteOptions, BranchFormatListOptions, BranchGeneralListOptions, BranchListFilters,
-    BranchListMode, BranchMoveKind, BranchMoveOptions, BranchSort, BranchTrackMode,
-    BranchUpstreamAction, BranchUpstreamOptions, BranchVerboseListOptions,
+    BranchColumnStyle, BranchCreateOptions, BranchDeleteMode, BranchDeleteOptions,
+    BranchFormatListOptions, BranchGeneralListOptions, BranchListFilters, BranchListMode,
+    BranchMoveKind, BranchMoveOptions, BranchSort, BranchTrackMode, BranchUpstreamAction,
+    BranchUpstreamOptions, BranchVerboseListOptions, branch_ahead_behind_sort_value,
+    branch_contains_eq_value, branch_date_sort_value, branch_merged_eq_value,
+    branch_no_contains_eq_value, branch_no_merged_eq_value, branch_objectname_sort_value,
+    branch_objectsize_sort_value, branch_objecttype_sort_value, branch_push_sort_value,
+    branch_upstream_sort_value, branch_version_sort_value,
 };
 use crate::commands::cli_options::{last_tri_state_bool, opt_bool, opt_str, option_bool};
 use crate::*;
 use sley_options::{
-    parse_options, CallbackValue, OptFlags, OptValue, OptionName, OptionSpec, Parsed,
-    ParsedValue, UsageError,
+    CallbackValue, OptFlags, OptValue, OptionName, OptionSpec, Parsed, ParsedValue, UsageError,
+    parse_options,
 };
 
 const BRANCH_USAGE_LINES: [&str; 8] = [
@@ -256,12 +256,7 @@ fn branch_option_specs() -> &'static [OptionSpec<'static>] {
             OptFlags::NONE,
             "copy a branch, even if target exists",
         ),
-        opt_bool(
-            Some('l'),
-            Some("list"),
-            OptFlags::NONE,
-            "list branch names",
-        ),
+        opt_bool(Some('l'), Some("list"), OptFlags::NONE, "list branch names"),
         opt_bool(
             None,
             Some("show-current"),
@@ -341,6 +336,7 @@ pub(super) fn setup_branch_show_current_options(args: &[String]) -> Result<Optio
 
 pub(super) fn setup_branch_general_list_options(
     git_dir: &Path,
+    replace_objects: bool,
     args: &[String],
 ) -> Result<Option<BranchGeneralListOptions>> {
     let mut mode = BranchListMode::Local;
@@ -409,6 +405,7 @@ pub(super) fn setup_branch_general_list_options(
                 sort = Some(branch_sort_from_key(
                     git_dir,
                     repository_object_format(git_dir)?,
+                    replace_objects,
                     value,
                 )?);
                 explicit_no_sort = false;
@@ -421,6 +418,7 @@ pub(super) fn setup_branch_general_list_options(
                 sort = Some(branch_sort_from_key(
                     git_dir,
                     repository_object_format(git_dir)?,
+                    replace_objects,
                     value,
                 )?);
                 explicit_no_sort = false;
@@ -453,6 +451,7 @@ pub(super) fn setup_branch_general_list_options(
         sort = Some(branch_sort_from_key(
             git_dir,
             repository_object_format(git_dir)?,
+            replace_objects,
             config_sort,
         )?);
         saw_list_control = true;
@@ -481,6 +480,7 @@ pub(super) fn setup_branch_general_list_options(
 pub(super) fn setup_branch_format_list_options(
     git_dir: &Path,
     format: ObjectFormat,
+    replace_objects: bool,
     args: &[String],
 ) -> Result<Option<BranchFormatListOptions>> {
     if !args
@@ -530,13 +530,23 @@ pub(super) fn setup_branch_format_list_options(
                 let Some(value) = args.get(idx) else {
                     return Err(GitError::Command("--sort requires a value".into()));
                 };
-                sort = Some(branch_sort_from_key(git_dir, format, value)?);
+                sort = Some(branch_sort_from_key(
+                    git_dir,
+                    format,
+                    replace_objects,
+                    value,
+                )?);
             }
             value if value.starts_with("--sort=") => {
                 let value = value
                     .strip_prefix("--sort=")
                     .expect("prefix checked by match guard");
-                sort = Some(branch_sort_from_key(git_dir, format, value)?);
+                sort = Some(branch_sort_from_key(
+                    git_dir,
+                    format,
+                    replace_objects,
+                    value,
+                )?);
             }
             "--no-sort" => sort = None,
             value if value.starts_with('-') => return Ok(None),
@@ -556,7 +566,12 @@ pub(super) fn setup_branch_format_list_options(
     }))
 }
 
-fn branch_sort_from_key(git_dir: &Path, format: ObjectFormat, key: &str) -> Result<BranchSort> {
+fn branch_sort_from_key(
+    git_dir: &Path,
+    format: ObjectFormat,
+    replace_objects: bool,
+    key: &str,
+) -> Result<BranchSort> {
     let key = key.strip_prefix("--sort=").unwrap_or(key);
     match key {
         "refname" => Ok(BranchSort::Refname(false)),
@@ -587,7 +602,7 @@ fn branch_sort_from_key(git_dir: &Path, format: ObjectFormat, key: &str) -> Resu
         value if branch_ahead_behind_sort_value(value).is_some() => {
             let (rev, descending) =
                 branch_ahead_behind_sort_value(value).expect("checked ahead-behind sort");
-            let oid = resolve_revision(git_dir, format, rev)?;
+            let oid = resolve_revision(git_dir, format, rev, replace_objects)?;
             Ok(BranchSort::AheadBehind(oid, descending))
         }
         _ => {
@@ -623,12 +638,7 @@ fn branch_verbose_list_option_specs() -> &'static [OptionSpec<'static>] {
             OptFlags::NONE,
             "show hash and subject, give twice for upstream branch",
         ),
-        opt_bool(
-            Some('l'),
-            Some("list"),
-            OptFlags::NONE,
-            "list branch names",
-        ),
+        opt_bool(Some('l'), Some("list"), OptFlags::NONE, "list branch names"),
         opt_bool(
             None,
             Some("no-delete"),

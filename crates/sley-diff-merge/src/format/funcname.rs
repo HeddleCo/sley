@@ -12,6 +12,22 @@ pub struct CompiledFuncname {
 /// headings are truncated to it before the trailing-whitespace trim.
 const FUNCNAME_BUFFER: usize = 80;
 
+fn truncated_heading_len(heading: &[u8]) -> usize {
+    let mut len = heading.len().min(FUNCNAME_BUFFER);
+    // Git's UTF-8-aware hunk-header truncation never leaves a partial
+    // multibyte character in the fixed 80-byte funcname buffer. Preserve raw
+    // bytes for non-UTF-8 inputs, but retreat to a scalar boundary for valid
+    // UTF-8 headings.
+    if len < heading.len()
+        && let Ok(text) = std::str::from_utf8(heading)
+    {
+        while !text.is_char_boundary(len) {
+            len -= 1;
+        }
+    }
+    len
+}
+
 impl CompiledFuncname {
     /// Compile a funcname spec. `extended` selects ERE (`xfuncname` /
     /// builtins) over BRE (`funcname` config). Errors mirror upstream's
@@ -80,7 +96,7 @@ impl CompiledFuncname {
             .flatten()
             .unwrap_or_else(|| captures[0].expect("whole-match span present"));
         let heading = &line[start..end];
-        let mut result = heading.len().min(FUNCNAME_BUFFER);
+        let mut result = truncated_heading_len(heading);
         while result > 0 && heading[result - 1].is_ascii_whitespace() {
             result -= 1;
         }
@@ -96,7 +112,7 @@ pub fn default_funcname_heading(line: &[u8]) -> Option<Vec<u8>> {
     if !(first.is_ascii_alphabetic() || *first == b'_' || *first == b'$') {
         return None;
     }
-    let mut len = line.len().min(FUNCNAME_BUFFER);
+    let mut len = truncated_heading_len(line);
     while len > 0 && line[len - 1].is_ascii_whitespace() {
         len -= 1;
     }

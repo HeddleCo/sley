@@ -48,7 +48,7 @@ pub struct ConfigSection {
     pub entries: Vec<ConfigEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ConfigEntry {
     /// Comments and blank lines immediately preceding this entry within its section.
     pub preamble: Vec<ConfigPreambleLine>,
@@ -57,7 +57,21 @@ pub struct ConfigEntry {
     pub key: String,
     pub value: Option<String>,
     pub comment: Option<String>,
+    /// 1-based physical source line; absent for programmatically-created entries.
+    pub line_number: Option<usize>,
 }
+
+impl PartialEq for ConfigEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.preamble == other.preamble
+            && self.indent == other.indent
+            && self.key == other.key
+            && self.value == other.value
+            && self.comment == other.comment
+    }
+}
+
+impl Eq for ConfigEntry {}
 
 impl ConfigEntry {
     /// Build a programmatic entry (no preserved preamble/comment).
@@ -68,6 +82,7 @@ impl ConfigEntry {
             key: key.into(),
             value,
             comment: None,
+            line_number: None,
         }
     }
 }
@@ -132,6 +147,33 @@ impl GitConfig {
             .and_then(|entry| entry.value.as_deref())
     }
 
+    /// Return every `(key, value)` pair in a section without a subsection, in
+    /// file order. A bare key retains its missing value as `None` so callers
+    /// which require a value can distinguish it from an explicit boolean.
+    pub fn section_entries(&self, section_name: &str) -> Vec<(String, Option<String>)> {
+        self.section_entries_with_subsection(section_name, None)
+    }
+
+    /// Return every `(key, value)` pair for one exact section/subsection.
+    pub fn section_entries_with_subsection(
+        &self,
+        section_name: &str,
+        subsection: Option<&str>,
+    ) -> Vec<(String, Option<String>)> {
+        let mut out = Vec::new();
+        for section in &self.sections {
+            if !eq_ignore_ascii_case(&section.name, section_name)
+                || section.subsection.as_deref() != subsection
+            {
+                continue;
+            }
+            for entry in &section.entries {
+                out.push((entry.key.clone(), entry.value.clone()));
+            }
+        }
+        out
+    }
+
     /// Return every `(key, value)` pair in the `fsck` section (no subsection),
     /// in file order, with the value resolved to a string.
     ///
@@ -140,17 +182,10 @@ impl GitConfig {
     /// returned in their original case; a bare boolean-true key yields the
     /// string `"true"`.
     pub fn fsck_entries(&self) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        for section in &self.sections {
-            if !eq_ignore_ascii_case(&section.name, "fsck") || section.subsection.is_some() {
-                continue;
-            }
-            for entry in &section.entries {
-                let value = entry.value.clone().unwrap_or_else(|| "true".to_string());
-                out.push((entry.key.clone(), value));
-            }
-        }
-        out
+        self.section_entries("fsck")
+            .into_iter()
+            .map(|(key, value)| (key, value.unwrap_or_else(|| "true".to_string())))
+            .collect()
     }
 
     /// Return every value set for `section[.subsection].key`, in file order.
@@ -239,7 +274,7 @@ impl GitConfig {
     /// Section headers sit at column 0 as `[section]` or `[section "subsection"]`
     /// (subsections are quoted, with `"` and `\` backslash-escaped). Each entry is
     /// indented with a single tab and written as `key = value`, with the value
-    /// quoted/escaped exactly as git would (see [`quote_config_value`]) so the
+    /// quoted/escaped exactly as git would (see `quote_config_value`) so the
     /// result round-trips through [`GitConfig::parse`] and matches git's own output
     /// for the common cases. Bare boolean-true keys (value `None`) are written as
     /// just the key.
@@ -862,6 +897,7 @@ pub struct ConfigStackEntry {
     pub scope: ConfigScope,
     pub origin: ConfigOrigin,
     pub included_from: Option<ConfigOrigin>,
+    pub line_number: Option<usize>,
 }
 
 impl ConfigStackEntry {
@@ -953,6 +989,7 @@ impl ConfigStack {
                 scope: ConfigScope::Command,
                 origin: ConfigOrigin::command_line(),
                 included_from: None,
+                line_number: None,
             });
         }
     }
@@ -1128,6 +1165,7 @@ fn emit_parsed_config(
                 scope,
                 origin: origin.clone(),
                 included_from: included_from.clone(),
+                line_number: entry.line_number,
             });
             let Some(kind) = &include_kind else { continue };
             if !eq_ignore_ascii_case(&entry.key, "path") {
@@ -1776,6 +1814,7 @@ impl<'a> ConfigParser<'a> {
     /// Parse a `name` or `name = value` entry. The first character of the name is
     /// the next character.
     fn parse_entry(&mut self) -> Result<ConfigEntry> {
+        let line_number = self.line;
         let mut indent = String::new();
         while matches!(self.peek(), Some(' ') | Some('\t')) {
             if let Some(ch) = self.bump() {
@@ -1806,6 +1845,7 @@ impl<'a> ConfigParser<'a> {
                 key,
                 value: None,
                 comment: None,
+                line_number: Some(line_number),
             }),
             Some('\n') => {
                 self.bump();
@@ -1815,6 +1855,7 @@ impl<'a> ConfigParser<'a> {
                     key,
                     value: None,
                     comment: None,
+                    line_number: Some(line_number),
                 })
             }
             Some('=') => {
@@ -1826,6 +1867,7 @@ impl<'a> ConfigParser<'a> {
                     key,
                     value: Some(value),
                     comment,
+                    line_number: Some(line_number),
                 })
             }
             Some(ch) => Err(self.err(format!("expected '=' after variable name, found {ch:?}"))),
@@ -4121,5 +4163,26 @@ mod tests {
         assert_eq!(parse_config_bool("false"), Some(false));
         // An empty value is false (git treats `key =` as false).
         assert_eq!(parse_config_bool(""), Some(false));
+    }
+
+    #[test]
+    fn section_entries_preserve_missing_values_and_exact_subsections() {
+        let config =
+            GitConfig::parse(b"[fsck]\n\tskipList\n[fetch \"fsck\"]\n\tmissingEmail = warn\n")
+                .expect("config");
+        assert_eq!(
+            config.section_entries("fsck"),
+            vec![("skipList".to_string(), None)]
+        );
+        assert_eq!(
+            config.section_entries_with_subsection("fetch", Some("fsck")),
+            vec![("missingEmail".to_string(), Some("warn".to_string()))]
+        );
+        assert!(
+            config
+                .section_entries_with_subsection("fetch", Some("FSCK"))
+                .is_empty(),
+            "quoted subsection matching stays case-sensitive"
+        );
     }
 }

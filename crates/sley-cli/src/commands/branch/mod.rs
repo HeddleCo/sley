@@ -15,21 +15,52 @@ mod positional;
 mod positional_table;
 mod upstream;
 
+pub(super) struct BranchCommandContext {
+    pub(super) repository: sley::Repository,
+    pub(super) refs: crate::FileRefStore,
+    pub(super) config: crate::GitConfig,
+    pub(super) replace_objects: bool,
+}
+
+impl BranchCommandContext {
+    pub(super) fn open(session: &crate::session::CliSession) -> crate::Result<Self> {
+        let repository = session.open_repository()?;
+        let refs = repository.references();
+        let config = repository.config_snapshot()?;
+        Ok(Self {
+            repository,
+            refs,
+            config,
+            replace_objects: session.replace_objects(),
+        })
+    }
+
+    pub(super) fn git_dir(&self) -> &std::path::Path {
+        self.repository.git_dir()
+    }
+
+    pub(super) fn format(&self) -> crate::ObjectFormat {
+        self.repository.object_format()
+    }
+
+    pub(super) fn objects(&self) -> &crate::sley_odb::FileObjectDatabase {
+        self.repository.object_database()
+    }
+}
+
 // Names in scope for branch_options.rs (`use super::{...}`).
-use list::{
-    branch_ahead_behind_sort_value, branch_contains_eq_value, branch_date_sort_value,
-    branch_merged_eq_value, branch_no_contains_eq_value, branch_no_merged_eq_value,
-    branch_objectname_sort_value, branch_objectsize_sort_value, branch_objecttype_sort_value,
-    branch_push_sort_value, branch_upstream_sort_value, branch_version_sort_value,
-    BranchColumnStyle, BranchFormatListOptions, BranchGeneralListOptions, BranchListFilters,
-    BranchListMode, BranchSort, BranchVerboseListOptions,
-};
 use create::BranchCreateOptions;
 use delete::{BranchDeleteMode, BranchDeleteOptions};
+use list::{
+    BranchColumnStyle, BranchFormatListOptions, BranchGeneralListOptions, BranchListFilters,
+    BranchListMode, BranchSort, BranchVerboseListOptions, branch_ahead_behind_sort_value,
+    branch_contains_eq_value, branch_date_sort_value, branch_merged_eq_value,
+    branch_no_contains_eq_value, branch_no_merged_eq_value, branch_objectname_sort_value,
+    branch_objectsize_sort_value, branch_objecttype_sort_value, branch_push_sort_value,
+    branch_upstream_sort_value, branch_version_sort_value,
+};
 use move_::{BranchMoveKind, BranchMoveOptions};
 use upstream::{BranchUpstreamAction, BranchUpstreamOptions};
 
-pub(crate) use create::{
-    branch_create_set_tracking, create_branch_from_start, BranchTrackMode,
-};
+pub(crate) use create::{BranchTrackMode, branch_create_set_tracking, create_branch_from_start};
 pub(crate) use dispatch::cmd_branch;

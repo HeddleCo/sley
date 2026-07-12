@@ -8,7 +8,7 @@ use super::add::{
     advise_on_updating_sparse_paths, normalize_add_absolute_path,
 };
 
-pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_rm(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut paths = Vec::new();
     let mut recursive = false;
     let mut quiet = false;
@@ -16,6 +16,7 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
     let mut force = false;
     let mut dry_run = false;
     let mut ignore_unmatch = false;
+    let mut sparse = false;
     let mut parsing_options = true;
     let mut pathspec_from_file: Option<PathBuf> = None;
     let mut pathspec_file_nul = false;
@@ -44,7 +45,8 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
             "--no-cached" => cached = false,
             "--ignore-unmatch" => ignore_unmatch = true,
             "--no-ignore-unmatch" => ignore_unmatch = false,
-            "--sparse" | "--no-sparse" => {}
+            "--sparse" => sparse = true,
+            "--no-sparse" => sparse = false,
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
             "--pathspec-from-file" => {
@@ -120,10 +122,10 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
         );
         return Err(GitError::Exit(128));
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     let path_base = match cwd.strip_prefix(&worktree_root) {
         Ok(_) => cwd.as_path(),
         Err(_) => worktree_root.as_path(),
@@ -150,6 +152,7 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
             force,
             dry_run,
             ignore_unmatch,
+            sparse,
         },
         config_parameters_env.as_deref(),
     )?;
@@ -167,7 +170,7 @@ pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_mv(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut paths = Vec::new();
     let mut force = false;
     let mut dry_run = false;
@@ -218,9 +221,9 @@ pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
             "mv currently supports <source>... <destination>".into(),
         ));
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let destination = if paths[paths.len() - 1].is_absolute() {
         paths[paths.len() - 1].clone()

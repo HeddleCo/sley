@@ -9,7 +9,7 @@
 //!   [`config::SubmoduleConfigSet`] of typed [`config::Submodule`] entries, plus
 //!   the `check_submodule_name` / `check_submodule_url` security checks and the
 //!   recurse-mode / update-strategy enums.
-//! - [`relative_url`] — the `.gitmodules`-url → concrete-url resolution
+//! - [`relative_url()`] — the `.gitmodules`-url → concrete-url resolution
 //!   (`remote.c::relative_url` + `submodule--helper.c::resolve_relative_url`).
 //!   `submodule init` / `sync` / `add` all route their relative-url math through
 //!   this one primitive so every git URL form (ssh, scp-style, file://, helper,
@@ -31,6 +31,8 @@
 
 pub mod config;
 pub mod move_head;
+pub mod operations;
+pub mod path_safety;
 pub mod relative_url;
 pub mod update_strategy;
 
@@ -43,5 +45,10 @@ pub use move_head::{
     MoveHeadContext, MoveHeadFlags, MoveHeadVerdict, check_move_head, check_submodule_move_head,
     verify_clean_submodule,
 };
+pub use operations::{
+    ConfigMutation, InitCandidate, InitPlan, InitPlanError, InitRegistration, apply_init_plan,
+    plan_init,
+};
+pub use path_safety::submodule_path_has_symlink_parent;
 pub use relative_url::{relative_url, resolve_relative_url};
 pub use update_strategy::determine_update_strategy;

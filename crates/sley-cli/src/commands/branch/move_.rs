@@ -3,7 +3,7 @@
 use super::config::{copy_branch_config, rename_branch_config};
 use super::delete::branch_checked_out_worktree_path;
 use super::operand::{
-    branch_resolve_local_branch_operand, validate_branch_creation_name, BranchOperandKind,
+    BranchOperandKind, branch_resolve_local_branch_operand, validate_branch_creation_name,
 };
 use crate::*;
 
@@ -23,6 +23,7 @@ pub(super) struct BranchMoveOptions {
 pub(super) fn run_branch_move_options(
     git_dir: &Path,
     store: &FileRefStore,
+    config: &GitConfig,
     options: BranchMoveOptions,
 ) -> Result<()> {
     let (old_branch, new_branch) = branch_move_branches(store, options.kind, &options.branches)?;
@@ -113,7 +114,7 @@ pub(super) fn run_branch_move_options(
 
     match options.kind {
         BranchMoveKind::Rename => {
-            let committer = branch_reflog_committer_identity(store, &old_branch)?;
+            let committer = branch_reflog_committer_identity(store, config, &old_branch)?;
             let head_was_old = store.current_branch_ref()?.as_deref() == Some(old_ref.as_str());
             let old_oid = match store.read_ref(&old_ref)? {
                 Some(RefTarget::Direct(oid)) => oid,
@@ -121,14 +122,23 @@ pub(super) fn run_branch_move_options(
             };
             let head_reflog_message =
                 format!("Branch: renamed {old_ref} to {new_ref}").into_bytes();
-            if let Err(err) = store.move_branch(&old_branch, &new_branch, options.force, committer)
-            {
+            if let Err(err) = sley_refs::branch::transfer_branch(
+                store,
+                sley_refs::branch::BranchTransferOptions {
+                    kind: sley_refs::branch::BranchTransferKind::Move,
+                    source: old_branch.clone(),
+                    destination: new_branch.clone(),
+                    force: options.force,
+                    committer,
+                },
+            ) {
+                let err = err.into_git_error();
                 return branch_move_failed(err, "rename");
             }
             let linked_update = update_all_worktree_heads(git_dir, &old_ref, &new_ref);
             if head_was_old {
                 let null_oid = ObjectId::null(repository_object_format(git_dir)?);
-                let committer = branch_reflog_committer_identity(store, &new_branch)?;
+                let committer = branch_reflog_committer_identity(store, config, &new_branch)?;
                 store.append_reflog(
                     "HEAD",
                     &ReflogEntry {
@@ -152,9 +162,18 @@ pub(super) fn run_branch_move_options(
             linked_update?;
         }
         BranchMoveKind::Copy => {
-            let committer = branch_reflog_committer_identity(store, &old_branch)?;
-            if let Err(err) = store.copy_branch(&old_branch, &new_branch, options.force, committer)
-            {
+            let committer = branch_reflog_committer_identity(store, config, &old_branch)?;
+            if let Err(err) = sley_refs::branch::transfer_branch(
+                store,
+                sley_refs::branch::BranchTransferOptions {
+                    kind: sley_refs::branch::BranchTransferKind::Copy,
+                    source: old_branch.clone(),
+                    destination: new_branch.clone(),
+                    force: options.force,
+                    committer,
+                },
+            ) {
+                let err = err.into_git_error();
                 return branch_move_failed(err, "copy");
             }
             copy_branch_config(git_dir, &old_branch, &new_branch)?;
@@ -195,7 +214,11 @@ pub(super) fn any_worktree_head_points_at(git_dir: &Path, refname: &str) -> Resu
     Ok(!worktree_head_paths(git_dir, refname)?.is_empty())
 }
 
-pub(super) fn update_all_worktree_heads(git_dir: &Path, old_ref: &str, new_ref: &str) -> Result<()> {
+pub(super) fn update_all_worktree_heads(
+    git_dir: &Path,
+    old_ref: &str,
+    new_ref: &str,
+) -> Result<()> {
     let mut failed = false;
     for head_path in worktree_head_paths(git_dir, old_ref)? {
         if head_path.with_file_name("HEAD.lock").exists() {
@@ -243,9 +266,13 @@ pub(super) fn worktree_head_paths(git_dir: &Path, refname: &str) -> Result<Vec<P
     Ok(heads)
 }
 
-pub(super) fn branch_reflog_committer_identity(store: &FileRefStore, branch: &str) -> Result<Vec<u8>> {
+pub(super) fn branch_reflog_committer_identity(
+    store: &FileRefStore,
+    config: &GitConfig,
+    branch: &str,
+) -> Result<Vec<u8>> {
     if env::var("GIT_COMMITTER_DATE").is_ok() {
-        return commit_identity_from_env("COMMITTER");
+        return commit_identity_from_env("COMMITTER", config);
     }
     let refname = branch_ref_name(branch)?;
     let max_existing = store

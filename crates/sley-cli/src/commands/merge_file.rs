@@ -9,16 +9,12 @@
 //! (capped at 127), `0` for a clean merge, `129` for a usage error and `255`
 //! for an operational error (missing input, binary input).
 //!
-//! The merge engine reuses `sley_diff_merge`: the common path (default conflict
-//! style, default marker size, no conflict-resolution favoring) is produced by
-//! [`sley_diff_merge::merge_blobs`] directly. The extended flags — `--ours`,
-//! `--theirs`, `--union`, `--diff3`/`--zdiff3` and `--marker-size` — are served
-//! by a region walk built from the very same lower-level primitives
-//! `merge_blobs` is built on (`split_lines` + `myers_diff_lines`), so conflict
-//! detection and region boundaries stay consistent across every flag.
+//! All merge computation lives in `sley_diff_merge::merge_file`; this wrapper
+//! owns only argv/config resolution, filesystem or object-database inputs, and
+//! delivery of the typed engine outcome.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_diff_merge};
+use sley::plumbing::sley_diff_merge;
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
 
@@ -56,13 +52,15 @@ enum Favor {
 }
 
 /// Fully parsed `git merge-file` invocation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MergeFileOptions {
     to_stdout: bool,
     quiet: bool,
     object_id: bool,
     style: MergeStyle,
+    style_explicit: bool,
     favor: Favor,
+    diff_algorithm: sley_diff_merge::DiffAlgorithm,
     marker_size: usize,
     /// Labels supplied via `-L`, in order (`name1`, `orig`, `name2`).
     labels: Vec<String>,
@@ -70,13 +68,16 @@ struct MergeFileOptions {
     operands: Vec<String>,
 }
 
-pub(crate) fn cmd_merge_file(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_merge_file(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = match parse_merge_file_args(args)? {
         Some(options) => options,
         // A bare `--no-...`/help-style path that already produced its output.
         None => return Ok(()),
     };
-    run_merge_file(&options)
+    run_merge_file(cli_session, &options)
 }
 
 /// Parse the command line the way git's parse-options front-end does. Returns
@@ -88,7 +89,9 @@ fn parse_merge_file_args(args: &[String]) -> Result<Option<MergeFileOptions>> {
     let mut quiet = false;
     let mut object_id = false;
     let mut style = MergeStyle::Merge;
+    let mut style_explicit = false;
     let mut favor = Favor::None;
+    let mut diff_algorithm = sley_diff_merge::DiffAlgorithm::Myers;
     let mut marker_size = DEFAULT_MARKER_SIZE;
     let mut labels: Vec<String> = Vec::new();
     let mut operands: Vec<String> = Vec::new();
@@ -111,9 +114,18 @@ fn parse_merge_file_args(args: &[String]) -> Result<Option<MergeFileOptions>> {
             "--no-quiet" => quiet = false,
             "--object-id" => object_id = true,
             "--no-object-id" => object_id = false,
-            "--diff3" => style = MergeStyle::Diff3,
-            "--zdiff3" => style = MergeStyle::Zdiff3,
-            "--no-diff3" | "--no-zdiff3" => style = MergeStyle::Merge,
+            "--diff3" => {
+                style = MergeStyle::Diff3;
+                style_explicit = true;
+            }
+            "--zdiff3" => {
+                style = MergeStyle::Zdiff3;
+                style_explicit = true;
+            }
+            "--no-diff3" | "--no-zdiff3" => {
+                style = MergeStyle::Merge;
+                style_explicit = true;
+            }
             "--ours" => favor = Favor::Ours,
             "--theirs" => favor = Favor::Theirs,
             "--union" => favor = Favor::Union,
@@ -135,7 +147,7 @@ fn parse_merge_file_args(args: &[String]) -> Result<Option<MergeFileOptions>> {
                 let Some(value) = iter.next() else {
                     return merge_file_option_requires_value("diff-algorithm");
                 };
-                validate_diff_algorithm(value)?;
+                diff_algorithm = parse_diff_algorithm(value)?;
             }
             _ => {
                 if let Some(value) = arg.strip_prefix("-L") {
@@ -145,7 +157,7 @@ fn parse_merge_file_args(args: &[String]) -> Result<Option<MergeFileOptions>> {
                 } else if let Some(value) = arg.strip_prefix("--marker-size=") {
                     marker_size = parse_marker_size(value)?;
                 } else if let Some(value) = arg.strip_prefix("--diff-algorithm=") {
-                    validate_diff_algorithm(value)?;
+                    diff_algorithm = parse_diff_algorithm(value)?;
                 } else if arg == "-" || !arg.starts_with('-') {
                     operands.push(arg.to_string());
                 } else {
@@ -165,7 +177,9 @@ fn parse_merge_file_args(args: &[String]) -> Result<Option<MergeFileOptions>> {
         quiet,
         object_id,
         style,
+        style_explicit,
         favor,
+        diff_algorithm,
         marker_size,
         labels,
         operands,
@@ -216,12 +230,13 @@ fn parse_size_with_suffix(value: &str) -> Option<usize> {
     base.checked_mul(multiplier)
 }
 
-/// Validate a `--diff-algorithm` name. sley_diff_merge always merges with Myers,
-/// so the choice does not change behaviour here, but an unknown name is an error
-/// exactly as in git.
-fn validate_diff_algorithm(value: &str) -> Result<()> {
+/// Parse a `--diff-algorithm` name into the engine's typed algorithm selection.
+fn parse_diff_algorithm(value: &str) -> Result<sley_diff_merge::DiffAlgorithm> {
     match value {
-        "myers" | "minimal" | "patience" | "histogram" => Ok(()),
+        "myers" => Ok(sley_diff_merge::DiffAlgorithm::Myers),
+        "minimal" => Ok(sley_diff_merge::DiffAlgorithm::Minimal),
+        "patience" => Ok(sley_diff_merge::DiffAlgorithm::Patience),
+        "histogram" => Ok(sley_diff_merge::DiffAlgorithm::Histogram),
         _ => {
             // A bad option *value* prints only the diagnostic, no usage block.
             eprintln!(
@@ -292,9 +307,16 @@ struct MergeInputs {
     theirs_name: String,
 }
 
-fn run_merge_file(options: &MergeFileOptions) -> Result<()> {
+fn run_merge_file(
+    cli_session: &crate::session::CliSession,
+    options: &MergeFileOptions,
+) -> Result<()> {
+    let mut options = options.clone();
+    if !options.style_explicit {
+        options.style = configured_merge_style(cli_session)?;
+    }
     let inputs = if options.object_id {
-        read_object_id_inputs(&options.operands)?
+        read_object_id_inputs(cli_session, &options.operands)?
     } else {
         read_file_inputs(&options.operands)?
     };
@@ -315,25 +337,51 @@ fn run_merge_file(options: &MergeFileOptions) -> Result<()> {
         }
     }
 
-    let (ours_label, base_label, theirs_label) = resolve_labels(options, &inputs);
+    let (ours_label, base_label, theirs_label) = resolve_labels(&options, &inputs);
 
     let merged = merge_three_way(
         &inputs.base,
         &inputs.ours,
         &inputs.theirs,
-        options,
+        &options,
         &ours_label,
         &base_label,
         &theirs_label,
     );
 
-    emit_result(options, &inputs, &merged.content)?;
+    emit_result(cli_session, &options, &inputs, &merged.content)?;
 
     if merged.conflicts == 0 {
         Ok(())
     } else {
-        Err(GitError::Exit(merged.conflicts.min(MAX_CONFLICT_EXIT)))
+        Err(GitError::Exit(
+            i32::try_from(merged.conflicts)
+                .unwrap_or(MAX_CONFLICT_EXIT)
+                .min(MAX_CONFLICT_EXIT),
+        ))
     }
+}
+
+fn configured_merge_style(cli_session: &crate::session::CliSession) -> Result<MergeStyle> {
+    let config = if let Ok(git_dir) = cli_session.git_dir() {
+        commands::remote::read_effective_repo_config(&git_dir, cli_session.cwd())?
+    } else {
+        let context = sley_config::ConfigIncludeContext::new(None, None);
+        let mut config = sley_config::load_pre_dispatch_config(None, &context)?;
+        let parameters = injected_config_parameters()?;
+        sley_config::append_injected_config_sections_with_includes(
+            &mut config,
+            &parameters,
+            &context,
+            cli_session.cwd(),
+        )?;
+        config
+    };
+    Ok(match config.get("merge", None, "conflictstyle") {
+        Some(value) if value.eq_ignore_ascii_case("diff3") => MergeStyle::Diff3,
+        Some(value) if value.eq_ignore_ascii_case("zdiff3") => MergeStyle::Zdiff3,
+        _ => MergeStyle::Merge,
+    })
 }
 
 /// Pick the conflict-marker labels: an explicit `-L` wins, otherwise the input's
@@ -396,16 +444,21 @@ fn stat_error_text(err: &std::io::Error) -> String {
 }
 
 /// Read the three operands as object ids (full or abbreviated), reusing the
-/// object database to resolve and load each blob. Output labels default to the
-/// resolved (full) object ids, as git does in `--object-id` mode.
-fn read_object_id_inputs(operands: &[String]) -> Result<MergeInputs> {
-    let git_dir = crate::session::cli_git_dir()?;
-    let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+/// object database or worktree index to resolve and load each blob. Output
+/// labels preserve the operand spelling, as git does in `--object-id` mode.
+fn read_object_id_inputs(
+    cli_session: &crate::session::CliSession,
+    operands: &[String],
+) -> Result<MergeInputs> {
+    let git_dir = cli_session.git_dir()?;
+    let common_git_dir = cli_session.common_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let index = sley_worktree::read_repository_index(&git_dir, format)?;
 
-    let (ours, ours_name) = read_object_id_blob(&db, format, &operands[0])?;
-    let (base, base_name) = read_object_id_blob(&db, format, &operands[1])?;
-    let (theirs, theirs_name) = read_object_id_blob(&db, format, &operands[2])?;
+    let (ours, ours_name) = read_object_id_blob(&db, format, index.as_ref(), &operands[0])?;
+    let (base, base_name) = read_object_id_blob(&db, format, index.as_ref(), &operands[1])?;
+    let (theirs, theirs_name) = read_object_id_blob(&db, format, index.as_ref(), &operands[2])?;
     Ok(MergeInputs {
         ours,
         base,
@@ -416,18 +469,22 @@ fn read_object_id_inputs(operands: &[String]) -> Result<MergeInputs> {
     })
 }
 
-/// Resolve one object-id operand to `(blob bytes, full-hex name)`. Anything that
+/// Resolve one object-id operand to `(blob bytes, marker label)`. Anything that
 /// fails to resolve to a unique blob is the usage-style error (exit 129) git
 /// reports in `--object-id` mode.
 fn read_object_id_blob(
     db: &FileObjectDatabase,
     format: ObjectFormat,
+    index: Option<&Index>,
     spec: &str,
 ) -> Result<(Vec<u8>, String)> {
-    let oid = resolve_object_id(db, format, spec)?;
+    let oid = resolve_object_id(db, format, index, spec)?;
+    if oid == ObjectId::empty_blob(format) {
+        return Ok((Vec::new(), spec.into()));
+    }
     match db.read_object(&oid) {
         Ok(object) if object.object_type == ObjectType::Blob => {
-            Ok((object.body.clone(), oid.to_hex()))
+            Ok((object.body.clone(), spec.into()))
         }
         _ => {
             print_merge_file_usage();
@@ -439,8 +496,18 @@ fn read_object_id_blob(
 fn resolve_object_id(
     db: &FileObjectDatabase,
     format: ObjectFormat,
+    index: Option<&Index>,
     spec: &str,
 ) -> Result<ObjectId> {
+    if let Some(path) = spec.strip_prefix(':')
+        && !path.is_empty()
+        && let Some(index) = index
+        && let Some(entry) = index.entries.iter().find(|entry| {
+            entry.stage() == sley_index::Stage::Normal && entry.path.as_bytes() == path.as_bytes()
+        })
+    {
+        return Ok(entry.oid);
+    }
     if let Ok(oid) = ObjectId::from_hex(format, spec) {
         return Ok(oid);
     }
@@ -460,20 +527,7 @@ fn is_binary(bytes: &[u8]) -> bool {
     scan.contains(&0)
 }
 
-/// Final merged blob plus the number of conflict regions that were emitted (used
-/// for the exit status).
-struct MergeOutcome {
-    content: Vec<u8>,
-    conflicts: i32,
-}
-
 /// Run the three-way merge, honouring style, favoring and marker size.
-///
-/// For the default configuration (plain `Merge` style, default marker size, no
-/// favoring) the work is delegated straight to [`sley_diff_merge::merge_blobs`];
-/// the conflict count is then recovered from the identical region walk so the
-/// exit status is exact. Every other configuration is rendered from the region
-/// walk directly.
 fn merge_three_way(
     base: &[u8],
     ours: &[u8],
@@ -482,381 +536,40 @@ fn merge_three_way(
     ours_label: &str,
     base_label: &str,
     theirs_label: &str,
-) -> MergeOutcome {
-    let regions = build_regions(base, ours, theirs);
-    // A favoring mode (`--ours`/`--theirs`/`--union`) resolves every region, so
-    // git reports no conflicts and exits 0; only marker-emitting merges count.
-    let conflicts = if options.favor == Favor::None {
-        i32::try_from(
-            regions
-                .iter()
-                .filter(|region| matches!(region, Region::Conflict { .. }))
-                .count(),
-        )
-        .unwrap_or(MAX_CONFLICT_EXIT)
-    } else {
-        0
-    };
-
-    let default_config = options.style == MergeStyle::Merge
-        && options.favor == Favor::None
-        && options.marker_size == DEFAULT_MARKER_SIZE;
-
-    let content = if default_config {
-        // Reuse merge_blobs for the common case; byte-for-byte equivalent to the
-        // region renderer below but the canonical engine.
-        sley_diff_merge::merge_blobs(
-            base,
-            ours,
-            theirs,
-            &sley_diff_merge::MergeBlobOptions {
-                ours_label,
-                theirs_label,
-                base_label,
-                style: sley_diff_merge::ConflictStyle::Merge,
-                favor: sley_diff_merge::MergeFavor::None,
-                ws_ignore: sley_diff_merge::WsIgnore::EMPTY,
-                marker_size: DEFAULT_MARKER_SIZE,
+) -> sley_diff_merge::MergeFileOutcome {
+    sley_diff_merge::merge_file(
+        base,
+        ours,
+        theirs,
+        &sley_diff_merge::MergeFileOptions {
+            ours_label,
+            base_label,
+            theirs_label,
+            style: match options.style {
+                MergeStyle::Merge => sley_diff_merge::ConflictStyle::Merge,
+                MergeStyle::Diff3 => sley_diff_merge::ConflictStyle::Diff3,
+                MergeStyle::Zdiff3 => sley_diff_merge::ConflictStyle::ZDiff3,
             },
-        )
-        .content
-    } else {
-        render_regions(&regions, options, ours_label, base_label, theirs_label)
-    };
-
-    MergeOutcome { content, conflicts }
-}
-
-/// One span of the merged output: either text shared by all three inputs (or
-/// changed on only one side / changed identically) or a true conflict carrying
-/// each side's lines.
-enum Region<'a> {
-    Stable(Vec<sley_diff_merge::DiffLine<'a>>),
-    Conflict {
-        ours: Vec<sley_diff_merge::DiffLine<'a>>,
-        base: Vec<sley_diff_merge::DiffLine<'a>>,
-        theirs: Vec<sley_diff_merge::DiffLine<'a>>,
-    },
-}
-
-/// Walk base/ours/theirs in lockstep and classify each span, mirroring
-/// `sley_diff_merge::merge_blobs`' own algorithm so conflict counting and region
-/// boundaries match it exactly. Reuses `split_lines` + `myers_diff_lines`, the
-/// same primitives `merge_blobs` is built on.
-fn build_regions<'a>(base: &'a [u8], ours: &'a [u8], theirs: &'a [u8]) -> Vec<Region<'a>> {
-    let base_lines = sley_diff_merge::split_lines(base);
-    let ours_lines = sley_diff_merge::split_lines(ours);
-    let theirs_lines = sley_diff_merge::split_lines(theirs);
-
-    let ours_matches = matching_regions(&base_lines, &ours_lines);
-    let theirs_matches = matching_regions(&base_lines, &theirs_lines);
-    let stable = common_stable_segments(&ours_matches, &theirs_matches);
-
-    let mut regions = Vec::new();
-    let mut base_idx = 0usize;
-    let mut our_idx = 0usize;
-    let mut their_idx = 0usize;
-
-    for seg in &stable {
-        classify_changed_region(
-            &mut regions,
-            &base_lines[base_idx..seg.base_start],
-            &ours_lines[our_idx..seg.ours_start],
-            &theirs_lines[their_idx..seg.theirs_start],
-        );
-        push_stable(
-            &mut regions,
-            &base_lines[seg.base_start..seg.base_start + seg.len],
-        );
-        base_idx = seg.base_start + seg.len;
-        our_idx = seg.ours_start + seg.len;
-        their_idx = seg.theirs_start + seg.len;
-    }
-
-    classify_changed_region(
-        &mut regions,
-        &base_lines[base_idx..],
-        &ours_lines[our_idx..],
-        &theirs_lines[their_idx..],
-    );
-
-    regions
-}
-
-/// Append `lines` to the trailing `Stable` region, creating one if needed, so
-/// consecutive stable spans coalesce (matching merge_blobs' single output
-/// stream).
-fn push_stable<'a>(regions: &mut Vec<Region<'a>>, lines: &[sley_diff_merge::DiffLine<'a>]) {
-    if lines.is_empty() {
-        return;
-    }
-    if let Some(Region::Stable(existing)) = regions.last_mut() {
-        existing.extend_from_slice(lines);
-    } else {
-        regions.push(Region::Stable(lines.to_vec()));
-    }
-}
-
-/// Resolve one changed span (the gap between two stable segments) using the same
-/// diff3 rules as `merge_blobs::emit_region`.
-fn classify_changed_region<'a>(
-    regions: &mut Vec<Region<'a>>,
-    base_region: &[sley_diff_merge::DiffLine<'a>],
-    our_region: &[sley_diff_merge::DiffLine<'a>],
-    their_region: &[sley_diff_merge::DiffLine<'a>],
-) {
-    if our_region.is_empty() && their_region.is_empty() {
-        return;
-    }
-    let our_changed = our_region != base_region;
-    let their_changed = their_region != base_region;
-    match (our_changed, their_changed) {
-        (false, false) => push_stable(regions, base_region),
-        (true, false) => push_stable(regions, our_region),
-        (false, true) => push_stable(regions, their_region),
-        (true, true) => {
-            if our_region == their_region {
-                push_stable(regions, our_region);
-            } else {
-                regions.push(Region::Conflict {
-                    ours: our_region.to_vec(),
-                    base: base_region.to_vec(),
-                    theirs: their_region.to_vec(),
-                });
-            }
-        }
-    }
-}
-
-/// A matched (equal) region between base and one side.
-#[derive(Debug, Clone, Copy)]
-struct MatchRegion {
-    base_start: usize,
-    side_start: usize,
-    len: usize,
-}
-
-/// A run of base lines unchanged on both sides, with the aligned side starts.
-#[derive(Debug, Clone, Copy)]
-struct StableSegment {
-    base_start: usize,
-    ours_start: usize,
-    theirs_start: usize,
-    len: usize,
-}
-
-fn matching_regions(
-    base: &[sley_diff_merge::DiffLine<'_>],
-    side: &[sley_diff_merge::DiffLine<'_>],
-) -> Vec<MatchRegion> {
-    let ops = sley_diff_merge::myers_diff_lines(base, side);
-    let mut regions = Vec::new();
-    let mut base_idx = 0usize;
-    let mut side_idx = 0usize;
-    for op in ops {
-        match op {
-            sley_diff_merge::DiffOp::Equal(n) => {
-                regions.push(MatchRegion {
-                    base_start: base_idx,
-                    side_start: side_idx,
-                    len: n,
-                });
-                base_idx += n;
-                side_idx += n;
-            }
-            sley_diff_merge::DiffOp::Delete(n) => base_idx += n,
-            sley_diff_merge::DiffOp::Insert(n) => side_idx += n,
-        }
-    }
-    regions
-}
-
-fn common_stable_segments(ours: &[MatchRegion], theirs: &[MatchRegion]) -> Vec<StableSegment> {
-    let mut segments = Vec::new();
-    let mut oi = 0usize;
-    let mut ti = 0usize;
-    while oi < ours.len() && ti < theirs.len() {
-        let o = ours[oi];
-        let t = theirs[ti];
-        let o_end = o.base_start + o.len;
-        let t_end = t.base_start + t.len;
-        let lo = o.base_start.max(t.base_start);
-        let hi = o_end.min(t_end);
-        if lo < hi {
-            segments.push(StableSegment {
-                base_start: lo,
-                ours_start: o.side_start + (lo - o.base_start),
-                theirs_start: t.side_start + (lo - t.base_start),
-                len: hi - lo,
-            });
-        }
-        if o_end <= t_end {
-            oi += 1;
-        } else {
-            ti += 1;
-        }
-    }
-    segments
-}
-
-/// Render the region list into the final blob, applying style/favoring/marker
-/// size. The byte-level conflict-marker conventions match `merge_blobs`: markers
-/// always begin on a fresh line, labels are omitted when empty, and a side's raw
-/// bytes are preserved verbatim.
-fn render_regions(
-    regions: &[Region<'_>],
-    options: &MergeFileOptions,
-    ours_label: &str,
-    base_label: &str,
-    theirs_label: &str,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    for region in regions {
-        match region {
-            Region::Stable(lines) => emit_lines(&mut out, lines),
-            Region::Conflict { ours, base, theirs } => match options.favor {
-                Favor::Ours => emit_lines(&mut out, ours),
-                Favor::Theirs => emit_lines(&mut out, theirs),
-                Favor::Union => {
-                    emit_lines(&mut out, ours);
-                    emit_lines(&mut out, theirs);
-                }
-                Favor::None => emit_conflict(
-                    &mut out,
-                    ConflictLines { ours, base, theirs },
-                    ConflictMarkers {
-                        style: options.style,
-                        marker_size: options.marker_size,
-                        ours_label,
-                        base_label,
-                        theirs_label,
-                    },
-                ),
+            favor: match options.favor {
+                Favor::None => sley_diff_merge::MergeFavor::None,
+                Favor::Ours => sley_diff_merge::MergeFavor::Ours,
+                Favor::Theirs => sley_diff_merge::MergeFavor::Theirs,
+                Favor::Union => sley_diff_merge::MergeFavor::Union,
             },
-        }
-    }
-    out
-}
-
-fn emit_lines(out: &mut Vec<u8>, lines: &[sley_diff_merge::DiffLine<'_>]) {
-    for line in lines {
-        out.extend_from_slice(line.content);
-    }
-}
-
-/// Count the lines shared, in order, at the start of `a` and `b` (used by zdiff3
-/// to hoist common context out of a conflict).
-fn common_prefix_len(
-    a: &[sley_diff_merge::DiffLine<'_>],
-    b: &[sley_diff_merge::DiffLine<'_>],
-) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
-}
-
-/// Count the lines shared, in order, at the end of `a` and `b`, never exceeding
-/// what remains after an already-counted prefix of length `reserve` on either
-/// side.
-fn common_suffix_len(
-    a: &[sley_diff_merge::DiffLine<'_>],
-    b: &[sley_diff_merge::DiffLine<'_>],
-    reserve: usize,
-) -> usize {
-    let max = a.len().min(b.len()).saturating_sub(reserve);
-    let mut count = 0usize;
-    while count < max && a[a.len() - 1 - count] == b[b.len() - 1 - count] {
-        count += 1;
-    }
-    count
-}
-
-struct ConflictLines<'a, 'line> {
-    ours: &'a [sley_diff_merge::DiffLine<'line>],
-    base: &'a [sley_diff_merge::DiffLine<'line>],
-    theirs: &'a [sley_diff_merge::DiffLine<'line>],
-}
-
-struct ConflictMarkers<'a> {
-    style: MergeStyle,
-    marker_size: usize,
-    ours_label: &'a str,
-    base_label: &'a str,
-    theirs_label: &'a str,
-}
-
-fn emit_conflict(out: &mut Vec<u8>, lines: ConflictLines<'_, '_>, markers: ConflictMarkers<'_>) {
-    let ConflictLines { ours, base, theirs } = lines;
-    let ConflictMarkers {
-        style,
-        marker_size,
-        ours_label,
-        base_label,
-        theirs_label,
-    } = markers;
-
-    // zdiff3 hoists shared leading/trailing context out of the conflict.
-    let (prefix, suffix) = if style == MergeStyle::Zdiff3 {
-        let prefix = common_prefix_len(ours, theirs);
-        let suffix = common_suffix_len(ours, theirs, prefix);
-        (prefix, suffix)
-    } else {
-        (0, 0)
-    };
-
-    if prefix > 0 {
-        emit_lines(out, &ours[..prefix]);
-    }
-    let ours_inner = &ours[prefix..ours.len() - suffix];
-    let theirs_inner = &theirs[prefix..theirs.len() - suffix];
-
-    write_marker(out, b'<', marker_size, ours_label);
-    emit_lines(out, ours_inner);
-    if style == MergeStyle::Diff3 || style == MergeStyle::Zdiff3 {
-        ensure_newline(out);
-        write_marker(out, b'|', marker_size, base_label);
-        emit_lines(out, base);
-    }
-    ensure_newline(out);
-    write_divider(out, marker_size);
-    emit_lines(out, theirs_inner);
-    ensure_newline(out);
-    write_marker(out, b'>', marker_size, theirs_label);
-
-    if suffix > 0 {
-        emit_lines(out, &ours[ours.len() - suffix..]);
-    }
-}
-
-/// Ensure the buffer ends with a newline before the next marker, so markers
-/// always start a fresh line even after a no-newline-at-eof side.
-fn ensure_newline(out: &mut Vec<u8>) {
-    if !out.is_empty() && out.last() != Some(&b'\n') {
-        out.push(b'\n');
-    }
-}
-
-/// Write a marker line: `marker_size` copies of `ch`, then (if the label is
-/// non-empty) a space and the label, then a newline.
-fn write_marker(out: &mut Vec<u8>, ch: u8, marker_size: usize, label: &str) {
-    for _ in 0..marker_size {
-        out.push(ch);
-    }
-    if !label.is_empty() {
-        out.push(b' ');
-        out.extend_from_slice(label.as_bytes());
-    }
-    out.push(b'\n');
-}
-
-fn write_divider(out: &mut Vec<u8>, marker_size: usize) {
-    for _ in 0..marker_size {
-        out.push(b'=');
-    }
-    out.push(b'\n');
+            marker_size: options.marker_size,
+            algorithm: options.diff_algorithm,
+        },
+    )
 }
 
 /// Deliver the merged blob: to stdout with `-p`, to a freshly written object
 /// (printing its id) in `--object-id` mode, or back into the current file.
-fn emit_result(options: &MergeFileOptions, inputs: &MergeInputs, content: &[u8]) -> Result<()> {
+fn emit_result(
+    cli_session: &crate::session::CliSession,
+    options: &MergeFileOptions,
+    inputs: &MergeInputs,
+    content: &[u8],
+) -> Result<()> {
     if options.to_stdout {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
@@ -864,9 +577,10 @@ fn emit_result(options: &MergeFileOptions, inputs: &MergeInputs, content: &[u8])
         return Ok(());
     }
     if options.object_id {
-        let git_dir = crate::session::cli_git_dir()?;
-        let format = repository_object_format(&git_dir)?;
-        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let git_dir = cli_session.git_dir()?;
+        let common_git_dir = cli_session.common_git_dir(&git_dir)?;
+        let format = repository_object_format(&common_git_dir)?;
+        let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
         let oid = db.write_object(EncodedObject::new(ObjectType::Blob, content.to_vec()))?;
         println!("{oid}");
         return Ok(());
@@ -887,14 +601,21 @@ mod tests {
             quiet: false,
             object_id: false,
             style: MergeStyle::Merge,
+            style_explicit: false,
             favor: Favor::None,
+            diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
             marker_size: DEFAULT_MARKER_SIZE,
             labels: Vec::new(),
             operands: operands.iter().map(|s| (*s).to_string()).collect(),
         }
     }
 
-    fn merge(base: &[u8], ours: &[u8], theirs: &[u8], options: &MergeFileOptions) -> MergeOutcome {
+    fn merge(
+        base: &[u8],
+        ours: &[u8],
+        theirs: &[u8],
+        options: &MergeFileOptions,
+    ) -> sley_diff_merge::MergeFileOutcome {
         merge_three_way(base, ours, theirs, options, "a", "o", "b")
     }
 

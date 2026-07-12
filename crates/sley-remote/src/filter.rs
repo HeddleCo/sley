@@ -19,9 +19,9 @@ pub fn pack_filter_from_spec(spec: &str) -> Option<PackObjectFilter> {
         return Some(PackObjectFilter::BlobNone);
     }
     if let Some(depth) = spec.strip_prefix("tree:") {
-        return parse_rev_list_tree_depth(depth).ok().map(|depth| {
-            PackObjectFilter::TreeDepth(depth.min(u32::MAX as usize) as u32)
-        });
+        return parse_rev_list_tree_depth(depth)
+            .ok()
+            .map(|depth| PackObjectFilter::TreeDepth(depth.min(u32::MAX as usize) as u32));
     }
     spec.strip_prefix("blob:limit=")
         .and_then(git_parse_blob_limit)
@@ -78,7 +78,10 @@ fn sparse_filter_from_remote(
     Ok(PackObjectFilter::SparsePathSet(paths))
 }
 
-fn combine_pack_filters(left: PackObjectFilter, right: PackObjectFilter) -> PackObjectFilter {
+pub(crate) fn combine_pack_filters(
+    left: PackObjectFilter,
+    right: PackObjectFilter,
+) -> PackObjectFilter {
     match (left, right) {
         (PackObjectFilter::TreeDepth(a), PackObjectFilter::TreeDepth(b)) => {
             PackObjectFilter::TreeDepth(a.min(b))

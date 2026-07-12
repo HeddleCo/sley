@@ -1,6 +1,6 @@
 //! `git credential-cache` client.
 
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -11,7 +11,10 @@ use sley_core::{GitError, Result};
 
 use super::unix_socket::unix_stream_connect;
 
-use super::{credential_announce_capabilities, credential_set_all_capabilities, CredentialOpType, GitCredential};
+use super::{
+    CredentialOpType, GitCredential, credential_announce_capabilities,
+    credential_set_all_capabilities,
+};
 
 const FLAG_SPAWN: u8 = 0x1;
 const FLAG_RELAY: u8 = 0x2;
@@ -39,7 +42,9 @@ fn cmd_credential_cache_unix(args: &[String]) -> Result<()> {
         if arg == "--timeout" {
             idx += 1;
             let Some(value) = args.get(idx) else {
-                return Err(GitError::Command("credential-cache --timeout requires a value".into()));
+                return Err(GitError::Command(
+                    "credential-cache --timeout requires a value".into(),
+                ));
             };
             timeout = value
                 .parse()
@@ -51,7 +56,9 @@ fn cmd_credential_cache_unix(args: &[String]) -> Result<()> {
         } else if arg == "--socket" {
             idx += 1;
             let Some(value) = args.get(idx) else {
-                return Err(GitError::Command("credential-cache --socket requires a value".into()));
+                return Err(GitError::Command(
+                    "credential-cache --socket requires a value".into(),
+                ));
             };
             socket_path = Some(PathBuf::from(value));
         } else if let Some(value) = arg.strip_prefix("--socket=") {
@@ -97,10 +104,10 @@ fn announce_capabilities() -> Result<()> {
 
 #[cfg(unix)]
 fn default_socket_path() -> PathBuf {
-    if let Some(old) = home_dir().map(|home| home.join(".git-credential-cache")) {
-        if old.is_dir() {
-            return old.join("socket");
-        }
+    if let Some(old) = home_dir().map(|home| home.join(".git-credential-cache"))
+        && old.is_dir()
+    {
+        return old.join("socket");
     }
     xdg_cache_socket_path()
 }
@@ -129,7 +136,7 @@ fn xdg_cache_socket_path() -> PathBuf {
 }
 
 #[cfg(unix)]
-fn do_cache(socket: &PathBuf, action: &str, timeout: i32, flags: u8) -> Result<()> {
+fn do_cache(socket: &Path, action: &str, timeout: i32, flags: u8) -> Result<()> {
     let mut buf = format!("action={action}\ntimeout={timeout}\n");
     if flags & FLAG_RELAY != 0 {
         let mut relay = Vec::new();
@@ -224,37 +231,29 @@ fn spawn_daemon(socket: &Path) -> Result<()> {
     let mut child = command
         .spawn()
         .map_err(|err| GitError::Io(err.to_string()))?;
-    let mut stdout = child.stdout.take().expect("piped");
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitError::Io("cache daemon stdout was not piped".into()))?;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut buf = [0_u8; 128];
-        let n = stdout.read(&mut buf).unwrap_or(0);
-        let _ = tx.send(buf[..n].to_vec());
+        let mut line = Vec::new();
+        let _ = io::BufReader::new(&mut stdout).read_until(b'\n', &mut line);
+        let _ = tx.send(line);
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut acc = Vec::new();
-    loop {
-        match rx.try_recv() {
-            Ok(chunk) => acc.extend_from_slice(&chunk),
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => break,
-        }
-        if daemon_started(&acc) {
-            return Ok(());
-        }
-        if !acc.is_empty() {
-            return Err(GitError::Command(format!(
-                "cache daemon did not start: {}",
-                String::from_utf8_lossy(&acc)
-            )));
-        }
-        if let Ok(Some(_)) = child.try_wait() {
+    let line = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(line) => line,
+        Err(_) => {
+            let _ = child.try_wait();
             return Err(GitError::Command("cache daemon did not start: ".into()));
         }
-        if Instant::now() >= deadline {
-            return Err(GitError::Command("cache daemon did not start: ".into()));
-        }
-        thread::sleep(Duration::from_millis(25));
+    };
+    if daemon_started(&line) {
+        Ok(())
+    } else {
+        Err(GitError::Command(format!(
+            "cache daemon did not start: {}",
+            String::from_utf8_lossy(&line)
+        )))
     }
-    Err(GitError::Command("cache daemon did not start: ".into()))
 }

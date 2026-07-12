@@ -430,6 +430,65 @@ fn update_index_add_symlink_matches_upstream_git() {
     }
 }
 
+/// On a filesystem configured with `core.symlinks=false`, Git represents a
+/// checked-out symlink as a regular file but keeps the authoritative 120000
+/// type in the index when the path is updated.  The worktree's lstat type must
+/// not silently convert the tracked entry into a regular file.
+#[test]
+fn update_index_preserves_symlink_mode_when_core_symlinks_is_false() {
+    let root = unique_temp_dir("update-index-core-symlinks-false");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo dir");
+    fs::create_dir_all(&actual).expect("create actual repo dir");
+
+    for repo in [&expected, &actual] {
+        run_success(
+            sley_testkit::oracle_git(),
+            repo,
+            &["init", "-q", "-b", "main"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            repo,
+            &["config", "core.symlinks", "false"],
+        );
+        let oid = String::from_utf8(
+            run_with_stdin(
+                sley_testkit::oracle_git(),
+                repo,
+                &["hash-object", "-w", "--stdin"],
+                b"old-target",
+            )
+            .stdout,
+        )
+        .expect("object id utf8");
+        let record = format!("120000 {}\tlink\n", oid.trim());
+        let indexed = run_with_stdin(
+            sley_testkit::oracle_git(),
+            repo,
+            &["update-index", "--index-info"],
+            record.as_bytes(),
+        );
+        assert!(indexed.status.success());
+        fs::write(repo.join("link"), b"new-target").expect("write emulated symlink");
+    }
+
+    let args = ["update-index", "link"];
+    let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
+    let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
+    assert_same_output(actual_output, expected_output, &args);
+    assert_index_matches(&expected, &actual, &args);
+    let stage = run_success(
+        sley_testkit::oracle_git(),
+        &actual,
+        &["ls-files", "--stage", "link"],
+    );
+    assert!(stage.starts_with(b"120000 "), "stage output: {stage:?}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn update_index_no_input_compat_flags_match_upstream_git() {
     let root = unique_temp_dir("update-index-no-input-compat");
@@ -943,6 +1002,69 @@ fn update_index_refresh_matches_upstream_git() {
             assert_ls_files_verbose_matches(&expected, &actual, &format!("{args:?}"));
         }
     };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn update_index_refresh_symlink_matches_upstream_git() {
+    use std::os::unix::fs::symlink;
+
+    let root = unique_temp_dir("update-index-refresh-symlink");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo dir");
+    fs::create_dir_all(&actual).expect("create actual repo dir");
+    for repo in [&expected, &actual] {
+        run_success(
+            sley_testkit::oracle_git(),
+            repo,
+            &["init", "-q", "-b", "main"],
+        );
+        fs::write(repo.join("target"), b"worktree target").expect("write symlink target");
+        symlink("target", repo.join("link")).expect("create symlink");
+    }
+    let mut oid = None;
+    for repo in [&expected, &actual] {
+        let written = run_with_stdin(
+            sley_testkit::oracle_git(),
+            repo,
+            &["hash-object", "-w", "--stdin"],
+            b"target",
+        );
+        assert!(written.status.success());
+        let written = String::from_utf8(written.stdout)
+            .expect("object id utf8")
+            .trim()
+            .to_owned();
+        if let Some(expected_oid) = oid.as_ref() {
+            assert_eq!(&written, expected_oid);
+        } else {
+            oid = Some(written);
+        }
+    }
+    let oid = oid.expect("object id written");
+    let record = format!("120000 {oid}\tlink\n");
+    for repo in [&expected, &actual] {
+        let indexed = run_with_stdin(
+            sley_testkit::oracle_git(),
+            repo,
+            &["update-index", "--index-info"],
+            record.as_bytes(),
+        );
+        assert!(indexed.status.success());
+    }
+
+    let args = ["update-index", "--refresh"];
+    let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
+    let actual_output = run(sley_testkit::sley_bin!(), &actual, &args);
+    assert_same_output(actual_output, expected_output, &args);
+    assert_index_matches(&expected, &actual, &args);
+    assert_eq!(
+        run_success(sley_testkit::oracle_git(), &expected, &["diff-files"]),
+        run_success(sley_testkit::oracle_git(), &actual, &["diff-files"])
+    );
+
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -1881,6 +2003,47 @@ fn update_index_cacheinfo_matches_upstream_git() {
                 assert_index_matches_for_label(&expected, &actual, label);
             }
         }
+
+        let parent = format!("100644,{blob},conflict");
+        let parent_args = ["update-index", "--add", "--cacheinfo", parent.as_str()];
+        let expected_output = run(sley_testkit::oracle_git(), &expected, &parent_args);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &parent_args);
+        assert_same_output(actual_output, expected_output, &parent_args);
+
+        let child = format!("100644,{blob},conflict/child");
+        let rejected = ["update-index", "--add", "--cacheinfo", child.as_str()];
+        let expected_output = run(sley_testkit::oracle_git(), &expected, &rejected);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &rejected);
+        assert_same_output(actual_output, expected_output, &rejected);
+        assert_index_matches_for_label(&expected, &actual, "cacheinfo-df-rejected");
+
+        let replaced = [
+            "update-index",
+            "--add",
+            "--replace",
+            "--cacheinfo",
+            child.as_str(),
+        ];
+        let expected_output = run(sley_testkit::oracle_git(), &expected, &replaced);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &replaced);
+        assert_same_output(actual_output, expected_output, &replaced);
+        assert_index_matches_for_label(&expected, &actual, "cacheinfo-df-replaced");
+
+        let parent_two = format!("100644,{blob},multi");
+        let child_two = format!("100644,{blob},multi/child");
+        let multiple = [
+            "update-index",
+            "--add",
+            "--replace",
+            "--cacheinfo",
+            parent_two.as_str(),
+            "--cacheinfo",
+            child_two.as_str(),
+        ];
+        let expected_output = run(sley_testkit::oracle_git(), &expected, &multiple);
+        let actual_output = run(sley_testkit::sley_bin!(), &actual, &multiple);
+        assert_same_output(actual_output, expected_output, &multiple);
+        assert_index_matches_for_label(&expected, &actual, "cacheinfo-multiple-df-replaced");
     };
     let _ = fs::remove_dir_all(&root);
 }
@@ -1949,6 +2112,24 @@ fn update_index_index_info_matches_upstream_git() {
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches_for_label(&expected, &actual, label);
         }
+
+        let nul_terminated =
+            format!("100644 {one}\tpath with\nnewline\0100644 {two}\tpath with space\0");
+        let args = ["update-index", "-z", "--index-info"];
+        let expected_output = run_with_stdin(
+            sley_testkit::oracle_git(),
+            &expected,
+            &args,
+            nul_terminated.as_bytes(),
+        );
+        let actual_output = run_with_stdin(
+            sley_testkit::sley_bin!(),
+            &actual,
+            &args,
+            nul_terminated.as_bytes(),
+        );
+        assert_same_output(actual_output, expected_output, &args);
+        assert_index_matches_for_label(&expected, &actual, "nul-terminated-raw-paths");
 
         let args = ["update-index", "--index-info", "extra"];
         let expected_output = run_with_stdin(sley_testkit::oracle_git(), &expected, &args, b"");

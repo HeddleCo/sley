@@ -6,7 +6,7 @@ use crate::commands::cli_options::{
     cli_usage_error, count_force_occurrences, last_tri_state_bool, opt_bool, opt_str, option_str,
 };
 use crate::*;
-use sley_options::{OptFlags, OptionName, parse_options, ParsedValue};
+use sley_options::{OptFlags, OptionName, ParsedValue, parse_options};
 
 pub(super) fn setup_worktree_list_options(args: &[String]) -> Result<WorktreeListOptions> {
     let parsed = parse_options(args, worktree_list_option_specs(), &WORKTREE_LIST_USAGE)
@@ -16,7 +16,10 @@ pub(super) fn setup_worktree_list_options(args: &[String]) -> Result<WorktreeLis
     }
     let porcelain = parsed.last_bool("porcelain", false);
     let verbose = parsed.last_bool("verbose", false);
-    let z = parsed.options.iter().any(|option| option.short == Some('z'));
+    let z = parsed
+        .options
+        .iter()
+        .any(|option| option.short == Some('z'));
     let mut expire = true;
     for option in &parsed.options {
         if option.long == Some("expire") {
@@ -252,7 +255,12 @@ const WORKTREE_ADD_USAGE: &[&str] = &[
 
 fn worktree_list_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
     static SPECS: &[sley_options::OptionSpec<'static>] = &[
-        opt_bool(None, Some("porcelain"), OptFlags::NONE, "machine-readable output"),
+        opt_bool(
+            None,
+            Some("porcelain"),
+            OptFlags::NONE,
+            "machine-readable output",
+        ),
         opt_bool(
             Some('v'),
             Some("verbose"),
@@ -266,15 +274,30 @@ fn worktree_list_option_specs() -> &'static [sley_options::OptionSpec<'static>] 
             OptFlags::NONE,
             "add 'prunable' annotation to missing worktrees older than <time>",
         ),
-        opt_bool(Some('z'), None, OptFlags::NONEG, "terminate records with a NUL character"),
+        opt_bool(
+            Some('z'),
+            None,
+            OptFlags::NONEG,
+            "terminate records with a NUL character",
+        ),
     ];
     SPECS
 }
 
 fn worktree_prune_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
     static SPECS: &[sley_options::OptionSpec<'static>] = &[
-        opt_bool(Some('n'), Some("dry-run"), OptFlags::NONE, "do not remove, show only"),
-        opt_bool(Some('v'), Some("verbose"), OptFlags::NONE, "report pruned working trees"),
+        opt_bool(
+            Some('n'),
+            Some("dry-run"),
+            OptFlags::NONE,
+            "do not remove, show only",
+        ),
+        opt_bool(
+            Some('v'),
+            Some("verbose"),
+            OptFlags::NONE,
+            "report pruned working trees",
+        ),
         opt_str(
             None,
             Some("expire"),
@@ -343,14 +366,52 @@ fn worktree_add_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
             OptFlags::NONE,
             "checkout <branch> even if already checked out in other worktree",
         ),
-        opt_str(Some('b'), None, "<branch>", OptFlags::NONE, "create a new branch"),
-        opt_str(Some('B'), None, "<branch>", OptFlags::NONE, "create or reset a branch"),
+        opt_str(
+            Some('b'),
+            None,
+            "<branch>",
+            OptFlags::NONE,
+            "create a new branch",
+        ),
+        opt_str(
+            Some('B'),
+            None,
+            "<branch>",
+            OptFlags::NONE,
+            "create or reset a branch",
+        ),
         opt_bool(None, Some("orphan"), OptFlags::NONE, "create unborn branch"),
-        opt_bool(Some('d'), Some("detach"), OptFlags::NONE, "detach HEAD at named commit"),
-        opt_bool(None, Some("checkout"), OptFlags::NONE, "populate the new working tree"),
-        opt_bool(None, Some("lock"), OptFlags::NONE, "keep the new working tree locked"),
-        opt_str(None, Some("reason"), "<string>", OptFlags::NONE, "reason for locking"),
-        opt_bool(Some('q'), Some("quiet"), OptFlags::NONE, "suppress progress reporting"),
+        opt_bool(
+            Some('d'),
+            Some("detach"),
+            OptFlags::NONE,
+            "detach HEAD at named commit",
+        ),
+        opt_bool(
+            None,
+            Some("checkout"),
+            OptFlags::NONE,
+            "populate the new working tree",
+        ),
+        opt_bool(
+            None,
+            Some("lock"),
+            OptFlags::NONE,
+            "keep the new working tree locked",
+        ),
+        opt_str(
+            None,
+            Some("reason"),
+            "<string>",
+            OptFlags::NONE,
+            "reason for locking",
+        ),
+        opt_bool(
+            Some('q'),
+            Some("quiet"),
+            OptFlags::NONE,
+            "suppress progress reporting",
+        ),
         opt_bool(
             None,
             Some("track"),

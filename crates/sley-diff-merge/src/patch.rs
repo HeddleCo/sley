@@ -1,7 +1,6 @@
 //! Unified diff patch parsing and application.
 
-use sley_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result};
-use std::path::{Path, PathBuf};
+use sley_core::{GitError, Result};
 
 use crate::{name, ws};
 

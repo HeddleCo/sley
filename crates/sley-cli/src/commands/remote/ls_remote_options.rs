@@ -3,7 +3,7 @@
 use super::{LsRemoteOptions, LsRemoteSort};
 use crate::commands::cli_options::{last_tri_state_bool, opt_bool, opt_str, option_str};
 use crate::*;
-use sley_options::{parse_options, OptionName, OptionSpec, ParsedValue};
+use sley_options::{OptionName, OptionSpec, ParsedValue, parse_options};
 
 const LS_REMOTE_USAGE: &[&str] = &[
     "git ls-remote [--branches] [--tags] [--refs] [--upload-pack=<exec>]",
@@ -13,18 +13,81 @@ const LS_REMOTE_USAGE: &[&str] = &[
 
 fn ls_remote_option_specs() -> &'static [OptionSpec<'static>] {
     static SPECS: &[OptionSpec<'static>] = &[
-        opt_bool(Some('q'), Some("quiet"), sley_options::OptFlags::NONE, "do not print remote URL"),
-        opt_bool(Some('t'), Some("tags"), sley_options::OptFlags::NONE, "limit to tags"),
-        opt_bool(Some('b'), Some("branches"), sley_options::OptFlags::NONE, "limit to branches"),
-        opt_bool(Some('h'), None, sley_options::OptFlags::NONE, "limit to branches"),
-        opt_bool(None, Some("heads"), sley_options::OptFlags::NONE, "limit to branches"),
-        opt_bool(None, Some("refs"), sley_options::OptFlags::NONE, "do not show peeled tags"),
-        opt_bool(None, Some("symref"), sley_options::OptFlags::NONE, "show underlying ref"),
-        opt_bool(None, Some("exit-code"), sley_options::OptFlags::NONE, "exit with code 2 if no refs"),
-        opt_bool(None, Some("get-url"), sley_options::OptFlags::NONE, "take url.<base>.insteadOf into account"),
-        opt_str(None, Some("upload-pack"), "exec", sley_options::OptFlags::NONE, "path of git-upload-pack"),
-        opt_str(Some('o'), Some("server-option"), "server-specific", sley_options::OptFlags::NONE, "option to transmit"),
-        opt_str(None, Some("sort"), "key", sley_options::OptFlags::NONE, "field name to sort on"),
+        opt_bool(
+            Some('q'),
+            Some("quiet"),
+            sley_options::OptFlags::NONE,
+            "do not print remote URL",
+        ),
+        opt_bool(
+            Some('t'),
+            Some("tags"),
+            sley_options::OptFlags::NONE,
+            "limit to tags",
+        ),
+        opt_bool(
+            Some('b'),
+            Some("branches"),
+            sley_options::OptFlags::NONE,
+            "limit to branches",
+        ),
+        opt_bool(
+            Some('h'),
+            None,
+            sley_options::OptFlags::NONE,
+            "limit to branches",
+        ),
+        opt_bool(
+            None,
+            Some("heads"),
+            sley_options::OptFlags::NONE,
+            "limit to branches",
+        ),
+        opt_bool(
+            None,
+            Some("refs"),
+            sley_options::OptFlags::NONE,
+            "do not show peeled tags",
+        ),
+        opt_bool(
+            None,
+            Some("symref"),
+            sley_options::OptFlags::NONE,
+            "show underlying ref",
+        ),
+        opt_bool(
+            None,
+            Some("exit-code"),
+            sley_options::OptFlags::NONE,
+            "exit with code 2 if no refs",
+        ),
+        opt_bool(
+            None,
+            Some("get-url"),
+            sley_options::OptFlags::NONE,
+            "take url.<base>.insteadOf into account",
+        ),
+        opt_str(
+            None,
+            Some("upload-pack"),
+            "exec",
+            sley_options::OptFlags::NONE,
+            "path of git-upload-pack",
+        ),
+        opt_str(
+            Some('o'),
+            Some("server-option"),
+            "server-specific",
+            sley_options::OptFlags::NONE,
+            "option to transmit",
+        ),
+        opt_str(
+            None,
+            Some("sort"),
+            "key",
+            sley_options::OptFlags::NONE,
+            "field name to sort on",
+        ),
     ];
     SPECS
 }
@@ -47,10 +110,7 @@ pub(super) fn setup_ls_remote_options(args: &[String]) -> Result<LsRemoteOptions
         .filter(|option| {
             matches!(
                 (option.short, option.long),
-                (Some('b'), _)
-                    | (Some('h'), _)
-                    | (_, Some("branches"))
-                    | (_, Some("heads"))
+                (Some('b'), _) | (Some('h'), _) | (_, Some("branches")) | (_, Some("heads"))
             )
         })
         .filter_map(|option| match option.value {
@@ -79,7 +139,9 @@ pub(super) fn setup_ls_remote_options(args: &[String]) -> Result<LsRemoteOptions
             continue;
         }
         match (option.short, option.long) {
-            (_, Some("upload-pack")) if !matches!(option.name, OptionName::NegatedLong("upload-pack")) => {
+            (_, Some("upload-pack"))
+                if !matches!(option.name, OptionName::NegatedLong("upload-pack")) =>
+            {
                 if let Some(value) = option_str(option) {
                     options.upload_pack_command = Some(value.to_string());
                 }

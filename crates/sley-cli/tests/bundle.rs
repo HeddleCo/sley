@@ -2644,16 +2644,15 @@ fn fetch_sha256_file_url_imports_objects_like_upstream_git() {
         let actual = run(sley_testkit::sley_bin!(), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         let actual_git_dir = actual_repo.join(".git");
-        let (_pack_path, index_path) = repository_pack_pair(&actual_git_dir);
-        let index_arg = index_path.to_string_lossy();
-        run_success(
-            sley_testkit::oracle_git(),
-            &actual_repo,
-            &["verify-pack", "-v", &index_arg],
+        let expected_git_dir = expected_repo.join(".git");
+        assert_eq!(
+            repository_pack_indexes(&actual_git_dir).len(),
+            repository_pack_indexes(&expected_git_dir).len(),
+            "small SHA-256 fetch should match Git's unpackLimit storage policy"
         );
         assert!(
-            !loose_object_path(&actual_git_dir, &head).exists(),
-            "fetched commit should be stored in pack, not as loose object"
+            loose_object_path(&actual_git_dir, &head).exists(),
+            "small fetched commit should be unpacked as a loose object"
         );
         let expected_ref = run_success(
             sley_testkit::oracle_git(),
@@ -2703,7 +2702,14 @@ fn fetch_local_repository_protocol_pack_excludes_existing_haves() {
         run_success(
             sley_testkit::sley_bin!(),
             &actual_repo,
-            &["fetch", "-q", source_arg, &refspec],
+            &[
+                "-c",
+                "fetch.unpackLimit=0",
+                "fetch",
+                "-q",
+                source_arg,
+                &refspec,
+            ],
         );
         let actual_git_dir = actual_repo.join(".git");
         let before_indexes = repository_pack_indexes(&actual_git_dir)
@@ -2737,7 +2743,14 @@ fn fetch_local_repository_protocol_pack_excludes_existing_haves() {
         run_success(
             sley_testkit::sley_bin!(),
             &actual_repo,
-            &["fetch", "-q", source_arg, &refspec],
+            &[
+                "-c",
+                "fetch.unpackLimit=0",
+                "fetch",
+                "-q",
+                source_arg,
+                &refspec,
+            ],
         );
 
         let after_indexes = repository_pack_indexes(&actual_git_dir);

@@ -4,7 +4,34 @@
 use crate::*;
 use sley::plumbing::{sley_diff_merge, sley_index, sley_worktree};
 
-pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
+struct AddContext {
+    cwd: PathBuf,
+    git_dir: PathBuf,
+    worktree_root: PathBuf,
+    format: ObjectFormat,
+    config: GitConfig,
+}
+
+impl AddContext {
+    fn open(cli_session: &crate::session::CliSession) -> Result<Self> {
+        let repository = cli_session.open_repository()?;
+        let git_dir = repository.git_dir().to_path_buf();
+        let worktree_root = repository
+            .workdir()
+            .ok_or_else(|| GitError::Unsupported("add requires a repository worktree".into()))?;
+        let format = repository.object_format();
+        let config = read_repo_config(&git_dir)?;
+        Ok(Self {
+            cwd: cli_session.cwd().to_path_buf(),
+            git_dir,
+            worktree_root,
+            format,
+            config,
+        })
+    }
+}
+
+pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     // `add -i` / `add --interactive` and `add -p` / `add --patch` route to the
     // interactive engine. git treats `--patch` as implying interactive and lets
     // a pathspec follow. We collect the non-flag pathspec args plus the diff-tuning
@@ -111,6 +138,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         }
         if patch {
             return crate::commands::add_interactive::cmd_add_patch(
+                cli_session,
                 &spec,
                 context,
                 interhunk,
@@ -118,7 +146,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             );
         }
         if interactive {
-            return crate::commands::add_interactive::cmd_add_interactive(&spec);
+            return crate::commands::add_interactive::cmd_add_interactive(cli_session, &spec);
         }
     }
     let mut paths = Vec::new();
@@ -133,6 +161,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let mut intent_to_add = false;
     let mut sparse = false;
     let mut refresh = false;
+    let mut renormalize = false;
     let mut warn_embedded_repos = true;
     let mut chmod = None;
     let mut pathspec_from_file: Option<PathBuf> = None;
@@ -173,6 +202,8 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             "--no-ignore-missing" => ignore_missing = false,
             "--refresh" => refresh = true,
             "--no-refresh" => refresh = false,
+            "--renormalize" => renormalize = true,
+            "--no-renormalize" => renormalize = false,
             "-N" | "--intent-to-add" => intent_to_add = true,
             "--no-intent-to-add" => intent_to_add = false,
             "--chmod" => {
@@ -291,18 +322,17 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         );
         return Ok(());
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let context = AddContext::open(cli_session)?;
+    let cwd = &context.cwd;
+    let git_dir = &context.git_dir;
+    let format = context.format;
+    let worktree_root = &context.worktree_root;
+    let pathspec_magic = effective_pathspec_flags(cli_session);
     let ignore_errors = ignore_errors.unwrap_or_else(|| {
-        read_repo_config(&git_dir)
-            .ok()
-            .and_then(|config| {
-                config
-                    .get_bool("add", None, "ignore-errors")
-                    .or_else(|| config.get_bool("add", None, "ignoreErrors"))
-            })
+        context
+            .config
+            .get_bool("add", None, "ignore-errors")
+            .or_else(|| context.config.get_bool("add", None, "ignoreErrors"))
             .unwrap_or(false)
     });
     // git refuses (with advice + exit 1) to update entries that the skip-worktree
@@ -317,9 +347,45 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         &paths,
         sparse,
         refresh,
+        &context.config,
     )?;
+    if renormalize {
+        let tracked_paths = resolve_add_renormalize_paths(
+            &cwd,
+            &worktree_root,
+            &git_dir,
+            format,
+            &paths,
+            pathspec_magic,
+        )?;
+        if dry_run {
+            let actions = tracked_paths
+                .into_iter()
+                .map(AddAction::Add)
+                .collect::<Vec<_>>();
+            print_add_actions(&worktree_root, &actions)?;
+            return Ok(());
+        }
+        sley_worktree::renormalize_index_paths_filtered(
+            &worktree_root,
+            &git_dir,
+            format,
+            &tracked_paths,
+            &context.config,
+        )?;
+        commands::hooks::run_post_index_change_hook(cli_session, false, false)?;
+        return Ok(());
+    }
     if refresh {
-        refresh_index_after_add(&cwd, &worktree_root, &git_dir, format, &paths, true)?;
+        refresh_index_after_add(
+            &cwd,
+            &worktree_root,
+            &git_dir,
+            format,
+            &paths,
+            true,
+            pathspec_magic,
+        )?;
         return Ok(());
     }
     if intent_to_add && !dry_run {
@@ -376,12 +442,11 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     };
     let do_refresh = !dry_run && chmod.is_none();
     if update && !all && paths.is_empty() && !dry_run && chmod.is_none() {
-        let config = read_repo_config(&git_dir)?;
         let actions = sley_worktree::add_update_all_tracked_filtered(
             &worktree_root,
             &git_dir,
             format,
-            &config,
+            &context.config,
         )?
         .into_iter()
         .map(|action| -> Result<AddAction> {
@@ -427,7 +492,6 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             .cloned()
             .collect::<Vec<_>>();
         if !action_paths.is_empty() {
-            let config = read_repo_config(&git_dir)?;
             let had_errors = update_index_paths_filtered_for_add(
                 &worktree_root,
                 &git_dir,
@@ -442,7 +506,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                     ignore_skip_worktree_entries: false,
                     allow_skip_worktree_entries: sparse,
                 },
-                &config,
+                &context.config,
                 ignore_errors,
             )?;
             if had_errors {
@@ -450,7 +514,15 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             }
         }
         if do_refresh {
-            refresh_index_after_add(&cwd, &worktree_root, &git_dir, format, &refresh_paths, false)?;
+            refresh_index_after_add(
+                &cwd,
+                &worktree_root,
+                &git_dir,
+                format,
+                &refresh_paths,
+                false,
+                pathspec_magic,
+            )?;
         }
         if verbose {
             print_add_actions(&worktree_root, &actions)?;
@@ -478,12 +550,13 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             sparse,
         },
         parsed_index,
+        pathspec_magic,
     )?;
     if dry_run {
         print_add_actions(&worktree_root, &actions)?;
         validate_add_chmod_dry_run(&worktree_root, &actions, chmod)?;
         if !ignored_paths.is_empty() {
-            print_add_ignored_paths(&git_dir, &ignored_paths);
+            print_add_ignored_paths(&context.config, &ignored_paths);
             return Err(GitError::Exit(1));
         }
         return Ok(());
@@ -517,7 +590,6 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         .cloned()
         .collect::<Vec<_>>();
     if !action_paths.is_empty() {
-        let config = read_repo_config(&git_dir)?;
         let warn_embedded = warn_embedded_repos && actions_may_add_embedded_repo(&actions);
         // Snapshot the tracked paths before staging only when the warning can
         // actually fire. Ordinary file adds never need this second index pass.
@@ -558,7 +630,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                 format,
                 &action_paths,
                 update_options,
-                &config,
+                &context.config,
                 true,
             )?
         } else if let Some(index) = reusable_index.take() {
@@ -569,7 +641,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                 index,
                 &action_paths,
                 update_options,
-                &config,
+                &context.config,
             )?;
             false
         } else {
@@ -579,13 +651,18 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                 format,
                 &action_paths,
                 update_options,
-                &config,
+                &context.config,
                 false,
             )?;
             false
         };
         if warn_embedded {
-            warn_on_embedded_repos(&git_dir, &worktree_root, &actions, &previously_tracked)?;
+            warn_on_embedded_repos(
+                &context.config,
+                &worktree_root,
+                &actions,
+                &previously_tracked,
+            )?;
         }
         if had_errors {
             if verbose {
@@ -595,16 +672,24 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         }
     }
     if do_refresh && !add_refresh_is_redundant(&worktree_root, &refresh_paths, &actions) {
-        refresh_index_after_add(&cwd, &worktree_root, &git_dir, format, &refresh_paths, false)?;
+        refresh_index_after_add(
+            &cwd,
+            &worktree_root,
+            &git_dir,
+            format,
+            &refresh_paths,
+            false,
+            pathspec_magic,
+        )?;
     }
     if verbose {
         print_add_actions(&worktree_root, &actions)?;
     }
     if !ignored_paths.is_empty() {
-        print_add_ignored_paths(&git_dir, &ignored_paths);
+        print_add_ignored_paths(&context.config, &ignored_paths);
         return Err(GitError::Exit(1));
     }
-    commands::hooks::run_post_index_change_hook(false, false)?;
+    commands::hooks::run_post_index_change_hook(cli_session, false, false)?;
     Ok(())
 }
 
@@ -803,27 +888,49 @@ fn refresh_index_after_add(
     format: ObjectFormat,
     refresh_paths: &[PathBuf],
     strict_pathspec: bool,
+    pathspec_magic: sley_worktree::PathspecMatchMagic,
 ) -> Result<()> {
     let selected = if refresh_paths.is_empty() {
         Vec::new()
     } else {
-        let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        let Some(mut index) = sley_worktree::read_repository_index(git_dir, format)? else {
             if strict_pathspec {
                 for path in refresh_paths {
-                    eprintln!("fatal: pathspec '{}' did not match any files", path.to_string_lossy());
+                    eprintln!(
+                        "fatal: pathspec '{}' did not match any files",
+                        path.to_string_lossy()
+                    );
                 }
                 return Err(GitError::Exit(128));
             }
             return Ok(());
         };
-        let mut compiled = AddCompiledPathspecs::parse(cwd, worktree_root, refresh_paths)?;
+        // Pathspec validation operates on logical tracked paths, not on the
+        // on-disk sparse-index representation.  An exact path such as
+        // `folder1/a` must therefore match the leaf hidden beneath a collapsed
+        // `folder1/` sparse-directory entry.  Expand only this temporary view;
+        // refresh_index_paths_with_options() still owns any observable index
+        // mutation and can preserve the sparse layout on disk.
+        if index
+            .entries
+            .iter()
+            .any(sley_index::IndexEntry::is_sparse_dir)
+        {
+            let odb = sley_odb::FileObjectDatabase::from_git_dir(git_dir, format);
+            sley_worktree::expand_sparse_index_view(&mut index, &odb, format)?;
+        }
+        let mut compiled =
+            AddCompiledPathspecs::parse(cwd, worktree_root, refresh_paths, pathspec_magic)?;
         let mut selected = Vec::new();
         for entry in &index.entries {
             if entry.stage() != sley_index::Stage::Normal {
                 continue;
             }
             if compiled.matches(entry.path.as_bytes()) {
-                selected.push(worktree_path_from_git_path(worktree_root, entry.path.as_bytes())?);
+                selected.push(worktree_path_from_git_path(
+                    worktree_root,
+                    entry.path.as_bytes(),
+                )?);
             }
         }
         if strict_pathspec && let Some(spec) = compiled.unmatched_includes().next() {
@@ -988,7 +1095,7 @@ fn die_on_pathspec_inside_submodule_by_scan(
 /// path) about each embedded git repository that was just added as a gitlink,
 /// and print the `advice.addEmbeddedRepo` hint once.
 fn warn_on_embedded_repos(
-    git_dir: &Path,
+    config: &GitConfig,
     worktree_root: &Path,
     actions: &[AddAction],
     previously_tracked: &BTreeSet<Vec<u8>>,
@@ -1013,9 +1120,8 @@ fn warn_on_embedded_repos(
             continue;
         }
         adviced = true;
-        let advice_enabled = read_repo_config(git_dir)
-            .ok()
-            .and_then(|config| config.get_bool("advice", None, "addembeddedrepo"))
+        let advice_enabled = config
+            .get_bool("advice", None, "addembeddedrepo")
             .unwrap_or(true);
         if !advice_enabled {
             continue;
@@ -1114,7 +1220,12 @@ struct AddCompiledPathspecs {
 }
 
 impl AddCompiledPathspecs {
-    fn parse(cwd: &Path, worktree_root: &Path, paths: &[PathBuf]) -> Result<Self> {
+    fn parse(
+        cwd: &Path,
+        worktree_root: &Path,
+        paths: &[PathBuf],
+        pathspec_magic: sley_worktree::PathspecMatchMagic,
+    ) -> Result<Self> {
         let root = fs::canonicalize(worktree_root)?;
         let cwd_prefix = fs::canonicalize(cwd)
             .ok()
@@ -1128,7 +1239,7 @@ impl AddCompiledPathspecs {
             let element = sley_pathspec::parse_normalized_pathspec_element(
                 &cwd_prefix,
                 &arg,
-                effective_pathspec_flags(),
+                pathspec_magic,
             )?;
             have_include |= !element.is_exclude();
             specs.push(AddCompiledPathspec {
@@ -1186,6 +1297,39 @@ impl AddCompiledPathspecs {
     }
 }
 
+/// Resolve `git add --renormalize` exclusively against stage-0 index entries.
+/// Renormalization implies `-u`: tracked deletions remain selected for removal,
+/// while untracked filesystem matches are never introduced.
+fn resolve_add_renormalize_paths(
+    cwd: &Path,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    pathspec_magic: sley_worktree::PathspecMatchMagic,
+) -> Result<Vec<PathBuf>> {
+    let mut compiled = AddCompiledPathspecs::parse(cwd, worktree_root, paths, pathspec_magic)?;
+    let index = sley_worktree::read_repository_index(git_dir, format)?;
+    let mut selected = Vec::new();
+    if let Some(index) = index {
+        for entry in index
+            .entries
+            .iter()
+            .filter(|entry| entry.stage() == sley_index::Stage::Normal)
+        {
+            let git_path = entry.path.as_bytes();
+            if compiled.matches(git_path) {
+                selected.push(worktree_path_from_git_path(worktree_root, git_path)?);
+            }
+        }
+    }
+    for spec in compiled.unmatched_includes() {
+        eprintln!("fatal: pathspec '{}' did not match any files", spec.display);
+        return Err(GitError::Exit(128));
+    }
+    Ok(selected)
+}
+
 fn add_pathspec_arg_for_matcher(worktree_root: &Path, path: &Path) -> Result<String> {
     if !path.is_absolute() {
         return Ok(path.to_string_lossy().into_owned());
@@ -1223,7 +1367,10 @@ fn normalize_add_pathspec_absolute_path_lexically(path: &Path) -> PathBuf {
     normalized
 }
 
-fn case_insensitive_existing_path_under_worktree(worktree_root: &Path, absolute: &Path) -> Option<PathBuf> {
+fn case_insensitive_existing_path_under_worktree(
+    worktree_root: &Path,
+    absolute: &Path,
+) -> Option<PathBuf> {
     if !absolute.exists() {
         return None;
     }
@@ -1280,7 +1427,8 @@ fn resolve_add_regular_actions(
     format: ObjectFormat,
     paths: Vec<PathBuf>,
     options: AddRegularOptions,
-    reusable_index: Option<Index>,
+    mut reusable_index: Option<Index>,
+    pathspec_magic: sley_worktree::PathspecMatchMagic,
 ) -> Result<AddRegularResolution> {
     if let Some(exact) = resolve_add_regular_tracked_exact_actions(
         cwd,
@@ -1297,7 +1445,23 @@ fn resolve_add_regular_actions(
             ignored_paths: Vec::new(),
         });
     }
-    let mut compiled_pathspecs = AddCompiledPathspecs::parse(cwd, worktree_root, &paths)?;
+    // `--sparse` explicitly authorizes paths outside the cone. Resolve its
+    // pathspec and worktree changes against logical leaves rather than treating
+    // a materialized collapsed sparse directory as one stageable directory
+    // entry. This is a temporary semantic view; the mutation engine expands
+    // only selected directories in the on-disk index.
+    if options.sparse
+        && let Some(index) = reusable_index.as_mut()
+        && index
+            .entries
+            .iter()
+            .any(sley_index::IndexEntry::is_sparse_dir)
+    {
+        let odb = sley_odb::FileObjectDatabase::from_git_dir(git_dir, format);
+        sley_worktree::expand_sparse_index_view(index, &odb, format)?;
+    }
+    let mut compiled_pathspecs =
+        AddCompiledPathspecs::parse(cwd, worktree_root, &paths, pathspec_magic)?;
     let pathspecs = paths
         .into_iter()
         .map(|path| {
@@ -1319,8 +1483,27 @@ fn resolve_add_regular_actions(
     let mut seen = BTreeSet::new();
     let mut ignored_paths = BTreeSet::new();
     let _ignore_errors = options.ignore_errors;
+    // A pathspec is matched by an unchanged tracked file too. The status stream
+    // intentionally omits such files, so mark index matches independently
+    // without turning them into staging actions. This is what lets commands
+    // such as `git add --ignore-errors '*.txt'` succeed as a no-op.
+    let indexed_paths = add_all_index_paths(git_dir, format, reusable_index.as_ref())?;
+    for indexed_path in &indexed_paths {
+        let path_matches = compiled_pathspecs.matches(indexed_path);
+        if !path_matches {
+            continue;
+        }
+        if !compiled_pathspecs.have_include() {
+            for matched in &mut matched {
+                *matched = true;
+            }
+        } else {
+            for idx in compiled_pathspecs.matched_include_indexes() {
+                matched[idx] = true;
+            }
+        }
+    }
     if !options.force {
-        let indexed_paths = add_all_index_paths(git_dir, format, reusable_index.as_ref())?;
         for (idx, ignored_path) in collect_add_ignored_pathspec_matches(
             worktree_root,
             git_dir,
@@ -1354,7 +1537,7 @@ fn resolve_add_regular_actions(
             actions.push(AddAction::Add(path));
         }
     }
-    sley_worktree::stream_short_status(worktree_root, git_dir, format, |entry| {
+    let mut collect_status_action = |entry: sley_worktree::ShortStatusRow<'_>| {
         let actionable = (entry.index == b'?' && entry.worktree == b'?')
             || entry.worktree == b'M'
             || entry.worktree == b'T'
@@ -1398,7 +1581,28 @@ fn resolve_add_regular_actions(
             actions.push(action);
         }
         Ok(sley_worktree::StreamControl::Continue)
-    })?;
+    };
+    if let Some(index) = reusable_index.as_ref().filter(|index| {
+        index.is_sparse()
+            || index
+                .entries
+                .iter()
+                .any(sley_index::IndexEntry::is_sparse_dir)
+    }) {
+        // General status must account for staged HEAD-to-index differences and
+        // may therefore need a full index. Add only needs index-to-worktree and
+        // untracked changes, so use the sparse-boundary-aware engine query.
+        for entry in sley_worktree::collect_add_worktree_status_with_index(
+            worktree_root,
+            git_dir,
+            format,
+            index,
+        )? {
+            collect_status_action(entry.as_row())?;
+        }
+    } else {
+        sley_worktree::stream_short_status(worktree_root, git_dir, format, collect_status_action)?;
+    }
     if options.chmod.is_some() || options.force {
         // `--force` stages paths the status walk never reports (gitignored
         // files; gitignored embedded repositories as gitlinks), so resolve the
@@ -1639,18 +1843,18 @@ fn add_ignored_display_path(
     Ok(candidate_git_path.to_vec())
 }
 
-fn print_add_ignored_paths(git_dir: &Path, ignored_paths: &[Vec<u8>]) {
+fn print_add_ignored_paths(config: &GitConfig, ignored_paths: &[Vec<u8>]) {
     eprintln!("The following paths are ignored by one of your .gitignore files:");
     for path in ignored_paths {
         eprintln!("{}", String::from_utf8_lossy(path));
     }
-    if add_ignored_file_advice_enabled(git_dir) {
+    if add_ignored_file_advice_enabled(config) {
         eprintln!("hint: Use -f if you really want to add them.");
         eprintln!("hint: Disable this message with \"git config set advice.addIgnoredFile false\"");
     }
 }
 
-fn add_ignored_file_advice_enabled(git_dir: &Path) -> bool {
+fn add_ignored_file_advice_enabled(config: &GitConfig) -> bool {
     if env::var("GIT_ADVICE")
         .ok()
         .as_deref()
@@ -1659,13 +1863,9 @@ fn add_ignored_file_advice_enabled(git_dir: &Path) -> bool {
     {
         return false;
     }
-    read_repo_config(git_dir)
-        .ok()
-        .and_then(|config| {
-            config
-                .get_bool("advice", None, "addignoredfile")
-                .or_else(|| config.get_bool("advice", None, "addIgnoredFile"))
-        })
+    config
+        .get_bool("advice", None, "addignoredfile")
+        .or_else(|| config.get_bool("advice", None, "addIgnoredFile"))
         .unwrap_or(true)
 }
 
@@ -1702,7 +1902,33 @@ fn resolve_add_regular_tracked_exact_actions(
         let git_path = add_git_path_bytes(relative)?;
         let range = add_index_entries_path_range(&index.entries, &git_path);
         if range.is_empty() {
-            return Ok(None);
+            let metadata = match fs::symlink_metadata(&absolute) {
+                Ok(metadata) => metadata,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let file_type = metadata.file_type();
+            if metadata.is_dir() || !(file_type.is_file() || file_type.is_symlink()) {
+                return Ok(None);
+            }
+            if sley_worktree::standard_ignore_match(worktree_root, &git_path, false)?
+                .is_some_and(|ignore_match| ignore_match.ignored)
+            {
+                return Ok(None);
+            }
+            // An exact, present, untracked file needs no whole-status walk to
+            // prove it is actionable. Return it directly and let the shared
+            // index mutation engine decide whether its path intersects a
+            // collapsed sparse directory.
+            actions.push(AddAction::Add(absolute));
+            continue;
         }
         if range.len() != 1 {
             return Ok(None);
@@ -1781,6 +2007,7 @@ fn reject_add_skip_worktree_paths(
     paths: &[PathBuf],
     sparse_flag: bool,
     is_refresh: bool,
+    config: &GitConfig,
 ) -> Result<()> {
     if sparse_flag || paths.is_empty() {
         return Ok(());
@@ -1863,7 +2090,7 @@ fn reject_add_skip_worktree_paths(
     if rejected.is_empty() {
         return Ok(());
     }
-    advise_on_updating_sparse_paths(git_dir, &rejected);
+    advise_on_updating_sparse_paths_with_config(config, &rejected);
     Err(GitError::Exit(1))
 }
 
@@ -1871,13 +2098,18 @@ fn reject_add_skip_worktree_paths(
 /// definition" header, one line per path, then the hint block (gated by
 /// `advice.updateSparsePath`, default true). Shared by `add` and `mv`.
 pub(super) fn advise_on_updating_sparse_paths(git_dir: &Path, paths: &[String]) {
+    let config = read_repo_config(git_dir).unwrap_or_default();
+    advise_on_updating_sparse_paths_with_config(&config, paths);
+}
+
+fn advise_on_updating_sparse_paths_with_config(config: &GitConfig, paths: &[String]) {
     eprintln!("The following paths and/or pathspecs matched paths that exist");
     eprintln!("outside of your sparse-checkout definition, so will not be");
     eprintln!("updated in the index:");
     for path in paths {
         eprintln!("{path}");
     }
-    if add_update_sparse_path_advice_enabled(git_dir) {
+    if add_update_sparse_path_advice_enabled(config) {
         eprintln!("hint: If you intend to update such entries, try one of the following:");
         eprintln!("hint: * Use the --sparse option.");
         eprintln!("hint: * Disable or modify the sparsity rules.");
@@ -1889,10 +2121,9 @@ pub(super) fn advise_on_updating_sparse_paths(git_dir: &Path, paths: &[String]) 
 
 /// `advice.updateSparsePath` (default true) gates the hint block that follows
 /// the "outside of your sparse-checkout definition" header.
-fn add_update_sparse_path_advice_enabled(git_dir: &Path) -> bool {
-    read_repo_config(git_dir)
-        .ok()
-        .and_then(|config| config.get_bool("advice", None, "updateSparsePath"))
+fn add_update_sparse_path_advice_enabled(config: &GitConfig) -> bool {
+    config
+        .get_bool("advice", None, "updateSparsePath")
         .unwrap_or(true)
 }
 

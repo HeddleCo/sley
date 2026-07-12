@@ -501,6 +501,41 @@ fn rm_sparse_flags_are_accepted_like_upstream_git() {
 }
 
 #[test]
+fn rm_sparse_collapsed_directory_matches_upstream_git() {
+    let root = unique_temp_dir("rm-sparse-directory");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    {
+        prepare_repo(&upstream);
+        prepare_repo(&rust);
+        for repo in [&upstream, &rust] {
+            git(
+                repo,
+                &["sparse-checkout", "init", "--cone", "--sparse-index"],
+            );
+        }
+
+        let args = ["rm", "--sparse", "-r", "dir"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            git(&rust, &["ls-files", "--sparse"]),
+            git(&upstream, &["ls-files", "--sparse"]),
+            "sparse index differed after recursive rm"
+        );
+        assert_eq!(
+            git(&rust, &["status", "--short"]),
+            git(&upstream, &["status", "--short"]),
+            "status differed after recursive sparse rm"
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn rm_pathspec_from_file_matches_upstream_git() {
     let root = unique_temp_dir("rm-pathspec-from-file");
     let upstream = root.join("upstream");

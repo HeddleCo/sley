@@ -66,9 +66,12 @@ impl PartialOrd for LastModifiedQueueEntry {
     }
 }
 
-pub(crate) fn cmd_last_modified(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_last_modified(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = parse_last_modified_args(args)?;
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let db = repo.objects();
     let format = repo.format();
     let options = disambiguate_last_modified_positionals(options, &repo);
@@ -89,7 +92,7 @@ pub(crate) fn cmd_last_modified(args: &[String]) -> Result<()> {
         repo.cwd(),
         Some(repo.worktree_root()?),
         &options.pathspecs,
-        effective_pathspec_flags(),
+        effective_pathspec_flags(cli_session),
     )?;
     let start_info = read_commit_info(db, format, &start_commit)?;
     let paths = collect_last_modified_paths(

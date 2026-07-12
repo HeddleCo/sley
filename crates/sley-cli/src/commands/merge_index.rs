@@ -32,7 +32,10 @@ struct MergeIndexStages {
     theirs: Option<(u32, ObjectId)>,
 }
 
-pub(crate) fn cmd_merge_index(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_merge_index(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut idx = 0;
     let mut one_shot = false;
     let mut quiet = false;
@@ -50,8 +53,9 @@ pub(crate) fn cmd_merge_index(args: &[String]) -> Result<()> {
     };
     idx += 1;
 
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let mut index = read_worktree_index(&git_dir, format)?;
 
@@ -90,7 +94,17 @@ pub(crate) fn cmd_merge_index(args: &[String]) -> Result<()> {
 
     let mut errors = 0u32;
     for path in &paths {
-        if !run_merge_program(&program, &db, &git_dir, format, &mut index, path, quiet)? {
+        if !run_merge_program(
+            &program,
+            &db,
+            &git_dir,
+            &worktree_root,
+            format,
+            &mut index,
+            path,
+            quiet,
+            cli_session.lazy_fetch(),
+        )? {
             errors += 1;
             if !one_shot {
                 if !quiet {
@@ -155,15 +169,26 @@ fn run_merge_program(
     program: &str,
     db: &FileObjectDatabase,
     git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     index: &mut sley_index::Index,
     path: &[u8],
     quiet: bool,
+    lazy_fetch: bool,
 ) -> Result<bool> {
     let stages = collect_stages(index, path);
     let basename = program.rsplit(['/', '\\']).next().unwrap_or(program);
     if matches!(basename, "git-merge-one-file" | "merge-one-file") {
-        merge_one_file(db, git_dir, format, index, path, &stages)
+        merge_one_file(
+            db,
+            git_dir,
+            worktree_root,
+            format,
+            index,
+            path,
+            &stages,
+            lazy_fetch,
+        )
     } else {
         run_external_merge_program(program, path, &stages, quiet)
     }
@@ -175,12 +200,13 @@ fn run_merge_program(
 fn merge_one_file(
     db: &FileObjectDatabase,
     git_dir: &Path,
+    worktree_root: &Path,
     format: ObjectFormat,
     index: &mut sley_index::Index,
     path: &[u8],
     stages: &MergeIndexStages,
+    lazy_fetch: bool,
 ) -> Result<bool> {
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
     let path_str = String::from_utf8_lossy(path).into_owned();
 
     match (stages.base, stages.ours, stages.theirs) {
@@ -192,8 +218,8 @@ fn merge_one_file(
         // Added in their branch only: stage and materialise it.
         (None, None, Some((mode, oid))) => {
             println!("Adding {path_str}");
-            let content = merge_read_blob(db, &oid)?;
-            merge_write_worktree_file(&worktree_root, path, &content, mode)?;
+            let content = merge_read_blob(db, &oid, lazy_fetch)?;
+            merge_write_worktree_file(worktree_root, path, &content, mode)?;
             set_stage0(index, path, mode, oid);
             Ok(true)
         }
@@ -207,8 +233,8 @@ fn merge_one_file(
                 return Ok(false);
             }
             println!("Adding {path_str}");
-            let content = merge_read_blob(db, &our_oid)?;
-            merge_write_worktree_file(&worktree_root, path, &content, our_mode)?;
+            let content = merge_read_blob(db, &our_oid, lazy_fetch)?;
+            merge_write_worktree_file(worktree_root, path, &content, our_mode)?;
             set_stage0(index, path, our_mode, our_oid);
             Ok(true)
         }
@@ -218,7 +244,7 @@ fn merge_one_file(
                 && theirs.is_none_or(|(_, oid)| oid == base_oid)
                 && (ours.is_none() || theirs.is_none()) =>
         {
-            remove_path(index, &worktree_root, path)?;
+            remove_path(index, worktree_root, path)?;
             Ok(true)
         }
         // Modified on both sides (base present or both added differently).
@@ -232,11 +258,11 @@ fn merge_one_file(
                 return Ok(false);
             }
             let base_content = match base {
-                Some((_, oid)) => merge_read_blob(db, &oid)?,
+                Some((_, oid)) => merge_read_blob(db, &oid, lazy_fetch)?,
                 None => Vec::new(),
             };
-            let our_content = merge_read_blob(db, &our_oid)?;
-            let their_content = merge_read_blob(db, &their_oid)?;
+            let our_content = merge_read_blob(db, &our_oid, lazy_fetch)?;
+            let their_content = merge_read_blob(db, &their_oid, lazy_fetch)?;
             if base.is_some() {
                 println!("Auto-merging {path_str}");
             } else {
@@ -258,7 +284,7 @@ fn merge_one_file(
             );
             // The working tree always gets the merge result (markers and all),
             // matching git-merge-one-file's `cat "$src1" >"$4"`.
-            merge_write_worktree_file(&worktree_root, path, &merged.content, our_mode)?;
+            merge_write_worktree_file(worktree_root, path, &merged.content, our_mode)?;
             let mut conflict = merged.conflicted || base.is_none();
             let mut message = if conflict { "content conflict" } else { "" }.to_string();
             if our_mode != their_mode {

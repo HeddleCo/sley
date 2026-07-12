@@ -3,6 +3,7 @@
 
 use crate::*;
 use sley::plumbing::{sley_config, sley_core, sley_index, sley_worktree};
+use sley_worktree::admin::{LinkedWorktreeAdmin, WorktreeAdminOutcome, WorktreeAdminSnapshot};
 
 #[path = "worktree_options.rs"]
 mod worktree_options;
@@ -12,25 +13,30 @@ use worktree_options::{
     setup_worktree_repair_options, setup_worktree_unlock_options,
 };
 
-pub(crate) fn cmd_worktree(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let Some(subcommand) = args.first().map(String::as_str) else {
         eprintln!("error: need a subcommand");
         return worktree_usage();
     };
-    match subcommand {
-        "add" => cmd_worktree_add(&args[1..]),
-        "list" => cmd_worktree_list(&args[1..]),
-        "prune" => cmd_worktree_prune(&args[1..]),
-        "lock" => cmd_worktree_lock(&args[1..]),
-        "move" => cmd_worktree_move(&args[1..]),
-        "remove" => cmd_worktree_remove(&args[1..]),
-        "repair" => cmd_worktree_repair(&args[1..]),
-        "unlock" => cmd_worktree_unlock(&args[1..]),
+    let outcome = match subcommand {
+        "add" => cmd_worktree_add(cli_session, &args[1..]),
+        "list" => cmd_worktree_list(cli_session, &args[1..]),
+        "prune" => cmd_worktree_prune(cli_session, &args[1..]),
+        "lock" => cmd_worktree_lock(cli_session, &args[1..]),
+        "move" => cmd_worktree_move(cli_session, &args[1..]),
+        "remove" => cmd_worktree_remove(cli_session, &args[1..]),
+        "repair" => cmd_worktree_repair(cli_session, &args[1..]),
+        "unlock" => cmd_worktree_unlock(cli_session, &args[1..]),
         _ => {
             eprintln!("error: unknown subcommand: '{subcommand}'");
-            worktree_usage()
+            return worktree_usage();
         }
-    }
+    }?;
+    let _ = outcome;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -54,25 +60,10 @@ struct WorktreeListEntry {
 }
 
 #[derive(Debug)]
-struct LinkedWorktreeAdmin {
-    admin_dir: PathBuf,
-    admin_name: String,
-    path: PathBuf,
-    prunable_reason: Option<String>,
-    locked_reason: Option<String>,
-}
-
-#[derive(Debug)]
 struct WorktreePruneOptions {
     dry_run: bool,
     verbose: bool,
     expire: i64,
-}
-
-#[derive(Debug)]
-struct PruneKeptWorktree {
-    path: PathBuf,
-    admin_name: Option<String>,
 }
 
 #[derive(Debug)]
@@ -140,16 +131,26 @@ struct WorktreeTrackedEntry {
     oid: ObjectId,
 }
 
-pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_add(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<WorktreeAdminOutcome> {
     let mut options = setup_worktree_add_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let path = resolve_cli_path(&cwd, &options.path);
+    let add_plan = sley_worktree::admin::plan_add(
+        path.clone(),
+        options.force,
+        options.lock,
+        options.lock_reason.as_deref(),
+    );
     validate_worktree_add_destination(&path, &options.path)?;
     let store = FileRefStore::new(&common_git_dir, format).with_reftable_combined_logs(true);
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let identity_config = identity_effective_config_for(cli_session).unwrap_or_default();
+    let committer = commit_identity_from_env("COMMITTER", &identity_config)?;
 
     // `--orphan` with no explicit `-b`/`-B` names the new unborn branch after
     // the worktree basename (git: `opts.orphan && !new_branch`).
@@ -185,6 +186,7 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
         &path,
         &options,
         committer.clone(),
+        cli_session.replace_objects(),
     )?;
     if let Some(branch) = add_head.branch_name.as_ref() {
         let refname = branch_ref_name(branch)?;
@@ -217,7 +219,8 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
     if !options.quiet && !add_head.orphan {
         eprintln!("{}", add_head.prepare_message);
     }
-    check_worktree_candidate_path(&common_git_dir, &path, &options.path, options.force)?;
+    let admin_snapshot = WorktreeAdminSnapshot::scan(&common_git_dir)?;
+    check_worktree_candidate_path(&admin_snapshot, &path, &options.path, add_plan.force)?;
     // `--relative-paths`/`--no-relative-paths` override the `worktree.useRelativePaths`
     // config default (git: `opts.relative_paths = use_relative_paths`).
     let relative_paths = options.relative_paths.unwrap_or_else(|| {
@@ -231,6 +234,7 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
     write_worktree_linking_files(&common_git_dir, &admin_dir, &path, relative_paths)?;
     fs::write(admin_dir.join("commondir"), "../..\n")?;
     copy_worktree_config_for_new_worktree(&common_git_dir, &git_dir, &admin_dir)?;
+    copy_sparse_checkout_for_new_worktree(&git_dir, &admin_dir)?;
     let common_store = FileRefStore::new(&common_git_dir, format);
     let reftable_refs = common_store.uses_reftable()?;
     let alternate_refs = common_store.uses_alternate_ref_storage();
@@ -253,15 +257,8 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
         alternate_refs,
         committer.clone(),
     )?;
-    if options.lock {
-        fs::write(
-            admin_dir.join("locked"),
-            options
-                .lock_reason
-                .as_deref()
-                .map(|reason| format!("{reason}\n"))
-                .unwrap_or_default(),
-        )?;
+    if let Some(contents) = add_plan.lock_contents.as_ref() {
+        fs::write(admin_dir.join("locked"), contents)?;
     }
     if add_head.orphan {
         // Orphan worktrees check out the empty tree: write an empty index (with
@@ -271,7 +268,7 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
         if !options.quiet {
             eprintln!("{}", add_head.prepare_message);
         }
-        return Ok(());
+        return Ok(WorktreeAdminOutcome::Added { path });
     }
     write_linked_worktree_checkout(
         &common_git_dir,
@@ -281,6 +278,13 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
         &add_head.oid,
         options.checkout,
     )?;
+    if options.checkout {
+        // `worktree add` inherits the invoking worktree's sparse definition.
+        // Build the target tree normally, then reconcile it through the shared
+        // sparse engine so skip-worktree bits, sparse-directory collapsing and
+        // materialized files all use the same semantics as sparse-checkout set.
+        sley_worktree::reapply_active_sparse_checkout(&path, &admin_dir, format)?;
+    }
     // The prepare line was already printed (before check_candidate_path); only
     // the post-checkout "HEAD is now at ..." reset line remains.
     if !options.quiet && options.checkout {
@@ -289,7 +293,7 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
     if options.checkout {
         run_worktree_add_post_checkout_hook(&admin_dir, &path, format, &add_head.oid)?;
     }
-    Ok(())
+    Ok(WorktreeAdminOutcome::Added { path })
 }
 
 fn write_linked_worktree_head(
@@ -361,21 +365,31 @@ fn write_linked_worktree_head(
     Ok(())
 }
 
-pub(crate) fn cmd_worktree_list(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_list(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<WorktreeAdminOutcome> {
     let options = setup_worktree_list_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let entries = collect_worktree_list_entries(&common_git_dir, format, options.expire)?;
+    let snapshot = WorktreeAdminSnapshot::scan(&common_git_dir)?;
+    let plan = sley_worktree::admin::plan_list(&snapshot, options.expire);
+    let entries = collect_worktree_list_entries(
+        &common_git_dir,
+        format,
+        &plan.linked,
+        plan.include_prunable,
+    )?;
     if options.porcelain {
         print_worktree_list_porcelain(&entries, options.z)?;
     } else {
         print_worktree_list_default(&entries, &common_git_dir, options.verbose);
     }
-    Ok(())
+    Ok(WorktreeAdminOutcome::Listed {
+        count: entries.len(),
+    })
 }
-
 
 fn worktree_usage<T>() -> Result<T> {
     eprintln!(
@@ -384,29 +398,31 @@ fn worktree_usage<T>() -> Result<T> {
     Err(GitError::Exit(129))
 }
 
-
-pub(crate) fn cmd_worktree_prune(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_prune(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<WorktreeAdminOutcome> {
     let options = setup_worktree_prune_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let plan = sley_worktree::admin::plan_prune(options.dry_run, options.verbose, options.expire);
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let mut kept = prune_worktree_admins(&common_git_dir, &options)?;
+    let mut kept = prune_worktree_admins(&common_git_dir, &plan)?;
     let main_path = fs::canonicalize(&common_git_dir).unwrap_or_else(|_| common_git_dir.clone());
-    kept.push(PruneKeptWorktree {
+    kept.push(sley_worktree::admin::PruneKeptWorktree {
         path: normalize_lexical_path(&main_path),
         admin_name: None,
     });
-    prune_duplicate_worktree_admins(&common_git_dir, &options, kept);
-    if !options.dry_run {
+    prune_duplicate_worktree_admins(&common_git_dir, &plan, kept);
+    if !plan.dry_run {
         remove_empty_worktrees_dir(&common_git_dir);
     }
-    Ok(())
+    Ok(WorktreeAdminOutcome::Pruned)
 }
 
 fn prune_worktree_admins(
     common_git_dir: &Path,
-    options: &WorktreePruneOptions,
-) -> Result<Vec<PruneKeptWorktree>> {
+    options: &sley_worktree::admin::PruneWorktreesPlan,
+) -> Result<Vec<sley_worktree::admin::PruneKeptWorktree>> {
     let worktrees_dir = common_git_dir.join("worktrees");
     let Ok(entries) = fs::read_dir(&worktrees_dir) else {
         return Ok(Vec::new());
@@ -419,119 +435,30 @@ fn prune_worktree_admins(
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        match should_prune_worktree_admin(&path, &name, options.expire)? {
-            PruneAdminDecision::Prune(reason) => {
+        match sley_worktree::admin::plan_prune_admin(&path, options.expire)? {
+            sley_worktree::admin::PruneAdminDecision::Prune(reason) => {
                 prune_worktree_admin(&path, &name, &reason, options)
             }
-            PruneAdminDecision::Keep { gitdir } => kept.push(PruneKeptWorktree {
-                path: gitdir,
-                admin_name: Some(name),
-            }),
-            PruneAdminDecision::Skip => {}
+            sley_worktree::admin::PruneAdminDecision::Keep { gitdir } => {
+                kept.push(sley_worktree::admin::PruneKeptWorktree {
+                    path: gitdir,
+                    admin_name: Some(name),
+                })
+            }
+            sley_worktree::admin::PruneAdminDecision::Skip => {}
         }
     }
     Ok(kept)
 }
 
-enum PruneAdminDecision {
-    Prune(String),
-    Keep { gitdir: PathBuf },
-    Skip,
-}
-
-fn should_prune_worktree_admin(
-    admin_dir: &Path,
-    _admin_name: &str,
-    expire: i64,
-) -> Result<PruneAdminDecision> {
-    if !admin_dir.is_dir() {
-        return Ok(PruneAdminDecision::Prune(
-            "not a valid directory".to_string(),
-        ));
-    }
-    if admin_dir.join("locked").exists() {
-        return Ok(PruneAdminDecision::Skip);
-    }
-    let gitdir_file = admin_dir.join("gitdir");
-    let metadata = match fs::metadata(&gitdir_file) {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            return Ok(PruneAdminDecision::Prune(
-                "gitdir file does not exist".to_string(),
-            ));
-        }
-    };
-    let mut path = match fs::read_to_string(&gitdir_file) {
-        Ok(path) => path,
-        Err(err) => {
-            return Ok(PruneAdminDecision::Prune(format!(
-                "unable to read gitdir file ({err})"
-            )));
-        }
-    };
-    let expected = metadata.len() as usize;
-    if path.len() != expected {
-        return Ok(PruneAdminDecision::Prune(format!(
-            "short read (expected {expected} bytes, read {})",
-            path.len()
-        )));
-    }
-    while path.ends_with(['\n', '\r']) {
-        path.pop();
-    }
-    if path.is_empty() {
-        return Ok(PruneAdminDecision::Prune("invalid gitdir file".to_string()));
-    }
-    let gitdir = resolve_admin_path_forgiving(admin_dir, &path);
-    if !gitdir.exists() {
-        let index = admin_dir.join("index");
-        let expired = fs::metadata(index)
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64 <= expire)
-            .unwrap_or(true);
-        if expired {
-            return Ok(PruneAdminDecision::Prune(
-                "gitdir file points to non-existent location".to_string(),
-            ));
-        }
-    }
-    Ok(PruneAdminDecision::Keep { gitdir })
-}
-
-fn resolve_admin_path_forgiving(admin_dir: &Path, value: &str) -> PathBuf {
-    let path = PathBuf::from(value);
-    let resolved = if path.is_absolute() {
-        path
-    } else {
-        admin_dir.join(path)
-    };
-    fs::canonicalize(&resolved).unwrap_or_else(|_| normalize_lexical_path(&resolved))
-}
-
 fn prune_duplicate_worktree_admins(
     common_git_dir: &Path,
-    options: &WorktreePruneOptions,
-    mut kept: Vec<PruneKeptWorktree>,
+    options: &sley_worktree::admin::PruneWorktreesPlan,
+    kept: Vec<sley_worktree::admin::PruneKeptWorktree>,
 ) {
-    kept.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| match (&left.admin_name, &right.admin_name) {
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (Some(_), None) => std::cmp::Ordering::Greater,
-                (Some(left), Some(right)) => left.cmp(right),
-                (None, None) => std::cmp::Ordering::Equal,
-            })
-    });
-    for index in 1..kept.len() {
-        if kept[index].path == kept[index - 1].path
-            && let Some(admin_name) = kept[index].admin_name.as_ref()
-        {
-            let admin_dir = common_git_dir.join("worktrees").join(admin_name);
-            prune_worktree_admin(&admin_dir, admin_name, "duplicate entry", options);
-        }
+    for admin_name in sley_worktree::admin::plan_duplicate_prunes(kept) {
+        let admin_dir = common_git_dir.join("worktrees").join(&admin_name);
+        prune_worktree_admin(&admin_dir, &admin_name, "duplicate entry", options);
     }
 }
 
@@ -539,7 +466,7 @@ fn prune_worktree_admin(
     admin_dir: &Path,
     admin_name: &str,
     reason: &str,
-    options: &WorktreePruneOptions,
+    options: &sley_worktree::admin::PruneWorktreesPlan,
 ) {
     if options.dry_run || options.verbose {
         eprintln!("Removing worktrees/{admin_name}: {reason}");
@@ -563,114 +490,149 @@ fn remove_empty_worktrees_dir(common_git_dir: &Path) {
     let _ = fs::remove_dir(common_git_dir.join("worktrees"));
 }
 
-pub(crate) fn cmd_worktree_lock(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_lock(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<WorktreeAdminOutcome> {
     let options = setup_worktree_lock_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let admin = find_linked_worktree_admin(&common_git_dir, &cwd, &options.path)?;
-    if admin.locked_reason.is_some() {
-        eprint!("fatal: '{}' is already locked", options.path);
-        if let Some(reason) = admin.locked_reason.filter(|reason| !reason.is_empty()) {
-            eprint!(", reason: {reason}");
+    let snapshot = WorktreeAdminSnapshot::scan(&common_git_dir)?;
+    let admin = find_linked_worktree_admin(&snapshot, &common_git_dir, cwd, &options.path)?;
+    let plan = match sley_worktree::admin::plan_lock(&admin, options.reason.as_deref()) {
+        Ok(plan) => plan,
+        Err(sley_worktree::admin::LockWorktreeError::AlreadyLocked { reason }) => {
+            eprint!("fatal: '{}' is already locked", options.path);
+            if !reason.is_empty() {
+                eprint!(", reason: {reason}");
+            }
+            eprintln!();
+            return Err(GitError::Exit(128));
         }
-        eprintln!();
-        return Err(GitError::Exit(128));
-    }
-    let contents = options
-        .reason
-        .map(|reason| format!("{reason}\n"))
-        .unwrap_or_default();
-    fs::write(admin.admin_dir.join("locked"), contents)?;
-    Ok(())
+    };
+    fs::write(&plan.lock_file, &plan.contents)?;
+    Ok(WorktreeAdminOutcome::Locked {
+        path: plan.worktree_path,
+    })
 }
 
-pub(crate) fn cmd_worktree_unlock(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_unlock(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<WorktreeAdminOutcome> {
     let path = setup_worktree_unlock_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let admin = find_linked_worktree_admin(&common_git_dir, &cwd, &path)?;
-    if admin.locked_reason.is_none() {
+    let snapshot = WorktreeAdminSnapshot::scan(&common_git_dir)?;
+    let admin = find_linked_worktree_admin(&snapshot, &common_git_dir, cwd, &path)?;
+    let plan = sley_worktree::admin::plan_unlock(&admin).map_err(|_| {
         eprintln!("fatal: '{path}' is not locked");
-        return Err(GitError::Exit(128));
-    }
-    fs::remove_file(admin.admin_dir.join("locked"))?;
-    Ok(())
+        GitError::Exit(128)
+    })?;
+    fs::remove_file(&plan.lock_file)?;
+    Ok(WorktreeAdminOutcome::Unlocked {
+        path: plan.worktree_path,
+    })
 }
 
-pub(crate) fn cmd_worktree_remove(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_remove(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<WorktreeAdminOutcome> {
     let options = setup_worktree_remove_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let admin = find_linked_worktree_admin_for_remove(&common_git_dir, &cwd, &options.path)?;
-    if let Some(reason) = admin.locked_reason.as_ref()
-        && options.force < 2
-    {
+    let snapshot = WorktreeAdminSnapshot::scan(&common_git_dir)?;
+    let admin =
+        find_linked_worktree_admin_for_remove(&snapshot, &common_git_dir, cwd, &options.path)?;
+    let plan = sley_worktree::admin::plan_remove(&admin, options.force).map_err(|error| {
         eprint!("fatal: cannot remove a locked working tree");
-        if !reason.is_empty() {
-            eprint!(", lock reason: {reason}");
+        if !error.reason.is_empty() {
+            eprint!(", lock reason: {}", error.reason);
         }
         eprintln!();
         eprintln!("use 'remove -f -f' to override or unlock first");
-        return Err(GitError::Exit(128));
-    }
-    if options.force == 0 && worktree_remove_has_local_changes(&common_git_dir, &admin, format)? {
+        GitError::Exit(128)
+    })?;
+    if plan.force == 0 && worktree_remove_has_local_changes(&common_git_dir, &admin, format)? {
         eprintln!(
             "fatal: '{}' contains modified or untracked files, use --force to delete it",
             options.path
         );
         return Err(GitError::Exit(128));
     }
-    if admin.path.exists() {
-        fs::remove_dir_all(&admin.path)?;
+    if plan.worktree_path.exists() {
+        fs::remove_dir_all(&plan.worktree_path)?;
     }
-    if admin.admin_dir.exists() {
-        fs::remove_dir_all(&admin.admin_dir)?;
+    if plan.admin_dir.exists() {
+        fs::remove_dir_all(&plan.admin_dir)?;
     }
-    Ok(())
+    Ok(WorktreeAdminOutcome::Removed {
+        path: plan.worktree_path,
+    })
 }
 
-pub(crate) fn cmd_worktree_move(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_move(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<WorktreeAdminOutcome> {
     let options = setup_worktree_move_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let admin = find_linked_worktree_admin_for_move(&common_git_dir, &cwd, &options.source)?;
-    if let Some(reason) = admin.locked_reason.as_ref()
-        && options.force < 2
-    {
+    let snapshot = WorktreeAdminSnapshot::scan(&common_git_dir)?;
+    let admin =
+        find_linked_worktree_admin_for_move(&snapshot, &common_git_dir, cwd, &options.source)?;
+    sley_worktree::admin::plan_move_access(&admin, options.force).map_err(|error| {
         eprint!("fatal: cannot move a locked working tree");
-        if !reason.is_empty() {
-            eprint!(", lock reason: {reason}");
+        if !error.reason.is_empty() {
+            eprint!(", lock reason: {}", error.reason);
         }
         eprintln!();
         eprintln!("use 'move -f -f' to override or unlock first");
-        return Err(GitError::Exit(128));
-    }
-    let destination = worktree_move_destination(&cwd, &admin.path, &options.destination)?;
+        GitError::Exit(128)
+    })?;
+    let destination = worktree_move_destination(cwd, &admin.path, &options.destination)?;
     let relative_paths = options.relative_paths.unwrap_or_else(|| {
         GitConfig::read(common_git_dir.join("config"))
             .ok()
             .and_then(|config| config.get_bool("worktree", None, "useRelativePaths"))
             .unwrap_or(false)
     });
-    fs::rename(&admin.path, &destination)?;
+    let plan = sley_worktree::admin::plan_move(&admin, destination, options.force, relative_paths)
+        .map_err(|error| {
+            eprint!("fatal: cannot move a locked working tree");
+            if !error.reason.is_empty() {
+                eprint!(", lock reason: {}", error.reason);
+            }
+            eprintln!();
+            eprintln!("use 'move -f -f' to override or unlock first");
+            GitError::Exit(128)
+        })?;
+    fs::rename(&plan.source, &plan.destination)?;
     write_worktree_linking_files(
         &common_git_dir,
-        &admin.admin_dir,
-        &destination,
-        relative_paths,
+        &plan.admin_dir,
+        &plan.destination,
+        plan.relative_paths,
     )?;
-    Ok(())
+    Ok(WorktreeAdminOutcome::Moved {
+        from: plan.source,
+        to: plan.destination,
+    })
 }
 
-pub(crate) fn cmd_worktree_repair(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_worktree_repair(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<WorktreeAdminOutcome> {
     let options = setup_worktree_repair_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let relative_paths = options.relative_paths.unwrap_or_else(|| {
         GitConfig::read(common_git_dir.join("config"))
@@ -678,45 +640,40 @@ pub(crate) fn cmd_worktree_repair(args: &[String]) -> Result<()> {
             .and_then(|config| config.get_bool("worktree", None, "useRelativePaths"))
             .unwrap_or(false)
     });
-    let mut failed = false;
-    if options.paths.is_empty() {
-        repair_worktree_at_path(&common_git_dir, &cwd, None, relative_paths, &mut failed)?;
+    let targets = if options.paths.is_empty() {
+        vec![(cwd.to_path_buf(), None)]
     } else {
-        for path in options.paths {
-            repair_worktree_at_path(
-                &common_git_dir,
-                &resolve_cli_path(&cwd, &path),
-                Some(&path),
-                relative_paths,
-                &mut failed,
-            )?;
-        }
+        options
+            .paths
+            .into_iter()
+            .map(|path| (resolve_cli_path(cwd, &path), Some(path)))
+            .collect()
+    };
+    let plan = sley_worktree::admin::plan_repair(targets, relative_paths);
+    let mut failed = false;
+    for (path, display) in &plan.targets {
+        repair_worktree_at_path(
+            &common_git_dir,
+            path,
+            display.as_deref(),
+            plan.relative_paths,
+            &mut failed,
+        )?;
     }
-    repair_registered_worktrees(&common_git_dir, relative_paths, &mut failed)?;
+    if plan.repair_registered {
+        let snapshot = WorktreeAdminSnapshot::scan(&common_git_dir)?;
+        repair_registered_worktrees(&common_git_dir, &snapshot, plan.relative_paths, &mut failed)?;
+    }
     if failed {
         return Err(GitError::Exit(1));
     }
-    Ok(())
+    Ok(WorktreeAdminOutcome::Repaired)
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 fn collect_worktree_list_entries(
     common_git_dir: &Path,
     format: ObjectFormat,
+    linked_admins: &[LinkedWorktreeAdmin],
     expire: bool,
 ) -> Result<Vec<WorktreeListEntry>> {
     let mut entries = Vec::new();
@@ -732,16 +689,16 @@ fn collect_worktree_list_entries(
         None,
     )?);
 
-    for admin in collect_linked_worktree_admins(common_git_dir)? {
-        let prunable_reason = expire.then_some(admin.prunable_reason).flatten();
+    for admin in linked_admins {
+        let prunable_reason = expire.then(|| admin.prunable_reason.clone()).flatten();
         entries.push(read_worktree_list_entry(
             &admin.admin_dir,
             common_git_dir,
             format,
-            admin.path,
+            admin.path.clone(),
             false,
             prunable_reason,
-            admin.locked_reason,
+            admin.locked_reason.clone(),
         )?);
     }
     Ok(entries)
@@ -757,54 +714,6 @@ fn main_worktree_list_path(common_git_dir: &Path) -> PathBuf {
     common
 }
 
-fn collect_linked_worktree_admins(common_git_dir: &Path) -> Result<Vec<LinkedWorktreeAdmin>> {
-    let worktrees_dir = common_git_dir.join("worktrees");
-    let Ok(admin_entries) = fs::read_dir(&worktrees_dir) else {
-        return Ok(Vec::new());
-    };
-    let mut admins = Vec::new();
-    for admin_entry in admin_entries {
-        let admin_entry = admin_entry?;
-        let admin_dir = admin_entry.path();
-        if !admin_dir.is_dir() {
-            continue;
-        }
-        let Some(admin) = linked_worktree_admin(&admin_dir)? else {
-            continue;
-        };
-        admins.push(admin);
-    }
-    admins.sort_by(|left, right| left.admin_dir.cmp(&right.admin_dir));
-    Ok(admins)
-}
-
-fn linked_worktree_admin(admin_dir: &Path) -> Result<Option<LinkedWorktreeAdmin>> {
-    let gitdir_file = admin_dir.join("gitdir");
-    if !gitdir_file.is_file() {
-        return Ok(None);
-    }
-    let value = fs::read_to_string(gitdir_file)?;
-    let gitdir = resolve_admin_path(admin_dir, value.trim());
-    let Some(path) = gitdir.parent() else {
-        return Ok(None);
-    };
-    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let locked_reason = read_worktree_lock_reason(admin_dir)?;
-    let prunable_reason = (locked_reason.is_none() && !gitdir.exists())
-        .then(|| "gitdir file points to non-existent location".to_string());
-    let admin_name = admin_dir
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    Ok(Some(LinkedWorktreeAdmin {
-        admin_dir: admin_dir.to_path_buf(),
-        admin_name,
-        path,
-        prunable_reason,
-        locked_reason,
-    }))
-}
-
 fn resolve_admin_path(admin_dir: &Path, value: &str) -> PathBuf {
     let path = PathBuf::from(value);
     if path.is_absolute() {
@@ -814,89 +723,65 @@ fn resolve_admin_path(admin_dir: &Path, value: &str) -> PathBuf {
     }
 }
 
-fn read_worktree_lock_reason(admin_dir: &Path) -> Result<Option<String>> {
-    let locked = admin_dir.join("locked");
-    if !locked.is_file() {
-        return Ok(None);
-    }
-    let value = fs::read_to_string(locked)?;
-    Ok(Some(value.trim_end_matches('\n').to_string()))
-}
-
 fn find_linked_worktree_admin(
+    snapshot: &WorktreeAdminSnapshot,
     common_git_dir: &Path,
     cwd: &Path,
     path: &str,
 ) -> Result<LinkedWorktreeAdmin> {
     let target = resolve_cli_path(cwd, path);
     let canonical_target = fs::canonicalize(&target).ok();
-    if let Ok(main) = worktree_root_for_git_dir(common_git_dir)
+    if let Some(main) = sley_worktree::worktree_root_for_git_dir(common_git_dir)?
         && (canonical_target.as_deref() == fs::canonicalize(main).ok().as_deref()
             || target == common_git_dir)
     {
         eprintln!("fatal: The main working tree cannot be locked or unlocked");
         return Err(GitError::Exit(128));
     }
-    for admin in collect_linked_worktree_admins(common_git_dir)? {
-        if canonical_target
-            .as_ref()
-            .is_some_and(|target| fs::canonicalize(&admin.path).ok().as_ref() == Some(target))
-            || normalize_lexical_path(&target) == normalize_lexical_path(&admin.path)
-        {
-            return Ok(admin);
-        }
+    if let Some(admin) = snapshot.find_path(&target) {
+        return Ok(admin.clone());
     }
     eprintln!("fatal: '{path}' is not a working tree");
     Err(GitError::Exit(128))
 }
 
 fn find_linked_worktree_admin_for_remove(
+    snapshot: &WorktreeAdminSnapshot,
     common_git_dir: &Path,
     cwd: &Path,
     path: &str,
 ) -> Result<LinkedWorktreeAdmin> {
     let target = resolve_cli_path(cwd, path);
     let canonical_target = fs::canonicalize(&target).ok();
-    if let Ok(main) = worktree_root_for_git_dir(common_git_dir)
+    if let Some(main) = sley_worktree::worktree_root_for_git_dir(common_git_dir)?
         && canonical_target.as_deref() == fs::canonicalize(main).ok().as_deref()
     {
         eprintln!("fatal: '{path}' is a main working tree");
         return Err(GitError::Exit(128));
     }
-    for admin in collect_linked_worktree_admins(common_git_dir)? {
-        if canonical_target
-            .as_ref()
-            .is_some_and(|target| fs::canonicalize(&admin.path).ok().as_ref() == Some(target))
-            || normalize_lexical_path(&target) == normalize_lexical_path(&admin.path)
-        {
-            return Ok(admin);
-        }
+    if let Some(admin) = snapshot.find_path(&target) {
+        return Ok(admin.clone());
     }
     eprintln!("fatal: '{path}' is not a working tree");
     Err(GitError::Exit(128))
 }
 
 fn find_linked_worktree_admin_for_move(
+    snapshot: &WorktreeAdminSnapshot,
     common_git_dir: &Path,
     cwd: &Path,
     path: &str,
 ) -> Result<LinkedWorktreeAdmin> {
     let target = resolve_cli_path(cwd, path);
     let canonical_target = fs::canonicalize(&target).ok();
-    if let Ok(main) = worktree_root_for_git_dir(common_git_dir)
+    if let Some(main) = sley_worktree::worktree_root_for_git_dir(common_git_dir)?
         && canonical_target.as_deref() == fs::canonicalize(main).ok().as_deref()
     {
         eprintln!("fatal: '{path}' is a main working tree");
         return Err(GitError::Exit(128));
     }
-    for admin in collect_linked_worktree_admins(common_git_dir)? {
-        if canonical_target
-            .as_ref()
-            .is_some_and(|target| fs::canonicalize(&admin.path).ok().as_ref() == Some(target))
-            || normalize_lexical_path(&target) == normalize_lexical_path(&admin.path)
-        {
-            return Ok(admin);
-        }
+    if let Some(admin) = snapshot.find_path(&target) {
+        return Ok(admin.clone());
     }
     eprintln!("fatal: '{path}' is not a working tree");
     Err(GitError::Exit(128))
@@ -1016,10 +901,11 @@ fn repair_worktree_at_path(
 
 fn repair_registered_worktrees(
     common_git_dir: &Path,
+    snapshot: &WorktreeAdminSnapshot,
     relative_paths: bool,
     failed: &mut bool,
 ) -> Result<()> {
-    for admin in collect_linked_worktree_admins(common_git_dir)? {
+    for admin in snapshot.linked() {
         repair_registered_worktree_gitfile(common_git_dir, &admin, relative_paths, failed)?;
     }
     Ok(())
@@ -1218,11 +1104,12 @@ fn can_use_local_refs(
     format: ObjectFormat,
     store: &FileRefStore,
     quiet: bool,
+    replace_objects: bool,
 ) -> Result<bool> {
     // HEAD is per-worktree: when `git worktree add` runs from inside a linked
     // worktree, its HEAD (and thus the implicit source commit) is that
     // worktree's, NOT the common dir's. Resolve against `worktree_git_dir`.
-    if resolve_revision(worktree_git_dir, format, "HEAD").is_ok() {
+    if resolve_revision(worktree_git_dir, format, "HEAD", replace_objects).is_ok() {
         return Ok(true);
     }
     for reference in store.list_refs()? {
@@ -1368,8 +1255,15 @@ fn dwim_orphan(
     store: &FileRefStore,
     options: &WorktreeAddOptions,
     remote: bool,
+    replace_objects: bool,
 ) -> Result<bool> {
-    if can_use_local_refs(worktree_git_dir, format, store, options.quiet)? {
+    if can_use_local_refs(
+        worktree_git_dir,
+        format,
+        store,
+        options.quiet,
+        replace_objects,
+    )? {
         return Ok(false);
     }
     if remote && can_use_remote_refs(common_git_dir, store, options)? {
@@ -1465,7 +1359,11 @@ fn worktree_add_resolve_head(
     path: &Path,
     options: &WorktreeAddOptions,
     committer: Vec<u8>,
+    replace_objects: bool,
 ) -> Result<WorktreeAddHead> {
+    let resolve_revision = |git_dir: &Path, format: ObjectFormat, rev: &str| {
+        crate::resolve_revision(git_dir, format, rev, replace_objects)
+    };
     // Explicit `--orphan` (the branch name was filled in by the caller): the new
     // worktree checks out an unborn branch with no source commit.
     if options.orphan {
@@ -1499,6 +1397,7 @@ fn worktree_add_resolve_head(
                 store,
                 options,
                 false,
+                replace_objects,
             )?
         {
             return worktree_add_inferred_orphan_head(branch.clone(), format);
@@ -1509,11 +1408,12 @@ fn worktree_add_resolve_head(
         // the invalid-reference error (with the `-b`-aware orphan hint) instead
         // of a lower-level failure from branch creation. The implicit "HEAD"
         // start resolves against the current worktree's HEAD.
-        worktree_add_resolve_commitish(worktree_git_dir, format, options, start)?;
+        worktree_add_resolve_commitish(worktree_git_dir, format, options, start, replace_objects)?;
         let was_reset = checkout_create_or_reset_branch(
             common_git_dir,
             worktree_git_dir,
             format,
+            replace_objects,
             branch,
             start,
             options.force_branch,
@@ -1556,9 +1456,21 @@ fn worktree_add_resolve_head(
         // Detaching at HEAD in a repo whose HEAD is dangling warns + dies via
         // can_use_local_refs (git: the `detach && branch == "HEAD"` arm).
         if commitish == "HEAD" {
-            can_use_local_refs(worktree_git_dir, format, store, options.quiet)?;
+            can_use_local_refs(
+                worktree_git_dir,
+                format,
+                store,
+                options.quiet,
+                replace_objects,
+            )?;
         }
-        let oid = worktree_add_resolve_commitish(worktree_git_dir, format, options, &commitish)?;
+        let oid = worktree_add_resolve_commitish(
+            worktree_git_dir,
+            format,
+            options,
+            &commitish,
+            replace_objects,
+        )?;
         return Ok(WorktreeAddHead {
             branch_name: None,
             oid,
@@ -1627,7 +1539,13 @@ fn worktree_add_resolve_head(
                 orphan: false,
             });
         }
-        let oid = worktree_add_resolve_commitish(worktree_git_dir, format, options, &commitish)?;
+        let oid = worktree_add_resolve_commitish(
+            worktree_git_dir,
+            format,
+            options,
+            &commitish,
+            replace_objects,
+        )?;
         return Ok(WorktreeAddHead {
             branch_name: None,
             oid,
@@ -1695,6 +1613,7 @@ fn worktree_add_resolve_head(
         store,
         options,
         true,
+        replace_objects,
     )? {
         return worktree_add_inferred_orphan_head(branch, format);
     }
@@ -1703,12 +1622,12 @@ fn worktree_add_resolve_head(
     // error (with the no-`-b` orphan hint) when HEAD is a dangling reference.
     // HEAD is per-worktree, so resolve + branch off the current worktree's HEAD,
     // but write the new branch into the common store.
-    worktree_add_resolve_commitish(worktree_git_dir, format, options, "HEAD")?;
+    worktree_add_resolve_commitish(worktree_git_dir, format, options, "HEAD", replace_objects)?;
     let head_oid = resolve_revision(worktree_git_dir, format, "HEAD")?;
     store.create_branch(
         &branch,
         head_oid,
-        commit_identity_from_env("COMMITTER")?,
+        committer,
         b"branch: Created from HEAD".to_vec(),
     )?;
     let oid = resolve_revision(common_git_dir, format, &branch)?;
@@ -1731,8 +1650,9 @@ fn worktree_add_resolve_commitish(
     format: ObjectFormat,
     options: &WorktreeAddOptions,
     commitish: &str,
+    replace_objects: bool,
 ) -> Result<ObjectId> {
-    match resolve_revision(common_git_dir, format, commitish) {
+    match resolve_revision(common_git_dir, format, commitish, replace_objects) {
         Ok(oid) => Ok(oid),
         Err(_) => {
             let attempt_hint = !options.quiet && options.start.is_none();
@@ -1791,37 +1711,30 @@ fn default_worktree_add_branch_name(path: &Path) -> Result<String> {
 /// needs `-f`. With sufficient force we delete the stale admin dir so the add
 /// can re-register the path.
 fn check_worktree_candidate_path(
-    common_git_dir: &Path,
+    snapshot: &WorktreeAdminSnapshot,
     path: &Path,
     original: &str,
     force: usize,
 ) -> Result<()> {
-    let canonical = fs::canonicalize(path).ok();
-    for admin in collect_linked_worktree_admins(common_git_dir)? {
-        let matches = match (&canonical, fs::canonicalize(&admin.path).ok()) {
-            (Some(a), Some(b)) => *a == b,
-            _ => normalize_lexical_path(path) == normalize_lexical_path(&admin.path),
-        };
-        if !matches {
-            continue;
+    match sley_worktree::admin::plan_add_registration(snapshot, path, force) {
+        Ok(sley_worktree::admin::AddRegistrationPlan::Available) => Ok(()),
+        Ok(sley_worktree::admin::AddRegistrationPlan::Replace { admin_dir }) => {
+            fs::remove_dir_all(admin_dir)?;
+            Ok(())
         }
-        let locked = admin.locked_reason.is_some();
-        if (!locked && force >= 1) || (locked && force >= 2) {
-            fs::remove_dir_all(&admin.admin_dir)?;
-            return Ok(());
+        Err(error) => {
+            if error.locked {
+                eprintln!(
+                    "fatal: '{original}' is a missing but locked worktree;\nuse 'add -f -f' to override, or 'unlock' and 'prune' or 'remove' to clear"
+                );
+            } else {
+                eprintln!(
+                    "fatal: '{original}' is a missing but already registered worktree;\nuse 'add -f' to override, or 'prune' or 'remove' to clear"
+                );
+            }
+            Err(GitError::Exit(128))
         }
-        if locked {
-            eprintln!(
-                "fatal: '{original}' is a missing but locked worktree;\nuse 'add -f -f' to override, or 'unlock' and 'prune' or 'remove' to clear"
-            );
-        } else {
-            eprintln!(
-                "fatal: '{original}' is a missing but already registered worktree;\nuse 'add -f' to override, or 'prune' or 'remove' to clear"
-            );
-        }
-        return Err(GitError::Exit(128));
     }
-    Ok(())
 }
 
 /// Port of git's `write_worktree_linking_files` (worktree.c): write the
@@ -1908,10 +1821,33 @@ fn copy_worktree_config_for_new_worktree(
             });
         }
     }
-    config.sections.retain(|section| !section.entries.is_empty());
+    config
+        .sections
+        .retain(|section| !section.entries.is_empty());
     if !config.sections.is_empty() {
-        fs::write(admin_dir.join("config.worktree"), config.to_canonical_bytes())?;
+        fs::write(
+            admin_dir.join("config.worktree"),
+            config.to_canonical_bytes(),
+        )?;
     }
+    Ok(())
+}
+
+/// Copy the invoking worktree's per-worktree sparse patterns into the newly
+/// allocated linked-worktree admin directory.  `extensions.worktreeConfig`
+/// already causes [`copy_worktree_config_for_new_worktree`] to carry the
+/// enabling `core.sparseCheckout` and `index.sparse` knobs; the pattern file is
+/// the other half of that per-worktree state.
+fn copy_sparse_checkout_for_new_worktree(source_git_dir: &Path, admin_dir: &Path) -> Result<()> {
+    let source = source_git_dir.join("info").join("sparse-checkout");
+    if !source.is_file() {
+        return Ok(());
+    }
+    let destination = admin_dir.join("info").join("sparse-checkout");
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, destination)?;
     Ok(())
 }
 
@@ -1923,8 +1859,8 @@ fn run_worktree_add_post_checkout_hook(
 ) -> Result<()> {
     let old = ObjectId::null(format).to_hex();
     let new = new_head.to_hex();
-    let hook_cwd = fs::canonicalize(worktree_path)
-        .unwrap_or_else(|_| normalize_lexical_path(worktree_path));
+    let hook_cwd =
+        fs::canonicalize(worktree_path).unwrap_or_else(|_| normalize_lexical_path(worktree_path));
     commands::hooks::run_traditional_hook_at(
         admin_dir,
         "post-checkout",
@@ -2101,8 +2037,7 @@ pub(crate) fn branch_checked_out_worktree(
                 || normalize_lexical_path(path) == normalize_lexical_path(ignore)
         })
     };
-    if let Some(worktree) =
-        sley_worktree::find_shared_symref(common_git_dir, "HEAD", refname)?
+    if let Some(worktree) = sley_worktree::find_shared_symref(common_git_dir, "HEAD", refname)?
         && !is_ignored(&worktree.path)
     {
         return Ok(Some(
@@ -2245,12 +2180,18 @@ fn worktree_remove_has_local_changes(
     admin: &LinkedWorktreeAdmin,
     format: ObjectFormat,
 ) -> Result<bool> {
-    let index = read_repository_index(&admin.admin_dir, format)?.unwrap_or(Index {
+    let mut index = read_repository_index(&admin.admin_dir, format)?.unwrap_or(Index {
         version: 2,
         entries: Vec::new(),
         extensions: Vec::new(),
         checksum: None,
     });
+    // A collapsed sparse directory is still the complete set of tracked leaves
+    // for dirtiness purposes. Expand only this temporary view: removing a
+    // linked worktree must neither rewrite its index nor advertise a sparse
+    // expansion merely because it checked whether removal is safe.
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    sley_worktree::expand_sparse_index_view(&mut index, &db, format)?;
     let head = worktree_head_tree_entries(common_git_dir, &admin.admin_dir, format)?;
     let mut tracked = BTreeSet::new();
     for entry in &index.entries {
@@ -2260,6 +2201,9 @@ fn worktree_remove_has_local_changes(
             .is_none_or(|head_entry| head_entry.mode != entry.mode || head_entry.oid != entry.oid)
         {
             return Ok(true);
+        }
+        if entry.is_skip_worktree() {
+            continue;
         }
         let path = admin
             .path

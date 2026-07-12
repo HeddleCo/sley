@@ -23,10 +23,7 @@ use std::path::{Component, Path, PathBuf};
 
 use sley::GitConfig;
 
-use crate::{
-    explicit_git_dir, explicit_work_tree, git_env_bool, global_bare, is_git_dir_candidate,
-    read_gitdir_file, resolve_cli_path,
-};
+use crate::{git_env_bool, is_git_dir_candidate, read_gitdir_file, resolve_cli_path, session};
 
 /// The resolved repository layout, in git's trace terms.
 pub(crate) struct SetupResult {
@@ -65,20 +62,20 @@ enum Discovered {
 /// Resolve the effective repository layout from the current environment, mirroring
 /// git's `setup_git_directory_gently`. `None` means no repository was found (git's
 /// `nongit_ok` path) — callers that require a repo surface their own error.
-pub(crate) fn setup_git_directory() -> Option<SetupResult> {
-    let cwd = env::current_dir().ok()?;
-    let discovered = discover(&cwd)?;
+pub(crate) fn setup_git_directory(cli_session: &session::CliSession) -> Option<SetupResult> {
+    let cwd = cli_session.cwd().to_path_buf();
+    let discovered = discover(cli_session, &cwd)?;
     match discovered {
-        Discovered::Explicit { git_dir } => setup_explicit(&git_dir, &cwd),
-        Discovered::Found { dir, git_dir } => setup_discovered(&git_dir, &dir, &cwd),
-        Discovered::Bare { dir } => setup_bare(&dir, &cwd),
+        Discovered::Explicit { git_dir } => setup_explicit(cli_session, &git_dir, &cwd),
+        Discovered::Found { dir, git_dir } => setup_discovered(cli_session, &git_dir, &dir, &cwd),
+        Discovered::Bare { dir } => setup_bare(cli_session, &dir, &cwd),
     }
 }
 
 /// git's `setup_git_directory_gently_1`: decide explicit vs discovered vs bare.
-fn discover(cwd: &Path) -> Option<Discovered> {
+fn discover(cli_session: &session::CliSession, cwd: &Path) -> Option<Discovered> {
     // GIT_DIR / --git-dir set explicitly: no discovery, just validation.
-    if let Some(git_dir) = explicit_git_dir() {
+    if let Some(git_dir) = cli_session.explicit_git_dir() {
         if git_dir.as_os_str().is_empty() {
             return None;
         }
@@ -88,7 +85,7 @@ fn discover(cwd: &Path) -> Option<Discovered> {
     }
 
     // `git --bare`: treat cwd as the (bare) git dir.
-    if global_bare() {
+    if cli_session.explicit_bare() {
         if is_git_dir_candidate(cwd) {
             return Some(Discovered::Bare {
                 dir: cwd.to_path_buf(),
@@ -151,7 +148,11 @@ fn discover(cwd: &Path) -> Option<Discovered> {
 }
 
 /// git's `setup_explicit_git_dir`. `cwd` is the user's original cwd.
-fn setup_explicit(gitdirenv: &str, cwd: &Path) -> Option<SetupResult> {
+fn setup_explicit(
+    cli_session: &session::CliSession,
+    gitdirenv: &str,
+    cwd: &Path,
+) -> Option<SetupResult> {
     // A `.git` *file* named by GIT_DIR is resolved to its target (git's
     // read_gitfile in setup_explicit_git_dir).
     let gitdir_path = resolve_cli_path(cwd, gitdirenv);
@@ -176,7 +177,7 @@ fn setup_explicit(gitdirenv: &str, cwd: &Path) -> Option<SetupResult> {
 
     let worktree: Option<PathBuf>;
 
-    if let Some(work_tree_env) = explicit_work_tree() {
+    if let Some(work_tree_env) = cli_session.explicit_work_tree() {
         // #3,#7,...: explicit GIT_WORK_TREE / --work-tree wins.
         let wt = resolve_cli_path(cwd, &work_tree_env.to_string_lossy());
         worktree = Some(canonicalize_or(&wt));
@@ -274,7 +275,12 @@ fn bare_explicit_result(
 
 /// git's `setup_discovered_git_dir`. `dir` is the directory `.git` was found in,
 /// `cwd` the user's original cwd. `gitdir` is relative-to-`dir` (".git").
-fn setup_discovered(gitdir: &str, dir: &Path, cwd: &Path) -> Option<SetupResult> {
+fn setup_discovered(
+    cli_session: &session::CliSession,
+    gitdir: &str,
+    dir: &Path,
+    cwd: &Path,
+) -> Option<SetupResult> {
     let gitdir_dir = dir.join(gitdir);
     // The textual git_dir git resolves a gitfile to its target for repo->gitdir;
     // for trace purposes we resolve `.git`-file targets here.
@@ -302,8 +308,9 @@ fn setup_discovered(gitdir: &str, dir: &Path, cwd: &Path) -> Option<SetupResult>
     // --work-tree / GIT_WORK_TREE / core.worktree: defer to explicit handling,
     // but with the *discovered* git dir. git makes the gitdir a realpath when
     // dir != cwd; we pass the resolved git dir text so trace matches.
-    if explicit_work_tree().is_some() || effective_core_worktree.is_some() {
+    if cli_session.explicit_work_tree().is_some() || effective_core_worktree.is_some() {
         return setup_explicit_from_discovered(
+            cli_session,
             &effective_gitdir_text,
             &effective_gitdir_dir,
             is_bare,
@@ -362,6 +369,7 @@ fn setup_discovered(gitdir: &str, dir: &Path, cwd: &Path) -> Option<SetupResult>
 /// `setup_explicit_git_dir` with the (realpath'd) discovered git dir. We inline
 /// the explicit resolution using the already-known git dir + config.
 fn setup_explicit_from_discovered(
+    cli_session: &session::CliSession,
     gitdir_text: &str,
     gitdir_dir: &Path,
     is_bare: bool,
@@ -379,7 +387,7 @@ fn setup_explicit_from_discovered(
     };
 
     let worktree: Option<PathBuf>;
-    if let Some(work_tree_env) = explicit_work_tree() {
+    if let Some(work_tree_env) = cli_session.explicit_work_tree() {
         let wt = resolve_cli_path(cwd, &work_tree_env.to_string_lossy());
         worktree = Some(canonicalize_or(&wt));
     } else if is_bare {
@@ -441,20 +449,21 @@ fn setup_explicit_from_discovered(
 
 /// git's `setup_bare_git_dir`. cwd is inside a git directory; `dir` is the git
 /// directory that was found (could equal cwd or be an ancestor).
-fn setup_bare(dir: &Path, cwd: &Path) -> Option<SetupResult> {
+fn setup_bare(cli_session: &session::CliSession, dir: &Path, cwd: &Path) -> Option<SetupResult> {
     let (is_bare, core_worktree) = read_worktree_config(dir);
 
     // --work-tree / GIT_WORK_TREE / core.worktree re-route through explicit
     // setup with the bare git dir (git's setup_bare_git_dir: "if
     // getenv(GIT_WORK_TREE) || git_work_tree_cfg"). A core.worktree gives the
     // otherwise-bare repo a real worktree (#20a).
-    if explicit_work_tree().is_some() || core_worktree.is_some() {
+    if cli_session.explicit_work_tree().is_some() || core_worktree.is_some() {
         let gitdir_text = if dir == cwd {
             ".".to_string()
         } else {
             path_to_string(dir)
         };
         return setup_explicit_from_discovered(
+            cli_session,
             &gitdir_text,
             dir,
             is_bare,

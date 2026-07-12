@@ -97,8 +97,11 @@ struct PatchIdOptions {
 }
 
 /// Entry point for `git patch-id`.
-pub(crate) fn cmd_patch_id(args: &[String]) -> Result<()> {
-    let options = match parse_patch_id_args(args)? {
+pub(crate) fn cmd_patch_id(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let options = match parse_patch_id_args(cli_session, args)? {
         PatchIdInvocation::Run(options) => options,
         PatchIdInvocation::Help => {
             // `-h` prints usage to stdout and exits 129, like git's parse-options.
@@ -110,7 +113,7 @@ pub(crate) fn cmd_patch_id(args: &[String]) -> Result<()> {
 
     // patch-id works outside a repository; the hash width then follows SHA-1, the
     // same default git uses when there is no object-format to consult.
-    let format = patch_id_object_format()?;
+    let format = patch_id_object_format(cli_session)?;
 
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;
@@ -182,7 +185,10 @@ enum PatchIdInvocation {
 /// mode flags are mutually exclusive, unambiguous prefixes are accepted, repeated
 /// identical flags are fine, `--` ends option parsing, and any leftover operands
 /// are ignored. Unknown options/switches and incompatible combinations exit 129.
-fn parse_patch_id_args(args: &[String]) -> Result<PatchIdInvocation> {
+fn parse_patch_id_args(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<PatchIdInvocation> {
     // The mode flag seen first on the command line, retained so a later,
     // *different* mode flag can be reported against it in declaration order.
     let mut chosen: Option<PatchIdMode> = None;
@@ -233,7 +239,7 @@ fn parse_patch_id_args(args: &[String]) -> Result<PatchIdInvocation> {
             stable: true,
             verbatim: true,
         },
-        None => patch_id_config_defaults()?,
+        None => patch_id_config_defaults(cli_session)?,
     };
     Ok(PatchIdInvocation::Run(options))
 }
@@ -299,10 +305,10 @@ fn patch_id_unknown_switch_error(switch: char) -> Result<PatchIdInvocation> {
 /// An unset value defaults to unstable/non-verbatim, matching git. `verbatim`
 /// implies `stable`. A value that is set but not a valid boolean is fatal with
 /// git's exact "bad boolean config value" message.
-fn patch_id_config_defaults() -> Result<PatchIdOptions> {
+fn patch_id_config_defaults(cli_session: &crate::session::CliSession) -> Result<PatchIdOptions> {
     let mut stable = false;
     let mut verbatim = false;
-    if let Ok(git_dir) = crate::session::cli_git_dir()
+    if let Ok(git_dir) = cli_session.git_dir()
         && let Ok(config) = read_repo_config(&git_dir)
     {
         if let Some(value) = config.get_entry("patchid", None, "stable") {
@@ -343,8 +349,8 @@ fn interpret_patch_id_bool(key: &str, value: Option<&str>) -> Result<bool> {
 /// The hash algorithm patch-id should use: the repository's object format when in
 /// a repository, else SHA-1 (git's choice with no repository to consult). A
 /// repository whose config cannot be read falls back to SHA-1 as well.
-fn patch_id_object_format() -> Result<ObjectFormat> {
-    match crate::session::cli_git_dir() {
+fn patch_id_object_format(cli_session: &crate::session::CliSession) -> Result<ObjectFormat> {
+    match cli_session.git_dir() {
         Ok(git_dir) => Ok(repository_object_format(&git_dir).unwrap_or(ObjectFormat::Sha1)),
         Err(_) => Ok(ObjectFormat::Sha1),
     }

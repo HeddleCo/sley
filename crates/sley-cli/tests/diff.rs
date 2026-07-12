@@ -1794,6 +1794,135 @@ fn diff_patch_hunk_ranges_for_single_line_changes_match_upstream_git() {
 }
 
 #[test]
+fn diff_interhunk_context_config_matches_upstream_git() {
+    let root = unique_temp_dir("diff-interhunk-context-config");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("file"), b"A\n1\nB\n").expect("write base fixture");
+        git(&root, &["add", "file"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+        fs::write(root.join("file"), b"X\n1\nY\n").expect("write changed fixture");
+
+        git(&root, &["config", "diff.interHunkContext", "1"]);
+        for args in [
+            vec!["diff", "-U0", "file"],
+            vec!["diff", "-U0", "--inter-hunk-context=0", "file"],
+        ] {
+            assert_eq!(
+                sley(&root, &args),
+                git(&root, &args),
+                "sley output differed for {args:?}"
+            );
+        }
+
+        let old_oid = utf8_trimmed(git(&root, &["rev-parse", "HEAD:file"]));
+        let new_oid = utf8_trimmed(git(&root, &["hash-object", "-w", "file"]));
+        let blob_args = ["diff", "-U0", old_oid.as_str(), new_oid.as_str()];
+        assert_eq!(
+            sley(&root, &blob_args),
+            git(&root, &blob_args),
+            "configured inter-hunk context differed for direct blobs"
+        );
+
+        for invalid in ["invalid", "-1", "2147483648", "999999999999999999999999"] {
+            git(&root, &["config", "diff.interHunkContext", invalid]);
+            let expected = run_status(sley_testkit::oracle_git(), &root, &["diff"]);
+            let actual = run_status(sley_testkit::sley_bin!(), &root, &["diff"]);
+            assert_eq!(actual, expected, "diagnostic differed for {invalid:?}");
+        }
+
+        git(&root, &["config", "--unset", "diff.interHunkContext"]);
+        for invalid in ["invalid", "-1", "2147483648"] {
+            let config = format!("diff.interHunkContext={invalid}");
+            let args = ["-c", config.as_str(), "diff"];
+            assert_eq!(
+                run_status(sley_testkit::sley_bin!(), &root, &args),
+                run_status(sley_testkit::oracle_git(), &root, &args),
+                "command-line diagnostic differed for {invalid:?}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn diff_direct_blob_pairs_match_upstream_git() {
+    let root = unique_temp_dir("diff-direct-blob-pairs");
+    fs::create_dir_all(&root).expect("create temp repo");
+    git(&root, &["init", "-q", "-b", "main"]);
+
+    fs::write(root.join("old.txt"), b"old\n").expect("write old blob");
+    fs::write(root.join("new.txt"), b"new\n").expect("write new blob");
+    fs::write(root.join("old.bin"), b"old\0binary\n").expect("write old binary blob");
+    fs::write(root.join("new.bin"), b"new\0binary\n").expect("write new binary blob");
+    let old = utf8_trimmed(git(&root, &["hash-object", "-w", "old.txt"]));
+    let new = utf8_trimmed(git(&root, &["hash-object", "-w", "new.txt"]));
+    let old_binary = utf8_trimmed(git(&root, &["hash-object", "-w", "old.bin"]));
+    let new_binary = utf8_trimmed(git(&root, &["hash-object", "-w", "new.bin"]));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root.join("new.txt"), fs::Permissions::from_mode(0o755))
+            .expect("make worktree file executable");
+    }
+
+    let cases = [
+        vec!["diff", old.as_str(), new.as_str()],
+        vec!["diff", "-R", old.as_str(), new.as_str()],
+        vec!["diff", old_binary.as_str(), new_binary.as_str()],
+        vec!["diff", old.as_str(), "new.txt"],
+        vec!["diff", "-R", old.as_str(), "new.txt"],
+        vec!["diff", "new.txt", old.as_str()],
+        vec!["diff", "-R", "new.txt", old.as_str()],
+    ];
+    for args in cases {
+        assert_eq!(
+            run_status(sley_testkit::sley_bin!(), &root, &args),
+            run_status(sley_testkit::oracle_git(), &root, &args),
+            "direct blob output differed for {args:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("new.txt", root.join("link")).expect("create symlink");
+        for args in [
+            vec!["diff", old.as_str(), "link"],
+            vec!["diff", "link", old.as_str()],
+        ] {
+            assert_eq!(
+                run_status(sley_testkit::sley_bin!(), &root, &args),
+                run_status(sley_testkit::oracle_git(), &root, &args),
+                "direct blob/symlink output differed for {args:?}"
+            );
+        }
+    }
+
+    fs::create_dir(root.join("directory")).expect("create directory fixture");
+    let args = ["diff", old.as_str(), "directory"];
+    assert_eq!(
+        run_status(sley_testkit::sley_bin!(), &root, &args),
+        run_status(sley_testkit::oracle_git(), &root, &args),
+        "non-file diagnostic differed"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn diff_patch_mode_changes_match_upstream_git() {
     let root = unique_temp_dir("diff-patch-mode-changes");
     fs::create_dir_all(&root).expect("create temp repo");
@@ -2843,6 +2972,71 @@ fn diff_two_tree_uses_committed_content_not_dirty_worktree() {
             "sley diff diverged from git for {args:?} (dirty worktree)",
         );
     }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn diff_outside_repository_implicitly_uses_no_index() {
+    let root = unique_temp_dir("diff-implicit-no-index-outside-repository");
+    fs::create_dir_all(&root).expect("create non-repository root");
+    fs::write(root.join("one"), b"one\n").expect("write old side");
+    fs::write(root.join("two"), b"two\n").expect("write new side");
+
+    let run = |program: &str| {
+        Command::new(program)
+            .current_dir(&root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .args(["diff", "one", "two"])
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {program}: {err}"))
+    };
+    let oracle = run(sley_testkit::oracle_git());
+    let actual = run(sley_testkit::sley_bin!());
+    assert_eq!(actual.status.code(), oracle.status.code());
+    assert_eq!(actual.stdout, oracle.stdout);
+    assert_eq!(actual.stderr, oracle.stderr);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn diff_no_index_external_diff_uses_repository_object_format_for_null_ids() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = unique_temp_dir("diff-no-index-external-sha256-null-ids");
+    fs::create_dir_all(&root).expect("create repository root");
+    git(
+        &root,
+        &["init", "-q", "-b", "main", "--object-format=sha256"],
+    );
+    fs::write(root.join("executable"), b"content\n").expect("write executable side");
+    fs::write(root.join("not-executable"), b"content\n").expect("write regular side");
+    let mut permissions = fs::metadata(root.join("executable"))
+        .expect("stat executable side")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(root.join("executable"), permissions).expect("chmod executable side");
+
+    let args = [
+        "-c",
+        "diff.external=echo diff",
+        "diff",
+        "--no-index",
+        "executable",
+        "not-executable",
+    ];
+    let oracle = run_status(sley_testkit::oracle_git(), &root, &args);
+    let actual = run_status(sley_testkit::sley_bin!(), &root, &args);
+    assert_eq!(actual, oracle);
+    assert_eq!(actual.0, 1);
+    assert!(
+        String::from_utf8_lossy(&actual.1).contains(&"0".repeat(64)),
+        "external diff did not receive SHA-256-width null ids: {}",
+        String::from_utf8_lossy(&actual.1),
+    );
+
     let _ = fs::remove_dir_all(&root);
 }
 

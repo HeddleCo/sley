@@ -21,7 +21,10 @@ fn parse_color_red() {
 
 #[test]
 fn parse_color_bold_green() {
-    assert_eq!(parse_color_value("bold green"), Some("\x1b[1;32m".to_string()));
+    assert_eq!(
+        parse_color_value("bold green"),
+        Some("\x1b[1;32m".to_string())
+    );
 }
 
 #[test]
@@ -51,7 +54,10 @@ fn parse_color_dim() {
 
 #[test]
 fn parse_color_blue_background() {
-    assert_eq!(parse_color_value("red blue"), Some("\x1b[31;44m".to_string()));
+    assert_eq!(
+        parse_color_value("red blue"),
+        Some("\x1b[31;44m".to_string())
+    );
 }
 
 #[test]
@@ -126,6 +132,14 @@ fn default_funcname_heading_dollar_prefix() {
         default_funcname_heading(b"$injector\n"),
         Some(b"$injector".to_vec())
     );
+}
+
+#[test]
+fn default_funcname_heading_truncates_at_utf8_boundary() {
+    let line = [b"L  ".as_slice(), "日本語".repeat(13).as_bytes(), b"\n"].concat();
+    let heading = default_funcname_heading(&line).expect("heading");
+    assert!(std::str::from_utf8(&heading).is_ok());
+    assert_eq!(heading.len(), 78);
 }
 
 #[test]
@@ -285,7 +299,8 @@ fn parse_color_normal_then_cyan() {
 
 #[test]
 fn compiled_funcname_capture_group() {
-    let compiled = CompiledFuncname::compile(b"^[[:space:]]*(func.*)", true, false).expect("compile");
+    let compiled =
+        CompiledFuncname::compile(b"^[[:space:]]*(func.*)", true, false).expect("compile");
     assert_eq!(
         compiled.match_line(b"  func foo()\n"),
         Some(b"func foo()".to_vec())

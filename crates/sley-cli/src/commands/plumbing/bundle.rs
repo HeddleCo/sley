@@ -2,16 +2,16 @@
 
 use crate::*;
 
-pub(crate) fn cmd_bundle(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_bundle(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let Some(subcommand) = args.first().map(String::as_str) else {
         print_bundle_usage();
         return Err(GitError::Exit(129));
     };
     match subcommand {
-        "create" => cmd_bundle_create(&args[1..]),
-        "verify" => cmd_bundle_verify(&args[1..]),
+        "create" => cmd_bundle_create(cli_session, &args[1..]),
+        "verify" => cmd_bundle_verify(cli_session, &args[1..]),
         "list-heads" => cmd_bundle_list_heads(&args[1..]),
-        "unbundle" => cmd_bundle_unbundle(&args[1..]),
+        "unbundle" => cmd_bundle_unbundle(cli_session, &args[1..]),
         _ => {
             print_bundle_usage();
             Err(GitError::Exit(129))
@@ -37,7 +37,7 @@ fn bundle_usage_error(usage: &str) -> Result<()> {
     eprint!("{usage}");
     Err(GitError::Exit(129))
 }
-fn cmd_bundle_create(args: &[String]) -> Result<()> {
+fn cmd_bundle_create(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut progress = false;
     let mut version = None;
@@ -75,12 +75,17 @@ fn cmd_bundle_create(args: &[String]) -> Result<()> {
     let Some(path) = path else {
         return bundle_usage_error(BUNDLE_CREATE_USAGE);
     };
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let options = parse_bundle_revision_args(&rev_args)?;
-    let selection = bundle_create_selection(&git_dir, format, &db, &options)?;
+    let selection = bundle_create_selection(
+        &git_dir,
+        format,
+        &db,
+        cli_session.replace_objects(),
+        &options,
+    )?;
     if selection.references.is_empty() {
         eprintln!("fatal: Refusing to create empty bundle.");
         return Err(GitError::Exit(128));
@@ -143,7 +148,7 @@ fn cmd_bundle_create(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_bundle_verify(args: &[String]) -> Result<()> {
+fn cmd_bundle_verify(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut path = None;
     for arg in args {
@@ -160,8 +165,7 @@ fn cmd_bundle_verify(args: &[String]) -> Result<()> {
     let Some(path) = path else {
         return bundle_usage_error(BUNDLE_VERIFY_USAGE);
     };
-    let cwd = env::current_dir()?;
-    let git_dir = match crate::session::cli_git_dir_from(&cwd) {
+    let git_dir = match cli_session.git_dir() {
         Ok(git_dir) => git_dir,
         Err(_) => {
             eprintln!("error: need a repository to verify a bundle");
@@ -188,7 +192,7 @@ fn cmd_bundle_list_heads(args: &[String]) -> Result<()> {
     print_bundle_refs(&bundle.references, refs)
 }
 
-fn cmd_bundle_unbundle(args: &[String]) -> Result<()> {
+fn cmd_bundle_unbundle(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut progress = false;
     let mut path = None;
     let mut refs = Vec::new();
@@ -205,8 +209,7 @@ fn cmd_bundle_unbundle(args: &[String]) -> Result<()> {
     let Some(path) = path else {
         return bundle_usage_error(BUNDLE_UNBUNDLE_USAGE);
     };
-    let cwd = env::current_dir()?;
-    let git_dir = match crate::session::cli_git_dir_from(&cwd) {
+    let git_dir = match cli_session.git_dir() {
         Ok(git_dir) => git_dir,
         Err(_) => {
             eprintln!("fatal: Need a repository to unbundle.");
@@ -395,7 +398,11 @@ fn parse_bundle_since(value: &str) -> Option<i64> {
     crate::commands::approxidate::parse_commit_date(value).map(|(timestamp, _)| timestamp)
 }
 
-fn bundle_all_references(git_dir: &Path, format: ObjectFormat) -> Result<Vec<BundleReference>> {
+fn bundle_all_references(
+    git_dir: &Path,
+    format: ObjectFormat,
+    replace_objects: bool,
+) -> Result<Vec<BundleReference>> {
     let store = FileRefStore::new(git_dir, format);
     let mut references = Vec::new();
     for reference in store.list_refs()? {
@@ -406,7 +413,7 @@ fn bundle_all_references(git_dir: &Path, format: ObjectFormat) -> Result<Vec<Bun
             });
         }
     }
-    if let Ok(oid) = resolve_revision(git_dir, format, "HEAD") {
+    if let Ok(oid) = resolve_revision(git_dir, format, "HEAD", replace_objects) {
         references.push(BundleReference {
             oid,
             name: "HEAD".into(),
@@ -433,10 +440,11 @@ fn bundle_create_selection(
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
+    replace_objects: bool,
     options: &BundleRevisionOptions,
 ) -> Result<BundleCreateSelection> {
     let mut includes = if options.all {
-        bundle_all_references(git_dir, format)?
+        bundle_all_references(git_dir, format, replace_objects)?
             .into_iter()
             .map(|reference| BundleSpec {
                 oid: reference.oid,
@@ -453,6 +461,7 @@ fn bundle_create_selection(
             git_dir,
             format,
             db,
+            replace_objects,
             spec,
             options.ignore_missing,
             &mut includes,
@@ -490,6 +499,7 @@ fn add_bundle_revision_spec(
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
+    replace_objects: bool,
     spec: &str,
     ignore_missing: bool,
     includes: &mut Vec<BundleSpec>,
@@ -501,7 +511,7 @@ fn add_bundle_revision_spec(
                 "bundle create excludes require a revision".into(),
             ));
         }
-        match resolve_revision(git_dir, format, excluded) {
+        match resolve_revision(git_dir, format, excluded, replace_objects) {
             Ok(oid) => excludes.push(oid),
             Err(err) if ignore_missing => {
                 let _ = err;
@@ -511,7 +521,7 @@ fn add_bundle_revision_spec(
         return Ok(());
     }
     if let Some(base) = spec.strip_suffix("^!") {
-        let oid = resolve_revision(git_dir, format, base)?;
+        let oid = resolve_revision(git_dir, format, base, replace_objects)?;
         includes.push(BundleSpec {
             oid,
             name: bundle_display_ref(git_dir, format, base, oid)?,
@@ -532,8 +542,8 @@ fn add_bundle_revision_spec(
     {
         let left = if left.is_empty() { "HEAD" } else { left };
         let right = if right.is_empty() { "HEAD" } else { right };
-        excludes.push(resolve_revision(git_dir, format, left)?);
-        let oid = resolve_revision(git_dir, format, right)?;
+        excludes.push(resolve_revision(git_dir, format, left, replace_objects)?);
+        let oid = resolve_revision(git_dir, format, right, replace_objects)?;
         includes.push(BundleSpec {
             oid,
             name: bundle_display_ref(git_dir, format, right, oid)?,
@@ -541,7 +551,7 @@ fn add_bundle_revision_spec(
         });
         return Ok(());
     }
-    let oid = match resolve_revision(git_dir, format, spec) {
+    let oid = match resolve_revision(git_dir, format, spec, replace_objects) {
         Ok(oid) => oid,
         Err(err) if ignore_missing => {
             let _ = err;

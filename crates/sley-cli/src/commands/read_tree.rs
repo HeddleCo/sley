@@ -30,9 +30,6 @@
 use crate::*;
 use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_rev, sley_worktree};
 
-/// A flat map from a repository-relative path to a tree leaf's `(mode, oid)`.
-type LeafMap = BTreeMap<Vec<u8>, (u32, ObjectId)>;
-
 /// Which top-level operation `read-tree` should perform. These mirror git's
 /// `--reset` / `--prefix` / `-m` switches, which are mutually exclusive.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,23 +66,12 @@ struct ReadTreeArgs {
     trees: Vec<String>,
 }
 
-/// A single resolved index entry destined for stage 0/1/2/3.
-#[derive(Debug, Clone)]
-struct StagedEntry {
-    mode: u32,
-    oid: ObjectId,
-    stage: u8,
-    /// git's `ce_stat_data` for this entry: carried forward from the source
-    /// index on a kept entry, or filled from the post-write `lstat` after a
-    /// `-u` worktree apply. `None` serializes as an all-zero stat (a fresh /
-    /// not-yet-refreshed entry, which `diff-files` treats as racily clean).
-    stat: Option<sley_unpack_trees::StatInfo>,
-}
+type StagedEntry = sley_worktree::ReadTreeEntry;
 
-pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_read_tree(cli_session: &session::CliSession, args: &[String]) -> Result<()> {
     let parsed = parse_read_tree_args(args)?;
 
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let git_dir = repo.git_dir();
     let format = repo.format();
     let db = repo.objects();
@@ -97,7 +83,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
 
     // `--empty` (and the deprecated no-argument spelling) just clears the index.
     if parsed.empty {
-        write_paired_entries(git_dir, format, Vec::new())?;
+        sley_worktree::persist_read_tree_entries(git_dir, format, Vec::new())?;
         return Ok(());
     }
 
@@ -124,11 +110,20 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
 
     match &parsed.mode {
         ReadTreeMode::Read => {
-            let entries = read_tree_overlay(db, format, repo.config(), &tree_oids)?;
+            let entries = plan_read_tree_entries(
+                &repo,
+                &tree_oids,
+                sley_worktree::ReadTreeTransitionMode::Overlay,
+            )?;
             if !parsed.dry_run {
-                write_paired_entries(git_dir, format, entries)?;
+                sley_worktree::persist_read_tree_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
-                    apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
+                    apply_read_tree_sparse_checkout(
+                        repo.worktree_root()?,
+                        git_dir,
+                        format,
+                        repo.config(),
+                    )?;
                 }
             }
         }
@@ -136,11 +131,15 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             // `--reset` accepts up to three trees but only the resulting union
             // matters; higher-stage entries are simply dropped (we never create
             // them here). With `-u` the worktree is updated to match.
-            let mut entries = read_tree_overlay(db, format, repo.config(), &tree_oids)?;
+            let mut entries = plan_read_tree_entries(
+                &repo,
+                &tree_oids,
+                sley_worktree::ReadTreeTransitionMode::Overlay,
+            )?;
             if apply_worktree {
-                let worktree_root = worktree_root_for_git_dir(git_dir)?;
+                let worktree_root = repo.worktree_root()?;
                 let reset_result = reset_worktree_to_entries(
-                    &worktree_root,
+                    worktree_root,
                     git_dir,
                     format,
                     db,
@@ -159,7 +158,7 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                     // reported as a phantom modification (`ie_match_stat` compares
                     // size+mtime, not content).
                     let _ = sley_worktree::refresh_index_paths(
-                        &worktree_root,
+                        worktree_root,
                         git_dir,
                         format,
                         &[],
@@ -171,19 +170,27 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                 reset_result?;
             }
             if !parsed.dry_run {
-                write_paired_entries(git_dir, format, entries)?;
+                sley_worktree::persist_read_tree_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
-                    apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
+                    apply_read_tree_sparse_checkout(
+                        repo.worktree_root()?,
+                        git_dir,
+                        format,
+                        repo.config(),
+                    )?;
                 }
             }
         }
         ReadTreeMode::Prefix(prefix) => {
-            let mut entries =
-                read_tree_prefix(git_dir, format, db, repo.config(), &tree_oids, prefix)?;
+            let mut entries = plan_read_tree_entries(
+                &repo,
+                &tree_oids,
+                sley_worktree::ReadTreeTransitionMode::Prefix(prefix.clone()),
+            )?;
             if apply_worktree {
-                let worktree_root = worktree_root_for_git_dir(git_dir)?;
+                let worktree_root = repo.worktree_root()?;
                 update_worktree_for_entries(
-                    &worktree_root,
+                    worktree_root,
                     git_dir,
                     format,
                     db,
@@ -194,9 +201,14 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                 )?;
             }
             if !parsed.dry_run {
-                write_paired_entries(git_dir, format, entries)?;
+                sley_worktree::persist_read_tree_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
-                    apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
+                    apply_read_tree_sparse_checkout(
+                        repo.worktree_root()?,
+                        git_dir,
+                        format,
+                        repo.config(),
+                    )?;
                 }
             }
         }
@@ -206,6 +218,11 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
             // oneway/twoway/threeway_merge). The engine computes the result
             // index and the worktree update plan; we apply the plan with `-u`.
             let entries = merge_trees(
+                if parsed.index_only {
+                    repo.worktree_root().ok()
+                } else {
+                    Some(repo.worktree_root()?)
+                },
                 git_dir,
                 format,
                 db,
@@ -213,12 +230,18 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
                 &tree_oids,
                 apply_worktree,
                 parsed.index_only,
+                parsed.sparse_checkout,
                 recurse_submodules,
             )?;
             if !parsed.dry_run {
-                write_paired_entries(git_dir, format, entries)?;
+                sley_worktree::persist_read_tree_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
-                    apply_read_tree_sparse_checkout(git_dir, format, repo.config())?;
+                    apply_read_tree_sparse_checkout(
+                        repo.worktree_root()?,
+                        git_dir,
+                        format,
+                        repo.config(),
+                    )?;
                 }
             }
         }
@@ -227,7 +250,53 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+struct CliReadTreeDiagnostics;
+
+impl sley_worktree::ReadTreeDiagnostics for CliReadTreeDiagnostics {
+    fn invalid_path(&mut self, path: &[u8]) {
+        eprintln!("error: invalid path '{}'", String::from_utf8_lossy(path));
+    }
+}
+
+fn plan_read_tree_entries(
+    repo: &RepositoryContext,
+    tree_oids: &[ObjectId],
+    mode: sley_worktree::ReadTreeTransitionMode,
+) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
+    let mut diagnostics = CliReadTreeDiagnostics;
+    Ok(
+        map_read_tree_transition_result(sley_worktree::plan_read_tree_transition(
+            repo.git_dir(),
+            repo.format(),
+            repo.objects(),
+            repo.config(),
+            sley_worktree::ReadTreeTransitionOptions { mode, tree_oids },
+            &mut diagnostics,
+        ))?
+        .entries,
+    )
+}
+
+fn map_read_tree_transition_result<T>(
+    result: sley_worktree::ReadTreeTransitionResult<T>,
+) -> Result<T> {
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(sley_worktree::ReadTreeTransitionError::InvalidPath(_)) => Err(GitError::Exit(128)),
+        Err(sley_worktree::ReadTreeTransitionError::BindOverlap { incoming, existing }) => {
+            eprintln!(
+                "error: Entry '{}' overlaps with '{}'.  Cannot bind.",
+                String::from_utf8_lossy(&incoming),
+                String::from_utf8_lossy(&existing)
+            );
+            Err(GitError::Exit(128))
+        }
+        Err(sley_worktree::ReadTreeTransitionError::Engine(error)) => Err(error),
+    }
+}
+
 fn apply_read_tree_sparse_checkout(
+    worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     config: &GitConfig,
@@ -275,8 +344,7 @@ fn apply_read_tree_sparse_checkout(
         patterns,
         sparse_index,
     };
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
-    sley_worktree::apply_sparse_checkout_with_mode(&worktree_root, git_dir, format, &sparse, mode)?;
+    sley_worktree::apply_sparse_checkout_with_mode(worktree_root, git_dir, format, &sparse, mode)?;
     Ok(())
 }
 
@@ -491,288 +559,6 @@ fn read_tree_check_cache_tree() -> bool {
     )
 }
 
-/// Convert a leaf map to sorted stage-0 `(path, entry)` pairs.
-fn leaves_to_stage0(leaves: LeafMap) -> Vec<(Vec<u8>, StagedEntry)> {
-    leaves
-        .into_iter()
-        .map(|(path, (mode, oid))| (path, stage0(mode, oid)))
-        .collect()
-}
-
-/// Overlay the listed trees into a single stage-0 index, with later trees
-/// winning on path collisions (git's non-merge multi-tree read).
-fn read_tree_overlay(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    config: &GitConfig,
-    tree_oids: &[ObjectId],
-) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
-    let path_rules = ReadTreePathRules::from_config(config);
-    let mut merged: LeafMap = BTreeMap::new();
-    for tree_oid in tree_oids {
-        for (path, value) in sley_diff_merge::flatten_tree(db, format, tree_oid)? {
-            verify_read_tree_path(&path, value.0, path_rules)?;
-            merged.insert(path, value);
-        }
-    }
-    Ok(leaves_to_stage0(merged))
-}
-
-/// Overlay a single tree (or up to three, last-wins) under `prefix` into the
-/// *current* index (stage 0), keeping every existing entry; on an exact path
-/// collision the new tree wins.
-fn read_tree_prefix(
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
-    config: &GitConfig,
-    tree_oids: &[ObjectId],
-    prefix: &[u8],
-) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
-    let path_rules = ReadTreePathRules::from_config(config);
-    let mut merged: LeafMap = current_index_stage0(git_dir, format)?;
-
-    // `prefix` is normalized to end in `/`; the root prefix is the sentinel
-    // "/", which means "no path prefix".
-    let real_prefix: &[u8] = if prefix == b"/" { b"" } else { prefix };
-
-    for tree_oid in tree_oids {
-        for (path, value) in sley_diff_merge::flatten_tree(db, format, tree_oid)? {
-            let mut full = real_prefix.to_vec();
-            full.extend_from_slice(&path);
-            verify_read_tree_path(&full, value.0, path_rules)?;
-            merged.insert(full, value);
-        }
-    }
-
-    Ok(leaves_to_stage0(merged))
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ReadTreePathRules {
-    protect_hfs: bool,
-    protect_ntfs: bool,
-}
-
-impl ReadTreePathRules {
-    fn from_config(config: &GitConfig) -> Self {
-        Self {
-            protect_hfs: config.get_bool("core", None, "protectHFS").unwrap_or(false),
-            protect_ntfs: config
-                .get_bool("core", None, "protectNTFS")
-                .unwrap_or(false),
-        }
-    }
-}
-
-/// git's `verify_path()` check for tree entries read into the index. It rejects
-/// paths that would address `.git` (or its HFS/NTFS aliases), `.`/`..`, or an
-/// embedded NUL before any index/worktree mutation.
-fn verify_read_tree_path(path: &[u8], mode: u32, rules: ReadTreePathRules) -> Result<()> {
-    if path.is_empty() || path.contains(&0) {
-        return invalid_read_tree_path(path);
-    }
-
-    for component in path.split(|&byte| byte == b'/') {
-        if component.is_empty() || component == b"." || component == b".." {
-            return invalid_read_tree_path(path);
-        }
-        if component.eq_ignore_ascii_case(b".git") {
-            return invalid_read_tree_path(path);
-        }
-        if rules.protect_hfs && is_hfs_dotgit(component) {
-            return invalid_read_tree_path(path);
-        }
-        if rules.protect_ntfs && is_ntfs_dotgit(component) {
-            return invalid_read_tree_path(path);
-        }
-        if mode == 0o120000 {
-            if rules.protect_hfs && is_hfs_dotgitmodules(component) {
-                return invalid_read_tree_path(path);
-            }
-            if rules.protect_ntfs && is_ntfs_dotgitmodules(component) {
-                return invalid_read_tree_path(path);
-            }
-            if component.eq_ignore_ascii_case(b".gitmodules") {
-                return invalid_read_tree_path(path);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn invalid_read_tree_path(path: &[u8]) -> Result<()> {
-    eprintln!("error: invalid path '{}'", String::from_utf8_lossy(path));
-    Err(GitError::Exit(128))
-}
-
-fn is_hfs_dotgit(name: &[u8]) -> bool {
-    strip_hfs_ignorable(name).eq_ignore_ascii_case(b".git")
-}
-
-fn is_hfs_dotgitmodules(name: &[u8]) -> bool {
-    strip_hfs_ignorable(name).eq_ignore_ascii_case(b".gitmodules")
-}
-
-fn is_ntfs_dotgit(name: &[u8]) -> bool {
-    for segment in name.split(|&byte| byte == b'\\') {
-        let stream_name = segment
-            .iter()
-            .position(|&byte| byte == b':')
-            .map_or(segment, |colon| &segment[..colon]);
-        let mut end = stream_name.len();
-        while end > 0 && (stream_name[end - 1] == b'.' || stream_name[end - 1] == b' ') {
-            end -= 1;
-        }
-        let trimmed = &stream_name[..end];
-        if trimmed.eq_ignore_ascii_case(b".git") || trimmed.eq_ignore_ascii_case(b"git~1") {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_ntfs_dotgitmodules(name: &[u8]) -> bool {
-    is_ntfs_dot_name(name, b".gitmodules", b"gitmodules", b"gi7eba")
-}
-
-fn is_ntfs_dot_name(name: &[u8], long: &[u8], short_base: &[u8], fallback: &[u8]) -> bool {
-    for segment in name.split(|&byte| byte == b'\\') {
-        let stream_name = segment
-            .iter()
-            .position(|&byte| byte == b':')
-            .map_or(segment, |colon| &segment[..colon]);
-        let mut end = stream_name.len();
-        while end > 0 && (stream_name[end - 1] == b'.' || stream_name[end - 1] == b' ') {
-            end -= 1;
-        }
-        let trimmed = &stream_name[..end];
-        if trimmed.eq_ignore_ascii_case(long) {
-            return true;
-        }
-        if short_base.len() >= 6
-            && trimmed.len() == 8
-            && trimmed[..6].eq_ignore_ascii_case(&short_base[..6])
-            && trimmed[6] == b'~'
-            && matches!(trimmed[7], b'1'..=b'4')
-        {
-            return true;
-        }
-        if trimmed.len() == 8 && trimmed[..fallback.len()].eq_ignore_ascii_case(fallback) {
-            let mut saw_tilde = false;
-            let mut ok = true;
-            for byte in trimmed.iter().take(8).skip(fallback.len()) {
-                if saw_tilde {
-                    ok &= byte.is_ascii_digit();
-                } else if *byte == b'~' {
-                    saw_tilde = true;
-                } else {
-                    ok = false;
-                }
-            }
-            if ok && saw_tilde {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn strip_hfs_ignorable(name: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(name) else {
-        return name.to_vec();
-    };
-    text.chars()
-        .filter(|ch| !is_hfs_ignorable(*ch))
-        .collect::<String>()
-        .into_bytes()
-}
-
-fn is_hfs_ignorable(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x200c | 0x200d | 0x200e | 0x200f | 0x202a..=0x202e | 0x206a..=0x206f
-        | 0xfeff | 0x00ad | 0x034f | 0x115f | 0x1160 | 0x17b4 | 0x17b5 | 0x2060..=0x2064
-    )
-}
-
-/// Read the current on-disk index's stage-0 entries into a path -> (mode, oid)
-/// map (used as the base for `--prefix` and the merge "current" side). A missing
-/// index yields an empty map.
-fn current_index_stage0(git_dir: &Path, format: ObjectFormat) -> Result<LeafMap> {
-    let mut out = BTreeMap::new();
-    if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
-        for entry in index.entries {
-            if entry_stage(&entry) == 0 {
-                out.insert(entry.path.into_bytes(), (entry.mode, entry.oid));
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// git's `ce_stat_data` for a parsed on-disk index entry: the cached `lstat`
-/// fields the merge must carry forward so a kept entry stays `diff-files`-clean.
-fn stat_info_from_index_entry(entry: &IndexEntry) -> sley_unpack_trees::StatInfo {
-    sley_unpack_trees::StatInfo {
-        ctime_seconds: entry.ctime_seconds,
-        ctime_nanoseconds: entry.ctime_nanoseconds,
-        mtime_seconds: entry.mtime_seconds,
-        mtime_nanoseconds: entry.mtime_nanoseconds,
-        dev: entry.dev,
-        ino: entry.ino,
-        uid: entry.uid,
-        gid: entry.gid,
-        size: entry.size,
-    }
-}
-
-/// Read the current on-disk index's stage-0 entries into the engine's
-/// [`sley_unpack_trees::FlatIndex`] — path → `(mode, oid, cached stat)` — so a
-/// `read-tree -m` carries each kept entry's `lstat` info forward. A missing
-/// index yields an empty map.
-fn current_index_flat(
-    git_dir: &Path,
-    format: ObjectFormat,
-) -> Result<sley_unpack_trees::FlatIndex> {
-    let mut out = sley_unpack_trees::FlatIndex::new();
-    if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
-        for entry in &index.entries {
-            if entry_stage(entry) == 0 {
-                out.insert(
-                    entry.path.as_bytes().to_vec(),
-                    (
-                        entry.mode,
-                        entry.oid,
-                        Some(stat_info_from_index_entry(entry)),
-                    ),
-                );
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// Extract the merge stage (0-3) encoded in bits 12-13 of an index entry's
-/// `flags` field.
-fn entry_stage(entry: &IndexEntry) -> u8 {
-    ((entry.flags >> 12) & 0x3) as u8
-}
-
-/// The set of every path present in the current index, across all stages. Used
-/// to tell which merge-result entries are newly added (and so subject to the
-/// "would be overwritten" untracked-file check under `-u`).
-fn original_index_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet<Vec<u8>>> {
-    let mut out = BTreeSet::new();
-    if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
-        for entry in index.entries {
-            out.insert(entry.path.into_bytes());
-        }
-    }
-    Ok(out)
-}
-
 /// Which command's porcelain error strings the engine's safety checks should
 /// emit, mirroring git's `setup_unpack_trees_porcelain(o, cmd)`. The merge
 /// rules are identical across commands; only the *user-facing abort text*
@@ -814,6 +600,9 @@ struct ReadTreeWorktree<'a> {
     /// `is_submodule_active` resolution (`submodule.<name>.active` /
     /// `submodule.active` / `submodule.<name>.url`).
     repo_config: GitConfig,
+    /// Attribute stack from the target tree. Workers receive already-converted
+    /// bytes and never consult a concurrently changing worktree stack.
+    tree_attributes: Option<sley_worktree::TreeAttributes>,
     /// Which command's abort text the safety checks emit (git's
     /// `setup_unpack_trees_porcelain`). `read-tree` keeps its historic
     /// per-path messages; `checkout`/`switch` use the collected-path block.
@@ -847,7 +636,6 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
             &self.worktree_root,
             &self.git_dir,
             self.format,
-            &self.repo_config,
             path,
             Some(&(ce.mode, ce.oid)),
             self.porcelain,
@@ -942,6 +730,20 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
         // TODO(unpack-trees): wire the untracked-would-be-lost-on-removal check
         // when the checkout pilot needs it.
         Ok(())
+    }
+
+    fn sparse_checkout_path_present(&self, path: &[u8]) -> Result<bool> {
+        let Some(file_path) = safe_worktree_path(&self.worktree_root, path) else {
+            return Ok(false);
+        };
+        let Ok(metadata) = fs::symlink_metadata(&file_path) else {
+            return Ok(false);
+        };
+        Ok(!sley_worktree::path_matches_standard_ignore(
+            &self.worktree_root,
+            path,
+            metadata.is_dir(),
+        )?)
     }
 
     fn check_submodule_move_head(
@@ -1083,6 +885,47 @@ impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
         )
     }
 
+    fn write_blobs(
+        &mut self,
+        entries: &[(Vec<u8>, u32, ObjectId)],
+    ) -> Result<Vec<Option<sley_unpack_trees::StatInfo>>> {
+        let ordinary = entries
+            .iter()
+            .filter(|(_, mode, _)| !sley_index::is_gitlink(*mode))
+            .map(
+                |(path, mode, oid)| sley_worktree::CheckoutMaterializationEntry {
+                    path: path.clone(),
+                    mode: *mode,
+                    oid: *oid,
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut ordinary_stats = sley_worktree::materialize_checkout_entries_with_database(
+            &self.worktree_root,
+            &self.git_dir,
+            self.format,
+            self.db,
+            &self.repo_config,
+            self.tree_attributes.as_ref(),
+            &ordinary,
+        )?
+        .stats;
+        entries
+            .iter()
+            .map(|(path, mode, oid)| {
+                if sley_index::is_gitlink(*mode) {
+                    return self.write_blob(path, *mode, oid);
+                }
+                ordinary_stats.remove(path).ok_or_else(|| {
+                    GitError::Transaction(format!(
+                        "checkout worker did not report path '{}'",
+                        String::from_utf8_lossy(path)
+                    ))
+                })
+            })
+            .collect()
+    }
+
     fn remove_path(&mut self, path: &[u8]) -> Result<()> {
         if self.recurse_submodules && self.path_is_configured_submodule(path) {
             return remove_submodule_worktree(&self.worktree_root, &self.git_dir, path);
@@ -1142,39 +985,39 @@ pub(crate) fn checkout_two_way_engine(
     recurse_submodules: bool,
     overwrite_untracked: bool,
 ) -> Result<()> {
-    use sley_unpack_trees::{MergeFn, UnpackTreesOptions, check_updates, unpack_trees};
-
-    let index = current_index_flat(git_dir, format)?;
+    let previous_index = sley_worktree::read_repository_index(git_dir, format)?;
+    let mut index = sley_worktree::read_current_unpack_index(git_dir, format)?;
 
     // git's `merge_working_tree`: `trees[0]` = the tree of the HEAD being left
     // (empty when HEAD is unborn), `trees[1]` = the tree being checked out.
     let old_leaves = match old_tree {
-        Some(oid) => sley_diff_merge::flatten_tree(db, format, oid)?,
-        None => sley_unpack_trees::FlatTree::new(),
+        Some(oid) => Some(sley_diff_merge::flatten_tree(db, format, oid)?),
+        None => None,
     };
     let new_leaves = sley_diff_merge::flatten_tree(db, format, new_tree)?;
-    let trees = vec![old_leaves, new_leaves];
-
-    let mut opts = UnpackTreesOptions::new(format);
-    opts.merge = true;
-    opts.update = true;
-    // `init_topts`: `o.initial_checkout = is_index_unborn(...)`. An unborn (empty)
-    // index has no staged deletion to honour, so twoway_merge takes a path from
-    // the new tree rather than its "deletion was staged" arm dropping it.
-    opts.initial_checkout = index.is_empty();
-    opts.index_only = false;
-    if overwrite_untracked {
-        opts.reset = sley_unpack_trees::ResetType::OverwriteUntracked;
+    let mut sparse_paths = index.keys().cloned().collect::<BTreeSet<_>>();
+    if let Some(old_leaves) = old_leaves.as_ref() {
+        sparse_paths.extend(old_leaves.keys().cloned());
     }
+    sparse_paths.extend(new_leaves.keys().cloned());
+    let apply_sparse_checkout = sley_worktree::configure_active_sparse_checkout_for_unpack_index(
+        git_dir,
+        &mut index,
+        &sparse_paths,
+    )?;
 
+    let repo_config = commands::remote::read_effective_repo_config(git_dir, worktree_root)?;
+    let tree_attributes =
+        sley_worktree::TreeAttributes::from_tree(worktree_root, git_dir, db, format, new_tree)?;
     let mut wt = ReadTreeWorktree {
         submodules: load_superproject_submodules(worktree_root),
-        repo_config: read_repo_config(git_dir).unwrap_or_default(),
+        repo_config,
+        tree_attributes: Some(tree_attributes),
         worktree_root: worktree_root.to_path_buf(),
         git_dir: git_dir.to_path_buf(),
         db,
         format,
-        original_paths: original_index_paths(git_dir, format)?,
+        original_paths: sley_worktree::read_current_index_paths(git_dir, format)?,
         porcelain,
         recurse_submodules,
         force_overwrite_tracked: overwrite_untracked,
@@ -1186,9 +1029,25 @@ pub(crate) fn checkout_two_way_engine(
     // the first rejection (before `check_updates` touches the worktree), so a
     // failed checkout leaves the working tree exactly as it was — matching git's
     // "Aborting" guarantee.
-    let mut result = unpack_trees(&index, &trees, MergeFn::TwoWay, &opts, &wt)?;
-    refuse_if_unpack_result_removes_current_directory(worktree_root, &result)?;
-    check_updates(&mut result, &opts, &mut wt)?;
+    let mut options = sley_unpack_trees::CheckoutTransitionOptions::new(format);
+    options.overwrite_untracked = overwrite_untracked;
+    options.apply_sparse_checkout = apply_sparse_checkout;
+    let plan =
+        sley_unpack_trees::plan_checkout_transition(&index, old_leaves, new_leaves, options, &wt)?;
+    refuse_if_unpack_result_removes_current_directory(worktree_root, plan.result())?;
+    let result = plan.apply(&mut wt)?;
+    if !result.sparse_checkout_present_paths.is_empty() {
+        eprintln!(
+            "warning: The following paths were already present and thus not updated despite sparse patterns:"
+        );
+        for path in &result.sparse_checkout_present_paths {
+            eprintln!("\t{}", String::from_utf8_lossy(path));
+        }
+        eprintln!();
+        eprintln!(
+            "After fixing the above paths, you may want to run `git sparse-checkout reapply`."
+        );
+    }
 
     // Serialize the merged index. check_updates folded the post-write `lstat`
     // back into each freshly-written entry, so the stat info is accurate.
@@ -1203,11 +1062,17 @@ pub(crate) fn checkout_two_way_engine(
                     oid: e.entry.oid,
                     stage: e.entry.stage,
                     stat: e.entry.stat,
+                    skip_worktree: Some(e.entry.is_skip_worktree()),
                 },
             )
         })
         .collect();
-    write_paired_entries(git_dir, format, pairs)
+    match previous_index.as_ref() {
+        Some(previous) => {
+            sley_worktree::persist_checkout_read_tree_entries(git_dir, format, pairs, previous)
+        }
+        None => sley_worktree::persist_read_tree_entries(git_dir, format, pairs),
+    }
 }
 
 /// Reset both index and worktree to `commit`, using the recursive gitlink writer
@@ -1223,18 +1088,85 @@ pub(crate) fn reset_index_and_worktree_to_commit(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let config = read_repo_config(git_dir).unwrap_or_default();
     let tree = commands::merge_rebase::commit_tree_oid(&db, format, commit)?;
-    let mut entries = read_tree_overlay(&db, format, &config, &[tree])?;
-    reset_worktree_to_entries(
-        worktree_root,
+    let mut diagnostics = CliReadTreeDiagnostics;
+    let entries = map_read_tree_transition_result(sley_worktree::plan_read_tree_transition(
         git_dir,
         format,
         &db,
         &config,
-        None,
-        &mut entries,
-        recurse_submodules,
-    )?;
-    write_paired_entries(git_dir, format, entries)
+        sley_worktree::ReadTreeTransitionOptions::overlay(&[tree]),
+        &mut diagnostics,
+    ))?
+    .entries;
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let previous_index = fs::read(&index_path).ok();
+    let target_paths = entries
+        .iter()
+        .map(|(path, _)| path.as_slice())
+        .collect::<BTreeSet<_>>();
+    if recurse_submodules
+        && let Some(index) = sley_worktree::read_repository_index(git_dir, format)?
+    {
+        for entry in index.entries.iter().filter(|entry| {
+            entry.stage() == sley_index::Stage::Normal
+                && sley_index::is_gitlink(entry.mode)
+                && !target_paths.contains(entry.path.as_bytes())
+        }) {
+            remove_submodule_worktree(worktree_root, git_dir, &entry.path)?;
+        }
+    }
+
+    // The shared hard-reset engine owns sparse pattern application and
+    // physical sparse-index shape preservation. The old read-tree overlay
+    // materialized every target leaf and relied on a porcelain reapply pass,
+    // which both expanded out-of-cone paths and collapsed partial sparse-index
+    // boundaries. Reset the superproject first, then recurse only into
+    // materialized target gitlinks.
+    sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, commit)?;
+    if !recurse_submodules {
+        return Ok(());
+    }
+    let persisted = sley_worktree::read_repository_index(git_dir, format)?
+        .map(|index| {
+            index
+                .entries
+                .into_iter()
+                .filter(|entry| entry.stage() == sley_index::Stage::Normal)
+                .map(|entry| (entry.path.as_bytes().to_vec(), entry))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    for (path, entry) in entries
+        .iter()
+        .filter(|(_, entry)| sley_index::is_gitlink(entry.mode))
+    {
+        if persisted
+            .get(path)
+            .is_some_and(sley_index::IndexEntry::is_skip_worktree)
+            || !gitlink_should_recurse(worktree_root, &config, path)
+        {
+            continue;
+        }
+        if let Err(error) =
+            checkout_submodule_to_commit(worktree_root, git_dir, format, path, &entry.oid)
+        {
+            // The superproject worktree has already moved, but a recursive
+            // submodule failure leaves its index at the pre-reset state. The
+            // reset caller refreshes that restored index against the rewritten
+            // worktree before propagating the failure, matching Git's partial
+            // failure contract.
+            match previous_index.as_ref() {
+                Some(bytes) => fs::write(&index_path, bytes)?,
+                None => match fs::remove_file(&index_path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err.into()),
+                },
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 /// Perform git's trivial fast-forward / two-way / three-way merge of the listed
@@ -1249,6 +1181,7 @@ pub(crate) fn reset_index_and_worktree_to_commit(
 /// * 3+ trees — `threeway_merge`: trivial 3-way, recording stage 1/2/3 on a
 ///   non-trivial path. Extra leading trees are additional merge bases.
 fn merge_trees(
+    worktree_root: Option<&Path>,
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
@@ -1256,6 +1189,7 @@ fn merge_trees(
     tree_oids: &[ObjectId],
     update_worktree: bool,
     index_only: bool,
+    sparse_checkout: bool,
     recurse_submodules: bool,
 ) -> Result<Vec<(Vec<u8>, StagedEntry)>> {
     use sley_unpack_trees::{MergeFn, UnpackTreesOptions, check_updates, unpack_trees};
@@ -1277,18 +1211,31 @@ fn merge_trees(
         }
     };
 
-    let index = current_index_flat(git_dir, format)?;
-    let path_rules = ReadTreePathRules::from_config(config);
+    let mut index = sley_worktree::read_current_unpack_index(git_dir, format)?;
+    let mut diagnostics = CliReadTreeDiagnostics;
     let trees: Vec<sley_unpack_trees::FlatTree> = tree_oids
         .iter()
         .map(|oid| {
-            let tree = sley_diff_merge::flatten_tree(db, format, oid)?;
-            for (path, (mode, _)) in &tree {
-                verify_read_tree_path(path, *mode, path_rules)?;
-            }
-            Ok(tree)
+            map_read_tree_transition_result(sley_worktree::flatten_validated_read_tree_source(
+                db,
+                format,
+                config,
+                oid,
+                &mut diagnostics,
+            ))
         })
         .collect::<Result<_>>()?;
+
+    let mut sparse_paths = index.keys().cloned().collect::<BTreeSet<_>>();
+    for tree in &trees {
+        sparse_paths.extend(tree.keys().cloned());
+    }
+    let apply_sparse_checkout = sparse_checkout
+        && sley_worktree::configure_active_sparse_checkout_for_unpack_index(
+            git_dir,
+            &mut index,
+            &sparse_paths,
+        )?;
 
     let mut opts = UnpackTreesOptions::new(format);
     opts.merge = true;
@@ -1310,20 +1257,29 @@ fn merge_trees(
     // checks entirely. This is also what makes `read-tree -i -m` usable in a bare
     // repository, where there is no worktree to require.
     opts.index_only = index_only;
+    opts.apply_sparse_checkout = apply_sparse_checkout && update_worktree && !index_only;
 
-    let worktree_root = if index_only {
-        worktree_root_for_git_dir(git_dir).unwrap_or_else(|_| git_dir.to_path_buf())
-    } else {
-        worktree_root_for_git_dir(git_dir)?
-    };
+    let worktree_root = worktree_root
+        .map(Path::to_path_buf)
+        .or_else(|| index_only.then(|| git_dir.to_path_buf()))
+        .ok_or_else(|| {
+            GitError::Unsupported("read-tree currently requires a non-bare worktree".into())
+        })?;
+    let tree_attributes = tree_oids
+        .last()
+        .map(|tree| {
+            sley_worktree::TreeAttributes::from_tree(&worktree_root, git_dir, db, format, tree)
+        })
+        .transpose()?;
     let mut wt = ReadTreeWorktree {
         submodules: load_superproject_submodules(&worktree_root),
         repo_config: read_repo_config(git_dir).unwrap_or_default(),
+        tree_attributes,
         worktree_root,
         git_dir: git_dir.to_path_buf(),
         db,
         format,
-        original_paths: original_index_paths(git_dir, format)?,
+        original_paths: sley_worktree::read_current_index_paths(git_dir, format)?,
         porcelain: UnpackPorcelain::ReadTree,
         recurse_submodules,
         force_overwrite_tracked: false,
@@ -1350,6 +1306,7 @@ fn merge_trees(
                     oid: e.entry.oid,
                     stage: e.entry.stage,
                     stat: e.entry.stat,
+                    skip_worktree: Some(e.entry.is_skip_worktree()),
                 },
             )
         })
@@ -1466,18 +1423,6 @@ fn submodule_has_dirty_index(sub_root: &Path) -> bool {
     }
 }
 
-/// Construct a stage-0 [`StagedEntry`] with no cached stat (the overlay /
-/// `--prefix` paths build the index purely from tree contents, so no worktree
-/// stat is available; git's `read-tree` without `-m` writes a zeroed stat too).
-fn stage0(mode: u32, oid: ObjectId) -> StagedEntry {
-    StagedEntry {
-        mode,
-        oid,
-        stage: 0,
-        stat: None,
-    }
-}
-
 /// Abort with git's "not uptodate" error when the working-tree copy of `path`
 /// disagrees with the index entry the merge is about to replace/remove.
 ///
@@ -1492,26 +1437,24 @@ fn verify_uptodate_path(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
-    config: &GitConfig,
     path: &[u8],
     expected: Option<&(u32, ObjectId)>,
     porcelain: UnpackPorcelain,
 ) -> Result<()> {
-    let Some((_mode, expected_oid)) = expected else {
+    let Some((expected_mode, expected_oid)) = expected else {
         // Untracked path: nothing in the index to be out of date with.
         return Ok(());
     };
-    let Some(file_path) = safe_worktree_path(worktree_root, path) else {
-        return Ok(());
-    };
-    let body = match fs::read(&file_path) {
-        Ok(body) => body,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.into()),
-    };
-    let body = sley_worktree::apply_clean_filter(worktree_root, git_dir, config, path, &body)?;
-    let actual = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
-    if &actual != expected_oid {
+    let state = sley_worktree::worktree_entry_state_by_git_path(
+        worktree_root,
+        git_dir,
+        format,
+        path,
+        expected_oid,
+        *expected_mode,
+        None,
+    )?;
+    if state == sley_worktree::WorktreeEntryState::Modified {
         match porcelain {
             UnpackPorcelain::ReadTree => {
                 let display = String::from_utf8_lossy(path);
@@ -1551,91 +1494,6 @@ fn safe_worktree_path(root: &Path, path: &[u8]) -> Option<PathBuf> {
     Some(root.join(relative))
 }
 
-/// Build and persist the on-disk index from sorted `(path, entry)` pairs.
-fn write_paired_entries(
-    git_dir: &Path,
-    format: ObjectFormat,
-    pairs: Vec<(Vec<u8>, StagedEntry)>,
-) -> Result<()> {
-    let skip_worktree_paths = read_skip_worktree_paths(git_dir, format)?;
-    let mut index_entries = Vec::with_capacity(pairs.len());
-    for (path, entry) in pairs {
-        let mut index_entry = make_index_entry(path, entry)?;
-        if skip_worktree_paths.contains(index_entry.path.as_bytes()) {
-            index_entry.set_skip_worktree(true);
-        }
-        index_entries.push(index_entry);
-    }
-    index_entries.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| (left.flags & 0x3000).cmp(&(right.flags & 0x3000)))
-    });
-    persist_index(git_dir, format, index_entries)
-}
-
-fn read_skip_worktree_paths(
-    git_dir: &Path,
-    format: ObjectFormat,
-) -> Result<std::collections::BTreeSet<Vec<u8>>> {
-    Ok(sley_worktree::read_repository_index(git_dir, format)?
-        .map(|index| {
-            index
-                .entries
-                .into_iter()
-                .filter(|entry| entry.is_skip_worktree())
-                .map(|entry| entry.path.into_bytes())
-                .collect()
-        })
-        .unwrap_or_default())
-}
-
-/// Convert a `(path, StagedEntry)` into a writable [`IndexEntry`], encoding the
-/// stage into bits 12-13 of `flags` and the path length into the low 12 bits.
-///
-/// When the entry carries cached stat info (a kept entry, or one refreshed by
-/// the `-u` apply), it is written into the entry's `ce_stat_data` fields so a
-/// follow-up `diff-files` reports the correct clean/dirty verdict; otherwise
-/// the stat fields stay zeroed (git's all-zero "needs refresh" state).
-fn make_index_entry(path: Vec<u8>, entry: StagedEntry) -> Result<IndexEntry> {
-    let name_len = path.len().min(0x0fff) as u16;
-    let stage_bits = ((entry.stage as u16) & 0x3) << 12;
-    let stat = entry.stat.unwrap_or_default();
-    Ok(IndexEntry {
-        ctime_seconds: stat.ctime_seconds,
-        ctime_nanoseconds: stat.ctime_nanoseconds,
-        mtime_seconds: stat.mtime_seconds,
-        mtime_nanoseconds: stat.mtime_nanoseconds,
-        dev: stat.dev,
-        ino: stat.ino,
-        mode: entry.mode,
-        uid: stat.uid,
-        gid: stat.gid,
-        size: stat.size,
-        oid: entry.oid,
-        flags: name_len | stage_bits,
-        flags_extended: 0,
-        path: BString::from(path),
-    })
-}
-
-/// Serialize `entries` into the repository index file. Stage > 0 entries set the
-/// stage bits in `flags`; the index v2/v3 writer accepts those (the higher bits
-/// of `flags`), so a fixed version 2 layout matches git's `ls-files --stage`.
-fn persist_index(git_dir: &Path, format: ObjectFormat, entries: Vec<IndexEntry>) -> Result<()> {
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let mut index = Index {
-        version: 2,
-        entries,
-        extensions: Vec::new(),
-        checksum: None,
-    };
-    index.upgrade_version_for_flags();
-    sley_worktree::refresh_cache_tree(&mut index, &db);
-    sley_worktree::write_repository_index_ref(git_dir, format, &index)?;
-    Ok(())
-}
-
 /// Materialize newly-introduced blobs into the working tree (used by
 /// `--prefix -u`): only stage-0 paths whose `(mode, oid)` differ from the prior
 /// index entry are written, so unrelated locally-modified files the prefix read
@@ -1652,7 +1510,7 @@ fn update_worktree_for_entries(
     entries: &mut [(Vec<u8>, StagedEntry)],
     recurse_submodules: bool,
 ) -> Result<()> {
-    let original = current_index_stage0(git_dir, format)?;
+    let original = sley_worktree::read_current_index_stage_zero(git_dir, format)?;
     let mut written: BTreeMap<Vec<u8>, Option<sley_unpack_trees::StatInfo>> = BTreeMap::new();
     // Borrow-split: pick write order from a read-only view, then mutate by path.
     let plan: Vec<(Vec<u8>, u32, ObjectId)> = worktree_write_order(entries)
@@ -1935,7 +1793,7 @@ fn gitlink_should_recurse(worktree_root: &Path, repo_config: &GitConfig, path: &
     is_submodule_active(repo_config, &submodule.name, path_str)
 }
 
-fn checkout_submodule_to_commit(
+pub(crate) fn checkout_submodule_to_commit(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -1946,13 +1804,23 @@ fn checkout_submodule_to_commit(
         return Ok(());
     };
     let path_str = String::from_utf8_lossy(path);
-    if submodule_path_contains_symlink(worktree_root, path)? {
+    if sley_submodule::submodule_path_has_symlink_parent(worktree_root, Path::new(&*path_str))? {
         eprintln!("fatal: refusing to checkout submodule path '{path_str}' through a symlink");
         return Err(GitError::Exit(128));
     }
     let (submodule_name, submodule_url) = submodule_name_and_url_for_path(worktree_root, &path_str)
         .unwrap_or_else(|| (path_str.to_string(), None));
-    let sub_git_dir = submodule_admin_git_dir(git_dir, &submodule_name);
+    let embedded_git_dir = sub_root.join(".git");
+    let admin_git_dir = submodule_admin_git_dir(git_dir, &submodule_name);
+    // Older/native-add repositories may still carry an embedded `.git`
+    // directory even when an admin copy also exists. Use that live repository
+    // directly; trying to replace the directory with a gitfile would fail with
+    // EISDIR and prevent recursive checkout from reaching the child engine.
+    let sub_git_dir = if embedded_git_dir.is_dir() {
+        embedded_git_dir.clone()
+    } else {
+        admin_git_dir
+    };
     if !sub_git_dir.is_dir() {
         if sub_root.join(".git").is_dir() {
             copy_dir_recursive(&sub_root.join(".git"), &sub_git_dir)?;
@@ -1968,7 +1836,9 @@ fn checkout_submodule_to_commit(
         remove_path_in_the_way(&sub_root)?;
     }
     fs::create_dir_all(&sub_root)?;
-    connect_submodule_worktree(&sub_root, &sub_git_dir)?;
+    if sub_git_dir != embedded_git_dir {
+        connect_submodule_worktree(&sub_root, &sub_git_dir)?;
+    }
 
     let sub_format = repository_object_format(&sub_git_dir).unwrap_or(format);
     if let Err(_err) =
@@ -2007,6 +1877,48 @@ fn checkout_submodule_to_commit(
     Ok(())
 }
 
+/// Reconcile populated submodules selected by a superproject path checkout.
+///
+/// The superproject index owns the target gitlink OID; each child uses the
+/// same worktree reset engine, including its configured materialization queue.
+pub(crate) fn checkout_submodules_for_paths(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+) -> Result<()> {
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok(());
+    };
+    let configured = load_superproject_submodules(worktree_root);
+    for entry in index.entries.into_iter().filter(|entry| {
+        entry.stage() == sley_index::Stage::Normal && sley_index::is_gitlink(entry.mode)
+    }) {
+        let git_path = entry.path.as_bytes();
+        let Ok(path_str) = std::str::from_utf8(git_path) else {
+            continue;
+        };
+        if configured
+            .as_ref()
+            .and_then(|set| set.from_path(path_str))
+            .is_none()
+        {
+            continue;
+        }
+        let full = worktree_root.join(path_str);
+        let selected = paths.iter().any(|requested| {
+            requested == worktree_root
+                || full == *requested
+                || full.starts_with(requested)
+                || requested.starts_with(&full)
+        });
+        if selected {
+            checkout_submodule_to_commit(worktree_root, git_dir, format, git_path, &entry.oid)?;
+        }
+    }
+    Ok(())
+}
+
 fn submodule_name_and_url_for_path(
     worktree_root: &Path,
     path: &str,
@@ -2034,7 +1946,8 @@ fn clone_submodule_for_checkout(
         resolved,
         sub_root.display().to_string(),
     ];
-    super::remote::cmd_clone(&args)?;
+    let clone_session = crate::session::CliSession::isolated_child(worktree_root.to_path_buf());
+    super::remote::cmd_clone(&clone_session, &args)?;
     connect_submodule_worktree(sub_root, sub_git_dir)?;
     Ok(())
 }
@@ -2044,7 +1957,7 @@ fn remove_submodule_worktree(worktree_root: &Path, git_dir: &Path, path: &[u8]) 
         return Ok(());
     };
     let path_str = String::from_utf8_lossy(path);
-    if submodule_path_contains_symlink(worktree_root, path)? {
+    if sley_submodule::submodule_path_has_symlink_parent(worktree_root, Path::new(&*path_str))? {
         eprintln!("fatal: refusing to remove submodule path '{path_str}' through a symlink");
         return Err(GitError::Exit(128));
     }
@@ -2068,31 +1981,6 @@ fn submodule_admin_git_dir(super_git_dir: &Path, name: &str) -> PathBuf {
         }
     }
     path
-}
-
-fn submodule_path_contains_symlink(worktree_root: &Path, path: &[u8]) -> Result<bool> {
-    let Ok(path) = std::str::from_utf8(path) else {
-        return Ok(false);
-    };
-    let mut current = worktree_root.to_path_buf();
-    for component in Path::new(path).components() {
-        let std::path::Component::Normal(name) = component else {
-            continue;
-        };
-        current.push(name);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
-            Ok(_) => {}
-            Err(err)
-                if err.kind() == io::ErrorKind::NotFound
-                    || err.kind() == io::ErrorKind::NotADirectory =>
-            {
-                return Ok(false);
-            }
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Ok(false)
 }
 
 fn connect_submodule_worktree(sub_root: &Path, sub_git_dir: &Path) -> Result<()> {
@@ -2548,6 +2436,36 @@ mod submodule_hook_tests {
         fs::create_dir_all(&empty).expect("mkdir empty");
         assert!(!submodule_is_populated(&empty));
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_uptodate_hashes_symlink_target_without_following_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "sley-rt-symlink-dir-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let git_dir = base.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create git directory");
+        fs::create_dir_all(base.join("target")).expect("create symlink target directory");
+        std::os::unix::fs::symlink("target", base.join("link")).expect("create symlink");
+        let oid = EncodedObject::new(ObjectType::Blob, b"target".to_vec())
+            .object_id(ObjectFormat::Sha1)
+            .expect("hash symlink target");
+
+        verify_uptodate_path(
+            &base,
+            &git_dir,
+            ObjectFormat::Sha1,
+            b"link",
+            Some(&(sley_index::SYMLINK_MODE, oid)),
+            UnpackPorcelain::Checkout,
+        )
+        .expect("symlink pointing to a directory is clean");
+
+        fs::remove_dir_all(base).expect("clean fixture");
     }
 
     // ----- end-to-end: active+populated+dirty, non-forced → WouldLose ----

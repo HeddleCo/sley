@@ -11,6 +11,73 @@ fn unique_temp_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sley-{name}-{}-{nanos}", std::process::id()))
 }
 
+#[test]
+fn ls_files_expands_only_sparse_directories_relevant_to_pathspec() {
+    let root = unique_temp_dir("ls-files-selective-sparse-expansion");
+    fs::create_dir_all(root.join("deep/deeper1")).expect("create in-cone directory");
+    fs::create_dir_all(root.join("outside")).expect("create out-of-cone directory");
+    git(&root, &["init", "-q", "-b", "main"]);
+    fs::write(root.join("deep/deeper1/file"), b"inside\n").expect("write in-cone file");
+    fs::write(root.join("outside/file"), b"outside\n").expect("write out-of-cone file");
+    git(&root, &["add", "."]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=Example User",
+            "-c",
+            "user.email=example@example.invalid",
+            "commit",
+            "-m",
+            "base",
+            "-q",
+        ],
+    );
+    git(
+        &root,
+        &["sparse-checkout", "init", "--cone", "--sparse-index"],
+    );
+    git(&root, &["sparse-checkout", "set", "deep"]);
+    assert_eq!(
+        git(&root, &["ls-files", "--sparse"]),
+        b"deep/deeper1/file\noutside/\n"
+    );
+
+    let in_cone_trace = root.join("in-cone-trace.json");
+    let expected = git(&root, &["ls-files", "deep/deeper1"]);
+    let actual = run_with_trace(
+        sley_testkit::sley_bin!(),
+        &root,
+        &["ls-files", "deep/deeper1"],
+        &in_cone_trace,
+    );
+    assert_eq!(actual, expected);
+    assert!(
+        !fs::read_to_string(&in_cone_trace)
+            .expect("read in-cone trace")
+            .contains("ensure_full_index"),
+        "an in-cone pathspec must not expand unrelated sparse directories"
+    );
+
+    let outside_trace = root.join("outside-trace.json");
+    let expected = git(&root, &["ls-files", "outside/file"]);
+    let actual = run_with_trace(
+        sley_testkit::sley_bin!(),
+        &root,
+        &["ls-files", "outside/file"],
+        &outside_trace,
+    );
+    assert_eq!(actual, expected);
+    assert!(
+        fs::read_to_string(&outside_trace)
+            .expect("read outside trace")
+            .contains("ensure_full_index"),
+        "an out-of-cone pathspec must expand its sparse directory"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn run(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
     let output = Command::new(program)
         .current_dir(cwd)
@@ -103,6 +170,23 @@ fn sley(cwd: &Path, args: &[&str]) -> Vec<u8> {
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
     run(sley_testkit::oracle_git(), cwd, args)
+}
+
+fn run_with_trace(program: &str, cwd: &Path, args: &[&str], trace: &Path) -> Vec<u8> {
+    let output = Command::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .env("GIT_TRACE2_EVENT", trace)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run traced {program} {args:?}: {err}"));
+    assert!(
+        output.status.success(),
+        "{program} {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
 }
 
 fn prepare_unmerged_index(root: &Path) {

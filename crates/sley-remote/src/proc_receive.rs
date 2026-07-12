@@ -6,6 +6,7 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::thread;
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
@@ -125,7 +126,10 @@ fn trim_ref_prefix(prefix: &str) -> String {
     out
 }
 
-pub fn proc_receive_ref_matches(patterns: &[ProcReceiveRefPattern], command: &ReceivePackCommand) -> bool {
+pub fn proc_receive_ref_matches(
+    patterns: &[ProcReceiveRefPattern],
+    command: &ReceivePackCommand,
+) -> bool {
     for pattern in patterns {
         if !pattern.want_add && command.old_id.is_null() {
             continue;
@@ -178,6 +182,8 @@ pub struct ProcReceiveHookInput<'a> {
     pub push_options: &'a [String],
     pub use_atomic: bool,
     pub use_push_options: bool,
+    /// Incoming-object quarantine environment inherited by the hook.
+    pub quarantine_env: &'a [(String, String)],
     pub remote_stderr: &'a mut Vec<u8>,
     pub capture_stderr: bool,
 }
@@ -214,6 +220,7 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
     child
         .current_dir(input.git_dir)
         .env("GIT_DIR", input.git_dir)
+        .envs(input.quarantine_env.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(if capture_stderr {
@@ -224,34 +231,54 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
 
     for (index, option) in input.push_options.iter().enumerate() {
         if index == 0 {
-            child.env("GIT_PUSH_OPTION_COUNT", input.push_options.len().to_string());
+            child.env(
+                "GIT_PUSH_OPTION_COUNT",
+                input.push_options.len().to_string(),
+            );
         }
         child.env(format!("GIT_PUSH_OPTION_{index}"), option);
     }
 
-    let mut child = child.spawn().map_err(|err| {
-        GitError::Io(format!("cannot spawn proc-receive hook: {err}"))
-    })?;
+    let mut child = child
+        .spawn()
+        .map_err(|err| GitError::Io(format!("cannot spawn proc-receive hook: {err}")))?;
 
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        GitError::Io("proc-receive hook stdin unavailable".into())
-    })?;
-    let mut stdout = child.stdout.take().ok_or_else(|| {
-        GitError::Io("proc-receive hook stdout unavailable".into())
-    })?;
+    // Drain the hook's stderr while its pkt-line protocol is in flight.  A hook
+    // may emit more than a pipe buffer before exiting, so waiting first can
+    // deadlock.  We still append the completed hook stream before receive-pack
+    // protocol diagnostics below, matching git's stderr mux ordering.
+    let hook_stderr = if capture_stderr {
+        child.stderr.take().map(|mut stderr| {
+            thread::spawn(move || {
+                let mut output = Vec::new();
+                let _ = stderr.read_to_end(&mut output);
+                output
+            })
+        })
+    } else {
+        None
+    };
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| GitError::Io("proc-receive hook stdin unavailable".into()))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitError::Io("proc-receive hook stdout unavailable".into()))?;
 
     let mut hook_failed = false;
-    if let Err(err) = write_proc_receive_version(
-        &mut stdin,
-        input.use_atomic,
-        input.use_push_options,
-    ) {
+    let mut protocol_messages = Vec::new();
+    if let Err(err) =
+        write_proc_receive_version(&mut stdin, input.use_atomic, input.use_push_options)
+    {
         hook_failed = true;
-        eprintln!("error: {}", proc_receive_remote_error_message(&err));
+        protocol_messages.push(proc_receive_remote_error_message(&err));
     }
 
     if !hook_failed {
-        for state in input.commands {
+        for state in proc_receive_command_order(input.commands) {
             if !state.scheduled_for_proc_receive() || state.error_string.is_some() {
                 continue;
             }
@@ -259,12 +286,14 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
             let line = format!("{} {} {}\n", cmd.old_id, cmd.new_id, cmd.name);
             if write_pkt_line_payload(&mut stdin, line.as_bytes()).is_err() {
                 hook_failed = true;
-                eprintln!("error: fail to write commands to proc-receive hook");
+                protocol_messages.push("fail to write commands to proc-receive hook".into());
                 break;
             }
         }
         if !hook_failed {
-            stdin.write_all(b"0000").map_err(|err| GitError::Io(err.to_string()))?;
+            stdin
+                .write_all(b"0000")
+                .map_err(|err| GitError::Io(err.to_string()))?;
         }
     }
 
@@ -274,14 +303,7 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
             Ok(use_push_options) => hook_use_push_options = use_push_options,
             Err(err) => {
                 hook_failed = true;
-                let message = proc_receive_remote_error_message(&err);
-                if input.capture_stderr {
-                    input
-                        .remote_stderr
-                        .extend_from_slice(format!("error: {message}\n").as_bytes());
-                } else {
-                    eprintln!("error: {message}");
-                }
+                protocol_messages.push(proc_receive_remote_error_message(&err));
             }
         }
         if hook_use_push_options && input.use_push_options {
@@ -290,12 +312,15 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
                 line.push(b'\n');
                 if write_pkt_line_payload(&mut stdin, &line).is_err() {
                     hook_failed = true;
-                    eprintln!("error: fail to write push-options to proc-receive hook");
+                    protocol_messages
+                        .push("fail to write push-options to proc-receive hook".into());
                     break;
                 }
             }
             if !hook_failed {
-                stdin.write_all(b"0000").map_err(|err| GitError::Io(err.to_string()))?;
+                stdin
+                    .write_all(b"0000")
+                    .map_err(|err| GitError::Io(err.to_string()))?;
             }
         }
     }
@@ -306,25 +331,31 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
     if !hook_failed {
         let mut reader = stdout;
         let outcome = read_proc_receive_report(input.format, &mut reader, &mut commands);
-        for message in &outcome.protocol_messages {
-            let message = proc_receive_remote_error_message(message);
-            if input.capture_stderr {
-                input
-                    .remote_stderr
-                    .extend_from_slice(format!("error: {message}\n").as_bytes());
-            } else {
-                eprintln!("error: {message}");
-            }
-        }
+        protocol_messages.extend(
+            outcome
+                .protocol_messages
+                .iter()
+                .map(proc_receive_remote_error_message),
+        );
         if outcome.hook_failed {
             hook_failed = true;
         }
     }
 
     let status = child.wait().map_err(|err| GitError::Io(err.to_string()))?;
-    if capture_stderr {
-        if let Some(mut stderr) = child.stderr.take() {
-            let _ = std::io::copy(&mut stderr, input.remote_stderr);
+    if let Some(hook_stderr) = hook_stderr {
+        let hook_stderr = hook_stderr
+            .join()
+            .map_err(|_| GitError::Io("proc-receive stderr reader panicked".into()))?;
+        input.remote_stderr.extend_from_slice(&hook_stderr);
+    }
+    for message in protocol_messages {
+        if input.capture_stderr {
+            input
+                .remote_stderr
+                .extend_from_slice(format!("error: {message}\n").as_bytes());
+        } else {
+            eprintln!("error: {message}");
         }
     }
     if !status.success() {
@@ -335,6 +366,22 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
         commands,
         hook_failed,
     })
+}
+
+fn proc_receive_command_order(
+    commands: &[ReceivePackCommandState],
+) -> Vec<&ReceivePackCommandState> {
+    let mut existing: Vec<_> = commands
+        .iter()
+        .filter(|state| !state.command.old_id.is_null())
+        .collect();
+    existing.sort_by(|left, right| left.command.name.cmp(&right.command.name));
+    existing.extend(
+        commands
+            .iter()
+            .filter(|state| state.command.old_id.is_null()),
+    );
+    existing
 }
 
 fn find_proc_receive_hook(git_dir: &Path) -> Result<Option<std::path::PathBuf>> {
@@ -461,8 +508,18 @@ fn read_proc_receive_report(
         };
 
         if text.starts_with("option ") {
-            if hint_index.is_none() || (!new_report && commands[hint_index.unwrap()].reports.is_empty())
-            {
+            let Some(idx) = hint_index else {
+                if !option_without_ok {
+                    option_without_ok = true;
+                    outcome.protocol_messages.push(
+                        "proc-receive reported 'option' without a matching 'ok/ng' directive"
+                            .into(),
+                    );
+                }
+                outcome.hook_failed = true;
+                continue;
+            };
+            if !new_report && commands[idx].reports.is_empty() {
                 if !option_without_ok {
                     option_without_ok = true;
                     outcome.protocol_messages.push(
@@ -473,7 +530,6 @@ fn read_proc_receive_report(
                 outcome.hook_failed = true;
                 continue;
             }
-            let idx = hint_index.unwrap();
             if new_report {
                 commands[idx].reports.push(ProcReceiveReport {
                     refname: None,
@@ -483,7 +539,13 @@ fn read_proc_receive_report(
                 });
                 new_report = false;
             }
-            let report = commands[idx].reports.last_mut().unwrap();
+            let Some(report) = commands[idx].reports.last_mut() else {
+                outcome.hook_failed = true;
+                outcome.protocol_messages.push(
+                    "proc-receive reported 'option' without a matching 'ok/ng' directive".into(),
+                );
+                continue;
+            };
             if let Some(rest) = text.strip_prefix("option refname ") {
                 report.refname = Some(rest.to_string());
             } else if let Some(rest) = text.strip_prefix("option old-oid ") {
@@ -576,13 +638,12 @@ fn find_command_index(
     refname: &str,
     hint: Option<usize>,
 ) -> Option<usize> {
-    if let Some(hint) = hint {
-        if commands
+    if let Some(hint) = hint
+        && commands
             .get(hint)
             .is_some_and(|state| state.command.name == refname)
-        {
-            return Some(hint);
-        }
+    {
+        return Some(hint);
     }
     commands
         .iter()
@@ -594,7 +655,8 @@ fn pkt_line_bytes(payload: &[u8]) -> &[u8] {
 }
 
 fn pkt_line_text(payload: &[u8]) -> Result<&str> {
-    std::str::from_utf8(pkt_line_bytes(payload)).map_err(|err| GitError::InvalidFormat(err.to_string()))
+    std::str::from_utf8(pkt_line_bytes(payload))
+        .map_err(|err| GitError::InvalidFormat(err.to_string()))
 }
 
 fn proc_receive_remote_error_message(err: impl std::fmt::Display) -> String {
@@ -617,11 +679,10 @@ pub fn apply_proc_receive_hook_failure(
         if state.error_string.is_some() {
             continue;
         }
-        if state.scheduled_for_proc_receive()
-            && state.proc_receive & RUN_PROC_RECEIVE_RETURNED == 0
+        if atomic
+            || (state.scheduled_for_proc_receive()
+                && state.proc_receive & RUN_PROC_RECEIVE_RETURNED == 0)
         {
-            state.error_string = Some("fail to run proc-receive hook".into());
-        } else if atomic {
             state.error_string = Some("fail to run proc-receive hook".into());
         }
     }

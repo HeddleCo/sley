@@ -74,6 +74,15 @@ pub enum UpsertNoteOutcome {
     Unchanged,
 }
 
+/// Controls whether an incremental note upsert may elide a redundant commit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpsertNoteOptions {
+    /// Advance the notes ref with a new commit even when the note already
+    /// references the requested blob. Git's porcelain does this for a forced
+    /// overwrite; embedders default to the idempotent behavior.
+    pub commit_if_unchanged: bool,
+}
+
 /// Result of an incremental note removal at the repository level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoveNoteOutcome {
@@ -591,22 +600,53 @@ pub fn upsert_note_for(
     identity: &NotesCommitIdentity,
     ref_expected: Option<RefTarget>,
 ) -> Result<UpsertNoteOutcome> {
-    if let Some(existing) = read_note_for(git_dir, format, store, notes_ref, annotated)?
-        && existing == blob
-    {
+    upsert_note_for_with_options(
+        git_dir,
+        format,
+        store,
+        notes_ref,
+        annotated,
+        blob,
+        message,
+        identity,
+        ref_expected,
+        UpsertNoteOptions::default(),
+    )
+}
+
+/// Like [`upsert_note_for`], with explicit redundant-commit behavior.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_note_for_with_options(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    notes_ref: &NotesRef,
+    annotated: &ObjectId,
+    blob: ObjectId,
+    message: &str,
+    identity: &NotesCommitIdentity,
+    ref_expected: Option<RefTarget>,
+    options: UpsertNoteOptions,
+) -> Result<UpsertNoteOutcome> {
+    let mut snapshot = load_notes_snapshot(git_dir, format, store, notes_ref)?;
+    if snapshot.notes.get(annotated).copied() == Some(blob) && !options.commit_if_unchanged {
         return Ok(UpsertNoteOutcome::Unchanged);
     }
-    let mut notes = list_notes(git_dir, format, store, notes_ref)?;
-    upsert_note(&mut notes, annotated, blob);
-    let notes_commit = commit_notes_update(
+    snapshot.notes.insert(*annotated, blob);
+    let notes = notes_vec_from_map(snapshot.notes);
+    let parents = snapshot.parent.into_iter().collect::<Vec<_>>();
+    let notes_commit = commit_notes_update_with_preloaded_non_notes(
         git_dir,
         format,
         store,
         notes_ref,
         &notes,
-        message,
+        format!("{message}\n").as_bytes(),
         identity,
+        &parents,
         ref_expected,
+        true,
+        &snapshot.non_notes,
     )?;
     Ok(UpsertNoteOutcome::Updated { notes_commit })
 }
@@ -677,25 +717,35 @@ pub fn remove_notes_for(
     identity: &NotesCommitIdentity,
     ref_expected: Option<RefTarget>,
 ) -> Result<RemoveNoteOutcome> {
-    if annotated.is_empty() || notes_head_oid(store, notes_ref)?.is_none() {
+    if annotated.is_empty() {
+        return Ok(RemoveNoteOutcome::Unchanged);
+    }
+    let mut snapshot = load_notes_snapshot(git_dir, format, store, notes_ref)?;
+    if snapshot.parent.is_none() {
         return Ok(RemoveNoteOutcome::Unchanged);
     }
     let targets: HashSet<_> = annotated.iter().collect();
-    let mut notes = list_notes(git_dir, format, store, notes_ref)?;
-    let before = notes.len();
-    notes.retain(|note| !targets.contains(&note.annotated));
-    if notes.len() == before {
+    let before = snapshot.notes.len();
+    snapshot
+        .notes
+        .retain(|annotated, _| !targets.contains(annotated));
+    if snapshot.notes.len() == before {
         return Ok(RemoveNoteOutcome::Unchanged);
     }
-    let notes_commit = commit_notes_update(
+    let notes = notes_vec_from_map(snapshot.notes);
+    let parents = snapshot.parent.into_iter().collect::<Vec<_>>();
+    let notes_commit = commit_notes_update_with_preloaded_non_notes(
         git_dir,
         format,
         store,
         notes_ref,
         &notes,
-        message,
+        format!("{message}\n").as_bytes(),
         identity,
+        &parents,
         ref_expected,
+        true,
+        &snapshot.non_notes,
     )?;
     Ok(RemoveNoteOutcome::Removed { notes_commit })
 }
@@ -842,6 +892,181 @@ fn notes_head_oid(store: &FileRefStore, notes_ref: &NotesRef) -> Result<Option<O
         Some(RefTarget::Direct(oid)) => Some(oid),
         _ => None,
     })
+}
+
+/// A mutation snapshot loads the current notes and the arbitrary non-note tree
+/// entries that Git preserves in one object-database pass.  Incremental notes
+/// operations previously walked every tree twice: once to materialize notes,
+/// then again immediately before writing to rediscover non-note entries.
+struct NotesSnapshot {
+    parent: Option<ObjectId>,
+    notes: BTreeMap<ObjectId, ObjectId>,
+    non_notes: Vec<NonNote>,
+}
+
+#[derive(Clone)]
+struct CachedTreeEntry {
+    name: Vec<u8>,
+    mode: u32,
+    oid: ObjectId,
+}
+
+struct NotesTreeCache<'a> {
+    db: &'a FileObjectDatabase,
+    format: ObjectFormat,
+    entries: BTreeMap<ObjectId, Vec<CachedTreeEntry>>,
+}
+
+impl<'a> NotesTreeCache<'a> {
+    fn new(db: &'a FileObjectDatabase, format: ObjectFormat) -> Self {
+        Self {
+            db,
+            format,
+            entries: BTreeMap::new(),
+        }
+    }
+
+    fn entries(&mut self, tree_oid: &ObjectId) -> Result<Vec<CachedTreeEntry>> {
+        if let Some(entries) = self.entries.get(tree_oid) {
+            return Ok(entries.clone());
+        }
+        let object = self.db.read_object(tree_oid)?;
+        let entries = if object.object_type == ObjectType::Tree {
+            TreeEntries::new(self.format, &object.body)
+                .map(|entry| {
+                    let entry = entry?;
+                    Ok(CachedTreeEntry {
+                        name: entry.name.to_vec(),
+                        mode: entry.mode,
+                        oid: entry.oid,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        self.entries.insert(*tree_oid, entries.clone());
+        Ok(entries)
+    }
+}
+
+fn load_notes_snapshot(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    notes_ref: &NotesRef,
+) -> Result<NotesSnapshot> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let Some(parent) = notes_head_oid(store, notes_ref)? else {
+        return Ok(NotesSnapshot {
+            parent: None,
+            notes: BTreeMap::new(),
+            non_notes: Vec::new(),
+        });
+    };
+    let commit = read_commit(&db, format, &parent)?;
+    let mut cache = NotesTreeCache::new(&db, format);
+    let mut notes = BTreeMap::new();
+    collect_notes_from_tree_cached(
+        git_dir,
+        &db,
+        format,
+        commit.tree,
+        "",
+        &mut notes,
+        &mut cache,
+    )?;
+    let mut non_notes = Vec::new();
+    collect_non_notes_rec_cached(format, &commit.tree, &[], 0, &mut non_notes, &mut cache)?;
+    Ok(NotesSnapshot {
+        parent: Some(parent),
+        notes,
+        non_notes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_notes_from_tree_cached(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: ObjectId,
+    prefix: &str,
+    out: &mut BTreeMap<ObjectId, ObjectId>,
+    cache: &mut NotesTreeCache<'_>,
+) -> Result<()> {
+    for entry in cache.entries(&tree_oid)? {
+        let Ok(name) = std::str::from_utf8(&entry.name) else {
+            continue;
+        };
+        if !is_hex_name(name) {
+            continue;
+        }
+        let mut hex = prefix.to_string();
+        hex.push_str(name);
+        if tree_entry_object_type(entry.mode) == ObjectType::Tree {
+            collect_notes_from_tree_cached(git_dir, db, format, entry.oid, &hex, out, cache)?;
+        } else if hex.len() == format.hex_len()
+            && let Ok(annotated) = ObjectId::from_hex(format, &hex)
+        {
+            let combined =
+                combine_loaded_note(git_dir, db, format, out.get(&annotated).copied(), entry.oid)?;
+            match combined {
+                Some(blob) => {
+                    out.insert(annotated, blob);
+                }
+                None => {
+                    out.remove(&annotated);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_non_notes_rec_cached(
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    prefix: &[u8],
+    consumed_hex: usize,
+    out: &mut Vec<NonNote>,
+    cache: &mut NotesTreeCache<'_>,
+) -> Result<()> {
+    let hex_len = format.hex_len();
+    for entry in cache.entries(tree_oid)? {
+        let name = &entry.name;
+        let name_len = name.len();
+        let is_tree = tree_entry_object_type(entry.mode) == ObjectType::Tree;
+        let is_hex = !name.is_empty() && name.iter().all(u8::is_ascii_hexdigit);
+
+        if consumed_hex < hex_len && name_len == hex_len - consumed_hex {
+            if !is_tree && is_hex {
+                continue;
+            }
+        } else if name_len == 2 && is_tree && is_hex {
+            let mut child_prefix = prefix.to_vec();
+            child_prefix.extend_from_slice(name);
+            child_prefix.push(b'/');
+            collect_non_notes_rec_cached(
+                format,
+                &entry.oid,
+                &child_prefix,
+                consumed_hex + 2,
+                out,
+                cache,
+            )?;
+            continue;
+        }
+
+        let mut full = prefix.to_vec();
+        full.extend_from_slice(name);
+        out.push(NonNote {
+            path: full,
+            mode: entry.mode,
+            oid: entry.oid,
+        });
+    }
+    Ok(())
 }
 
 fn notes_map_from_tree(
@@ -1063,17 +1288,48 @@ fn commit_notes_update_with_parents(
     ref_expected: Option<RefTarget>,
     update_ref: bool,
 ) -> Result<ObjectId> {
-    let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
-    // Preserve any non-note entries carried by the base notes commit. git keeps a
-    // sorted "non_note" list while loading a notes tree and weaves it back on
-    // write so arbitrary blobs/dirs living in a notes tree survive note edits
-    // (t3304). The base is the first parent — the commit whose tree was read,
-    // mutated, and is being rewritten here.
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let non_notes = match parents.first() {
         Some(parent) => collect_non_notes_from_commit(&db, format, parent)?,
         None => Vec::new(),
     };
-    let tree_oid = write_notes_tree_preserving(&mut db, notes, &non_notes)?;
+    commit_notes_update_with_preloaded_non_notes(
+        git_dir,
+        format,
+        store,
+        notes_ref,
+        notes,
+        message,
+        identity,
+        parents,
+        ref_expected,
+        update_ref,
+        &non_notes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_notes_update_with_preloaded_non_notes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    notes_ref: &NotesRef,
+    notes: &[Note],
+    message: &[u8],
+    identity: &NotesCommitIdentity,
+    parents: &[ObjectId],
+    ref_expected: Option<RefTarget>,
+    update_ref: bool,
+    non_notes: &[NonNote],
+) -> Result<ObjectId> {
+    let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
+    // Preserve any non-note entries carried by the base notes commit. git keeps a
+    // sorted "non_note" list while loading a notes tree and weaves it back on
+    // write so arbitrary blobs/dirs living in a notes tree survive note edits
+    // (t3304). Incremental operations supply the entries collected alongside
+    // their notes snapshot; full-replace callers collect them before entering
+    // this shared write path.
+    let tree_oid = write_notes_tree_preserving(&mut db, notes, non_notes)?;
 
     let commit_oid = create_commit(
         &mut db,
@@ -1888,6 +2144,58 @@ mod tests {
     }
 
     #[test]
+    fn upsert_note_for_can_commit_an_identical_blob() {
+        let dir = unique_temp_dir("upsert-identical-commit");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (git_dir, target) = init_repo_with_commit(&dir);
+        let format = ObjectFormat::Sha1;
+        let store = FileRefStore::new(&git_dir, format);
+        let notes_ref = heddle_notes_ref();
+        let identity = test_identity();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let blob = write_blob(&mut db, b"same note\n").expect("blob");
+
+        let first = upsert_note_for(
+            &git_dir, format, &store, &notes_ref, &target, blob, "first", &identity, None,
+        )
+        .expect("first upsert");
+        let UpsertNoteOutcome::Updated {
+            notes_commit: first_commit,
+        } = first
+        else {
+            panic!("expected first commit");
+        };
+        let second = upsert_note_for_with_options(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &target,
+            blob,
+            "forced",
+            &identity,
+            Some(RefTarget::Direct(first_commit)),
+            UpsertNoteOptions {
+                commit_if_unchanged: true,
+            },
+        )
+        .expect("forced identical upsert");
+        let UpsertNoteOutcome::Updated {
+            notes_commit: second_commit,
+        } = second
+        else {
+            panic!("expected redundant commit");
+        };
+        assert_ne!(first_commit, second_commit);
+        let second_object = db
+            .read_object(&second_commit)
+            .expect("second commit object");
+        let second_commit_data = Commit::parse(format, &second_object.body).expect("parse commit");
+        assert_eq!(second_commit_data.parents, vec![first_commit]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn upsert_note_for_updates_blob() {
         let dir = unique_temp_dir("upsert-update");
         fs::create_dir_all(&dir).expect("create temp dir");
@@ -2245,6 +2553,93 @@ mod tests {
             read_note_for(&git_dir, format, &store, &notes_ref, &target).expect("read"),
             Some(new_blob)
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incremental_upsert_preserves_non_note_tree_entries() {
+        let dir = unique_temp_dir("incremental-non-note");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (git_dir, target) = init_repo_with_commit(&dir);
+        let format = ObjectFormat::Sha1;
+        let store = FileRefStore::new(&git_dir, format);
+        let notes_ref = heddle_notes_ref();
+        let identity = test_identity();
+        let other =
+            ObjectId::from_hex(format, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").expect("oid");
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let first_blob = write_blob(&mut db, b"first note\n").expect("first blob");
+        let second_blob = write_blob(&mut db, b"second note\n").expect("second blob");
+        let metadata_blob = write_blob(&mut db, b"preserve me\n").expect("metadata blob");
+        let tree = Tree {
+            entries: vec![
+                TreeEntry {
+                    mode: 0o100644,
+                    name: BString::from(b"README"),
+                    oid: metadata_blob,
+                },
+                TreeEntry {
+                    mode: 0o100644,
+                    name: BString::from(target.to_hex().as_bytes()),
+                    oid: first_blob,
+                },
+            ],
+        };
+        let tree_oid = db
+            .write_object(EncodedObject::new(ObjectType::Tree, tree.write()))
+            .expect("tree");
+        let head = create_commit(
+            &mut db,
+            CommitCreate {
+                tree: tree_oid,
+                parents: Vec::new(),
+                author: identity.author.clone(),
+                committer: identity.committer.clone(),
+                message: b"seed notes\n".to_vec(),
+                encoding: None,
+                signature: None,
+            },
+        )
+        .expect("commit");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: notes_ref.as_str().to_string(),
+            expected: None,
+            new: RefTarget::Direct(head),
+            reflog: None,
+        });
+        tx.commit().expect("update ref");
+
+        let UpsertNoteOutcome::Updated { notes_commit } = upsert_note_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &other,
+            second_blob,
+            "add second",
+            &identity,
+            Some(RefTarget::Direct(head)),
+        )
+        .expect("upsert") else {
+            panic!("expected update");
+        };
+
+        assert_eq!(
+            read_note_for(&git_dir, format, &store, &notes_ref, &target).expect("first note"),
+            Some(first_blob)
+        );
+        assert_eq!(
+            read_note_for(&git_dir, format, &store, &notes_ref, &other).expect("second note"),
+            Some(second_blob)
+        );
+        let commit = read_commit(&db, format, &notes_commit).expect("notes commit");
+        let root = db.read_object(&commit.tree).expect("root tree");
+        let metadata = TreeEntries::new(format, &root.body)
+            .map(|entry| entry.expect("tree entry"))
+            .find(|entry| entry.name == b"README")
+            .expect("preserved README");
+        assert_eq!(metadata.oid, metadata_blob);
         let _ = fs::remove_dir_all(&dir);
     }
 

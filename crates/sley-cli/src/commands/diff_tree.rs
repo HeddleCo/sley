@@ -208,7 +208,10 @@ impl Default for DiffTreeOptions {
     }
 }
 
-pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_diff_tree(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     // `diff-tree -s --pretty=tformat:%s <commit>` — the no-diff subject-only
     // form the sequencer suite uses; print the subject and stop.
     {
@@ -224,12 +227,12 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
                 .cloned()
                 .collect();
             if setup_args.len() == 1 {
-                let cwd = env::current_dir()?;
-                let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+                let cwd = cli_session.cwd().to_path_buf();
+                let git_dir = cli_session.git_dir()?;
                 let format = repository_object_format(&git_dir)?;
                 let config = read_repo_config(&git_dir)?;
                 let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-                let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
+                let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir).ok();
                 let setup = sley_rev::setup_revisions(
                     &setup_args,
                     &sley_rev::RevisionSetupContext {
@@ -556,7 +559,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
         }
     }
     options.ignore_regexes = crate::compile_ignore_matching_regexes(&ignore_regex_patterns)?;
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let git_dir = repo.git_dir();
     let format = repo.format();
     let db = repo.objects();
@@ -618,8 +621,12 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
     } else {
         None
     };
-    let find_objects =
-        commands::diff::resolve_diff_find_objects(git_dir, format, &options.find_object_values)?;
+    let find_objects = commands::diff::resolve_diff_find_objects(
+        git_dir,
+        format,
+        db,
+        &options.find_object_values,
+    )?;
     // `--indent-heuristic` / `--no-indent-heuristic` win over the
     // `diff.indentHeuristic` config (which defaults to git's enabled behavior).
     let indent_heuristic = options.indent_heuristic.unwrap_or_else(|| {
@@ -634,6 +641,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             repo.cwd(),
             worktree_root,
             &setup.pathspecs,
+            repo.pathspec_magic(),
         )?)
     } else {
         None
@@ -650,6 +658,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
         indent_heuristic,
         ws_resolver,
         check_failed: std::cell::Cell::new(false),
+        lazy_fetch: cli_session.lazy_fetch(),
     };
 
     let mut has_differences = false;
@@ -1066,6 +1075,7 @@ struct DiffRequestContext<'a> {
     ws_resolver: Option<commands::diff::WhitespaceRuleResolver>,
     /// Accumulated `--check` failure status across all requests.
     check_failed: std::cell::Cell<bool>,
+    lazy_fetch: bool,
 }
 
 fn run_diff_request(
@@ -1085,6 +1095,9 @@ fn run_diff_request(
             && context.options.output.stat
         {
             write!(stdout, "{}", header.text)?;
+        } else if context.options.z {
+            stdout.write_all(header.text.as_bytes())?;
+            stdout.write_all(b"\0")?;
         } else {
             writeln!(stdout, "{}", header.text)?;
         }
@@ -1129,6 +1142,7 @@ fn run_diff_request(
             None,
             false,
             None,
+            context.lazy_fetch,
         )?
     } else {
         entries
@@ -1140,7 +1154,14 @@ fn run_diff_request(
     if context.options.check {
         if let Some(resolver) = &context.ws_resolver {
             let failed = commands::diff::run_diff_check(
-                &entries, context.db, None, false, false, None, resolver,
+                &entries,
+                context.db,
+                None,
+                false,
+                false,
+                None,
+                resolver,
+                context.lazy_fetch,
             )?;
             if failed {
                 context.check_failed.set(true);
@@ -1187,7 +1208,7 @@ fn run_diff_request(
         wrote_block = true;
     }
     let stat_entries_for_render = if output.numstat || output.stat || output.shortstat {
-        collect_diff_stat_entries(&entries, context.db, None, false)?
+        collect_diff_stat_entries(&entries, context.db, None, false, context.lazy_fetch)?
     } else {
         Vec::new()
     };
@@ -1227,6 +1248,7 @@ fn run_diff_request(
                 },
                 // diff-tree is plumbing: fixed 80 columns, no config caps.
                 widths: Some(DiffStatWidths::plumbing()),
+                config: None,
             },
             after_stat: None,
             prefix_already_written: wrote_block,
@@ -1238,6 +1260,7 @@ fn run_diff_request(
                 anchors: &[],
                 allow_textconv: false,
                 db: context.db,
+                lazy_fetch: context.lazy_fetch,
                 worktree_root: None,
                 use_worktree_new: false,
                 format: context.format,
@@ -1250,6 +1273,7 @@ fn run_diff_request(
                 colors: None,
                 word_diff: None,
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                suppress_blank_empty: false,
                 no_index_contents: None,
                 submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                 submodule_dirt: None,
@@ -1281,11 +1305,17 @@ fn run_combined_request(
 ) -> Result<bool> {
     let format = context.format;
     let db = context.db;
-    let mut paths = commands::combined::combined_paths(
+    let mut paths = commands::combined::combined_paths_with_options(
         db,
         format,
         &combined.result_tree,
         &combined.parent_trees,
+        commands::combined::CombinedPathOptions {
+            detect_renames: context.options.detect_renames,
+            rename_empty: context.options.rename_empty,
+            rename_threshold: context.options.rename_threshold,
+            include_trees: context.options.show_trees,
+        },
     )?;
     if !context.find_objects.is_empty() {
         paths.retain(|path| {
@@ -1309,10 +1339,22 @@ fn run_combined_request(
         dst_prefix: &context.options.dst_prefix,
         patch_abbrev: context.patch_abbrev,
         raw_abbrev: context.raw_abbrev,
+        lazy_fetch: context.lazy_fetch,
     };
 
     if output.name_only {
         for path in &paths {
+            if context.options.combined_all_paths {
+                for parent in &path.parents {
+                    let parent_path = &parent.path;
+                    if context.options.z {
+                        stdout.write_all(parent_path)?;
+                        stdout.write_all(b"\0")?;
+                    } else {
+                        write!(stdout, "{}\t", status_quote_path(parent_path, false))?;
+                    }
+                }
+            }
             if context.options.z {
                 stdout.write_all(&path.path)?;
                 stdout.write_all(b"\0")?;
@@ -1324,7 +1366,12 @@ fn run_combined_request(
     }
     if output.name_status {
         for path in &paths {
-            commands::combined::write_combined_name_status(stdout, path, context.options.z)?;
+            commands::combined::write_combined_name_status(
+                stdout,
+                path,
+                context.options.combined_all_paths,
+                context.options.z,
+            )?;
         }
         wrote_block |= !paths.is_empty();
     }
@@ -1350,7 +1397,7 @@ fn run_combined_request(
         )?;
         has_differences |= !first_parent_entries.is_empty();
         let stat_entries = if output.numstat || output.stat || output.shortstat {
-            collect_diff_stat_entries(&first_parent_entries, db, None, false)?
+            collect_diff_stat_entries(&first_parent_entries, db, None, false, context.lazy_fetch)?
         } else {
             Vec::new()
         };

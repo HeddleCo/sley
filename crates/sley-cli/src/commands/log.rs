@@ -32,6 +32,27 @@ use reflog::{
     log_walk_reflogs,
 };
 
+/// Resolve a file-backed config value across Git's system, global, and local
+/// layers. `RepositoryContext` intentionally carries the repository config and
+/// command-scoped injections; callers use this only when those higher
+/// precedence layers did not define the key.
+fn log_effective_file_config_value(
+    git_dir: &Path,
+    cwd: &Path,
+    section: &str,
+    variable: &str,
+) -> Result<Option<String>> {
+    let config = commands::remote::read_effective_repo_config(git_dir, cwd)
+        .map_err(report_config_setup_error)?;
+    Ok(config
+        .get(section, None, variable)
+        .map(str::to_string)
+        .or_else(|| {
+            matches!(config.get_all(section, None, variable).last(), Some(None))
+                .then(|| "true".to_string())
+        }))
+}
+
 /// Tracks `git log`'s notes-display state (`--notes`, `--show-notes[=ref]`,
 /// `--no-notes`, `--standard-notes`, `--no-standard-notes`), mirroring git's
 /// `display_notes_opt` / `show_notes` resolution.
@@ -554,14 +575,14 @@ impl sley_strbuf_expand::AtomResolver<FormatToken> for LogFormatNoteResolver<'_,
     }
 }
 
-pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
-    cmd_log_impl(args, false)
+pub(crate) fn cmd_log(cli_session: &session::CliSession, args: &[String]) -> Result<()> {
+    cmd_log_impl(cli_session, args, false)
 }
 
 /// `git whatchanged --i-still-use-this`: log with raw diff output by default
 /// and `always_show_header = 0` semantics (commits whose diff comes out empty
 /// — e.g. merges — are omitted entirely).
-pub(crate) fn cmd_whatchanged(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_whatchanged(cli_session: &session::CliSession, args: &[String]) -> Result<()> {
     let mut acknowledged = false;
     let mut filtered = Vec::with_capacity(args.len());
     for arg in args {
@@ -577,7 +598,7 @@ pub(crate) fn cmd_whatchanged(args: &[String]) -> Result<()> {
         );
         return Err(GitError::Exit(128));
     }
-    cmd_log_impl(&filtered, true)
+    cmd_log_impl(cli_session, &filtered, true)
 }
 
 fn log_limited_commit_format_supported(compiled: &CompiledLogFormat) -> bool {
@@ -662,11 +683,19 @@ fn log_output_needs_mailmap(output: &LogOutput, use_mailmap: bool) -> bool {
 
 fn log_cached_mailmap<'a>(
     cache: &'a mut Option<commands::utility::Mailmap>,
+    cli_session: &session::CliSession,
     git_dir: &Path,
     format: ObjectFormat,
+    replace_objects: bool,
 ) -> Result<&'a commands::utility::Mailmap> {
     if cache.is_none() {
-        *cache = Some(commands::utility::Mailmap::load_default(git_dir, format)?);
+        let worktree = cli_session.optional_worktree_for_git_dir(git_dir)?;
+        *cache = Some(commands::utility::Mailmap::load_default_with_worktree(
+            git_dir,
+            worktree.as_deref(),
+            format,
+            replace_objects,
+        )?);
     }
     Ok(cache.as_ref().expect("mailmap cache was just initialized"))
 }
@@ -684,12 +713,38 @@ pub(crate) fn render_log_raw_pretty(record: &sley_rev::CommitRecord, expand_tabs
     out.extend_from_slice(b"committer ");
     out.extend_from_slice(&record.commit.committer);
     out.extend_from_slice(b"\n\n");
-    for line in String::from_utf8_lossy(&record.commit.message).lines() {
+    render_log_raw_message(&record.commit.message, expand_tabs, &mut out);
+    out
+}
+
+fn render_log_raw_message(message: &[u8], expand_tabs: i32, out: &mut Vec<u8>) {
+    let mut lines = message.split(|byte| *byte == b'\n').peekable();
+    while let Some(line) = lines.next() {
+        // `str::lines`, used by the old implementation, omits the synthetic
+        // empty field after a final newline. Preserve that line structure while
+        // operating on bytes so `--format=raw` does not replace malformed
+        // commit bytes with UTF-8 replacement characters.
+        if line.is_empty() && lines.peek().is_none() && message.ends_with(b"\n") {
+            break;
+        }
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         out.extend_from_slice(b"    ");
-        out.extend_from_slice(&log_expand_tabs(line.as_bytes(), expand_tabs));
+        out.extend_from_slice(&log_expand_tabs(line, expand_tabs));
         out.push(b'\n');
     }
-    out
+}
+
+#[cfg(test)]
+mod raw_message_tests {
+    use super::render_log_raw_message;
+
+    #[test]
+    fn raw_message_preserves_malformed_utf8() {
+        let message = b"Th\xf8\x9d\x84\x9es\n";
+        let mut out = Vec::new();
+        render_log_raw_message(message, 0, &mut out);
+        assert_eq!(out, [b"    ".as_slice(), message].concat());
+    }
 }
 
 /// Display width of a message segment for tab-stop computation, mirroring
@@ -859,7 +914,12 @@ fn emit_plain_oneline_limited_commit(
     Ok(())
 }
 
-fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
+fn cmd_log_impl(
+    cli_session: &session::CliSession,
+    args: &[String],
+    whatchanged: bool,
+) -> Result<()> {
+    let lazy_fetch = cli_session.lazy_fetch();
     let mut setup_args = Vec::new();
     let mut setup_not = false;
     let mut default_revision_given = false;
@@ -904,6 +964,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut author_patterns = Vec::new();
     let mut committer_patterns = Vec::new();
     let mut grep_patterns = Vec::new();
+    let mut reflog_patterns = Vec::new();
     let mut grep_all_match = false;
     let mut invert_grep = false;
     let mut regexp_ignore_case = false;
@@ -918,6 +979,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut null_terminate = false;
     let mut graph = false;
     let mut boundary = false;
+    // `--merge` is revision.c's conflict-history mode (distinct from
+    // `--merges`, which merely filters by parent count).
+    let mut show_merge = false;
+    // Keep the oldest N commits from the fully filtered/simplified revision
+    // result. Unlike `--max-count`, this is applied from the tail of the normal
+    // newest-first walk, before an optional `--reverse` presentation flip.
+    let mut max_count_oldest: Option<usize> = None;
     let mut show_linear_break = false;
     let mut show_source = false;
     let mut ignored_missing_input = false;
@@ -1116,6 +1184,15 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             value if value.starts_with("--grep=") => {
                 grep_patterns.push(value["--grep=".len()..].to_string());
             }
+            "--grep-reflog" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| log_option_requires_value_error("grep-reflog"))?;
+                reflog_patterns.push(value.to_string());
+            }
+            value if value.starts_with("--grep-reflog=") => {
+                reflog_patterns.push(value["--grep-reflog=".len()..].to_string());
+            }
             "--all-match" => grep_all_match = true,
             "--invert-grep" => invert_grep = true,
             "-i" | "--regexp-ignore-case" => regexp_ignore_case = true,
@@ -1267,6 +1344,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             {
                 setup_args.push(arg.clone());
             }
+            "--merge" => show_merge = true,
             "--merges" => min_parents = Some(2),
             "--no-merges" => max_parents = Some(1),
             "--no-min-parents" => min_parents = None,
@@ -1896,6 +1974,15 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 preset_oneline = None;
                 plain_oneline = false;
             }
+            "--max-count-oldest" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("--max-count-oldest requires a value".into())
+                })?;
+                max_count_oldest = Some(log_parse_parent_count(value)?);
+            }
+            value if let Some(count) = value.strip_prefix("--max-count-oldest=") => {
+                max_count_oldest = Some(log_parse_parent_count(count)?);
+            }
             "-n" | "--max-count" => {
                 setup_args.push(arg.clone());
                 setup_args.push(
@@ -2130,8 +2217,11 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     }
                     follow_config_allowed = false;
                 }
-                if let Some((_, path)) = log_pathspec_magic(value) {
-                    setup_args.push(path.to_string());
+                if log_pathspec_magic(value).is_some() {
+                    // Preserve the complete magic expression for revision
+                    // setup. Stripping `:(exclude)`/other magic here prevents
+                    // ambiguity handling and unknown-magic validation.
+                    setup_args.push(value.to_string());
                 } else if value == ".." && Path::new(value).is_dir() {
                     if !setup_args.iter().any(|arg| arg == "--") {
                         setup_args.push("--".to_string());
@@ -2174,22 +2264,24 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     if whatchanged && !diff_opts.any() {
         diff_opts.raw = true;
     }
-    let git_dir = crate::session::cli_git_dir()?;
-    let format = repository_object_format(&git_dir)?;
-    let config = read_repo_config(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let repository = crate::repository::RepositoryContext::from_session(cli_session)?;
+    let git_dir = repository.git_dir().to_path_buf();
+    let format = repository.format();
+    let config = repository.config().clone();
+    let db = repository.repository().objects_mut();
     let has_commit_grafts = !sley_rev::revlist::load_commit_grafts(&db, format).is_empty();
-    let cwd = env::current_dir()?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir).ok();
+    let cwd = repository.cwd().to_path_buf();
+    let worktree_root = repository.worktree_root().ok().map(Path::to_path_buf);
     for rev in end_of_options_revs {
         if rev.starts_with('-') {
-            match resolve_revision(&git_dir, format, &rev) {
+            match repository.resolve_revision(&rev) {
                 Ok(oid) => setup_args.push(oid.to_hex()),
                 Err(_) => {
                     let head_ref = format!("refs/heads/{rev}");
                     let tag_ref = format!("refs/tags/{rev}");
-                    match resolve_revision(&git_dir, format, &head_ref)
-                        .or_else(|_| resolve_revision(&git_dir, format, &tag_ref))
+                    match repository
+                        .resolve_revision(&head_ref)
+                        .or_else(|_| repository.resolve_revision(&tag_ref))
                     {
                         Ok(oid) => setup_args.push(oid.to_hex()),
                         Err(_) => setup_args.push(rev),
@@ -2199,6 +2291,16 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         } else {
             setup_args.push(rev);
         }
+    }
+    if show_merge {
+        let merge_revisions = log_show_merge_revisions(&git_dir, format, &db, &config)?;
+        // Add these before command-line revision toggles such as `--not`:
+        // prepare_show_merge marks its heads interesting independently of the
+        // user's pending polarity.
+        setup_args.splice(0..0, merge_revisions);
+        // The mode supplies HEAD and the in-progress operation's other head;
+        // do not also install the ordinary single-HEAD default.
+        default_revision_given = true;
     }
     if !default_revision_given && !revision_input_with_ignore_missing {
         setup_args.splice(0..0, ["--default".to_string(), "HEAD".to_string()]);
@@ -2307,8 +2409,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         },
     ) {
         Ok(setup) => setup,
+        Err(GitError::NotFound(sley::NotFoundKind::BrokenReference { name, .. }))
+            if name == "HEAD" =>
+        {
+            eprintln!("fatal: your current branch appears to be broken");
+            return Err(GitError::Exit(128));
+        }
         Err(err) if inserted_default_head => {
-            if resolve_revision(&git_dir, format, "HEAD").is_err()
+            if repository.resolve_revision("HEAD").is_err()
                 && let Some(branch) = log_unborn_head_branch(&git_dir)
             {
                 eprintln!("fatal: your current branch '{branch}' does not have any commits yet");
@@ -2316,7 +2424,18 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             }
             return Err(err);
         }
-        Err(err) => return Err(err),
+        Err(err) => {
+            if matches!(
+                repository.resolve_revision("HEAD"),
+                Err(GitError::NotFound(
+                    sley::NotFoundKind::BrokenReference { .. }
+                ))
+            ) {
+                eprintln!("fatal: your current branch appears to be broken");
+                return Err(GitError::Exit(128));
+            }
+            return Err(err);
+        }
     };
     if let Some(leftover) = setup.leftovers.first() {
         return Err(GitError::Command(format!(
@@ -2346,7 +2465,29 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         sley_rev::NoWalkMode::Unsorted => (false, true),
     };
     let first_parent = revision_options.first_parent;
-    let pathspecs = setup.pathspecs;
+    let mut pathspecs = setup.pathspecs;
+    if show_merge {
+        let user_pathspec = if pathspecs.is_empty() {
+            None
+        } else {
+            let worktree_root = repository.worktree_root()?;
+            Some(DiffPathspec::new(
+                &cwd,
+                worktree_root,
+                &pathspecs,
+                effective_pathspec_flags(cli_session),
+            )?)
+        };
+        pathspecs = log_show_merge_conflict_paths(&git_dir, format, user_pathspec.as_ref())?;
+    }
+    if max_count_oldest.is_some() && max_count.is_some() {
+        eprintln!("fatal: options '--max-count-oldest' and '--max-count' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if max_count_oldest.is_some() && skip > 0 {
+        eprintln!("fatal: options '--max-count-oldest' and '--skip' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
     if !follow_explicit
         && !saw_follow
         && follow_config_allowed
@@ -2401,7 +2542,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let compiled_pickaxe = if has_find_object {
         let mut oids = HashSet::new();
         for pat in &find_object_patterns {
-            let oid = resolve_revision(&git_dir, format, pat).map_err(|_| {
+            let oid = repository.resolve_revision(pat).map_err(|_| {
                 eprintln!("error: unable to resolve '{pat}'");
                 GitError::Exit(128)
             })?;
@@ -2463,8 +2604,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     // pickaxe filters. Plain commit-log output should not pay for it.
     let log_userdiff =
         if diff_opts.any() || diff_opts.merges_imply_patch || compiled_pickaxe.is_some() {
-            let attributes = worktree_root_for_git_dir(&git_dir)
-                .ok()
+            let attributes = worktree_root
+                .as_deref()
                 .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
                 .transpose()?;
             Some(commands::userdiff::UserdiffResolver::with_attributes(
@@ -2486,13 +2627,18 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         let diff_pathspec = if pathspecs.is_empty() {
             None
         } else {
-            let cwd = env::current_dir()?;
-            let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-            Some(DiffPathspec::new(&cwd, &worktree_root, &pathspecs)?)
+            let worktree_root = repository.worktree_root()?;
+            Some(DiffPathspec::new(
+                &cwd,
+                worktree_root,
+                &pathspecs,
+                effective_pathspec_flags(cli_session),
+            )?)
         };
         let repo_abbrev = repository_abbrev_from_config(&git_dir, format, &config)?;
         Some(LogDiffContext {
             db: &db,
+            lazy_fetch,
             format,
             config: &config,
             userdiff: log_userdiff
@@ -2529,6 +2675,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 matches!(config.get_all("log", None, "decorate").last(), Some(None))
                     .then(|| "true".to_string())
             });
+        let decorate_config = match decorate_config {
+            Some(value) => Some(value),
+            None => log_effective_file_config_value(&git_dir, &cwd, "log", "decorate")?,
+        };
         if let Some(value) = decorate_config {
             match value.trim().to_ascii_lowercase().as_str() {
                 "short" | "true" | "yes" | "on" | "1" | "" => decoration = LogDecorationMode::Short,
@@ -2638,6 +2788,10 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             _ => pattern_kind,
         };
     }
+    if !walk_reflogs && !reflog_patterns.is_empty() {
+        eprintln!("fatal: the option '--grep-reflog' requires '--walk-reflogs'");
+        return Err(GitError::Exit(128));
+    }
     let author_filters =
         compile_log_filter_matcher(&author_patterns, pattern_kind, regexp_ignore_case, "header")?;
     let committer_filters = compile_log_filter_matcher(
@@ -2652,12 +2806,18 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         regexp_ignore_case,
         "command line",
     )?;
+    let reflog_filters =
+        compile_log_filter_matcher(&reflog_patterns, pattern_kind, regexp_ignore_case, "header")?;
     let grep_colors = LogGrepColors::from_config(&config, color_always);
     if walk_reflogs {
         let reflog_revisions = revision_options
             .positives
             .iter()
-            .filter_map(|tip| tip.source_name.clone())
+            .filter_map(|tip| {
+                tip.source_name
+                    .clone()
+                    .map(|source| (source, tip.from_ref_selector))
+            })
             .collect::<Vec<_>>();
         return log_walk_reflogs(
             &git_dir,
@@ -2669,6 +2829,15 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 output: &output,
                 reverse,
                 date_mode: &date_mode,
+                replace_objects: cli_session.replace_objects(),
+                author_filter: author_filters.as_ref(),
+                committer_filter: committer_filters.as_ref(),
+                message_filter: grep_filters.as_ref(),
+                reflog_filter: reflog_filters.as_ref(),
+                grep_all_match,
+                invert_grep,
+                output_encoding: &output_encoding,
+                use_mailmap,
             },
         );
     }
@@ -2741,6 +2910,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         return run_line_log_output(LineLogOutputCtx {
             git_dir: &git_dir,
             db: &db,
+            lazy_fetch,
+            replace_objects: cli_session.replace_objects(),
             format,
             config: &config,
             tip: starts[0],
@@ -2785,6 +2956,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         return Err(GitError::Command("unsupported log option --dirstat".into()));
     }
     if plain_oneline
+        && max_count_oldest.is_none()
         && walk
         && !graph
         && line_prefix.is_none()
@@ -2848,6 +3020,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         return Ok(());
     }
     if walk
+        && max_count_oldest.is_none()
         && !graph
         && line_prefix.is_none()
         && ordering == RevListOrdering::Default
@@ -2957,6 +3130,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         return Ok(());
     }
     if walk
+        && max_count_oldest.is_none()
         && !graph
         && line_prefix.is_none()
         && ordering == RevListOrdering::Default
@@ -3064,7 +3238,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut selected = Vec::new();
     let filter_mailmap = if use_mailmap && (author_filters.is_some() || committer_filters.is_some())
     {
-        Some(log_cached_mailmap(&mut mailmap_cache, &git_dir, format)?)
+        Some(log_cached_mailmap(
+            &mut mailmap_cache,
+            cli_session,
+            &git_dir,
+            format,
+            cli_session.replace_objects(),
+        )?)
     } else {
         None
     };
@@ -3094,9 +3274,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         let pickaxe_pathspec = if pathspecs.is_empty() {
             None
         } else {
-            let cwd = env::current_dir()?;
-            let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-            Some(DiffPathspec::new(&cwd, &worktree_root, &pathspecs)?)
+            let worktree_root = repository.worktree_root()?;
+            Some(DiffPathspec::new(
+                &cwd,
+                worktree_root,
+                &pathspecs,
+                effective_pathspec_flags(cli_session),
+            )?)
         };
         let mut kept = Vec::with_capacity(selected.len());
         for record in selected {
@@ -3122,9 +3306,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         let filter_pathspec = if pathspecs.is_empty() {
             None
         } else {
-            let cwd = env::current_dir()?;
-            let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-            Some(DiffPathspec::new(&cwd, &worktree_root, &pathspecs)?)
+            let worktree_root = repository.worktree_root()?;
+            Some(DiffPathspec::new(
+                &cwd,
+                worktree_root,
+                &pathspecs,
+                effective_pathspec_flags(cli_session),
+            )?)
         };
         let mut kept = Vec::with_capacity(selected.len());
         for record in selected {
@@ -3183,7 +3371,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             &cwd,
             worktree_root.as_deref(),
             &pathspecs,
-            effective_pathspec_flags(),
+            effective_pathspec_flags(cli_session),
         )?;
         let ordered_owned: Vec<sley_rev::CommitRecord> = commits.clone();
         let bottoms: HashSet<ObjectId> = revision_options.negatives.iter().copied().collect();
@@ -3222,7 +3410,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
             &cwd,
             worktree_root.as_deref(),
             &pathspecs,
-            effective_pathspec_flags(),
+            effective_pathspec_flags(cli_session),
         )?;
         let ordered_owned: Vec<sley_rev::CommitRecord> =
             selected.iter().map(|r| (*r).clone()).collect();
@@ -3316,9 +3504,17 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         });
         log_decoration_map(&git_dir, &db, format, map_mode, &decoration_filter)?
     };
+    let decoration_simplified_storage;
     if simplify_by_decoration {
-        selected
-            .retain(|record| decorations.contains_key(&record.oid) || record.parents.is_empty());
+        decoration_simplified_storage = log_simplify_by_decoration(selected, &decorations);
+        selected = rev_list_topo_order(decoration_simplified_storage.iter().collect())?;
+    } else {
+        decoration_simplified_storage = Vec::new();
+    }
+    let _ = &decoration_simplified_storage;
+    if let Some(count) = max_count_oldest {
+        let discard = selected.len().saturating_sub(count);
+        selected = selected.into_iter().skip(discard).collect();
     }
     // `--boundary` (with `--graph`): the uninteresting commits directly adjacent
     // to the shown set are git's BOUNDARY commits. Emit them as leaf nodes (`o`)
@@ -3425,7 +3621,13 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
         None
     };
     let output_mailmap = if log_output_needs_mailmap(&output, use_mailmap) {
-        log_cached_mailmap(&mut mailmap_cache, &git_dir, format)?
+        log_cached_mailmap(
+            &mut mailmap_cache,
+            cli_session,
+            &git_dir,
+            format,
+            cli_session.replace_objects(),
+        )?
     } else {
         &empty_mailmap
     };
@@ -3513,16 +3715,21 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                             &mut msg,
                         )?;
                     }
+                    let mut diff_attached = false;
                     if let Some(log_diff) = &log_diff {
-                        let mut padding = String::new();
-                        graph_state.padding_line(&mut padding);
+                        // Measuring a padding row by rendering it mutates the
+                        // graph's collapsing state and silently consumes a
+                        // topology row. Its visible width is already tracked by
+                        // the graph, so use that without advancing it.
                         let prefix_width =
-                            log_prefix_display_width(&padding) + log_prefix_display_width(prefix);
+                            graph_state.graph_width() as i64 + log_prefix_display_width(prefix);
                         log_diff.render(record, prefix_width, &mut diff_block)?;
                         if !diff_block.is_empty() {
+                            diff_attached = true;
                             if msg.last() != Some(&b'\n') {
                                 msg.push(b'\n');
                             }
+                            msg.extend_from_slice(diff_opts.block_separator_for(record));
                             msg.extend_from_slice(&diff_block);
                         }
                     }
@@ -3530,6 +3737,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     let newline_terminated = msg.last() == Some(&b'\n');
                     prev_missing_newline = !newline_terminated;
                     if *final_newline
+                        && (!diff_attached || !newline_terminated)
                         && (!*suppress_extra_final_newline
                             || index + 1 < selected.len()
                             || !newline_terminated)
@@ -3562,10 +3770,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                             msg.extend_from_slice(&notes);
                         }
                         if let Some(log_diff) = &log_diff {
-                            let mut padding = String::new();
-                            graph_state.padding_line(&mut padding);
-                            let prefix_width = log_prefix_display_width(&padding)
-                                + log_prefix_display_width(prefix);
+                            let prefix_width =
+                                graph_state.graph_width() as i64 + log_prefix_display_width(prefix);
                             log_diff.render(record, prefix_width, &mut diff_block)?;
                             if !diff_block.is_empty() {
                                 msg.extend_from_slice(diff_opts.block_separator_for(record));
@@ -3683,10 +3889,8 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                         // Measure the graph padding that will prefix the diff
                         // lines so the stat width math sees the same budget
                         // git's line-prefix callback gives it.
-                        let mut padding = String::new();
-                        graph_state.padding_line(&mut padding);
                         let prefix_width =
-                            log_prefix_display_width(&padding) + log_prefix_display_width(prefix);
+                            graph_state.graph_width() as i64 + log_prefix_display_width(prefix);
                         log_diff.render(record, prefix_width, &mut diff_block)?;
                         if !diff_block.is_empty() {
                             msg.extend_from_slice(diff_opts.block_separator_for(record));
@@ -4039,10 +4243,15 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                     log_diff.render(record, log_prefix_display_width(prefix), &mut diff_block)?;
                     if !diff_block.is_empty() {
                         let mut stdout = io::stdout();
-                        stdout.write_all(b"\n")?;
+                        let separator = diff_opts.block_separator_for(record);
                         if prefix.is_empty() {
+                            stdout.write_all(separator)?;
                             stdout.write_all(&diff_block)?;
                         } else {
+                            for line in separator.split_inclusive(|byte| *byte == b'\n') {
+                                stdout.write_all(prefix.as_bytes())?;
+                                stdout.write_all(line)?;
+                            }
                             let mut start = 0usize;
                             while start < diff_block.len() {
                                 let end = diff_block[start..]
@@ -4214,6 +4423,158 @@ fn log_parse_parent_count(value: &str) -> Result<usize> {
         eprintln!("fatal: '{value}': not an integer");
         GitError::Exit(128)
     })
+}
+
+/// Build revision.c's `prepare_show_merge()` pending set: both sides of the
+/// in-progress operation are interesting and their best common ancestors are
+/// uninteresting boundaries.
+fn log_show_merge_revisions<R: ObjectReader>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reader: &R,
+    config: &GitConfig,
+) -> Result<Vec<String>> {
+    let head =
+        sley_rev::resolve_revision_commitish_with_config(git_dir, format, reader, "HEAD", config)
+            .map_err(|_| {
+            eprintln!("fatal: --merge without HEAD?");
+            GitError::Exit(128)
+        })?;
+
+    let mut other = None;
+    for name in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "REBASE_HEAD",
+    ] {
+        if !git_dir.join(name).exists() {
+            continue;
+        }
+        let oid = sley_rev::resolve_revision_commitish_with_config(
+            git_dir, format, reader, name, config,
+        )?;
+        other = Some((name, oid));
+        break;
+    }
+    let Some((other_name, other_oid)) = other else {
+        eprintln!(
+            "fatal: --merge requires one of the pseudorefs MERGE_HEAD, CHERRY_PICK_HEAD, REVERT_HEAD or REBASE_HEAD"
+        );
+        return Err(GitError::Exit(128));
+    };
+
+    let mut revisions = vec!["HEAD".to_string(), other_name.to_string()];
+    revisions.extend(
+        sley_rev::merge_bases(git_dir, format, reader, &head, &other_oid)?
+            .into_iter()
+            .map(|base| format!("^{base}")),
+    );
+    Ok(revisions)
+}
+
+/// Replace the command-line pathspec with the set of currently unmerged index
+/// paths it selects. This mirrors `prepare_show_merge()`'s stage scan and makes
+/// later history simplification operate only on paths involved in the conflict.
+fn log_show_merge_conflict_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+    user_pathspec: Option<&DiffPathspec>,
+) -> Result<Vec<String>> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let bytes = match fs::read(index_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let index = Index::parse(&bytes, format)?;
+    let mut paths = BTreeSet::new();
+    for entry in index.entries {
+        if entry.stage().as_u16() == 0
+            || user_pathspec.is_some_and(|pathspec| !pathspec.matches(&entry.path))
+        {
+            continue;
+        }
+        paths.insert(argv_string_from_bytes(&entry.path));
+    }
+    Ok(paths.into_iter().collect())
+}
+
+/// `--simplify-by-decoration` treats undecorated commits as TREESAME, but it
+/// must retain merge connectors that join two decorated parent histories and
+/// rewrite parents across omitted commits. A plain `retain(decorated)` loses
+/// those connectors and leaves the survivors in date order rather than the
+/// topology Git presents.
+fn log_simplify_by_decoration(
+    selected: Vec<&sley_rev::CommitRecord>,
+    decorations: &HashMap<ObjectId, Vec<String>>,
+) -> Vec<sley_rev::CommitRecord> {
+    let records: HashMap<ObjectId, &sley_rev::CommitRecord> = selected
+        .iter()
+        .map(|record| (record.oid, *record))
+        .collect();
+    let decorated: HashSet<ObjectId> = decorations.keys().copied().collect();
+    let mut keep: HashSet<ObjectId> = selected
+        .iter()
+        .filter(|record| decorated.contains(&record.oid) || record.parents.is_empty())
+        .map(|record| record.oid)
+        .collect();
+
+    for record in &selected {
+        if record.parents.len() < 2 || keep.contains(&record.oid) {
+            continue;
+        }
+        let decorated_parents = record
+            .parents
+            .iter()
+            .filter(|parent| decorated.contains(*parent))
+            .take(2)
+            .count();
+        if decorated_parents >= 2 {
+            keep.insert(record.oid);
+        }
+    }
+
+    let mut simplified = selected
+        .into_iter()
+        .filter(|record| keep.contains(&record.oid))
+        .cloned()
+        .collect::<Vec<_>>();
+    for record in &mut simplified {
+        let mut rewritten = Vec::new();
+        let mut emitted = HashSet::new();
+        for parent in &record.parents {
+            log_nearest_kept_ancestors(*parent, &records, &keep, &mut emitted, &mut rewritten);
+        }
+        record.parents = rewritten.clone();
+        record.commit.parents = rewritten;
+    }
+    simplified
+}
+
+fn log_nearest_kept_ancestors(
+    start: ObjectId,
+    records: &HashMap<ObjectId, &sley_rev::CommitRecord>,
+    keep: &HashSet<ObjectId>,
+    emitted: &mut HashSet<ObjectId>,
+    out: &mut Vec<ObjectId>,
+) {
+    let mut pending = vec![start];
+    let mut visited = HashSet::new();
+    while let Some(oid) = pending.pop() {
+        if !visited.insert(oid) {
+            continue;
+        }
+        if keep.contains(&oid) {
+            if emitted.insert(oid) {
+                out.push(oid);
+            }
+            continue;
+        }
+        if let Some(record) = records.get(&oid) {
+            pending.extend(record.parents.iter().rev().copied());
+        }
+    }
 }
 
 fn log_parse_abbrev_width(value: &str) -> usize {

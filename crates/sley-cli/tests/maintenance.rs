@@ -175,6 +175,70 @@ fn apply_check_succeeds_for_clean_patch() {
 }
 
 #[test]
+fn apply_plain_patch_outside_repository_matches_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("apply-outside-repository");
+    let reference = root.join("reference");
+    let candidate = root.join("candidate");
+    fs::create_dir_all(&reference).expect("create reference directory");
+    fs::create_dir_all(&candidate).expect("create candidate directory");
+    write_file(&reference, "nums", "one\ntwo\nthree\nfour\n");
+    write_file(&candidate, "nums", "one\ntwo\nthree\nfour\n");
+    let patch = root.join("change.patch");
+    fs::write(
+        &patch,
+        b"diff --git a/nums b/nums\n--- a/nums\n+++ b/nums\n@@ -2,3 +2,4 @@ one\n two\n three\n four\n+five\n",
+    )
+    .expect("write patch");
+    let patch = patch.to_str().expect("utf8 patch path");
+
+    let expected = git(&reference, &["apply", patch]);
+    let actual = sley(&candidate, &["apply", patch]);
+    assert_eq!(actual.status.code(), expected.status.code());
+    assert_eq!(actual.stdout, expected.stdout);
+    assert_eq!(actual.stderr, expected.stderr);
+    assert_eq!(
+        fs::read(candidate.join("nums")).expect("read candidate"),
+        fs::read(reference.join("nums")).expect("read reference")
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn empty_imap_send_and_remote_http_usage_match_git_outside_repository() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("outside-repository-helper-errors");
+    let global_config = root.join("global-config");
+    fs::write(
+        &global_config,
+        b"[imap]\n\thost = imaps://localhost\n\tfolder = Drafts\n",
+    )
+    .expect("write isolated global config");
+    let run = |program: &str, args: &[&str]| {
+        Command::new(program)
+            .current_dir(&root)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &global_config)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+    };
+    for args in [&["imap-send", "-v"][..], &["remote-http"][..]] {
+        let expected = run(sley_testkit::oracle_git(), args);
+        let actual = run(sley_testkit::sley_bin!(), args);
+        assert_eq!(actual.status.code(), expected.status.code(), "{args:?}");
+        assert_eq!(actual.stdout, expected.stdout, "{args:?}");
+        assert_eq!(actual.stderr, expected.stderr, "{args:?}");
+    }
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn apply_creates_new_file_like_git() {
     if !git_available() {
         return;
@@ -468,6 +532,93 @@ fn maintenance_run_quiet_accepted() {
         out.status.success(),
         "sley maintenance run --quiet failed: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn maintenance_start_resolves_the_platform_scheduler_before_registering() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("maint-start-auto-scheduler");
+    let repo = root.join("repo");
+    let global_config = root.join("global-config");
+    git_ok(
+        &root,
+        &["init", "-q", repo.to_str().expect("utf8 repository path")],
+    );
+
+    let out = Command::new(sley_testkit::sley_bin!())
+        .current_dir(&repo)
+        .args(["maintenance", "start"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .env("HOME", &root)
+        .env("XDG_CONFIG_HOME", root.join("xdg"))
+        .env(
+            "GIT_TEST_MAINT_SCHEDULER",
+            "crontab:true,systemctl:true,launchctl:true,schtasks:true",
+        )
+        .output()
+        .expect("run maintenance start");
+    assert!(
+        out.status.success(),
+        "automatic scheduler resolution failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let global = fs::read_to_string(&global_config).expect("read global config");
+    assert!(global.contains("[maintenance]"), "{global}");
+    let registered_repo = fs::canonicalize(&repo).expect("canonical repository path");
+    assert!(
+        global.contains(&format!("repo = {}", registered_repo.display())),
+        "{global}"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn maintenance_start_does_not_register_when_auto_scheduler_is_unavailable() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("maint-start-unavailable-scheduler");
+    let repo = root.join("repo");
+    let global_config = root.join("global-config");
+    git_ok(
+        &root,
+        &["init", "-q", repo.to_str().expect("utf8 repository path")],
+    );
+
+    let out = Command::new(sley_testkit::sley_bin!())
+        .current_dir(&repo)
+        .args(["maintenance", "start"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .env("HOME", &root)
+        .env(
+            "GIT_TEST_MAINT_SCHEDULER",
+            "crontab:false,systemctl:false,launchctl:false,schtasks:false",
+        )
+        .output()
+        .expect("run maintenance start");
+    assert!(!out.status.success(), "unavailable scheduler succeeded");
+    // `maintenance start` with no explicit --scheduler is AUTO resolution; on
+    // Linux with neither systemd nor crontab available, upstream git dies with
+    // this exact message (git builtin/gc.c: "neither systemd timers nor crontab
+    // are available"). The "%s scheduler is not available" form is git's message
+    // for an EXPLICITLY-requested unavailable scheduler, not the AUTO path.
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("neither systemd timers nor crontab are available"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !global_config.exists(),
+        "failed scheduling registered the repository"
     );
 
     fs::remove_dir_all(&root).ok();

@@ -7,7 +7,7 @@
 # t/tNNNN-*.sh scripts). test-lib.sh can exercise an *externally installed* git
 # via the GIT_TEST_INSTALLED environment variable, which must point at a
 # directory ("bindir") containing a working `git` executable. This script
-# builds such a bindir whose `git` is a shim that execs the sley binary, then
+# builds such a bindir whose `git` launches the Sley binary directly, then
 # runs a configurable subset of the upstream scripts against it and aggregates
 # the results.
 #
@@ -40,9 +40,24 @@
 #
 #   SLEY_BIN            absolute path to the sley binary. If unset we try
 #                       $CARGO_BIN_EXE_sley, then target/debug/sley, and
-#                       finally `cargo build -p sley-cli --bin sley`.
-#   SLEY_TESTS          space-separated default script list (overrides the
-#                       built-in default subset). Positional args override this.
+#                       finally build all native sley-cli binaries.
+#   SLEY_SCALAR_BIN     absolute path to Sley's native scalar binary. Defaults
+#                       to the `scalar` sibling of SLEY_BIN; the runner refuses
+#                       to borrow a system-installed Scalar when it is absent.
+#   SLEY_TESTS          space-separated script list (overrides the default
+#                       manifest-defined 891-script surface). The special
+#                       values are `curated` and `foundational`. Positional
+#                       args override this.
+#   SLEY_UPSTREAM_MANIFEST
+#                       ordered TSV manifest (default: ../upstream-manifest.tsv)
+#                       defining inclusion, exclusions, applicability,
+#                       prerequisites, and timing eligibility.
+#   SLEY_TEST_TARGET    `sley` (default) or `oracle`. Oracle mode runs the same
+#                       harness against SLEY_ORACLE_BIN/SLEY_TEST_GIT and does
+#                       not build or resolve the Sley binary.
+#   SLEY_ORACLE_BIN     installed, version-matched Git executable for oracle
+#                       runs. Prefer a complete installed prefix, not a lone
+#                       binary without its exec-path helpers.
 #   SLEY_TEST_TIMEOUT   per-script timeout in seconds (default 120). 0 disables.
 #                       Falls back to a Perl alarm(2) wrapper when neither
 #                       timeout(1) nor gtimeout(1) is on PATH, so a hanging
@@ -63,6 +78,21 @@
 #                       a git short-SHA or tag). Defaults to a UTC timestamp.
 #                       The library never reads a clock; pass this to make runs
 #                       reproducibly labelled.
+#   SLEY_METADATA       immutable run-identity sidecar (default:
+#                       <summary-base>-metadata.tsv). Records the candidate,
+#                       upstream, manifest, platform, hash, and binary identity
+#                       needed to reconcile artifacts from separate runs.
+#   SLEY_CELLS          exact per-cell CSV. Columns: target,script,cell,status,
+#                       raw_result,directive,description. Status is one of
+#                       PASS, FAIL, TODO, or SKIP.
+#   SLEY_DETAILS        per-script classification CSV, including PASS, FAIL,
+#                       ABORT, and TIMEOUT plus exact cell-status counts.
+#   SLEY_ORACLE_CELLS   when set for a Sley run, compare its cells with this
+#                       oracle cells CSV and write SLEY_COMPARISON.
+#   SLEY_ORACLE_DETAILS optional oracle details CSV used to distinguish an
+#                       incomplete oracle script in the comparison summary.
+#   SLEY_COMPARISON     oracle/Sley per-cell comparison CSV (default:
+#                       <summary-base>-comparison.csv).
 #   SLEY_DEFAULT_HASH   hash algorithm primed into test-lib's test_oid database
 #                       (default: sha1; or sha256). Without it test-lib aborts
 #                       scripts with "BUG: undefined key" and pollutes results.
@@ -87,7 +117,7 @@
 
 set -u
 
-# --- Default subset -------------------------------------------------------
+# --- Foundational subset --------------------------------------------------
 #
 # Chosen to target commands sley already implements (init, hash-object,
 # cat-file, config, rev-parse, ls-files, ls-tree, symbolic-ref, update-ref),
@@ -139,9 +169,44 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$script_path")" && pwd)
 # scripts/ -> sley-testkit -> crates -> repo root
 testkit_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 repo_root=$(CDPATH= cd -- "$testkit_dir/../.." && pwd)
+manifest=${SLEY_UPSTREAM_MANIFEST:-$testkit_dir/upstream-manifest.tsv}
 
 log() { printf '%s\n' "$*" >&2; }
 die() { printf 'run-upstream-tests: %s\n' "$*" >&2; exit 1; }
+
+[ -f "$manifest" ] || die "curated manifest missing: $manifest"
+
+manifest_hash=${SLEY_DEFAULT_HASH:-${GIT_TEST_DEFAULT_HASH:-sha1}}
+case $manifest_hash in
+    sha1 | sha256) ;;
+    *) die "unsupported manifest hash lane: $manifest_hash" ;;
+esac
+manifest_uname=$(uname -s 2>/dev/null || printf unknown)
+case ${OS:-}:$manifest_uname in
+    *Windows*:* | *:MINGW* | *:MSYS* | *:CYGWIN*) manifest_platform=windows ;;
+    *:Darwin) manifest_platform=macos ;;
+    *:Linux) manifest_platform=linux ;;
+    *) manifest_platform=$(printf '%s' "$manifest_uname" | tr '[:upper:]' '[:lower:]') ;;
+esac
+
+# Print the last manifest rule matching SCRIPT. Fields after the script are:
+# action, platforms, hashes, performance, prerequisites, reason. Ordered rules
+# make a broad include plus explicit exclusions compact and reviewable.
+manifest_record() {
+    manifest_script=$1
+    manifest_match=""
+    tab=$(printf '\t')
+    while IFS="$tab" read -r action selector platforms hashes performance prerequisites reason; do
+        case ${action:-} in ''|'#'*) continue ;; esac
+        case $manifest_script in
+            $selector)
+                manifest_match="$action${tab}$platforms${tab}$hashes${tab}$performance${tab}$prerequisites${tab}$reason"
+                ;;
+        esac
+    done < "$manifest"
+    [ -n "$manifest_match" ] || return 1
+    printf '%s\n' "$manifest_match"
+}
 
 # --- Resolve the upstream t/ directory ------------------------------------
 upstream_t=""
@@ -176,16 +241,152 @@ if [ ! -f "$upstream_t/test-lib.sh" ]; then
     die "no test-lib.sh under $upstream_t (is this really git's t/ directory?)"
 fi
 
+# A stale, untracked tNNNN script changes the candidate set without changing
+# the pinned source revision. That can silently enroll a local test in broad
+# manifest rules and makes both parity counts and timing results
+# irreproducible. Tarball sources have no .git entry and remain supported.
+upstream_source_root=$(dirname -- "$upstream_t")
+if [ -e "$upstream_source_root/.git" ]; then
+    command -v git >/dev/null 2>&1 \
+        || die "cannot verify upstream test inventory: git is not available"
+    untracked_test_scripts=$(git -C "$upstream_source_root" ls-files --others -- \
+        't/t[0-9][0-9][0-9][0-9]-*.sh' 2>/dev/null) \
+        || die "cannot inspect untracked files in upstream Git checkout: $upstream_source_root"
+    if [ -n "$untracked_test_scripts" ]; then
+        die "untracked upstream test script(s) would alter manifest selection in $upstream_source_root:
+$untracked_test_scripts
+remove or track these files before running the upstream harness"
+    fi
+fi
+
+manifest_selected_tests() {
+    # Resolve every candidate in one awk process. Calling manifest_record for
+    # each of ~1,000 scripts re-read the manifest ~1,000 times, adding a large
+    # fixed cost to every paired timing run and diluting the wall-clock signal.
+    for candidate in "$upstream_t"/t[0-9][0-9][0-9][0-9]-*.sh; do
+        [ -f "$candidate" ] || continue
+        printf '%s\n' "${candidate##*/}"
+    done | awk -F '\t' -v platform="$manifest_platform" -v hash="$manifest_hash" '
+        function applies(values, wanted,    count, part, item) {
+            if (values == "" || values == "oracle" || values == "all") return 1
+            count = split(values, part, ",")
+            for (item = 1; item <= count; item++)
+                if (tolower(part[item]) == tolower(wanted)) return 1
+            return 0
+        }
+        function glob_regex(glob,    regex, i, char, close_offset, class) {
+            regex = "^"
+            for (i = 1; i <= length(glob); i++) {
+                char = substr(glob, i, 1)
+                if (char == "*") regex = regex ".*"
+                else if (char == "?") regex = regex "."
+                else if (char == "[") {
+                    close_offset = index(substr(glob, i + 1), "]")
+                    if (close_offset == 0) regex = regex "\\["
+                    else {
+                        class = substr(glob, i + 1, close_offset - 1)
+                        if (substr(class, 1, 1) == "!")
+                            class = "^" substr(class, 2)
+                        regex = regex "[" class "]"
+                        i += close_offset
+                    }
+                } else {
+                    if (char ~ /[.\\+^$(){}|]/) regex = regex "\\"
+                    regex = regex char
+                }
+            }
+            return regex "$"
+        }
+        FNR == NR {
+            if ($0 ~ /^# expected_included=/) {
+                expected_included = $0
+                sub(/^# expected_included=/, "", expected_included)
+            } else if ($0 ~ /^# expected_excluded=/) {
+                expected_excluded = $0
+                sub(/^# expected_excluded=/, "", expected_excluded)
+            } else if ($1 == "include" || $1 == "exclude") {
+                rules++
+                action[rules] = $1
+                selector[rules] = glob_regex($2)
+                platforms[rules] = $3
+                hashes[rules] = $4
+            }
+            next
+        }
+        {
+            selected = ""
+            selected_platforms = ""
+            selected_hashes = ""
+            for (rule = 1; rule <= rules; rule++) {
+                if ($0 ~ selector[rule]) {
+                    selected = action[rule]
+                    selected_platforms = platforms[rule]
+                    selected_hashes = hashes[rule]
+                }
+            }
+            if (selected == "include") {
+                included[++included_count] = $0
+                included_platforms[included_count] = selected_platforms
+                included_hashes[included_count] = selected_hashes
+            }
+            else if (selected == "exclude") excluded_count++
+        }
+        END {
+            if (expected_included != "" && included_count != expected_included) {
+                print "run-upstream-tests: manifest selected " included_count \
+                    " scripts, expected " expected_included \
+                    " (wrong upstream version or stale manifest)" > "/dev/stderr"
+                exit 1
+            }
+            if (expected_excluded != "" && excluded_count != expected_excluded) {
+                print "run-upstream-tests: manifest excluded " excluded_count \
+                    " scripts, expected " expected_excluded \
+                    " (wrong upstream version or stale manifest)" > "/dev/stderr"
+                exit 1
+            }
+            for (output_index = 1; output_index <= included_count; output_index++)
+                if (applies(included_platforms[output_index], platform) &&
+                    applies(included_hashes[output_index], hash))
+                    print included[output_index]
+        }
+    ' "$manifest" -
+}
+
+# CI can consume the manifest without building or invoking either target.
+case ${1:-} in
+    --list-curated)
+        manifest_selected_tests || exit $?
+        exit 0
+        ;;
+    --validate-manifest)
+        manifest_selected_tests >/dev/null || exit $?
+        log "manifest valid: $(sed -n 's/^# expected_included=//p' "$manifest" | head -n 1) included script(s)"
+        exit 0
+        ;;
+esac
+
 build_dir=$(dirname -- "$upstream_t")
-# Expose the upstream git build dir so sley's --exec-path can symlink its
-# git-upload-pack (bundle-uri + fetch filter) while keeping system git-http-backend.
+# Expose the build directory only because upstream test-lib and its own test
+# helpers require it. Sley helper materialization must ignore these variables.
 export GIT_BUILD_DIR="$build_dir"
 export GIT_SRC_DIR="${GIT_SRC_DIR:-$build_dir}"
-if [ ! -f "$build_dir/GIT-BUILD-OPTIONS" ]; then
-    log "WARNING: $build_dir/GIT-BUILD-OPTIONS is missing."
-    log "         Upstream test-lib.sh requires it and will abort each script."
-    log "         Run 'make GIT-BUILD-OPTIONS' in $build_dir first."
+[ -f "$build_dir/GIT-BUILD-OPTIONS" ] \
+    || die "$build_dir/GIT-BUILD-OPTIONS is missing; configure the pinned oracle build first"
+expected_oracle_tag=$(sed -n 's/^# oracle_git=//p' "$manifest" | head -n 1)
+expected_oracle_version=${expected_oracle_tag#v}
+actual_source_version=$(sed -n 's/^GIT_VERSION=//p' "$build_dir/GIT-VERSION-FILE" 2>/dev/null | head -n 1)
+if [ -n "$expected_oracle_version" ] \
+    && [ "$actual_source_version" != "$expected_oracle_version" ]; then
+    die "upstream test source is ${actual_source_version:-unknown}, manifest requires $expected_oracle_version"
 fi
+oracle_make_options=$(sed -n 's/^# oracle_make_options=//p' "$manifest" | head -n 1)
+case " $oracle_make_options " in
+    *" USE_LIBPCRE2=1 "*)
+        build_pcre2=$(sed -n "s/^USE_LIBPCRE2='\(.*\)'$/\1/p" "$build_dir/GIT-BUILD-OPTIONS" | head -n 1)
+        [ "$build_pcre2" = "1" ] \
+            || die "oracle feature profile mismatch: rebuild $build_dir with USE_LIBPCRE2=1"
+        ;;
+esac
 
 fake_ssh="$build_dir/t/helper/test-fake-ssh"
 if [ ! -x "$fake_ssh" ]; then
@@ -195,63 +396,227 @@ if [ ! -x "$fake_ssh" ]; then
     log "         Fix: cd $build_dir && make t/helper/test-fake-ssh"
 fi
 
-# --- Resolve the sley binary ----------------------------------------------
-sley_bin=""
-cargo_bin_exe=$(printenv CARGO_BIN_EXE_sley 2>/dev/null || true)
-if [ -n "${SLEY_BIN:-}" ]; then
-    sley_bin=$SLEY_BIN
-elif [ -n "$cargo_bin_exe" ]; then
-    sley_bin=$cargo_bin_exe
-elif [ -x "$repo_root/target/release/sley" ]; then
-    sley_bin=$repo_root/target/release/sley
-elif [ -x "$repo_root/target/debug/sley" ]; then
-    sley_bin=$repo_root/target/debug/sley
-fi
-
-if [ -z "$sley_bin" ] || [ ! -x "$sley_bin" ]; then
-    log "sley binary not found; building with 'cargo build -p sley-cli --release --bin sley --features git-compat-i18n'..."
-    ( cd "$repo_root" && cargo build -p sley-cli --release --bin sley --features git-compat-i18n ) \
-        || die "cargo build -p sley-cli --release --bin sley --features git-compat-i18n failed"
-    sley_bin=$repo_root/target/release/sley
-fi
-[ -x "$sley_bin" ] || die "sley binary still not executable: $sley_bin"
-# Absolutize.
-case $sley_bin in
-    /*) ;;
-    *) sley_bin=$(pwd)/$sley_bin ;;
+# --- Resolve the target binary --------------------------------------------
+test_target=${SLEY_TEST_TARGET:-sley}
+case $test_target in
+    sley|oracle) ;;
+    *) die "SLEY_TEST_TARGET must be 'sley' or 'oracle' (got: $test_target)" ;;
 esac
-log "sley binary: $sley_bin"
 
-# --- Build the shim bindir ------------------------------------------------
+sley_bin=""
+sley_scalar_bin=""
+oracle_bin=""
+oracle_exec_path=""
+if [ "$test_target" = "sley" ]; then
+    cargo_bin_exe=$(printenv CARGO_BIN_EXE_sley 2>/dev/null || true)
+    if [ -n "${SLEY_BIN:-}" ]; then
+        sley_bin=$SLEY_BIN
+    elif [ -n "$cargo_bin_exe" ]; then
+        sley_bin=$cargo_bin_exe
+    elif [ -x "$repo_root/target/release/sley" ]; then
+        sley_bin=$repo_root/target/release/sley
+    elif [ -x "$repo_root/target/debug/sley" ]; then
+        sley_bin=$repo_root/target/debug/sley
+    fi
+
+    if [ -z "$sley_bin" ] || [ ! -x "$sley_bin" ]; then
+        log "sley binary not found; building native CLI binaries..."
+        ( cd "$repo_root" && cargo build -p sley-cli --release --bins --features git-compat-i18n ) \
+            || die "cargo build -p sley-cli --release --bins --features git-compat-i18n failed"
+        sley_bin=$repo_root/target/release/sley
+    fi
+    [ -x "$sley_bin" ] || die "sley binary still not executable: $sley_bin"
+    case $sley_bin in /*) ;; *) sley_bin=$(pwd)/$sley_bin ;; esac
+    if [ -n "${SLEY_SCALAR_BIN:-}" ]; then
+        sley_scalar_bin=$SLEY_SCALAR_BIN
+    else
+        sley_scalar_bin=$(dirname -- "$sley_bin")/scalar
+        case $sley_bin in *.exe) sley_scalar_bin=$(dirname -- "$sley_bin")/scalar.exe ;; esac
+    fi
+    [ -x "$sley_scalar_bin" ] \
+        || die "native scalar binary missing beside Sley; build sley-cli --bins or set SLEY_SCALAR_BIN"
+    case $sley_scalar_bin in /*) ;; *) sley_scalar_bin=$(pwd)/$sley_scalar_bin ;; esac
+    target_bin=$sley_bin
+    log "sley binary: $sley_bin"
+else
+    if [ -n "${SLEY_ORACLE_BIN:-}" ]; then
+        oracle_bin=$SLEY_ORACLE_BIN
+    elif [ -n "${SLEY_TEST_GIT:-}" ]; then
+        oracle_bin=$SLEY_TEST_GIT
+    elif [ -x "$build_dir/git" ]; then
+        oracle_bin=$build_dir/git
+    else
+        oracle_bin=$(command -v git 2>/dev/null || true)
+    fi
+    [ -n "$oracle_bin" ] && [ -x "$oracle_bin" ] \
+        || die "oracle Git not executable; set SLEY_ORACLE_BIN to a complete v2.55.0 installation"
+    case $oracle_bin in /*) ;; *) oracle_bin=$(pwd)/$oracle_bin ;; esac
+    actual_oracle_version=$($oracle_bin version 2>/dev/null | awk '{ print $3; exit }')
+    if [ -n "$expected_oracle_version" ] \
+        && [ "$actual_oracle_version" != "$expected_oracle_version" ]; then
+        die "oracle Git version is $actual_oracle_version, manifest requires $expected_oracle_version"
+    fi
+    target_bin=$oracle_bin
+    oracle_exec_path=$($oracle_bin --exec-path 2>/dev/null || true)
+    if [ -z "$oracle_exec_path" ] || [ ! -d "$oracle_exec_path" ]; then
+        # A built source checkout may have been configured for a prefix that is
+        # not present on this machine. Its top-level build directory is still a
+        # complete exec path when the dashed helpers were built there.
+        source_exec_path=$(dirname -- "$oracle_bin")
+        if [ "$source_exec_path" = "$build_dir" ] && [ -d "$source_exec_path" ]; then
+            oracle_exec_path=$source_exec_path
+        else
+            die "oracle Git has no usable exec path; use a complete installed prefix: $oracle_bin"
+        fi
+    fi
+    # test-lib invokes dashed, shell, remote, and auxiliary helpers through the
+    # installed prefix. Catch a partial source-tree oracle before it turns into
+    # hundreds of false failures. Executable helpers may carry `.exe` on
+    # Windows; sourced shell libraries intentionally need only be regular files.
+    for helper in git-upload-pack git-receive-pack git-http-backend git-remote-http git-submodule; do
+        if [ ! -x "$oracle_exec_path/$helper" ] && [ ! -x "$oracle_exec_path/$helper.exe" ]; then
+            die "oracle helper missing: $helper (exec path: $oracle_exec_path)"
+        fi
+    done
+    for helper in git-sh-i18n git-sh-setup; do
+        if [ ! -f "$oracle_exec_path/$helper" ]; then
+            die "oracle shell library missing: $helper (exec path: $oracle_exec_path)"
+        fi
+    done
+    oracle_bindir=$(dirname -- "$oracle_bin")
+    if [ ! -x "$oracle_bindir/scalar" ] && [ ! -x "$oracle_bindir/scalar.exe" ]; then
+        die "oracle auxiliary command missing: scalar (bindir: $oracle_bindir)"
+    fi
+    if [ -e "$oracle_exec_path/git-gui--askyesno" ] \
+        || [ -e "$oracle_exec_path/git-gui--askyesno.exe" ]; then
+        die "oracle feature profile mismatch: rebuild v2.55.0 with NO_TCLTK=YesPlease"
+    fi
+    log "oracle git: $oracle_bin"
+    log "oracle exec path: $oracle_exec_path"
+fi
+
+# --- Build/select the installed-git bindir --------------------------------
 #
 # test-lib.sh runs `$GIT_TEST_INSTALLED/git --exec-path` early and aborts if it
 # fails. Delegate that probe to sley too: feature-enabled builds can return a
 # Git-compatible helper dir (git-sh-i18n, git-sh-i18n--envsubst), while lean
-# builds still return their binary directory. We also export SLEY_BIN inside the
-# shim so its value is visible regardless of how the shim is invoked.
-bindir=$(mktemp -d "${TMPDIR:-/tmp}/sley-upstream-bindir.XXXXXX") \
-    || die "could not create temp bindir"
-cleanup() { rm -rf "$bindir"; }
+# builds still return their binary directory. Each test process exports
+# SLEY_BIN so Sley-owned shell adapters can call back into the original binary.
+generated_bindir=""
+if [ "$test_target" = "sley" ]; then
+    bindir=$(mktemp -d "${TMPDIR:-/tmp}/sley-upstream-bindir.XXXXXX") \
+        || die "could not create temp bindir"
+    generated_bindir=$bindir
+    # Expose Sley under Git's installed binary name without inserting a shell
+    # process in front of every command. A shell shim adds one `/bin/sh` launch
+    # per assertion command (hundreds in scripts such as t7004), which is a
+    # material candidate-only timing tax. Prefer a hardlink, then a symlink,
+    # and finally a one-time binary copy for cross-filesystem/Windows hosts.
+    installed_git=$bindir/git
+    case $sley_bin in *.exe) installed_git=$bindir/git.exe ;; esac
+    if ln "$sley_bin" "$installed_git" 2>/dev/null; then
+        : direct hardlink
+    elif ln -s "$sley_bin" "$installed_git" 2>/dev/null; then
+        : direct symlink
+    elif cp "$sley_bin" "$installed_git"; then
+        : direct copy
+    else
+        die "could not expose Sley as a direct installed git launcher"
+    fi
+    chmod +x "$installed_git"
+
+    # Scalar is a separate native binary. Put it in the same isolated installed
+    # prefix so upstream tests cannot silently borrow Homebrew/system Git's
+    # scalar from the remainder of PATH.
+    installed_scalar=$bindir/scalar
+    case $sley_scalar_bin in *.exe) installed_scalar=$bindir/scalar.exe ;; esac
+    if ln "$sley_scalar_bin" "$installed_scalar" 2>/dev/null; then
+        : direct scalar hardlink
+    elif ln -s "$sley_scalar_bin" "$installed_scalar" 2>/dev/null; then
+        : direct scalar symlink
+    elif cp "$sley_scalar_bin" "$installed_scalar"; then
+        : direct scalar copy
+    else
+        die "could not expose native Scalar in the installed test prefix"
+    fi
+    chmod +x "$installed_scalar"
+
+    # Apache's upstream test configuration passes GIT_EXEC_PATH into CGI
+    # programs but not SLEY_BIN. Sley's owned git-http-backend adapter needs
+    # the latter to call back into the selected candidate binary. Wrap only
+    # the test HTTP daemon and add a PassEnv directive on its command line;
+    # this keeps the upstream source/config untouched and remains isolated per
+    # wave runner.
+    sley_real_httpd=${LIB_HTTPD_PATH:-}
+    if [ -z "$sley_real_httpd" ]; then
+        for candidate in /usr/sbin/httpd /usr/sbin/apache2 \
+            "$(command -v httpd 2>/dev/null || true)" \
+            "$(command -v apache2 2>/dev/null || true)"
+        do
+            if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+                sley_real_httpd=$candidate
+                break
+            fi
+        done
+    fi
+    if [ -n "$sley_real_httpd" ] && [ -x "$sley_real_httpd" ]; then
+        sley_httpd_wrapper=$bindir/sley-httpd-with-cgi-env
+        cat > "$sley_httpd_wrapper" <<'EOF'
+#!/bin/sh
+if test -z "${SLEY_REAL_HTTPD-}"
+then
+	echo "fatal: SLEY_REAL_HTTPD is required by Sley's test HTTP wrapper" >&2
+	exit 127
+fi
+exec "$SLEY_REAL_HTTPD" -c 'PassEnv SLEY_BIN' "$@"
+EOF
+        chmod +x "$sley_httpd_wrapper"
+        SLEY_REAL_HTTPD=$sley_real_httpd
+        LIB_HTTPD_PATH=$sley_httpd_wrapper
+        export SLEY_REAL_HTTPD LIB_HTTPD_PATH
+    fi
+else
+    bindir=$(dirname -- "$oracle_bin")
+fi
+cleanup() { [ -z "$generated_bindir" ] || rm -rf "$generated_bindir"; }
 trap cleanup EXIT INT TERM
 
-cat > "$bindir/git" <<SHIM
-#!/bin/sh
-# Auto-generated sley shim for upstream test-lib.sh (GIT_TEST_INSTALLED).
-SLEY_BIN='$sley_bin'
-SHIM_DIR='$bindir'
-exec "\$SLEY_BIN" "\$@"
-SHIM
-chmod +x "$bindir/git"
-
-# Sanity-check the shim answers --exec-path (mirrors test-lib.sh's probe).
-if ! "$bindir/git" --exec-path >/dev/null 2>&1; then
-    die "sley shim failed its --exec-path self-check"
+# Sanity-check the selected installed layout exactly as test-lib will see it.
+if [ "$test_target" = "oracle" ]; then
+    if ! GIT_EXEC_PATH="$oracle_exec_path" "$bindir/git" --exec-path >/dev/null 2>&1; then
+        die "oracle installed-git layout failed its --exec-path self-check"
+    fi
+else
+    sley_exec_path=$("$bindir/git" --exec-path 2>/dev/null || true)
+    [ -n "$sley_exec_path" ] && [ -d "$sley_exec_path" ] \
+        || die "sley installed-git layout failed its --exec-path self-check"
+    provenance="$sley_exec_path/.sley-helper-provenance"
+    [ -f "$provenance" ] && [ ! -L "$provenance" ] \
+        || die "sley exec path has no owned helper provenance: $sley_exec_path"
+    grep -qx 'owner=sley' "$provenance" \
+        || die "sley helper provenance has the wrong owner: $provenance"
+    grep -qx 'crate=sley-i18n' "$provenance" \
+        || die "sley helper provenance has the wrong crate: $provenance"
+    for helper in git-sh-i18n git-sh-i18n--envsubst git-upload-pack git-receive-pack git-http-backend; do
+        [ -f "$sley_exec_path/$helper" ] && [ ! -L "$sley_exec_path/$helper" ] \
+            || die "Sley-owned helper missing or borrowed through a symlink: $helper"
+    done
+    for helper in git-http-fetch git-http-push git-remote-ftp git-remote-ftps git-remote-http git-remote-https git-upload-archive; do
+        [ ! -e "$sley_exec_path/$helper" ] && [ ! -L "$sley_exec_path/$helper" ] \
+            || die "unimplemented helper must not be borrowed: $helper"
+    done
 fi
 
 # --- Select scripts -------------------------------------------------------
 selection=$*
 if [ -z "$selection" ]; then
-    selection=${SLEY_TESTS:-$DEFAULT_TESTS}
+    selection=${SLEY_TESTS:-curated}
+fi
+
+if [ "$selection" = "curated" ]; then
+    selection=$(manifest_selected_tests) || exit $?
+elif [ "$selection" = "foundational" ]; then
+    selection=$DEFAULT_TESTS
 fi
 
 resolve_one() {
@@ -396,10 +761,23 @@ history=${SLEY_HISTORY:-$repo_root/crates/sley-testkit/upstream-history.csv}
 # Per-run script timings. This stays separate from the pass/fail summary so
 # floor checks can continue to consume the stable seven-column CSV shape.
 timings=${SLEY_TIMINGS:-${summary%.csv}-timings.csv}
+cells=${SLEY_CELLS:-${summary%.csv}-cells.csv}
+details=${SLEY_DETAILS:-${summary%.csv}-details.csv}
+comparison=${SLEY_COMPARISON:-${summary%.csv}-comparison.csv}
+comparison_summary=${SLEY_COMPARISON_SUMMARY:-${comparison%.csv}-summary.csv}
 run_label=${SLEY_RUN_LABEL:-}
 if [ -z "$run_label" ]; then
     run_label=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date 2>/dev/null || printf 'unknown')
 fi
+metadata=${SLEY_METADATA:-${summary%.csv}-metadata.tsv}
+
+# A fresh artifact root is the normal certification layout. Create all parent
+# directories before running a script so a missing output directory cannot
+# waste the run and discard its exact-cell evidence.
+for artifact in "$report" "$summary" "$history" "$timings" "$cells" "$details" "$comparison" "$comparison_summary" "$metadata"; do
+    artifact_parent=$(dirname -- "$artifact")
+    mkdir -p "$artifact_parent" || die "could not create artifact directory: $artifact_parent"
+done
 
 # The hash algorithm test-lib.sh assumes. Upstream's test_oid database is keyed
 # by hash algo; if neither GIT_TEST_DEFAULT_HASH nor GIT_TEST_BUILTIN_HASH is
@@ -408,7 +786,52 @@ fi
 # assertions. A built checkout's GIT-BUILD-OPTIONS often omits
 # GIT_TEST_BUILTIN_HASH, so we default it here to keep results meaningful.
 # Callers can override (e.g. SLEY_DEFAULT_HASH=sha256).
-default_hash=${SLEY_DEFAULT_HASH:-${GIT_TEST_DEFAULT_HASH:-sha1}}
+default_hash=$manifest_hash
+
+metadata_value() {
+    printf '%s' "$1" | tr '\t\r\n' '   '
+}
+
+upstream_commit=$(git -C "$upstream_source_root" rev-parse HEAD 2>/dev/null || printf unknown)
+candidate_commit=${SLEY_CANDIDATE_COMMIT:-$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || printf unknown)}
+if candidate_status=$(git -C "$repo_root" status --porcelain --untracked-files=normal 2>/dev/null); then
+    if [ -n "$candidate_status" ]; then candidate_tree_state=dirty; else candidate_tree_state=clean; fi
+else
+    candidate_tree_state=unknown
+fi
+if upstream_status=$(git -C "$upstream_source_root" status --porcelain --untracked-files=normal 2>/dev/null); then
+    if [ -n "$upstream_status" ]; then upstream_tree_state=dirty; else upstream_tree_state=clean; fi
+else
+    upstream_tree_state=unknown
+fi
+target_version=$("$bindir/git" --version 2>/dev/null | head -n 1 || true)
+target_checksum=$(cksum "$target_bin" 2>/dev/null | awk '{ print $1 ":" $2; exit }')
+target_checksum=${target_checksum:-unknown}
+manifest_checksum=$(cksum "$manifest" 2>/dev/null | awk '{ print $1 ":" $2; exit }')
+manifest_checksum=${manifest_checksum:-unknown}
+machine_arch=$(uname -m 2>/dev/null || printf unknown)
+selection_count=$(printf '%s\n' $scripts | awk 'NF { count++ } END { print count + 0 }')
+selection_checksum=$(printf '%s\n' $scripts | cksum | awk '{ print $1 ":" $2; exit }')
+{
+    printf 'schema\tsley-upstream-run-metadata-v1\n'
+    printf 'run_label\t%s\n' "$(metadata_value "$run_label")"
+    printf 'target\t%s\n' "$(metadata_value "$test_target")"
+    printf 'candidate_commit\t%s\n' "$(metadata_value "$candidate_commit")"
+    printf 'candidate_tree_state\t%s\n' "$(metadata_value "$candidate_tree_state")"
+    printf 'target_binary\t%s\n' "$(metadata_value "$target_bin")"
+    printf 'target_binary_checksum\t%s\n' "$(metadata_value "$target_checksum")"
+    printf 'target_version\t%s\n' "$(metadata_value "$target_version")"
+    printf 'upstream_commit\t%s\n' "$(metadata_value "$upstream_commit")"
+    printf 'upstream_tree_state\t%s\n' "$(metadata_value "$upstream_tree_state")"
+    printf 'upstream_t\t%s\n' "$(metadata_value "$upstream_t")"
+    printf 'manifest\t%s\n' "$(metadata_value "$manifest")"
+    printf 'manifest_checksum\t%s\n' "$(metadata_value "$manifest_checksum")"
+    printf 'platform\t%s\n' "$(metadata_value "$manifest_platform")"
+    printf 'architecture\t%s\n' "$(metadata_value "$machine_arch")"
+    printf 'hash\t%s\n' "$(metadata_value "$default_hash")"
+    printf 'selection_count\t%s\n' "$(metadata_value "$selection_count")"
+    printf 'selection_checksum\t%s\n' "$(metadata_value "$selection_checksum")"
+} > "$metadata"
 
 # Map a script basename back to a friendly command name (inverse of the
 # command_alias table) for the summary/history; falls back to the basename.
@@ -428,10 +851,13 @@ command_for_script() {
 
 # --- Run ------------------------------------------------------------------
 {
-    printf 'sley upstream test report\n'
+    printf '%s upstream test report\n' "$test_target"
     printf 'run label: %s\n' "$run_label"
-    printf 'sley binary: %s\n' "$sley_bin"
+    printf 'target: %s\n' "$test_target"
+    printf 'target binary: %s\n' "$target_bin"
     printf 'upstream t/: %s\n' "$upstream_t"
+    printf 'manifest: %s\n' "$manifest"
+    printf 'metadata: %s\n' "$metadata"
     printf 'default hash: %s\n' "$default_hash"
     printf 'per-script timeout: %ss\n' "$timeout_secs"
     printf '\n'
@@ -448,11 +874,15 @@ if [ ! -f "$history" ]; then
 fi
 
 printf 'label,script,command,result,elapsed_ms,ok,notok,total,plan_total\n' > "$timings"
+printf 'target,script,cell,status,raw_result,directive,description\n' > "$cells"
+printf 'target,script,result,exit_code,pass,fail,todo,skip,total_cells,plan_total,abort,timeout,missing_cells,extra_cells\n' > "$details"
 
 total=0
 passed=0
 failed=0
 errored=0
+aborted=0
+skipped_scripts=0
 
 now_millis() {
     if command -v perl >/dev/null 2>&1; then
@@ -486,6 +916,221 @@ stop_stale_httpd() {
     done
 }
 
+# Parse upstream's top-level TAP lines without conflating directives with raw
+# `ok`/`not ok`. The TSV is private scratch data; the public cells artifact is
+# fully quoted CSV so assertion titles may safely contain commas.
+parse_tap_cells() {
+    tap_input=$1
+    tap_output=$2
+    # Test diagnostics may intentionally contain arbitrary path/message bytes.
+    # BSD awk evaluates every record against the regular expressions below and
+    # aborts with `towc: multibyte conversion failure` under a UTF-8 locale when
+    # it sees an invalid byte, even if that record is not TAP. Parse TAP as a
+    # byte stream so diagnostics cannot truncate the exact cell vector.
+    LC_ALL=C awk '
+        function emit(raw, text,    cell, description, upper, todo_pos, skip_pos, directive, status, cut) {
+            cell = text
+            sub(/[[:space:]].*$/, "", cell)
+            description = text
+            sub(/^[0-9]+([[:space:]]+-[[:space:]]*)?/, "", description)
+            upper = toupper(description)
+            todo_pos = index(upper, "# TODO")
+            skip_pos = index(upper, "# SKIP")
+            directive = ""
+            cut = 0
+            if (skip_pos > 0 && (todo_pos == 0 || skip_pos < todo_pos)) {
+                directive = "SKIP"
+                cut = skip_pos
+            } else if (todo_pos > 0) {
+                directive = "TODO"
+                cut = todo_pos
+            }
+            if (cut > 0)
+                description = substr(description, 1, cut - 1)
+            sub(/[[:space:]]+$/, "", description)
+            if (directive == "SKIP")
+                status = "SKIP"
+            else if (directive == "TODO")
+                status = "TODO"
+            else if (raw == "ok")
+                status = "PASS"
+            else
+                status = "FAIL"
+            gsub(/[\t\r]/, " ", description)
+            printf "%s\t%s\t%s\t%s\t%s\n", cell, status, raw, directive, description
+        }
+        {
+            tap = $0
+            # A command under test may finish a raw pkt-line stream with a
+            # control frame and no newline. Upstream then writes its TAP result
+            # to the same captured stdout, producing e.g. `0000ok 60 - ...`.
+            # Strip only complete pkt-line control frames immediately followed
+            # by a syntactically valid TAP result; arbitrary diagnostics that
+            # merely begin with hexadecimal text remain untouched.
+            if (tap ~ /^(000[012])+(ok|not ok) [0-9]+([[:space:]]+-|[[:space:]]+#|$)/) {
+                while (tap ~ /^000[012]/)
+                    tap = substr(tap, 5)
+            }
+            if (tap ~ /^ok [0-9]+([[:space:]]+-|[[:space:]]+#|$)/) {
+                text = tap
+                sub(/^ok[[:space:]]+/, "", text)
+                emit("ok", text)
+                next
+            }
+            if (tap ~ /^not ok [0-9]+([[:space:]]+-|[[:space:]]+#|$)/) {
+                text = tap
+                sub(/^not ok[[:space:]]+/, "", text)
+                emit("not_ok", text)
+                next
+            }
+        }
+        /^1\.\.0([[:space:]]+#[[:space:]]*SKIP|[[:space:]]*$)/ {
+            description = $0
+            sub(/^1\.\.0[[:space:]]*#[[:space:]]*SKIP[[:space:]]*/, "", description)
+            gsub(/[\t\r]/, " ", description)
+            printf "plan\tSKIP\tplan\tSKIP\t%s\n", description
+        }
+    ' "$tap_input" > "$tap_output"
+}
+
+append_cells_csv() {
+    tap_tsv=$1
+    tap_script=$2
+    awk -F '\t' -v target="$test_target" -v script="$tap_script" '
+        function q(value) { gsub(/"/, "\"\"", value); return "\"" value "\"" }
+        { print q(target) "," q(script) "," q($1) "," q($2) "," q($3) "," q($4) "," q($5) }
+    ' "$tap_tsv" >> "$cells"
+}
+
+compare_with_oracle() {
+    oracle_cells=$1
+    oracle_details=${SLEY_ORACLE_DETAILS:-}
+    [ -f "$oracle_cells" ] || die "oracle cells artifact missing: $oracle_cells"
+    comparison_rows=$(mktemp "${TMPDIR:-/tmp}/sley-upstream-comparison.XXXXXX") \
+        || die "could not create comparison scratch file"
+    comparison_scripts=$(mktemp "${TMPDIR:-/tmp}/sley-upstream-comparison-scripts.XXXXXX") \
+        || die "could not create comparison summary scratch file"
+    comparison_selected=$(mktemp "${TMPDIR:-/tmp}/sley-upstream-comparison-selected.XXXXXX") \
+        || die "could not create comparison selection scratch file"
+    awk -F, 'NR > 1 { print $2 }' "$details" > "$comparison_selected"
+
+    awk -F, -v rows="$comparison_rows" '
+        function clean(value) {
+            sub(/^"/, "", value)
+            sub(/"$/, "", value)
+            gsub(/""/, "\"", value)
+            return value
+        }
+        function note(script, cell, oracle_status, sley_status, kind) {
+            print script "," cell "," oracle_status "," sley_status "," kind >> rows
+            oracle_count[script] += (oracle_status != "")
+            sley_count[script] += (sley_status != "")
+            if (kind != "MATCH_PASS" && kind != "ORACLE_SKIP" && kind != "ORACLE_TODO")
+                mismatches[script]++
+            if (kind == "UNEXPECTED_SLEY_SKIP")
+                unexpected[script]++
+            if (kind == "MISSING_SLEY_CELL")
+                missing[script]++
+            if (kind == "EXTRA_SLEY_CELL")
+                extra[script]++
+            if (oracle_status == "PASS" && sley_status != "PASS")
+                correctness_fail[script]++
+            seen_script[script] = 1
+        }
+        FILENAME == ARGV[1] {
+            selected_script[clean($1)] = 1
+            next
+        }
+        FILENAME == ARGV[2] {
+            if (FNR == 1) next
+            script = clean($2); cell = clean($3); key = script SUBSEP cell
+            if (script in selected_script)
+                oracle_status[key] = clean($4)
+            next
+        }
+        FILENAME == ARGV[3] {
+            if (FNR == 1) next
+            script = clean($2); cell = clean($3); key = script SUBSEP cell
+            sley_status[key] = clean($4)
+        }
+        END {
+            for (key in oracle_status) {
+                split(key, parts, SUBSEP)
+                script = parts[1]; cell = parts[2]
+                os = oracle_status[key]; ss = sley_status[key]
+                if (ss == "") kind = "MISSING_SLEY_CELL"
+                else if (os == "SKIP" && ss == "SKIP") kind = "ORACLE_SKIP"
+                else if (os == "TODO" && ss == "TODO") kind = "ORACLE_TODO"
+                else if (os == "SKIP" || os == "TODO") kind = "STATUS_MISMATCH"
+                else if (ss == "SKIP") kind = "UNEXPECTED_SLEY_SKIP"
+                else if (os == "PASS" && ss == "PASS") kind = "MATCH_PASS"
+                else if (os == "PASS" && ss == "FAIL") kind = "SLEY_FAILURE"
+                else kind = "STATUS_MISMATCH"
+                note(script, cell, os, ss, kind)
+            }
+            for (key in sley_status) {
+                if (key in oracle_status) continue
+                split(key, parts, SUBSEP)
+                note(parts[1], parts[2], "", sley_status[key], "EXTRA_SLEY_CELL")
+            }
+            for (script in seen_script) {
+                correctness = correctness_fail[script] ? "FAIL" : "PASS"
+                print script "," oracle_count[script] + 0 "," sley_count[script] + 0 "," \
+                    mismatches[script] + 0 "," unexpected[script] + 0 "," \
+                    missing[script] + 0 "," extra[script] + 0 "," correctness
+            }
+        }
+    ' "$comparison_selected" "$oracle_cells" "$cells" > "$comparison_scripts"
+
+    {
+        printf 'script,cell,oracle_status,sley_status,comparison\n'
+        sort -t, -k1,1 -k2,2n "$comparison_rows"
+    } > "$comparison"
+
+    printf 'script,oracle_result,sley_result,oracle_cells,sley_cells,cell_vector,correctness,unexpected_sley_skips,missing_sley_cells,extra_sley_cells,performance_eligible,performance_comparison\n' > "$comparison_summary"
+    sort -t, -k1,1 "$comparison_scripts" | while IFS=, read -r c_script c_oracle_count c_sley_count c_mismatches c_unexpected c_missing c_extra c_correctness; do
+        record=$(manifest_record "$c_script" || true)
+        tab=$(printf '\t')
+        old_ifs=$IFS
+        IFS="$tab"
+        set -- $record
+        IFS=$old_ifs
+        c_performance=${4:-ineligible}
+        c_oracle_result="UNKNOWN"
+        if [ -n "$oracle_details" ] && [ -f "$oracle_details" ]; then
+            c_oracle_result=$(awk -F, -v script="$c_script" '$2 == script { print $3; exit }' "$oracle_details")
+            c_oracle_result=${c_oracle_result:-UNKNOWN}
+        fi
+        c_sley_result=$(awk -F, -v script="$c_script" '$2 == script { print $3; exit }' "$details")
+        c_sley_result=${c_sley_result:-UNKNOWN}
+        if [ "$c_sley_result" = "SKIP" ] && [ "$c_oracle_result" != "SKIP" ]; then
+            c_unexpected=$((c_unexpected + 1))
+            c_correctness=FAIL
+        fi
+        if [ "$c_mismatches" -eq 0 ]; then
+            c_vector=EXACT
+        else
+            c_vector=INCOMPARABLE
+        fi
+        if [ "$c_performance" = "eligible" ] \
+            && [ "$c_vector" = "EXACT" ] \
+            && [ "$c_oracle_result" = "PASS" ] \
+            && [ "$c_sley_result" = "PASS" ]; then
+            c_performance_comparison=COMPARABLE
+        else
+            c_performance_comparison=INCOMPARABLE
+        fi
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+            "$c_script" "$c_oracle_result" "$c_sley_result" "$c_oracle_count" \
+            "$c_sley_count" "$c_vector" "$c_correctness" "$c_unexpected" \
+            "$c_missing" "$c_extra" "$c_performance" "$c_performance_comparison" \
+            >> "$comparison_summary"
+    done
+    rm -f "$comparison_rows" "$comparison_scripts" "$comparison_selected"
+    log "Oracle/Sley cell comparison: $comparison"
+    log "Oracle/Sley comparison summary: $comparison_summary"
+}
+
 run_one() {
     script=$1
     stop_stale_httpd
@@ -494,8 +1139,9 @@ run_one() {
     start_ms=$(now_millis)
 
     # Run the script from inside upstream_t so it can source test-lib.sh, with
-    # GIT_TEST_INSTALLED pointed at our shim bindir. --no-bin-wrappers because an
-    # installed-git layout has none; --root keeps trash dirs in our temp area.
+    # GIT_TEST_INSTALLED pointed at our direct-launch bindir. --no-bin-wrappers
+    # because an installed-git layout has none; --root keeps trash dirs in our
+    # temp area.
     # GIT_TEST_DEFAULT_HASH primes test-lib's test_oid database (see note above).
     (
         cd "$upstream_t" || exit 99
@@ -503,10 +1149,23 @@ run_one() {
         # grandchild `sh` regardless of how the chosen shell scopes assignment
         # prefixes on a shell-function invocation.
         export GIT_TEST_INSTALLED="$bindir"
-        export SLEY_BIN="$sley_bin"
+        export PATH="$bindir:$PATH"
+        if [ "$test_target" = "sley" ]; then
+            export SLEY_BIN="$sley_bin"
+        else
+            export GIT_EXEC_PATH="$oracle_exec_path"
+        fi
         export GIT_BUILD_DIR="$build_dir"
         export GIT_SRC_DIR="${GIT_SRC_DIR:-$build_dir}"
         export GIT_TEST_DEFAULT_HASH="$default_hash"
+        # Git's own t/Makefile runs external chainlint once for the whole
+        # suite and disables the per-script invocation. Besides duplicating
+        # that work, chainlint.pl probes macOS through sysctl; restricted test
+        # environments can reject the probe and contaminate assertions that
+        # compare nested test-framework stderr byte-for-byte (notably t0000).
+        # Keep the runtime &&-chain checks enabled; this switch only disables
+        # the redundant external Perl chainlint pass.
+        export GIT_TEST_EXT_CHAIN_LINT=0
         # Daemon-capable scripts should fail loudly when the environment cannot
         # bind a loopback listener; otherwise upstream marks them SKIP and the
         # floor checker sees a misleading PASS with zero assertions.
@@ -523,19 +1182,23 @@ run_one() {
         elapsed_ms=0
     fi
 
-    # Parse TAP "ok"/"not ok" counts from the captured output.
-    ok_count=$(grep -cE '^ok [0-9]' "$out_file" 2>/dev/null || true)
-    notok_count=$(grep -cE '^not ok [0-9]' "$out_file" 2>/dev/null || true)
-    ok_count=${ok_count:-0}
-    notok_count=${notok_count:-0}
-    plan_line=$(grep -E '^1\.\.[0-9]+' "$out_file" 2>/dev/null | head -n 1)
+    # Preserve raw counts in the legacy summary, and publish exact classified
+    # cells separately. A TODO `not ok` is not a Sley failure; an `ok` SKIP is
+    # not evidence that an oracle-applicable cell passed.
+    tap_tsv="$workdir/cells.tsv"
+    parse_tap_cells "$out_file" "$tap_tsv"
+    append_cells_csv "$tap_tsv" "$script"
+    ok_count=$(awk -F '\t' '$3 == "ok" { n++ } END { print n + 0 }' "$tap_tsv")
+    notok_count=$(awk -F '\t' '$3 == "not_ok" { n++ } END { print n + 0 }' "$tap_tsv")
+    pass_count=$(awk -F '\t' '$2 == "PASS" { n++ } END { print n + 0 }' "$tap_tsv")
+    fail_count=$(awk -F '\t' '$2 == "FAIL" { n++ } END { print n + 0 }' "$tap_tsv")
+    todo_count=$(awk -F '\t' '$2 == "TODO" { n++ } END { print n + 0 }' "$tap_tsv")
+    skip_count=$(awk -F '\t' '$2 == "SKIP" { n++ } END { print n + 0 }' "$tap_tsv")
+    plan_line=$(grep -E '^1\.\.[0-9]+' "$out_file" 2>/dev/null | tail -n 1)
     plan_total=$(printf '%s' "$plan_line" | sed -n 's/^1\.\.\([0-9][0-9]*\).*/\1/p')
-    if [ -n "$plan_total" ] \
-        && grep -q "known breakage(s) vanished" "$out_file" 2>/dev/null \
-        && [ $((ok_count + notok_count)) -eq "$plan_total" ] 2>/dev/null
-    then
-        ok_count=$plan_total
-        notok_count=0
+    plan_skip=0
+    if printf '%s\n' "$plan_line" | grep -Eq '^1\.\.0[[:space:]]+#[[:space:]]*SKIP'; then
+        plan_skip=1
     fi
     last_lines=$(tail -n 3 "$out_file" 2>/dev/null | tr '\n' '|' | sed 's/|$//')
     command_name=$(command_for_script "$script")
@@ -543,23 +1206,36 @@ run_one() {
 
     result="FAIL"
     detail=""
+    is_abort=0
+    is_timeout=0
+    missing_cells=0
+    extra_cells=0
+    if [ -n "$plan_total" ]; then
+        if [ "$run_total" -lt "$plan_total" ]; then
+            missing_cells=$((plan_total - run_total))
+        elif [ "$run_total" -gt "$plan_total" ]; then
+            extra_cells=$((run_total - plan_total))
+        fi
+    fi
     # GNU timeout exits 124; our Perl alarm fallback exits 142 (128 + SIGALRM).
     if [ "$rc" -eq 124 ] || [ "$rc" -eq 142 ]; then
         result="TIMEOUT"
         errored=$((errored + 1))
+        is_timeout=1
         detail="exceeded ${timeout_secs}s (rc=$rc); ok=$ok_count notok=$notok_count so far"
-    elif [ "$rc" -eq 0 ]; then
+    elif [ -z "$plan_total" ] || [ "$run_total" -ne "$plan_total" ]; then
+        result="ABORT"
+        aborted=$((aborted + 1))
+        is_abort=1
+        detail="rc=$rc incomplete TAP plan=${plan_total:-missing} observed=$run_total ${last_lines}"
+    elif [ "$rc" -eq 0 ] && [ "$plan_skip" -eq 1 ]; then
+        result="SKIP"
+        skipped_scripts=$((skipped_scripts + 1))
+        detail="$plan_line"
+    elif [ "$rc" -eq 0 ] && [ "$fail_count" -eq 0 ]; then
         result="PASS"
         passed=$((passed + 1))
         detail="$plan_line"
-    elif [ "$notok_count" -eq 0 ] \
-        && [ -n "$plan_total" ] \
-        && [ "$ok_count" -eq "$plan_total" ] \
-        && grep -q "known breakage(s) vanished" "$out_file" 2>/dev/null
-    then
-        result="PASS"
-        passed=$((passed + 1))
-        detail="${plan_line} (known breakage vanished)"
     else
         failed=$((failed + 1))
         detail="rc=$rc ${plan_line:+($plan_line) }${last_lines}"
@@ -579,6 +1255,10 @@ run_one() {
     printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$run_label" "$script" "$command_name" "$result" "$elapsed_ms" \
         "$ok_count" "$notok_count" "$run_total" "${plan_total:-}" >> "$timings"
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$test_target" "$script" "$result" "$rc" "$pass_count" "$fail_count" \
+        "$todo_count" "$skip_count" "$run_total" "${plan_total:-}" "$is_abort" \
+        "$is_timeout" "$missing_cells" "$extra_cells" >> "$details"
 
     if [ -n "${SLEY_KEEP_TRASH:-}" ]; then
         printf '  trash=%s\n' "$workdir" >> "$report"
@@ -609,7 +1289,7 @@ run_one() {
 }
 
 log ""
-log "Running upstream scripts against sley..."
+log "Running upstream scripts against $test_target..."
 log ""
 printf '%-28s %-8s %5s %5s  %s\n' "SCRIPT" "RESULT" "OK" "FAIL" "DETAIL"
 printf '%s\n' "-------------------------------------------------------------------------"
@@ -621,6 +1301,10 @@ for script in $scripts; do
     seen="$seen $script"
     run_one "$script"
 done
+
+if [ "$test_target" = "sley" ] && [ -n "${SLEY_ORACLE_CELLS:-}" ]; then
+    compare_with_oracle "$SLEY_ORACLE_CELLS"
+fi
 
 {
     printf '\n'
@@ -639,8 +1323,12 @@ done
             "$s_cmd" "$s_result" "$s_ok" "$s_notok" "$s_total" "$pct"
     done
     printf '\n'
-    printf 'SUMMARY: %s script(s): %s passed, %s failed, %s timed out.\n' \
-        "$total" "$passed" "$failed" "$errored"
+    awk -F, '
+        NR > 1 { pass += $5; fail += $6; todo += $7; skip += $8 }
+        END { printf "TAP CELL SUMMARY: pass=%d fail=%d todo=%d skip=%d.\n", pass, fail, todo, skip }
+    ' "$details"
+    printf 'SUMMARY: %s script(s): %s passed, %s skipped, %s failed, %s aborted, %s timed out.\n' \
+        "$total" "$passed" "$skipped_scripts" "$failed" "$aborted" "$errored"
 } | tee -a "$report"
 
 log ""
@@ -648,9 +1336,12 @@ log "Full report written to: $report"
 log "Machine-readable summary: $summary"
 log "Pass-rate history (appended): $history"
 log "Per-script timings: $timings"
+log "Exact TAP cells: $cells"
+log "Per-script classifications: $details"
+log "Run identity metadata: $metadata"
 
 # Non-zero exit if anything did not pass, so CI/wrappers can gate on it.
-if [ "$passed" -eq "$total" ]; then
+if [ $((passed + skipped_scripts)) -eq "$total" ]; then
     exit 0
 fi
 exit 1

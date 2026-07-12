@@ -1054,6 +1054,129 @@ fn log_committer_filter_matches_upstream_git() {
 }
 
 #[test]
+fn log_identity_filters_end_at_email_and_exclude_timestamp() {
+    let root = unique_temp_dir("log-identity-filter-boundary");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        git_with_env(
+            &root,
+            &[
+                "-c",
+                "user.name=Committer Person",
+                "-c",
+                "user.email=committer@example.invalid",
+                "commit",
+                "--allow-empty",
+                "--author",
+                "With Asterisk <xyzzy@frotz.com>",
+                "-m",
+                "identity boundary",
+                "-q",
+            ],
+            &[
+                ("GIT_AUTHOR_DATE", "@1112911993 -0700"),
+                ("GIT_COMMITTER_DATE", "@1112911993 -0700"),
+            ],
+        );
+
+        for args in [
+            vec!["log", r"--author=frotz\.com>$", "--format=%s"],
+            vec!["log", "--author=-0700", "--format=%s"],
+            vec!["log", r"--committer=example\.invalid>$", "--format=%s"],
+            vec!["log", "--committer=-0700", "--format=%s"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = sley(&root, &args);
+            assert_eq!(actual, expected, "sley log output differed for {args:?}");
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn log_reflog_filters_intersect_identity_and_message_filters() {
+    let root = unique_temp_dir("log-reflog-filters");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        for (author, subject, body) in [
+            ("Thor One <thor@example.invalid>", "initial", "first body"),
+            (
+                "Other Person <other@example.invalid>",
+                "second",
+                "second body",
+            ),
+            ("Thor Two <thor2@example.invalid>", "third", "third body"),
+        ] {
+            git(
+                &root,
+                &[
+                    "-c",
+                    "user.name=Committer User",
+                    "-c",
+                    "user.email=committer@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "--author",
+                    author,
+                    "-m",
+                    subject,
+                    "-m",
+                    body,
+                    "-q",
+                ],
+            );
+        }
+
+        for args in [
+            vec!["log", "-g", "--grep-reflog=commit: third", "--format=%s"],
+            vec![
+                "log",
+                "-g",
+                "--grep-reflog=commit: third",
+                "--grep-reflog=commit: second",
+                "--format=%s",
+            ],
+            vec![
+                "log",
+                "-g",
+                "--grep-reflog=commit: third",
+                "--author=Thor",
+                "--format=%s",
+            ],
+            vec![
+                "log",
+                "-g",
+                "--grep-reflog=commit: third",
+                "--author=non-existent",
+                "--format=%s",
+            ],
+            vec![
+                "log",
+                "-g",
+                "--grep-reflog=commit: third",
+                "--committer=Committer User",
+                "--grep=third body",
+                "--format=%s",
+            ],
+        ] {
+            let expected = git(&root, &args);
+            let actual = sley(&root, &args);
+            assert_eq!(actual, expected, "sley log output differed for {args:?}");
+        }
+
+        let args = ["log", "--grep-reflog=commit: third"];
+        assert_same_output(
+            run_output(sley_testkit::sley_bin!(), &root, &args),
+            run_output(sley_testkit::oracle_git(), &root, &args),
+            &args,
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn log_epoch_age_filters_match_upstream_git() {
     let root = unique_temp_dir("log-age-filter");
     fs::create_dir_all(&root).expect("create temp repo");
@@ -1680,5 +1803,44 @@ fn log_reverse_matches_upstream_git() {
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
     };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn log_decorate_full_from_global_config_matches_upstream_git() {
+    let root = unique_temp_dir("log-global-decorate-full");
+    fs::create_dir_all(&root).expect("create temp repo");
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=Example User",
+            "-c",
+            "user.email=example@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "subject",
+            "-q",
+        ],
+    );
+
+    let global = root.join("global-config");
+    fs::write(&global, b"[log]\n\tdecorate = full\n").expect("write global config");
+    let args = ["log", "--format=%s%d", "-1"];
+    let run_with_global = |program: &str| {
+        Command::new(program)
+            .current_dir(&root)
+            .args(args)
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+    };
+    let expected = run_with_global(sley_testkit::oracle_git());
+    let actual = run_with_global(sley_testkit::sley_bin!());
+    assert_same_output(actual, expected, &args);
+
     let _ = fs::remove_dir_all(&root);
 }

@@ -44,9 +44,9 @@ use sley_transport::RemoteUrl;
 #[cfg(feature = "http")]
 use sley_transport::{HttpClient, UreqHttpClient};
 
-use crate::fetch::{FetchOptions, FetchSource};
 #[cfg(not(feature = "http"))]
 use crate::fetch::fetch;
+use crate::fetch::{FetchOptions, FetchSource};
 use crate::{CredentialProvider, ProgressSink};
 
 /// Internal placeholder branch used while clone initializes before it knows
@@ -95,6 +95,9 @@ pub struct CloneOptions<'a> {
     /// `refs/remotes/<origin>/HEAD` is only written if the checked-out branch is
     /// the remote default.
     pub single_branch: bool,
+    /// Concrete transfer-progress policy resolved by the embedding wrapper.
+    /// The library never inspects terminal/process-global state itself.
+    pub progress: bool,
     /// Shallow clone depth (`--depth N`): truncate history to `N` commits per tip,
     /// writing `$GIT_DIR/shallow`. `None` is a full clone. Honored by the HTTP
     /// and SSH transports and by the in-process local server (`git clone
@@ -119,6 +122,8 @@ pub struct CloneOptions<'a> {
     /// Partial-clone object filter (`--filter=blob:none`) to apply to the
     /// clone fetch. Only honored by the in-process local server.
     pub filter: Option<sley_odb::PackObjectFilter>,
+    /// Resolve `--filter=auto` from accepted promisor advertisements.
+    pub filter_auto: bool,
     /// Whether `checkout_branch` came from an explicit `--branch`. When set, a
     /// missing remote tip for that branch is a hard error ("Remote branch … not
     /// found"); when unset, a missing tip is an empty/unborn-repository clone.
@@ -128,6 +133,8 @@ pub struct CloneOptions<'a> {
     /// SSH command-line shape for the clone's internal fetch, used for
     /// clone-only flags like `-4`/`-6`.
     pub ssh_options: Option<crate::ssh::SshTransportOptions>,
+    /// Explicit SSH upload-pack program selected by clone's `--upload-pack`.
+    pub upload_pack_command: Option<&'a str>,
     /// Refuse cloning from a shallow source (`--reject-shallow`).
     pub reject_shallow: bool,
 }
@@ -147,6 +154,9 @@ pub struct CloneOutcome {
     /// The caller prints git's "You appear to have cloned an empty repository."
     /// warning and skips the worktree checkout.
     pub empty: bool,
+    /// Equal-work counts from the clone's fetch, when its transport exposes
+    /// truthful native transfer metadata.
+    pub pack_generation_progress: Option<crate::PackGenerationProgress>,
 }
 
 /// Fully resolved inputs for a [`clone`] run.
@@ -242,6 +252,7 @@ fn clone_impl(
     let layout = RepositoryBootstrap::init(InitOptions {
         git_dir_override: request.git_dir_override.map(Path::to_path_buf),
         core_worktree: request.core_worktree.map(str::to_string),
+        object_dir: None,
         worktree: request.destination.to_path_buf(),
         object_format: request.format,
         object_format_explicit: false,
@@ -288,15 +299,18 @@ fn clone_impl(
             common_git_dir: remote_common_git_dir.clone(),
         },
     };
-    let fetch_options = clone_fetch_options(
-        request.options.depth,
-        request.options.deepen_since,
-        request.options.deepen_not.clone(),
-        request.options.filter.clone(),
-        !request.options.checkout,
-        request.options.reject_shallow,
-        request.options.ssh_options,
-    );
+    let fetch_options = clone_fetch_options(CloneFetchOptions {
+        progress: request.options.progress,
+        depth: request.options.depth,
+        deepen_since: request.options.deepen_since,
+        deepen_not: request.options.deepen_not.clone(),
+        filter: request.options.filter.clone(),
+        filter_auto: request.options.filter_auto,
+        record_promisor_refs: !request.options.checkout,
+        reject_shallow: request.options.reject_shallow,
+        ssh_options: request.options.ssh_options,
+        upload_pack_command: request.options.upload_pack_command,
+    });
     let fetch_request = crate::fetch::FetchRequest {
         git_dir: &git_dir,
         format: request.format,
@@ -305,6 +319,7 @@ fn clone_impl(
         source: &fetch_source,
         refspecs: &[],
         options: &fetch_options,
+        validation: None,
     };
     let fetch_services = crate::fetch::FetchServices {
         credentials: services.credentials,
@@ -312,9 +327,10 @@ fn clone_impl(
         ref_hook: None,
     };
     #[cfg(feature = "http")]
-    crate::fetch::fetch_with_http_client(fetch_request, fetch_services, http_client)?;
+    let fetch_outcome =
+        crate::fetch::fetch_with_http_client(fetch_request, fetch_services, http_client)?;
     #[cfg(not(feature = "http"))]
-    fetch(fetch_request, fetch_services)?;
+    let fetch_outcome = fetch(fetch_request, fetch_services)?;
 
     let store = FileRefStore::new(&git_dir, request.format);
     if let Some(detached) = &request.options.detached_head {
@@ -343,6 +359,7 @@ fn clone_impl(
             git_dir,
             branch_oid: Some(*detached),
             empty: false,
+            pack_generation_progress: fetch_outcome.pack_generation_progress,
         });
     }
     let remote_branch_ref = format!(
@@ -387,6 +404,7 @@ fn clone_impl(
                 git_dir,
                 branch_oid: None,
                 empty: true,
+                pack_generation_progress: fetch_outcome.pack_generation_progress,
             });
         }
     };
@@ -412,11 +430,20 @@ fn clone_impl(
             &request,
             &git_dir,
             branch_oid,
+            &config,
+            &fetch_outcome.accepted_promisor_remotes,
             services.credentials,
             http_client,
         )?;
         #[cfg(not(feature = "http"))]
-        fetch_partial_clone_checkout_blobs(&request, &git_dir, branch_oid, services.credentials)?;
+        fetch_partial_clone_checkout_blobs(
+            &request,
+            &git_dir,
+            branch_oid,
+            &config,
+            &fetch_outcome.accepted_promisor_remotes,
+            services.credentials,
+        )?;
     } else {
         let mut tx = store.transaction();
         tx.update(RefUpdate {
@@ -444,6 +471,7 @@ fn clone_impl(
         git_dir,
         branch_oid: Some(branch_oid),
         empty: false,
+        pack_generation_progress: fetch_outcome.pack_generation_progress,
     })
 }
 
@@ -489,10 +517,12 @@ fn fetch_partial_clone_checkout_blobs(
     request: &CloneRequest<'_>,
     git_dir: &Path,
     commit_oid: ObjectId,
+    config: &GitConfig,
+    accepted_promisors: &[sley_protocol::PromisorRemoteAdvertisement],
     credentials: &mut dyn CredentialProvider,
     #[cfg(feature = "http")] http_client: Option<&dyn HttpClient>,
 ) -> Result<()> {
-    if request.options.filter.is_none() {
+    if request.options.filter.is_none() && !request.options.filter_auto {
         return Ok(());
     }
     match request.source {
@@ -512,9 +542,25 @@ fn fetch_partial_clone_checkout_blobs(
                 &mut seen,
                 &mut wants,
             )?;
+            let relative_base = git_dir.parent().unwrap_or(git_dir);
+            let mut hydration_git_dir = remote_git_dir.clone();
+            for advertised in accepted_promisors {
+                let url = config
+                    .get("remote", Some(&advertised.name), "url")
+                    .filter(|url| !url.is_empty())
+                    .unwrap_or(&advertised.url);
+                if let Ok(crate::fetch::FetchSource::Local {
+                    git_dir: accepted_git_dir,
+                    ..
+                }) = crate::fetch_source_for_url(url, relative_base)
+                {
+                    hydration_git_dir = accepted_git_dir;
+                    break;
+                }
+            }
             crate::local::install_fetch_pack_via_local_upload_pack(
                 git_dir,
-                remote_git_dir,
+                &hydration_git_dir,
                 request.format,
                 wants,
                 None,
@@ -607,6 +653,7 @@ fn fetch_http_partial_clone_checkout_blobs(
         deepen_not: Vec::new(),
         deepen_relative: false,
         git_protocol: git_protocol.as_deref(),
+        post_buffer: crate::http::http_post_buffer(None),
         // The client already has the checkout commit and its trees; advertising
         // them as haves would make the server omit the (filtered-out) blobs we
         // are explicitly requesting, so suppress haves for this top-up fetch.
@@ -678,10 +725,8 @@ fn collect_tree_materialization_wants(
             collect_tree_materialization_wants(
                 remote_db, local_db, format, entry.oid, seen, wants,
             )?;
-        } else if !entry.is_gitlink() {
-            if seen.insert(entry.oid) && !local_db.contains(&entry.oid)? {
-                wants.push(entry.oid);
-            }
+        } else if !entry.is_gitlink() && seen.insert(entry.oid) && !local_db.contains(&entry.oid)? {
+            wants.push(entry.oid);
         }
     }
     Ok(())
@@ -691,17 +736,37 @@ fn collect_tree_materialization_wants(
 /// `FETCH_HEAD`, the requested shallow `depth`, and otherwise neutral (no prune, no
 /// `--tags`, not a dry run, not appending). Mirrors the options the CLI's clone
 /// paths passed.
-fn clone_fetch_options(
+struct CloneFetchOptions<'a> {
+    progress: bool,
     depth: Option<u32>,
     deepen_since: Option<i64>,
     deepen_not: Vec<String>,
     filter: Option<sley_odb::PackObjectFilter>,
+    filter_auto: bool,
     record_promisor_refs: bool,
     reject_shallow: bool,
     ssh_options: Option<crate::ssh::SshTransportOptions>,
-) -> FetchOptions {
+    upload_pack_command: Option<&'a str>,
+}
+
+fn clone_fetch_options(options: CloneFetchOptions<'_>) -> FetchOptions {
+    let CloneFetchOptions {
+        progress,
+        depth,
+        deepen_since,
+        deepen_not,
+        filter,
+        filter_auto,
+        record_promisor_refs,
+        reject_shallow,
+        ssh_options,
+        upload_pack_command,
+    } = options;
     FetchOptions {
-        quiet: true,
+        // Clone keeps fetch bookkeeping quiet, but an explicitly/resolved
+        // enabled transfer-progress policy must reach the progress sink.
+        quiet: !progress,
+        progress: Some(progress),
         auto_follow_tags: true,
         fetch_all_tags: false,
         prune: false,
@@ -717,6 +782,7 @@ fn clone_fetch_options(
         depth,
         merge_srcs: Vec::new(),
         filter,
+        filter_auto,
         refetch: false,
         cloning: true,
         record_promisor_refs,
@@ -727,6 +793,7 @@ fn clone_fetch_options(
         deepen_since,
         deepen_not,
         ssh_options,
+        upload_pack_command: upload_pack_command.map(str::to_string),
         atomic: false,
         negotiation_restrict: None,
         negotiation_include: None,

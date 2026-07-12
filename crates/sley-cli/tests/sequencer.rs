@@ -146,6 +146,47 @@ fn cherry_pick_clean_matches_git() {
 }
 
 #[test]
+fn cherry_pick_in_cone_preserves_sparse_index_layout() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("cp-sparse-layout");
+    let reference = root.join("reference");
+    let candidate = root.join("candidate");
+    fs::create_dir_all(reference.join("deep")).expect("create deep");
+    fs::create_dir_all(reference.join("other")).expect("create other");
+    git_ok(&reference, &["init", "-q", "-b", "main"]);
+    write_file(&reference, "deep/a", "base\n");
+    write_file(&reference, "other/a", "other\n");
+    git_ok(&reference, &["add", "."]);
+    git_ok(&reference, &["commit", "-qm", "base"]);
+    git_ok(&reference, &["checkout", "-qb", "topic"]);
+    write_file(&reference, "deep/a", "changed\n");
+    git_ok(&reference, &["commit", "-qam", "changed"]);
+    git_ok(&reference, &["checkout", "-q", "main"]);
+    git_ok(
+        &reference,
+        &["sparse-checkout", "set", "--sparse-index", "deep"],
+    );
+    copy_dir_all(&reference, &candidate);
+
+    let expected = git(&reference, &["cherry-pick", "topic"]);
+    let actual = sley(&candidate, &["cherry-pick", "topic"]);
+    assert_eq!(actual.status.code(), expected.status.code());
+    assert!(
+        actual.status.success(),
+        "{}",
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    let expected_layout = git(&reference, &["ls-files", "--sparse"]);
+    let actual_layout = git(&candidate, &["ls-files", "--sparse"]);
+    assert_eq!(actual_layout.stdout, expected_layout.stdout);
+    assert!(String::from_utf8_lossy(&actual_layout.stdout).contains("other/\n"));
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn cherry_pick_conflict_matches_git() {
     if !git_available() {
         return;

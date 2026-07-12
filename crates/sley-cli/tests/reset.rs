@@ -130,6 +130,118 @@ fn reset_path_unstages_modified_file_like_upstream_git() {
 }
 
 #[test]
+fn reset_in_cone_path_keeps_unrelated_sparse_directories_collapsed() {
+    let root = unique_temp_dir("reset-in-cone-sparse-index");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    for repo in [&upstream, &rust] {
+        git(repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("deep")).expect("create in-cone directory");
+        fs::create_dir_all(repo.join("outside")).expect("create out-of-cone directory");
+        fs::write(repo.join("deep/a"), b"base\n").expect("write in-cone file");
+        fs::write(repo.join("outside/a"), b"outside\n").expect("write out-of-cone file");
+        git(repo, &["add", "."]);
+        run_with_identity(repo, &["commit", "-m", "base", "-q"]);
+        fs::write(repo.join("deep/a"), b"second\n").expect("write second revision");
+        git(repo, &["add", "deep/a"]);
+        run_with_identity(repo, &["commit", "-m", "second", "-q"]);
+        git(
+            repo,
+            &["sparse-checkout", "init", "--cone", "--sparse-index"],
+        );
+        git(repo, &["sparse-checkout", "set", "deep"]);
+    }
+
+    let args = ["reset", "HEAD~1", "--", "deep/a"];
+    let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+    let trace = root.join("reset-trace.json");
+    let actual = Command::new(sley_testkit::sley_bin!())
+        .current_dir(&rust)
+        .args(args)
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .expect("run traced sley reset");
+    assert_same_output(actual, expected, &args);
+    assert!(
+        !fs::read_to_string(trace)
+            .expect("read reset trace")
+            .contains("ensure_full_index"),
+        "resetting an explicit in-cone leaf must not expand sparse directories"
+    );
+    assert_eq!(
+        git(&rust, &["ls-files", "--sparse", "--stage"]),
+        git(&upstream, &["ls-files", "--sparse", "--stage"]),
+        "candidate sparse index differed after pathspec reset"
+    );
+    assert_eq!(
+        git(&rust, &["diff", "--cached", "--name-status"]),
+        git(&upstream, &["diff", "--cached", "--name-status"]),
+        "cached changes differed after pathspec reset"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reset_out_of_cone_directory_replaces_sparse_tree_without_expansion() {
+    let root = unique_temp_dir("reset-out-of-cone-sparse-directory");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    for repo in [&upstream, &rust] {
+        git(repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("deep")).expect("create in-cone directory");
+        fs::create_dir_all(repo.join("outside")).expect("create out-of-cone directory");
+        fs::write(repo.join("deep/a"), b"inside\n").expect("write in-cone file");
+        fs::write(repo.join("outside/a"), b"base\n").expect("write out-of-cone file");
+        git(repo, &["add", "."]);
+        run_with_identity(repo, &["commit", "-m", "base", "-q"]);
+        fs::write(repo.join("outside/a"), b"second\n").expect("update out-of-cone file");
+        git(repo, &["add", "outside/a"]);
+        run_with_identity(repo, &["commit", "-m", "second", "-q"]);
+        git(
+            repo,
+            &["sparse-checkout", "init", "--cone", "--sparse-index"],
+        );
+        git(repo, &["sparse-checkout", "set", "deep"]);
+        git(repo, &["config", "advice.sparseIndexExpanded", "false"]);
+    }
+
+    let args = ["reset", "HEAD~1", "--", "outside"];
+    let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+    let trace = root.join("reset-directory-trace.json");
+    let actual = Command::new(sley_testkit::sley_bin!())
+        .current_dir(&rust)
+        .args(args)
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .expect("run traced sparse-directory reset");
+    assert_same_output(actual, expected, &args);
+    assert!(
+        !fs::read_to_string(trace)
+            .expect("read sparse-directory reset trace")
+            .contains("ensure_full_index"),
+        "resetting an out-of-cone directory must replace its sparse tree directly"
+    );
+    assert_eq!(
+        git(&rust, &["ls-files", "--sparse", "--stage"]),
+        git(&upstream, &["ls-files", "--sparse", "--stage"]),
+        "candidate sparse tree entry differed after directory reset"
+    );
+    assert_eq!(
+        git(&rust, &["diff", "--cached", "--name-status"]),
+        git(&upstream, &["diff", "--cached", "--name-status"]),
+        "cached subtree changes differed after directory reset"
+    );
+    assert!(!rust.join("outside").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn reset_sha256_mixed_and_hard_match_upstream_git() {
     let root = unique_temp_dir("reset-sha256");
     let upstream_mixed = root.join("upstream-mixed");
@@ -733,5 +845,83 @@ fn reset_mixed_quiet_to_commit_suppresses_summary_like_upstream_git() {
         let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn reset_soft_rejects_pending_checkout_merge_like_upstream_git() {
+    let root = unique_temp_dir("reset-soft-checkout-merge");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+
+    for repo in [&upstream, &rust] {
+        prepare_repo(repo);
+        git(repo, &["branch", "branch3"]);
+        git(repo, &["branch", "branch4"]);
+        git(repo, &["checkout", "-q", "branch3"]);
+        fs::write(repo.join("file.txt"), b"base\nbranch3\n").expect("write branch3 file");
+        git(repo, &["add", "file.txt"]);
+        run_with_identity(repo, &["commit", "-m", "branch3", "-q"]);
+        git(repo, &["checkout", "-q", "branch4"]);
+        fs::write(repo.join("file.txt"), b"base\nbranch4 dirty\n")
+            .expect("write branch4 worktree file");
+        git(repo, &["checkout", "-m", "branch3"]);
+    }
+
+    let before_head = git(&rust, &["rev-parse", "HEAD"]);
+    let before_unmerged = git(&rust, &["ls-files", "--unmerged"]);
+    assert!(
+        !before_unmerged.is_empty(),
+        "checkout -m must leave unmerged entries"
+    );
+
+    let args = ["reset", "--soft"];
+    let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+    let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+    assert_same_output(actual, expected, &args);
+    assert_eq!(git(&rust, &["rev-parse", "HEAD"]), before_head);
+    assert_eq!(git(&rust, &["ls-files", "--unmerged"]), before_unmerged);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn reset_mixed_refresh_flag_controls_index_refresh_like_upstream_git() {
+    let root = unique_temp_dir("reset-mixed-refresh-flag");
+
+    for (case, flag, expect_clean) in [
+        ("refresh", "--refresh", true),
+        ("no-refresh", "--no-refresh", false),
+    ] {
+        let upstream = root.join(format!("upstream-{case}"));
+        let rust = root.join(format!("rust-{case}"));
+        fs::create_dir_all(&upstream).expect("create upstream repo");
+        fs::create_dir_all(&rust).expect("create rust repo");
+
+        for repo in [&upstream, &rust] {
+            prepare_repo(repo);
+            fs::write(repo.join("file2"), b"tracked\n").expect("write file2");
+            git(repo, &["add", "file2"]);
+            run_with_identity(repo, &["commit", "-m", "add file2", "-q"]);
+            git(repo, &["rm", "--cached", "file2"]);
+        }
+
+        let args = ["reset", flag, "--mixed", "HEAD"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+        assert_same_output(actual, expected, &args);
+
+        let expected_diff = git(&upstream, &["diff-files", "--name-status"]);
+        let actual_diff = git(&rust, &["diff-files", "--name-status"]);
+        assert_eq!(actual_diff, expected_diff, "diff-files differed for {flag}");
+        assert_eq!(
+            actual_diff.is_empty(),
+            expect_clean,
+            "wrong refresh state for {flag}"
+        );
+    }
+
     let _ = fs::remove_dir_all(&root);
 }

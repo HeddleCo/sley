@@ -9,14 +9,14 @@
 //! is a drop-in replacement.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_worktree};
+use sley::plumbing::sley_worktree;
 // Pull shared plumbing (RepositoryContext, ObjectReader, Index/IndexEntry,
 // GitError/Result, std::* re-exports, …) from the crate root.
 // A submodule can see its ancestors' items, so the glob keeps this file in step
 // with whatever the root exposes without re-listing each name.
 use crate::commands::cli_options::{last_tri_state_bool, opt_bool, opt_str};
 use crate::*;
-use sley_options::{parse_options, OptionSpec, ParsedValue};
+use sley_options::{OptionSpec, ParsedValue, parse_options};
 
 /// Which index stage to copy out. Real `git` defaults to stage 0; `--stage=<n>`
 /// selects a single conflict stage and `--stage=all` (handled separately) is not
@@ -63,8 +63,7 @@ impl Default for CheckoutIndexOptions {
     }
 }
 
-const CHECKOUT_INDEX_USAGE_LINES: &[&str] =
-    &["git checkout-index [<options>] [--] [<file>...]"];
+const CHECKOUT_INDEX_USAGE_LINES: &[&str] = &["git checkout-index [<options>] [--] [<file>...]"];
 
 fn checkout_index_option_specs() -> &'static [OptionSpec<'static>] {
     static SPECS: &[OptionSpec<'static>] = &[
@@ -146,9 +145,12 @@ fn checkout_index_option_specs() -> &'static [OptionSpec<'static>] {
     SPECS
 }
 
-pub(crate) fn cmd_checkout_index(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_checkout_index(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = setup_checkout_index_options(args)?;
-    run_checkout_index(options)
+    run_checkout_index(cli_session, options)
 }
 
 /// Stage bits live in the upper nibble of the index entry flags.
@@ -166,10 +168,7 @@ fn checkout_index_entry_skip_worktree(entry: &IndexEntry) -> bool {
 }
 
 fn setup_checkout_index_options(args: &[String]) -> Result<CheckoutIndexOptions> {
-    if args
-        .iter()
-        .any(|arg| arg == "-h" || arg == "--help")
-    {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         return Err(checkout_index_help());
     }
     let parsed = match parse_options(
@@ -191,7 +190,10 @@ fn setup_checkout_index_options(args: &[String]) -> Result<CheckoutIndexOptions>
     options.force = parsed.last_bool("force", false);
     options.quiet = parsed.last_bool("quiet", false);
     options.update_stat = parsed.last_bool("index", false);
-    options.nul = parsed.options.iter().any(|option| option.short == Some('z'));
+    options.nul = parsed
+        .options
+        .iter()
+        .any(|option| option.short == Some('z'));
     options.stdin = parsed.last_bool("stdin", false);
     options.ignore_skip_worktree_bits = parsed.last_bool("ignore-skip-worktree-bits", false);
     let mut create = true;
@@ -239,7 +241,10 @@ fn parse_checkout_index_stage(value: &str) -> Result<CheckoutIndexStage> {
     }
 }
 
-fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
+fn run_checkout_index(
+    cli_session: &crate::session::CliSession,
+    options: CheckoutIndexOptions,
+) -> Result<()> {
     if options.all && !options.paths.is_empty() {
         eprintln!("fatal: git checkout-index: don't mix '--all' and explicit filenames");
         return Err(GitError::Exit(128));
@@ -260,7 +265,7 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let repo = match RepositoryContext::discover_current() {
+    let repo = match RepositoryContext::from_session(cli_session) {
         Ok(repo) => repo,
         Err(GitError::NotFound(_)) => {
             eprintln!("fatal: not a git repository (or any of the parent directories): .git");
@@ -284,6 +289,19 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
             checksum: None,
         },
     };
+    // checkout-index addresses logical cache entries. Keep the serialized
+    // sparse-directory names only for Git's special explicit-directory error,
+    // then expand a command-local view so `--all` and
+    // `--ignore-skip-worktree-bits` can see the represented leaves without an
+    // observable full-index transition or an on-disk rewrite.
+    let sparse_directory_paths = index
+        .entries
+        .iter()
+        .filter(|entry| entry.is_sparse_dir())
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect::<BTreeSet<_>>();
+    let physical_sparse_index = (!sparse_directory_paths.is_empty()).then(|| index.clone());
+    sley_worktree::expand_sparse_index_view(&mut index, db, format)?;
 
     // The path prefix of the current directory relative to the worktree root is
     // prepended to explicit pathspecs for cache lookup (so `a.txt` from `sub/`
@@ -355,6 +373,20 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
                 .map(|(idx, _)| idx)
                 .collect();
             if positions.is_empty() {
+                let mut sparse_lookup = lookup.clone();
+                if !sparse_lookup.ends_with(b"/") {
+                    sparse_lookup.push(b'/');
+                }
+                if sparse_directory_paths.contains(&sparse_lookup) {
+                    if !options.quiet {
+                        eprintln!(
+                            "git checkout-index: {} is a sparse directory",
+                            String::from_utf8_lossy(&sparse_lookup)
+                        );
+                    }
+                    had_error = true;
+                    continue;
+                }
                 if matches!(options.stage, CheckoutIndexStage::All)
                     && index.entries.iter().any(|entry| entry.path == lookup)
                 {
@@ -376,6 +408,16 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
                         || !checkout_index_entry_skip_worktree(&index.entries[*idx])
                 })
                 .collect();
+            if positions.is_empty() {
+                if !options.quiet {
+                    eprintln!(
+                        "git checkout-index: {} has skip-worktree enabled; use '--ignore-skip-worktree-bits' to checkout",
+                        String::from_utf8_lossy(&lookup)
+                    );
+                }
+                had_error = true;
+                continue;
+            }
             if temp {
                 if checkout_temp_index_entries(&checkout_context, &dir_prefix, &positions, &index)?
                 {
@@ -396,14 +438,35 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
     }
 
     if wrote_index {
-        index.entries.sort_by(|left, right| {
+        let mut index_to_write = if let Some(mut physical) = physical_sparse_index {
+            // The expanded index is a semantic checkout view, not a new
+            // storage layout. `checkout-index -u` updates cached stat data for
+            // physical leaf entries only; collapsed directories remain
+            // collapsed just as Git leaves them, and the `sdir` extension is
+            // preserved.
+            for entry in &mut physical.entries {
+                if entry.is_sparse_dir() {
+                    continue;
+                }
+                if let Some(updated) = index.entries.iter().find(|updated| {
+                    updated.path == entry.path
+                        && checkout_index_entry_stage(updated) == checkout_index_entry_stage(entry)
+                }) {
+                    copy_checkout_index_stat(entry, updated);
+                }
+            }
+            physical
+        } else {
+            index
+        };
+        index_to_write.entries.sort_by(|left, right| {
             left.path.cmp(&right.path).then_with(|| {
                 checkout_index_entry_stage(left).cmp(&checkout_index_entry_stage(right))
             })
         });
         fs::write(
             sley_worktree::repository_index_path(git_dir),
-            index.write(format)?,
+            index_to_write.write(format)?,
         )?;
     }
 
@@ -411,6 +474,18 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+fn copy_checkout_index_stat(destination: &mut IndexEntry, source: &IndexEntry) {
+    destination.ctime_seconds = source.ctime_seconds;
+    destination.ctime_nanoseconds = source.ctime_nanoseconds;
+    destination.mtime_seconds = source.mtime_seconds;
+    destination.mtime_nanoseconds = source.mtime_nanoseconds;
+    destination.dev = source.dev;
+    destination.ino = source.ino;
+    destination.uid = source.uid;
+    destination.gid = source.gid;
+    destination.size = source.size;
 }
 
 enum CheckoutOutcome {
@@ -630,7 +705,13 @@ fn checkout_one_index_entry(
     }
 
     if let Some(parent) = dest.parent() {
-        checkout_index_ensure_parent_dirs(parent, context.options.force)?;
+        let protected_prefix_parent =
+            checkout_index_prefix_parent(context.worktree_root, &context.options.prefix)?;
+        checkout_index_ensure_parent_dirs(
+            parent,
+            context.options.force,
+            protected_prefix_parent.as_deref(),
+        )?;
     }
 
     // Mode 0o120000 is a symlink; everything else is a regular file (executable
@@ -746,12 +827,41 @@ fn write_checkout_regular_file(dest: &Path, body: &[u8], mode: u32) -> Result<()
     Ok(())
 }
 
-fn checkout_index_ensure_parent_dirs(path: &Path, force: bool) -> Result<()> {
+/// Return the directory portion that belongs wholly to `--prefix`.
+///
+/// Existing symlinks in this portion are followed by Git: the prefix names an
+/// output location supplied by the caller, rather than an index path being
+/// materialized.  A symlink introduced only after concatenating an index path
+/// is still replaced under `--force`.
+fn checkout_index_prefix_parent(worktree_root: &Path, prefix: &str) -> Result<Option<PathBuf>> {
+    let Some(slash) = prefix.as_bytes().iter().rposition(|byte| *byte == b'/') else {
+        return Ok(None);
+    };
+    let directory = &prefix.as_bytes()[..slash];
+    if directory.is_empty() {
+        return Ok(None);
+    }
+    let directory =
+        std::str::from_utf8(directory).map_err(|err| GitError::InvalidPath(err.to_string()))?;
+    Ok(Some(worktree_root.join(directory)))
+}
+
+fn checkout_index_ensure_parent_dirs(
+    path: &Path,
+    force: bool,
+    protected_prefix_parent: Option<&Path>,
+) -> Result<()> {
     if path.as_os_str().is_empty() {
         return Ok(());
     }
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        if metadata.file_type().is_symlink()
+            && protected_prefix_parent.is_some_and(|prefix| prefix.starts_with(path))
+            && fs::metadata(path).is_ok_and(|target| target.is_dir())
+        {
             return Ok(());
         }
         if !force {
@@ -761,7 +871,7 @@ fn checkout_index_ensure_parent_dirs(path: &Path, force: bool) -> Result<()> {
         checkout_index_remove_existing_path(path)?;
     }
     if let Some(parent) = path.parent() {
-        checkout_index_ensure_parent_dirs(parent, force)?;
+        checkout_index_ensure_parent_dirs(parent, force, protected_prefix_parent)?;
     }
     match fs::create_dir(path) {
         Ok(()) => Ok(()),

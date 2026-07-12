@@ -6,7 +6,7 @@ use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{
     Reftable, ReftableLogRecord, ReftableLogUpdate, ReftableLogValue, ReftableRefRecord,
-    ReftableRefValue,
+    ReftableRefValue, ReftableWriteOptions,
 };
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -20,6 +20,93 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod branch;
+pub mod migration;
+
+/// Match a refname component against Git's ref-filter wildcard rules.
+///
+/// `*` spans slashes, `?` matches one byte, bracket classes and backslash
+/// escapes are supported, and malformed bracket classes treat `[` literally.
+pub fn refname_pattern_matches_case(pattern: &str, name: &str, ignore_case: bool) -> bool {
+    fn matches_from(pattern: &[u8], name: &[u8]) -> bool {
+        match pattern {
+            [] => name.is_empty(),
+            [b'*', rest @ ..] => {
+                matches_from(rest, name) || (!name.is_empty() && matches_from(pattern, &name[1..]))
+            }
+            [b'?', rest @ ..] => !name.is_empty() && matches_from(rest, &name[1..]),
+            [b'\\', escaped, rest @ ..] => {
+                matches!(name, [first, ..] if first == escaped) && matches_from(rest, &name[1..])
+            }
+            [b'[', rest @ ..] => {
+                if let Some((matched, consumed)) =
+                    match_refname_pattern_class(rest, name.first().copied())
+                {
+                    !name.is_empty() && matched && matches_from(&rest[consumed..], &name[1..])
+                } else {
+                    matches!(name, [b'[', ..]) && matches_from(rest, &name[1..])
+                }
+            }
+            [literal, rest @ ..] => {
+                matches!(name, [first, ..] if first == literal) && matches_from(rest, &name[1..])
+            }
+        }
+    }
+
+    if ignore_case {
+        let pattern = pattern
+            .as_bytes()
+            .iter()
+            .map(u8::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        let name = name
+            .as_bytes()
+            .iter()
+            .map(u8::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        matches_from(&pattern, &name)
+    } else {
+        matches_from(pattern.as_bytes(), name.as_bytes())
+    }
+}
+
+fn match_refname_pattern_class(class: &[u8], name: Option<u8>) -> Option<(bool, usize)> {
+    let mut idx = 0;
+    let negated = matches!(class.first(), Some(b'!' | b'^'));
+    if negated {
+        idx += 1;
+    }
+
+    let mut matched = false;
+    let mut saw_member = false;
+    while idx < class.len() {
+        if class[idx] == b']' && saw_member {
+            return Some((if negated { !matched } else { matched }, idx + 1));
+        }
+        let start = class[idx];
+        if start == b'\\' && idx + 1 < class.len() {
+            idx += 1;
+        }
+        let start = class[idx];
+        saw_member = true;
+        if idx + 2 < class.len() && class[idx + 1] == b'-' && class[idx + 2] != b']' {
+            let mut end_idx = idx + 2;
+            if class[end_idx] == b'\\' && end_idx + 1 < class.len() {
+                end_idx += 1;
+            }
+            let end = class[end_idx];
+            if let Some(value) = name {
+                matched |= start <= value && value <= end;
+            }
+            idx = end_idx + 1;
+        } else {
+            matched |= name == Some(start);
+            idx += 1;
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefTarget {
     Direct(ObjectId),
@@ -30,6 +117,38 @@ pub enum RefTarget {
 pub struct Ref {
     pub name: String,
     pub target: RefTarget,
+}
+
+/// One entry in a transaction-oriented ref snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefReadSnapshotValue {
+    Target(RefTarget),
+    Broken,
+}
+
+/// A single-pass view of the ref namespace used while planning a transaction.
+///
+/// Unlike user-facing ref iteration, snapshot construction is silent and keeps
+/// broken loose refs as typed entries so callers can diagnose them without
+/// rescanning the filesystem or emitting iteration warnings.
+#[derive(Debug, Clone, Default)]
+pub struct RefReadSnapshot {
+    entries: BTreeMap<String, RefReadSnapshotValue>,
+}
+
+impl RefReadSnapshot {
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&RefReadSnapshotValue> {
+        self.entries.get(name)
+    }
+}
+
+/// A backend-independent export used to move all live refs and reflogs as one
+/// logical operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefSnapshot {
+    pub refs: Vec<Ref>,
+    pub reflogs: Vec<(String, Vec<ReflogEntry>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -684,9 +803,74 @@ pub struct FileRefStore {
     common_dir: PathBuf,
     storage_dir: PathBuf,
     format: ObjectFormat,
-    honor_reference_backend_env: bool,
+    ref_storage: RefStorageConfiguration,
+    packed_refs_lock_timeout_millis: u64,
     reftable_lock_timeout_millis: Option<u64>,
+    reftable_write_options: ReftableWriteOptions,
     combine_reftable_logs: bool,
+    prefer_symlink_refs: bool,
+    reference_fsync: ReferenceFsyncPolicy,
+    shared_repository: sley_formats::SharedRepositoryPermissions,
+}
+
+#[derive(Debug, Clone)]
+struct RefStorageConfiguration {
+    backend: Option<(RefBackendKind, Option<PathBuf>)>,
+    invalid_value: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReferenceFsyncMethod {
+    Fsync,
+    WriteoutOnly,
+    Batch,
+}
+
+impl ReferenceFsyncMethod {
+    const fn platform_default() -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            Self::Batch
+        }
+        #[cfg(all(not(target_os = "windows"), target_os = "macos"))]
+        {
+            Self::WriteoutOnly
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            Self::Fsync
+        }
+    }
+
+    fn from_config(value: Option<&str>) -> Self {
+        match value {
+            Some("fsync") => Self::Fsync,
+            Some("writeout-only") => Self::WriteoutOnly,
+            Some("batch") => Self::Batch,
+            _ => Self::platform_default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReferenceFsyncPolicy {
+    enabled: bool,
+    method: ReferenceFsyncMethod,
+}
+
+impl ReferenceFsyncPolicy {
+    fn from_config(core_fsync: Option<&str>, core_fsync_method: Option<&str>) -> Self {
+        let enabled =
+            core_fsync.is_some_and(core_fsync_includes_reference) && git_test_fsync_enabled();
+        Self {
+            enabled,
+            method: ReferenceFsyncMethod::from_config(core_fsync_method),
+        }
+    }
+
+    fn method_if_enabled(self) -> Option<ReferenceFsyncMethod> {
+        self.enabled.then_some(self.method)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -732,29 +916,125 @@ pub struct AppliedBundleRefUpdate {
     pub new_oid: ObjectId,
 }
 
-fn configured_ref_storage_backend(
-    common_dir: &Path,
-    honor_env: bool,
-) -> Option<(RefBackendKind, Option<PathBuf>)> {
-    if honor_env
-        && let Ok(value) = env::var("GIT_REFERENCE_BACKEND")
-        && let Ok((kind, path)) = parse_ref_storage_backend_value(&value)
-    {
-        return Some((
-            kind,
-            path.map(|path| ref_storage_path_from_config(common_dir, path)),
-        ));
+fn configured_ref_storage_backend(common_dir: &Path, honor_env: bool) -> RefStorageConfiguration {
+    if honor_env && let Ok(value) = env::var("GIT_REFERENCE_BACKEND") {
+        return match parse_ref_storage_backend_value(&value) {
+            Ok((kind, path)) => RefStorageConfiguration {
+                backend: Some((
+                    kind,
+                    path.map(|path| ref_storage_path_from_config(common_dir, path)),
+                )),
+                invalid_value: None,
+            },
+            Err(_) => RefStorageConfiguration {
+                backend: None,
+                invalid_value: Some(value),
+            },
+        };
     }
-    let config = GitConfig::read(common_dir.join("config")).ok()?;
-    let value = config.get("extensions", None, "refStorage")?;
-    parse_ref_storage_backend_value(value)
+    let value = GitConfig::read(common_dir.join("config"))
         .ok()
-        .map(|(kind, path)| {
-            (
+        .and_then(|config| {
+            config
+                .get("extensions", None, "refStorage")
+                .map(str::to_string)
+        });
+    let Some(value) = value else {
+        return RefStorageConfiguration {
+            backend: None,
+            invalid_value: None,
+        };
+    };
+    match parse_ref_storage_backend_value(&value) {
+        Ok((kind, path)) => RefStorageConfiguration {
+            backend: Some((
                 kind,
                 path.map(|path| ref_storage_path_from_config(common_dir, path)),
-            )
-        })
+            )),
+            invalid_value: None,
+        },
+        Err(_) => RefStorageConfiguration {
+            backend: None,
+            invalid_value: Some(value),
+        },
+    }
+}
+
+fn configured_reference_fsync(common_dir: &Path) -> ReferenceFsyncPolicy {
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(sley_config::git_dir_for_include_context(common_dir)),
+        sley_config::repo_current_branch_name(common_dir),
+    );
+    let config = sley_config::load_effective_config(common_dir, &context).ok();
+    ReferenceFsyncPolicy::from_config(
+        config
+            .as_ref()
+            .and_then(|config| config.get("core", None, "fsync")),
+        config
+            .as_ref()
+            .and_then(|config| config.get("core", None, "fsyncMethod")),
+    )
+}
+
+fn core_fsync_includes_reference(value: &str) -> bool {
+    const COMPONENTS: [(&str, bool); 11] = [
+        ("loose-object", false),
+        ("pack", false),
+        ("pack-metadata", false),
+        ("commit-graph", false),
+        ("index", false),
+        ("objects", false),
+        ("reference", true),
+        ("derived-metadata", false),
+        ("committed", true),
+        ("added", true),
+        ("all", true),
+    ];
+    let mut positive = false;
+    let mut negative = false;
+    for raw_component in value.split(',') {
+        let component = raw_component.trim();
+        if component == "none" || component.is_empty() {
+            continue;
+        }
+        let (negated, component) = component
+            .strip_prefix('-')
+            .map_or((false, component), |component| (true, component));
+        if component.is_empty() {
+            continue;
+        }
+        let matches_reference = COMPONENTS
+            .iter()
+            .any(|(name, includes_reference)| *includes_reference && name.starts_with(component));
+        if matches_reference {
+            if negated {
+                negative = true;
+            } else {
+                positive = true;
+            }
+        }
+    }
+    // Git starts from FSYNC_COMPONENTS_DEFAULT (which excludes references),
+    // then applies accumulated negatives and positives. Positives win when the
+    // same component appears in both sets.
+    (platform_default_includes_reference_fsync() && !negative) || positive
+}
+
+fn platform_default_includes_reference_fsync() -> bool {
+    // FSYNC_COMPONENTS_DEFAULT excludes reference files on every platform in
+    // Git v2.55. Keep this as a function because Git exposes the default as a
+    // platform-overridable compile-time policy.
+    false
+}
+
+fn git_test_fsync_enabled() -> bool {
+    let Ok(value) = env::var("GIT_TEST_FSYNC") else {
+        return true;
+    };
+    !matches!(
+        value.to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off" | ""
+    )
 }
 
 fn ref_storage_path_from_config(common_dir: &Path, path: PathBuf) -> PathBuf {
@@ -806,6 +1086,18 @@ impl FileRefStore {
         Self::new_with_reference_backend_env(git_dir, format, false)
     }
 
+    /// Git directory this store was opened for.
+    #[must_use]
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
+    /// Object format used by reference targets and reflogs.
+    #[must_use]
+    pub const fn object_format(&self) -> ObjectFormat {
+        self.format
+    }
+
     fn new_with_reference_backend_env(
         git_dir: impl Into<PathBuf>,
         format: ObjectFormat,
@@ -814,8 +1106,15 @@ impl FileRefStore {
         let git_dir = git_dir.into();
         let common_dir = repository_common_dir(&git_dir);
         let configured = configured_ref_storage_backend(&common_dir, honor_reference_backend_env);
-        let storage_dir = match configured {
-            Some((_, Some(path))) => path,
+        let reference_fsync = configured_reference_fsync(&common_dir);
+        let shared_repository =
+            sley_formats::SharedRepositoryPermissions::from_git_dir(&common_dir);
+        let prefer_symlink_refs = GitConfig::read(common_dir.join("config"))
+            .ok()
+            .and_then(|config| config.get_bool("core", None, "preferSymlinkRefs"))
+            .unwrap_or(false);
+        let storage_dir = match configured.backend.as_ref() {
+            Some((_, Some(path))) => path.clone(),
             Some((RefBackendKind::Reftable, None)) if git_dir != common_dir => git_dir.clone(),
             _ => common_dir.clone(),
         };
@@ -824,9 +1123,14 @@ impl FileRefStore {
             common_dir,
             storage_dir,
             format,
-            honor_reference_backend_env,
+            ref_storage: configured,
+            packed_refs_lock_timeout_millis: 1_000,
             reftable_lock_timeout_millis: None,
+            reftable_write_options: ReftableWriteOptions::default(),
             combine_reftable_logs: false,
+            prefer_symlink_refs,
+            reference_fsync,
+            shared_repository,
         }
     }
 
@@ -835,8 +1139,65 @@ impl FileRefStore {
         self
     }
 
+    /// Override how long files-backend transactions retry `packed-refs.lock`.
+    ///
+    /// Git defaults this to one second and lets `core.packedRefsTimeout`
+    /// override it. Keeping the timeout on the store makes the transaction
+    /// responsible for lock ordering and prevents a loose ref from disappearing
+    /// while its stale packed value is still visible.
+    #[must_use]
+    pub fn with_packed_refs_lock_timeout_millis(mut self, timeout_millis: u64) -> Self {
+        self.packed_refs_lock_timeout_millis = timeout_millis;
+        self
+    }
+
+    /// Override the writer settings used for newly appended or compacted
+    /// reftable tables.
+    pub fn with_reftable_write_options(mut self, options: ReftableWriteOptions) -> Self {
+        self.reftable_write_options = options;
+        self
+    }
+
     pub fn with_reftable_combined_logs(mut self, combine: bool) -> Self {
         self.combine_reftable_logs = combine;
+        self
+    }
+
+    /// Whether files-backend symbolic refs should use legacy filesystem
+    /// symlinks instead of textual `ref: ...` files.
+    #[must_use]
+    pub const fn prefers_symlink_refs(&self) -> bool {
+        self.prefer_symlink_refs
+    }
+
+    /// Override the effective `core.preferSymlinkRefs` value for callers that
+    /// carry command-line config outside the repository config file.
+    #[must_use]
+    pub fn with_prefer_symlink_refs(mut self, prefer: bool) -> Self {
+        self.prefer_symlink_refs = prefer;
+        self
+    }
+
+    /// Override the effective `core.fsync` settings for reference writes.
+    ///
+    /// The CLI uses this for command-line `-c` values, which live outside the
+    /// process environment. Passing `None` for either value retains Git's
+    /// platform default for that setting.
+    pub fn with_reference_fsync_config(
+        mut self,
+        core_fsync: Option<&str>,
+        core_fsync_method: Option<&str>,
+    ) -> Self {
+        if core_fsync.is_some() || core_fsync_method.is_some() {
+            let enabled = core_fsync
+                .map(core_fsync_includes_reference)
+                .unwrap_or(self.reference_fsync.enabled)
+                && git_test_fsync_enabled();
+            let method = core_fsync_method.map_or(self.reference_fsync.method, |value| {
+                ReferenceFsyncMethod::from_config(Some(value))
+            });
+            self.reference_fsync = ReferenceFsyncPolicy { enabled, method };
+        }
         self
     }
 
@@ -871,7 +1232,7 @@ impl FileRefStore {
     /// cmd_refs_exists). A ref "exists" if its loose file is present (regardless
     /// of contents — dangling symrefs, bad object ids, and refs written with a
     /// bad name all count) or if it is recorded in packed-refs / the reftable.
-    /// Unlike [`read_ref`], no name validation is performed and the object the
+    /// Unlike [`Self::read_ref`], no name validation is performed and the object the
     /// ref points at is never read. Returns:
     ///   * `Ok(true)`  — the raw ref exists.
     ///   * `Ok(false)` — ENOENT or EISDIR (a bare directory where the ref would
@@ -922,6 +1283,45 @@ impl FileRefStore {
         parse_reflog(self.format, &fs::read(path)?)
     }
 
+    /// Read the well-formed entries usable by reflog maintenance.
+    ///
+    /// Files-backend enumeration can encounter hand-written or truncated log
+    /// lines. Git's expiry walk skips those records rather than aborting
+    /// `reflog expire --all`, while direct reflog reads retain strict parsing.
+    pub fn read_reflog_for_expiry(&self, name: &str) -> Result<Vec<ReflogEntry>> {
+        validate_ref_name_for_read(name)?;
+        if self.uses_reftable()? {
+            return self.read_reftable_logs(name);
+        }
+        let path = self.reflog_path(name);
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+        let mut entries = Vec::new();
+        for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+            if let Ok(mut parsed) = parse_reflog(self.format, line) {
+                entries.append(&mut parsed);
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Reapply `core.sharedRepository` to an existing reflog even when expiry
+    /// retained every entry and therefore did not rewrite the file.
+    pub fn adjust_reflog_permissions(&self, name: &str) -> Result<()> {
+        validate_ref_name_for_read(name)?;
+        if self.uses_reftable()? {
+            return Ok(());
+        }
+        let path = self.reflog_path(name);
+        if path.exists() {
+            self.shared_repository.adjust_file(&path)?;
+        }
+        Ok(())
+    }
+
     pub fn reflog_exists(&self, name: &str) -> Result<bool> {
         validate_ref_name_for_read(name)?;
         if self.uses_reftable()? {
@@ -940,7 +1340,11 @@ impl FileRefStore {
         if create_reflog || reflog_exists {
             return Ok(true);
         }
-        let Ok(config) = GitConfig::read(self.common_dir.join("config")) else {
+        let context = sley_config::ConfigIncludeContext::new(
+            Some(sley_config::git_dir_for_include_context(&self.common_dir)),
+            sley_config::repo_current_branch_name(&self.common_dir),
+        );
+        let Ok(config) = sley_config::load_effective_config(&self.common_dir, &context) else {
             return Ok(false);
         };
         if let Some(value) = config.get("core", None, "logAllRefUpdates") {
@@ -961,12 +1365,102 @@ impl FileRefStore {
         let parent = path
             .parent()
             .ok_or_else(|| GitError::InvalidPath("reflog path has no parent".into()))?;
-        fs::create_dir_all(parent)?;
+        self.shared_repository.create_dir_all(parent)?;
         let mut bytes = Vec::new();
         for entry in entries {
             bytes.extend_from_slice(&entry.to_line());
         }
-        write_locked(&path, &bytes)
+        write_locked(&path, &bytes, self.reference_fsync.method_if_enabled())?;
+        self.shared_repository.adjust_file(&path)
+    }
+
+    /// Export the live refs and, when requested, all non-empty reflogs from the
+    /// active backend. Reftable exports are folded from one stable stack read;
+    /// files-backend exports retain the backend's normal per-file consistency.
+    ///
+    /// The reftable implementation folds refs and logs while reading the stack
+    /// once. This avoids the quadratic `list_reflog_names` followed by one full
+    /// stack scan per name that a storage migration would otherwise perform.
+    pub fn export_snapshot(&self, include_reflogs: bool) -> Result<RefSnapshot> {
+        if self.uses_reftable()? {
+            let mut refs = BTreeMap::<String, Ref>::new();
+            let mut logs = BTreeMap::<(String, u64), Option<ReftableLogUpdate>>::new();
+            for table in self.reftables()? {
+                for record in table.refs {
+                    let is_migratable_root = !record.name.starts_with("refs/")
+                        && is_root_ref_syntax(&record.name)
+                        && !matches!(record.name.as_str(), "FETCH_HEAD" | "MERGE_HEAD");
+                    if !record.name.starts_with("refs/") && !is_migratable_root {
+                        continue;
+                    }
+                    match reftable_ref_target(record.value)? {
+                        Some(target) => {
+                            refs.insert(
+                                record.name.clone(),
+                                Ref {
+                                    name: record.name,
+                                    target,
+                                },
+                            );
+                        }
+                        None => {
+                            refs.remove(&record.name);
+                        }
+                    }
+                }
+                if include_reflogs {
+                    for record in table.logs {
+                        let value = match record.value {
+                            ReftableLogValue::Deletion => None,
+                            ReftableLogValue::Update(update) => Some(update),
+                        };
+                        logs.insert((record.refname, record.update_index), value);
+                    }
+                }
+            }
+
+            let mut reflogs = BTreeMap::<String, Vec<ReflogEntry>>::new();
+            if include_reflogs {
+                let null = ObjectId::null(self.format);
+                for ((name, _), update) in logs {
+                    let Some(update) = update else {
+                        continue;
+                    };
+                    if !reftable_log_update_is_empty_marker(&update, null) {
+                        reflogs
+                            .entry(name)
+                            .or_default()
+                            .push(reflog_entry_from_reftable(update));
+                    }
+                }
+            }
+            return Ok(RefSnapshot {
+                refs: refs.into_values().collect(),
+                reflogs: reflogs.into_iter().collect(),
+            });
+        }
+
+        let refs = self.list_all_refs()?;
+        if !include_reflogs {
+            return Ok(RefSnapshot {
+                refs,
+                reflogs: Vec::new(),
+            });
+        }
+        // The files backend exposes the complete materialized reflog namespace
+        // by walking `logs/`. Do not probe every live ref for a corresponding
+        // log: large repositories commonly have thousands of refs but only a
+        // handful of reflogs, and one failed filesystem lookup per ref made
+        // migration time scale with refs twice.
+        let names = self.list_reflog_names()?;
+        let mut reflogs = Vec::new();
+        for name in names {
+            let entries = self.read_reflog(&name)?;
+            if !entries.is_empty() {
+                reflogs.push((name, entries));
+            }
+        }
+        Ok(RefSnapshot { refs, reflogs })
     }
 
     pub fn import_snapshot(
@@ -991,7 +1485,7 @@ impl FileRefStore {
                     log_records.push(ReftableLogRecord {
                         refname: name.clone(),
                         update_index,
-                        value: ReftableLogValue::Update(reftable_update_from_reflog(entry)?),
+                        value: ReftableLogValue::Update(self.reftable_update_from_reflog(entry)?),
                     });
                     update_index = update_index.checked_add(1).ok_or_else(|| {
                         GitError::InvalidFormat("reftable update index overflow".into())
@@ -1004,21 +1498,46 @@ impl FileRefStore {
             return Ok(());
         }
 
-        let mut tx = self.transaction();
-        for reference in refs {
-            tx.update(RefUpdate {
-                name: reference.name.clone(),
-                expected: None,
-                new: reference.target.clone(),
-                reflog: None,
-            });
+        if pack_files_refs {
+            let mut packed = Vec::new();
+            let mut tx = self.transaction();
+            for reference in refs {
+                if packable_loose_ref_name(&reference.name)
+                    && matches!(&reference.target, RefTarget::Direct(_))
+                {
+                    packed.push(PackedRef {
+                        reference: reference.clone(),
+                        peeled: None,
+                    });
+                } else {
+                    tx.update(RefUpdate {
+                        name: reference.name.clone(),
+                        expected: None,
+                        new: reference.target.clone(),
+                        reflog: None,
+                    });
+                }
+            }
+            // A migration directory is private to the caller, so direct refs
+            // can be materialized in their final packed form. Writing them as
+            // loose files only to rescan, pack, and prune them adds two file
+            // operations and a lock per ref without improving atomicity.
+            self.write_packed_refs(&packed)?;
+            tx.commit()?;
+        } else {
+            let mut tx = self.transaction();
+            for reference in refs {
+                tx.update(RefUpdate {
+                    name: reference.name.clone(),
+                    expected: None,
+                    new: reference.target.clone(),
+                    reflog: None,
+                });
+            }
+            tx.commit()?;
         }
-        tx.commit()?;
         for (name, entries) in reflogs {
             self.write_reflog(name, entries)?;
-        }
-        if pack_files_refs {
-            let _ = self.pack_refs(true)?;
         }
         Ok(())
     }
@@ -1056,7 +1575,7 @@ impl FileRefStore {
         for entry in &retained {
             bytes.extend_from_slice(&entry.to_line());
         }
-        write_locked(&path, &bytes)?;
+        write_locked(&path, &bytes, self.reference_fsync.method_if_enabled())?;
         Ok(original_len - retained.len())
     }
 
@@ -1112,13 +1631,54 @@ impl FileRefStore {
             for entry in &retained {
                 bytes.extend_from_slice(&entry.to_line());
             }
-            write_locked(&path, &bytes)?;
+            write_locked(&path, &bytes, self.reference_fsync.method_if_enabled())?;
         }
         Ok(removed)
     }
 
     pub fn list_refs(&self) -> Result<Vec<Ref>> {
         self.list_refs_with_prefix("refs/")
+    }
+
+    /// Capture all updateable refs in one silent filesystem pass.
+    ///
+    /// Loose entries override packed entries, including when the loose entry
+    /// is broken. This mirrors ref resolution while avoiding both repeated
+    /// packed-ref parsing and the warnings emitted by user-facing iteration.
+    pub fn read_snapshot_for_update(&self) -> Result<RefReadSnapshot> {
+        if self.uses_reftable()? {
+            let entries = self
+                .list_refs()?
+                .into_iter()
+                .map(|reference| {
+                    (
+                        reference.name,
+                        RefReadSnapshotValue::Target(reference.target),
+                    )
+                })
+                .collect();
+            return Ok(RefReadSnapshot { entries });
+        }
+
+        let mut entries = BTreeMap::new();
+        let packed_path = self.storage_dir.join("packed-refs");
+        if packed_path.exists() {
+            for packed in parse_packed_refs(self.format, &fs::read(packed_path)?)? {
+                entries.insert(
+                    packed.reference.name,
+                    RefReadSnapshotValue::Target(packed.reference.target),
+                );
+            }
+        }
+        self.collect_loose_ref_snapshot(&self.storage_dir.join("refs"), "refs", &mut entries)?;
+        let worktree_base = self.current_worktree_storage_dir();
+        if worktree_base != self.storage_dir {
+            for namespace in CURRENT_WORKTREE_REF_PREFIXES {
+                let prefix = namespace.trim_end_matches('/');
+                self.collect_loose_ref_snapshot(&worktree_base.join(prefix), prefix, &mut entries)?;
+            }
+        }
+        Ok(RefReadSnapshot { entries })
     }
 
     pub fn list_refs_with_prefix(&self, prefix: &str) -> Result<Vec<Ref>> {
@@ -1324,7 +1884,12 @@ impl FileRefStore {
         timeout_millis: u64,
     ) -> Result<()> {
         let path = self.packed_refs_write_path()?;
-        write_locked_with_timeout(&path, &write_packed_refs(refs)?, timeout_millis)
+        write_locked_with_timeout(
+            &path,
+            &write_packed_refs(refs)?,
+            timeout_millis,
+            self.reference_fsync.method_if_enabled(),
+        )
     }
 
     pub fn pack_refs(&self, prune_loose: bool) -> Result<Vec<PackedRef>> {
@@ -1381,7 +1946,7 @@ impl FileRefStore {
         if auto && !pack_refs_auto_required_for(&packed_path, loose_refs.len())? {
             return Ok(packed_refs.into_values().collect());
         }
-        let mut packed_loose_names = Vec::new();
+        let mut packed_loose_refs = Vec::new();
         for reference in loose_refs {
             let RefTarget::Direct(oid) = reference.target else {
                 continue;
@@ -1390,7 +1955,7 @@ impl FileRefStore {
                 PackRefDecision::Pack { peeled } => peeled,
                 PackRefDecision::Skip => continue,
             };
-            packed_loose_names.push(reference.name.clone());
+            packed_loose_refs.push((reference.name.clone(), oid));
             packed_refs.insert(
                 reference.name.clone(),
                 PackedRef {
@@ -1406,8 +1971,8 @@ impl FileRefStore {
         let refs = packed_refs.into_values().collect::<Vec<_>>();
         self.write_packed_refs_with_timeout(&refs, timeout_millis)?;
         if prune_loose {
-            for name in packed_loose_names {
-                self.delete_loose_ref(&name)?;
+            for (name, oid) in packed_loose_refs {
+                self.prune_loose_ref_after_pack(&name, &oid)?;
             }
         }
         Ok(refs)
@@ -1592,6 +2157,14 @@ impl FileRefStore {
                 "branch {old_branch} is symbolic"
             )));
         };
+        if !copy
+            && fs::symlink_metadata(self.reflog_path(&old_name))
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(GitError::Transaction(format!(
+                "reflog for '{old_name}' is a symlink"
+            )));
+        }
         // Detect a directory/file conflict against some *other* ref before
         // mutating anything (git's rename_ref fails up front, leaving the old
         // branch intact): e.g. renaming `q` -> `r/q` while `r` exists, or `q` ->
@@ -1787,53 +2360,26 @@ impl FileRefStore {
             self.remove_reflog_file(name);
             return Ok(oid);
         }
-        let Some(reference) = self.read_loose_ref(name)? else {
-            return self.delete_packed_ref(name, kind, short_name);
-        };
-        let oid = match reference.target {
-            RefTarget::Direct(oid) => oid,
-            RefTarget::Symbolic(target) => {
-                return Err(GitError::InvalidFormat(format!(
-                    "{kind} {short_name} is symbolic to {target}"
-                )));
-            }
-        };
-        self.delete_loose_ref(name)?;
-        // A loose ref can shadow a packed entry of the same name (e.g. an update
-        // after `pack-refs --all` writes a loose file over the packed copy).
-        // git removes the ref from packed-refs too, so unlinking only the loose
-        // file would leave the stale packed entry resurfacing. Drop any packed
-        // copy as well; its absence is not an error.
-        match self.delete_packed_ref(name, kind, short_name) {
-            Ok(_) | Err(GitError::NotFound(_)) => {}
-            Err(err) => return Err(err),
-        }
-        Ok(oid)
-    }
-
-    fn delete_packed_ref(&self, name: &str, kind: &str, short_name: &str) -> Result<ObjectId> {
-        let path = self.storage_dir.join("packed-refs");
-        if !path.exists() {
-            return Err(GitError::reference_not_found(format!(
-                "{kind} {short_name}"
-            )));
-        }
-        let mut refs = parse_packed_refs(self.format, &fs::read(&path)?)?;
-        let Some(index) = refs
-            .iter()
-            .position(|reference| reference.reference.name == name)
-        else {
-            return Err(GitError::reference_not_found(format!(
-                "{kind} {short_name}"
-            )));
-        };
-        let removed = refs.remove(index);
-        let RefTarget::Direct(oid) = removed.reference.target else {
+        let target = self
+            .read_ref(name)?
+            .ok_or_else(|| GitError::reference_not_found(format!("{kind} {short_name}")))?;
+        let RefTarget::Direct(oid) = target else {
             return Err(GitError::InvalidFormat(format!(
                 "{kind} {short_name} is symbolic"
             )));
         };
-        self.write_packed_refs(&refs)?;
+
+        // Deleting loose first and packed second briefly exposes the stale
+        // packed value and cannot roll the loose deletion back when the packed
+        // rewrite fails. Route both representations through the transaction:
+        // it locks loose and packed state before either becomes observable.
+        let mut tx = self.transaction();
+        tx.delete_with_precondition(
+            name.to_string(),
+            RefDeletePrecondition::Direct(Some(oid)),
+            None,
+        );
+        tx.commit()?;
         Ok(oid)
     }
 
@@ -1916,7 +2462,7 @@ impl FileRefStore {
         if packed_changed {
             let packed_bytes =
                 write_packed_refs(&packed_refs).map_err(ref_delete_error_from_git)?;
-            packed_lock.write_all(&packed_bytes)?;
+            packed_lock.write_all(&packed_bytes, self.reference_fsync.method_if_enabled())?;
             let lock_path = packed_lock.close();
             if let Err(err) = fs::rename(&lock_path, &packed_path) {
                 let _ = fs::remove_file(&lock_path);
@@ -1947,8 +2493,7 @@ impl FileRefStore {
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(err)
-                if err.kind() == std::io::ErrorKind::NotFound
-                    || err.raw_os_error() == Some(20) =>
+                if err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(20) =>
             {
                 return Ok(None);
             }
@@ -1957,15 +2502,25 @@ impl FileRefStore {
         if metadata.is_dir() {
             return Ok(None);
         }
-        if metadata.file_type().is_symlink()
-            && let Ok(target) = fs::read_link(&path)
-        {
-            let target = target.to_string_lossy();
-            if target.starts_with("refs/") {
-                return Ok(Some(Ref {
-                    name: name.to_string(),
-                    target: RefTarget::Symbolic(target.into_owned()),
-                }));
+        if metadata.file_type().is_symlink() {
+            if let Ok(target) = fs::read_link(&path) {
+                let target = target.to_string_lossy();
+                if target.starts_with("refs/") {
+                    return Ok(Some(Ref {
+                        name: name.to_string(),
+                        target: RefTarget::Symbolic(target.into_owned()),
+                    }));
+                }
+            }
+            // A legacy ref symlink is meaningful only when its link text is a
+            // `refs/...` target. If an arbitrary filesystem symlink is broken,
+            // Git treats the ref as absent instead of letting ENOENT abort an
+            // otherwise unrelated ref transaction.
+            if fs::metadata(&path).is_err_and(|err| {
+                err.kind() == std::io::ErrorKind::NotFound
+                    || err.kind() == std::io::ErrorKind::NotADirectory
+            }) {
+                return Ok(None);
             }
         }
         let bytes = fs::read(path)?;
@@ -2024,12 +2579,22 @@ impl FileRefStore {
         Ok(refs.into_values().collect())
     }
 
-    fn list_root_refs(&self) -> Result<Vec<Ref>> {
+    /// List the live one-level references held by the active ref backend.
+    ///
+    /// `FETCH_HEAD` and `MERGE_HEAD` are working-state files rather than
+    /// migratable refs, so they are deliberately excluded for both backends.
+    /// Callers which expose a narrower root-ref surface (for example
+    /// `for-each-ref --include-root-refs`) should apply their own semantic
+    /// predicate to this backend-independent inventory.
+    pub fn list_root_refs(&self) -> Result<Vec<Ref>> {
         if self.uses_reftable()? {
             let mut refs = BTreeMap::<String, Ref>::new();
             for table in self.reftables()? {
                 for record in table.refs {
-                    if record.name.starts_with("refs/") || !is_root_ref_syntax(&record.name) {
+                    if record.name.starts_with("refs/")
+                        || !is_root_ref_syntax(&record.name)
+                        || matches!(record.name.as_str(), "FETCH_HEAD" | "MERGE_HEAD")
+                    {
                         continue;
                     }
                     match reftable_ref_target(record.value)? {
@@ -2058,11 +2623,7 @@ impl FileRefStore {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !is_root_ref_syntax(&name)
-                || (name != "HEAD" && !name.ends_with("_HEAD"))
-                || name == "FETCH_HEAD"
-                || name == "MERGE_HEAD"
-            {
+            if !is_root_ref_syntax(&name) || matches!(name.as_str(), "FETCH_HEAD" | "MERGE_HEAD") {
                 continue;
             }
             if let Ok(reference) = parse_loose_ref(self.format, name, &fs::read(entry.path())?) {
@@ -2139,9 +2700,14 @@ impl FileRefStore {
             common_dir: self.common_dir.clone(),
             storage_dir,
             format: self.format,
-            honor_reference_backend_env: self.honor_reference_backend_env,
+            ref_storage: self.ref_storage.clone(),
+            packed_refs_lock_timeout_millis: self.packed_refs_lock_timeout_millis,
             reftable_lock_timeout_millis: self.reftable_lock_timeout_millis,
+            reftable_write_options: self.reftable_write_options,
             combine_reftable_logs: self.combine_reftable_logs,
+            prefer_symlink_refs: self.prefer_symlink_refs,
+            reference_fsync: self.reference_fsync,
+            shared_repository: self.shared_repository.clone(),
         }
     }
 
@@ -2156,13 +2722,19 @@ impl FileRefStore {
     /// resolution in `FileRefStore::new`. (Without this, shared refs under an
     /// alternate-path backend are looked up in the empty default `reftable/`.)
     fn shared_reftable_storage_dir(&self) -> PathBuf {
-        match configured_ref_storage_backend(&self.common_dir, self.honor_reference_backend_env) {
-            Some((_, Some(path))) => path,
+        match self.ref_storage.backend.as_ref() {
+            Some((_, Some(path))) => path.clone(),
             _ => self.common_dir.clone(),
         }
     }
 
     fn current_worktree_storage_dir(&self) -> PathBuf {
+        // In the normal linked-worktree layout `storage_dir` is already the
+        // worktree's administrative gitdir. Only an explicitly relocated
+        // reftable backend needs the `worktrees/<id>` suffix below.
+        if self.storage_dir == self.git_dir {
+            return self.git_dir.clone();
+        }
         if self.storage_dir != self.common_dir {
             if self.git_dir != self.common_dir
                 && let Some(worktree) = self.git_dir.file_name()
@@ -2198,20 +2770,14 @@ impl FileRefStore {
     }
 
     pub fn uses_reftable(&self) -> Result<bool> {
-        if self.honor_reference_backend_env
-            && let Ok(value) = env::var("GIT_REFERENCE_BACKEND")
-        {
-            return Ok(parse_ref_storage_backend_value(&value)?.0 == RefBackendKind::Reftable);
+        if let Some(value) = self.ref_storage.invalid_value.as_deref() {
+            return parse_ref_storage_backend_value(value)
+                .map(|(kind, _)| kind == RefBackendKind::Reftable);
         }
-        let config_path = self.common_dir.join("config");
-        if !config_path.exists() {
-            return Ok(false);
-        }
-        let config = GitConfig::parse(&fs::read(config_path)?)?;
-        let Some(value) = config.get("extensions", None, "refStorage") else {
-            return Ok(false);
-        };
-        Ok(parse_ref_storage_backend_value(value)?.0 == RefBackendKind::Reftable)
+        Ok(matches!(
+            self.ref_storage.backend,
+            Some((RefBackendKind::Reftable, _))
+        ))
     }
 
     pub fn reftable_table_count(&self) -> Result<usize> {
@@ -2281,8 +2847,17 @@ impl FileRefStore {
     /// write). Returns the allocated update index.
     fn append_reftable_table(
         &self,
+        refs: Vec<ReftableRefRecord>,
+        logs: Vec<ReftableLogRecord>,
+    ) -> Result<u64> {
+        self.append_reftable_table_with_compaction(refs, logs, true)
+    }
+
+    fn append_reftable_table_with_compaction(
+        &self,
         mut refs: Vec<ReftableRefRecord>,
         mut logs: Vec<ReftableLogRecord>,
+        auto_compact: bool,
     ) -> Result<u64> {
         let reftable_dir = self.storage_dir.join("reftable");
         fs::create_dir_all(&reftable_dir)?;
@@ -2297,9 +2872,20 @@ impl FileRefStore {
             record.update_index = update_index;
         }
         let table_name = reftable_table_name(update_index, update_index);
-        let bytes = Reftable::write(self.format, update_index, update_index, &refs, &logs)?;
+        let bytes = Reftable::write_with_options(
+            self.format,
+            update_index,
+            update_index,
+            &refs,
+            &logs,
+            self.reftable_write_options,
+        )?;
         let table_path = reftable_dir.join(&table_name);
-        write_locked(&table_path, &bytes)?;
+        write_locked(
+            &table_path,
+            &bytes,
+            self.reference_fsync.method_if_enabled(),
+        )?;
         self.apply_reftable_shared_file_mode(&table_path)?;
         table_names.push(table_name);
         let mut list = Vec::new();
@@ -2307,9 +2893,9 @@ impl FileRefStore {
             list.extend_from_slice(name.as_bytes());
             list.push(b'\n');
         }
-        list_lock.commit(&list)?;
+        list_lock.commit(&list, self.reference_fsync.method_if_enabled())?;
         self.apply_reftable_shared_file_mode(&list_path)?;
-        if logs.is_empty() && table_names.len() > 6 {
+        if auto_compact && logs.is_empty() && table_names.len() > 6 {
             self.auto_compact_reftable_stack()?;
         }
         Ok(update_index)
@@ -2395,9 +2981,20 @@ impl FileRefStore {
         let table_name = reftable_table_name(min_index, max_index);
         let refs = refs.into_values().collect::<Vec<_>>();
         let logs = logs.into_values().collect::<Vec<_>>();
-        let bytes = Reftable::write(self.format, min_index, max_index, &refs, &logs)?;
+        let bytes = Reftable::write_with_options(
+            self.format,
+            min_index,
+            max_index,
+            &refs,
+            &logs,
+            self.reftable_write_options,
+        )?;
         let table_path = reftable_dir.join(&table_name);
-        write_locked(&table_path, &bytes)?;
+        write_locked(
+            &table_path,
+            &bytes,
+            self.reference_fsync.method_if_enabled(),
+        )?;
         self.apply_reftable_shared_file_mode(&table_path)?;
         let mut list = Vec::new();
         for name in &old_names[..start] {
@@ -2410,7 +3007,7 @@ impl FileRefStore {
             list.extend_from_slice(name.as_bytes());
             list.push(b'\n');
         }
-        list_lock.commit(&list)?;
+        list_lock.commit(&list, self.reference_fsync.method_if_enabled())?;
         self.apply_reftable_shared_file_mode(&list_path)?;
         for name in compact_names {
             if name != table_name {
@@ -2459,14 +3056,50 @@ impl FileRefStore {
             return Ok(());
         }
         let reftable_dir = self.storage_dir.join("reftable");
-        let start = names
+        let header_overhead = match self.format {
+            ObjectFormat::Sha1 => 23,
+            ObjectFormat::Sha256 => 27,
+        };
+        let sizes = names
+            .iter()
+            .map(|name| {
+                Ok(fs::metadata(reftable_dir.join(name))?
+                    .len()
+                    .saturating_sub(header_overhead))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let factor = self.reftable_geometric_factor()?;
+        let Some((start, end)) = reftable_compaction_segment(&sizes, factor) else {
+            return Ok(());
+        };
+
+        // Git locks a candidate segment newest-to-oldest. If it encounters a
+        // table already owned by another compactor, it still merges the newer
+        // suffix when at least two of those tables are available. This is what
+        // lets writers continue restoring the geometric sequence behind a
+        // long-lived lock on an older table.
+        let start = names[start..end]
             .iter()
             .rposition(|name| reftable_dir.join(format!("{name}.lock")).exists())
-            .map_or(0, |index| index + 1);
-        if names.len().saturating_sub(start) > 1 {
-            self.compact_reftable_stack_range(start, names.len(), false)?;
+            .map_or(start, |locked| start + locked + 1);
+        if end.saturating_sub(start) < 2 {
+            return Ok(());
         }
+        self.compact_reftable_stack_range(start, end, false)?;
         Ok(())
+    }
+
+    fn reftable_geometric_factor(&self) -> Result<u64> {
+        let config_path = self.common_dir.join("config");
+        let Ok(config) = GitConfig::read(config_path) else {
+            return Ok(2);
+        };
+        Ok(config
+            .get("reftable", None, "geometricFactor")
+            .and_then(|value| value.parse::<u8>().ok())
+            .filter(|factor| *factor != 0)
+            .map(u64::from)
+            .unwrap_or(2))
     }
 
     /// Merge the log records for `name` across the whole stack into the reflog
@@ -2539,7 +3172,17 @@ impl FileRefStore {
             if path.is_dir() {
                 self.collect_loose_refs(&path, &name, refs)?;
             } else if !name.ends_with(".lock") {
-                let bytes = fs::read(path)?;
+                let bytes = match fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(err)
+                        if entry.file_type()?.is_symlink()
+                            && (err.kind() == std::io::ErrorKind::NotFound
+                                || err.kind() == std::io::ErrorKind::NotADirectory) =>
+                    {
+                        continue;
+                    }
+                    Err(err) => return Err(err.into()),
+                };
                 if loose_ref_bytes_are_reftable_sentinel(&name, &bytes) {
                     continue;
                 }
@@ -2560,7 +3203,73 @@ impl FileRefStore {
         Ok(())
     }
 
-    fn collect_loose_refs_with_prefix(&self, prefix: &str, refs: &mut BTreeMap<String, Ref>) -> Result<()> {
+    fn collect_loose_ref_snapshot(
+        &self,
+        dir: &Path,
+        prefix: &str,
+        entries: &mut BTreeMap<String, RefReadSnapshotValue>,
+    ) -> Result<()> {
+        let read_dir = match fs::read_dir(dir) {
+            Ok(read_dir) => read_dir,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        for entry in read_dir {
+            let entry = entry?;
+            let path = entry.path();
+            let name = format!("{prefix}/{}", entry.file_name().to_string_lossy());
+            if path.is_dir() {
+                self.collect_loose_ref_snapshot(&path, &name, entries)?;
+                continue;
+            }
+            if name.ends_with(".lock") {
+                continue;
+            }
+            if entry.file_type()?.is_symlink()
+                && let Ok(target) = fs::read_link(&path)
+                && target.to_string_lossy().starts_with("refs/")
+            {
+                entries.insert(
+                    name,
+                    RefReadSnapshotValue::Target(RefTarget::Symbolic(
+                        target.to_string_lossy().into_owned(),
+                    )),
+                );
+                continue;
+            }
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err)
+                    if entry.file_type()?.is_symlink()
+                        && (err.kind() == std::io::ErrorKind::NotFound
+                            || err.kind() == std::io::ErrorKind::NotADirectory) =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
+            if loose_ref_bytes_are_reftable_sentinel(&name, &bytes) {
+                continue;
+            }
+            let value = match parse_loose_ref(self.format, name.clone(), &bytes) {
+                Ok(reference)
+                    if validate_ref_name(&name).is_ok()
+                        && !ref_target_is_broken(&reference.target) =>
+                {
+                    RefReadSnapshotValue::Target(reference.target)
+                }
+                Ok(_) | Err(_) => RefReadSnapshotValue::Broken,
+            };
+            entries.insert(name, value);
+        }
+        Ok(())
+    }
+
+    fn collect_loose_refs_with_prefix(
+        &self,
+        prefix: &str,
+        refs: &mut BTreeMap<String, Ref>,
+    ) -> Result<()> {
         self.collect_loose_refs_with_prefix_from_base(&self.storage_dir, prefix, refs)
     }
 
@@ -2575,7 +3284,11 @@ impl FileRefStore {
         }
         for namespace in CURRENT_WORKTREE_REF_PREFIXES {
             if ref_prefixes_overlap(prefix, namespace) {
-                let scan_prefix = if prefix.starts_with(namespace) { prefix } else { namespace };
+                let scan_prefix = if prefix.starts_with(namespace) {
+                    prefix
+                } else {
+                    namespace
+                };
                 self.collect_loose_refs_with_prefix_from_base(&base, scan_prefix, refs)?;
             }
         }
@@ -2637,7 +3350,11 @@ impl FileRefStore {
         Ok(())
     }
 
-    fn collect_loose_ref_names_with_prefix(&self, prefix: &str, names: &mut BTreeSet<String>) -> Result<()> {
+    fn collect_loose_ref_names_with_prefix(
+        &self,
+        prefix: &str,
+        names: &mut BTreeSet<String>,
+    ) -> Result<()> {
         self.collect_loose_ref_names_with_prefix_from_base(&self.storage_dir, prefix, names)
     }
 
@@ -2652,7 +3369,11 @@ impl FileRefStore {
         }
         for namespace in CURRENT_WORKTREE_REF_PREFIXES {
             if ref_prefixes_overlap(prefix, namespace) {
-                let scan_prefix = if prefix.starts_with(namespace) { prefix } else { namespace };
+                let scan_prefix = if prefix.starts_with(namespace) {
+                    prefix
+                } else {
+                    namespace
+                };
                 self.collect_loose_ref_names_with_prefix_from_base(&base, scan_prefix, names)?;
             }
         }
@@ -2778,8 +3499,13 @@ impl FileRefStore {
         let parent = path
             .parent()
             .ok_or_else(|| GitError::InvalidPath("ref path has no parent".into()))?;
-        fs::create_dir_all(parent)?;
-        write_locked(&path, &write_loose_ref(reference))
+        self.shared_repository.create_dir_all(parent)?;
+        write_locked(
+            &path,
+            &write_loose_ref(reference),
+            self.reference_fsync.method_if_enabled(),
+        )?;
+        self.shared_repository.adjust_file(&path)
     }
 
     fn delete_loose_ref(&self, name: &str) -> Result<()> {
@@ -2791,7 +3517,9 @@ impl FileRefStore {
                 .create_new(true)
                 .open(&lock_path)?;
             file.write_all(b"delete\n")?;
-            file.sync_all()?;
+            if let Some(method) = self.reference_fsync.method_if_enabled() {
+                sync_reference_file(&file, method)?;
+            }
         }
         match fs::remove_file(&path) {
             Ok(()) => {
@@ -2804,6 +3532,47 @@ impl FileRefStore {
                 Err(GitError::Io(err.to_string()))
             }
         }
+    }
+
+    /// Remove a loose ref after its value has been committed to packed-refs.
+    ///
+    /// Unlike a normal ref deletion, this is only a cleanup of a redundant
+    /// copy: the packed-refs lock has already provided the durable update. Do
+    /// not fsync the temporary per-ref lock, which would turn packing a large
+    /// loose-ref set into one durability barrier per ref. Holding the lock
+    /// still excludes cooperating writers, and the value check preserves a
+    /// loose update that raced with creation of the packed snapshot.
+    fn prune_loose_ref_after_pack(&self, name: &str, packed_oid: &ObjectId) -> Result<bool> {
+        let path = self.ref_path(name);
+        let lock_path = lock_path_for(&path)?;
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)?;
+        let outcome = (|| -> Result<bool> {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(err) => return Err(err.into()),
+            };
+            let reference = match parse_loose_ref(self.format, name.to_string(), &bytes) {
+                Ok(reference) => reference,
+                Err(_) => return Ok(false),
+            };
+            if reference.target != RefTarget::Direct(*packed_oid) {
+                return Ok(false);
+            }
+            fs::remove_file(&path)?;
+            Ok(true)
+        })();
+        drop(lock);
+        let cleanup = fs::remove_file(&lock_path);
+        let deleted = outcome?;
+        cleanup?;
+        if deleted {
+            self.prune_empty_ref_dirs(name);
+        }
+        Ok(deleted)
     }
 
     /// Remove now-empty parent directories left after deleting a loose ref,
@@ -2898,10 +3667,33 @@ impl FileRefStore {
         }
     }
 
+    /// Convert a reflog entry to its reftable representation, applying the
+    /// backend's message ceiling. Git truncates transaction log messages to
+    /// half the configured block size before handing them to the writer so a
+    /// pathological commit subject cannot make an otherwise-valid ref update
+    /// fail solely because of its reflog text.
+    fn reftable_update_from_reflog(&self, entry: &ReflogEntry) -> Result<ReftableLogUpdate> {
+        let mut update = reftable_update_from_reflog(entry)?;
+        let block_size = if self.reftable_write_options.block_size == 0 {
+            ReftableWriteOptions::default().block_size
+        } else {
+            self.reftable_write_options.block_size
+        };
+        let limit = (block_size / 2) as usize;
+        if update.message.len() > limit {
+            let mut end = limit;
+            while !update.message.is_char_boundary(end) {
+                end -= 1;
+            }
+            update.message.truncate(end);
+        }
+        Ok(update)
+    }
+
     pub fn append_reflog(&self, name: &str, entry: &ReflogEntry) -> Result<()> {
         validate_ref_name_for_read(name)?;
         if self.uses_reftable()? {
-            let update = reftable_update_from_reflog(entry)?;
+            let update = self.reftable_update_from_reflog(entry)?;
             self.append_reftable_table(
                 Vec::new(),
                 vec![ReftableLogRecord {
@@ -2917,12 +3709,39 @@ impl FileRefStore {
         let parent = path
             .parent()
             .ok_or_else(|| GitError::InvalidPath("reflog path has no parent".into()))?;
-        fs::create_dir_all(parent)?;
+        self.shared_repository.create_dir_all(parent)?;
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)?;
+            .open(&path)?;
         file.write_all(&entry.to_line())?;
+        drop(file);
+        self.shared_repository.adjust_file(&path)
+    }
+
+    /// Append a completed loose-backend transaction's reflogs with one
+    /// directory preparation per parent. The caller has already selected the
+    /// files backend and validated every ref name while coalescing the
+    /// transaction, so repeating backend/config probes and parent creation for
+    /// each log entry only adds filesystem work to large batches.
+    fn append_loose_reflogs(&self, reflogs: Vec<(String, ReflogEntry)>) -> Result<()> {
+        let mut prepared_parents = BTreeSet::new();
+        for (name, entry) in reflogs {
+            let path = self.reflog_path(&name);
+            let parent = path
+                .parent()
+                .ok_or_else(|| GitError::InvalidPath("reflog path has no parent".into()))?;
+            if prepared_parents.insert(parent.to_path_buf()) {
+                self.shared_repository.create_dir_all(parent)?;
+            }
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            file.write_all(&entry.to_line())?;
+            drop(file);
+            self.shared_repository.adjust_file(&path)?;
+        }
         Ok(())
     }
 
@@ -2981,7 +3800,7 @@ impl FileRefStore {
             logs.push(ReftableLogRecord {
                 refname: name.to_string(),
                 update_index,
-                value: ReftableLogValue::Update(reftable_update_from_reflog(entry)?),
+                value: ReftableLogValue::Update(self.reftable_update_from_reflog(entry)?),
             });
         }
         if entries.is_empty() && preserve_empty {
@@ -3035,20 +3854,34 @@ impl FileRefStore {
         for record in &mut refs {
             record.update_index = alloc_index;
         }
-        let mut min_index = alloc_index;
+        // Log tombstones may target update indices from older tables, but the
+        // new table's range describes the update(s) allocated by this write.
+        // Git therefore keeps the lower bound at `alloc_index`; including old
+        // tombstone indices would overlap the preceding table's range and make
+        // the stack invalid to native reftable readers.
+        let min_index = alloc_index;
         let mut max_index = alloc_index;
         for record in &logs {
-            min_index = min_index.min(record.update_index);
             max_index = max_index.max(record.update_index);
         }
         for record in &refs {
-            min_index = min_index.min(record.update_index);
             max_index = max_index.max(record.update_index);
         }
         let table_name = reftable_table_name(min_index, max_index);
-        let bytes = Reftable::write(self.format, min_index, max_index, &refs, &logs)?;
+        let bytes = Reftable::write_with_options(
+            self.format,
+            min_index,
+            max_index,
+            &refs,
+            &logs,
+            self.reftable_write_options,
+        )?;
         let table_path = reftable_dir.join(&table_name);
-        write_locked(&table_path, &bytes)?;
+        write_locked(
+            &table_path,
+            &bytes,
+            self.reference_fsync.method_if_enabled(),
+        )?;
         self.apply_reftable_shared_file_mode(&table_path)?;
         table_names.push(table_name);
         let mut list = Vec::new();
@@ -3056,13 +3889,29 @@ impl FileRefStore {
             list.extend_from_slice(name.as_bytes());
             list.push(b'\n');
         }
-        list_lock.commit(&list)?;
+        list_lock.commit(&list, self.reference_fsync.method_if_enabled())?;
         self.apply_reftable_shared_file_mode(&list_path)?;
         Ok(max_index)
     }
 
     fn ref_path(&self, name: &str) -> PathBuf {
         self.ref_base_dir(name).join(name)
+    }
+
+    fn display_ref_path(&self, name: &str) -> String {
+        self.display_storage_path(&self.ref_path(name))
+    }
+
+    fn display_storage_path(&self, path: &Path) -> String {
+        if let Ok(relative) = path.strip_prefix(&self.git_dir) {
+            let prefix = self
+                .git_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(".git");
+            return format!("{prefix}/{}", relative.to_string_lossy().replace('\\', "/"));
+        }
+        path.to_string_lossy().into_owned()
     }
 
     fn reflog_path(&self, name: &str) -> PathBuf {
@@ -3115,6 +3964,12 @@ impl FileRefStore {
         let path = self.ref_path(name);
         match fs::symlink_metadata(path) {
             Ok(meta) if meta.is_dir() => Ok(false),
+            Ok(meta)
+                if meta.file_type().is_symlink()
+                    && fs::metadata(self.ref_path(name)).is_ok_and(|target| target.is_dir()) =>
+            {
+                Ok(false)
+            }
             Ok(_) => {
                 let path = self.ref_path(name);
                 if let Ok(bytes) = fs::read(path)
@@ -3342,6 +4197,37 @@ fn reftable_table_name(min_update_index: u64, max_update_index: u64) -> String {
 fn reftable_autocompaction_disabled() -> bool {
     std::env::var("GIT_TEST_REFTABLE_AUTOCOMPACTION")
         .is_ok_and(|value| value.eq_ignore_ascii_case("false"))
+}
+
+/// Select the oldest-first, end-exclusive table range that must be merged to
+/// restore the geometric size progression used by Git's reftable stack.
+fn reftable_compaction_segment(sizes: &[u64], factor: u64) -> Option<(usize, usize)> {
+    if sizes.len() <= 1 {
+        return None;
+    }
+    let factor = if factor == 0 { 2 } else { factor };
+
+    let mut pivot = None;
+    let mut end = 0;
+    for index in (1..sizes.len()).rev() {
+        if sizes[index - 1] < sizes[index].saturating_mul(factor) {
+            pivot = Some(index);
+            end = index + 1;
+            break;
+        }
+    }
+    let mut index = pivot?;
+    let mut bytes = sizes[index];
+    let mut start = index;
+    while index > 0 {
+        let current = bytes;
+        bytes = bytes.saturating_add(sizes[index - 1]);
+        if sizes[index - 1] < current.saturating_mul(factor) {
+            start = index - 1;
+        }
+        index -= 1;
+    }
+    (start < end).then_some((start, end))
 }
 
 /// Whether `name` parses as a valid reftable file name the way git's
@@ -3801,13 +4687,21 @@ impl FileRefStore {
                     Ok(ReftableLogRecord {
                         refname: name,
                         update_index: 0,
-                        value: ReftableLogValue::Update(reftable_update_from_reflog(&entry)?),
+                        value: ReftableLogValue::Update(self.reftable_update_from_reflog(&entry)?),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            self.append_reftable_table(records, log_records)?;
+            self.append_reftable_table_with_compaction(records, log_records, false)?;
             for name in &delete_names {
                 self.remove_reflog_file(name);
+            }
+            // Shared stacks use the native combined ref+log transaction shape
+            // for update-ref and should auto-compact at the transaction
+            // boundary. Per-worktree stacks currently retain their append-only
+            // shape: compacting a two-table worktree stack here would collapse
+            // a geometric sequence Git leaves intact.
+            if self.storage_dir == self.shared_reftable_storage_dir() {
+                self.auto_compact_reftable_stack()?;
             }
             return Ok(());
         }
@@ -3907,6 +4801,7 @@ impl FileRefStore {
             None
         };
         let mut pending = Vec::with_capacity(changes.len() + usize::from(has_delete));
+        let mut prepared_parents = BTreeSet::new();
         // Acquire every lock first; bail (releasing what we hold) on any failure.
         for change in &changes {
             let name = change.name();
@@ -3927,7 +4822,9 @@ impl FileRefStore {
             let parent = path
                 .parent()
                 .ok_or_else(|| GitError::InvalidPath("ref path has no parent".into()))?;
-            if let Err(err) = fs::create_dir_all(parent) {
+            if prepared_parents.insert(parent.to_path_buf())
+                && let Err(err) = fs::create_dir_all(parent)
+            {
                 release_pending_locks(&pending);
                 if err.kind() == std::io::ErrorKind::NotADirectory {
                     return Err(ref_directory_conflict_error(
@@ -3944,15 +4841,21 @@ impl FileRefStore {
                     return Err(err);
                 }
             };
-            if let Err(err) = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                release_pending_locks(&pending);
-                return Err(GitError::Io(format!("could not lock ref {name}: {err}")));
-            }
             let action = match change {
+                CoalescedRefChange::Update(update)
+                    if self.prefer_symlink_refs && matches!(update.new, RefTarget::Symbolic(_)) =>
+                {
+                    let RefTarget::Symbolic(target) = &update.new else {
+                        unreachable!("guard requires a symbolic target")
+                    };
+                    PendingPathAction::WriteSymbolic {
+                        target: target.clone(),
+                        fallback_contents: write_loose_ref(&Ref {
+                            name: update.name.clone(),
+                            target: update.new.clone(),
+                        }),
+                    }
+                }
                 CoalescedRefChange::Update(update) => PendingPathAction::Write {
                     contents: write_loose_ref(&Ref {
                         name: update.name.clone(),
@@ -3961,12 +4864,42 @@ impl FileRefStore {
                 },
                 CoalescedRefChange::Delete(_) => PendingPathAction::Delete,
             };
+            let mut lock_file = match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(file) => file,
+                Err(err) => {
+                    release_pending_locks(&pending);
+                    return Err(GitError::Io(format!("could not lock ref {name}: {err}")));
+                }
+            };
+            // The lock file is private until it is renamed into place, so it
+            // is safe to stage its bytes as soon as the lock is acquired. This
+            // keeps the all-locks-before-apply and rollback guarantees while
+            // avoiding a second open/truncate pass over large transactions.
+            let stage_result = match &action {
+                PendingPathAction::Write { contents } => lock_file.write_all(contents),
+                PendingPathAction::WriteSymbolic { .. } => Ok(()),
+                PendingPathAction::Delete => lock_file.write_all(b"delete\n"),
+                PendingPathAction::ReleaseLock => Ok(()),
+            };
+            drop(lock_file);
+            if let Err(err) = stage_result {
+                let _ = fs::remove_file(&lock_path);
+                release_pending_locks(&pending);
+                return Err(err.into());
+            }
+            let staged = !matches!(action, PendingPathAction::WriteSymbolic { .. });
             pending.push(PendingPathChange {
                 name: name.to_string(),
+                display_path: self.display_ref_path(name),
                 path,
                 lock_path,
-                original: None,
+                original: OriginalPathState::Missing,
                 action,
+                staged,
             });
         }
 
@@ -3981,13 +4914,12 @@ impl FileRefStore {
                     return Err(err);
                 }
             };
-            if let Err(err) = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&packed_lock_path)
-            {
+            if let Err(err) = acquire_path_lock_with_timeout(
+                &packed_lock_path,
+                self.packed_refs_lock_timeout_millis,
+            ) {
                 release_pending_locks(&pending);
-                return Err(GitError::Io(format!("could not lock packed-refs: {err}")));
+                return Err(err);
             }
             let packed_original = match fs::read(&packed_path) {
                 Ok(bytes) => Some(bytes),
@@ -4012,10 +4944,16 @@ impl FileRefStore {
             use_packed_snapshot = true;
             pending.push(PendingPathChange {
                 name: "packed-refs".into(),
+                display_path: self.display_storage_path(&packed_path),
                 path: packed_path.clone(),
                 lock_path: packed_lock_path,
-                original: packed_original,
+                original: packed_original
+                    .as_ref()
+                    .map_or(OriginalPathState::Missing, |bytes| {
+                        OriginalPathState::File(bytes.clone())
+                    }),
                 action: PendingPathAction::ReleaseLock,
+                staged: false,
             });
         } else if packed_path.exists() {
             packed_refs = parse_packed_refs(self.format, &fs::read(&packed_path)?)?;
@@ -4039,18 +4977,20 @@ impl FileRefStore {
         for index in 0..changes.len() {
             match &changes[index] {
                 CoalescedRefChange::Update(update) => {
-                    let current = if use_packed_snapshot {
-                        match self.read_ref_from_packed_snapshot(&update.name, &packed_ref_targets)
-                        {
-                            Ok(current) => current,
+                    let (current, has_loose) = if use_packed_snapshot {
+                        match self.read_locked_ref_state(&update.name, &packed_ref_targets) {
+                            Ok(state) => (state.current, state.has_loose),
                             Err(err) => {
                                 release_pending_locks(&pending);
                                 return Err(err);
                             }
                         }
                     } else {
-                        match self.read_ref(&update.name) {
-                            Ok(current) => current,
+                        match self.read_loose_ref(&update.name) {
+                            Ok(loose) => {
+                                let has_loose = loose.is_some();
+                                (loose.map(|reference| reference.target), has_loose)
+                            }
                             Err(err) => {
                                 release_pending_locks(&pending);
                                 return Err(err);
@@ -4065,14 +5005,20 @@ impl FileRefStore {
                             update.precondition.describe(&update.name),
                         ));
                     }
-                    pending[index].original = match read_optional_file(&pending[index].path) {
-                        Ok(original) => original,
-                        Err(err) => {
-                            release_pending_locks(&pending);
-                            return Err(err);
+                    pending[index].original = if has_loose {
+                        match read_original_path_state(&pending[index].path) {
+                            Ok(original) => original,
+                            Err(err) => {
+                                release_pending_locks(&pending);
+                                return Err(err);
+                            }
                         }
+                    } else {
+                        OriginalPathState::Missing
                     };
-                    if pending[index].original.is_none() && current.as_ref() == Some(&update.new) {
+                    if matches!(pending[index].original, OriginalPathState::Missing)
+                        && current.as_ref() == Some(&update.new)
+                    {
                         pending[index].action = PendingPathAction::ReleaseLock;
                     }
                     for entry in &update.reflog {
@@ -4101,7 +5047,7 @@ impl FileRefStore {
                         return Err(err);
                     }
                     pending[index].original = if state.has_loose {
-                        match read_optional_file(&pending[index].path) {
+                        match read_original_path_state(&pending[index].path) {
                             Ok(original) => original,
                             Err(err) => {
                                 release_pending_locks(&pending);
@@ -4109,7 +5055,7 @@ impl FileRefStore {
                             }
                         }
                     } else {
-                        None
+                        OriginalPathState::Missing
                     };
                     delete_names.insert(delete.name.clone());
                 }
@@ -4120,6 +5066,28 @@ impl FileRefStore {
             let old_len = packed_refs.len();
             packed_refs.retain(|reference| !delete_names.contains(&reference.reference.name));
             if packed_refs.len() != old_len {
+                // Git prepares a packed-refs rewrite in an O_EXCL temporary
+                // named `packed-refs.new` while holding `packed-refs.lock`.
+                // Refuse the transaction before applying any loose deletion if
+                // that staging path is already occupied.
+                let packed_new_path = self.storage_dir.join("packed-refs.new");
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&packed_new_path)
+                {
+                    Ok(file) => {
+                        drop(file);
+                        let _ = fs::remove_file(&packed_new_path);
+                    }
+                    Err(err) => {
+                        release_pending_locks(&pending);
+                        return Err(GitError::Io(format!(
+                            "Unable to create '{}': {err}",
+                            packed_new_path.display()
+                        )));
+                    }
+                }
                 let packed_bytes = match write_packed_refs(&packed_refs) {
                     Ok(bytes) => bytes,
                     Err(err) => {
@@ -4137,7 +5105,7 @@ impl FileRefStore {
 
         // Stage every new value or delete marker into its lock file. Nothing has
         // been renamed or removed yet, so on failure we only drop lock files.
-        for change in &pending {
+        for change in &mut pending {
             if let Err(err) = stage_pending_change(change) {
                 release_pending_locks(&pending);
                 return Err(err);
@@ -4165,6 +5133,14 @@ impl FileRefStore {
                 rollback_after_apply(&pending, index + 1);
                 return Err(err);
             }
+            if matches!(
+                pending[index].action,
+                PendingPathAction::Write { .. } | PendingPathAction::WriteSymbolic { .. }
+            ) && let Err(err) = self.shared_repository.adjust_file(&pending[index].path)
+            {
+                rollback_after_apply(&pending, index + 1);
+                return Err(err);
+            }
             if matches!(pending[index].action, PendingPathAction::Delete) {
                 self.prune_empty_ref_dirs(&pending[index].name);
             }
@@ -4181,24 +5157,13 @@ impl FileRefStore {
         let head_mirror = Self::head_reflog_mirror(head_branch.as_deref(), &reflogs);
         reflogs.extend(head_mirror);
         // All refs are durable; append reflogs last, matching git's ordering.
-        for (name, entry) in reflogs {
-            self.append_reflog(&name, &entry)?;
-        }
+        self.append_loose_reflogs(reflogs)?;
         // git fires the `committed` hook once every ref change has landed. Its
         // exit status is ignored — the transaction has already succeeded.
         if let (Some(hook), Some(updates)) = (hook, hook_updates) {
             hook.run(RefTransactionPhase::Committed, updates)?;
         }
         Ok(())
-    }
-
-    fn read_ref_from_packed_snapshot(
-        &self,
-        name: &str,
-        packed_refs: &HashMap<String, RefTarget>,
-    ) -> Result<Option<RefTarget>> {
-        let state = self.read_locked_ref_state(name, packed_refs)?;
-        Ok(state.current)
     }
 
     fn read_locked_ref_state(
@@ -4342,18 +5307,32 @@ fn coalesce_ref_updates(updates: Vec<QueuedUpdate>) -> Result<Vec<CoalescedRefUp
     Ok(coalesced)
 }
 
-/// A staged path change: the target path, its lock file, and original bytes for
-/// rollback.
+/// A staged path change: the target path, its lock file, and exact original
+/// filesystem representation for rollback.
 struct PendingPathChange {
     name: String,
+    display_path: String,
     path: PathBuf,
     lock_path: PathBuf,
-    original: Option<Vec<u8>>,
+    original: OriginalPathState,
     action: PendingPathAction,
+    staged: bool,
+}
+
+enum OriginalPathState {
+    Missing,
+    File(Vec<u8>),
+    Symlink(PathBuf),
 }
 
 enum PendingPathAction {
-    Write { contents: Vec<u8> },
+    Write {
+        contents: Vec<u8>,
+    },
+    WriteSymbolic {
+        target: String,
+        fallback_contents: Vec<u8>,
+    },
     Delete,
     ReleaseLock,
 }
@@ -4394,7 +5373,11 @@ impl DeleteLock {
         }
     }
 
-    fn write_all(&mut self, bytes: &[u8]) -> std::result::Result<(), RefDeleteError> {
+    fn write_all(
+        &mut self,
+        bytes: &[u8],
+        fsync_method: Option<ReferenceFsyncMethod>,
+    ) -> std::result::Result<(), RefDeleteError> {
         let Some(file) = self.file.as_mut() else {
             return Err(RefDeleteError::Io(std::io::Error::other(
                 "lock file is already closed",
@@ -4402,7 +5385,9 @@ impl DeleteLock {
         };
         file.set_len(0)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        if let Some(method) = fsync_method {
+            sync_reference_file(file, method)?;
+        }
         Ok(())
     }
 
@@ -4477,13 +5462,15 @@ impl ReftableListLock {
         }
     }
 
-    fn commit(mut self, bytes: &[u8]) -> Result<()> {
+    fn commit(mut self, bytes: &[u8], fsync_method: Option<ReferenceFsyncMethod>) -> Result<()> {
         let Some(mut file) = self.file.take() else {
             return Err(GitError::Io("reftable list lock is already closed".into()));
         };
         file.set_len(0)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        if let Some(method) = fsync_method {
+            sync_reference_file(&file, method)?;
+        }
         drop(file);
         fs::rename(&self.lock_path, &self.list_path)
             .map_err(|err| GitError::Io(err.to_string()))?;
@@ -4595,11 +5582,25 @@ fn ref_delete_error_from_git(err: GitError) -> RefDeleteError {
     }
 }
 
-fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
+fn read_original_path_state(path: &Path) -> Result<OriginalPathState> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OriginalPathState::Missing);
+        }
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+    if metadata.file_type().is_symlink() {
+        return fs::read_link(path)
+            .map(OriginalPathState::Symlink)
+            .map_err(|err| GitError::Io(err.to_string()));
+    }
+    if metadata.is_dir() {
+        return Ok(OriginalPathState::Missing);
+    }
     match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) if err.kind() == std::io::ErrorKind::IsADirectory => Ok(None),
+        Ok(bytes) => Ok(OriginalPathState::File(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(OriginalPathState::Missing),
         Err(err) => Err(GitError::Io(err.to_string())),
     }
 }
@@ -4636,25 +5637,57 @@ fn stage_lock_file(lock_path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn stage_pending_change(change: &PendingPathChange) -> Result<()> {
-    match &change.action {
-        PendingPathAction::Write { contents } => stage_lock_file(&change.lock_path, contents),
-        PendingPathAction::Delete => stage_lock_file(&change.lock_path, b"delete\n"),
-        PendingPathAction::ReleaseLock => Ok(()),
+fn stage_pending_change(change: &mut PendingPathChange) -> Result<()> {
+    if change.staged {
+        return Ok(());
     }
+    match &change.action {
+        PendingPathAction::Write { contents } => stage_lock_file(&change.lock_path, contents)?,
+        PendingPathAction::WriteSymbolic {
+            target,
+            fallback_contents,
+        } => stage_symbolic_lock_file(&change.lock_path, target, fallback_contents)?,
+        PendingPathAction::Delete => stage_lock_file(&change.lock_path, b"delete\n")?,
+        PendingPathAction::ReleaseLock => {}
+    }
+    change.staged = true;
+    Ok(())
 }
 
 fn apply_pending_change(change: &PendingPathChange) -> Result<()> {
     match &change.action {
-        PendingPathAction::Write { .. } => {
-            // git's `remove_empty_directories`: an empty directory tree sitting
-            // where the loose ref file belongs (e.g. leftover `refs/x/foo/bar/`)
-            // is cleared before the rename so the ref can be written.
-            remove_empty_dir_tree(&change.path).map_err(|err| GitError::Io(err.to_string()))?;
-            fs::rename(&change.lock_path, &change.path).map_err(|err| GitError::Io(err.to_string()))
+        PendingPathAction::Write { .. } | PendingPathAction::WriteSymbolic { .. } => {
+            match fs::rename(&change.lock_path, &change.path) {
+                Ok(()) => Ok(()),
+                Err(first_err) => {
+                    // Usually the destination does not exist, so avoid a stat
+                    // for every update. On the rare empty-directory conflict,
+                    // preserve git's remove_empty_directories behavior and
+                    // retry the rename after clearing the tree.
+                    match fs::symlink_metadata(&change.path) {
+                        Ok(meta) if meta.is_dir() => {
+                            remove_empty_dir_tree(&change.path).map_err(|err| {
+                                if err.kind() == std::io::ErrorKind::Other
+                                    && err.to_string() == "directory not empty"
+                                {
+                                    GitError::Transaction(format!(
+                                        "cannot lock ref '{}': there is a non-empty directory '{}' blocking reference '{}'",
+                                        change.name, change.display_path, change.name
+                                    ))
+                                } else {
+                                    GitError::Io(err.to_string())
+                                }
+                            })?;
+                            fs::rename(&change.lock_path, &change.path)
+                                .map_err(|err| GitError::Io(err.to_string()))
+                        }
+                        _ => Err(GitError::Io(first_err.to_string())),
+                    }
+                }
+            }
         }
         PendingPathAction::Delete => {
-            if change.original.is_some() {
+            if !matches!(change.original, OriginalPathState::Missing) {
                 fs::remove_file(&change.path).map_err(|err| GitError::Io(err.to_string()))?;
             }
             fs::remove_file(&change.lock_path).map_err(|err| GitError::Io(err.to_string()))
@@ -4662,6 +5695,25 @@ fn apply_pending_change(change: &PendingPathChange) -> Result<()> {
         PendingPathAction::ReleaseLock => {
             fs::remove_file(&change.lock_path).map_err(|err| GitError::Io(err.to_string()))
         }
+    }
+}
+
+fn stage_symbolic_lock_file(
+    lock_path: &Path,
+    target: &str,
+    fallback_contents: &[u8],
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = fallback_contents;
+        fs::remove_file(lock_path)?;
+        std::os::unix::fs::symlink(target, lock_path)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = target;
+        stage_lock_file(lock_path, fallback_contents)
     }
 }
 
@@ -4683,10 +5735,13 @@ fn rollback_after_apply(pending: &[PendingPathChange], applied: usize) {
             continue;
         }
         match &change.original {
-            Some(bytes) => {
+            OriginalPathState::File(bytes) => {
                 let _ = restore_file_atomically(&change.path, bytes);
             }
-            None => {
+            OriginalPathState::Symlink(target) => {
+                let _ = restore_symlink_atomically(&change.path, &change.lock_path, target);
+            }
+            OriginalPathState::Missing => {
                 let _ = fs::remove_file(&change.path);
             }
         }
@@ -4697,10 +5752,38 @@ fn rollback_after_apply(pending: &[PendingPathChange], applied: usize) {
     }
 }
 
+#[cfg(unix)]
+fn restore_symlink_atomically(path: &Path, lock_path: &Path, target: &Path) -> std::io::Result<()> {
+    let _ = fs::remove_file(lock_path);
+    std::os::unix::fs::symlink(target, lock_path)?;
+    fs::rename(lock_path, path)
+}
+
+#[cfg(windows)]
+fn restore_symlink_atomically(path: &Path, lock_path: &Path, target: &Path) -> std::io::Result<()> {
+    let _ = fs::remove_file(lock_path);
+    std::os::windows::fs::symlink_file(target, lock_path)?;
+    fs::rename(lock_path, path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn restore_symlink_atomically(
+    _path: &Path,
+    _lock_path: &Path,
+    _target: &Path,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symbolic reference rollback is unsupported on this platform",
+    ))
+}
+
 #[cfg(test)]
 thread_local! {
     static FAIL_LOOSE_COMMIT_ACTION: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    static REFERENCE_FSYNC_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static FAIL_REFERENCE_FSYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -4731,7 +5814,7 @@ fn restore_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    write_locked(path, bytes)
+    write_locked(path, bytes, None)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -5336,11 +6419,35 @@ pub fn tag_ref_name(tag: &str) -> Result<String> {
     TagRefNameBuf::from_tag_name(tag).map(TagRefNameBuf::into_string)
 }
 
-fn write_locked(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_locked_with_timeout(path, bytes, 0)
+fn sync_reference_file(file: &fs::File, method: ReferenceFsyncMethod) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        REFERENCE_FSYNC_CALLS.with(|calls| calls.set(calls.get() + 1));
+        let fail = FAIL_REFERENCE_FSYNC.with(|fail| fail.replace(false));
+        if fail {
+            return Err(std::io::Error::other("injected reference fsync failure"));
+        }
+    }
+    match method {
+        ReferenceFsyncMethod::WriteoutOnly => file.sync_data(),
+        ReferenceFsyncMethod::Fsync | ReferenceFsyncMethod::Batch => file.sync_all(),
+    }
 }
 
-fn write_locked_with_timeout(path: &Path, bytes: &[u8], timeout_millis: u64) -> Result<()> {
+fn write_locked(
+    path: &Path,
+    bytes: &[u8],
+    fsync_method: Option<ReferenceFsyncMethod>,
+) -> Result<()> {
+    write_locked_with_timeout(path, bytes, 0, fsync_method)
+}
+
+fn write_locked_with_timeout(
+    path: &Path,
+    bytes: &[u8],
+    timeout_millis: u64,
+    fsync_method: Option<ReferenceFsyncMethod>,
+) -> Result<()> {
     let lock_path = lock_path_for(path)?;
     let start = SystemTime::now();
     loop {
@@ -5350,8 +6457,15 @@ fn write_locked_with_timeout(path: &Path, bytes: &[u8], timeout_millis: u64) -> 
             .open(&lock_path)
         {
             Ok(mut file) => {
-                file.write_all(bytes)?;
-                file.sync_all()?;
+                let write_result = file.write_all(bytes).and_then(|()| match fsync_method {
+                    Some(method) => sync_reference_file(&file, method),
+                    None => Ok(()),
+                });
+                if let Err(err) = write_result {
+                    drop(file);
+                    let _ = fs::remove_file(&lock_path);
+                    return Err(err.into());
+                }
                 break;
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && timeout_millis > 0 => {
@@ -5374,6 +6488,40 @@ fn write_locked_with_timeout(path: &Path, bytes: &[u8], timeout_millis: u64) -> 
         Err(err) => {
             let _ = fs::remove_file(lock_path);
             Err(GitError::Io(err.to_string()))
+        }
+    }
+}
+
+fn acquire_path_lock_with_timeout(path: &Path, timeout_millis: u64) -> Result<()> {
+    let start = SystemTime::now();
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(file) => {
+                drop(file);
+                return Ok(());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && timeout_millis > 0 => {
+                let elapsed = start
+                    .elapsed()
+                    .unwrap_or_else(|_| Duration::from_millis(timeout_millis + 1));
+                if elapsed.as_millis() as u64 >= timeout_millis {
+                    return Err(GitError::Io(format!(
+                        "Unable to create '{}': File exists",
+                        path.display()
+                    )));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => {
+                return Err(GitError::Io(format!(
+                    "Unable to create '{}': {err}",
+                    path.display()
+                )));
+            }
         }
     }
 }
@@ -5560,11 +6708,8 @@ fn is_root_ref_syntax(name: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b == b'-' || b == b'_')
 }
 
-const CURRENT_WORKTREE_REF_PREFIXES: &[&str] = &[
-    "refs/bisect/",
-    "refs/worktree/",
-    "refs/rewritten/",
-];
+const CURRENT_WORKTREE_REF_PREFIXES: &[&str] =
+    &["refs/bisect/", "refs/worktree/", "refs/rewritten/"];
 
 fn current_worktree_ref(name: &str) -> bool {
     is_root_ref_syntax(name)
@@ -5781,6 +6926,76 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn refname_patterns_match_git_wildcards_and_case_policy() {
+        assert!(refname_pattern_matches_case(
+            "release/*",
+            "release/1",
+            false
+        ));
+        assert!(refname_pattern_matches_case("V[1-3].?", "v2.0", true));
+        assert!(!refname_pattern_matches_case("V[1-3].?", "v2.0", false));
+        assert!(refname_pattern_matches_case(
+            r"release\*",
+            "release*",
+            false
+        ));
+        assert!(refname_pattern_matches_case("release[", "release[", false));
+    }
+
+    #[test]
+    fn core_fsync_reference_component_matches_git_groups_and_negation() {
+        assert!(!core_fsync_includes_reference("none"));
+        assert!(!core_fsync_includes_reference("objects,index"));
+        assert!(!core_fsync_includes_reference("-reference"));
+        assert!(core_fsync_includes_reference("reference"));
+        assert!(core_fsync_includes_reference("ref"));
+        assert!(core_fsync_includes_reference("committed"));
+        assert!(core_fsync_includes_reference("added"));
+        assert!(core_fsync_includes_reference("all"));
+        // Git accumulates positive and negative masks, then applies positives
+        // last, so an explicitly included component wins in either order.
+        assert!(core_fsync_includes_reference("reference,-reference"));
+        assert!(core_fsync_includes_reference("-reference,reference"));
+    }
+
+    #[test]
+    fn reference_fsync_policy_controls_reference_barriers() {
+        let disabled_dir = temp_git_dir();
+        REFERENCE_FSYNC_CALLS.with(|calls| calls.set(0));
+        FileRefStore::new(&disabled_dir, ObjectFormat::Sha1)
+            .with_reference_fsync_config(Some("none"), Some("fsync"))
+            .write_packed_refs(&[])
+            .expect("disabled reference write");
+        assert_eq!(REFERENCE_FSYNC_CALLS.with(std::cell::Cell::get), 0);
+        fs::remove_dir_all(disabled_dir).expect("remove disabled repository");
+
+        let enabled_dir = temp_git_dir();
+        REFERENCE_FSYNC_CALLS.with(|calls| calls.set(0));
+        FileRefStore::new(&enabled_dir, ObjectFormat::Sha1)
+            .with_reference_fsync_config(Some("reference"), Some("fsync"))
+            .write_packed_refs(&[])
+            .expect("enabled reference write");
+        assert_eq!(REFERENCE_FSYNC_CALLS.with(std::cell::Cell::get), 1);
+        fs::remove_dir_all(enabled_dir).expect("remove enabled repository");
+    }
+
+    #[test]
+    fn reference_fsync_failure_aborts_locked_write_and_cleans_lock() {
+        let git_dir = temp_git_dir();
+        REFERENCE_FSYNC_CALLS.with(|calls| calls.set(0));
+        FAIL_REFERENCE_FSYNC.with(|fail| fail.set(true));
+        let err = FileRefStore::new(&git_dir, ObjectFormat::Sha1)
+            .with_reference_fsync_config(Some("reference"), Some("fsync"))
+            .write_packed_refs(&[])
+            .expect_err("injected fsync failure must abort");
+        assert!(err.to_string().contains("injected reference fsync failure"));
+        assert!(!git_dir.join("packed-refs").exists());
+        assert!(!git_dir.join("packed-refs.lock").exists());
+        assert_eq!(REFERENCE_FSYNC_CALLS.with(std::cell::Cell::get), 1);
+        fs::remove_dir_all(git_dir).expect("remove failed repository");
+    }
 
     #[test]
     fn loose_ref_round_trips_direct() {
@@ -6474,7 +7689,9 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 reflog: None,
             });
             tx.commit().expect("test operation should succeed");
-            store.delete_ref(name).expect("test operation should succeed");
+            store
+                .delete_ref(name)
+                .expect("test operation should succeed");
         }
         assert!(!git_dir.join("refs").join("heads").join("l").exists());
         assert!(git_dir.join("refs").join("heads").exists());
@@ -7142,6 +8359,90 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
     }
 
     #[test]
+    fn root_ref_listing_is_backend_independent() {
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let expected = vec![
+            Ref {
+                name: "AUTO_MERGE".into(),
+                target: RefTarget::Direct(oid),
+            },
+            Ref {
+                name: "FOO_HEAD".into(),
+                target: RefTarget::Direct(oid),
+            },
+            Ref {
+                name: "HEAD".into(),
+                target: RefTarget::Symbolic("refs/heads/main".into()),
+            },
+        ];
+
+        let files_dir = temp_git_dir();
+        fs::write(files_dir.join("AUTO_MERGE"), format!("{oid}\n")).expect("write files root ref");
+        fs::write(files_dir.join("FOO_HEAD"), format!("{oid}\n")).expect("write files root ref");
+        fs::write(files_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("write files root ref");
+        fs::write(files_dir.join("FETCH_HEAD"), format!("{oid}\n"))
+            .expect("write working-state file");
+        fs::write(files_dir.join("MERGE_HEAD"), format!("{oid}\n"))
+            .expect("write working-state file");
+        let files = FileRefStore::new(&files_dir, ObjectFormat::Sha1)
+            .list_root_refs()
+            .expect("list files root refs");
+
+        let reftable_dir = temp_git_dir();
+        write_reftable_config(&reftable_dir);
+        write_reftable_stack(
+            &reftable_dir,
+            &[(
+                "0x000000000001-0x000000000001-00000000.ref",
+                vec![
+                    ReftableRefRecord {
+                        name: "AUTO_MERGE".into(),
+                        update_index: 1,
+                        value: ReftableRefValue::Direct(oid),
+                    },
+                    ReftableRefRecord {
+                        name: "FETCH_HEAD".into(),
+                        update_index: 1,
+                        value: ReftableRefValue::Direct(oid),
+                    },
+                    ReftableRefRecord {
+                        name: "FOO_HEAD".into(),
+                        update_index: 1,
+                        value: ReftableRefValue::Direct(oid),
+                    },
+                    ReftableRefRecord {
+                        name: "HEAD".into(),
+                        update_index: 1,
+                        value: ReftableRefValue::Symbolic("refs/heads/main".into()),
+                    },
+                    ReftableRefRecord {
+                        name: "MERGE_HEAD".into(),
+                        update_index: 1,
+                        value: ReftableRefValue::Direct(oid),
+                    },
+                    ReftableRefRecord {
+                        name: "refs/heads/main".into(),
+                        update_index: 1,
+                        value: ReftableRefValue::Direct(oid),
+                    },
+                ],
+            )],
+        );
+        let reftable = FileRefStore::new(&reftable_dir, ObjectFormat::Sha1)
+            .list_root_refs()
+            .expect("list reftable root refs");
+
+        assert_eq!(files, expected);
+        assert_eq!(reftable, expected);
+        fs::remove_dir_all(files_dir).expect("remove test files repo");
+        fs::remove_dir_all(reftable_dir).expect("remove test reftable repo");
+    }
+
+    #[test]
     fn file_ref_store_reads_loose_fetch_head_in_reftable_repo() {
         let git_dir = temp_git_dir();
         write_reftable_config(&git_dir);
@@ -7185,6 +8486,24 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         fs::write(git_dir.join("reftable").join("tables.list"), b"")
             .expect("test operation should succeed");
         let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let null = ObjectId::null(ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+
+        store
+            .write_reflog(
+                "refs/heads/main",
+                &[ReflogEntry {
+                    old_oid: null,
+                    new_oid: oid,
+                    committer: b"A U Thor <author@example.com> 1 +0000".to_vec(),
+                    message: b"commit: initial".to_vec(),
+                }],
+            )
+            .expect("test operation should succeed");
 
         store
             .write_reflog("refs/heads/main", &[])
@@ -7196,18 +8515,82 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 .expect("test operation should succeed")
                 .is_empty()
         );
+        assert!(
+            store
+                .reflog_exists("refs/heads/main")
+                .expect("test operation should succeed")
+        );
         let tables = store.reftables().expect("test operation should succeed");
+        assert!(
+            tables
+                .windows(2)
+                .all(|pair| pair[0].header.max_update_index < pair[1].header.min_update_index)
+        );
         let marker = tables
             .iter()
             .flat_map(|table| table.logs.iter())
-            .find(|record| record.refname == "refs/heads/main")
+            .find(|record| {
+                record.refname == "refs/heads/main"
+                    && matches!(
+                        &record.value,
+                        ReftableLogValue::Update(update)
+                            if update.old_oid == null && update.new_oid == null
+                    )
+            })
             .expect("empty reflog marker should exist");
         let ReftableLogValue::Update(update) = &marker.value else {
             panic!("empty reflog marker should be an update");
         };
-        let null = ObjectId::null(ObjectFormat::Sha1);
         assert_eq!(update.old_oid, null);
         assert_eq!(update.new_oid, null);
+
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_store_limits_reftable_reflog_messages_to_half_a_block() {
+        let git_dir = temp_git_dir();
+        write_reftable_config(&git_dir);
+        fs::create_dir_all(git_dir.join("reftable")).expect("test operation should succeed");
+        fs::write(git_dir.join("reftable").join("tables.list"), b"")
+            .expect("test operation should succeed");
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1).with_reftable_write_options(
+            ReftableWriteOptions {
+                block_size: 0,
+                ..ReftableWriteOptions::default()
+            },
+        );
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(oid),
+            reflog: Some(ReflogEntry {
+                old_oid: ObjectId::null(ObjectFormat::Sha1),
+                new_oid: oid,
+                committer: b"A U Thor <author@example.com> 1 +0000".to_vec(),
+                message: vec![b'x'; 50_000],
+            }),
+        });
+        tx.commit()
+            .expect("long reflog message should be truncated");
+
+        let message = store
+            .reftables()
+            .expect("test operation should succeed")
+            .into_iter()
+            .flat_map(|table| table.logs)
+            .find_map(|record| match record.value {
+                ReftableLogValue::Update(update) => Some(update.message),
+                ReftableLogValue::Deletion => None,
+            })
+            .expect("reflog update should exist");
+        assert_eq!(message.len(), 2048);
 
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
@@ -7404,6 +8787,83 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             reftable_table_name_is_valid(last),
             "rust-written reftable name must parse as git's hex format, got {last}"
         );
+
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn reftable_auto_compaction_uses_git_geometric_segments() {
+        assert_eq!(
+            reftable_compaction_segment(&[512, 64, 17, 16, 9, 9, 9, 16, 2, 16], 2),
+            Some((1, 10))
+        );
+        assert_eq!(reftable_compaction_segment(&[64, 32, 16, 8, 4, 2], 2), None);
+    }
+
+    #[test]
+    fn file_ref_store_geometric_compaction_keeps_a_stack() {
+        let git_dir = temp_git_dir();
+        write_reftable_config(&git_dir);
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+
+        for index in 1..=20 {
+            let mut tx = store.transaction();
+            tx.update(RefUpdate {
+                name: format!("refs/heads/branch-{index}"),
+                expected: None,
+                new: RefTarget::Direct(oid),
+                reflog: None,
+            });
+            tx.commit().expect("test operation should succeed");
+        }
+
+        let table_count = store
+            .reftable_table_count()
+            .expect("test operation should succeed");
+        assert!(table_count > 1, "geometric stack collapsed to one table");
+        assert!(table_count < 20, "geometric stack was never compacted");
+
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn combined_reftable_transactions_auto_compact_geometrically() {
+        let git_dir = temp_git_dir();
+        write_reftable_config(&git_dir);
+        let store =
+            FileRefStore::new(&git_dir, ObjectFormat::Sha1).with_reftable_combined_logs(true);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+
+        for index in 1..=20 {
+            let mut tx = store.transaction();
+            tx.update(RefUpdate {
+                name: format!("refs/heads/branch-{index}"),
+                expected: None,
+                new: RefTarget::Direct(oid),
+                reflog: Some(ReflogEntry {
+                    old_oid: ObjectId::null(ObjectFormat::Sha1),
+                    new_oid: oid,
+                    committer: format!("A <a@example.invalid> {index} +0000").into_bytes(),
+                    message: Vec::new(),
+                }),
+            });
+            tx.commit().expect("test operation should succeed");
+        }
+
+        let table_count = store
+            .reftable_table_count()
+            .expect("test operation should succeed");
+        assert!(table_count > 0, "combined transaction stack disappeared");
+        assert!(table_count < 20, "combined transactions never compacted");
 
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
@@ -7607,6 +9067,190 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         assert!(git_dir.join("packed-refs").exists());
         assert!(!git_dir.join("packed-refs.lock").exists());
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn post_pack_prune_preserves_a_racing_loose_update() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let packed_oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let newer_oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .expect("test operation should succeed");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(newer_oid),
+            reflog: None,
+        });
+        tx.commit().expect("seed racing loose update");
+
+        assert!(
+            !store
+                .prune_loose_ref_after_pack("refs/heads/main", &packed_oid)
+                .expect("mismatched loose value is preserved")
+        );
+        assert_eq!(
+            store
+                .read_ref("refs/heads/main")
+                .expect("read preserved loose ref"),
+            Some(RefTarget::Direct(newer_oid))
+        );
+        assert!(!git_dir.join("refs/heads/main.lock").exists());
+
+        assert!(
+            store
+                .prune_loose_ref_after_pack("refs/heads/main", &newer_oid)
+                .expect("matching loose value is pruned")
+        );
+        assert!(!git_dir.join("refs/heads/main").exists());
+        assert!(!git_dir.join("refs/heads/main.lock").exists());
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_store_imports_files_snapshot_in_final_packed_form() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let refs = vec![
+            Ref {
+                name: "HEAD".into(),
+                target: RefTarget::Symbolic("refs/heads/main".into()),
+            },
+            Ref {
+                name: "ORIG_HEAD".into(),
+                target: RefTarget::Direct(oid),
+            },
+            Ref {
+                name: "refs/heads/main".into(),
+                target: RefTarget::Direct(oid),
+            },
+        ];
+        let reflogs = vec![(
+            "refs/heads/main".into(),
+            vec![reflog_entry(&oid, 1, "import")],
+        )];
+
+        store
+            .import_snapshot(&refs, &reflogs, true)
+            .expect("import files snapshot");
+
+        assert!(git_dir.join("packed-refs").exists());
+        assert!(!git_dir.join("refs/heads/main").exists());
+        assert!(git_dir.join("HEAD").exists());
+        assert!(git_dir.join("ORIG_HEAD").exists());
+        assert_eq!(
+            store.read_ref("refs/heads/main").expect("read packed ref"),
+            Some(RefTarget::Direct(oid))
+        );
+        assert_eq!(
+            store
+                .read_reflog("refs/heads/main")
+                .expect("read reflog")
+                .len(),
+            1
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn files_snapshot_exports_materialized_logs_without_probing_every_ref() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("valid oid");
+        let refs = vec![Ref {
+            name: "refs/heads/no-log".into(),
+            target: RefTarget::Direct(oid),
+        }];
+        store
+            .import_snapshot(&refs, &[], false)
+            .expect("import ref without reflog");
+        let deleted_log = vec![reflog_entry(&oid, 1, "deleted ref")];
+        store
+            .write_reflog("refs/heads/deleted", &deleted_log)
+            .expect("write materialized reflog without live ref");
+
+        assert_eq!(
+            store.export_snapshot(true).expect("export files snapshot"),
+            RefSnapshot {
+                refs,
+                reflogs: vec![("refs/heads/deleted".into(), deleted_log)],
+            }
+        );
+        fs::remove_dir_all(git_dir).expect("remove test repository");
+    }
+
+    #[test]
+    fn reftable_snapshot_export_batches_refs_and_reflogs() {
+        let git_dir = temp_git_dir();
+        write_reftable_config(&git_dir);
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let refs = vec![
+            Ref {
+                name: "HEAD".into(),
+                target: RefTarget::Symbolic("refs/heads/main".into()),
+            },
+            Ref {
+                name: "ORIG_HEAD".into(),
+                target: RefTarget::Direct(oid),
+            },
+            Ref {
+                name: "refs/heads/main".into(),
+                target: RefTarget::Direct(oid),
+            },
+        ];
+        let reflogs = vec![
+            ("HEAD".into(), vec![reflog_entry(&oid, 1, "head")]),
+            (
+                "refs/heads/main".into(),
+                vec![
+                    reflog_entry(&oid, 2, "first"),
+                    reflog_entry(&oid, 3, "second"),
+                ],
+            ),
+        ];
+        store
+            .import_snapshot(&refs, &reflogs, false)
+            .expect("import reftable snapshot");
+
+        assert_eq!(
+            store.export_snapshot(true).expect("export with reflogs"),
+            RefSnapshot {
+                refs: refs.clone(),
+                reflogs,
+            }
+        );
+        assert_eq!(
+            store
+                .export_snapshot(false)
+                .expect("export without reflogs"),
+            RefSnapshot {
+                refs,
+                reflogs: Vec::new(),
+            }
+        );
+        fs::remove_dir_all(git_dir).expect("remove test reftable repo");
     }
 
     #[test]
@@ -7907,6 +9551,253 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 .exists()
         );
         assert!(!git_dir.join("refs").join("tags").join("v1.0.lock").exists());
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_transaction_preserves_batched_reflog_order() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let first = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let second = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .expect("test operation should succeed");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(first),
+            reflog: Some(reflog_entry(&first, 1, "first")),
+        });
+        tx.update(RefUpdate {
+            name: "refs/heads/topic".into(),
+            expected: None,
+            new: RefTarget::Direct(first),
+            reflog: Some(reflog_entry(&first, 2, "topic")),
+        });
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(second),
+            reflog: Some(reflog_entry(&second, 3, "second")),
+        });
+        tx.commit().expect("test operation should succeed");
+
+        let main_log = store
+            .read_reflog("refs/heads/main")
+            .expect("test operation should succeed");
+        assert_eq!(
+            main_log
+                .iter()
+                .map(|entry| entry.message.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"first".as_slice(), b"second".as_slice()]
+        );
+        assert_eq!(
+            store
+                .read_reflog("refs/heads/topic")
+                .expect("test operation should succeed")[0]
+                .message,
+            b"topic"
+        );
+        assert_eq!(
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
+            Some(RefTarget::Direct(second))
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_transaction_replaces_empty_directory_at_ref_path() {
+        let git_dir = temp_git_dir();
+        let blocked_ref = git_dir.join("refs").join("heads").join("topic");
+        fs::create_dir_all(blocked_ref.join("empty").join("nested"))
+            .expect("test operation should succeed");
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/topic".into(),
+            expected: None,
+            new: RefTarget::Direct(oid),
+            reflog: None,
+        });
+        tx.commit().expect("test operation should succeed");
+
+        assert!(blocked_ref.is_file());
+        assert_eq!(
+            store
+                .read_ref("refs/heads/topic")
+                .expect("test operation should succeed"),
+            Some(RefTarget::Direct(oid))
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_transaction_reports_non_empty_directory_without_mutation() {
+        let git_dir = temp_git_dir();
+        let blocked_ref = git_dir.join("refs/heads/topic");
+        fs::create_dir_all(blocked_ref.join("nested")).expect("test operation should succeed");
+        fs::write(blocked_ref.join("nested/blocker.lock"), b"")
+            .expect("test operation should succeed");
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/topic".into(),
+            expected: None,
+            new: RefTarget::Direct(oid),
+            reflog: None,
+        });
+
+        let error = tx.commit().expect_err("non-empty directory must block ref");
+        assert!(error.to_string().contains("there is a non-empty directory"));
+        assert!(blocked_ref.join("nested/blocker.lock").is_file());
+        assert!(!git_dir.join("refs/heads/topic.lock").exists());
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_ref_store_ignores_broken_filesystem_symlink_during_iteration() {
+        let git_dir = temp_git_dir();
+        let heads = git_dir.join("refs/heads");
+        fs::create_dir_all(&heads).expect("test operation should succeed");
+        std::os::unix::fs::symlink("does-not-exist", heads.join("broken"))
+            .expect("test operation should succeed");
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+
+        assert!(
+            store
+                .list_refs()
+                .expect("test operation should succeed")
+                .is_empty()
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn update_snapshot_keeps_broken_loose_ref_over_packed_value() {
+        let git_dir = temp_git_dir();
+        fs::create_dir_all(git_dir.join("refs/heads")).expect("test operation should succeed");
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        store
+            .write_packed_refs(&[PackedRef {
+                reference: Ref {
+                    name: "refs/heads/topic".into(),
+                    target: RefTarget::Direct(oid),
+                },
+                peeled: None,
+            }])
+            .expect("test operation should succeed");
+        fs::write(git_dir.join("refs/heads/topic"), b"gobbledigook\n")
+            .expect("test operation should succeed");
+
+        let snapshot = store
+            .read_snapshot_for_update()
+            .expect("test operation should succeed");
+        assert_eq!(
+            snapshot.get("refs/heads/topic"),
+            Some(&RefReadSnapshotValue::Broken)
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_ref_transaction_writes_symbolic_ref_as_symlink_when_preferred() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1).with_prefer_symlink_refs(true);
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "TEST_SYMREF_HEAD".into(),
+            expected: None,
+            new: RefTarget::Symbolic("refs/heads/main".into()),
+            reflog: None,
+        });
+        tx.commit().expect("test operation should succeed");
+
+        let path = git_dir.join("TEST_SYMREF_HEAD");
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("test operation should succeed")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(path).expect("test operation should succeed"),
+            PathBuf::from("refs/heads/main")
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_ref_transaction_rollback_restores_original_symbolic_ref_symlink() {
+        let git_dir = temp_git_dir();
+        let heads = git_dir.join("refs/heads");
+        fs::create_dir_all(&heads).expect("test operation should succeed");
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        fs::write(heads.join("main"), format!("{oid}\n")).expect("test operation should succeed");
+        let symref_path = git_dir.join("TEST_SYMREF_HEAD");
+        std::os::unix::fs::symlink("refs/heads/main", &symref_path)
+            .expect("test operation should succeed");
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1).with_prefer_symlink_refs(true);
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "TEST_SYMREF_HEAD".into(),
+            expected: None,
+            new: RefTarget::Symbolic("refs/heads/topic".into()),
+            reflog: None,
+        });
+        tx.update(RefUpdate {
+            name: "refs/heads/other".into(),
+            expected: None,
+            new: RefTarget::Direct(oid),
+            reflog: None,
+        });
+
+        set_fail_loose_commit_action_for_test(Some(1));
+        tx.commit()
+            .expect_err("injected second apply failure must roll back the symref");
+
+        assert!(
+            fs::symlink_metadata(&symref_path)
+                .expect("test operation should succeed")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(&symref_path).expect("test operation should succeed"),
+            PathBuf::from("refs/heads/main")
+        );
+        assert!(!heads.join("other").exists());
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 

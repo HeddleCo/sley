@@ -645,3 +645,102 @@ fn diff_tree_error_cases_match_git() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn combined_all_paths_name_outputs_match_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("diff-tree-combined-all-paths-names");
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    git_ok(&repo, &["init", "-q", "-b", "left"]);
+
+    let base = (0..80)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    let mut left_content = base.clone();
+    left_content.push_str("left parent\n");
+    fs::write(repo.join("left.txt"), left_content).expect("write left parent");
+    git_ok(&repo, &["add", "left.txt"]);
+    git_ok(&repo, &["commit", "-qm", "left parent"]);
+    let left = rev_parse(&repo, "HEAD");
+
+    git_ok(&repo, &["checkout", "-q", "--orphan", "right"]);
+    git_ok(&repo, &["rm", "-q", "-f", "left.txt"]);
+    let mut right_content = base.clone();
+    right_content.push_str("right parent\n");
+    fs::write(repo.join("right.txt"), right_content).expect("write right parent");
+    git_ok(&repo, &["add", "right.txt"]);
+    git_ok(&repo, &["commit", "-qm", "right parent"]);
+    let right = rev_parse(&repo, "HEAD");
+
+    git_ok(&repo, &["rm", "-q", "right.txt"]);
+    let mut result_content = base;
+    result_content.push_str("left parent\nright parent\nmerge result\n");
+    fs::write(repo.join("result.txt"), result_content).expect("write merge result");
+    git_ok(&repo, &["add", "result.txt"]);
+    let tree_out = git(&repo, &["write-tree"]);
+    assert!(tree_out.status.success(), "write-tree failed");
+    let tree = String::from_utf8(tree_out.stdout)
+        .expect("tree oid utf8")
+        .trim()
+        .to_string();
+    let merge_out = git(
+        &repo,
+        &[
+            "commit-tree",
+            tree.as_str(),
+            "-p",
+            left.as_str(),
+            "-p",
+            right.as_str(),
+            "-m",
+            "merge",
+        ],
+    );
+    assert!(
+        merge_out.status.success(),
+        "commit-tree failed: {}",
+        String::from_utf8_lossy(&merge_out.stderr)
+    );
+    let merge = String::from_utf8(merge_out.stdout)
+        .expect("merge oid utf8")
+        .trim()
+        .to_string();
+
+    for args in [
+        vec![
+            "diff-tree",
+            "-c",
+            "-M",
+            "--combined-all-paths",
+            "--name-status",
+            "--no-commit-id",
+            merge.as_str(),
+        ],
+        vec![
+            "diff-tree",
+            "-c",
+            "-M",
+            "--combined-all-paths",
+            "--name-only",
+            "--no-commit-id",
+            merge.as_str(),
+        ],
+        vec![
+            "diff-tree",
+            "-c",
+            "-M",
+            "--combined-all-paths",
+            "--name-status",
+            "--no-commit-id",
+            "-z",
+            merge.as_str(),
+        ],
+    ] {
+        assert_same(&repo, &args);
+    }
+
+    fs::remove_dir_all(&root).ok();
+}

@@ -1,0 +1,56 @@
+# sley-upstream-manifest-v1
+# oracle_git=v2.55.0
+# oracle_make_options=USE_LIBPCRE2=1 NO_TCLTK=YesPlease
+# expected_included=891
+# expected_excluded=155
+#
+# Ordered rules; the last matching rule wins. `selector` uses POSIX shell glob
+# syntax. `oracle` applicability means that the cell is applicable on exactly
+# the platform/hash combinations where the pinned oracle runs it (rather than
+# emitting an upstream SKIP). Performance comparisons additionally require an
+# exact oracle/Sley TAP cell vector.
+#
+# action	selector	platforms	hashes	performance	prerequisites	reason
+include	t[0-9][0-9][0-9][0-9]-*.sh	oracle	oracle	eligible	upstream-declared	curated parity surface
+exclude	t3305-notes-fanout.sh	oracle	oracle	ineligible	large-repository	resource-intensive stress test outside current curated surface
+exclude	t3453-history-fixup.sh	oracle	oracle	ineligible	upstream-declared	not enrolled in current curated surface
+exclude	t4021-format-patch-numbered.sh	oracle	oracle	ineligible	upstream-declared	not enrolled in current curated surface
+exclude	t4141-apply-too-large.sh	oracle	oracle	ineligible	large-files	resource-intensive large-file stress test
+exclude	t4253-am-keep-cr-dos.sh	oracle	oracle	ineligible	upstream-declared	not enrolled in current curated surface
+exclude	t4254-am-corrupt.sh	oracle	oracle	ineligible	upstream-declared	not enrolled in current curated surface
+exclude	t4256-am-format-flowed.sh	oracle	oracle	ineligible	upstream-declared	not enrolled in current curated surface
+exclude	t4258-am-quoted-cr.sh	oracle	oracle	ineligible	upstream-declared	not enrolled in current curated surface
+exclude	t5100-mailinfo.sh	oracle	oracle	ineligible	mail-stack	not enrolled in current curated surface
+exclude	t5539-fetch-http-shallow.sh	oracle	oracle	ineligible	httpd,curl	requires optional smart-HTTP test infrastructure
+exclude	t5540-http-push-webdav.sh	oracle	oracle	ineligible	httpd,curl,webdav	requires optional WebDAV test infrastructure
+exclude	t5541-http-push-smart.sh	oracle	oracle	ineligible	httpd,curl	requires optional smart-HTTP test infrastructure
+exclude	t5542-push-http-shallow.sh	oracle	oracle	ineligible	httpd,curl	requires optional smart-HTTP test infrastructure
+exclude	t5549-fetch-push-http.sh	oracle	oracle	ineligible	httpd,curl	requires optional smart-HTTP test infrastructure
+exclude	t5550-http-fetch-dumb.sh	oracle	oracle	ineligible	httpd,curl	requires optional dumb-HTTP test infrastructure
+exclude	t5551-http-fetch-smart.sh	oracle	oracle	ineligible	httpd,curl	requires optional smart-HTTP test infrastructure
+exclude	t5555-http-smart-common.sh	oracle	oracle	ineligible	httpd,curl	requires optional smart-HTTP test infrastructure
+exclude	t5557-http-get.sh	oracle	oracle	ineligible	httpd,curl	requires optional HTTP test infrastructure
+exclude	t5558-clone-bundle-uri.sh	oracle	oracle	ineligible	httpd,curl	requires optional bundle-URI HTTP infrastructure
+exclude	t5559-http-fetch-smart-http2.sh	oracle	oracle	ineligible	httpd,curl,http2	requires optional HTTP/2 test infrastructure
+exclude	t5560-http-backend-noserver.sh	oracle	oracle	ineligible	cgi,curl	requires optional HTTP backend infrastructure
+exclude	t5561-http-backend.sh	oracle	oracle	ineligible	httpd,cgi,curl	requires optional HTTP backend infrastructure
+exclude	t5562-http-backend-content-length.sh	oracle	oracle	ineligible	httpd,cgi,curl	requires optional HTTP backend infrastructure
+exclude	t5563-simple-http-auth.sh	oracle	oracle	ineligible	httpd,curl	requires optional HTTP authentication infrastructure
+exclude	t5564-http-proxy.sh	oracle	oracle	ineligible	httpd,curl,proxy	requires optional HTTP proxy infrastructure
+exclude	t5566-push-group.sh	oracle	oracle	ineligible	httpd,curl	requires optional smart-HTTP test infrastructure
+exclude	t5570-git-daemon.sh	oracle	oracle	ineligible	loopback-network	requires optional git-daemon network infrastructure
+exclude	t5581-http-curl-verbose.sh	oracle	oracle	ineligible	httpd,curl	requires optional HTTP test infrastructure
+exclude	t5584-http-429-retry.sh	oracle	oracle	ineligible	httpd,curl	requires optional HTTP retry infrastructure
+exclude	t5608-clone-2gb.sh	oracle	oracle	ineligible	large-files	resource-intensive two-gigabyte clone stress test
+exclude	t5732-protocol-v2-bundle-uri-http.sh	oracle	oracle	ineligible	httpd,curl	requires optional protocol-v2 HTTP infrastructure
+exclude	t7006-pager.sh	oracle	oracle	ineligible	terminal,pager	terminal timing is not stable enough for suite performance gating
+exclude	t7527-builtin-fsmonitor.sh	oracle	oracle	ineligible	platform-fsmonitor	requires platform-specific filesystem monitor infrastructure
+exclude	t7705-repack-incremental-midx.sh	oracle	oracle	ineligible	large-repository	resource-intensive incremental MIDX stress test
+exclude	t9001-send-email.sh	oracle	oracle	ineligible	perl,mail-stack	requires optional mail integration dependencies
+exclude	t91*.sh	oracle	oracle	ineligible	subversion,perl	legacy git-svn integration requires external Subversion tooling
+exclude	t9200-git-cvsexportcommit.sh	oracle	oracle	ineligible	cvs	legacy CVS integration requires external tooling
+exclude	t940*.sh	oracle	oracle	ineligible	cvs	legacy CVS server integration requires external tooling
+exclude	t950*.sh	oracle	oracle	ineligible	gitweb,httpd	gitweb integration requires optional web infrastructure
+exclude	t960*.sh	oracle	oracle	ineligible	cvs	legacy CVS import integration requires external tooling
+exclude	t98*.sh	oracle	oracle	ineligible	perforce,python	legacy Perforce integration requires external tooling
+exclude	t9904-url-parse.sh	oracle	oracle	ineligible	upstream-declared	not enrolled in current curated surface

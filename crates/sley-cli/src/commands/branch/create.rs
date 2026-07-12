@@ -1,14 +1,14 @@
 //! Branch creation and tracking setup.
 
-use super::config::{validate_autosetuprebase, write_branch_repo_config, AutoRebase};
-use super::upstream::{
-    branch_tracking_ref_candidate, branch_upstream_remote_ref, resolve_branch_upstream,
-    ResolvedBranchUpstream,
-};
+use super::config::{AutoRebase, validate_autosetuprebase, write_branch_repo_config};
 use super::delete::force_update_branch;
-use super::list::{print_branch_list, BranchListMode};
+use super::list::{BranchListMode, print_branch_list};
 use super::operand::{
-    branch_resolve_local_branch_operand, validate_branch_creation_name, BranchOperandKind,
+    BranchOperandKind, branch_resolve_local_branch_operand, validate_branch_creation_name,
+};
+use super::upstream::{
+    ResolvedBranchUpstream, branch_tracking_ref_candidate, branch_upstream_remote_ref,
+    resolve_branch_upstream,
 };
 use crate::*;
 
@@ -33,6 +33,8 @@ pub(super) fn run_branch_create_options(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    config: &GitConfig,
+    replace_objects: bool,
     options: BranchCreateOptions,
 ) -> Result<()> {
     if options.recurse_submodules {
@@ -53,7 +55,9 @@ pub(super) fn run_branch_create_options(
     match options.positionals.as_slice() {
         [] => print_branch_list(store, BranchListMode::Local),
         [branch] if options.force => {
-            let branch = force_update_branch(git_dir, format, store, branch, None)?;
+            let branch = force_update_branch(
+                git_dir, format, store, config, replace_objects, branch, None,
+            )?;
             branch_create_set_tracking(git_dir, store, &branch, None, options.track, options.quiet)
         }
         [branch] => {
@@ -61,6 +65,8 @@ pub(super) fn run_branch_create_options(
                 git_dir,
                 format,
                 store,
+                config,
+                replace_objects,
                 branch,
                 None,
                 options.create_reflog,
@@ -75,7 +81,15 @@ pub(super) fn run_branch_create_options(
             )
         }
         [branch, start] if options.force => {
-            let branch = force_update_branch(git_dir, format, store, branch, Some(start))?;
+            let branch = force_update_branch(
+                git_dir,
+                format,
+                store,
+                config,
+                replace_objects,
+                branch,
+                Some(start),
+            )?;
             branch_create_set_tracking(
                 git_dir,
                 store,
@@ -90,6 +104,8 @@ pub(super) fn run_branch_create_options(
                 git_dir,
                 format,
                 store,
+                config,
+                replace_objects,
                 branch,
                 Some(start),
                 options.create_reflog,
@@ -421,7 +437,10 @@ pub(super) fn install_tracking_config(
     Ok(())
 }
 
-pub(super) fn branch_create_direct_upstream(store: &FileRefStore, start: Option<&String>) -> Result<String> {
+pub(super) fn branch_create_direct_upstream(
+    store: &FileRefStore,
+    start: Option<&String>,
+) -> Result<String> {
     match start.map(String::as_str) {
         None | Some("HEAD") => Ok(store.current_branch()?.unwrap_or_else(|| "HEAD".into())),
         Some(start) => Ok(start.to_string()),
@@ -564,6 +583,7 @@ pub(super) fn resolve_branch_start(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     start: &str,
 ) -> Result<ObjectId> {
     let peel_branch_start = |oid: ObjectId| -> Result<ObjectId> {
@@ -571,10 +591,12 @@ pub(super) fn resolve_branch_start(
         // (e.g. `git branch topic v1.0`), not the tag object itself.
         let db = FileObjectDatabase::from_git_dir(git_dir, format);
         sley_rev::peel_to_commit(&db, format, &oid).map_err(|_| {
-            GitError::InvalidObject(format!("branch start '{start}' does not resolve to a commit"))
+            GitError::InvalidObject(format!(
+                "branch start '{start}' does not resolve to a commit"
+            ))
         })
     };
-    match resolve_revision(git_dir, format, start) {
+    match resolve_revision(git_dir, format, start, replace_objects) {
         Ok(oid) => peel_branch_start(oid),
         Err(err) => {
             // A trailing range operator with an empty other side (`main..`,
@@ -585,7 +607,7 @@ pub(super) fn resolve_branch_start(
                 .or_else(|| start.strip_suffix(".."))
                 && !base.is_empty()
                 && !base.contains("..")
-                && let Ok(oid) = resolve_revision(git_dir, format, base)
+                && let Ok(oid) = resolve_revision(git_dir, format, base, replace_objects)
             {
                 return peel_branch_start(oid);
             }
@@ -611,16 +633,29 @@ pub(crate) fn create_branch_from_start(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    config: &GitConfig,
+    replace_objects: bool,
     branch: &str,
     start: Option<&String>,
 ) -> Result<()> {
-    create_branch_from_start_with_reflog(git_dir, format, store, branch, start, false)
+    create_branch_from_start_with_reflog(
+        git_dir,
+        format,
+        store,
+        config,
+        replace_objects,
+        branch,
+        start,
+        false,
+    )
 }
 
 pub(super) fn create_branch_from_start_with_reflog(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    config: &GitConfig,
+    replace_objects: bool,
     branch: &str,
     start: Option<&String>,
     create_reflog: bool,
@@ -631,13 +666,13 @@ pub(super) fn create_branch_from_start_with_reflog(
         return Err(GitError::Exit(128));
     }
     let start_rev = start.map_or("HEAD", String::as_str);
-    let start_oid = resolve_branch_start(git_dir, format, store, start_rev)?;
+    let start_oid = resolve_branch_start(git_dir, format, store, replace_objects, start_rev)?;
     let message = branch_create_reflog_message(store, start)?;
     let reflog = if branch_should_write_reflog(git_dir, &refname, create_reflog)? {
         Some(ReflogEntry {
             old_oid: ObjectId::null(format),
             new_oid: start_oid,
-            committer: commit_identity_from_env("COMMITTER")?,
+            committer: commit_identity_from_env("COMMITTER", config)?,
             message,
         })
     } else {
@@ -654,7 +689,11 @@ pub(super) fn create_branch_from_start_with_reflog(
     Ok(())
 }
 
-pub(super) fn branch_should_write_reflog(git_dir: &Path, name: &str, create_reflog: bool) -> Result<bool> {
+pub(super) fn branch_should_write_reflog(
+    git_dir: &Path,
+    name: &str,
+    create_reflog: bool,
+) -> Result<bool> {
     if create_reflog || branch_reflog_path(git_dir, name)?.exists() {
         return Ok(true);
     }
@@ -674,7 +713,10 @@ pub(super) fn branch_should_write_reflog(git_dir: &Path, name: &str, create_refl
     Ok(branch_log_all_ref_updates_matches(name, "true"))
 }
 
-pub(super) fn branch_create_reflog_message(store: &FileRefStore, start: Option<&String>) -> Result<Vec<u8>> {
+pub(super) fn branch_create_reflog_message(
+    store: &FileRefStore,
+    start: Option<&String>,
+) -> Result<Vec<u8>> {
     let display = match start {
         Some(start) => start.clone(),
         None => store.current_branch()?.unwrap_or_else(|| "HEAD".into()),
@@ -682,7 +724,10 @@ pub(super) fn branch_create_reflog_message(store: &FileRefStore, start: Option<&
     Ok(format!("branch: Created from {display}").into_bytes())
 }
 
-pub(super) fn branch_reset_reflog_message(store: &FileRefStore, start: Option<&String>) -> Result<Vec<u8>> {
+pub(super) fn branch_reset_reflog_message(
+    store: &FileRefStore,
+    start: Option<&String>,
+) -> Result<Vec<u8>> {
     let display = match start {
         Some(start) => start.clone(),
         None => store.current_branch()?.unwrap_or_else(|| "HEAD".into()),
@@ -707,5 +752,3 @@ pub(super) fn branch_log_all_ref_updates_matches(name: &str, value: &str) -> boo
         || name.starts_with("refs/remotes/")
         || name.starts_with("refs/notes/")
 }
-
-

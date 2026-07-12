@@ -73,7 +73,12 @@ pub fn fetch_bundle(request: FetchBundleRequest<'_>) -> Result<()> {
     }
     let refspecs =
         fetch_refspecs_for_source(Vec::new(), request.refspecs, request.options.fetch_all_tags);
-    let mut fetched = bundle_fetch_refs(&references, &refspecs, request.options.auto_follow_tags)?;
+    let mut fetched = bundle_fetch_refs(
+        request.format,
+        &references,
+        &refspecs,
+        request.options.auto_follow_tags,
+    )?;
     if request.options.fetch_all_tags {
         mark_tag_refspec_updates_not_for_merge(&mut fetched);
         order_bundle_fetch_all_tags_updates(&mut fetched);
@@ -129,6 +134,7 @@ fn write_bundle_default_fetch_head(
 }
 
 fn bundle_fetch_refs(
+    format: ObjectFormat,
     references: &[BundleReference],
     refspecs: &[String],
     auto_follow_tags: bool,
@@ -145,5 +151,5 @@ fn bundle_fetch_refs(
         .iter()
         .map(|refspec| parse_refspec(refspec))
         .collect::<Result<Vec<_>>>()?;
-    plan_fetch_ref_updates(&refs, &refspecs, auto_follow_tags)
+    plan_fetch_ref_updates(format, &refs, &refspecs, auto_follow_tags)
 }

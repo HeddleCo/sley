@@ -19,13 +19,26 @@
 //! The lift proceeds in stages (see `docs/git-remote-extraction.md`); this is
 //! the scaffold (stage A).
 
+use std::io::Read;
 use std::path::Path;
 
 use sley_config::GitConfig;
-use sley_core::{ObjectFormat, Result};
+pub use sley_config::remotes::{SetUrlError, SetUrlKind, SetUrlOp, set_url};
+use sley_core::{GitError, ObjectFormat, Result};
+use sley_protocol::{
+    RefAdvertisementSet, parse_ref_advertisement_set, parse_upload_pack_features,
+    read_pkt_line_frames_until_flush,
+};
 use sley_transport::GitCredential;
 
+mod admin;
 mod install;
+pub use admin::{
+    AddRemoteOptions, AddRemoteOutcome, RemoteAdminError, RemoteHeadMutation, RemoteHeadPlan,
+    RemoteMirror, RemotePrunePlan, RemoteTagMode, RemoveRemoteOutcome, RenameRemoteOutcome,
+    add_remote, apply_remote_head, plan_remote_prune, remote_branch_fetch_refspec, remove_remote,
+    rename_remote, set_remote_branches,
+};
 pub use install::{
     install_protocol_v2_fetch_promisor_response_from_reader,
     install_protocol_v2_fetch_response_from_reader,
@@ -46,17 +59,22 @@ pub use credentials::{
     http_credential_host, http_protocol_name, http_url_credential,
 };
 
+mod http_backend;
+pub use http_backend::{
+    HttpBackendOperation, HttpBackendPlan, HttpBackendRequest, HttpBackendService,
+    http_backend_service_enabled, plan_http_backend_request,
+};
+
 #[cfg(feature = "http")]
 mod http;
 #[cfg(feature = "http")]
 pub use http::{
-    HttpFetchPackRequest, HttpServiceAdvertisements, http_advertised_refs,
-    http_authorization_headers, http_check_status, http_protocol_v2_fetch_response,
-    http_send_with_auth, http_service_advertisements, http_upload_pack_advertisements,
-    http_upload_pack_features, http_validate_content_type,
+    HttpFetchPackRequest, HttpOperationBatch, HttpServiceAdvertisements, HttpUploadPackDiscovery,
+    http_advertised_refs, http_authorization_headers, http_check_status, http_discover_upload_pack,
+    http_protocol_v2_fetch_response, http_send_with_auth, http_service_advertisements,
+    http_upload_pack_advertisements, http_upload_pack_features, http_validate_content_type,
     install_fetch_pack_via_http_protocol_v2_fetch, install_fetch_pack_via_http_upload_pack,
-    new_http_client, HttpOperationBatch,
-    remote_url_is_http,
+    new_http_client, remote_url_is_http,
 };
 // Re-export the smart-HTTP client seam so out-of-crate hosts (e.g. weft) can
 // implement [`HttpClient`] to enforce network policy on the dial without a
@@ -67,16 +85,30 @@ pub use sley_transport::{HttpClient, HttpResponse, UreqHttpClient};
 
 mod ssh;
 pub use ssh::{
-    SshFetchPackRequest, SshTransportOptions, install_fetch_pack_via_ssh_upload_pack, ssh_program,
-    ssh_transport_options_from_config, ssh_upload_pack_advertisements,
-    ssh_upload_pack_advertisements_with_options,
+    SshFetchPackRequest, SshTransportOptions, SshUploadPackDiscovery,
+    discover_ssh_upload_pack_advertisements_with_command, install_fetch_pack_via_ssh_upload_pack,
+    ssh_program, ssh_transport_options_from_config, ssh_upload_pack_advertisements,
+    ssh_upload_pack_advertisements_with_command, ssh_upload_pack_advertisements_with_options,
 };
 
 mod git;
 mod git_proxy;
 pub use git::{
-    GitFetchPackRequest, git_upload_pack_advertisements,
+    GitFetchPackRequest, discover_git_upload_pack_advertisements, git_upload_pack_advertisements,
     git_upload_pack_advertisements_with_protocol, install_fetch_pack_via_git_upload_pack,
+};
+
+mod helper;
+pub use helper::{
+    DiscoveredRemoteHelperFetchOperation, RemoteHelperCapabilities, RemoteHelperEvent,
+    RemoteHelperEventSink, RemoteHelperExportRequest, RemoteHelperFetchDiscovery,
+    RemoteHelperFetchOperation, RemoteHelperFetchServices, RemoteHelperPlumbing,
+    RemoteHelperPushError, RemoteHelperPushOperation, RemoteHelperPushOptions,
+    RemoteHelperPushOutcome, RemoteHelperPushServices, RemoteHelperRef, RemoteHelperRefValue,
+    RemoteHelperSession, RemoteHelperSpec, discover_remote_helper_fetch,
+    fetch_via_discovered_remote_helper, fetch_via_remote_helper,
+    imported_remote_helper_advertisements, push_via_remote_helper, resolve_remote_helper,
+    rewrite_remote_helper_import_stream,
 };
 
 mod proc_receive;
@@ -95,34 +127,72 @@ pub use receive_pack_server::{
     write_receive_pack_server_report, write_receive_pack_sideband_stderr,
 };
 
+/// Read a v0/v1 upload-pack advertisement before a local object format exists.
+///
+/// Clone is the important caller: the remote advertisement establishes the
+/// format of the repository that will be created. Fetch and push instead know
+/// their repository format already and continue to use the strict readers.
+pub(crate) fn read_discovered_upload_pack_advertisements(
+    reader: &mut impl Read,
+) -> Result<(RefAdvertisementSet, ObjectFormat)> {
+    let frames = read_pkt_line_frames_until_flush(reader)?;
+    let sha1 = parse_ref_advertisement_set(ObjectFormat::Sha1, &frames);
+    let sha256 = parse_ref_advertisement_set(ObjectFormat::Sha256, &frames);
+    for (format, parsed) in [
+        (ObjectFormat::Sha1, sha1.as_ref()),
+        (ObjectFormat::Sha256, sha256.as_ref()),
+    ] {
+        let Ok(set) = parsed else {
+            continue;
+        };
+        let advertised = set
+            .refs
+            .first()
+            .map(|reference| parse_upload_pack_features(&reference.capabilities))
+            .transpose()?
+            .and_then(|features| features.object_format)
+            .unwrap_or(ObjectFormat::Sha1);
+        if advertised == format {
+            return Ok((set.clone(), format));
+        }
+    }
+    match sha1 {
+        Err(err) => Err(err),
+        Ok(_) => Err(GitError::InvalidObjectId(
+            "advertised object format does not match advertised object ids".into(),
+        )),
+    }
+}
+
 mod local;
 pub use local::{
     INFINITE_DEPTH, LocalDeepenPlan, attach_receive_pack_capabilities,
     attach_upload_pack_capabilities, compute_local_deepen, compute_local_deepen_by_rev_list,
+    hydrate_objects_from_local_promisor_remotes, hydrate_reachable_from_local_promisor_remotes,
     install_fetch_pack_via_local_upload_pack, local_fetch_advertisements, local_have_oids,
     receive_pack_features, receive_pack_into_local_repository,
     receive_pack_request_uses_push_options, receive_pack_stream_into_local_repository,
-    serve_upload_pack_v2, serve_upload_pack_v2_with_config, upload_pack_features,
-    upload_pack_from_local_repository, upload_pack_request_uses_sideband,
-    upload_pack_sideband_response,
+    serve_upload_pack_v2, serve_upload_pack_v2_stateless_with_config,
+    serve_upload_pack_v2_with_config, upload_pack_features, upload_pack_from_local_repository,
+    upload_pack_request_uses_sideband, upload_pack_sideband_response,
 };
 
 mod filter;
 pub use filter::{pack_filter_from_spec, pack_filter_from_spec_for_clone};
 
 mod fetch;
-pub use fetch::{
-    FetchOptions, FetchOutcome, FetchRequest, FetchServices, FetchSource, PruneRefsInput,
-    PrunedRef, append_reachable_auto_follow_tags, apply_configured_fetch_prune_option,
-    apply_configured_partial_clone_filter, apply_configured_remote_tag_option, fetch,
-    fetch_head_source_description,
-    fetch_refspec_excludes, fetch_refspecs_for_source, mark_tag_refspec_updates_not_for_merge,
-    order_bundle_fetch_all_tags_updates, prune_refs_from_advertisements,
-    retain_missing_auto_follow_tags, write_default_fetch_head, write_fetch_head,
-    write_fetch_head_records,
-};
 #[cfg(feature = "http")]
 pub use fetch::fetch_with_http_client;
+pub use fetch::{
+    FetchOptions, FetchOutcome, FetchRepositoryPlan, FetchRequest, FetchServices, FetchSource,
+    PruneRefsInput, PrunedRef, RemoteHelperFetchRequest, append_reachable_auto_follow_tags,
+    apply_configured_fetch_prune_option, apply_configured_partial_clone_filter,
+    apply_configured_remote_tag_option, fetch, fetch_head_source_description,
+    fetch_refspec_excludes, fetch_refspecs_for_source, finalize_remote_helper_fetch,
+    mark_tag_refspec_updates_not_for_merge, order_bundle_fetch_all_tags_updates,
+    plan_fetch_repository, prune_refs_from_advertisements, retain_missing_auto_follow_tags,
+    write_default_fetch_head, write_fetch_head, write_fetch_head_records,
+};
 
 mod pack;
 pub use pack::{
@@ -138,18 +208,21 @@ pub use push::{
     apply_receive_pack_report_to_push_refs, execute_push_action_plan, execute_push_plan,
     local_push_source_refs, normalize_push_refname, normalize_push_refspec, plan_push,
     plan_push_actions, push, push_actions, push_local_uses_receive_pack_server,
-    push_local_with_report, run_local_push_post_hooks, push_url_for_display,
-    read_receive_pack_push_report, reject_non_fast_forward_pushes, stage_local_push_quarantine,
-    validate_receive_pack_report, validate_receive_pack_unpack,
+    push_local_with_report, push_local_with_report_and_objects, push_url_for_display,
+    read_receive_pack_push_report, reject_non_fast_forward_pushes, run_local_push_post_hooks,
+    stage_local_push_quarantine, validate_receive_pack_report, validate_receive_pack_unpack,
 };
 
 mod ls_remote;
-pub use ls_remote::{LsRemoteFilter, LsRemoteRecord, LsRemoteSource, ls_remote};
+pub use ls_remote::{
+    LsRemoteFilter, LsRemoteOutcome, LsRemoteRecord, LsRemoteRequest, LsRemoteSource, ls_remote,
+    ls_remote_with,
+};
 
 mod clone;
-pub use clone::{CloneOptions, CloneOutcome, CloneRequest, CloneServices, CloneSource, clone};
 #[cfg(feature = "http")]
 pub use clone::clone_with_http_client;
+pub use clone::{CloneOptions, CloneOutcome, CloneRequest, CloneServices, CloneSource, clone};
 
 mod bundle;
 pub use bundle::{FetchBundleRequest, fetch_bundle};
@@ -157,7 +230,7 @@ mod bundle_uri;
 pub use bundle_uri::{
     BundleUriEntry, BundleUriList, bundle_uri_fetch_order, handshake_advertises_bundle_uri,
     http_remote_bundle_uri_list, parse_bundle_uri_line, prefetch_advertised_bundle_uris,
-    transfer_bundle_uri_enabled,
+    prefetch_advertised_bundle_uris_with_client, transfer_bundle_uri_enabled,
 };
 
 mod shallow;
@@ -172,10 +245,20 @@ pub use protocol::{
     transport_scheme_for_remote, transport_scheme_for_url,
 };
 
+mod promisor;
+pub use promisor::{
+    PromisorAcceptPolicy, PromisorRemoteDecision, PromisorRemoteField, PromisorRemoteFieldUpdate,
+    apply_promisor_remote_field_updates, config_has_promisor_remote,
+    configured_promisor_remote_names, decide_promisor_remote_reply, promisor_accept_policy,
+    promisor_remote_auto_filter, promisor_remote_server_capability,
+};
+
 mod resolve;
 pub use resolve::{
-    fetch_source_for_url, fetch_url, push_destination_for_url, push_url, resolve_fetch_source,
-    resolve_push_destination, transport_kind_for_url,
+    RemoteResolutionContext, ResolvedRemote, discover_local_git_dir, fetch_source_for_url,
+    fetch_url, push_destination_for_url, push_url, resolve_configured_local_remote_git_dir,
+    resolve_fetch_source, resolve_local_remote_git_dir, resolve_push_destination, resolve_remote,
+    transport_kind_for_url,
 };
 
 /// The object format of the repository whose common `$GIT_DIR` is `common_git_dir`.
@@ -227,8 +310,8 @@ impl CredentialProvider for NoCredentials {
 }
 
 /// Structured transfer statistics during a fetch/clone pack receive+index.
-/// All monotonic within one operation; reset per operation.
-#[derive(Debug, Clone, Copy, Default)]
+/// All counters are monotonic within one operation and reset per operation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TransferProgress {
     /// Wire/pack bytes received so far. THE KB counter. No reliable total
     /// (smart-HTTP doesn't announce pack size up front).
@@ -243,15 +326,37 @@ pub struct TransferProgress {
     pub indexed_deltas: u64,
 }
 
+/// Equal-work counts for one pack generated natively by Sley.
+///
+/// These are semantic events rather than pre-rendered terminal text, allowing
+/// an embedding wrapper to render Git-compatible generation progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackGenerationProgress {
+    /// Objects enumerated and written by the transfer.
+    pub total_objects: usize,
+    /// Objects eligible for the delta-compression search phase.
+    pub compression_objects: usize,
+    /// Objects ultimately written as deltas.
+    pub delta_objects: u32,
+}
+
 /// Receives human-facing progress and summary events from an operation (the
-/// "To <remote>" push summary, prune notices, "Cloning into…", etc.). The
+/// `To <remote>` push summary, prune notices, "Cloning into…", etc.). The
 /// orchestration returns structured outcomes regardless; this is purely for
 /// presentation, so the default implementations discard everything.
 pub trait ProgressSink {
+    /// A structured object-transfer progress event.
+    fn transfer(&mut self, _progress: TransferProgress) {}
+
+    /// Structured counts for a pack generated locally by Sley.
+    fn pack_generation(&mut self, _progress: &PackGenerationProgress) {}
+
     /// A free-form progress or summary line.
     fn message(&mut self, _message: &str) {}
-    /// Structured transfer progress. Default: ignore (keeps existing impls valid).
-    fn transfer(&mut self, _progress: TransferProgress) {}
+    /// A user-facing diagnostic that belongs on stderr in a CLI wrapper.
+    fn diagnostic(&mut self, message: &str) {
+        self.message(message);
+    }
 }
 
 /// A [`ProgressSink`] that discards every event.
@@ -273,6 +378,31 @@ mod tests {
     use sley_odb::{FileObjectDatabase, ObjectWriter};
     use sley_refs::{FileRefStore, RefTarget, RefUpdate};
     use sley_transport::{RemoteUrl, parse_remote_url};
+
+    #[test]
+    fn clone_discovery_adopts_advertised_sha256_format() {
+        let advertised = sley_protocol::RefAdvertisementSet {
+            protocol: sley_protocol::ProtocolVersion::V0,
+            refs: vec![sley_protocol::RefAdvertisement {
+                oid: sley_core::ObjectId::null(ObjectFormat::Sha256),
+                name: "capabilities^{}".into(),
+                capabilities: vec![sley_core::Capability {
+                    name: "object-format".into(),
+                    value: Some("sha256".into()),
+                }],
+            }],
+            shallow: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        sley_protocol::write_ref_advertisement_set(&mut bytes, &advertised)
+            .expect("advertisement should encode");
+
+        let (parsed, format) = read_discovered_upload_pack_advertisements(&mut bytes.as_slice())
+            .expect("format should be discovered");
+
+        assert_eq!(format, ObjectFormat::Sha256);
+        assert_eq!(parsed, advertised);
+    }
 
     #[test]
     fn no_credentials_never_fills() {
@@ -330,6 +460,7 @@ mod tests {
     fn fetch_options(depth: Option<u32>) -> FetchOptions {
         FetchOptions {
             quiet: true,
+            progress: None,
             auto_follow_tags: false,
             fetch_all_tags: false,
             prune: false,
@@ -345,6 +476,7 @@ mod tests {
             depth,
             merge_srcs: Vec::new(),
             filter: None,
+            filter_auto: false,
             refetch: false,
             cloning: false,
             record_promisor_refs: true,
@@ -355,6 +487,7 @@ mod tests {
             deepen_since: None,
             deepen_not: Vec::new(),
             ssh_options: None,
+            upload_pack_command: None,
             atomic: false,
             negotiation_restrict: None,
             negotiation_include: None,
@@ -443,6 +576,7 @@ mod tests {
                 source: &source,
                 refspecs: &[refspec],
                 options: &options,
+                validation: None,
             },
             FetchServices {
                 credentials,
@@ -484,6 +618,8 @@ mod tests {
             quiet: true,
             force: false,
             thin: PushThinMode::Auto,
+            atomic: false,
+            push_options: Vec::new(),
         };
         let mut progress = SilentProgress;
 
@@ -635,6 +771,7 @@ mod tests {
             checkout_branch: &branch,
             remote_head_branch: &branch,
             single_branch: true,
+            progress: false,
             depth: Some(1),
             deepen_since: None,
             deepen_not: Vec::new(),
@@ -642,11 +779,13 @@ mod tests {
             detached_head: None,
             checkout: true,
             filter: None,
+            filter_auto: false,
             // The live test clones a specific branch via --single-branch, so the
             // branch was explicitly requested (a missing remote tip is a hard error).
             branch_explicit: true,
             ref_storage: sley_formats::RefStorageFormat::Files,
             ssh_options: None,
+            upload_pack_command: None,
             reject_shallow: false,
         };
         let mut clone_credentials = NoCredentials;

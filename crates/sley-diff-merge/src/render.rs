@@ -31,12 +31,86 @@ use crate::line_diff::{
     DiffAlgorithm, DiffLine, DiffOp, WsIgnore, line_is_blank, myers_diff_lines_ws,
     patience_diff_lines_anchored, split_lines,
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, error::Error, fmt};
 
 /// git's default hunk context (`-U3`).
 pub const DEFAULT_CONTEXT: usize = 3;
 const FUNCTION_CONTEXT_FLAG: usize = 1usize << (usize::BITS - 1);
 const CONTEXT_VALUE_MASK: usize = !FUNCTION_CONTEXT_FLAG;
+
+/// Why a configured `diff.interHunkContext` value could not be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterHunkContextError {
+    /// The value is not a Git integer, including an overflowing unit suffix.
+    InvalidNumericValue,
+    /// The value is numeric but does not fit Git's C `int` config type.
+    OutOfRange,
+    /// Inter-hunk context cannot be negative.
+    NegativeValue,
+}
+
+impl fmt::Display for InterHunkContextError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidNumericValue => f.write_str("invalid inter-hunk context integer"),
+            Self::OutOfRange => f.write_str("inter-hunk context integer is out of range"),
+            Self::NegativeValue => f.write_str("inter-hunk context cannot be negative"),
+        }
+    }
+}
+
+impl Error for InterHunkContextError {}
+
+/// Resolve CLI and configured inter-hunk context with Git's precedence.
+///
+/// Configuration is validated even when a CLI value is present because Git
+/// loads and validates `diff.interHunkContext` before parsing command options.
+pub fn resolve_interhunk_context(
+    cli_value: Option<usize>,
+    config_value: Option<&str>,
+) -> Result<usize, InterHunkContextError> {
+    let configured = match config_value {
+        Some(value) => {
+            let parsed = sley_config::parse_config_int(value).ok_or_else(|| {
+                if config_int_looks_numeric(value) {
+                    InterHunkContextError::OutOfRange
+                } else {
+                    InterHunkContextError::InvalidNumericValue
+                }
+            })?;
+            if i32::try_from(parsed).is_err() {
+                return Err(InterHunkContextError::OutOfRange);
+            }
+            if parsed < 0 {
+                return Err(InterHunkContextError::NegativeValue);
+            }
+            Some(usize::try_from(parsed).map_err(|_| InterHunkContextError::InvalidNumericValue)?)
+        }
+        None => None,
+    };
+    Ok(cli_value.or(configured).unwrap_or(0))
+}
+
+fn config_int_looks_numeric(value: &str) -> bool {
+    let trimmed = value.trim();
+    let digits = match trimmed.as_bytes().last() {
+        Some(b'k' | b'K' | b'm' | b'M' | b'g' | b'G') => {
+            &trimmed[..trimmed.len().saturating_sub(1)]
+        }
+        _ => trimmed,
+    };
+    let digits = digits.strip_prefix(['+', '-']).unwrap_or(digits);
+    if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        digits.bytes().all(|byte| matches!(byte, b'0'..=b'7'))
+    } else {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    }
+}
 
 /// Encode `-W` / `--function-context` into the context field without changing
 /// the option shape used by the existing renderer call sites.
@@ -198,6 +272,9 @@ pub struct HunkRenderOptions<'a, 'h> {
     pub word_diff: Option<&'a mut dyn HunkWordDiff>,
     /// Hunk body line indicators (` `, `-`, `+` by default).
     pub line_indicators: LineIndicators,
+    /// `diff.suppressBlankEmpty`: omit the context indicator on a context line
+    /// whose body is empty (the terminating LF is still emitted).
+    pub suppress_blank_empty: bool,
     /// `--ws-error-highlight` configuration: when set and colors are on, the
     /// renderer paints whitespace errors on the selected line kinds with
     /// `colors.whitespace` (git's `emit_line_ws_markup`). `None` disables it.
@@ -306,6 +383,7 @@ impl Default for HunkRenderOptions<'_, '_> {
             colors: None,
             word_diff: None,
             line_indicators: LineIndicators::default(),
+            suppress_blank_empty: false,
             ws_error: None,
             ws_ignore: WsIgnore::default(),
             algorithm: DiffAlgorithm::Myers,
@@ -2271,6 +2349,9 @@ fn render_one_hunk(
             LineKind::Delete => options.line_indicators.old,
             LineKind::Insert => options.line_indicators.new,
         };
+        let emit_prefix = !(options.suppress_blank_empty
+            && line.kind == LineKind::Context
+            && line.content == b"\n");
         match options.colors {
             Some(colors) => {
                 // Whitespace-error highlighting applies to the selected line
@@ -2287,9 +2368,17 @@ fn render_one_hunk(
                     .and_then(|styles| styles.get(start + offset))
                     .copied()
                     .filter(|style| style.moved);
-                write_patch_line_colored(out, prefix, line.content, colors, ws_rule, moved);
+                write_patch_line_colored(
+                    out,
+                    prefix,
+                    emit_prefix,
+                    line.content,
+                    colors,
+                    ws_rule,
+                    moved,
+                );
             }
-            None => write_patch_line(out, prefix, line.content),
+            None => write_patch_line(out, prefix, emit_prefix, line.content),
         }
     }
 }
@@ -2328,8 +2417,10 @@ fn hunk_section_heading(
 /// Write a single diff line with its `prefix` marker, appending the
 /// `\ No newline at end of file` note when the source line lacks a trailing
 /// LF.
-fn write_patch_line(out: &mut Vec<u8>, prefix: u8, line: &[u8]) {
-    out.push(prefix);
+fn write_patch_line(out: &mut Vec<u8>, prefix: u8, emit_prefix: bool, line: &[u8]) {
+    if emit_prefix {
+        out.push(prefix);
+    }
     out.extend_from_slice(line);
     if !line.ends_with(b"\n") {
         out.extend_from_slice(b"\n\\ No newline at end of file\n");
@@ -2351,6 +2442,7 @@ fn write_patch_line(out: &mut Vec<u8>, prefix: u8, line: &[u8]) {
 fn write_patch_line_colored(
     out: &mut Vec<u8>,
     prefix: u8,
+    emit_prefix: bool,
     line: &[u8],
     colors: RenderColors<'_>,
     ws_rule: Option<crate::ws::WsRule>,
@@ -2377,7 +2469,9 @@ fn write_patch_line_colored(
     if let Some(rule) = ws_rule {
         if rule == 0 {
             out.extend_from_slice(color.as_bytes());
-            out.push(prefix);
+            if emit_prefix {
+                out.push(prefix);
+            }
             out.extend_from_slice(body);
             out.extend_from_slice(colors.reset.as_bytes());
             out.push(b'\n');
@@ -2392,7 +2486,9 @@ fn write_patch_line_colored(
         // Sign in the line color, then the body through ws_check_emit (no
         // trailing newline in `body`, so the emit's own LF handling is inert).
         out.extend_from_slice(color.as_bytes());
-        out.push(prefix);
+        if emit_prefix {
+            out.push(prefix);
+        }
         out.extend_from_slice(colors.reset.as_bytes());
         let emit_colors = crate::ws::WsEmitColors {
             set: color,
@@ -2417,7 +2513,9 @@ fn write_patch_line_colored(
 
     if prefix == b'+' {
         out.extend_from_slice(color.as_bytes());
-        out.push(prefix);
+        if emit_prefix {
+            out.push(prefix);
+        }
         out.extend_from_slice(colors.reset.as_bytes());
         if !body.is_empty() {
             out.extend_from_slice(color.as_bytes());
@@ -2426,7 +2524,9 @@ fn write_patch_line_colored(
         }
     } else {
         out.extend_from_slice(color.as_bytes());
-        out.push(prefix);
+        if emit_prefix {
+            out.push(prefix);
+        }
         out.extend_from_slice(body);
         out.extend_from_slice(colors.reset.as_bytes());
     }
@@ -2525,8 +2625,8 @@ impl Default for CombinedRenderOptions {
 /// `show_hunks || mode_differs`).
 ///
 /// Mirrors `show_patch_diff`'s body half: build the `sline` array, fold each
-/// parent into it via [`combine_one_parent`], run [`make_hunks`], then
-/// [`dump_sline`].
+/// parent into it via `combine_one_parent`, run `make_hunks`, then
+/// `dump_sline`.
 pub fn render_combined(out: &mut Vec<u8>, result: &[u8], parents: &[&[u8]]) -> bool {
     render_combined_with(out, result, parents, &CombinedRenderOptions::default())
 }
@@ -3244,6 +3344,44 @@ mod tests {
     }
 
     #[test]
+    fn interhunk_context_resolution_validates_config_before_cli_precedence() {
+        assert_eq!(resolve_interhunk_context(None, None), Ok(0));
+        assert_eq!(resolve_interhunk_context(None, Some("2k")), Ok(2048));
+        assert_eq!(resolve_interhunk_context(Some(3), Some("2")), Ok(3));
+        assert_eq!(
+            resolve_interhunk_context(Some(3), Some("invalid")),
+            Err(InterHunkContextError::InvalidNumericValue)
+        );
+        assert_eq!(
+            resolve_interhunk_context(None, Some("-1")),
+            Err(InterHunkContextError::NegativeValue)
+        );
+    }
+
+    #[test]
+    fn interhunk_context_merges_complete_byte_rendering() {
+        let old = b"A\n1\nB\n";
+        let new = b"X\n1\nY\n";
+
+        let mut split = Vec::new();
+        let mut split_options = HunkRenderOptions {
+            context: 0,
+            ..Default::default()
+        };
+        render_hunks(&mut split, Some(old), Some(new), &mut split_options);
+        assert_eq!(split, b"@@ -1 +1 @@\n-A\n+X\n@@ -3 +3 @@\n-B\n+Y\n");
+
+        let mut merged = Vec::new();
+        let mut merged_options = HunkRenderOptions {
+            context: 0,
+            interhunk: 1,
+            ..Default::default()
+        };
+        render_hunks(&mut merged, Some(old), Some(new), &mut merged_options);
+        assert_eq!(merged, b"@@ -1,3 +1,3 @@\n-A\n+X\n 1\n-B\n+Y\n");
+    }
+
+    #[test]
     fn single_line_change_basic_hunk() {
         let out = render_plain(Some(b"alpha\nbeta\ngamma\n"), Some(b"alpha\nBETA\ngamma\n"));
         assert_eq!(
@@ -3281,6 +3419,19 @@ mod tests {
     fn pure_insertion_into_empty() {
         let out = render_plain(None, Some(b"x\ny\n"));
         assert_eq!(out, b"@@ -0,0 +1,2 @@\n+x\n+y\n".to_vec());
+    }
+
+    #[test]
+    fn suppress_blank_empty_omits_only_empty_context_indicator() {
+        let old = b"\nx\n";
+        let new = b"\ny\n";
+        let mut out = Vec::new();
+        let mut options = HunkRenderOptions {
+            suppress_blank_empty: true,
+            ..Default::default()
+        };
+        render_hunks(&mut out, Some(old), Some(new), &mut options);
+        assert_eq!(out, b"@@ -1,2 +1,2 @@\n\n-x\n+y\n");
     }
 
     #[test]

@@ -5,7 +5,7 @@ use super::create::{
     branch_create_reflog_message, branch_reset_reflog_message, branch_should_write_reflog,
     resolve_branch_start,
 };
-use super::operand::{branch_resolve_local_branch_operand, BranchOperandKind};
+use super::operand::{BranchOperandKind, branch_resolve_local_branch_operand};
 use crate::*;
 
 pub(super) struct BranchDeleteOptions {
@@ -175,6 +175,8 @@ pub(super) fn force_update_branch(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    config: &GitConfig,
+    replace_objects: bool,
     branch: &str,
     start: Option<&String>,
 ) -> Result<String> {
@@ -193,7 +195,7 @@ pub(super) fn force_update_branch(
         return Err(GitError::Exit(128));
     }
     let start_rev = start.map_or("HEAD", String::as_str);
-    let new_oid = resolve_branch_start(git_dir, format, store, start_rev)?;
+    let new_oid = resolve_branch_start(git_dir, format, store, replace_objects, start_rev)?;
     let previous = store.read_ref(&name)?;
     let reflog = match previous {
         Some(RefTarget::Direct(old_oid)) if old_oid == new_oid => None,
@@ -201,20 +203,20 @@ pub(super) fn force_update_branch(
             Some(ReflogEntry {
                 old_oid,
                 new_oid,
-                committer: commit_identity_from_env("COMMITTER")?,
+                committer: commit_identity_from_env("COMMITTER", config)?,
                 message: branch_reset_reflog_message(store, start)?,
             })
         }
         Some(_) if branch_should_write_reflog(git_dir, &name, false)? => Some(ReflogEntry {
             old_oid: zero_oid(format)?,
             new_oid,
-            committer: commit_identity_from_env("COMMITTER")?,
+            committer: commit_identity_from_env("COMMITTER", config)?,
             message: branch_reset_reflog_message(store, start)?,
         }),
         None if branch_should_write_reflog(git_dir, &name, false)? => Some(ReflogEntry {
             old_oid: ObjectId::null(format),
             new_oid,
-            committer: commit_identity_from_env("COMMITTER")?,
+            committer: commit_identity_from_env("COMMITTER", config)?,
             message: branch_create_reflog_message(store, start)?,
         }),
         _ => None,
@@ -233,7 +235,9 @@ pub(super) fn force_update_branch(
 pub(super) fn delete_merged_branches(
     git_dir: &Path,
     format: ObjectFormat,
+    db: &FileObjectDatabase,
     store: &FileRefStore,
+    replace_objects: bool,
     branches: &[String],
     quiet: bool,
 ) -> Result<()> {
@@ -242,12 +246,11 @@ pub(super) fn delete_merged_branches(
         return Err(GitError::Exit(128));
     }
 
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let config = read_repo_config(git_dir)?;
-    let head_reachable = resolve_revision(git_dir, format, "HEAD")
+    let head_reachable = resolve_revision(git_dir, format, "HEAD", replace_objects)
         .ok()
-        .and_then(|head| sley_rev::peel_to_commit(&db, format, &head).ok())
-        .map(|head| sley_rev::reachable_commit_oids(git_dir, format, &db, [head], false))
+        .and_then(|head| sley_rev::peel_to_commit(db, format, &head).ok())
+        .map(|head| sley_rev::reachable_commit_oids(git_dir, format, db, [head], false))
         .transpose()?;
 
     let mut failed = false;
@@ -277,7 +280,7 @@ pub(super) fn delete_merged_branches(
             failed = true;
             continue;
         };
-        let Ok(tip) = sley_rev::peel_to_commit(&db, format, &oid) else {
+        let Ok(tip) = sley_rev::peel_to_commit(db, format, &oid) else {
             eprintln!("error: branch '{branch}' not found");
             failed = true;
             continue;
@@ -285,7 +288,7 @@ pub(super) fn delete_merged_branches(
         let reachable = branch_delete_reachable_base(
             store,
             git_dir,
-            &db,
+            db,
             format,
             &config,
             &name,

@@ -21,7 +21,7 @@ fn diff_peel_rev_tree(
     db: &FileObjectDatabase,
     rev: &str,
 ) -> Result<ObjectId> {
-    let oid = resolve_revision(git_dir, format, rev)?;
+    let oid = sley_rev::RevisionResolver::new(git_dir, format, db).resolve(rev)?;
     sley_rev::peel_to_tree(db, format, &oid)
 }
 
@@ -31,7 +31,7 @@ pub(crate) fn diff_resolve_commit_arg(
     db: &FileObjectDatabase,
     rev: &str,
 ) -> Result<ObjectId> {
-    let oid = resolve_revision(git_dir, format, rev)?;
+    let oid = sley_rev::RevisionResolver::new(git_dir, format, db).resolve(rev)?;
     match sley_rev::peel_to_commit(db, format, &oid) {
         Ok(commit) => Ok(commit),
         Err(err) => {
@@ -74,10 +74,38 @@ fn diff_split_revisions(
     format: ObjectFormat,
     db: &FileObjectDatabase,
     path_args: Vec<String>,
+    combined_requested: bool,
 ) -> Result<(Vec<ObjectId>, Vec<String>)> {
     let Some(first) = path_args.first() else {
         return Ok((Vec::new(), Vec::new()));
     };
+    // `<merge>^!` names the merge result while excluding each parent. For
+    // diff, that is the native combined selection: result tree first, then
+    // every parent tree in commit order. A non-merge keeps ordinary two-tree
+    // semantics (parent -> result).
+    if let Some(base) = first.strip_suffix("^!")
+        && !base.is_empty()
+        && let Ok(commit_oid) = diff_resolve_commit_arg(git_dir, format, db, base)
+    {
+        let object = db.read_object(&commit_oid)?;
+        let commit = Commit::parse_ref(format, &object.body)?;
+        let parent_trees = commit
+            .parents
+            .iter()
+            .map(|parent| sley_rev::peel_to_tree(db, format, parent))
+            .collect::<Result<Vec<_>>>()?;
+        let trees = match parent_trees.as_slice() {
+            [] => vec![ObjectId::empty_tree(format), commit.tree],
+            [parent] => vec![*parent, commit.tree],
+            _ => {
+                let mut trees = Vec::with_capacity(parent_trees.len() + 1);
+                trees.push(commit.tree);
+                trees.extend(parent_trees);
+                trees
+            }
+        };
+        return Ok((trees, path_args[1..].to_vec()));
+    }
     // Range forms name exactly two trees and consume only the first token. Check
     // `...` before `..` so `A...B` is not mis-split, and require both sides so a
     // relative path like `../x` (left side empty) is never taken as a range.
@@ -135,13 +163,14 @@ fn diff_split_revisions(
     {
         return diff_usage_error();
     }
-    // Otherwise peel up to three leading args that each resolve as a revision.
-    // The three-tree form is a combined diff: result parent1 parent2.
+    // Otherwise peel leading args that each resolve as a revision. Explicit
+    // `-c`/`--cc` accepts one result plus an arbitrary parent count; ordinary
+    // diff retains its historical three-tree cap (result parent1 parent2).
     let mut trees = Vec::new();
     let mut rest = Vec::new();
     let mut iter = path_args.into_iter();
     for token in iter.by_ref() {
-        if trees.len() < 3
+        if (combined_requested || trees.len() < 3)
             && let Ok(tree) = diff_peel_rev_tree(git_dir, format, db, &token)
         {
             trees.push(tree);
@@ -169,7 +198,11 @@ fn diff_split_merge_base(
             eprintln!("fatal: --merge-base does not work with ranges");
             return Err(GitError::Exit(128));
         }
-        if commits.len() < 2 && resolve_revision(git_dir, format, &token).is_ok() {
+        if commits.len() < 2
+            && sley_rev::RevisionResolver::new(git_dir, format, db)
+                .resolve(&token)
+                .is_ok()
+        {
             let commit = diff_resolve_commit_arg(git_dir, format, db, &token)?;
             commits.push((commit, token));
             continue;
@@ -253,6 +286,182 @@ struct IndexBlobSpec {
     path: Vec<u8>,
     mode: u32,
     oid: ObjectId,
+}
+
+#[derive(Clone)]
+struct DirectBlobSpec {
+    path: Vec<u8>,
+    mode: u32,
+    oid: ObjectId,
+    content: Vec<u8>,
+    anonymous: bool,
+    file: bool,
+}
+
+fn diff_direct_blob_pair(
+    cwd: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    args: &[String],
+) -> Result<Option<(DirectBlobSpec, DirectBlobSpec)>> {
+    let pair = if args.len() == 1 {
+        let Some((left, right)) = args[0].split_once("..") else {
+            return Ok(None);
+        };
+        if left.is_empty() || right.is_empty() {
+            return Ok(None);
+        }
+        let Some(left) = resolve_direct_blob_source(cwd, git_dir, format, db, left, false)? else {
+            return Ok(None);
+        };
+        let Some(right) = resolve_direct_blob_source(cwd, git_dir, format, db, right, false)?
+        else {
+            return Ok(None);
+        };
+        (left, right)
+    } else if args.len() == 2 {
+        let Some(left) = resolve_direct_blob_source(cwd, git_dir, format, db, &args[0], true)?
+        else {
+            return Ok(None);
+        };
+        let Some(right) = resolve_direct_blob_source(cwd, git_dir, format, db, &args[1], true)?
+        else {
+            return Ok(None);
+        };
+        if left.file && right.file {
+            return Ok(None);
+        }
+        if left.file {
+            eprintln!("fatal: {}: no such path in the working tree.", args[1]);
+            eprintln!(
+                "Use 'git <command> -- <path>...' to specify paths that do not exist locally."
+            );
+            return Err(GitError::Exit(128));
+        }
+        (left, right)
+    } else {
+        return Ok(None);
+    };
+
+    let (mut left, mut right) = pair;
+    // `builtin_diff_b_f` treats the parsed object as the old side and borrows
+    // the worktree path/mode for an anonymous blob.
+    if left.anonymous && right.file {
+        left.path.clone_from(&right.path);
+        left.mode = right.mode;
+    } else if right.anonymous && left.file {
+        right.path.clone_from(&left.path);
+        right.mode = left.mode;
+    }
+    Ok(Some((left, right)))
+}
+
+fn resolve_direct_blob_source(
+    cwd: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    spec: &str,
+    allow_file: bool,
+) -> Result<Option<DirectBlobSpec>> {
+    if let Some((revision, path)) = spec.split_once(':')
+        && !revision.is_empty()
+        && !path.is_empty()
+        && let Ok(entry) = sley_rev::resolve_rev_path_entry(git_dir, format, db, revision, path)
+        && entry.object_type == ObjectType::Blob
+    {
+        let object = db.read_object(&entry.oid)?;
+        return Ok(Some(DirectBlobSpec {
+            path: path.as_bytes().to_vec(),
+            mode: entry.mode.unwrap_or(0o100644),
+            oid: entry.oid,
+            content: object.body.clone(),
+            anonymous: false,
+            file: false,
+        }));
+    }
+
+    if let Ok(oid) = sley_rev::RevisionResolver::new(git_dir, format, db).resolve(spec)
+        && let Ok(object) = db.read_object(&oid)
+        && object.object_type == ObjectType::Blob
+    {
+        return Ok(Some(DirectBlobSpec {
+            path: spec.as_bytes().to_vec(),
+            mode: 0o100644,
+            oid,
+            content: object.body.clone(),
+            anonymous: true,
+            file: false,
+        }));
+    }
+
+    if !allow_file {
+        return Ok(None);
+    }
+    let absolute = cwd.join(spec);
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    let file_type = metadata.file_type();
+    if !file_type.is_file() && !file_type.is_symlink() {
+        eprintln!("fatal: '{spec}': not a regular file or symlink");
+        return Err(GitError::Exit(128));
+    }
+    let content = if file_type.is_symlink() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            fs::read_link(&absolute)?.as_os_str().as_bytes().to_vec()
+        }
+        #[cfg(not(unix))]
+        {
+            fs::read(&absolute)?
+        }
+    } else {
+        fs::read(&absolute)?
+    };
+    let oid = sley_core::object_id_for_bytes(format, "blob", &content)?;
+    let mode = direct_blob_filesystem_mode(&absolute);
+    Ok(Some(DirectBlobSpec {
+        path: spec.as_bytes().to_vec(),
+        mode,
+        oid,
+        content,
+        anonymous: false,
+        file: true,
+    }))
+}
+
+#[cfg(unix)]
+fn direct_blob_filesystem_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::symlink_metadata(path)
+        .ok()
+        .map(|metadata| {
+            if metadata.file_type().is_symlink() {
+                0o120000
+            } else if metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 == 0 {
+                0o100644
+            } else if metadata.file_type().is_file() {
+                0o100755
+            } else if metadata.file_type().is_dir() {
+                0o040000
+            } else if metadata.file_type().is_fifo() {
+                0o010000
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0o100644)
+}
+
+#[cfg(not(unix))]
+fn direct_blob_filesystem_mode(_path: &Path) -> u32 {
+    0o100644
 }
 
 fn diff_index_blob_pair(
@@ -383,9 +592,12 @@ impl WhitespaceRuleResolver {
             },
             None => sley_diff_merge::ws::WS_DEFAULT_RULE,
         };
-        let matcher = worktree_root_for_git_dir(git_dir).ok().and_then(|root| {
-            sley_worktree::StandardAttributeMatcher::from_worktree_root(root).ok()
-        });
+        let matcher = sley_worktree::worktree_root_for_git_dir(git_dir)
+            .ok()
+            .flatten()
+            .and_then(|root| {
+                sley_worktree::StandardAttributeMatcher::from_worktree_root(root).ok()
+            });
         Ok(Self {
             config_rule,
             matcher,
@@ -478,6 +690,7 @@ pub(crate) fn run_diff_check(
     use_worktree_new: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
     resolver: &WhitespaceRuleResolver,
+    lazy_fetch: bool,
 ) -> Result<bool> {
     let mut stdout = io::stdout();
     let mut status = false;
@@ -488,8 +701,14 @@ pub(crate) fn run_diff_check(
         if entry.new_mode == Some(0o160000) {
             continue;
         }
-        let new_content =
-            diff_entry_new_content(entry, db, worktree_root, use_worktree_new, worktree_clean)?;
+        let new_content = diff_entry_new_content(
+            entry,
+            db,
+            worktree_root,
+            use_worktree_new,
+            worktree_clean,
+            lazy_fetch,
+        )?;
         let Some(new_content) = new_content else {
             continue;
         };
@@ -499,6 +718,7 @@ pub(crate) fn run_diff_check(
             worktree_root,
             use_worktree_old,
             worktree_clean,
+            lazy_fetch,
         )?
         .unwrap_or_default();
         let path = status_quote_path(&entry.path, false);
@@ -531,9 +751,10 @@ fn diff_entry_old_content_for_diff(
     worktree_root: Option<&Path>,
     use_worktree_old: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+    lazy_fetch: bool,
 ) -> Result<Option<Vec<u8>>> {
     if !use_worktree_old {
-        return diff_entry_old_content(entry, db);
+        return diff_entry_old_content(entry, db, lazy_fetch);
     }
     let Some(mode) = entry.old_mode else {
         return Ok(None);
@@ -711,15 +932,17 @@ fn run_external_diff_entries(
     entries: &[sley_diff_merge::NameStatusEntry],
     lookup_entries: &DiffRelativeLookupMap,
     db: &FileObjectDatabase,
+    cwd: &Path,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
     userdiff: &commands::userdiff::UserdiffResolver,
     global: Option<&ExternalDiffCommand>,
     options: ExternalDiffRunOptions<'_>,
+    lazy_fetch: bool,
 ) -> Result<Option<i32>> {
     let mut handled = false;
     let mut found_changes = false;
-    let git_prefix = external_diff_git_prefix(worktree_root);
+    let git_prefix = external_diff_git_prefix(cwd, worktree_root);
     let mut output_file = match options.output {
         Some(path) if !options.quiet => Some(
             fs::OpenOptions::new()
@@ -750,6 +973,7 @@ fn run_external_diff_entries(
             autocrlf: options.autocrlf,
             quiet: options.quiet,
             output_file: output_file.as_mut(),
+            lazy_fetch,
         };
         let rc = run_one_external_diff(
             entry,
@@ -807,6 +1031,7 @@ struct ExternalDiffProcessContext<'a> {
     autocrlf: bool,
     quiet: bool,
     output_file: Option<&'a mut fs::File>,
+    lazy_fetch: bool,
 }
 
 fn run_one_external_diff(
@@ -825,6 +1050,7 @@ fn run_one_external_diff(
         context.use_worktree_new,
         false,
         context.autocrlf,
+        context.lazy_fetch,
     )?;
     let new_file = prepare_external_diff_file(
         entry,
@@ -834,6 +1060,7 @@ fn run_one_external_diff(
         context.use_worktree_new,
         true,
         context.autocrlf,
+        context.lazy_fetch,
     )?;
     let path = String::from_utf8_lossy(&entry.path).into_owned();
     let old_hex = external_diff_oid(
@@ -883,9 +1110,8 @@ fn run_one_external_diff(
     Ok(status.code().unwrap_or(128))
 }
 
-fn external_diff_git_prefix(worktree_root: Option<&Path>) -> Option<String> {
+fn external_diff_git_prefix(cwd: &Path, worktree_root: Option<&Path>) -> Option<String> {
     let root = worktree_root?;
-    let cwd = env::current_dir().ok()?;
     let relative = cwd.strip_prefix(root).ok()?;
     if relative.as_os_str().is_empty() {
         return None;
@@ -931,6 +1157,7 @@ fn prepare_external_diff_file(
     use_worktree_new: bool,
     new_side: bool,
     autocrlf: bool,
+    lazy_fetch: bool,
 ) -> Result<ExternalDiffFile> {
     if new_side
         && use_worktree_new
@@ -946,9 +1173,16 @@ fn prepare_external_diff_file(
         }
     }
     let content = if new_side {
-        diff_entry_new_content(lookup_entry, db, worktree_root, use_worktree_new, None)?
+        diff_entry_new_content(
+            lookup_entry,
+            db,
+            worktree_root,
+            use_worktree_new,
+            None,
+            lazy_fetch,
+        )?
     } else {
-        diff_entry_old_content(lookup_entry, db)?
+        diff_entry_old_content(lookup_entry, db, lazy_fetch)?
     };
     let Some(content) = content else {
         return Ok(ExternalDiffFile {
@@ -1019,15 +1253,20 @@ fn unique_external_diff_temp_dir() -> Result<PathBuf> {
     ))
 }
 
-fn diff_should_use_implicit_no_index(path_args: &[String], explicit_paths: &[String]) -> bool {
+fn diff_should_use_implicit_no_index(
+    path_args: &[String],
+    explicit_paths: &[String],
+    outside_repository: bool,
+) -> bool {
     let total = path_args.len() + explicit_paths.len();
     if total != 2 {
         return false;
     }
-    path_args
-        .iter()
-        .chain(explicit_paths)
-        .any(|path| diff_arg_looks_outside_worktree(path))
+    outside_repository
+        || path_args
+            .iter()
+            .chain(explicit_paths)
+            .any(|path| diff_arg_looks_outside_worktree(path))
 }
 
 fn diff_arg_looks_outside_worktree(path: &str) -> bool {
@@ -1039,7 +1278,94 @@ fn diff_arg_looks_outside_worktree(path: &str) -> bool {
         .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
-pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
+pub(crate) fn resolve_diff_interhunk_context(
+    cli_value: Option<usize>,
+    repository: Option<&RepositoryContext>,
+    cli_session: &crate::session::CliSession,
+) -> Result<usize> {
+    let config = repository.map(RepositoryContext::config);
+    let config_value = config.and_then(|config| config.get("diff", None, "interhunkcontext"));
+    match sley_diff_merge::render::resolve_interhunk_context(cli_value, config_value) {
+        Ok(value) => Ok(value),
+        Err(
+            error @ (sley_diff_merge::render::InterHunkContextError::InvalidNumericValue
+            | sley_diff_merge::render::InterHunkContextError::OutOfRange),
+        ) => {
+            let value = config_value.unwrap_or_default();
+            let location = diff_interhunk_config_entry(repository, cli_session)?
+                .and_then(|entry| match entry.origin.kind {
+                    sley_config::ConfigOriginKind::File => {
+                        Some(format!(" in file {}", entry.origin.name))
+                    }
+                    sley_config::ConfigOriginKind::Blob => {
+                        Some(format!(" in blob {}", entry.origin.name))
+                    }
+                    sley_config::ConfigOriginKind::Stdin => Some(" in standard input".to_string()),
+                    sley_config::ConfigOriginKind::CommandLine => None,
+                })
+                .unwrap_or_default();
+            let kind = if matches!(
+                error,
+                sley_diff_merge::render::InterHunkContextError::OutOfRange
+            ) {
+                "out of range"
+            } else {
+                "invalid unit"
+            };
+            eprintln!(
+                "fatal: bad numeric config value '{value}' for 'diff.interhunkcontext'{location}: {kind}"
+            );
+            Err(GitError::Exit(128))
+        }
+        Err(sley_diff_merge::render::InterHunkContextError::NegativeValue) => {
+            let entry = diff_interhunk_config_entry(repository, cli_session)?;
+            match entry {
+                Some(entry) if entry.origin.kind == sley_config::ConfigOriginKind::File => {
+                    eprintln!(
+                        "fatal: bad config variable 'diff.interhunkcontext' in file '{}' at line {}",
+                        entry.origin.name,
+                        entry.line_number.unwrap_or(0)
+                    );
+                }
+                _ => eprintln!(
+                    "fatal: unable to parse 'diff.interhunkcontext' from command-line config"
+                ),
+            }
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn diff_interhunk_config_entry(
+    repository: Option<&RepositoryContext>,
+    cli_session: &crate::session::CliSession,
+) -> Result<Option<sley_config::ConfigStackEntry>> {
+    let Some(repository) = repository else {
+        return Ok(None);
+    };
+    let git_dir = repository.git_dir();
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(sley_config::git_dir_for_include_context(git_dir)),
+        crate::repo_current_branch_name(git_dir),
+    );
+    let config_path = git_dir.join("config");
+    let display_path = config_path
+        .strip_prefix(cli_session.cwd())
+        .unwrap_or(&config_path);
+    let mut stack = sley_config::ConfigStack::new();
+    stack.push_file(
+        display_path,
+        sley_config::ConfigScope::Local,
+        true,
+        &context,
+    )?;
+    let parameters = crate::injected_config_parameters()?;
+    stack.push_parameters_with_includes(&parameters, &context)?;
+    Ok(stack.get("diff", None, "interhunkcontext").cloned())
+}
+
+pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    let lazy_fetch = cli_session.lazy_fetch();
     let sley_rev::diff_options::DiffOptions {
         output_format,
         cached,
@@ -1168,7 +1494,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff pickaxe controls are not supported for this output mode".into(),
         ));
     }
-    if !find_object_values.is_empty() && crate::session::cli_git_dir().is_err() {
+    // Probe once because `diff --no-index` is valid outside a repository while
+    // every repository-backed mode must reuse one session-scoped facade.
+    let repository = RepositoryContext::from_session(cli_session);
+    let outside_repository = repository.is_err();
+    let interhunk =
+        resolve_diff_interhunk_context(interhunk, repository.as_ref().ok(), cli_session)?;
+    if !find_object_values.is_empty() && outside_repository {
         eprintln!("fatal: --find-object requires a git repository");
         return Err(GitError::Exit(128));
     }
@@ -1190,9 +1522,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff pickaxe regex matching is not supported".into(),
         ));
     }
-    let cwd = env::current_dir()?;
-    let implicit_no_index =
-        !no_index && diff_should_use_implicit_no_index(&path_args, &explicit_paths);
+    let cwd = cli_session.cwd().to_path_buf();
+    let implicit_no_index = !no_index
+        && diff_should_use_implicit_no_index(&path_args, &explicit_paths, outside_repository);
     if no_index || implicit_no_index {
         let mut paths = path_args;
         if head {
@@ -1211,6 +1543,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 raw_abbrev,
                 patch_abbrev,
                 patch_full_index,
+                patch_binary,
                 allow_external,
                 exit_code,
                 output: output.as_deref(),
@@ -1225,7 +1558,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 cli_src_prefix: cli_src_prefix.as_deref(),
                 cli_dst_prefix: cli_dst_prefix.as_deref(),
                 quiet,
-                interhunk: interhunk.unwrap_or(0),
+                interhunk,
                 ws_ignore,
                 diff_algorithm,
                 ignore_blank_lines,
@@ -1235,11 +1568,18 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 // to git's enabled-by-default behavior absent an explicit flag.
                 indent_heuristic: indent_heuristic.unwrap_or(true),
                 anchored: &anchored,
+                lazy_fetch,
             },
+            repository.as_ref().ok(),
         );
     }
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let repo_config = read_repo_config(&git_dir).ok();
+    let repo = repository?;
+    let git_dir = repo.git_dir().to_path_buf();
+    let repo_config = Some(repo.config().clone());
+    let suppress_blank_empty = repo_config
+        .as_ref()
+        .and_then(|config| config.get_bool("diff", None, "suppressblankempty"))
+        .unwrap_or(false);
     let resolved_context =
         sley_rev::diff_options::resolve_diff_context(context, repo_config.as_ref())?;
     let patch_context = if diff_patch_context_control {
@@ -1253,8 +1593,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         .as_ref()
         .and_then(|config| config.get_bool("core", None, "quotepath"))
         .unwrap_or(true);
-    let format = repository_object_format(&git_dir)?;
-    if let Ok(config) = read_repo_config(&git_dir) {
+    let format = repo.format();
+    if let Some(config) = repo_config.as_ref() {
         if let Some(value) = config.get("diff", None, "colormoved")
             && let Err(err) = log_validate_color_moved(value)
         {
@@ -1270,8 +1610,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     }
     let color_moved_mode = match color_moved {
         Some(mode) => mode,
-        None => match read_repo_config(&git_dir)
-            .ok()
+        None => match repo_config
+            .as_ref()
             .and_then(|config| config.get("diff", None, "colormoved").map(str::to_owned))
         {
             Some(value) => sley_rev::diff_options::parse_color_moved_mode(&value)?,
@@ -1280,8 +1620,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     };
     let color_moved_ws = match color_moved_ws {
         Some(ws) => ws,
-        None => match read_repo_config(&git_dir)
-            .ok()
+        None => match repo_config
+            .as_ref()
             .and_then(|config| config.get("diff", None, "colormovedws").map(str::to_owned))
         {
             Some(value) => sley_rev::diff_options::parse_color_moved_ws(&value)?,
@@ -1321,9 +1661,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     });
     let submodule_format =
         diff_submodule_format.unwrap_or(sley_rev::diff_options::SubmoduleDiffFormat::Short);
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    // A writable-capable view is cheap and shares the facade's pack/decoded
+    // caches; existing diff helpers take a concrete ODB reference.
+    let db = repo.repository().objects_mut();
     if !head
         && !merge_base
+        && !reverse
         && explicit_paths.is_empty()
         && let Some((left, right)) = diff_index_blob_pair(&git_dir, format, &path_args)?
     {
@@ -1464,6 +1807,83 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         }
         *opts = base;
     }
+    let direct_blob_patch = !head
+        && !cached
+        && !merge_base
+        && explicit_paths.is_empty()
+        && !quiet
+        && !color_always
+        && !patch_binary
+        && !raw
+        && !name_status
+        && !name_only
+        && !stat
+        && !numstat
+        && !shortstat
+        && !summary
+        && !check
+        && dirstat.is_none()
+        && !no_patch
+        && output.is_none()
+        && line_prefix.is_none()
+        && color_moved.is_none()
+        && word_diff_mode.is_none()
+        && anchored.is_empty()
+        && ws_ignore.is_empty()
+        && ignore_regexes.is_empty()
+        && !ignore_blank_lines;
+    if direct_blob_patch
+        && let Some((mut left, mut right)) =
+            diff_direct_blob_pair(&cwd, &git_dir, format, &db, &path_args)?
+    {
+        if reverse && right.file {
+            eprintln!("fatal: unable to read {}", zero_oid(format)?);
+            return Err(GitError::Exit(128));
+        }
+        if reverse {
+            std::mem::swap(&mut left, &mut right);
+        }
+        let mut stdout = io::stdout().lock();
+        sley_diff_merge::porcelain::render_blob_patch(
+            &mut stdout,
+            sley_diff_merge::porcelain::BlobDiffSide {
+                oid: left.oid,
+                mode: left.mode,
+                path: &left.path,
+                content: &left.content,
+            },
+            sley_diff_merge::porcelain::BlobDiffSide {
+                oid: right.oid,
+                mode: right.mode,
+                path: &right.path,
+                content: &right.content,
+            },
+            sley_diff_merge::porcelain::BlobPatchOptions {
+                object_format: format,
+                full_index: patch_full_index,
+                abbrev: patch_abbrev.unwrap_or(7),
+                src_prefix: if reverse {
+                    dst_prefix.as_bytes()
+                } else {
+                    src_prefix.as_bytes()
+                },
+                dst_prefix: if reverse {
+                    src_prefix.as_bytes()
+                } else {
+                    dst_prefix.as_bytes()
+                },
+                context: patch_context,
+                interhunk,
+                algorithm: diff_algorithm,
+                indent_heuristic,
+            },
+        )
+        .map_err(|error| GitError::Io(error.to_string()))?;
+        if exit_code && (left.oid != right.oid || left.mode != right.mode) {
+            return Err(GitError::Exit(1));
+        }
+        return Ok(());
+    }
     // Pull any leading `<rev>` / `<rev> <rev>` / `<rev>..<rev>` / `<rev>...<rev>`
     // out of the positional arguments; the remainder are pathspecs. Without this,
     // `diff A B` was treated as two paths and silently fell back to an
@@ -1479,27 +1899,33 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let (diff_trees, mut path_args) = if merge_base {
         diff_split_merge_base(&git_dir, format, &db, cached, path_args)?
     } else {
-        diff_split_revisions(&git_dir, format, &db, path_args)?
+        diff_split_revisions(&git_dir, format, &db, path_args, combined.is_some())?
     };
     path_args.extend(explicit_paths);
-    let find_objects = resolve_diff_find_objects(&git_dir, format, &find_object_values)?;
-    let no_output_mode = !raw
-        && !stat
-        && !compact_summary
-        && !numstat
-        && !shortstat
-        && !summary
-        && dirstat.is_none()
-        && !name_status
-        && !name_only;
-    let output_may_show_oids = !quiet && !no_patch && !name_only && !name_status;
-    let needs_raw_abbrev = output_may_show_oids && raw && raw_abbrev.is_none();
+    let find_objects = resolve_diff_find_objects(&git_dir, format, &db, &find_object_values)?;
+    let render_selection = sley_diff_merge::porcelain::select_render_formats(
+        sley_diff_merge::porcelain::RenderSelectionOptions {
+            default_output: sley_diff_merge::porcelain::DefaultDiffOutput::Patch,
+            raw,
+            patch,
+            name_status,
+            name_only,
+            stat: stat || compact_summary,
+            numstat,
+            shortstat,
+            summary,
+            auxiliary_format: dirstat.is_some(),
+            suppress_output: no_patch,
+        },
+    );
+    let output_may_show_oids = !quiet && (render_selection.raw || render_selection.patch);
+    let needs_raw_abbrev = output_may_show_oids && render_selection.raw && raw_abbrev.is_none();
     let needs_patch_abbrev = output_may_show_oids
-        && (patch || no_output_mode)
+        && render_selection.patch
         && !patch_full_index
         && patch_abbrev.is_none();
     let repository_abbrev = if needs_raw_abbrev || needs_patch_abbrev {
-        repository_abbrev(&git_dir, format)?
+        repo.abbrev()?
     } else {
         None
     };
@@ -1518,9 +1944,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .min(format.hex_len())
     };
     let worktree_root = if cached {
-        worktree_root_for_git_dir(&git_dir).ok()
+        repo.worktree_root().ok().map(Path::to_path_buf)
     } else {
-        Some(worktree_root_for_git_dir(&git_dir)?)
+        Some(repo.worktree_root()?.to_path_buf())
     };
     if !cached
         && diff_trees.len() != 2
@@ -1531,11 +1957,14 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let pathspec = if path_args.is_empty() {
         DiffPathspec::default()
     } else {
-        let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-        DiffPathspec::new(&cwd, &worktree_root, &path_args)?
+        let worktree_root = match worktree_root.as_deref() {
+            Some(root) => root,
+            None => repo.worktree_root()?,
+        };
+        DiffPathspec::new(&cwd, worktree_root, &path_args, repo.pathspec_magic())?
     };
-    if diff_trees.len() == 3 {
-        let has_differences = write_diff_combined_three_tree(
+    if diff_trees.len() >= 3 {
+        let has_differences = write_diff_combined_trees(
             &db,
             format,
             &diff_trees,
@@ -1553,6 +1982,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 diff_algorithm,
                 line_prefix: line_prefix.as_deref(),
                 orderfile: resolved_orderfile.as_deref(),
+                lazy_fetch,
             },
         )?;
         if (quiet || exit_code) && has_differences {
@@ -1610,10 +2040,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         diff.entries
                     } else {
                         sley_diff_merge::diff_name_status_tree_index_with_options(
-                            &git_dir,
-                            format,
-                            tree,
-                            options,
+                            &git_dir, format, tree, options,
                         )?
                     }
                 } else {
@@ -1644,21 +2071,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 if inexact_renames {
                     let diff =
                         sley_diff_merge::diff_name_status_trees_with_options_and_diagnostics(
-                        &db,
-                        format,
-                        left,
-                        right,
-                        options,
-                    )?;
+                            &db, format, left, right, options,
+                        )?;
                     rename_limit_diagnostics = diff.rename_limit;
                     diff.entries
                 } else {
                     sley_diff_merge::diff_name_status_trees_with_options(
-                        &db,
-                        format,
-                        left,
-                        right,
-                        options,
+                        &db, format, left, right, options,
                     )?
                 }
             }
@@ -1670,20 +2089,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         }
     } else if cached {
         if inexact_renames {
-            let diff =
-                sley_diff_merge::diff_name_status_head_index_with_options_and_diagnostics(
-                    &git_dir,
-                    format,
-                    options,
-                )?;
+            let diff = sley_diff_merge::diff_name_status_head_index_with_options_and_diagnostics(
+                &git_dir, format, options,
+            )?;
             rename_limit_diagnostics = diff.rename_limit;
             diff.entries
         } else {
-            sley_diff_merge::diff_name_status_head_index_with_options(
-                &git_dir,
-                format,
-                options,
-            )?
+            sley_diff_merge::diff_name_status_head_index_with_options(&git_dir, format, options)?
         }
     } else if head {
         let head_tree = diff_peel_rev_tree(&git_dir, format, &db, "HEAD")?;
@@ -1753,8 +2165,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let (entries, dirty_submodules) = if skip_submodule_work {
         (entries, HashMap::new())
     } else {
-        let submodule_config =
-            submodule_diff_config(&git_dir, worktree_root.as_deref(), ignore_submodules_cli);
+        let submodule_config = submodule_diff_config_with_config(
+            &git_dir,
+            worktree_root.as_deref(),
+            ignore_submodules_cli,
+            repo_config.as_ref(),
+        );
         let mut entries = apply_submodule_ignore_filter(entries, &submodule_config);
         let dirty_submodules = match (use_worktree_new, worktree_root.as_deref()) {
             (true, Some(root)) => collect_dirty_submodules(
@@ -1793,6 +2209,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             worktree_root.as_deref(),
             use_worktree_new,
             worktree_clean.as_ref(),
+            lazy_fetch,
         )?
     } else if pickaxe_all || pickaxe_regex {
         sort_diff_entries_by_path(entries)
@@ -1814,7 +2231,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let entries = if matches!(diff_relative, sley_rev::diff_options::DiffRelativeMode::Off) {
         entries
     } else {
-        let prefix = diff_relative_prefix(&diff_relative, &cwd, &git_dir)?;
+        let prefix = diff_relative_prefix(cli_session, &diff_relative, &cwd, &git_dir)?;
         let (entries, lookups) = apply_diff_relative(entries, &prefix);
         relative_lookup_entries = lookups;
         entries
@@ -1865,11 +2282,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 worktree_root.as_deref(),
                 use_worktree_new,
                 worktree_clean.as_ref(),
-                interhunk.unwrap_or(0),
+                interhunk,
                 patch_context,
                 ws_ignore,
                 ignore_blank_lines,
                 &ignore_regexes,
+                lazy_fetch,
             )? {
                 visible.push(entry);
             }
@@ -1911,6 +2329,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             use_worktree_new,
             worktree_clean.as_ref(),
             &resolver,
+            lazy_fetch,
         )?;
         let mut code = 0;
         if check_failed {
@@ -1924,10 +2343,10 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
-    let show_patch_for_external = !name_only && !name_status && (patch || no_output_mode);
-    if allow_external && show_patch_for_external && !no_patch {
-        let userdiff_attributes = worktree_root_for_git_dir(&git_dir)
-            .ok()
+    let show_patch_for_external = render_selection.patch;
+    if allow_external && show_patch_for_external {
+        let userdiff_attributes = worktree_root
+            .as_deref()
             .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
             .transpose()?;
         let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
@@ -1939,6 +2358,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             &entries,
             &relative_lookup_entries,
             &db,
+            &cwd,
             worktree_root.as_deref(),
             use_worktree_new,
             &userdiff,
@@ -1952,6 +2372,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     .and_then(|config| config.get_bool("core", None, "autocrlf"))
                     .unwrap_or(false),
             },
+            lazy_fetch,
         )? {
             if code != 0 {
                 return Err(GitError::Exit(code));
@@ -1961,13 +2382,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     }
     if !quiet && !no_patch {
         let mut stdout = Vec::new();
-        let show_raw = raw && !name_only && !name_status;
-        let show_numstat = numstat && !name_only && !name_status;
-        let show_stat = (stat || compact_summary) && !name_only && !name_status;
-        let show_shortstat = shortstat && !name_only && !name_status;
-        let show_patch = !name_only && !name_status && (patch || no_output_mode);
-        let show_summary = summary && !name_only && !name_status;
-        let stat_entries = if show_numstat || show_stat || show_shortstat {
+        let show_raw = render_selection.raw;
+        let show_numstat = render_selection.numstat;
+        let show_stat = render_selection.stat;
+        let show_shortstat = render_selection.shortstat;
+        let show_patch = render_selection.patch;
+        let show_summary = render_selection.summary;
+        let stat_entries = if render_selection.needs_line_stats() {
             let mut stat_entries = if ignore_active {
                 collect_diff_stat_entries_with_ignore(
                     &entries,
@@ -1983,6 +2404,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         diff_algorithm,
                         indent_heuristic,
                     },
+                    lazy_fetch,
                 )?
             } else if !relative_lookup_entries.is_empty() {
                 collect_diff_stat_entries_with_lookup(
@@ -1992,6 +2414,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     worktree_root.as_deref(),
                     use_worktree_new,
                     worktree_clean.as_ref(),
+                    lazy_fetch,
                 )?
             } else {
                 collect_diff_stat_entries_with_worktree_clean(
@@ -2000,6 +2423,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     worktree_root.as_deref(),
                     use_worktree_new,
                     worktree_clean.as_ref(),
+                    lazy_fetch,
                 )?
             };
             if diff_rewrite_control {
@@ -2010,6 +2434,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     worktree_root.as_deref(),
                     use_worktree_new,
                     worktree_clean.as_ref(),
+                    lazy_fetch,
                 )?;
             }
             Some(stat_entries)
@@ -2068,6 +2493,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     use_worktree_new,
                     worktree_clean.as_ref(),
                     dirstat_options,
+                    lazy_fetch,
                 )?;
             }
             Ok(())
@@ -2089,8 +2515,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             // `diff.<name>.*` config) for hunk headings. Attributes always come
             // from the real worktree, even when the content comparison is
             // `--cached`.
-            let userdiff_attributes = worktree_root_for_git_dir(&git_dir)
-                .ok()
+            let userdiff_attributes = worktree_root
+                .as_deref()
                 .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
                 .transpose()?;
             let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
@@ -2134,21 +2560,18 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                             quote_path_fully,
                         },
                         widths: Some(resolved_stat_widths),
+                        config: None,
                     },
                     after_stat: Some(&mut render_dirstat),
                     prefix_already_written: false,
                 },
                 |entry| {
-                    let lookup_entry =
-                        diff_relative_lookup_entry(entry, &relative_lookup_entries);
+                    let lookup_entry = diff_relative_lookup_entry(entry, &relative_lookup_entries);
                     zero_all_worktree_oids
                         || (zero_worktree_oids
-                            && lookup_entry
-                                .new_oid
-                                .as_ref()
-                                .is_none_or(|oid| {
-                                    index_oids.get(&lookup_entry.path[..]) != Some(oid)
-                                }))
+                            && lookup_entry.new_oid.as_ref().is_none_or(|oid| {
+                                index_oids.get(&lookup_entry.path[..]) != Some(oid)
+                            }))
                 },
                 |stdout, entry| {
                     if cached_unmerged_paths.contains(entry.path.as_bytes()) {
@@ -2165,6 +2588,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                                 patch_abbrev,
                                 &src_prefix,
                                 &dst_prefix,
+                                lazy_fetch,
                             )?;
                         }
                         return Ok(());
@@ -2185,13 +2609,10 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         }
                         _ => None,
                     };
-                    let lookup_entry =
-                        diff_relative_lookup_entry(entry, &relative_lookup_entries);
+                    let lookup_entry = diff_relative_lookup_entry(entry, &relative_lookup_entries);
                     let relative_materialized = !relative_lookup_entries.is_empty();
                     let materialized_contents = if !is_gitlink_pair(lookup_entry)
-                        && (relative_materialized
-                            || use_worktree_old
-                            || worktree_clean.is_some())
+                        && (relative_materialized || use_worktree_old || worktree_clean.is_some())
                     {
                         Some((
                             diff_entry_old_content_for_diff(
@@ -2200,6 +2621,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                                 worktree_root.as_deref(),
                                 use_worktree_old,
                                 worktree_clean.as_ref(),
+                                lazy_fetch,
                             )?,
                             diff_entry_new_content(
                                 lookup_entry,
@@ -2207,6 +2629,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                                 worktree_root.as_deref(),
                                 use_worktree_new,
                                 worktree_clean.as_ref(),
+                                lazy_fetch,
                             )?,
                         ))
                     } else {
@@ -2217,8 +2640,10 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         .map(|(old, new)| (old.as_deref(), new.as_deref()));
                     let options = DiffRenderOptions {
                         line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                        suppress_blank_empty,
                         binary: patch_binary,
                         db: &db,
+                        lazy_fetch,
                         worktree_root: worktree_root.as_deref(),
                         use_worktree_new,
                         format,
@@ -2235,7 +2660,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                         submodule_dirt: Some(&dirty_submodules),
                         ws_error,
                         color_moved,
-                        interhunk: interhunk.unwrap_or(0),
+                        interhunk,
                         ws_ignore,
                         diff_algorithm,
                         ignore_blank_lines,
@@ -2278,21 +2703,18 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                             quote_path_fully,
                         },
                         widths: Some(resolved_stat_widths),
+                        config: None,
                     },
                     after_stat: Some(&mut render_dirstat),
                     prefix_already_written: false,
                 },
                 |entry| {
-                    let lookup_entry =
-                        diff_relative_lookup_entry(entry, &relative_lookup_entries);
+                    let lookup_entry = diff_relative_lookup_entry(entry, &relative_lookup_entries);
                     zero_all_worktree_oids
                         || (zero_worktree_oids
-                            && lookup_entry
-                                .new_oid
-                                .as_ref()
-                                .is_none_or(|oid| {
-                                    index_oids.get(&lookup_entry.path[..]) != Some(oid)
-                                }))
+                            && lookup_entry.new_oid.as_ref().is_none_or(|oid| {
+                                index_oids.get(&lookup_entry.path[..]) != Some(oid)
+                            }))
                 },
                 |_, _| Ok(()),
             )?;
@@ -2387,17 +2809,17 @@ struct CombinedDiffOptions<'a> {
     /// `-O<orderfile>` / `diff.orderfile`: reorder the combined paths by the
     /// orderfile patterns (`diffcore_order` runs for combined diffs too).
     orderfile: Option<&'a str>,
+    lazy_fetch: bool,
 }
 
-fn write_diff_combined_three_tree(
+fn write_diff_combined_trees(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     trees: &[ObjectId],
     pathspec: &DiffPathspec,
     options: CombinedDiffOptions<'_>,
 ) -> Result<bool> {
-    let parent_trees = [trees[1], trees[2]];
-    let mut paths = commands::combined::combined_paths(db, format, &trees[0], &parent_trees)?;
+    let mut paths = commands::combined::combined_paths(db, format, &trees[0], &trees[1..])?;
     paths.retain(|path| pathspec.matches(&path.path));
     if paths.is_empty() {
         return Ok(false);
@@ -2422,8 +2844,22 @@ fn write_diff_combined_three_tree(
     let no_output = options
         .output_format
         .contains(sley_rev::diff_options::DiffOutputFormat::NO_OUTPUT);
-    let no_output_mode = !raw && !name_status && !name_only && !patch && !no_output;
-    let show_patch = !name_status && !name_only && (patch || no_output_mode);
+    let selection = sley_diff_merge::porcelain::select_render_formats(
+        sley_diff_merge::porcelain::RenderSelectionOptions {
+            default_output: sley_diff_merge::porcelain::DefaultDiffOutput::Patch,
+            raw,
+            patch,
+            name_status,
+            name_only,
+            stat: false,
+            numstat: false,
+            shortstat: false,
+            summary: false,
+            auxiliary_format: false,
+            suppress_output: no_output,
+        },
+    );
+    let show_patch = selection.patch;
 
     let render_ctx = commands::combined::CombinedRenderCtx {
         db,
@@ -2437,19 +2873,20 @@ fn write_diff_combined_three_tree(
         dst_prefix: options.dst_prefix,
         patch_abbrev: options.patch_abbrev,
         raw_abbrev: options.raw_abbrev,
+        lazy_fetch: options.lazy_fetch,
     };
     let mut out = Vec::new();
-    if raw && !name_status && !name_only {
+    if selection.raw {
         for path in &paths {
             commands::combined::write_combined_raw(&mut out, &render_ctx, path, options.z)?;
         }
     }
-    if name_status {
+    if selection.name_status {
         for path in &paths {
-            commands::combined::write_combined_name_status(&mut out, path, options.z)?;
+            commands::combined::write_combined_name_status(&mut out, path, false, options.z)?;
         }
     }
-    if name_only {
+    if selection.name_only {
         for path in &paths {
             if options.z {
                 out.write_all(&path.path)?;
@@ -2460,7 +2897,7 @@ fn write_diff_combined_three_tree(
         }
     }
     if show_patch {
-        if raw {
+        if selection.separates_patch_from_prefix() {
             writeln!(out)?;
         }
         for path in &paths {
@@ -2477,10 +2914,7 @@ fn write_diff_combined_three_tree(
     Ok(!out.is_empty())
 }
 
-fn diff_unmerged_index_paths(
-    git_dir: &Path,
-    format: ObjectFormat,
-) -> Result<BTreeSet<Vec<u8>>> {
+fn diff_unmerged_index_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet<Vec<u8>>> {
     let index_path = sley_worktree::repository_index_path(git_dir);
     if !index_path.exists() {
         return Ok(BTreeSet::new());
@@ -2554,9 +2988,10 @@ fn write_diff_unmerged_worktree_combined(
     abbrev: usize,
     src_prefix: &str,
     dst_prefix: &str,
+    lazy_fetch: bool,
 ) -> Result<()> {
-    let ours = read_blob(db, &path.ours)?;
-    let theirs = read_blob(db, &path.theirs)?;
+    let ours = read_blob(db, &path.ours, lazy_fetch)?;
+    let theirs = read_blob(db, &path.theirs, lazy_fetch)?;
     let ours_lines = diff_split_lines(&ours);
     let theirs_lines = diff_split_lines(&theirs);
     let worktree_lines = diff_split_lines(&path.worktree);
@@ -2684,6 +3119,7 @@ pub(crate) fn apply_diff_pickaxe(
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+    lazy_fetch: bool,
 ) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
     if needle.is_empty() {
         return Ok(Vec::new());
@@ -2697,6 +3133,7 @@ pub(crate) fn apply_diff_pickaxe(
                 worktree_root,
                 use_worktree_new,
                 worktree_clean,
+                lazy_fetch,
             )? {
                 return Ok(sort_diff_entries_by_path(entries));
             }
@@ -2713,6 +3150,7 @@ pub(crate) fn apply_diff_pickaxe(
             worktree_root,
             use_worktree_new,
             worktree_clean,
+            lazy_fetch,
         )? {
             matches.push(entry.clone());
         }
@@ -2727,10 +3165,17 @@ fn diff_entry_matches_pickaxe(
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+    lazy_fetch: bool,
 ) -> Result<bool> {
-    let old_content = diff_entry_old_content(entry, db)?;
-    let new_content =
-        diff_entry_new_content(entry, db, worktree_root, use_worktree_new, worktree_clean)?;
+    let old_content = diff_entry_old_content(entry, db, lazy_fetch)?;
+    let new_content = diff_entry_new_content(
+        entry,
+        db,
+        worktree_root,
+        use_worktree_new,
+        worktree_clean,
+        lazy_fetch,
+    )?;
     Ok(
         count_non_overlapping_occurrences(old_content.as_deref().unwrap_or_default(), needle)
             != count_non_overlapping_occurrences(
@@ -2743,20 +3188,27 @@ fn diff_entry_matches_pickaxe(
 pub(crate) fn resolve_diff_find_objects(
     git_dir: &Path,
     format: ObjectFormat,
+    db: &FileObjectDatabase,
     values: &[String],
 ) -> Result<Vec<ObjectId>> {
     values
         .iter()
-        .map(|value| resolve_diff_find_object(git_dir, format, value))
+        .map(|value| resolve_diff_find_object(git_dir, format, db, value))
         .collect()
 }
 
-fn resolve_diff_find_object(git_dir: &Path, format: ObjectFormat, value: &str) -> Result<ObjectId> {
+fn resolve_diff_find_object(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    value: &str,
+) -> Result<ObjectId> {
     if value.len() == format.hex_len() && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return ObjectId::from_hex(format, value)
             .map_err(|_| diff_find_object_unable_to_resolve_error(value));
     }
-    resolve_revision(git_dir, format, value)
+    sley_rev::RevisionResolver::new(git_dir, format, db)
+        .resolve(value)
         .map_err(|_| diff_find_object_unable_to_resolve_error(value))
 }
 
@@ -2821,16 +3273,19 @@ fn diff_find_object_pickaxe_all_conflict_error() -> Result<()> {
 }
 
 fn diff_relative_prefix(
+    cli_session: &crate::session::CliSession,
     mode: &sley_rev::diff_options::DiffRelativeMode,
     cwd: &Path,
     git_dir: &Path,
 ) -> Result<Vec<u8>> {
     match mode {
         sley_rev::diff_options::DiffRelativeMode::Off => Ok(Vec::new()),
-        sley_rev::diff_options::DiffRelativeMode::Cwd => Ok(worktree_prefix(cwd, git_dir)?
-            .trim_end_matches('/')
-            .as_bytes()
-            .to_vec()),
+        sley_rev::diff_options::DiffRelativeMode::Cwd => {
+            Ok(worktree_prefix(cli_session, cwd, git_dir)?
+                .trim_end_matches('/')
+                .as_bytes()
+                .to_vec())
+        }
         sley_rev::diff_options::DiffRelativeMode::Prefix(prefix) => {
             Ok(diff_relative_prefix_arg(prefix).into_bytes())
         }
@@ -3041,17 +3496,19 @@ fn collect_diff_stat_entries_with_ignore<'a>(
     use_worktree_new: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
     ignore: DiffStatIgnoreOptions<'_>,
+    lazy_fetch: bool,
 ) -> Result<Vec<DiffStatEntryData<'a>>> {
     let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         let lookup_entry = diff_relative_lookup_entry(entry, lookup_entries);
-        let old_content = diff_entry_old_content(lookup_entry, db)?;
+        let old_content = diff_entry_old_content(lookup_entry, db, lazy_fetch)?;
         let new_content = diff_entry_new_content(
             lookup_entry,
             db,
             worktree_root,
             use_worktree_new,
             worktree_clean,
+            lazy_fetch,
         )?;
         let stats = if old_content.as_deref().is_some_and(is_binary_content)
             || new_content.as_deref().is_some_and(is_binary_content)
@@ -3080,17 +3537,19 @@ fn collect_diff_stat_entries_with_lookup<'a>(
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+    lazy_fetch: bool,
 ) -> Result<Vec<DiffStatEntryData<'a>>> {
     let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         let lookup_entry = diff_relative_lookup_entry(entry, lookup_entries);
-        let old_content = diff_entry_old_content(lookup_entry, db)?;
+        let old_content = diff_entry_old_content(lookup_entry, db, lazy_fetch)?;
         let new_content = diff_entry_new_content(
             lookup_entry,
             db,
             worktree_root,
             use_worktree_new,
             worktree_clean,
+            lazy_fetch,
         )?;
         let stats = diff_line_stats(old_content.as_deref(), new_content.as_deref());
         stat_entries.push(DiffStatEntryData { entry, stats });
@@ -3105,19 +3564,21 @@ fn apply_diff_break_rewrite_stats(
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+    lazy_fetch: bool,
 ) -> Result<()> {
     for data in entries {
         if !matches!(data.entry.status, sley_diff_merge::NameStatus::Modified) {
             continue;
         }
         let lookup_entry = diff_relative_lookup_entry(data.entry, lookup_entries);
-        let old_content = diff_entry_old_content(lookup_entry, db)?;
+        let old_content = diff_entry_old_content(lookup_entry, db, lazy_fetch)?;
         let new_content = diff_entry_new_content(
             lookup_entry,
             db,
             worktree_root,
             use_worktree_new,
             worktree_clean,
+            lazy_fetch,
         )?;
         let (Some(old), Some(new)) = (old_content.as_deref(), new_content.as_deref()) else {
             continue;
@@ -3194,6 +3655,7 @@ struct DiffNoIndexParams<'a> {
     raw_abbrev: Option<Option<usize>>,
     patch_abbrev: Option<usize>,
     patch_full_index: bool,
+    patch_binary: bool,
     allow_external: bool,
     exit_code: bool,
     output: Option<&'a str>,
@@ -3215,6 +3677,7 @@ struct DiffNoIndexParams<'a> {
     ignore_regexes: &'a [sley_grep::Regex],
     indent_heuristic: bool,
     anchored: &'a [Vec<u8>],
+    lazy_fetch: bool,
 }
 
 struct NoIndexSide {
@@ -3243,16 +3706,18 @@ enum NoIndexPathKind {
 /// `git diff --no-index <path> <path>`: compare two files outside (or beside)
 /// the object database. Attributes and `diff.*` config still apply when the
 /// command runs inside a repository. Exits 1 when the files differ.
-fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>) -> Result<()> {
+fn cmd_diff_no_index(
+    cwd: &Path,
+    paths: &[String],
+    params: DiffNoIndexParams<'_>,
+    repository: Option<&RepositoryContext>,
+) -> Result<()> {
     if paths.len() < 2 {
         eprintln!("usage: git diff --no-index [<options>] <path> <path>");
         return Err(GitError::Exit(129));
     }
-    let git_dir = crate::session::cli_git_dir_from(&cwd).ok();
-    let format = git_dir
-        .as_deref()
-        .map(repository_object_format)
-        .transpose()?
+    let format = repository
+        .map(RepositoryContext::format)
         .unwrap_or(ObjectFormat::Sha1);
     let mut entries = no_index_entries(&paths[0], &paths[1], &paths[2..], format)?;
     if params.reverse {
@@ -3263,16 +3728,12 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
     }
     // Repository context is optional: when present, .gitattributes drivers,
     // diff.<name>.* config, and color overrides all apply.
-    let config = git_dir
-        .as_deref()
-        .and_then(|dir| read_repo_config(dir).ok());
+    let config = repository.map(|repository| repository.config().clone());
     let (mut src_prefix, mut dst_prefix) = no_index_resolve_prefixes(config.as_ref(), &params);
     if params.reverse {
         std::mem::swap(&mut src_prefix, &mut dst_prefix);
     }
-    let worktree_root = git_dir
-        .as_deref()
-        .and_then(|dir| worktree_root_for_git_dir(dir).ok());
+    let worktree_root = repository.and_then(|repository| repository.worktree_root().ok());
     let colors = params
         .color
         .then(|| commands::diff_words::DiffColors::enabled(config.as_ref()));
@@ -3306,8 +3767,15 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
     });
     // A throwaway object database handle: content reads are overridden, so it
     // is never consulted.
-    let scratch_git_dir = git_dir.clone().unwrap_or_else(|| cwd.to_path_buf());
-    let db = FileObjectDatabase::from_git_dir(&scratch_git_dir, format);
+    let scratch_db;
+    let db = if let Some(repository) = repository {
+        repository.objects()
+    } else {
+        // Outside a repository the patch renderer still requires an ODB
+        // service, although no-index provides every content side explicitly.
+        scratch_db = FileObjectDatabase::from_git_dir(cwd, format);
+        &scratch_db
+    };
     let raw = params
         .output_format
         .contains(sley_rev::diff_options::DiffOutputFormat::RAW);
@@ -3326,17 +3794,33 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
     let no_output = params
         .output_format
         .contains(sley_rev::diff_options::DiffOutputFormat::NO_OUTPUT);
+    let selection = sley_diff_merge::porcelain::select_render_formats(
+        sley_diff_merge::porcelain::RenderSelectionOptions {
+            default_output: sley_diff_merge::porcelain::DefaultDiffOutput::Patch,
+            raw,
+            patch,
+            name_status,
+            name_only,
+            stat: false,
+            numstat,
+            shortstat: false,
+            summary: false,
+            auxiliary_format: false,
+            suppress_output: no_output,
+        },
+    );
     let userdiff_attributes = worktree_root
         .as_ref()
         .map(|root| sley_worktree::StandardAttributeMatcher::from_worktree_root(root))
         .transpose()?;
     let userdiff =
         commands::userdiff::UserdiffResolver::with_attributes(userdiff_attributes, config.clone());
-    let show_patch_for_external = !name_only && !name_status && (patch || (!raw && !no_output));
-    if params.allow_external && show_patch_for_external && !no_output {
+    let show_patch_for_external = selection.patch;
+    if params.allow_external && show_patch_for_external {
         let global_external = global_external_diff_command(config.as_ref());
         if let Some(code) = run_external_diff_no_index_entries(
             &entries,
+            format,
             &userdiff,
             global_external.as_ref(),
             ExternalDiffRunOptions {
@@ -3363,10 +3847,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
             Some(width) => width.map(|width| width.min(format.hex_len())),
             None => Some(7),
         };
-        let repository_abbrev = git_dir
-            .as_deref()
-            .map(|dir| repository_abbrev(dir, format))
-            .transpose()?;
+        let repository_abbrev = repository.map(RepositoryContext::abbrev).transpose()?;
         let patch_abbrev = if params.patch_full_index {
             format.hex_len()
         } else if let Some(width) = params.patch_abbrev {
@@ -3378,7 +3859,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                 None => 7.min(format.hex_len()),
             }
         };
-        if raw && !name_status && !name_only {
+        if selection.raw {
             for entry in &entries {
                 write_diff_raw_entry(
                     &mut stdout,
@@ -3390,7 +3871,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                 )?;
             }
         }
-        if name_status {
+        if selection.name_status {
             for entry in &entries {
                 if params.z {
                     stdout.write_all(entry.entry.status.label().as_bytes())?;
@@ -3407,7 +3888,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                 }
             }
         }
-        if name_only {
+        if selection.name_only {
             for entry in &entries {
                 if params.z {
                     stdout.write_all(&entry.entry.path)?;
@@ -3417,28 +3898,33 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
                 }
             }
         }
-        if numstat {
+        if selection.numstat {
             for entry in &entries {
                 let stats =
                     diff_line_stats(entry.old_content.as_deref(), entry.new_content.as_deref());
                 write_diff_numstat_materialized_entry(&mut stdout, &entry.entry, stats, params.z)?;
             }
         }
-        if raw || name_status || name_only || numstat || no_output {
+        if selection.raw
+            || selection.name_status
+            || selection.name_only
+            || selection.numstat
+            || no_output
+        {
             return Err(GitError::Exit(1));
         }
-        let show_patch =
-            patch || params.output_format == sley_rev::diff_options::DiffOutputFormat::empty();
-        if !show_patch {
+        if !selection.patch {
             return Err(GitError::Exit(1));
         }
         for entry in &entries {
             let options = DiffRenderOptions {
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
-                binary: false,
+                suppress_blank_empty: false,
+                binary: params.patch_binary,
                 anchors: params.anchored,
                 allow_textconv: true,
-                db: &db,
+                db,
+                lazy_fetch: params.lazy_fetch,
                 worktree_root: None,
                 use_worktree_new: false,
                 format,
@@ -3936,6 +4422,7 @@ fn no_index_resolve_prefixes(
 
 fn run_external_diff_no_index_entries(
     entries: &[NoIndexEntry],
+    format: ObjectFormat,
     userdiff: &commands::userdiff::UserdiffResolver,
     global: Option<&ExternalDiffCommand>,
     options: ExternalDiffRunOptions<'_>,
@@ -3965,6 +4452,7 @@ fn run_external_diff_no_index_entries(
         }
         let rc = run_one_external_diff_no_index(
             entry,
+            format,
             &command,
             idx + 1,
             entries.len(),
@@ -3997,6 +4485,7 @@ fn run_external_diff_no_index_entries(
 
 fn run_one_external_diff_no_index(
     entry: &NoIndexEntry,
+    format: ObjectFormat,
     command: &ExternalDiffCommand,
     counter: usize,
     total: usize,
@@ -4009,8 +4498,8 @@ fn run_one_external_diff_no_index(
     let new_path = String::from_utf8_lossy(&entry.entry.path).into_owned();
     let old_file = external_no_index_file(&old_path, entry.old_content.as_deref(), autocrlf)?;
     let new_file = external_no_index_file(&new_path, entry.new_content.as_deref(), autocrlf)?;
-    let old_hex = ObjectId::null(ObjectFormat::Sha1).to_hex();
-    let new_hex = ObjectId::null(ObjectFormat::Sha1).to_hex();
+    let old_hex = ObjectId::null(format).to_hex();
+    let new_hex = ObjectId::null(format).to_hex();
     let old_mode = external_diff_mode(entry.entry.old_mode);
     let new_mode = external_diff_mode(entry.entry.new_mode);
     let args = [

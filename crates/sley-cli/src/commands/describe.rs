@@ -80,7 +80,7 @@ pub(crate) fn describe_for_format(
         return Ok(Some(describe_tag_output_name(best, &options)));
     }
 
-    let search = describe_search(format, db, &options, &tags.by_commit, target)?;
+    let search = describe_search(git_dir, format, db, &options, &tags.by_commit, target)?;
     let Some((best, _traversed)) = search.found else {
         return Ok(None);
     };
@@ -100,7 +100,10 @@ pub(crate) fn describe_for_format(
     }
 }
 
-pub(crate) fn cmd_describe(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_describe(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut options = DescribeOptions::default();
     let mut commits: Vec<String> = Vec::new();
     let mut positional_only = false;
@@ -197,7 +200,7 @@ pub(crate) fn cmd_describe(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     if options.contains {
-        return describe_contains(&options, &commits);
+        return describe_contains(cli_session, &options, &commits);
     }
     if options.dirty.is_some() && !commits.is_empty() {
         eprintln!("fatal: option '--dirty' and commit-ishes cannot be used together");
@@ -208,10 +211,11 @@ pub(crate) fn cmd_describe(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let repo = RepositoryContext::discover_current()?;
-    let git_dir = repo.git_dir();
-    let format = repo.format();
-    let db = repo.objects();
+    let repo = RepositoryContext::from_session(cli_session)?;
+    let repository = repo.repository();
+    let git_dir = repository.git_dir();
+    let format = repository.object_format();
+    let db = repository.object_database();
 
     // Resolve the effective abbreviation length once: an unset/`--abbrev`
     // sentinel falls back to the repository's `core.abbrev` (default 7).
@@ -230,9 +234,10 @@ pub(crate) fn cmd_describe(args: &[String]) -> Result<()> {
     }
 
     if commits.is_empty() {
-        let dirty_suffix = describe_dirty_suffix(git_dir, format, &options)?;
+        let dirty_suffix = describe_dirty_suffix(repo.worktree_root()?, git_dir, format, &options)?;
         let head = resolve_describe_commit(&repo, "HEAD")?;
         describe_one(
+            git_dir,
             format,
             db,
             &options,
@@ -247,7 +252,7 @@ pub(crate) fn cmd_describe(args: &[String]) -> Result<()> {
         for commit in &commits {
             match resolve_describe_target(&repo, commit)? {
                 DescribeTarget::Commit(target) => {
-                    describe_one(format, db, &options, abbrev, &tags, &target, None)?;
+                    describe_one(git_dir, format, db, &options, abbrev, &tags, &target, None)?;
                 }
                 DescribeTarget::Blob(blob) => {
                     describe_blob(git_dir, format, db, &options, abbrev, &tags, &blob)?;
@@ -486,7 +491,11 @@ fn describe_ref_names(refname: &str, options: &DescribeOptions) -> Option<Descri
 /// `name-rev --peel-tag --name-only --no-undefined`, with tag-only filtering
 /// unless `--all` was requested. Keep that route so the two commands share the
 /// same naming walk and exact-tag handling.
-fn describe_contains(options: &DescribeOptions, commits: &[String]) -> Result<()> {
+fn describe_contains(
+    cli_session: &crate::session::CliSession,
+    options: &DescribeOptions,
+    commits: &[String],
+) -> Result<()> {
     let mut args = vec![
         "--peel-tag".to_string(),
         "--name-only".to_string(),
@@ -519,7 +528,7 @@ fn describe_contains(options: &DescribeOptions, commits: &[String]) -> Result<()
     } else {
         args.extend(commits.iter().cloned());
     }
-    crate::commands::name_rev::cmd_name_rev(&args)
+    crate::commands::name_rev::cmd_name_rev(cli_session, &args)
 }
 
 fn describe_ref_passes_filters(match_name: &str, options: &DescribeOptions) -> bool {
@@ -612,6 +621,7 @@ struct PossibleTag<'a> {
 
 /// Describe a single target commit, printing the result (or an error per git).
 fn describe_one(
+    git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
     options: &DescribeOptions,
@@ -620,12 +630,22 @@ fn describe_one(
     target: &ObjectId,
     dirty_suffix: Option<&str>,
 ) -> Result<()> {
-    let text = describe_commit_text(format, db, options, abbrev, tags, target, dirty_suffix)?;
+    let text = describe_commit_text(
+        git_dir,
+        format,
+        db,
+        options,
+        abbrev,
+        tags,
+        target,
+        dirty_suffix,
+    )?;
     println!("{text}");
     Ok(())
 }
 
 fn describe_commit_text(
+    git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
     options: &DescribeOptions,
@@ -668,7 +688,7 @@ fn describe_commit_text(
         eprintln!("No exact match on refs or tags, searching to describe");
     }
 
-    let search = describe_search(format, db, options, &tags.by_commit, target)?;
+    let search = describe_search(git_dir, format, db, options, &tags.by_commit, target)?;
 
     let Some((best, traversed)) = search.found else {
         // No candidate tag was reachable from the target.
@@ -718,6 +738,7 @@ const MAX_FLAG_CANDIDATES: usize = 31;
 /// walk, including the `depth = seen_commits - 1` seeding, the per-commit depth
 /// increments, the early-exit, and the `finish_depth_computation` tail.
 fn describe_search<'a>(
+    git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
     options: &DescribeOptions,
@@ -732,11 +753,12 @@ fn describe_search<'a>(
     let mut queue: std::collections::BinaryHeap<DescribeQueueItem> =
         std::collections::BinaryHeap::new();
 
-    let target_date = describe_commit_date(db, format, target)?;
-    queue.push(DescribeQueueItem {
-        date: target_date,
-        oid: *target,
-    });
+    let mut metadata = sley_rev::CommitMetadataReader::new(git_dir, format, db);
+    queue.push(describe_queue_item(
+        &mut metadata,
+        target,
+        options.first_parent,
+    )?);
     seen.insert(*target);
 
     let effective_max = options.max_candidates.min(MAX_FLAG_CANDIDATES);
@@ -751,19 +773,16 @@ fn describe_search<'a>(
     let mut gave_up: Option<DescribeQueueItem> = None;
 
     while let Some(item) = queue.pop() {
-        let oid = item.oid;
         seen_commits += 1;
 
         // Stop collecting once the candidate budget (or the entire tag universe)
         // is exhausted; the winner's depth is finished separately below.
         if candidates.len() == effective_max || candidates.len() == names_size {
-            gave_up = Some(DescribeQueueItem {
-                date: item.date,
-                oid,
-            });
+            gave_up = Some(item);
             seen_commits -= 1;
             break;
         }
+        let oid = item.oid;
 
         if let Some(best) = tags.get(&oid) {
             if !describe_eligible(best, options) {
@@ -817,12 +836,14 @@ fn describe_search<'a>(
             }
         }
 
-        let parents = describe_commit_parents(db, format, &oid, options.first_parent)?;
-        for parent in parents {
+        for parent in item.parents {
             *flags.entry(parent).or_insert(0) |= commit_flags;
             if seen.insert(parent) {
-                let date = describe_commit_date(db, format, &parent)?;
-                queue.push(DescribeQueueItem { date, oid: parent });
+                queue.push(describe_queue_item(
+                    &mut metadata,
+                    &parent,
+                    options.first_parent,
+                )?);
             }
         }
     }
@@ -854,7 +875,12 @@ fn describe_search<'a>(
         queue.push(gave_up);
     }
     let extra = finish_depth_computation(
-        format, db, options, &mut queue, &mut flags, &mut seen, best_flag,
+        &mut metadata,
+        options,
+        &mut queue,
+        &mut flags,
+        &mut seen,
+        best_flag,
     )?;
     candidates[best_index].depth += extra;
 
@@ -879,8 +905,7 @@ struct DescribeSearchResult<'a> {
 /// not reachable from the winning tag still lies between the target and that
 /// tag and adds one to its depth. Returns the additional depth accumulated.
 fn finish_depth_computation(
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
+    metadata: &mut sley_rev::CommitMetadataReader<'_, FileObjectDatabase>,
     options: &DescribeOptions,
     queue: &mut std::collections::BinaryHeap<DescribeQueueItem>,
     flags: &mut HashMap<ObjectId, u32>,
@@ -907,8 +932,7 @@ fn finish_depth_computation(
             unflagged.remove(&oid);
             extra += 1;
         }
-        let parents = describe_commit_parents(db, format, &oid, options.first_parent)?;
-        for parent in parents {
+        for parent in item.parents {
             let flag_before = flags.get(&parent).copied().unwrap_or(0) & best_flag;
             let was_seen = seen.contains(&parent);
             if !was_seen {
@@ -917,8 +941,11 @@ fn finish_depth_computation(
             *flags.entry(parent).or_insert(0) |= commit_flags;
             let flag_after = flags.get(&parent).copied().unwrap_or(0) & best_flag;
             if !was_seen {
-                let date = describe_commit_date(db, format, &parent)?;
-                queue.push(DescribeQueueItem { date, oid: parent });
+                queue.push(describe_queue_item(
+                    metadata,
+                    &parent,
+                    options.first_parent,
+                )?);
                 if flag_after == 0 {
                     unflagged.insert(parent);
                 }
@@ -971,6 +998,23 @@ fn describe_no_candidate(
 struct DescribeQueueItem {
     date: i64,
     oid: ObjectId,
+    parents: Vec<ObjectId>,
+}
+
+fn describe_queue_item(
+    metadata: &mut sley_rev::CommitMetadataReader<'_, FileObjectDatabase>,
+    oid: &ObjectId,
+    first_parent: bool,
+) -> Result<DescribeQueueItem> {
+    let mut commit = metadata.get(oid)?;
+    if first_parent {
+        commit.parents.truncate(1);
+    }
+    Ok(DescribeQueueItem {
+        date: commit.commit_time,
+        oid: commit.oid,
+        parents: commit.parents,
+    })
 }
 
 impl PartialEq for DescribeQueueItem {
@@ -1098,7 +1142,7 @@ fn describe_blob(
     tags: &DescribeTags,
     blob: &ObjectId,
 ) -> Result<()> {
-    let head = match resolve_revision(git_dir, format, "HEAD") {
+    let head = match sley_rev::RevisionResolver::new(git_dir, format, db).resolve("HEAD") {
         Ok(oid) => oid,
         Err(_) => {
             eprintln!(
@@ -1118,7 +1162,16 @@ fn describe_blob(
         let object = db.read_object(&commit_oid)?;
         let commit = Commit::parse(format, &object.body)?;
         if let Some(path) = describe_find_blob_path(db, format, &commit.tree, blob)? {
-            let text = describe_commit_text(format, db, options, abbrev, tags, &commit_oid, None)?;
+            let text = describe_commit_text(
+                git_dir,
+                format,
+                db,
+                options,
+                abbrev,
+                tags,
+                &commit_oid,
+                None,
+            )?;
             println!("{text}:{path}");
             return Ok(());
         }
@@ -1204,6 +1257,7 @@ fn describe_find_blob_path_inner(
 /// its mark only when the tracked working tree differs from the index/HEAD;
 /// untracked files do not count. Errors computing status fall back to `--broken`.
 fn describe_dirty_suffix(
+    worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     options: &DescribeOptions,
@@ -1211,9 +1265,8 @@ fn describe_dirty_suffix(
     if options.dirty.is_none() && options.broken.is_none() {
         return Ok(None);
     }
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
     let mut dirty = false;
-    match sley_worktree::stream_short_status(&worktree_root, git_dir, format, |entry| {
+    match sley_worktree::stream_short_status(worktree_root, git_dir, format, |entry| {
         let index_dirty = entry.index != b' ' && entry.index != b'?' && entry.index != b'!';
         let worktree_dirty =
             entry.worktree != b' ' && entry.worktree != b'?' && entry.worktree != b'!';

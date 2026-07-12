@@ -12,7 +12,7 @@
 //! [`ProgressSink`]) — so it never reads process-global state, parses arguments,
 //! or prints. The structured result ([`PushOutcome`]) carries the executed
 //! receive-pack commands and the remote's report-status for the caller to format
-//! into git's "To <remote>" summary and to drive any set-upstream config write.
+//! into git's `To <remote>` summary and to drive any set-upstream config write.
 //!
 //! SSH push still lives in the CLI; only HTTP and local move here. The
 //! push-planning helpers are shared (the CLI's SSH path calls the same `pub`
@@ -23,12 +23,13 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::proc_receive::ProcReceiveReport;
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result, redact_url_for_display};
 use sley_object::ObjectType;
 use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, build_and_install_reachable_pack,
-    collect_reachable_object_ids,
+    collect_reachable_object_ids, collect_reachable_object_ids_tolerating_promised_missing,
 };
 #[cfg(feature = "http")]
 use sley_protocol::{
@@ -43,13 +44,14 @@ use sley_protocol::{
     RefSpec, parse_refspec, plan_push_commands, read_and_demux_sideband_stream,
     read_receive_pack_report_status, read_receive_pack_report_status_v2,
 };
-use crate::proc_receive::ProcReceiveReport;
 
 use crate::pack::push_pack_roots;
-use crate::pack::{PushPackRequest, write_push_packfile};
 #[cfg(feature = "http")]
 use crate::pack::write_receive_pack_body;
-use crate::proc_receive::{ReceivePackCommandState, parse_proc_receive_refs, proc_receive_ref_matches};
+use crate::pack::{PushPackRequest, write_push_packfile};
+use crate::proc_receive::{
+    ReceivePackCommandState, parse_proc_receive_refs, proc_receive_ref_matches,
+};
 
 use crate::receive_pack_server::{
     ReceivePackServerOptions, ReceivePackServerReport, ReceivePackServerRequest, serve_receive_pack,
@@ -108,9 +110,8 @@ impl PushThinMode {
 /// `set-upstream` (`-u`) is intentionally absent: it only writes
 /// `branch.<name>.remote`/`merge` config, which is a caller concern (the library
 /// returns the executed commands in [`PushOutcome::commands`] so the caller can
-/// drive that write). Atomic / push-options are likewise absent because the
-/// CLI's HTTP and local push paths accept but do not act on them today.
-#[derive(Debug, Clone, Copy, Default)]
+/// drive that write).
+#[derive(Debug, Clone, Default)]
 pub struct PushOptions {
     /// Suppress the per-command side-effect of negotiating the `quiet`
     /// receive-pack capability (matching `git push --quiet`). Output suppression
@@ -121,6 +122,10 @@ pub struct PushOptions {
     pub force: bool,
     /// Thin-pack behavior for transports that send a real receive-pack body.
     pub thin: PushThinMode,
+    /// Request all-or-nothing receive-pack ref updates.
+    pub atomic: bool,
+    /// Push options sent after the receive-pack command list.
+    pub push_options: Vec<String>,
 }
 
 /// One caller-authored receive-pack command.
@@ -257,7 +262,7 @@ impl ReceivePackPushReport {
 pub struct PushOutcome {
     /// The receive-pack commands that were executed, in planning order. Each
     /// carries the ref name and its old/new object id; the caller formats these
-    /// into git's "To <remote>" summary and uses them to drive set-upstream.
+    /// into git's `To <remote>` summary and uses them to drive set-upstream.
     /// Empty when nothing matched the refspecs (a no-op push).
     pub commands: Vec<ReceivePackCommand>,
     /// The remote's report-status, when one was requested and received.
@@ -331,10 +336,7 @@ impl PushReportRef {
             .map(|report| ReceivePackCommand {
                 old_id: report.old_oid.unwrap_or(self.old_id),
                 new_id: report.new_oid.unwrap_or(self.new_id),
-                name: report
-                    .refname
-                    .clone()
-                    .unwrap_or_else(|| self.dst.clone()),
+                name: report.refname.clone().unwrap_or_else(|| self.dst.clone()),
             })
             .collect()
     }
@@ -352,7 +354,7 @@ impl PushReportRef {
 }
 
 /// The full result of a push as git's transport layer models it: every ref's
-/// classified status, ready to be rendered into the "To <url>" report and used
+/// classified status, ready to be rendered into the `To <url>` report and used
 /// to decide the process exit code and the `pull-before-push` advice.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PushStatusReport {
@@ -428,6 +430,8 @@ pub struct PushServices<'a> {
 pub struct PushPlan {
     /// The receive-pack commands that will be executed if the caller proceeds.
     pub commands: Vec<ReceivePackCommand>,
+    /// Client-side rejected commands which must still be rendered by the caller.
+    pub preflight_rejections: Vec<(ReceivePackCommand, PushRefStatus)>,
     execution: PushExecution,
 }
 
@@ -464,7 +468,7 @@ enum PushExecution {
 ///
 /// Returns the structured [`PushOutcome`]; never prints or returns
 /// `GitError::Exit`. A still-`None` report in the outcome means the remote did
-/// not advertise `report-status`. Set-upstream config and the "To <remote>"
+/// not advertise `report-status`. Set-upstream config and the `To <remote>`
 /// summary are the caller's job, driven from [`PushOutcome::commands`].
 pub fn push(request: PushRequest<'_>, mut services: PushServices<'_>) -> Result<PushOutcome> {
     let plan = plan_push(request, &mut services)?;
@@ -518,6 +522,7 @@ pub fn plan_push(request: PushRequest<'_>, services: &mut PushServices<'_>) -> R
                 remote: remote_url,
                 refspecs: request.refspecs,
                 force: request.options.force,
+                command_options: crate::ssh::ssh_transport_options_from_config(request.config),
             })?;
             let commands = plan.commands.clone();
             let execution = if commands.is_empty() {
@@ -527,6 +532,7 @@ pub fn plan_push(request: PushRequest<'_>, services: &mut PushServices<'_>) -> R
             };
             Ok(PushPlan {
                 commands,
+                preflight_rejections: Vec::new(),
                 execution,
             })
         }
@@ -548,6 +554,7 @@ pub fn plan_push(request: PushRequest<'_>, services: &mut PushServices<'_>) -> R
             };
             Ok(PushPlan {
                 commands,
+                preflight_rejections: Vec::new(),
                 execution,
             })
         }
@@ -622,6 +629,7 @@ pub fn plan_push_actions(
             };
             Ok(PushPlan {
                 commands,
+                preflight_rejections: Vec::new(),
                 execution,
             })
         }
@@ -645,6 +653,7 @@ pub fn plan_push_actions(
             };
             Ok(PushPlan {
                 commands,
+                preflight_rejections: Vec::new(),
                 execution,
             })
         }
@@ -665,6 +674,7 @@ pub fn plan_push_actions(
             };
             Ok(PushPlan {
                 commands,
+                preflight_rejections: Vec::new(),
                 execution,
             })
         }
@@ -702,6 +712,7 @@ pub fn plan_push_actions(
             };
             Ok(PushPlan {
                 commands,
+                preflight_rejections: Vec::new(),
                 execution,
             })
         }
@@ -828,6 +839,16 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
     let advertisement_set = discovered.set;
     let features = advertised_receive_pack_features(&advertisement_set.refs)?;
     verify_remote_object_format(&features, format)?;
+    if options.atomic && !features.atomic {
+        return Err(GitError::InvalidFormat(
+            "receive-pack feature 'atomic' was not advertised".into(),
+        ));
+    }
+    if !options.push_options.is_empty() && !features.push_options {
+        return Err(GitError::InvalidFormat(
+            "receive-pack feature 'push-options' was not advertised".into(),
+        ));
+    }
 
     let local_store = FileRefStore::new(git_dir, format);
     let mut local_refs = local_push_source_refs(&local_store, format)?;
@@ -840,8 +861,23 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
         options.force,
     )?;
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    reject_non_fast_forward_pushes(common_git_dir, &local_db, format, &command_forces)?;
-    let commands = commands_from_forces(&command_forces);
+    let mut accepted = Vec::new();
+    let mut preflight_rejections = Vec::new();
+    for (command, force) in command_forces {
+        if push_command_is_non_fast_forward(common_git_dir, &local_db, format, &command, force)? {
+            preflight_rejections.push((command, PushRefStatus::RejectNonFastForward));
+        } else {
+            accepted.push((command, force));
+        }
+    }
+    if options.atomic && !preflight_rejections.is_empty() {
+        preflight_rejections.extend(
+            accepted
+                .drain(..)
+                .map(|(command, _)| (command, PushRefStatus::AtomicPushFailed)),
+        );
+    }
+    let commands = commands_from_forces(&accepted);
     let execution = if commands.is_empty() {
         PushExecution::Noop
     } else {
@@ -855,11 +891,13 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
     };
     Ok(PushPlan {
         commands,
+        preflight_rejections,
         execution,
     })
 }
 
 #[cfg(feature = "http")]
+#[allow(clippy::too_many_arguments)]
 fn execute_push_http(
     request: PushRequest<'_>,
     credentials: &mut dyn CredentialProvider,
@@ -883,8 +921,8 @@ fn execute_push_http(
             &features,
             request.format,
             request.options.quiet,
-            false,
-            &[],
+            request.options.atomic,
+            &request.options.push_options,
         ),
         thin: request.options.thin.wants_thin(),
     };
@@ -1111,6 +1149,7 @@ fn plan_push_local(request: PushLocalRequest<'_>) -> Result<PushPlan> {
     };
     Ok(PushPlan {
         commands,
+        preflight_rejections: Vec::new(),
         execution,
     })
 }
@@ -1128,24 +1167,16 @@ fn execute_push_local(
         remote_excluded_tip_roots(&remote_git_dir, request.format, &remote_refs)?;
     let starts = push_pack_roots(&commands, &pack_objects);
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
-    let remote_db = FileObjectDatabase::from_git_dir(&remote_common_git_dir, request.format);
-    let remote_excluded =
-        collect_reachable_object_ids(&remote_db, request.format, remote_excluded_tips)?;
-
-    // git's `transfer.fsckObjects`: the receiving side fscks every object the
-    // push introduces and rejects the push when one fails (most importantly a
-    // malicious `.gitmodules` url). The local fast path copies objects directly
-    // rather than through `index-pack --strict`, so run the same gate here.
-    if remote_transfer_fsck_objects(&remote_common_git_dir) {
-        fsck_pushed_objects(&local_db, request.format, &starts, &remote_excluded)?;
-    }
-    let remote_config =
-        sley_config::read_repo_config(&remote_git_dir, None).unwrap_or_default();
-    let report = if push_local_uses_receive_pack_server(
+    let remote_config = sley_config::read_repo_config(&remote_git_dir, None).unwrap_or_default();
+    let remote_excluded = collect_remote_reachable_exclusions(
+        &remote_common_git_dir,
+        request.format,
+        remote_excluded_tips,
         &remote_config,
-        &remote_git_dir,
-        &commands,
-    ) {
+    )?;
+
+    let report = if push_local_uses_receive_pack_server(&remote_config, &remote_git_dir, &commands)
+    {
         local_push_via_receive_pack_server(LocalPushViaReceivePackRequest {
             remote_git_dir: &remote_git_dir,
             source_common_git_dir: request.common_git_dir,
@@ -1171,14 +1202,16 @@ fn execute_push_local(
                 b"PACK".to_vec()
             },
         };
-        ReceivePackPushReport::V1(crate::local::receive_pack_reachable_pack_into_local_repository(
-            &remote_git_dir,
-            request.format,
-            &receive_request,
-            &local_db,
-            starts,
-            remote_excluded,
-        )?)
+        ReceivePackPushReport::V1(
+            crate::local::receive_pack_reachable_pack_into_local_repository(
+                &remote_git_dir,
+                request.format,
+                &receive_request,
+                &local_db,
+                starts,
+                remote_excluded,
+            )?,
+        )
     };
     validate_receive_pack_unpack(&report)?;
     Ok(PushOutcome {
@@ -1186,15 +1219,6 @@ fn execute_push_local(
         report: Some(report),
         remote_progress: Vec::new(),
     })
-}
-
-/// Whether the local remote enables `transfer.fsckObjects` (the receiving-side
-/// fsck gate). Reads only the remote's own config.
-fn remote_transfer_fsck_objects(remote_common_git_dir: &Path) -> bool {
-    GitConfig::read(remote_common_git_dir.join("config"))
-        .ok()
-        .and_then(|config| config.get_bool("transfer", None, "fsckObjects"))
-        .unwrap_or(false)
 }
 
 /// Disposable object directory used to expose incoming local-push objects to
@@ -1228,8 +1252,13 @@ pub fn stage_local_push_quarantine(
     }
     let remote_refs = crate::local::local_fetch_advertisements(remote_git_dir, format)?;
     let remote_excluded_tips = remote_excluded_tip_roots(remote_git_dir, format, &remote_refs)?;
-    let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, format);
-    let remote_excluded = collect_reachable_object_ids(&remote_db, format, remote_excluded_tips)?;
+    let remote_config = sley_config::read_repo_config(remote_git_dir, None).unwrap_or_default();
+    let remote_excluded = collect_remote_reachable_exclusions(
+        remote_common_git_dir,
+        format,
+        remote_excluded_tips,
+        &remote_config,
+    )?;
     let object_dir = create_push_quarantine_object_dir(remote_common_git_dir)?;
     let quarantine_db = FileObjectDatabase::new(object_dir.clone(), format);
     let installed = match build_and_install_reachable_pack(
@@ -1254,6 +1283,32 @@ pub fn stage_local_push_quarantine(
         return Ok(None);
     }
     Ok(Some(PushQuarantine { object_dir }))
+}
+
+/// Compute the object closure a local push may treat as present at its receiver.
+///
+/// A partial-clone receiver can legitimately advertise a ref whose reachable
+/// closure crosses an object it has promised to obtain from another remote.
+/// That promised gap is an end point in the receiver's `have` closure, not a
+/// reason to abort the push. Repositories without a configured promisor retain
+/// the strict walk, so a stray `.promisor` sidecar cannot hide corruption.
+fn collect_remote_reachable_exclusions<I>(
+    remote_common_git_dir: &Path,
+    format: ObjectFormat,
+    starts: I,
+    remote_config: &GitConfig,
+) -> Result<std::collections::HashSet<ObjectId>>
+where
+    I: IntoIterator<Item = ObjectId>,
+{
+    let remote_has_promisor = crate::promisor::config_has_promisor_remote(remote_config);
+    let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, format)
+        .with_promisor_remote_present(remote_has_promisor);
+    if remote_has_promisor {
+        collect_reachable_object_ids_tolerating_promised_missing(&remote_db, format, starts)
+    } else {
+        collect_reachable_object_ids(&remote_db, format, starts)
+    }
 }
 
 fn create_push_quarantine_object_dir(remote_common_git_dir: &Path) -> Result<PathBuf> {
@@ -1335,38 +1390,6 @@ fn append_remote_alternate_ref_tips(
     Ok(())
 }
 
-/// Run fsck over the objects this push introduces (reachable from `starts`,
-/// minus what the remote already has). On any error-severity finding, print it
-/// and reject the push — git's `transfer.fsckObjects` behavior.
-fn fsck_pushed_objects(
-    local_db: &FileObjectDatabase,
-    format: ObjectFormat,
-    starts: &[ObjectId],
-    remote_excluded: &std::collections::HashSet<ObjectId>,
-) -> Result<()> {
-    if starts.is_empty() {
-        return Ok(());
-    }
-    let new_objects: Vec<ObjectId> =
-        collect_reachable_object_ids(local_db, format, starts.to_vec())?
-            .into_iter()
-            .filter(|oid| !remote_excluded.contains(oid))
-            .collect();
-    // The reader is the COMPLETE local db so link-walks never spuriously report
-    // a "missing object" for something the remote already holds; only genuine
-    // content errors (e.g. a disallowed .gitmodules url) in the new objects fail.
-    let report = sley_fsck::fsck_objects(local_db, format, [], new_objects);
-    if report.is_ok() {
-        return Ok(());
-    }
-    for issue in &report.issues {
-        if issue.severity == sley_fsck::IssueSeverity::Error {
-            eprintln!("fatal: {}", issue.message);
-        }
-    }
-    Err(GitError::Exit(128))
-}
-
 /// Fully resolved inputs for a status-reporting push to a local repository.
 pub struct PushReportRequest<'a> {
     /// Local repository `$GIT_DIR`.
@@ -1418,7 +1441,22 @@ pub struct PushReportRequest<'a> {
 /// nothing is sent. The caller renders the report and derives the exit code.
 pub fn push_local_with_report(
     request: PushReportRequest<'_>,
+    config: &GitConfig,
+) -> Result<PushStatusReport> {
+    let objects = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
+    push_local_with_report_and_objects(request, config, &objects)
+}
+
+/// [`push_local_with_report`] with an explicit source object database.
+///
+/// Source revision and ancestry reads use `objects`, allowing an embedding
+/// repository to inject replacement-object policy. Pack construction and
+/// installation remain raw storage operations, so replacements never change
+/// the bytes written under an object id.
+pub fn push_local_with_report_and_objects(
+    request: PushReportRequest<'_>,
     _config: &GitConfig,
+    objects: &FileObjectDatabase,
 ) -> Result<PushStatusReport> {
     let format = request.format;
     let remote_format = crate::object_format_for_git_dir(request.remote_common_git_dir)?;
@@ -1431,7 +1469,13 @@ pub fn push_local_with_report(
     }
     let local_store = FileRefStore::new(request.git_dir, format);
     let mut local_refs = local_push_source_refs(&local_store, format)?;
-    add_revision_push_sources(request.git_dir, format, request.refspecs, &mut local_refs);
+    add_revision_push_sources_with_reader(
+        request.git_dir,
+        format,
+        objects,
+        request.refspecs,
+        &mut local_refs,
+    );
     let remote_refs = crate::local::local_fetch_advertisements(request.remote_git_dir, format)?;
     let planned = plan_push_command_sources(
         format,
@@ -1440,16 +1484,29 @@ pub fn push_local_with_report(
         request.refspecs,
         request.force,
     )?;
+    let source_db = objects;
+    // Pack construction and installation are storage operations. Keep their
+    // reads raw even when source resolution and ancestry honor replacements.
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, format);
     let remote_config =
         sley_config::read_repo_config(request.remote_git_dir, None).unwrap_or_default();
+    // receive-pack parses its fsck namespace before considering individual ref
+    // updates. Preserve that ordering even when the local client can reject a
+    // checked-out branch without otherwise entering the receive server.
+    let _ = sley_fsck::FsckPolicy::from_config(
+        &remote_config,
+        sley_fsck::FsckConfigKind::Receive,
+        format,
+        request.remote_git_dir,
+        false,
+    )?;
 
     // Classify each planned command the way git's send-pack does, collecting
     // rejections rather than bailing on the first one.
     let mut refs: Vec<PushReportRef> = Vec::new();
     for plan in &planned {
         let status = classify_push_command(
-            &local_db,
+            source_db,
             format,
             plan,
             &request,
@@ -1466,7 +1523,7 @@ pub fn push_local_with_report(
                 || if plan.command.name.starts_with("refs/heads/") {
                     !is_fast_forward(
                         request.common_git_dir,
-                        &local_db,
+                        source_db,
                         format,
                         &plan.command.old_id,
                         &plan.command.new_id,
@@ -1530,56 +1587,50 @@ pub fn push_local_with_report(
             remote_excluded_tip_roots(request.remote_git_dir, format, &remote_refs)?;
         let pack_objects: Vec<ObjectId> = Vec::new();
         let starts = push_pack_roots(&send, &pack_objects);
-        let remote_db = FileObjectDatabase::from_git_dir(request.remote_common_git_dir, format);
-        let remote_excluded =
-            collect_reachable_object_ids(&remote_db, format, remote_excluded_tips)?;
-        // git's `transfer.fsckObjects`: fsck the introduced objects on the
-        // receiving side and reject the push on a content error (a disallowed
-        // `.gitmodules` url, a malformed object, ...).
-        if remote_transfer_fsck_objects(request.remote_common_git_dir) {
-            fsck_pushed_objects(&local_db, format, &starts, &remote_excluded)?;
-        }
-        let remote_config =
-            sley_config::read_repo_config(request.remote_git_dir, None).unwrap_or_default();
-        let report = if push_local_uses_receive_pack_server(
+        let remote_excluded = collect_remote_reachable_exclusions(
+            request.remote_common_git_dir,
+            format,
+            remote_excluded_tips,
             &remote_config,
-            request.remote_git_dir,
-            &send,
-        ) {
-            local_push_via_receive_pack_server(LocalPushViaReceivePackRequest {
-                remote_git_dir: request.remote_git_dir,
-                source_common_git_dir: request.common_git_dir,
-                format,
-                commands: &send,
-                push_options: request.push_options,
-                atomic: request.atomic,
-                quiet: request.quiet,
-                remote_advertisements: &remote_refs,
-                remote_stderr: request.remote_stderr,
-            })?
-        } else {
-            let receive_request = ReceivePackPushRequest {
-                commands: ReceivePackRequest {
-                    shallow: Vec::new(),
-                    commands: send.clone(),
-                    capabilities: Vec::new(),
-                },
-                push_options: None,
-                packfile: if starts.is_empty() {
-                    Vec::new()
-                } else {
-                    b"PACK".to_vec()
-                },
+        )?;
+        let report =
+            if push_local_uses_receive_pack_server(&remote_config, request.remote_git_dir, &send) {
+                local_push_via_receive_pack_server(LocalPushViaReceivePackRequest {
+                    remote_git_dir: request.remote_git_dir,
+                    source_common_git_dir: request.common_git_dir,
+                    format,
+                    commands: &send,
+                    push_options: request.push_options,
+                    atomic: request.atomic,
+                    quiet: request.quiet,
+                    remote_advertisements: &remote_refs,
+                    remote_stderr: request.remote_stderr,
+                })?
+            } else {
+                let receive_request = ReceivePackPushRequest {
+                    commands: ReceivePackRequest {
+                        shallow: Vec::new(),
+                        commands: send.clone(),
+                        capabilities: Vec::new(),
+                    },
+                    push_options: None,
+                    packfile: if starts.is_empty() {
+                        Vec::new()
+                    } else {
+                        b"PACK".to_vec()
+                    },
+                };
+                ReceivePackPushReport::V1(
+                    crate::local::receive_pack_reachable_pack_into_local_repository(
+                        request.remote_git_dir,
+                        format,
+                        &receive_request,
+                        &local_db,
+                        starts,
+                        remote_excluded,
+                    )?,
+                )
             };
-            ReceivePackPushReport::V1(crate::local::receive_pack_reachable_pack_into_local_repository(
-                request.remote_git_dir,
-                format,
-                &receive_request,
-                &local_db,
-                starts,
-                remote_excluded,
-            )?)
-        };
         apply_receive_pack_report_to_push_refs(&mut refs, &report);
     }
 
@@ -2019,6 +2070,14 @@ pub fn push_local_uses_receive_pack_server(
     commands: &[ReceivePackCommand],
 ) -> bool {
     let _ = remote_git_dir;
+    if config.get_bool("receive", None, "fsckObjects").is_some()
+        || config.get_bool("transfer", None, "fsckObjects").is_some()
+        || !config
+            .section_entries_with_subsection("receive", Some("fsck"))
+            .is_empty()
+    {
+        return true;
+    }
     let patterns = parse_proc_receive_refs(config);
     if patterns.is_empty() {
         return false;
@@ -2068,14 +2127,18 @@ fn local_push_via_receive_pack_server(
     )?;
     let mut packfile = Vec::new();
     write_push_packfile(&pack_request, &mut packfile)?;
-    let config =
-        sley_config::read_repo_config(request.remote_git_dir, None).unwrap_or_default();
+    let config = sley_config::read_repo_config(request.remote_git_dir, None).unwrap_or_default();
+    let validation = sley_fsck::FsckPolicy::from_config(
+        &config,
+        sley_fsck::FsckConfigKind::Receive,
+        request.format,
+        request.remote_git_dir,
+        false,
+    )?;
     let mut pack_reader = Cursor::new(packfile);
     let mut discard_stderr = Vec::new();
     let capture_stderr = request.remote_stderr.is_some();
-    let remote_stderr = request
-        .remote_stderr
-        .unwrap_or(&mut discard_stderr);
+    let remote_stderr = request.remote_stderr.unwrap_or(&mut discard_stderr);
     let outcome = serve_receive_pack(ReceivePackServerRequest {
         git_dir: request.remote_git_dir,
         format: request.format,
@@ -2085,6 +2148,7 @@ fn local_push_via_receive_pack_server(
         },
         pack_reader: &mut pack_reader,
         config: &config,
+        validation: &validation,
         options: ReceivePackServerOptions {
             quiet: request.quiet,
             remote_stderr: if capture_stderr {
@@ -2238,6 +2302,17 @@ pub(crate) fn add_revision_push_sources(
     refspecs: &[String],
     local_refs: &mut Vec<PushSourceRef>,
 ) {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    add_revision_push_sources_with_reader(git_dir, format, &db, refspecs, local_refs);
+}
+
+fn add_revision_push_sources_with_reader(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reader: &impl ObjectReader,
+    refspecs: &[String],
+    local_refs: &mut Vec<PushSourceRef>,
+) {
     for refspec in refspecs {
         let refspec = refspec.strip_prefix('+').unwrap_or(refspec);
         let src = refspec.split_once(':').map_or(refspec, |(src, _)| src);
@@ -2254,7 +2329,7 @@ pub(crate) fn add_revision_push_sources(
         }) {
             continue;
         }
-        if let Ok(oid) = sley_rev::resolve_revision(git_dir, format, src)
+        if let Ok(oid) = sley_rev::resolve_revision_with_reader(git_dir, format, reader, src)
             && !local_refs.iter().any(|reference| reference.name == src)
         {
             local_refs.push(PushSourceRef {
@@ -2563,18 +2638,18 @@ pub fn read_receive_pack_push_report_with_progress(
         }
         let mut payload = demuxed.data.as_slice();
         if use_report_v2 {
-            Ok(ReceivePackPushReport::V2(read_receive_pack_report_status_v2(
-                format, &mut payload,
-            )?))
+            Ok(ReceivePackPushReport::V2(
+                read_receive_pack_report_status_v2(format, &mut payload)?,
+            ))
         } else {
             Ok(ReceivePackPushReport::V1(read_receive_pack_report_status(
                 &mut payload,
             )?))
         }
     } else if use_report_v2 {
-        Ok(ReceivePackPushReport::V2(read_receive_pack_report_status_v2(
-            format, reader,
-        )?))
+        Ok(ReceivePackPushReport::V2(
+            read_receive_pack_report_status_v2(format, reader)?,
+        ))
     } else {
         Ok(ReceivePackPushReport::V1(read_receive_pack_report_status(
             reader,
@@ -2590,8 +2665,11 @@ pub fn apply_receive_pack_report_to_push_refs(
     if let Some(message) = report.unpack_failed() {
         for reference in refs.iter_mut() {
             if matches!(reference.status, PushRefStatus::Ok) {
-                reference.status =
-                    PushRefStatus::RemoteReject(format!("unpacker error: {message}"));
+                reference.status = PushRefStatus::RemoteReject(if message == "unpacker error" {
+                    message.to_string()
+                } else {
+                    format!("unpacker error: {message}")
+                });
             }
         }
         return;
@@ -2601,8 +2679,7 @@ pub fn apply_receive_pack_report_to_push_refs(
             for command_status in &status.commands {
                 if let ReceivePackCommandStatus::Ng { name, message } = command_status {
                     for reference in refs.iter_mut() {
-                        if reference.dst == *name && matches!(reference.status, PushRefStatus::Ok)
-                        {
+                        if reference.dst == *name && matches!(reference.status, PushRefStatus::Ok) {
                             reference.status = PushRefStatus::RemoteReject(message.clone());
                         }
                     }
@@ -2643,15 +2720,19 @@ fn find_push_report_ref_index(
     name: &str,
     hint: Option<usize>,
 ) -> Option<usize> {
-    if let Some(hint) = hint {
-        if refs.get(hint).is_some_and(|reference| reference.dst == name) {
-            return Some(hint);
-        }
+    if let Some(hint) = hint
+        && refs
+            .get(hint)
+            .is_some_and(|reference| reference.dst == name)
+    {
+        return Some(hint);
     }
     refs.iter().position(|reference| reference.dst == name)
 }
 
-fn proc_receive_report_from_options(options: &ReceivePackCommandStatusV2Options) -> ProcReceiveReport {
+fn proc_receive_report_from_options(
+    options: &ReceivePackCommandStatusV2Options,
+) -> ProcReceiveReport {
     ProcReceiveReport {
         refname: options.refname.clone(),
         old_oid: options.old_oid.clone(),
@@ -2791,15 +2872,7 @@ pub fn reject_non_fast_forward_pushes(
     command_forces: &[(ReceivePackCommand, bool)],
 ) -> Result<()> {
     for (command, force) in command_forces {
-        if *force
-            || !command.name.starts_with("refs/heads/")
-            || command.old_id.is_null()
-            || command.new_id.is_null()
-        {
-            continue;
-        }
-        let ancestors = sley_rev::ancestor_depths(common_git_dir, format, local_db, &command.new_id)?;
-        if !ancestors.contains_key(&command.old_id) {
+        if push_command_is_non_fast_forward(common_git_dir, local_db, format, command, *force)? {
             let short = command.name.trim_start_matches("refs/heads/");
             return Err(GitError::Command(format!(
                 "failed to push some refs: non-fast-forward update to {short}"
@@ -2807,6 +2880,24 @@ pub fn reject_non_fast_forward_pushes(
         }
     }
     Ok(())
+}
+
+fn push_command_is_non_fast_forward(
+    common_git_dir: &Path,
+    local_db: &FileObjectDatabase,
+    format: ObjectFormat,
+    command: &ReceivePackCommand,
+    force: bool,
+) -> Result<bool> {
+    if force
+        || !command.name.starts_with("refs/heads/")
+        || command.old_id.is_null()
+        || command.new_id.is_null()
+    {
+        return Ok(false);
+    }
+    let ancestors = sley_rev::ancestor_depths(common_git_dir, format, local_db, &command.new_id)?;
+    Ok(!ancestors.contains_key(&command.old_id))
 }
 
 /// Resolve a (possibly symbolic) ref target to its object id, following up to
@@ -2839,8 +2930,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use sley_formats::RepositoryLayout;
-    use sley_object::{Commit, EncodedObject, ObjectType, Tree};
-    use sley_odb::{FileObjectDatabase, ObjectWriter};
+    use sley_object::{BString, Commit, EncodedObject, ObjectType, Tree, TreeEntry};
+    use sley_odb::{FileObjectDatabase, ObjectReplacements, ObjectWriter};
     use sley_protocol::{ReceivePackCommandStatus, ReceivePackUnpackStatus};
     use sley_refs::{RefTarget, RefUpdate};
 
@@ -2885,6 +2976,29 @@ mod tests {
         .expect("commit should write")
     }
 
+    fn write_commit_for_tree(
+        git_dir: &Path,
+        tree: ObjectId,
+        parents: Vec<ObjectId>,
+        message: &str,
+    ) -> ObjectId {
+        let db = FileObjectDatabase::from_git_dir(git_dir, ObjectFormat::Sha1);
+        let identity = b"Test User <test@example.invalid> 1 +0000".to_vec();
+        db.write_object(EncodedObject::new(
+            ObjectType::Commit,
+            Commit {
+                tree,
+                parents,
+                author: identity.clone(),
+                committer: identity,
+                encoding: None,
+                message: format!("{message}\n").into_bytes(),
+            }
+            .write(),
+        ))
+        .expect("commit should write")
+    }
+
     fn set_ref(git_dir: &Path, name: &str, target: RefTarget) {
         let store = FileRefStore::new(git_dir, ObjectFormat::Sha1);
         let mut tx = store.transaction();
@@ -2902,7 +3016,34 @@ mod tests {
             quiet: true,
             force: false,
             thin: PushThinMode::Auto,
+            atomic: false,
+            push_options: Vec::new(),
         }
+    }
+
+    #[test]
+    fn revision_push_source_uses_injected_replacement_parent() {
+        let git_dir = temp_repo("replacement-source");
+        let original_parent = write_commit(&git_dir, Vec::new(), "original parent");
+        let replacement_parent = write_commit(&git_dir, Vec::new(), "replacement parent");
+        let original = write_commit(&git_dir, vec![original_parent], "original");
+        let replacement = write_commit(&git_dir, vec![replacement_parent], "replacement");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1)
+            .with_replacements(ObjectReplacements::new([(original, replacement)]));
+        let refspecs = [format!("{original}^:refs/heads/topic")];
+        let mut sources = Vec::new();
+
+        add_revision_push_sources_with_reader(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &db,
+            &refspecs,
+            &mut sources,
+        );
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, format!("{original}^"));
+        assert_eq!(sources[0].oid, replacement_parent);
     }
 
     /// Records the last send and which `HttpClient` method delivered it, so the
@@ -3240,6 +3381,113 @@ mod tests {
                 .read_ref("refs/heads/main")
                 .expect("remote ref should read"),
             Some(RefTarget::Direct(tip))
+        );
+    }
+
+    #[test]
+    fn local_push_accepts_promised_gap_in_remote_have_closure() {
+        let local = temp_repo("local-promisor-receiver");
+        let remote = temp_repo("remote-promisor-receiver");
+        let local_db = FileObjectDatabase::from_git_dir(&local, ObjectFormat::Sha1);
+        let remote_db = FileObjectDatabase::from_git_dir(&remote, ObjectFormat::Sha1);
+        let promised_blob = local_db
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"payload held by the receiver's promisor\n".to_vec(),
+            ))
+            .expect("blob should write");
+        let tree = local_db
+            .write_object(EncodedObject::new(
+                ObjectType::Tree,
+                Tree {
+                    entries: vec![TreeEntry {
+                        mode: 0o100644,
+                        name: BString::from("payload"),
+                        oid: promised_blob,
+                    }],
+                }
+                .write(),
+            ))
+            .expect("tree should write");
+        let base = write_commit_for_tree(&local, tree, Vec::new(), "base");
+        let tip = write_commit_for_tree(&local, tree, vec![base], "tip");
+        set_ref(&local, "refs/heads/main", RefTarget::Direct(tip));
+        set_ref(
+            &local,
+            "HEAD",
+            RefTarget::Symbolic("refs/heads/main".into()),
+        );
+
+        sley_odb::build_and_install_reachable_pack_filtered(
+            &local_db,
+            &remote_db,
+            ObjectFormat::Sha1,
+            vec![base],
+            &std::collections::HashSet::new(),
+            RawPackInstallOptions {
+                promisor: true,
+                ..Default::default()
+            },
+            Some(sley_odb::PackObjectFilter::BlobNone),
+            None,
+        )
+        .expect("filtered pack should build")
+        .expect("filtered pack should install");
+        set_ref(&remote, "refs/heads/main", RefTarget::Direct(base));
+        set_ref(
+            &remote,
+            "HEAD",
+            RefTarget::Symbolic("refs/heads/unborn".into()),
+        );
+        let mut config = fs::read(remote.join("config")).expect("remote config should read");
+        config.extend_from_slice(b"\n[remote \"lop\"]\n\tpromisor = true\n");
+        fs::write(remote.join("config"), config).expect("promisor config should write");
+        assert!(
+            !remote_db
+                .contains(&promised_blob)
+                .expect("remote object lookup")
+        );
+
+        let refspecs = ["refs/heads/main:refs/heads/main".to_string()];
+        let report = push_local_with_report(
+            PushReportRequest {
+                git_dir: &local,
+                common_git_dir: &local,
+                format: ObjectFormat::Sha1,
+                remote_git_dir: &remote,
+                remote_common_git_dir: &remote,
+                refspecs: &refspecs,
+                force: false,
+                atomic: false,
+                dry_run: false,
+                force_with_lease: &[],
+                force_with_lease_default: false,
+                force_if_includes: false,
+                receive_config_overrides: &[],
+                push_options: &[],
+                remote_stderr: None,
+                quiet: true,
+            },
+            &GitConfig::default(),
+        )
+        .expect("push into incomplete promisor receiver should succeed");
+
+        assert_eq!(report.refs.len(), 1, "unexpected push report: {report:#?}");
+        let reference = &report.refs[0];
+        assert_eq!(reference.dst, "refs/heads/main");
+        assert_eq!(reference.new_id, tip);
+        assert_eq!(reference.status, PushRefStatus::Ok);
+        assert_eq!(
+            FileRefStore::new(&remote, ObjectFormat::Sha1)
+                .read_ref("refs/heads/main")
+                .expect("remote ref should read"),
+            Some(RefTarget::Direct(tip))
+        );
+        remote_db.refresh_read_cache();
+        assert!(
+            !remote_db
+                .contains(&promised_blob)
+                .expect("receiver should retain promised gap")
         );
     }
 

@@ -182,8 +182,15 @@ enum Invocation {
 }
 
 /// Entry point for `git interpret-trailers`.
-pub(crate) fn cmd_interpret_trailers(args: &[String]) -> Result<()> {
-    let options = match parse_args(args)? {
+pub(crate) fn cmd_interpret_trailers(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let config = cli_session
+        .git_dir()
+        .ok()
+        .and_then(|git_dir| read_repo_config(&git_dir).ok());
+    let options = match parse_args(args, config.as_ref())? {
         Invocation::Run(options) => options,
         Invocation::Help => {
             print!("{USAGE}");
@@ -268,8 +275,12 @@ pub(crate) fn cmd_interpret_trailers(args: &[String]) -> Result<()> {
 /// Matching git's `amend_strbuf_with_trailers`, divider handling is disabled
 /// (`no_divider = true`): a `---` line in a commit/tag *body* is ordinary text,
 /// not a patch divider, so trailers append after it rather than before it.
-pub(crate) fn apply_trailers_to_message(message: &str, trailer_args: &[String]) -> String {
-    let config = load_trailer_config();
+pub(crate) fn apply_trailers_to_message(
+    config: Option<&GitConfig>,
+    message: &str,
+    trailer_args: &[String],
+) -> String {
+    let config = load_trailer_config(config);
     let default_where = config.where_;
     let default_if_exists = config.if_exists;
     let default_if_missing = config.if_missing;
@@ -340,9 +351,9 @@ fn io_reason(err: &std::io::Error) -> String {
 /// Parse argv into [`Options`]. On an option error this prints git's diagnostic
 /// to stderr and returns `Err(GitError::Exit(129))`; `-h`/`--help` yields
 /// [`Invocation::Help`].
-fn parse_args(args: &[String]) -> Result<Invocation> {
+fn parse_args(args: &[String], config: Option<&GitConfig>) -> Result<Invocation> {
     // Seed defaults from configuration (best-effort) before applying argv.
-    let config = load_trailer_config();
+    let config = load_trailer_config(config);
 
     let mut opts = Options {
         in_place: false,
@@ -699,7 +710,7 @@ struct TrailerConfig {
 /// `trailer.<name>.<var>` populates a per-token [`ConfItem`]. Reading is entirely
 /// best-effort so the command still works outside a repository (git's
 /// compiled-in defaults then apply).
-fn load_trailer_config() -> TrailerConfig {
+fn load_trailer_config(config: Option<&GitConfig>) -> TrailerConfig {
     let mut cfg = TrailerConfig {
         where_: Where::End,
         if_exists: IfExists::AddIfDifferentNeighbor,
@@ -710,7 +721,7 @@ fn load_trailer_config() -> TrailerConfig {
         conf_items: Vec::new(),
     };
 
-    let Some(config) = effective_config() else {
+    let Some(config) = config else {
         return cfg;
     };
 
@@ -807,12 +818,6 @@ fn load_trailer_config() -> TrailerConfig {
 /// key including overrides. Best-effort; returns `None` outside a repository
 /// (git's compiled-in defaults then apply, matching real interpret-trailers which
 /// runs fine outside a repo).
-fn effective_config() -> Option<GitConfig> {
-    let dir = env::current_dir().ok()?;
-    let git_dir = crate::session::cli_git_dir_from(dir).ok()?;
-    read_repo_config(&git_dir).ok()
-}
-
 // ---------------------------------------------------------------------------
 // Trailer model
 // ---------------------------------------------------------------------------

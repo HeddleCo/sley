@@ -1,5 +1,7 @@
 use super::*;
-use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_remote, sley_rev, sley_worktree};
+use sley::plumbing::{
+    sley_core, sley_diff_merge, sley_index, sley_remote, sley_rev, sley_worktree,
+};
 
 pub(crate) fn read_commit_tree(
     db: &FileObjectDatabase,
@@ -341,9 +343,11 @@ fn worktree_blob_identity(format: ObjectFormat, path: &Path) -> Result<Option<(u
     )))
 }
 
-fn ensure_pull_can_merge() -> Result<()> {
-    let color_advice = effective_config_with_overrides()
-        .and_then(|config| config.get("color", None, "advice").map(str::to_string))
+fn ensure_pull_can_merge(config: &GitConfig) -> Result<()> {
+    let config = effective_config_with_overrides(config);
+    let color_advice = config
+        .get("color", None, "advice")
+        .map(str::to_string)
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("always"));
     let print_hint = |line: &str| {
         if color_advice {
@@ -567,124 +571,47 @@ fn pull_remote_tracking_ref(config: &GitConfig, remote: &str, remote_ref: &str) 
     None
 }
 
-fn print_fetch_status(
-    source: &str,
-    updates: &[FetchRefUpdate],
-    old_oids: &HashMap<String, ObjectId>,
-) {
-    let mut displayed = false;
-    for update in updates {
-        let src_short = update
-            .src
-            .strip_prefix("refs/heads/")
-            .unwrap_or(update.src.as_str());
-        let Some(dst) = update.dst.as_ref() else {
-            if !displayed {
-                eprintln!("From {source}");
-                displayed = true;
-            }
-            eprintln!(" * branch            {src_short:11}-> FETCH_HEAD");
-            continue;
-        };
-        if old_oids.get(dst) == Some(&update.oid) {
-            continue;
-        }
-        if !displayed {
-            eprintln!("From {source}");
-            displayed = true;
-        }
-        let dst_short = dst.strip_prefix("refs/remotes/").unwrap_or(dst.as_str());
-        let old_short = old_oids
-            .get(dst)
-            .map(format_log_abbrev_oid)
-            .unwrap_or_else(|| "0000000".to_string());
-        eprintln!(
-            "   {}..{}  {:11} -> {}",
-            old_short,
-            format_log_abbrev_oid(&update.oid),
-            src_short,
-            dst_short
-        );
-    }
-}
-
 fn pull_fetch(
+    context: &crate::commands::remote::RemoteCommandContext,
     git_dir: &Path,
     format: ObjectFormat,
     remote: &str,
     refspecs: &[String],
     options: FetchOptions,
 ) -> Result<FetchOutcome> {
+    if let Some(outcome) = crate::commands::remote::fetch_with_remote_helper(
+        context,
+        git_dir,
+        format,
+        remote,
+        refspecs,
+        options.clone(),
+    )? {
+        return Ok(outcome);
+    }
     if let Ok(input) = fs::read(remote)
         && let Ok(bundle) = Bundle::parse(&input, format)
     {
         fetch_bundle(git_dir, format, remote, refspecs, &bundle, options)?;
         return Ok(FetchOutcome::default());
     }
-    if fetch_source_is_ssh(remote)? {
-        fetch_ssh_repository(git_dir, format, remote, refspecs, options)?;
-        Ok(FetchOutcome::default())
+    if fetch_source_is_http(context, remote)? {
+        fetch_http_repository_with_outcome(context, git_dir, format, remote, refspecs, options)
+    } else if fetch_source_is_ssh(context, remote)? {
+        fetch_ssh_repository_with_outcome(context, git_dir, format, remote, refspecs, options)
+    } else if fetch_source_is_git(context, remote)? {
+        fetch_git_repository_with_outcome(context, git_dir, format, remote, refspecs, options)
     } else {
-        let config = read_repo_config(git_dir)?;
-        let remote_git_dir = ls_remote_git_dir(remote)?;
-        let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
-        let fetch_source = sley_remote::FetchSource::Local {
-            git_dir: remote_git_dir,
-            common_git_dir: remote_common_git_dir,
-        };
-        let store = FileRefStore::new(git_dir, format);
-        let mut old_oids = HashMap::new();
-        if !options.merge_srcs.is_empty() {
-            for update_dst in store.list_refs()? {
-                if let Some((oid, _)) = resolve_for_each_ref_target(&store, &update_dst)? {
-                    old_oids.insert(update_dst.name, oid);
-                }
-            }
-        }
-        let quiet = options.quiet;
-        let outcome = run_fetch_with_outcome(
+        fetch_local_repository_with_outcome(
+            context,
             git_dir,
             format,
-            &config,
             remote,
-            &fetch_source,
             refspecs,
             options,
-        )?;
-        if !quiet {
-            print_fetch_status(remote, &outcome.ref_updates, &old_oids);
-        }
-        Ok(outcome)
+            &[],
+        )
     }
-}
-
-fn run_fetch_with_outcome(
-    git_dir: &Path,
-    format: ObjectFormat,
-    config: &GitConfig,
-    source: &str,
-    fetch_source: &sley_remote::FetchSource,
-    refspecs: &[String],
-    options: FetchOptions,
-) -> Result<FetchOutcome> {
-    let mut credentials = sley_remote::CredentialHelperProvider::new(Some(config));
-    let mut progress = StdoutProgress::default();
-    sley_remote::fetch(
-        sley_remote::FetchRequest {
-            git_dir,
-            format,
-            config,
-            remote_name: source,
-            source: fetch_source,
-            refspecs,
-            options: &options,
-        },
-        sley_remote::FetchServices {
-            credentials: &mut credentials,
-            progress: &mut progress,
-            ref_hook: None,
-        },
-    )
 }
 
 fn pull_checkout_into_void(
@@ -693,6 +620,7 @@ fn pull_checkout_into_void(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     commit_oid: &ObjectId,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let object = db.read_object(commit_oid)?;
     let commit = Commit::parse_ref(format, &object.body)?;
@@ -750,7 +678,7 @@ fn pull_checkout_into_void(
         let content = if sley_index::is_gitlink(*mode) {
             Vec::new()
         } else {
-            merge_read_blob(db, oid)?
+            merge_read_blob(db, oid, lazy_fetch)?
         };
         merge_write_worktree_file(worktree_root, path, &content, *mode)?;
         index_entries.push(merge_index_entry(path, *mode, *oid, 0));
@@ -769,7 +697,36 @@ fn pull_checkout_into_void(
     Ok(())
 }
 
-pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
+fn hydrate_pull_target_blobs(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+    lazy_fetch: bool,
+) -> Result<()> {
+    if !lazy_fetch {
+        return Ok(());
+    }
+    let tree_oid = read_commit_tree(db, format, commit_oid)?;
+    let target = sley_diff_merge::flatten_tree(db, format, &tree_oid)?;
+    let missing = target
+        .values()
+        .filter(|(mode, _)| !sley_index::is_gitlink(*mode))
+        .filter_map(|(_, oid)| match db.contains(oid) {
+            Ok(false) => Some(Ok(*oid)),
+            Ok(true) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !missing.is_empty() {
+        let _ =
+            sley_remote::hydrate_objects_from_local_promisor_remotes(git_dir, format, &missing)?;
+        db.refresh_read_cache();
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     // git's `set_reflog_message`: record the pull invocation (`pull …`) as the
     // reflog action so a fast-forward merge writes `pull …: Fast-forward`. The
     // workspace forbids `std::env::set_var`, so the action is stashed in a
@@ -902,8 +859,9 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             }
         }
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let remote_context =
+        crate::commands::remote::RemoteCommandContext::require_repository(cli_session)?;
+    let git_dir = remote_context.required_git_dir()?.to_path_buf();
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
@@ -970,11 +928,12 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         None
     };
     if effective_rebase.enabled() && effective_autostash != Some(true) {
-        let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+        let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
         ensure_pull_rebase_clean_without_autostash(&git_dir, &worktree_root, format)?;
     }
     let fetch_options = FetchOptions {
         quiet: verbosity < 0,
+        progress: None,
         auto_follow_tags: true,
         fetch_all_tags: tags == Some(true),
         prune: false,
@@ -990,6 +949,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         depth,
         merge_srcs: merge_srcs.clone(),
         filter: None,
+        filter_auto: false,
         refetch: false,
         cloning: false,
         record_promisor_refs: true,
@@ -1000,6 +960,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         deepen_since: None,
         deepen_not: Vec::new(),
         ssh_options: None,
+        upload_pack_command: None,
         atomic: false,
         negotiation_restrict: None,
         negotiation_include: None,
@@ -1021,17 +982,23 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     // pull-into-void decision keys off the *pre-fetch* state, so capture it now.
     let orig_head_unborn = orig_head.is_none();
     let before_fetch_refs = fetch_ref_snapshot(&git_dir, format)?;
-    let fetch_outcome =
-        match pull_fetch(&git_dir, format, &remote, &refspecs, fetch_options.clone()) {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                if !merge_srcs.is_empty() && format!("{err}").contains("remote ref") {
-                    print_pull_no_such_ref_fetched(&merge_srcs);
-                    return Err(GitError::Exit(1));
-                }
-                return Err(err);
+    let fetch_outcome = match pull_fetch(
+        &remote_context,
+        &git_dir,
+        format,
+        &remote,
+        &refspecs,
+        fetch_options.clone(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            if !merge_srcs.is_empty() && format!("{err}").contains("remote ref") {
+                print_pull_no_such_ref_fetched(&merge_srcs);
+                return Err(GitError::Exit(1));
             }
-        };
+            return Err(err);
+        }
+    };
     if set_upstream {
         crate::commands::remote::fetch_set_upstream_from_outcome(
             &git_dir,
@@ -1045,8 +1012,9 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     }
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     fetch_populated_submodules_after_superproject(FetchSubmoduleRequest {
+        runtime_cwd: remote_context.cwd(),
         git_dir: &git_dir,
         format,
         worktree_root: &worktree_root,
@@ -1105,7 +1073,14 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(128));
         }
         let merge_oid = merge_records[0].oid;
-        pull_checkout_into_void(&git_dir, &worktree_root, &db, format, &merge_oid)?;
+        pull_checkout_into_void(
+            &git_dir,
+            &worktree_root,
+            &db,
+            format,
+            &merge_oid,
+            cli_session.lazy_fetch(),
+        )?;
         let target_ref = match store.read_ref("HEAD")? {
             Some(RefTarget::Symbolic(branch)) => branch,
             _ => "HEAD".to_string(),
@@ -1121,7 +1096,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
                 reflog: Some(ReflogEntry {
                     old_oid: zero_oid(format)?,
                     new_oid: merge_oid,
-                    committer: commit_identity_from_env("COMMITTER")?,
+                    committer: commit_identity_from_env("COMMITTER", &config)?,
                     message: b"initial pull".to_vec(),
                 }),
             });
@@ -1129,7 +1104,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
-    let ours_oid = resolve_revision(&git_dir, format, "HEAD")?;
+    let ours_oid = resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects())?;
     let merge_oids = merge_records
         .iter()
         .map(|record| sley_rev::peel_to_commit(&db, format, &record.oid))
@@ -1159,7 +1134,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         // so a `--recurse-submodules` pull re-syncs a submodule worktree that an
         // earlier `--no-recurse-submodules` pull advanced the gitlink for without
         // checking out.
-        pull_update_submodules_after_merge(update_recurse_submodules, verbosity)?;
+        pull_update_submodules_after_merge(cli_session, update_recurse_submodules, verbosity)?;
         return Ok(());
     }
     let fast_forward = if merge_oids.len() == 1 {
@@ -1176,9 +1151,10 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         effective_rebase = PullRebase::False;
     }
     if opt_ff.is_none() && rebase_unspecified && !fast_forward {
-        ensure_pull_can_merge()?;
+        ensure_pull_can_merge(&config)?;
     }
     if fast_forward {
+        hydrate_pull_target_blobs(&git_dir, &db, format, &theirs_oid, cli_session.lazy_fetch())?;
         let mut merge_args = Vec::new();
         if effective_rebase.enabled() {
             merge_args.push("--ff-only".to_string());
@@ -1194,8 +1170,8 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             merge_args.push("--quiet".to_string());
         }
         merge_args.push("FETCH_HEAD".to_string());
-        cmd_merge(&merge_args)?;
-        pull_update_submodules_after_merge(update_recurse_submodules, verbosity)?;
+        cmd_merge(cli_session, &merge_args)?;
+        pull_update_submodules_after_merge(cli_session, update_recurse_submodules, verbosity)?;
         return Ok(());
     }
     if effective_rebase.enabled() {
@@ -1220,7 +1196,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         } else {
             rebase_args.push("FETCH_HEAD".to_string());
         }
-        return commands::rebase::cmd_rebase(&rebase_args);
+        return commands::rebase::cmd_rebase(cli_session, &rebase_args);
     }
     let mut merge_args = Vec::new();
     if let Some(ff) = opt_ff {
@@ -1239,8 +1215,8 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     } else {
         merge_args.extend(merge_oids.iter().map(ToString::to_string));
     }
-    cmd_merge(&merge_args)?;
-    pull_update_submodules_after_merge(update_recurse_submodules, verbosity)?;
+    cmd_merge(cli_session, &merge_args)?;
+    pull_update_submodules_after_merge(cli_session, update_recurse_submodules, verbosity)?;
     Ok(())
 }
 
@@ -1251,7 +1227,11 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
 /// `--no-recurse-submodules` pull is brought back in sync on the next
 /// `--recurse-submodules` pull. Scoped to the merge paths; `pull --rebase`
 /// keeps its own (local-commit-preserving) submodule handling.
-fn pull_update_submodules_after_merge(recurse: bool, verbosity: i32) -> Result<()> {
+fn pull_update_submodules_after_merge(
+    cli_session: &crate::session::CliSession,
+    recurse: bool,
+    verbosity: i32,
+) -> Result<()> {
     if !recurse {
         return Ok(());
     }
@@ -1261,5 +1241,5 @@ fn pull_update_submodules_after_merge(recurse: bool, verbosity: i32) -> Result<(
     }
     args.push("update".to_string());
     args.push("--recursive".to_string());
-    commands::submodule::cmd_submodule(&args)
+    commands::submodule::cmd_submodule(cli_session, &args)
 }

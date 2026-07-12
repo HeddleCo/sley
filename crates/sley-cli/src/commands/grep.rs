@@ -19,6 +19,7 @@ use sley_grep::{
 use sley_pathspec::{parse_normalized_pathspec_element, pathspec_attrs_match_with};
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 /// Parsed command-line options for `git grep`.
 struct GrepOptions {
@@ -239,7 +240,7 @@ fn parse_grep_bool(value: Option<&str>) -> bool {
     }
 }
 
-pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut opts = GrepOptions::new();
     // `positionals` is the post-option token stream (pattern, revs, paths). A `--`
     // among them is preserved as the literal marker `\0DD\0` so the later rev/path
@@ -483,7 +484,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         opts.push_pattern(positionals.remove(0));
     }
 
-    let repo = match RepositoryContext::discover_current() {
+    let repo = match RepositoryContext::from_session(cli_session) {
         Ok(repo) => Some(repo),
         Err(err) => {
             if no_index || grep_fallback_to_no_index()? {
@@ -540,6 +541,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         reject_nul_pattern_without_pcre(&opts)?;
         let color_config = repo.as_ref().map(|repo| repo.config());
         let any = grep_no_index(
+            cli_session,
             &opts,
             color_config,
             repo.as_ref(),
@@ -648,7 +650,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
     })?;
     let expr = build_expr(&opts.tokens);
 
-    let worktree_root = match worktree_root_for_git_dir(git_dir) {
+    let worktree_root = match worktree_root_for_git_dir(cli_session, git_dir) {
         Ok(root) if root.is_dir() => Some(root),
         _ => None,
     };
@@ -657,6 +659,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         cwd,
         opts.full_name,
         &opts.pathspecs,
+        effective_pathspec_flags(cli_session),
     )?;
     let userdiff_attributes = worktree_root
         .as_deref()
@@ -690,6 +693,8 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
                 format,
                 db,
                 config: repo.config(),
+                lazy_fetch: cli_session.lazy_fetch(),
+                replace_objects: cli_session.replace_objects(),
             },
             b"",
             &plan,
@@ -708,6 +713,8 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
                     config: repo.config(),
                     common_dir: repo.git_dir(),
                     worktree_root: worktree_root.as_deref(),
+                    lazy_fetch: cli_session.lazy_fetch(),
+                    replace_objects: cli_session.replace_objects(),
                 },
                 b"",
                 &plan,
@@ -1146,6 +1153,7 @@ fn run_open_pager(_pager: &str, _opts: &GrepOptions, _files: &[Vec<u8>]) -> Resu
 }
 
 fn grep_no_index(
+    cli_session: &crate::session::CliSession,
     opts: &GrepOptions,
     color_config: Option<&GitConfig>,
     repo: Option<&RepositoryContext>,
@@ -1153,11 +1161,11 @@ fn grep_no_index(
     dashdash: &str,
     pager: Option<&RefCell<Vec<Vec<u8>>>>,
 ) -> Result<bool> {
-    let cwd = env::current_dir()?;
+    let cwd = cli_session.cwd().to_path_buf();
     let cwd_canon = fs::canonicalize(&cwd)?;
     let raw_paths = no_index_paths(positionals, dashdash)?;
     let worktree_root = if opts.untracked {
-        repo.and_then(|repo| worktree_root_for_git_dir(repo.git_dir()).ok())
+        repo.and_then(|repo| repo.worktree_root().ok().map(Path::to_path_buf))
     } else {
         None
     };
@@ -1167,6 +1175,7 @@ fn grep_no_index(
         &cwd,
         opts.full_name,
         pathspec_args,
+        effective_pathspec_flags(cli_session),
     )?;
     let matcher = GrepMatcher::compile(GrepCompileConfig {
         patterns: &opts.patterns,
@@ -1430,12 +1439,16 @@ fn submodule_name_to_gitdir(common_dir: &Path, name: &str) -> PathBuf {
 /// Open a submodule via its populated worktree gitlink (`<worktree>/.git`), as
 /// `grep_cache`'s recursion does. Returns `None` for an unpopulated/unresolvable
 /// gitlink.
-fn open_submodule_worktree(worktree_root: &Path, sub_rel: &[u8]) -> Option<OwnedSubrepo> {
+fn open_submodule_worktree(
+    worktree_root: &Path,
+    sub_rel: &[u8],
+    replace_objects: bool,
+) -> Option<OwnedSubrepo> {
     let sub_worktree = worktree_root.join(bytes_to_path(sub_rel));
     let git_dir = sley_diff_merge::gitlink_git_dir(&sub_worktree)?;
     let common = common_git_dir_for_git_dir(&git_dir).ok()?;
     let format = repository_object_format(&common).ok()?;
-    let db = FileObjectDatabase::from_git_dir(&common, format);
+    let db = crate::repository::open_object_database(&git_dir, format, replace_objects).ok()?;
     let config = read_repo_config(&git_dir).ok()?;
     Some(OwnedSubrepo {
         git_dir: common,
@@ -1458,6 +1471,7 @@ fn open_submodule_tree(
     common_dir: &Path,
     name: &str,
     path: &[u8],
+    replace_objects: bool,
 ) -> Option<OwnedSubrepo> {
     let sub_worktree = worktree_root.map(|root| root.join(bytes_to_path(path)));
     let git_dir = sub_worktree
@@ -1469,7 +1483,7 @@ fn open_submodule_tree(
         })?;
     let common = common_git_dir_for_git_dir(&git_dir).ok()?;
     let format = repository_object_format(&common).ok()?;
-    let db = FileObjectDatabase::from_git_dir(&common, format);
+    let db = crate::repository::open_object_database(&git_dir, format, replace_objects).ok()?;
     let config = read_repo_config(&git_dir).ok()?;
     Some(OwnedSubrepo {
         git_dir: common,
@@ -1505,12 +1519,13 @@ fn submodule_active(
         .collect();
     if !active_specs.is_empty() {
         return active_specs.iter().any(|spec| {
-            sley_pathspec::PathspecElement::parse(
-                spec.as_bytes(),
-                sley_pathspec::PathspecMatchMagic::default(),
-            )
-            .map(|element| element.matches_path(path))
-            .unwrap_or(false)
+            *spec == "."
+                || sley_pathspec::PathspecElement::parse(
+                    spec.as_bytes(),
+                    sley_pathspec::PathspecMatchMagic::default(),
+                )
+                .map(|element| element.matches_path(path))
+                .unwrap_or(false)
         });
     }
     config.get("submodule", Some(name), "url").is_some()
@@ -1582,6 +1597,8 @@ struct GrepIndexSource<'a> {
     format: ObjectFormat,
     db: &'a FileObjectDatabase,
     config: &'a GitConfig,
+    lazy_fetch: bool,
+    replace_objects: bool,
 }
 
 fn grep_index_source(
@@ -1601,9 +1618,16 @@ fn grep_index_level(
     out: &mut impl Write,
     printed_file: &mut bool,
 ) -> Result<bool> {
-    let Some(index) = sley_worktree::read_repository_index(source.git_dir, source.format)? else {
+    let Some(mut index) = sley_worktree::read_repository_index(source.git_dir, source.format)?
+    else {
         return Ok(false);
     };
+    // A collapsed sparse-directory is an index storage optimization, not a
+    // searchable file. Expand only this command-local semantic view so cached
+    // grep can inspect the represented blobs while worktree grep still honors
+    // their inherited SKIP_WORKTREE bits. The view API neither writes the index
+    // nor emits Git's observable `ensure_full_index` transition.
+    sley_worktree::expand_sparse_index_view(&mut index, source.db, source.format)?;
     const CE_VALID: u16 = 0x8000;
 
     // git's `clear_skip_worktree_from_present_files`: under sparse checkout a
@@ -1669,7 +1693,8 @@ fn grep_index_level(
         if mode == 0o160000 {
             if let Some(submodules) = &submodules
                 && submodule_active(source.config, submodules, &path)
-                && let Some(sub) = open_submodule_worktree(source.worktree_root, &path)
+                && let Some(sub) =
+                    open_submodule_worktree(source.worktree_root, &path, source.replace_objects)
                 && let Some(sub_worktree) = sub.worktree_root.as_deref()
             {
                 let sub_source = GrepIndexSource {
@@ -1678,6 +1703,8 @@ fn grep_index_level(
                     format: sub.format,
                     db: &sub.db,
                     config: &sub.config,
+                    lazy_fetch: source.lazy_fetch,
+                    replace_objects: source.replace_objects,
                 };
                 let sub_prefix = submodule_prefix(prefix, &path);
                 let matched = grep_index_level(&sub_source, &sub_prefix, plan, out, printed_file)?;
@@ -1725,7 +1752,8 @@ fn grep_index_level(
                 i = next(false, i);
                 continue;
             }
-            let object = read_object_maybe_prefetch_promisor(source.db, &oid)?;
+            let object =
+                grep_read_object_maybe_prefetch_promisor(source.db, &oid, source.lazy_fetch)?;
             Cow::Owned(object.body.to_vec())
         } else {
             let absolute = source.worktree_root.join(bytes_to_path(&path));
@@ -1762,6 +1790,8 @@ struct GrepTreeSource<'a> {
     /// submodule's in-place gitlink. For a nested level this is the parent
     /// submodule's worktree.
     worktree_root: Option<&'a Path>,
+    lazy_fetch: bool,
+    replace_objects: bool,
 }
 
 fn grep_tree_source(
@@ -1790,8 +1820,31 @@ fn grep_tree_level(
         None
     };
 
-    let mut any = false;
+    // `grep_tree()` collects the object ids selected by the pathspec before it
+    // opens any blob. In a partial clone that lets the promisor machinery send
+    // one request containing every missing blob instead of lazily fetching one
+    // object per entry. Do this independently at each repository level: a
+    // submodule has its own object database and promisor configuration.
+    let mut candidate_blobs = Vec::new();
+    let mut eligible_paths = Vec::with_capacity(flat.len());
     for (path, (mode, oid)) in &flat {
+        let eligible = if *mode != 0o160000 {
+            let full = join_prefix(prefix, path);
+            plan.pathspec
+                .matches_tree(&full, source.db, source.format, source.tree_oid)?
+                && plan.pathspec.within_max_depth(&full, plan.opts.max_depth)
+        } else {
+            false
+        };
+        if eligible {
+            candidate_blobs.push(*oid);
+        }
+        eligible_paths.push(eligible);
+    }
+    grep_prefetch_promisor_objects(source.db, &candidate_blobs, source.lazy_fetch)?;
+
+    let mut any = false;
+    for ((path, (mode, oid)), eligible) in flat.iter().zip(eligible_paths) {
         let full = join_prefix(prefix, path);
         if *mode == 0o160000 {
             if let Some(submodules) = &submodules
@@ -1799,7 +1852,18 @@ fn grep_tree_level(
                 && let Ok(path_str) = std::str::from_utf8(path)
                 && let Some(name) = submodules.from_path(path_str).map(|m| m.name.clone())
                 && let Some(sub) =
-                    open_submodule_tree(source.worktree_root, source.common_dir, &name, path)
+                    open_submodule_tree(
+                        source.worktree_root,
+                        source.common_dir,
+                        &name,
+                        path,
+                        source.replace_objects,
+                    )
+                // A historical superproject tree can name a submodule commit
+                // omitted by `clone --also-filter-submodules`. Materialize the
+                // promised commit before peeling it; blob reads below retain
+                // their own lazy-fetch boundary.
+                && grep_read_object_maybe_prefetch_promisor(&sub.db, oid, source.lazy_fetch).is_ok()
                 && let Ok(sub_tree) = sley_rev::peel_to_tree(&sub.db, sub.format, oid)
             {
                 let sub_source = GrepTreeSource {
@@ -1810,6 +1874,8 @@ fn grep_tree_level(
                     config: &sub.config,
                     common_dir: &sub.git_dir,
                     worktree_root: sub.worktree_root.as_deref(),
+                    lazy_fetch: source.lazy_fetch,
+                    replace_objects: source.replace_objects,
                 };
                 let sub_prefix = submodule_prefix(prefix, path);
                 let matched = grep_tree_level(&sub_source, &sub_prefix, plan, out, printed_file)?;
@@ -1817,17 +1883,11 @@ fn grep_tree_level(
             }
             continue;
         }
-        if !plan
-            .pathspec
-            .matches_tree(&full, source.db, source.format, source.tree_oid)?
-        {
-            continue;
-        }
-        if !plan.pathspec.within_max_depth(&full, plan.opts.max_depth) {
+        if !eligible {
             continue;
         }
         let display = plan.pathspec.display(&full);
-        let object = read_object_maybe_prefetch_promisor(source.db, oid)?;
+        let object = grep_read_object_maybe_prefetch_promisor(source.db, oid, source.lazy_fetch)?;
         let driver = grep_userdiff_driver(plan, &full)?;
         let funcname = driver.as_ref().and_then(|driver| driver.funcname.as_ref());
         let matched = grep_buffer(
@@ -1842,6 +1902,131 @@ fn grep_tree_level(
         any = any || matched;
     }
     Ok(any)
+}
+
+/// Materialize the missing subset of `oids` in one request per configured
+/// local/file promisor. This is grep's equivalent of Git's
+/// `oidset_parse_file()` + `promisor_remote_get_direct()` batch boundary.
+///
+/// The shared single-object read seam remains the fallback for transports that
+/// cannot be resolved to an in-process local upload-pack (including custom
+/// `remote.<name>.uploadpack` commands). That preserves existing behavior while
+/// making the native local/file path both truthful and substantially cheaper.
+fn grep_prefetch_promisor_objects(
+    db: &FileObjectDatabase,
+    oids: &[ObjectId],
+    lazy_fetch: bool,
+) -> Result<()> {
+    if !lazy_fetch || oids.is_empty() {
+        return Ok(());
+    }
+
+    let mut seen = HashSet::new();
+    let mut missing = Vec::new();
+    for oid in oids {
+        if seen.insert(*oid) && !db.contains(oid)? {
+            missing.push(*oid);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let objects_dir = db.objects_dir();
+    let Some(git_dir) = (objects_dir.file_name() == Some(std::ffi::OsStr::new("objects")))
+        .then(|| objects_dir.parent().map(Path::to_path_buf))
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let Ok(config) = read_repo_config(&git_dir) else {
+        return Ok(());
+    };
+    let resolution_cwd =
+        sley_worktree::worktree_root_for_git_dir(&git_dir)?.unwrap_or_else(|| git_dir.clone());
+
+    for remote_name in promisor_remote_names(&config) {
+        if missing.is_empty() {
+            break;
+        }
+        // A configured upload-pack is an arbitrary shell protocol. The shared
+        // single-object seam owns that compatibility fallback; never invoke it
+        // speculatively here or borrow an installed Git executable.
+        if config
+            .get("remote", Some(&remote_name), "uploadpack")
+            .is_some()
+        {
+            continue;
+        }
+        let Some(url) = config.get("remote", Some(&remote_name), "url") else {
+            continue;
+        };
+        let resolution = sley_remote::RemoteResolutionContext {
+            cwd: &resolution_cwd,
+            local_git_dir: Some(&git_dir),
+            config: Some(&config),
+        };
+        let Ok(remote_git_dir) = sley_remote::resolve_local_remote_git_dir(resolution, url) else {
+            continue;
+        };
+        let filter = config
+            .get("remote", Some(&remote_name), "partialclonefilter")
+            .and_then(sley_remote::pack_filter_from_spec)
+            .or(Some(sley_odb::PackObjectFilter::BlobNone));
+        if sley_remote::install_fetch_pack_via_local_upload_pack(
+            &git_dir,
+            &remote_git_dir,
+            db.object_format(),
+            missing.clone(),
+            None,
+            true,
+            false,
+            filter,
+            None,
+            false,
+            None,
+        )
+        .is_err()
+        {
+            continue;
+        }
+
+        db.refresh_read_cache();
+        let before = missing.len();
+        let mut still_missing = Vec::with_capacity(before);
+        for oid in missing {
+            if !db.contains(&oid)? {
+                still_missing.push(oid);
+            }
+        }
+        missing = still_missing;
+        let hydrated = before - missing.len();
+        if hydrated > 0 {
+            // Upstream records the batch cardinality at the caller and the
+            // number of objects written by the pack producer. The in-process
+            // transport has no child trace stream, so publish both truthful
+            // engine outcomes in this process.
+            sley_core::trace2::data("promisor", "fetch_count", hydrated as u64);
+            sley_core::trace2::data("pack-objects", "written", hydrated as u64);
+        }
+    }
+    Ok(())
+}
+
+/// Read an object through the shared promisor boundary and record grep's
+/// command-level lazy-fetch count only when this call actually materialized a
+/// previously missing object.
+fn grep_read_object_maybe_prefetch_promisor(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+    lazy_fetch: bool,
+) -> Result<Arc<EncodedObject>> {
+    let was_missing = lazy_fetch && !db.contains(oid)?;
+    let object = read_object_maybe_prefetch_promisor(db, oid, lazy_fetch)?;
+    if was_missing {
+        sley_core::trace2::data("promisor", "fetch_count", 1);
+    }
+    Ok(object)
 }
 
 // ---------------------------------------------------------------------------
@@ -2554,6 +2739,7 @@ impl GrepPathspec {
         cwd: &Path,
         full_name: bool,
         pathspecs: &[String],
+        magic: sley_worktree::PathspecMatchMagic,
     ) -> Result<Self> {
         let prefix = if let Some(root) = worktree_root {
             let root = fs::canonicalize(root)?;
@@ -2570,7 +2756,6 @@ impl GrepPathspec {
             .filter(|component| !component.is_empty())
             .count();
         let mut filters = Vec::new();
-        let magic = effective_pathspec_flags();
         for spec in pathspecs {
             let element = parse_normalized_pathspec_element(&prefix, spec, magic)?;
             let is_dir_spec = !element
@@ -2896,6 +3081,36 @@ mod tests {
     }
 
     #[test]
+    fn unicode_icase_matches_literals_fixed_strings_and_classes() {
+        assert!(contains(
+            "TILRAUN: Halló Heimur!".as_bytes(),
+            "HALLÓ".as_bytes(),
+            true
+        ));
+
+        let bre = Regex::compile("HALLÓ", RegexMode::Bre, true, false).expect("compile BRE");
+        assert!(bre.find_from("Halló".as_bytes(), 0).is_some());
+
+        let pcre = Regex::compile("[Æ]\0Ð", RegexMode::Pcre, true, false).expect("compile PCRE");
+        assert_eq!(pcre.find_from("æ\0ð".as_bytes(), 0), Some((0, 5)));
+    }
+
+    #[test]
+    fn pcre_utf8_atoms_quantify_and_report_full_byte_spans() {
+        let repeated = Regex::compile("ó+", RegexMode::Pcre, false, false).expect("compile");
+        assert_eq!(repeated.find_from("xóó".as_bytes(), 0), Some((1, 5)));
+
+        let dot = Regex::compile("ll.", RegexMode::Pcre, false, false).expect("compile");
+        assert_eq!(dot.find_from("Halló".as_bytes(), 0), Some((2, 6)));
+    }
+
+    #[test]
+    fn unicode_icase_preserves_invalid_utf8_subject_bytes() {
+        let pcre = Regex::compile("Æ", RegexMode::Pcre, true, false).expect("compile");
+        assert_eq!(pcre.find_from(b"\x80\n\xc3\xa6", 0), Some((2, 4)));
+    }
+
+    #[test]
     fn wildmatch_crosses_slash() {
         assert!(grep_test_pathspec(b"*.txt").matches_path(b"sub/c.txt"));
         assert!(grep_test_pathspec(b"sub/*").matches_path(b"sub/c.txt"));
@@ -2963,5 +3178,17 @@ mod tests {
         assert_eq!(submodule_prefix(b"", b"submodule"), b"submodule/");
         assert_eq!(submodule_prefix(b"submodule/", b"sub"), b"submodule/sub/");
         assert_eq!(join_prefix(b"submodule/", b"a"), b"submodule/a");
+    }
+
+    #[test]
+    fn dot_submodule_active_selects_every_configured_submodule() {
+        let config =
+            GitConfig::parse(b"[submodule]\n\tactive = .\n[submodule \"sub\"]\n\turl = ./sub\n")
+                .expect("config parses");
+        let gitmodules = GitConfig::parse(b"[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n")
+            .expect("gitmodules parses");
+        let submodules = sley_submodule::SubmoduleConfigSet::parse(&gitmodules);
+
+        assert!(submodule_active(&config, &submodules, b"sub"));
     }
 }

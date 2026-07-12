@@ -206,6 +206,10 @@ where
     fn parse(&mut self, args: &[String]) -> Result<()> {
         let mut positional_only = false;
         let mut end_of_options = false;
+        // When an explicit `--` is present, every positional before it is a
+        // revision, even if it happens to carry pathspec magic. This decision
+        // must be known before parsing the earlier tokens.
+        let has_pathspec_separator = args.iter().any(|arg| arg == "--");
         let mut iter = args.iter().peekable();
         while let Some(arg) = iter.next() {
             if positional_only {
@@ -213,7 +217,7 @@ where
                 continue;
             }
             if end_of_options {
-                self.add_positional(arg)?;
+                self.add_positional(arg, has_pathspec_separator)?;
                 continue;
             }
             match arg.as_str() {
@@ -401,7 +405,7 @@ where
                     )?)?;
                 }
                 value if value.starts_with('-') => self.setup.leftovers.push(value.to_string()),
-                value => self.add_positional(value)?,
+                value => self.add_positional(value, has_pathspec_separator)?,
             }
         }
         Ok(())
@@ -491,11 +495,24 @@ where
         Ok(())
     }
 
-    fn add_positional(&mut self, value: &str) -> Result<()> {
+    fn add_positional(&mut self, value: &str, revision_only: bool) -> Result<()> {
         match self.add_revision_arg(value) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Without `--`, an argument that resolves both as a revision
+                // and as an existing worktree path is ambiguous. Pathspec magic
+                // is stripped before probing (`:/a` means `<worktree>/a`).
+                if !revision_only && positional_matches_worktree_path(self.ctx, value)? {
+                    return ambiguous_argument(value);
+                }
+                Ok(())
+            }
             Err(_) if self.setup.options.ignore_missing => Ok(()),
-            Err(_) if path_exists(self.ctx, value) || looks_like_pathspec(value) => {
+            Err(_) if revision_only => ambiguous_argument(value),
+            Err(_) if positional_matches_worktree_path(self.ctx, value)? => {
+                self.setup.pathspecs.push(value.to_string());
+                Ok(())
+            }
+            Err(_) if looks_like_nonmagic_pathspec(value) => {
                 self.setup.pathspecs.push(value.to_string());
                 Ok(())
             }
@@ -527,6 +544,17 @@ where
     }
 
     fn add_revision_token(&mut self, rev: &str, negated: bool) -> Result<()> {
+        // The bare `:/text` spelling has repository-wide plumbing semantics in
+        // the general resolver, but revision setup scopes it to this worktree's
+        // current HEAD. In particular it must not find an orphaned commit, a
+        // linked worktree's detached HEAD, or a matching commit on another ref.
+        let scoped;
+        let rev = if let Some(text) = rev.strip_prefix(":/") {
+            scoped = format!("HEAD^{{/{text}}}");
+            scoped.as_str()
+        } else {
+            rev
+        };
         let oid = resolve_revision_commitish_with_config_optional(
             self.ctx.git_dir,
             self.ctx.format,
@@ -693,6 +721,29 @@ where
                 self.setup.options.negatives.push(commit);
             }
         }
+        // `--all` is wider than `refs/*`: revision.c enumerates the main ref
+        // namespace and then calls `refs_head_ref`, so a detached HEAD remains
+        // a pending tip even though no branch names it. Run HEAD through the
+        // same selector/exclusion state as ordinary refs; duplicate symbolic
+        // HEADs are harmless because the walk deduplicates object ids.
+        let (include_head, exclude_head) = ref_selection("HEAD", &self.ref_selectors, &hidden_refs);
+        if (include_head || exclude_head)
+            && let Some(oid) = sley_refs::resolve_ref_peeled(&store, "HEAD")?
+        {
+            if include_head {
+                self.setup.options.positives.push(RevisionTip {
+                    oid,
+                    rev: "HEAD".to_string(),
+                    source_name: Some("HEAD".to_string()),
+                    from_ref_selector: true,
+                });
+            }
+            if exclude_head
+                && let Ok(commit) = peel_to_commit(self.ctx.reader, self.ctx.format, &oid)
+            {
+                self.setup.options.negatives.push(commit);
+            }
+        }
         Ok(())
     }
 }
@@ -816,19 +867,10 @@ fn ambiguous_argument(value: &str) -> Result<()> {
     Err(ambiguous_argument_error(value))
 }
 
-/// git's `looks_like_pathspec()`: an argument that fails to parse as a revision
-/// is still taken as a pathspec when it carries pathspec magic (`:(...)` or a
-/// `:/`, `:!`, `:^` short prefix) or an unescaped glob special (`*`, `?`, `[`),
-/// even if no matching file exists on disk.
-fn looks_like_pathspec(arg: &str) -> bool {
-    if arg.starts_with(":(") {
-        return true;
-    }
-    if let Some(rest) = arg.strip_prefix(':')
-        && matches!(rest.as_bytes().first(), Some(b'/' | b'!' | b'^'))
-    {
-        return true;
-    }
+/// A non-magic positional with wildcard syntax remains a pathspec even when no
+/// current worktree path matches it. Magic pathspecs are parsed and validated
+/// separately so an unknown magic word cannot silently become an empty filter.
+fn looks_like_nonmagic_pathspec(arg: &str) -> bool {
     let mut bytes = arg.bytes();
     while let Some(byte) = bytes.next() {
         match byte {
@@ -840,6 +882,42 @@ fn looks_like_pathspec(arg: &str) -> bool {
         }
     }
     false
+}
+
+fn positional_matches_worktree_path<R>(
+    ctx: &RevisionSetupContext<'_, R>,
+    value: &str,
+) -> Result<bool> {
+    let carries_magic = value.starts_with(":(")
+        || value
+            .strip_prefix(':')
+            .is_some_and(|rest| matches!(rest.as_bytes().first(), Some(b'/' | b'!' | b'^')));
+    if !carries_magic {
+        return Ok(path_exists(ctx, value));
+    }
+
+    let element = sley_pathspec::PathspecElement::parse(
+        value.as_bytes(),
+        sley_pathspec::PathspecMatchMagic::default(),
+    )
+    .map_err(|error| {
+        eprintln!("fatal: {error} in '{value}'");
+        GitError::Exit(128)
+    })?;
+    // The empty top-level pathspec `:/` denotes the whole tree. It is not a
+    // competing filename for revision search's empty-pattern spelling.
+    if element.pattern().is_empty() {
+        return Ok(false);
+    }
+    let Ok(pattern) = std::str::from_utf8(element.pattern()) else {
+        return Ok(false);
+    };
+    let base = if element.is_top() {
+        ctx.worktree_root.unwrap_or(ctx.cwd)
+    } else {
+        ctx.cwd
+    };
+    Ok(base.join(pattern).exists())
 }
 
 fn path_exists<R>(ctx: &RevisionSetupContext<'_, R>, value: &str) -> bool {

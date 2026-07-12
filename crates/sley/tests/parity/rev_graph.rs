@@ -102,7 +102,12 @@ fn ahead_behind_equal_tips_matches_oracle() {
         |fixture| {
             let head = fixture.oracle_ok(&["rev-parse", "HEAD"]);
             let head = String::from_utf8_lossy(&head).trim().to_string();
-            fixture.oracle(&["rev-list", "--left-right", "--count", &format!("{head}...{head}")])
+            fixture.oracle(&[
+                "rev-list",
+                "--left-right",
+                "--count",
+                &format!("{head}...{head}"),
+            ])
         },
     );
 }

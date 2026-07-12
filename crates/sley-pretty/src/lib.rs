@@ -190,7 +190,7 @@ pub enum LogFormatDialect {
 pub enum FormatTier {
     /// `%H` (and literals / no-op color codes only).
     OidOnly,
-    /// Oids + parents + left/right marker — satisfied by [`CommitMetadata`].
+    /// Oids + parents + left/right marker — satisfied by [`sley_rev::CommitMetadata`].
     Metadata,
     /// Tree oid and/or subject line — needs a parsed commit header, not the body.
     Header,
@@ -1155,10 +1155,9 @@ fn parse_describe_spec(opts: &str) -> Option<DescribeSpec> {
             spec.abbrev = Some(v.parse::<usize>().ok()?);
         } else if let Some(v) = part.strip_prefix("match=") {
             spec.matches.push(v.to_string());
-        } else if let Some(v) = part.strip_prefix("exclude=") {
-            spec.excludes.push(v.to_string());
         } else {
-            return None;
+            let v = part.strip_prefix("exclude=")?;
+            spec.excludes.push(v.to_string());
         }
     }
     Some(spec)
@@ -1250,22 +1249,26 @@ pub mod presets {
     }
 }
 
+mod column;
 mod log;
 mod trailers;
 
+pub use column::{ColumnLayout, ColumnOptions, format_columns};
+
 pub use log::{
-    LogDescribeLookup, LogFormatContext, LogSignatureLookup, LogSignatureView, MailmapLookup,
-    StashFormatContext, append_log_oid, commit_author_for_commit_encoding, commit_body,
-    commit_encoding, commit_object_message_and_optional_encoding,
-    commit_encoding_config, commit_encoding_header_from_config, commit_identity_name_email,
-    commit_message_for_commit_encoding, commit_message_for_output, commit_message_has_invalid_utf8,
-    commit_message_has_nul, commit_message_lines, commit_subject, commit_subject_bytes,
-    emit_compiled_log_format, emit_compiled_log_format_limited_commit, emit_compiled_log_format_metadata,
-    emit_compiled_log_format_metadata_with_message, emit_compiled_stash_format, emit_log_one_token,
-    encoding_for_name, encoding_is_none, encoding_is_utf8, format_log_abbrev_oid,
-    format_log_commit_header_oid, format_log_oid, format_subst_for_commit, git_color_name_to_ansi,
-    git_color_spec_to_ansi, log_email_local_part, log_output_encoding, log_pick_utf8,
-    log_reencode_message, log_rewrap, log_sanitized_subject,
+    ColorParseError, LogDescribeLookup, LogFormatContext, LogSignatureLookup, LogSignatureView,
+    MailmapLookup, StashFormatContext, append_log_oid, commit_author_for_commit_encoding,
+    commit_body, commit_encoding, commit_encoding_config, commit_encoding_header_from_config,
+    commit_identity_name_email, commit_message_for_commit_encoding, commit_message_for_output,
+    commit_message_has_invalid_utf8, commit_message_has_nul, commit_message_lines,
+    commit_object_message_and_optional_encoding, commit_subject, commit_subject_bytes,
+    emit_compiled_log_format, emit_compiled_log_format_limited_commit,
+    emit_compiled_log_format_metadata, emit_compiled_log_format_metadata_with_message,
+    emit_compiled_stash_format, emit_log_one_token, encoding_for_name, encoding_is_none,
+    encoding_is_utf8, format_log_abbrev_oid, format_log_commit_header_oid, format_log_oid,
+    format_subst_for_commit, git_color_name_to_ansi, git_color_spec_to_ansi, log_email_local_part,
+    log_output_encoding, log_pick_utf8, log_reencode_message, log_rewrap, log_sanitized_subject,
+    try_git_color_spec_to_ansi,
 };
 pub use trailers::format_trailers_from_commit;
 
@@ -1368,5 +1371,23 @@ mod tests {
         let compiled = CompiledLogFormat::compile("%gs", LogFormatDialect::Log)
             .expect("reflog subject format should compile");
         assert_eq!(compiled.tokens, vec![FormatToken::ReflogGs]);
+    }
+
+    #[test]
+    fn git_color_parser_covers_reset_attributes_and_extended_colors() {
+        for (spec, expected) in [
+            ("reset", "\x1b[m"),
+            ("reset blue bold dim", "\x1b[;1;2;34m"),
+            ("nobold nodim no-ul", "\x1b[22;24m"),
+            ("254 bold 255", "\x1b[1;38;5;254;48;5;255m"),
+            ("#ff00ff #0f0", "\x1b[38;2;255;0;255;48;2;0;255;0m"),
+            ("normal black", "\x1b[40m"),
+            ("default default", "\x1b[39;49m"),
+        ] {
+            assert_eq!(try_git_color_spec_to_ansi(spec), Ok(expected.into()));
+        }
+        for invalid in ["-2", "256", "redX", "#12x456", "#1234"] {
+            assert_eq!(try_git_color_spec_to_ansi(invalid), Err(ColorParseError));
+        }
     }
 }

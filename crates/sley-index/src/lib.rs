@@ -17,6 +17,8 @@ use std::{env, fs, io};
 
 pub use sley_core::BString;
 
+pub mod projection;
+
 // ===========================================================================
 // Gitlink (submodule) primitive — the SINGLE source of truth for "is this
 // entry a gitlink, and what does it mean for a gitlink to be up to date?".

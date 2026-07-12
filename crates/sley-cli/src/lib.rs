@@ -9,10 +9,6 @@
     clippy::all
 )]
 
-use sley::{
-    BString, GitConfig, GitError, Index, IndexEntry, ObjectFormat, ObjectId, RefPrecondition,
-    ReferenceTarget as RefTarget, Result,
-};
 use sley::plumbing::sley_config::{ConfigBoolOrInt, ConfigEntry, ConfigSection};
 use sley::plumbing::sley_core::DateMode;
 use sley::plumbing::sley_formats::{
@@ -29,6 +25,17 @@ use sley::plumbing::sley_odb::{
     install_reachable_pack, prune_unreachable_loose, repository_object_ids, repository_objects_dir,
 };
 use sley::plumbing::sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
+use sley::plumbing::sley_refs::{
+    FileRefStore, PackRefDecision, Ref, RefTransactionHookUpdate, RefTransactionPhase, RefUpdate,
+    ReferenceTransactionHook, ReflogEntry, branch_ref_name, check_refname_format,
+    parse_packed_refs, resolve_ref_peeled, tag_ref_name, validate_ref_name, validate_symref_name,
+    validate_symref_target,
+};
+use sley::plumbing::sley_remote::FetchOutcome;
+use sley::{
+    BString, GitConfig, GitError, Index, IndexEntry, ObjectFormat, ObjectId, RefPrecondition,
+    ReferenceTarget as RefTarget, Result,
+};
 use sley_pathspec::{
     LsFilesPathFilter, PathspecAttributeCheck, PathspecAttributeState,
     parse_normalized_pathspec_element, pathspec_attrs_match_with, pathspec_filters_have_include,
@@ -42,12 +49,6 @@ use sley_protocol::{
     write_receive_pack_report_status, write_ref_advertisement_set,
     write_upload_pack_packfile_response, write_upload_pack_raw_packfile_response,
 };
-use sley::plumbing::sley_refs::{
-    FileRefStore, PackRefDecision, Ref, RefTransactionHookUpdate, RefTransactionPhase, RefUpdate,
-    ReferenceTransactionHook, ReflogEntry, branch_ref_name, check_refname_format, parse_packed_refs,
-    resolve_ref_peeled, tag_ref_name, validate_ref_name, validate_symref_name, validate_symref_target,
-};
-use sley::plumbing::sley_remote::FetchOutcome;
 use sley_transport::{RemoteTransport, RemoteUrl, parse_remote_url};
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -83,6 +84,7 @@ mod repo_path;
 mod repo_paths;
 mod repository;
 mod revision;
+mod scalar;
 mod session;
 mod session_globals;
 mod setup;
@@ -90,32 +92,34 @@ mod status_format;
 mod trace2_cli;
 mod tree_print;
 
+pub(crate) use sley::plumbing::sley_rev::revlist::*;
 pub(crate) use sley::plumbing::{
     sley_config, sley_core, sley_diff_merge, sley_formats, sley_index, sley_object, sley_odb,
-    sley_pack, sley_pretty, sley_refs, sley_rev, sley_remote, sley_worktree,
+    sley_pack, sley_pretty, sley_refs, sley_remote, sley_rev, sley_worktree,
 };
-pub(crate) use sley_ref_filter::*;
-pub(crate) use sley::plumbing::sley_rev::revlist::*;
 pub(crate) use sley_options::validators::*;
+pub(crate) use sley_ref_filter::*;
 
-pub(crate) use global_options::{
-    apply_global_options, argv_bytes_from_os, argv_bytes_from_string, argv_string_from_bytes,
-    core_big_file_threshold, effective_config_parameters_env, global_config_value,
-    injected_config_parameters, GlobalConfigOverride, PathspecFlags, DEFAULT_BIG_FILE_THRESHOLD,
-};
 pub use global_options::argv_string_from_os;
+pub(crate) use global_options::{
+    DEFAULT_BIG_FILE_THRESHOLD, GlobalConfigOverride, PathspecFlags, apply_global_options,
+    argv_bytes_from_os, argv_bytes_from_string, argv_string_from_bytes, core_big_file_threshold,
+    effective_config_parameters_env, global_config_value, injected_config_parameters,
+};
 pub(crate) use repo_paths::common_git_dir_for_git_dir;
+pub use scalar::run_scalar;
 pub(crate) use trace2_cli::{
-    trace2_emit_def_params_at_depth, trace2_emit_def_params_once,
-    trace2_emit_process_ancestry_at_depth, trace_reference_fsync_counter,
+    trace_reference_fsync_counter, trace2_emit_def_params_at_depth, trace2_emit_def_params_once,
+    trace2_emit_process_ancestry_at_depth,
 };
 
 pub(crate) use diff_render::{
-    DiffEntryRawRenderOptions, DiffEntryRenderContext, DiffEntryRenderModes, DiffEntryStatRenderOptions,
-    DiffEntryStatSource, DiffLineStats, DiffRenderOptions, DiffPathspec, DiffStatEntryData,
-    DiffStatOptions, DiffWorktreeCleanContext, WordDiffRequest, apply_diff_max_depth,
-    apply_diff_order_file, apply_diff_pathspec, apply_submodule_ignore_filter,
-    collect_diff_stat_entries, collect_diff_stat_entries_with_worktree_clean, collect_dirty_submodules,
+    DiffEntryRawRenderOptions, DiffEntryRenderContext, DiffEntryRenderModes,
+    DiffEntryStatRenderOptions, DiffEntryStatSource, DiffLineStats, DiffPathspec,
+    DiffRenderOptions, DiffStatEntryData, DiffStatOptions, DiffWorktreeCleanContext,
+    WordDiffRequest, apply_diff_max_depth, apply_diff_order_file, apply_diff_pathspec,
+    apply_submodule_ignore_filter, collect_diff_stat_entries,
+    collect_diff_stat_entries_with_worktree_clean, collect_dirty_submodules,
     compile_ignore_matching_regexes, diff_entry_new_content, diff_entry_old_content,
     diff_entry_produces_output, diff_line_stats, diff_rename_limit_requires_integer_error,
     diff_stat_decimal_width, diff_stat_pprint_rename, diff_stat_totals, gitlink_diff_content,
@@ -123,10 +127,11 @@ pub(crate) use diff_render::{
     prefetch_via_configured_upload_pack, promisor_remote_names, read_blob,
     read_object_maybe_prefetch_promisor, render_diff_entries, render_tree_to_tree_patch,
     repo_path_to_path, reverse_diff_entries, reverse_diff_entry, submodule_diff_config,
-    submodule_git_dir_for_path, validate_diff_rename_limit, write_diff_dirstat,
-    write_diff_numstat_materialized_entry, write_diff_patch_entry, write_diff_raw_entry,
-    write_diff_shortstat_materialized, write_diff_stat_materialized,
-    write_diff_stat_materialized_with_widths, write_diff_stat_summary_line, write_diff_summary_entry,
+    submodule_diff_config_with_config, submodule_git_dir_for_path, validate_diff_rename_limit,
+    write_diff_dirstat, write_diff_numstat_materialized_entry, write_diff_patch_entry,
+    write_diff_raw_entry, write_diff_shortstat_materialized, write_diff_stat_materialized,
+    write_diff_stat_materialized_with_widths, write_diff_stat_summary_line,
+    write_diff_summary_entry,
 };
 
 pub(crate) use discovery::{
@@ -141,38 +146,40 @@ pub(crate) use log_cli::{
     compile_log_message_grep_matcher, log_author_filters_match, log_author_requires_value_error,
     log_committer_filters_match, log_committer_requires_value_error, log_date_mode,
     log_date_requires_value_error, log_days_from_civil, log_decoration_map, log_grep_filters_match,
-    log_grep_pattern_kind_from_config, log_grep_requires_value_error, log_option_requires_value_error,
-    log_option_takes_no_value_error, log_parse_age, log_parse_date_cutoff, log_parse_date_ymd,
-    log_parse_diff_algorithm, log_parse_time_hms, log_parse_timezone_offset_seconds,
-    log_pickaxe_all_objfind_conflict_error, log_pickaxe_empty_error, log_pickaxe_g_regex_conflict_error,
-    log_pickaxe_kinds_conflict_error, log_pickaxe_requires_value_error, parse_log_filter_patterns,
+    log_grep_pattern_kind_from_config, log_grep_requires_value_error,
+    log_option_requires_value_error, log_option_takes_no_value_error, log_parse_age,
+    log_parse_date_cutoff, log_parse_date_ymd, log_parse_diff_algorithm, log_parse_time_hms,
+    log_parse_timezone_offset_seconds, log_pickaxe_all_objfind_conflict_error,
+    log_pickaxe_empty_error, log_pickaxe_g_regex_conflict_error, log_pickaxe_kinds_conflict_error,
+    log_pickaxe_requires_value_error, parse_log_filter_patterns,
     parse_log_filter_patterns_with_diagnostic_verbosity, print_log_decorations, print_log_format,
     print_stash_compiled_format, source_tag_signatures_for_revision_tips,
 };
 pub(crate) use repo_helpers::{
-    repository_abbrev, repository_abbrev_from_config, repository_object_format,
-    worktree_prefix, worktree_root_for_git_dir,
+    repository_abbrev, repository_abbrev_from_config, repository_object_format, worktree_prefix,
+    worktree_root_for_git_dir,
 };
 
 pub(crate) use sley::plumbing::sley_pretty::{
-    CompiledLogFormat, FormatToken, LogFormatDialect, LogDescribeLookup, LogFormatContext,
+    CompiledLogFormat, FormatToken, LogDescribeLookup, LogFormatContext, LogFormatDialect,
     LogSignatureLookup, LogSignatureView, MailmapLookup, StashFormatContext, append_log_oid,
     commit_author_for_commit_encoding, commit_body, commit_encoding, commit_encoding_config,
-    commit_object_message_and_optional_encoding,
-    commit_encoding_header_from_config, commit_identity_name_email, commit_message_for_commit_encoding,
-    commit_message_for_output, commit_message_has_invalid_utf8, commit_message_has_nul,
-    commit_message_lines, commit_subject, commit_subject_bytes, emit_compiled_log_format,
+    commit_encoding_header_from_config, commit_identity_name_email,
+    commit_message_for_commit_encoding, commit_message_for_output, commit_message_has_invalid_utf8,
+    commit_message_has_nul, commit_message_lines, commit_object_message_and_optional_encoding,
+    commit_subject, commit_subject_bytes, emit_compiled_log_format,
     emit_compiled_log_format_limited_commit, emit_compiled_log_format_metadata,
     emit_compiled_log_format_metadata_with_message, emit_compiled_stash_format, emit_log_one_token,
     encoding_for_name, encoding_is_none, encoding_is_utf8, format_log_abbrev_oid,
-    format_log_commit_header_oid, format_log_oid, format_subst_for_commit, format_trailers_from_commit,
-    git_color_name_to_ansi, git_color_spec_to_ansi, log_email_local_part, log_output_encoding,
-    log_pick_utf8, log_reencode_message, log_rewrap, log_sanitized_subject, presets,
+    format_log_commit_header_oid, format_log_oid, format_subst_for_commit,
+    format_trailers_from_commit, git_color_name_to_ansi, git_color_spec_to_ansi,
+    log_email_local_part, log_output_encoding, log_pick_utf8, log_reencode_message, log_rewrap,
+    log_sanitized_subject, presets, try_git_color_spec_to_ansi,
 };
 pub(crate) use sley::plumbing::sley_rev::diff_options::{
     DiffFilter, DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleIgnoreMode,
-    diff_stat_count_option, diff_stat_parse_width_option, parse_diff_filter, parse_diff_rename_limit,
-    parse_similarity_threshold, parse_submodule_ignore_mode,
+    diff_stat_count_option, diff_stat_parse_width_option, parse_diff_filter,
+    parse_diff_rename_limit, parse_similarity_threshold, parse_submodule_ignore_mode,
 };
 
 pub(crate) use commands::args::{GitArgCursor, long_option_value};
@@ -201,32 +208,32 @@ pub(crate) use session_globals::*;
 pub(crate) use status_format::*;
 pub(crate) use tree_print::*;
 
+pub(crate) use cli_misc::{
+    AddAction, add_path_matches, check_ignore_tracked_paths, count_objects_human_bytes,
+    current_unix_seconds, delete_symbolic_ref, pack_refs_peeled_oid, parse_abbrev,
+    read_pathspecs_from_file, read_repository_index, resolve_add_update_actions,
+    resolve_ref_to_oid, set_config_value, show_ref_filter_matches,
+    submodule_worktree_has_untracked_entries, symbolic_ref_cannot_delete, symbolic_ref_delete_head,
+    write_check_attr_state,
+};
 pub(crate) use init_config::{
     DEFAULT_BRANCH_NAME_ADVICE, clone_init_default_branch_config,
     clone_init_default_submodule_path_config, enable_submodule_path_config_extension,
     init_config_value, parse_bad_config_line_with_path, parse_bad_config_line_without_path,
     parse_config_bool, report_config_setup_error, submodule_path_config_enabled,
 };
-pub(crate) use reflog_parse::{
-    parse_reflog_count, parse_reflog_expire_date, parse_reflog_expire_time,
-    parse_reflog_integer, parse_reflog_max_parent_count, parse_reflog_min_parent_count,
-    parse_reflog_skip_count, reflog_invalid_integer_error, reflog_reference_name,
-};
 pub(crate) use ls_files_pathspec::{
-    LsFilesPathspec, index_entry_stage, normalize_absolute_cli_pathspec,
-    normalize_lexical_path, path_component_count, relative_path_bytes,
-    relative_path_from_absolute, relative_path_from_absolute_components,
+    LsFilesPathspec, index_entry_stage, normalize_absolute_cli_pathspec, normalize_lexical_path,
+    path_component_count, relative_path_bytes, relative_path_from_absolute,
+    relative_path_from_absolute_components,
+};
+pub(crate) use reflog_parse::{
+    parse_reflog_count, parse_reflog_expire_date, parse_reflog_expire_time, parse_reflog_integer,
+    parse_reflog_max_parent_count, parse_reflog_min_parent_count, parse_reflog_skip_count,
+    reflog_invalid_integer_error, reflog_reference_name,
 };
 pub(crate) use refname_pattern::{
     refname_pattern_matches, refname_pattern_matches_case, short_oid,
-};
-pub(crate) use cli_misc::{
-    AddAction, add_path_matches, check_ignore_tracked_paths, count_objects_human_bytes,
-    current_unix_seconds, delete_symbolic_ref, pack_refs_peeled_oid, parse_abbrev,
-    read_pathspecs_from_file, read_repository_index, resolve_add_update_actions,
-    resolve_ref_to_oid, set_config_value, show_ref_filter_matches,
-    submodule_worktree_has_untracked_entries, symbolic_ref_cannot_delete,
-    symbolic_ref_delete_head, write_check_attr_state,
 };
 
 pub(crate) fn collect_short_status(
@@ -265,16 +272,8 @@ pub(crate) fn collect_short_status_with_options(
 pub fn run(args: Vec<String>) -> Result<()> {
     sley_core::set_original_cwd(env::current_dir().ok());
     let global = apply_global_options(&args)?;
-    sley_core::trace2::touch();
-    sley_core::trace2::start(global.args);
-    trace2_emit_process_ancestry_at_depth(sley_core::trace2::depth(), &[]);
-    trace2_emit_def_params_once();
-    // `-c` / `--config-env` overrides are folded into the process
-    // `GIT_CONFIG_PARAMETERS` env var during option parsing, so the single
-    // `injected_config_parameters()` reader is the source of truth for every
-    // config read; no separate global-override store is needed.
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    session::install_cli_session(session::CliSession::from_parsed_globals(
+    let cli_session = session::CliSession::from_parsed_globals(
         cwd,
         global.git_dir.clone(),
         global.work_tree.clone(),
@@ -283,16 +282,24 @@ pub fn run(args: Vec<String>) -> Result<()> {
         global.replace_objects,
         global.lazy_fetch,
         global.pathspec_flags,
-    ));
+    );
+    sley_core::trace2::touch();
+    sley_core::trace2::start(global.args);
+    trace2_emit_process_ancestry_at_depth(sley_core::trace2::depth(), &[]);
+    trace2_emit_def_params_once(&cli_session);
+    // `-c` / `--config-env` overrides are folded into the process
+    // `GIT_CONFIG_PARAMETERS` env var during option parsing, so the single
+    // `injected_config_parameters()` reader is the source of truth for every
+    // config read; no separate global-override store is needed.
     // Emit git's GIT_TRACE_SETUP output (the env/config/gitfile discovery trace)
     // before dispatching. This is the CLI-side repository setup that
     // `sley::Repository::discover` deliberately leaves to this layer.
     if env::var_os("GIT_TRACE_SETUP").is_some()
-        && let Some(setup_result) = setup::setup_git_directory()
+        && let Some(setup_result) = setup::setup_git_directory(&cli_session)
     {
         setup::trace_repo_setup(&setup_result);
     }
-    dispatch::dispatch_with_aliases(global.args, &global.config, 0)
+    dispatch::dispatch_with_aliases(&cli_session, global.args, &global.config, 0)
 }
 
 #[cfg(test)]

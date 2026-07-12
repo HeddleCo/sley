@@ -27,7 +27,7 @@ pub fn bounded_inflate_reserve(size_hint: usize, compressed_len: usize) -> usize
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_inflate_reserve, MAX_INFLATE_RESERVE};
+    use super::{MAX_INFLATE_RESERVE, bounded_inflate_reserve};
 
     #[test]
     fn bounded_inflate_reserve_caps_attacker_declared_size() {

@@ -61,14 +61,13 @@
 //! self-contained command modules (`commands::verify_commit`, `commands::tag`,
 //! `commands::stash`).
 
-// Glob the crate root for shared plumbing (RepositoryContext, the
-// ObjectReader/ObjectWriter traits, EncodedObject, ObjectType, ObjectId,
-// GitError, io, etc.); see commands::stash for the rationale behind the
-// wildcard import.
+// Glob the crate root for shared CLI rendering and diagnostics (EncodedObject,
+// ObjectType, ObjectId, GitError, io, etc.); see commands::stash for the
+// rationale behind the wildcard import.
 use crate::*;
 
 /// Entry point for `git mktag`.
-pub(crate) fn cmd_mktag(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_mktag(cli_session: &session::CliSession, args: &[String]) -> Result<()> {
     let strict = match parse_mktag_args(args)? {
         MktagInvocation::Run { strict } => strict,
         MktagInvocation::Help => {
@@ -80,13 +79,13 @@ pub(crate) fn cmd_mktag(args: &[String]) -> Result<()> {
 
     // Discover the repository up front. git prints its standard
     // "not a git repository" fatal (exit 128) before inspecting stdin's contents.
-    let repo = match RepositoryContext::discover_current() {
+    let repo = match cli_session.open_repository() {
         Ok(repo) => repo,
         Err(GitError::NotFound(_)) => return mktag_not_a_repository(),
         Err(err) => return Err(err),
     };
-    let format = repo.format();
-    let db = repo.objects().clone();
+    let format = repo.object_format();
+    let config = read_repo_config(repo.git_dir())?;
 
     // Read the entire payload. mktag is binary-safe: the buffer is stored exactly
     // as received once it passes validation.
@@ -95,7 +94,7 @@ pub(crate) fn cmd_mktag(args: &[String]) -> Result<()> {
 
     // fsck the payload (prints any problems inline, like git). A fatal outcome
     // ends with the trailing fatal line and exit 128.
-    let mut reporter = FsckReporter::from_repo(strict, repo.config());
+    let mut reporter = FsckReporter::from_repo(strict, &config);
     let parsed = fsck_tag(format, &payload, &mut reporter);
     if reporter.is_fatal() {
         eprintln!("{FSCK_FATAL_TEXT}");
@@ -109,10 +108,10 @@ pub(crate) fn cmd_mktag(args: &[String]) -> Result<()> {
 
     // The tagged object must exist and match the declared type. These checks are
     // reported without the fsck framing and use the canonical object id.
-    verify_tagged_object(&repo, &db, &parsed)?;
+    verify_tagged_object(cli_session.replace_objects(), &repo, &parsed)?;
 
     // Write the payload verbatim and print the resulting object id.
-    let oid = db.write_object(EncodedObject::new(ObjectType::Tag, payload))?;
+    let oid = repo.write_object(EncodedObject::new(ObjectType::Tag, payload))?;
     println!("{oid}");
     Ok(())
 }
@@ -740,12 +739,13 @@ fn check_refname_component(component: &[u8]) -> bool {
 ///   * A type mismatch:
 ///     `fatal: object '<oid>' tagged as '<declared>', but is a '<actual>' type`.
 fn verify_tagged_object(
-    repo: &RepositoryContext,
-    db: &FileObjectDatabase,
+    replace_objects: bool,
+    repo: &sley::Repository,
     parsed: &ParsedTag,
 ) -> Result<()> {
-    let read_oid = apply_replace_object(repo.refs(), &parsed.object_id)?;
-    let object = match db.read_object(&read_oid) {
+    let refs = repo.references();
+    let read_oid = apply_replace_object(replace_objects, &refs, &parsed.object_id)?;
+    let object = match repo.read_object(&read_oid) {
         Ok(object) => object,
         Err(_) => {
             eprintln!("fatal: could not read tagged object '{}'", parsed.object_id);

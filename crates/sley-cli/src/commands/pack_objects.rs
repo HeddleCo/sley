@@ -18,15 +18,15 @@
 //! reuse exactly like upstream.
 #![allow(clippy::expect_used)]
 
+use sley::plumbing::{sley_config, sley_core, sley_odb, sley_rev};
 use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::io::IsTerminal;
 use std::sync::Arc;
-use sley::plumbing::{sley_config, sley_core, sley_odb, sley_rev};
 
-use sley::{PackWriteOptions};
-use sley::plumbing::sley_pack::{PackInput, PackReverseIndex, pack_order_index_positions};
 use crate::*;
+use sley::PackWriteOptions;
+use sley::plumbing::sley_pack::{PackInput, PackReverseIndex, pack_order_index_positions};
 
 #[derive(Default)]
 struct PackObjectsOptions {
@@ -71,6 +71,9 @@ struct PackObjectsOptions {
     path_walk: bool,
     sparse: Option<bool>,
     thin: bool,
+    /// Effective `pack.writeReverseIndex` policy. Unlike repack, pack-objects
+    /// defaults this setting to false when it is not configured.
+    write_reverse_index: bool,
     write_bitmap_index: bool,
     name_hash_version: Option<i32>,
     max_pack_size: Option<u64>,
@@ -106,7 +109,10 @@ enum PackReuseMode {
     Multi,
 }
 
-pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_pack_objects(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut options = PackObjectsOptions::default();
     let mut saw_dashdash = false;
     for arg in args {
@@ -285,12 +291,20 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     }
     validate_pack_objects_options(&options)?;
 
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
+    let config = read_repo_config(&git_dir)?;
+    options.write_reverse_index = config
+        .get_bool("pack", None, "writeReverseIndex")
+        .unwrap_or(false);
     let database = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    options.object_filter =
-        std::mem::take(&mut options.object_filter).resolve(&git_dir, &database, format)?;
+    options.object_filter = std::mem::take(&mut options.object_filter).resolve(
+        &git_dir,
+        &database,
+        format,
+        cli_session.replace_objects(),
+    )?;
     let progress = options
         .progress
         .unwrap_or_else(|| io::stderr().is_terminal());
@@ -303,8 +317,10 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             &common_git_dir,
             &database,
             format,
+            &config,
             &options,
             progress,
+            max_pack_size,
         );
     }
     let traversal = options.revs || options.all;
@@ -313,12 +329,24 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             collect_stdin_packs_objects(&common_git_dir, &database, format, &options)?;
         (oids, objects, Vec::new())
     } else if traversal {
-        collect_traversal_objects(&git_dir, &common_git_dir, &database, format, &options)?
+        collect_traversal_objects(
+            &git_dir,
+            &common_git_dir,
+            &database,
+            format,
+            &options,
+            cli_session.lazy_fetch(),
+            cli_session.replace_objects(),
+        )?
     } else {
         let oids = read_pack_objects_stdin(format)?;
         let mut objects = Vec::with_capacity(oids.len());
         for oid in &oids {
-            match crate::read_object_maybe_prefetch_promisor(&database, oid) {
+            match crate::read_object_maybe_prefetch_promisor(
+                &database,
+                oid,
+                cli_session.lazy_fetch(),
+            ) {
                 Ok(object) => objects.push(object),
                 Err(GitError::NotFound(_)) => {
                     eprintln!("fatal: unable to read {oid}");
@@ -381,6 +409,7 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             &objects,
             &pack_write_options,
             options.index_version,
+            options.write_reverse_index,
             limit,
         )?;
         let stats_line =
@@ -445,8 +474,16 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     };
 
     let base_name = options.base_name.expect("checked above");
-    let positions = pack_order_index_positions(&result.entries);
-    let reverse_index = PackReverseIndex::write(format, &positions, &result.checksum)?;
+    let reverse_index = if options.write_reverse_index {
+        let positions = pack_order_index_positions(&result.entries);
+        Some(PackReverseIndex::write(
+            format,
+            &positions,
+            &result.checksum,
+        )?)
+    } else {
+        None
+    };
 
     // The writer always produces a v2 `.idx`; honour an explicit
     // `--index-version=1` by re-serialising the same entries in the v1 layout.
@@ -460,7 +497,9 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     // index that points at a missing or incomplete pack.
     let checksum = result.checksum.to_hex();
     fs::write(format!("{base_name}-{checksum}.pack"), &result.pack)?;
-    fs::write(format!("{base_name}-{checksum}.rev"), &reverse_index)?;
+    if let Some(reverse_index) = reverse_index {
+        fs::write(format!("{base_name}-{checksum}.rev"), reverse_index)?;
+    }
     fs::write(format!("{base_name}-{checksum}.idx"), &index_bytes)?;
     println!("{checksum}");
     let stats_line =
@@ -528,6 +567,7 @@ fn write_split_pack_files(
     objects: &[Arc<EncodedObject>],
     options: &PackWriteOptions,
     index_version: Option<u32>,
+    write_reverse_index: bool,
     limit: u64,
 ) -> Result<u32> {
     let mut total_delta_count = 0u32;
@@ -550,6 +590,7 @@ fn write_split_pack_files(
             written.entries,
             written.checksum,
             index_version,
+            write_reverse_index,
         )?;
     }
     Ok(total_delta_count)
@@ -582,9 +623,14 @@ fn write_pack_file_parts(
     entries: Vec<sley_pack::PackIndexEntry>,
     checksum: ObjectId,
     index_version: Option<u32>,
+    write_reverse_index: bool,
 ) -> Result<()> {
-    let positions = pack_order_index_positions(&entries);
-    let reverse_index = PackReverseIndex::write(format, &positions, &checksum)?;
+    let reverse_index = if write_reverse_index {
+        let positions = pack_order_index_positions(&entries);
+        Some(PackReverseIndex::write(format, &positions, &checksum)?)
+    } else {
+        None
+    };
     let index_bytes = if index_version == Some(1) {
         PackIndex::write_v1(format, &entries, &checksum)?
     } else {
@@ -592,7 +638,9 @@ fn write_pack_file_parts(
     };
     let checksum_hex = checksum.to_hex();
     fs::write(format!("{base_name}-{checksum_hex}.pack"), &pack)?;
-    fs::write(format!("{base_name}-{checksum_hex}.rev"), &reverse_index)?;
+    if let Some(reverse_index) = reverse_index {
+        fs::write(format!("{base_name}-{checksum_hex}.rev"), reverse_index)?;
+    }
     fs::write(format!("{base_name}-{checksum_hex}.idx"), &index_bytes)?;
     println!("{checksum_hex}");
     Ok(())
@@ -1141,6 +1189,8 @@ fn collect_traversal_objects(
     database: &FileObjectDatabase,
     format: ObjectFormat,
     options: &PackObjectsOptions,
+    lazy_fetch: bool,
+    replace_objects: bool,
 ) -> Result<TraversalPackObjects> {
     let mut wants: Vec<ObjectId> = Vec::new();
     let mut haves: Vec<ObjectId> = Vec::new();
@@ -1151,7 +1201,7 @@ fn collect_traversal_objects(
                 wants.push(oid);
             }
         }
-        if let Ok(head) = resolve_revision(git_dir, format, "HEAD") {
+        if let Ok(head) = resolve_revision(git_dir, format, "HEAD", replace_objects) {
             wants.push(head);
         }
     }
@@ -1173,14 +1223,16 @@ fn collect_traversal_objects(
             if let Some(range) = sley_rev::parse_revision_range(rev) {
                 match range {
                     sley_rev::RevisionRange::Asymmetric { start, end } => {
-                        let start_oid = match resolve_revision(git_dir, format, &start) {
-                            Ok(oid) => oid,
-                            Err(_) => {
-                                eprintln!("fatal: bad revision '{start}'");
-                                return Err(GitError::Exit(128));
-                            }
-                        };
-                        let end_oid = match resolve_revision(git_dir, format, &end) {
+                        let start_oid =
+                            match resolve_revision(git_dir, format, &start, replace_objects) {
+                                Ok(oid) => oid,
+                                Err(_) => {
+                                    eprintln!("fatal: bad revision '{start}'");
+                                    return Err(GitError::Exit(128));
+                                }
+                            };
+                        let end_oid = match resolve_revision(git_dir, format, &end, replace_objects)
+                        {
                             Ok(oid) => oid,
                             Err(_) => {
                                 eprintln!("fatal: bad revision '{end}'");
@@ -1201,7 +1253,7 @@ fn collect_traversal_objects(
                 Some(rest) => (true, rest),
                 None => (false, rev),
             };
-            let oid = match resolve_revision(git_dir, format, rev) {
+            let oid = match resolve_revision(git_dir, format, rev, replace_objects) {
                 Ok(oid) => oid,
                 Err(_) => {
                     eprintln!("fatal: bad revision '{rev}'");
@@ -1237,6 +1289,7 @@ fn collect_traversal_objects(
             filter: &options.object_filter,
             missing_action: options.missing_action,
             excluded: &excluded,
+            lazy_fetch,
         };
         for oid in wants.iter().rev() {
             walk.visit_oid(*oid, Vec::new(), 0, true, &mut traversal_state)?;
@@ -1371,13 +1424,14 @@ impl PackObjectFilter {
         git_dir: &Path,
         database: &FileObjectDatabase,
         format: ObjectFormat,
+        replace_objects: bool,
     ) -> Result<Self> {
         match self {
             Self::SparseOid(value) => {
                 let oid = if let Some((rev, path)) = value.split_once(':') {
                     sley_rev::resolve_rev_path(git_dir, format, database, rev, path)?
                 } else {
-                    resolve_revision(git_dir, format, &value)?
+                    resolve_revision(git_dir, format, &value, replace_objects)?
                 };
                 let object = database.read_object(&oid)?;
                 if object.object_type != ObjectType::Blob {
@@ -1395,7 +1449,7 @@ impl PackObjectFilter {
             }
             Self::Combine(filters) => filters
                 .into_iter()
-                .map(|filter| filter.resolve(git_dir, database, format))
+                .map(|filter| filter.resolve(git_dir, database, format, replace_objects))
                 .collect::<Result<Vec<_>>>()
                 .map(Self::Combine),
             filter => Ok(filter),
@@ -1452,6 +1506,7 @@ struct FilteredPackTraversal<'a> {
     filter: &'a PackObjectFilter,
     missing_action: PackObjectsMissingAction,
     excluded: &'a HashSet<ObjectId>,
+    lazy_fetch: bool,
 }
 
 #[derive(Default)]
@@ -1477,7 +1532,8 @@ impl FilteredPackTraversal<'_> {
         if self.excluded.contains(&oid) {
             return Ok(());
         }
-        let object = crate::read_object_maybe_prefetch_promisor(self.database, &oid)?;
+        let object =
+            crate::read_object_maybe_prefetch_promisor(self.database, &oid, self.lazy_fetch)?;
         match object.object_type {
             ObjectType::Commit => self.visit_commit(oid, object, provided, state),
             ObjectType::Tree => self.visit_tree(oid, object, path, depth, provided, state),
@@ -1543,7 +1599,11 @@ impl FilteredPackTraversal<'_> {
         if self.excluded.contains(&oid) {
             return Ok(());
         }
-        let object = match crate::read_object_maybe_prefetch_promisor(self.database, &oid) {
+        let object = match crate::read_object_maybe_prefetch_promisor(
+            self.database,
+            &oid,
+            self.lazy_fetch,
+        ) {
             Ok(object) => object,
             Err(GitError::NotFound(_)) => {
                 eprintln!("fatal: bad tree object {oid}");
@@ -1615,7 +1675,11 @@ impl FilteredPackTraversal<'_> {
         let size = if self.filter.needs_blob_size() {
             match object {
                 Some(ref object) => Some(object.body.len()),
-                None => match crate::read_object_maybe_prefetch_promisor(self.database, &oid) {
+                None => match crate::read_object_maybe_prefetch_promisor(
+                    self.database,
+                    &oid,
+                    self.lazy_fetch,
+                ) {
                     Ok(read) => {
                         let len = read.body.len();
                         object = Some(read);
@@ -1639,7 +1703,11 @@ impl FilteredPackTraversal<'_> {
         if include {
             let object = match object {
                 Some(object) => object,
-                None => match crate::read_object_maybe_prefetch_promisor(self.database, &oid) {
+                None => match crate::read_object_maybe_prefetch_promisor(
+                    self.database,
+                    &oid,
+                    self.lazy_fetch,
+                ) {
                     Ok(object) => object,
                     Err(GitError::NotFound(_))
                         if self.missing_action == PackObjectsMissingAction::AllowAny =>
@@ -2263,8 +2331,29 @@ struct PackMembership {
 
 impl ObjectLocationScan {
     fn scan(common_git_dir: &Path, format: ObjectFormat) -> Result<Self> {
+        let environment_alternates = env::var_os("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .map(|value| env::split_paths(&value).collect::<Vec<_>>())
+            .unwrap_or_default();
+        Self::scan_with_environment_alternates(common_git_dir, format, &environment_alternates)
+    }
+
+    fn scan_with_environment_alternates(
+        common_git_dir: &Path,
+        format: ObjectFormat,
+        environment_alternates: &[PathBuf],
+    ) -> Result<Self> {
         let objects_dir = sley_odb::repository_objects_dir(common_git_dir);
         let mut object_dirs: Vec<(PathBuf, bool)> = vec![(objects_dir.clone(), true)];
+        // Environment alternates participate in the same locality policy as
+        // `objects/info/alternates`. In particular, `--local` must not copy an
+        // object merely because its alternate was injected for this process
+        // instead of recorded in the repository.
+        object_dirs.extend(
+            environment_alternates
+                .iter()
+                .cloned()
+                .map(|path| (path, false)),
+        );
         // info/alternates: one path per line, relative entries resolved
         // against the objects directory (upstream link_alt_odb_entry).
         if let Ok(alternates) = fs::read_to_string(objects_dir.join("info/alternates")) {
@@ -2504,8 +2593,10 @@ fn write_cruft_pack(
     common_git_dir: &Path,
     database: &FileObjectDatabase,
     format: ObjectFormat,
+    config: &sley_config::GitConfig,
     options: &PackObjectsOptions,
     progress: bool,
+    max_pack_size: Option<u64>,
 ) -> Result<()> {
     let objects_dir = sley_odb::repository_objects_dir(common_git_dir);
     let pack_dir = objects_dir.join("pack");
@@ -2514,6 +2605,7 @@ fn write_cruft_pack(
     // packs. Both name the *new* world; any pack not mentioned is "unknown" and
     // is kept (its objects ignored), exactly like upstream's third branch.
     let mut fresh_packs: HashSet<String> = HashSet::new();
+    let mut discard_packs: HashSet<String> = HashSet::new();
     {
         let stdin = io::stdin();
         let mut input = stdin.lock();
@@ -2530,24 +2622,28 @@ fn write_cruft_pack(
             // Discard packs (`-name`) are not retained, so their objects are
             // *candidates* for the new cruft pack — they are not "fresh".
             if let Some(stripped) = name.strip_prefix('-') {
-                let _ = stripped;
+                discard_packs.insert(stripped.to_string());
             } else {
                 fresh_packs.insert(name.to_string());
             }
         }
     }
 
-    // Index every pack on disk. A pack is "kept" (its objects skipped) iff it
-    // is fresh or was not mentioned at all; a pack is a candidate source iff it
-    // was named on the discard list OR it is a non-fresh pack the caller knew
-    // about. Upstream keeps both fresh and unknown packs; we collect from the
-    // complement, which on this suite's `keep="$(...).idx"` invocations is the
-    // set of unreachable/cruft packs left behind.
+    // Index every pack on disk. A pack is "kept" (its objects skipped) when it
+    // is fresh or was not mentioned at all. Only an explicit discard-list entry
+    // makes a pack a candidate source. That distinction matters when a pack is
+    // created after the caller enumerates its inputs: upstream treats such an
+    // unknown pack as retained instead of silently folding it into the cruft
+    // output.
     //
     // The mtime contributed by a packed object is the pack's own mtime, except
     // for a cruft pack (`.mtimes` present) where each object carries its own
     // recorded mtime.
     let mut mtimes: HashMap<ObjectId, u32> = HashMap::new();
+    let locations = options
+        .local
+        .then(|| ObjectLocationScan::scan(common_git_dir, format))
+        .transpose()?;
     // Object ids that live in a kept (fresh/unknown) pack: such a copy vetoes
     // adding the object to the cruft pack (want_object_in_pack's kept-pack
     // rule), unless a cruft pack being retained holds it — but on this suite
@@ -2578,8 +2674,12 @@ fn write_cruft_pack(
                 continue;
             };
             // Skip a `.keep`-marked pack just like a kept pack.
-            let is_kept_pack =
-                fresh_packs.contains(&pack_name) || idx_path.with_extension("keep").exists();
+            // Unknown packs (mentioned in neither set) appeared after the
+            // caller enumerated its inputs and must also be retained. Only an
+            // explicit `-pack-name.pack` line selects a pack for replacement.
+            let is_kept_pack = fresh_packs.contains(&pack_name)
+                || !discard_packs.contains(&pack_name)
+                || idx_path.with_extension("keep").exists();
             if is_kept_pack {
                 for entry in &index.entries {
                     kept_pack_oids.insert(entry.oid);
@@ -2627,6 +2727,12 @@ fn write_cruft_pack(
         if kept.contains(&oid) {
             return;
         }
+        if locations
+            .as_ref()
+            .is_some_and(|locations| !locations.wanted(&oid, options))
+        {
+            return;
+        }
         mtimes
             .entry(oid)
             .and_modify(|existing| {
@@ -2656,80 +2762,71 @@ fn write_cruft_pack(
     // Expiration: rescue older objects reachable from a recent one, then drop
     // the rest. Without an expiration, every candidate survives.
     if let Some(expiration) = options.cruft_expiration {
-        rescue_and_expire_cruft(database, format, &mut mtimes, expiration)?;
+        // Git invokes recent-object hooks from pack-objects only after it has
+        // found at least one cruft candidate. An empty cruft side is a no-op,
+        // even when a configured hook would fail.
+        let additional_recent = if mtimes.is_empty() {
+            Vec::new()
+        } else {
+            let hook_cwd = env::current_dir()?;
+            commands::hooks::run_recent_objects_hooks(config, format, &hook_cwd)?
+        };
+        rescue_and_expire_cruft(
+            database,
+            format,
+            &mut mtimes,
+            expiration,
+            &additional_recent,
+        )?;
     }
-
-    // Materialise the surviving objects. A blob that exists only as a missing
-    // tree link (recorded with no readable body) is skipped — matching
-    // add_cruft_object_entry's "missing non-tip blob" guard.
-    let mut survivors: Vec<(ObjectId, u32)> = mtimes.into_iter().collect();
-    survivors.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
     let _ = (git_dir, progress);
-
-    let mut inputs_oids: Vec<ObjectId> = Vec::with_capacity(survivors.len());
-    let mut inputs_objects: Vec<Arc<EncodedObject>> = Vec::with_capacity(survivors.len());
-    let mut mtime_by_oid: HashMap<ObjectId, u32> = HashMap::with_capacity(survivors.len());
-    for (oid, mtime) in survivors {
-        match database.read_object(&oid) {
-            Ok(object) => {
-                inputs_oids.push(oid);
-                inputs_objects.push(object);
-                mtime_by_oid.insert(oid, mtime);
-            }
-            Err(GitError::NotFound(_)) => {
-                // Unreadable object (e.g. a missing blob referenced only by a
-                // tree link); upstream never adds it to the pack.
-            }
-            Err(err) => return Err(err),
-        }
+    let mut cruft_packs = sley_odb::build_cruft_packs_from_mtimes(
+        database,
+        format,
+        &mtimes,
+        &sley_odb::CruftPackOptions {
+            max_pack_size,
+            pack_write: PackWriteOptions::new(),
+            ..sley_odb::CruftPackOptions::default()
+        },
+    )?;
+    if cruft_packs.is_empty() {
+        cruft_packs.push(sley_odb::build_empty_cruft_pack(
+            format,
+            &PackWriteOptions::new(),
+        )?);
     }
 
-    let inputs: Vec<PackInput<'_>> = inputs_oids
-        .iter()
-        .zip(&inputs_objects)
-        .map(|(oid, object)| PackInput {
-            oid,
-            object: object.as_ref(),
-        })
-        .collect();
-
-    let written = PackFile::write_packed_with_known_ids_and_options(
-        &inputs,
-        format,
-        &PackWriteOptions::new(),
-    )?;
-
-    // The `.mtimes` table is stored in lexicographic (index) order, which is
-    // NOT the pack-emit order `written.entries` carries — sort a copy by oid
-    // first so the table lines up with the `.idx` fanout the reader walks.
-    let mut sorted_entries: Vec<&sley_pack::PackIndexEntry> = written.entries.iter().collect();
-    sorted_entries.sort_by(|a, b| a.oid.as_bytes().cmp(b.oid.as_bytes()));
-    let mtimes_table: Vec<u32> = sorted_entries
-        .iter()
-        .map(|entry| mtime_by_oid.get(&entry.oid).copied().unwrap_or(0))
-        .collect();
-
-    let base_name = options.base_name.clone();
-    let checksum_hex = written.checksum.to_hex();
-
-    let positions = pack_order_index_positions(&written.entries);
-    let reverse_index = PackReverseIndex::write(format, &positions, &written.checksum)?;
-    let mtimes_bytes = sley_pack::PackMtimes::write(format, &mtimes_table, &written.checksum)?;
-
     if options.stdout_mode {
+        let Some(cruft) = cruft_packs.first() else {
+            return Ok(());
+        };
+        if cruft_packs.len() != 1 {
+            return Err(GitError::InvalidFormat(
+                "stdout cruft output unexpectedly produced multiple packs".into(),
+            ));
+        }
         let mut stdout = io::stdout();
-        stdout.write_all(&written.pack)?;
+        stdout.write_all(&cruft.pack)?;
         stdout.flush()?;
         return Ok(());
     }
 
-    let base_name = base_name.expect("base name required without --stdout");
-    fs::write(format!("{base_name}-{checksum_hex}.pack"), &written.pack)?;
-    fs::write(format!("{base_name}-{checksum_hex}.rev"), &reverse_index)?;
-    fs::write(format!("{base_name}-{checksum_hex}.mtimes"), &mtimes_bytes)?;
-    fs::write(format!("{base_name}-{checksum_hex}.idx"), &written.index)?;
-    println!("{checksum_hex}");
+    let base_name = options
+        .base_name
+        .as_ref()
+        .expect("base name required without --stdout");
+    for cruft in cruft_packs {
+        let checksum_hex = cruft.checksum.to_hex();
+        fs::write(format!("{base_name}-{checksum_hex}.pack"), &cruft.pack)?;
+        if options.write_reverse_index {
+            fs::write(format!("{base_name}-{checksum_hex}.rev"), &cruft.rev)?;
+        }
+        fs::write(format!("{base_name}-{checksum_hex}.mtimes"), &cruft.mtimes)?;
+        fs::write(format!("{base_name}-{checksum_hex}.idx"), &cruft.idx)?;
+        println!("{checksum_hex}");
+    }
     Ok(())
 }
 
@@ -2754,6 +2851,7 @@ fn rescue_and_expire_cruft(
     format: ObjectFormat,
     mtimes: &mut HashMap<ObjectId, u32>,
     expiration: u32,
+    additional_recent: &[ObjectId],
 ) -> Result<()> {
     // Recent objects anchor the rescue traversal.
     let recent: Vec<ObjectId> = mtimes
@@ -2766,7 +2864,8 @@ fn rescue_and_expire_cruft(
     // Every object reached (recent or older) survives; an older object reached
     // this way is rescued at the cutoff mtime.
     let mut keep: HashSet<ObjectId> = HashSet::new();
-    let mut pending: Vec<ObjectId> = recent.clone();
+    let mut pending: Vec<ObjectId> = recent;
+    pending.extend_from_slice(additional_recent);
     while let Some(oid) = pending.pop() {
         if !keep.insert(oid) {
             continue;
@@ -2813,4 +2912,103 @@ fn rescue_and_expire_cruft(
     }
     *mtimes = next;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_objects_dir(name: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!(
+            "sley-pack-objects-{name}-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).expect("create object directory");
+        path
+    }
+
+    #[test]
+    fn local_policy_rejects_objects_available_from_an_alternate() {
+        let loose = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("loose oid");
+        let packed = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "2222222222222222222222222222222222222222",
+        )
+        .expect("packed oid");
+        let locations = ObjectLocationScan {
+            nonlocal_loose: HashSet::from([loose]),
+            packs: vec![PackMembership {
+                oids: HashSet::from([packed]),
+                local: false,
+                keep: false,
+            }],
+        };
+        let local = PackObjectsOptions {
+            local: true,
+            ..PackObjectsOptions::default()
+        };
+        assert!(!locations.wanted(&loose, &local));
+        assert!(!locations.wanted(&packed, &local));
+
+        let nonlocal = PackObjectsOptions::default();
+        assert!(locations.wanted(&loose, &nonlocal));
+        assert!(locations.wanted(&packed, &nonlocal));
+    }
+
+    #[test]
+    fn location_scan_includes_environment_alternate_loose_objects() {
+        let git_dir = temp_objects_dir("environment-alternate-git-dir");
+        let local_objects = git_dir.join("objects");
+        fs::create_dir_all(&local_objects).expect("create local objects");
+        let alternate_objects = temp_objects_dir("environment-alternate-objects");
+        let alternate = FileObjectDatabase::new(alternate_objects.clone(), ObjectFormat::Sha1);
+        let oid = alternate
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"environment alternate\n".to_vec(),
+            ))
+            .expect("write alternate object");
+
+        let locations = ObjectLocationScan::scan_with_environment_alternates(
+            &git_dir,
+            ObjectFormat::Sha1,
+            std::slice::from_ref(&alternate_objects),
+        )
+        .expect("scan environment alternate");
+        let local = PackObjectsOptions {
+            local: true,
+            ..PackObjectsOptions::default()
+        };
+        assert!(!locations.wanted(&oid, &local));
+
+        fs::remove_dir_all(git_dir).ok();
+        fs::remove_dir_all(alternate_objects).ok();
+    }
+
+    #[test]
+    fn configured_recent_tip_rescues_an_expired_candidate() {
+        let objects_dir = temp_objects_dir("recent-tip");
+        let database = FileObjectDatabase::new(objects_dir.clone(), ObjectFormat::Sha1);
+        let rescued = database
+            .write_object(EncodedObject::new(ObjectType::Blob, b"rescued".to_vec()))
+            .expect("write rescued object");
+        let expired = database
+            .write_object(EncodedObject::new(ObjectType::Blob, b"expired".to_vec()))
+            .expect("write expired object");
+        let mut mtimes = HashMap::from([(rescued, 1), (expired, 1)]);
+
+        rescue_and_expire_cruft(&database, ObjectFormat::Sha1, &mut mtimes, 2, &[rescued])
+            .expect("rescue configured tip");
+
+        assert_eq!(mtimes, HashMap::from([(rescued, 1)]));
+        fs::remove_dir_all(objects_dir).ok();
+    }
 }

@@ -7,106 +7,180 @@ pub(super) struct ReflogWalkOptions<'a> {
     pub(super) output: &'a LogOutput,
     pub(super) reverse: bool,
     pub(super) date_mode: &'a DateMode,
+    pub(super) replace_objects: bool,
+    pub(super) author_filter: Option<&'a sley_grep::GrepMatcher>,
+    pub(super) committer_filter: Option<&'a sley_grep::GrepMatcher>,
+    pub(super) message_filter: Option<&'a sley_grep::GrepMatcher>,
+    pub(super) reflog_filter: Option<&'a sley_grep::GrepMatcher>,
+    pub(super) grep_all_match: bool,
+    pub(super) invert_grep: bool,
+    pub(super) output_encoding: &'a str,
+    pub(super) use_mailmap: bool,
 }
 
 pub(super) fn log_walk_reflogs(
     git_dir: &Path,
     format: ObjectFormat,
-    revisions: &[String],
+    revisions: &[(String, bool)],
     opts: ReflogWalkOptions<'_>,
 ) -> Result<()> {
     let store = FileRefStore::new(git_dir, format);
-    let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut db = crate::repository::open_object_database(git_dir, format, opts.replace_objects)?;
     let decorations = HashMap::new();
-    let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
+    let mailmap = commands::utility::Mailmap::load_default(git_dir, format, opts.replace_objects)?;
     let mut stdout = io::stdout();
     let references = if revisions.is_empty() {
-        vec![ReflogWalkTarget::new(None)?]
+        vec![ReflogWalkTarget::new(&store, git_dir, format, None)?]
     } else {
         revisions
             .iter()
-            .map(|revision| ReflogWalkTarget::new(Some(revision)))
+            .map(|revision| ReflogWalkTarget::new(&store, git_dir, format, Some(revision)))
             .collect::<Result<Vec<_>>>()?
     };
+    let mut walks = references
+        .into_iter()
+        .map(|target| {
+            let mut entries = store.read_reflog(&target.reference)?;
+            entries.reverse();
+            Ok(ReflogWalkCursor::new(target, entries, opts.reverse))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut skipped = 0usize;
     let mut emitted = 0usize;
-    for target in references {
-        let mut entries = store.read_reflog(&target.reference)?;
-        entries.reverse();
-        // Honor the `@{N}` selector: the walk starts at reflog entry `N`. Select
-        // the entries at index >= start_offset while preserving each entry's true
-        // index (so the `HEAD@{index}` selector shown is correct), then apply
-        // `--reverse` to the selected range only, matching git.
-        let mut selected: Vec<(usize, &ReflogEntry)> = entries
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index >= target.start_offset)
-            .collect();
-        if opts.reverse {
-            selected.reverse();
+    loop {
+        let selected_target = if opts.reverse {
+            // Preserve the historical reverse-walk behavior. Git currently
+            // rejects --reverse with --walk-reflogs, but keeping this path
+            // target-ordered avoids changing Sley's existing extension while
+            // the normal walk below gains Git's timestamp merge.
+            walks.iter().position(|walk| walk.next_index.is_some())
+        } else {
+            // Git's next_reflog_entry() performs a stable k-way merge over the
+            // current entry of every selected reflog. It replaces `best` only
+            // for a strictly newer timestamp, so equal timestamps retain the
+            // ref enumeration order (FileRefStore returns refname order).
+            let mut best: Option<(usize, i64)> = None;
+            for (target_index, walk) in walks.iter().enumerate() {
+                let Some((_, entry)) = walk.current() else {
+                    continue;
+                };
+                let timestamp = entry.timestamp_seconds()?;
+                if best.is_none_or(|(_, best_timestamp)| timestamp > best_timestamp) {
+                    best = Some((target_index, timestamp));
+                }
+            }
+            best.map(|(target_index, _)| target_index)
+        };
+        let Some(target_index) = selected_target else {
+            break;
+        };
+        let index = walks[target_index]
+            .next_index
+            .expect("selected reflog cursor has a current entry");
+        walks[target_index].advance(opts.reverse);
+        let target = &walks[target_index].target;
+        let entry = &walks[target_index].entries[index];
+
+        if !reflog_entry_matches(&db, format, entry, &mailmap, &opts)? {
+            continue;
         }
-        for (index, entry) in selected {
-            if skipped < opts.skip {
-                skipped += 1;
-                continue;
-            }
-            if opts.max_count.is_some_and(|max_count| emitted >= max_count) {
-                stdout.flush()?;
-                return Ok(());
-            }
-            let emitted_entry = match opts.output {
-                LogOutput::Compiled {
+        if skipped < opts.skip {
+            skipped += 1;
+            continue;
+        }
+        if opts.max_count.is_some_and(|max_count| emitted >= max_count) {
+            stdout.flush()?;
+            return Ok(());
+        }
+        let emitted_entry = match opts.output {
+            LogOutput::Compiled {
+                compiled,
+                final_newline,
+                ..
+            } => {
+                let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+                let mut ctx = ReflogWalkFormatContext {
                     compiled,
-                    final_newline,
-                    ..
-                } => {
-                    let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
-                    let mut ctx = ReflogWalkFormatContext {
-                        compiled,
-                        db: &mut db,
-                        format,
-                        display_reference: &target.display_reference,
-                        full_reference: &target.reference,
-                        date_mode: opts.date_mode,
-                        decorations: &decorations,
-                        mailmap: &mailmap,
-                    };
-                    if !emit_compiled_reflog_walk_format(&mut ctx, entry, index, &mut line)? {
-                        false
-                    } else {
-                        stdout.write_all(&line)?;
-                        if *final_newline && !line.ends_with(b"\n") {
-                            stdout.write_all(b"\n")?;
-                        }
-                        true
+                    db: &mut db,
+                    format,
+                    display_reference: &target.display_reference,
+                    full_reference: &target.full_display_reference,
+                    date_mode: opts.date_mode,
+                    decorations: &decorations,
+                    mailmap: &mailmap,
+                };
+                if !emit_compiled_reflog_walk_format(&mut ctx, entry, index, &mut line)? {
+                    false
+                } else {
+                    stdout.write_all(&line)?;
+                    if *final_newline && !line.ends_with(b"\n") {
+                        stdout.write_all(b"\n")?;
                     }
+                    true
                 }
-                LogOutput::Default(_) => {
-                    let display_selector = target.display_selector(entry, index, opts.date_mode);
-                    emit_default_reflog_walk_format(
-                        &mut db,
-                        format,
-                        entry,
-                        &target.display_reference,
-                        &display_selector,
-                        opts.date_mode,
-                        &mailmap,
-                        &mut stdout,
-                    )?
-                }
-            };
-            if emitted_entry {
-                emitted += 1;
             }
+            LogOutput::Default(_) => {
+                let display_selector = target.display_selector(entry, index, opts.date_mode);
+                emit_default_reflog_walk_format(
+                    &mut db,
+                    format,
+                    entry,
+                    &target.display_reference,
+                    &display_selector,
+                    opts.date_mode,
+                    &mailmap,
+                    &mut stdout,
+                )?
+            }
+        };
+        if emitted_entry {
+            emitted += 1;
         }
     }
     stdout.flush()?;
     Ok(())
 }
 
+fn reflog_entry_matches(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    entry: &ReflogEntry,
+    mailmap: &commands::utility::Mailmap,
+    opts: &ReflogWalkOptions<'_>,
+) -> Result<bool> {
+    if opts
+        .reflog_filter
+        .is_some_and(|filter| !filter.matches_any(&entry.message))
+    {
+        return Ok(false);
+    }
+    if opts.author_filter.is_none()
+        && opts.committer_filter.is_none()
+        && opts.message_filter.is_none()
+    {
+        return Ok(true);
+    }
+    let Some(record) = reflog_walk_commit_record(db, format, entry)? else {
+        return Ok(false);
+    };
+    let filter_mailmap = opts.use_mailmap.then_some(mailmap);
+    Ok(
+        log_author_matcher_matches(&record, opts.author_filter, filter_mailmap)
+            && log_committer_matcher_matches(&record, opts.committer_filter, filter_mailmap)
+            && log_grep_matcher_matches(
+                &record,
+                opts.message_filter,
+                opts.grep_all_match,
+                opts.invert_grep,
+                opts.output_encoding,
+            ),
+    )
+}
+
 struct ReflogWalkTarget {
     reference: String,
     display_reference: String,
+    full_display_reference: String,
     date_selector: bool,
     /// The numeric `@{N}` selector: the walk starts at reflog entry `N`
     /// (`HEAD@{1}` skips the most-recent entry and starts one older). Zero for a
@@ -114,12 +188,73 @@ struct ReflogWalkTarget {
     start_offset: usize,
 }
 
+struct ReflogWalkCursor {
+    target: ReflogWalkTarget,
+    /// Newest-first, so the vector index is also the `%gD`/`%gd` selector.
+    entries: Vec<ReflogEntry>,
+    /// Current selector index. `None` means this reflog is exhausted.
+    next_index: Option<usize>,
+}
+
+impl ReflogWalkCursor {
+    fn new(target: ReflogWalkTarget, entries: Vec<ReflogEntry>, reverse: bool) -> Self {
+        let next_index = if reverse {
+            entries
+                .len()
+                .checked_sub(1)
+                .filter(|index| *index >= target.start_offset)
+        } else {
+            (target.start_offset < entries.len()).then_some(target.start_offset)
+        };
+        Self {
+            target,
+            entries,
+            next_index,
+        }
+    }
+
+    fn current(&self) -> Option<(usize, &ReflogEntry)> {
+        let index = self.next_index?;
+        Some((index, &self.entries[index]))
+    }
+
+    fn advance(&mut self, reverse: bool) {
+        let Some(index) = self.next_index else {
+            return;
+        };
+        self.next_index = if reverse {
+            index
+                .checked_sub(1)
+                .filter(|next| *next >= self.target.start_offset)
+        } else {
+            let next = index + 1;
+            (next < self.entries.len()).then_some(next)
+        };
+    }
+}
+
 impl ReflogWalkTarget {
-    fn new(revision: Option<&String>) -> Result<Self> {
-        let original = revision.map(String::as_str);
-        let reference = reflog_reference_name(original)?;
+    fn new(
+        store: &FileRefStore,
+        git_dir: &Path,
+        format: ObjectFormat,
+        revision: Option<&(String, bool)>,
+    ) -> Result<Self> {
+        let original = revision.map(|(revision, _)| revision.as_str());
+        let reference = reflog_reference_name(store, git_dir, format, original)?;
+        let display_reference = reflog_walk_display_reference(&reference);
+        // `%gD` normally preserves the full spelling supplied by the caller,
+        // while `%gd` shortens a branch name. A pseudo-ref selector such as
+        // `--branches=root*` does not have an explicit full spelling: Git feeds
+        // the namespace-trimmed branch name to the reflog walk for both atoms.
+        let full_display_reference = if revision.is_some_and(|(_, from_selector)| *from_selector) {
+            display_reference.clone()
+        } else {
+            reference.clone()
+        };
         Ok(Self {
-            display_reference: reflog_walk_display_reference(&reference),
+            display_reference,
+            full_display_reference,
             reference,
             date_selector: original.is_some_and(reflog_revision_uses_date_selector),
             start_offset: original.map(reflog_revision_start_offset).unwrap_or(0),
@@ -339,28 +474,24 @@ pub(super) fn log_committer_matcher_matches(
 
 /// git's `apply_mailmap_to_header`: when `--use-mailmap`/`log.mailmap` is active
 /// the `--author`/`--committer` grep runs against the *mailmapped* identity
-/// header. Rewrites `Name <email> <ts> <tz>` → `MappedName <mapped@email> ...`.
-/// With no mailmap (or an empty one) the original header bytes are returned.
+/// header. Git's `strip_timestamp` then limits the searchable bytes to the
+/// final `>` so dates and timezone offsets can never satisfy identity filters.
 fn log_mailmapped_identity_header(
     raw: &[u8],
     mailmap: Option<&commands::utility::Mailmap>,
 ) -> Vec<u8> {
     let Some(mailmap) = mailmap.filter(|m| !m.is_empty()) else {
-        return raw.to_vec();
+        return raw
+            .iter()
+            .rposition(|&byte| byte == b'>')
+            .map_or_else(|| raw.to_vec(), |end| raw[..=end].to_vec());
     };
     let (name, email) = mailmap.rewrite_identity(raw);
-    // Preserve the trailing ` <ts> <tz>` (everything after the closing `>`).
-    let tail = raw
-        .iter()
-        .position(|&b| b == b'>')
-        .map(|idx| &raw[idx + 1..])
-        .unwrap_or(b"");
-    let mut out = Vec::with_capacity(name.len() + email.len() + tail.len() + 4);
+    let mut out = Vec::with_capacity(name.len() + email.len() + 3);
     out.extend_from_slice(&name);
     out.extend_from_slice(b" <");
     out.extend_from_slice(&email);
     out.push(b'>');
-    out.extend_from_slice(tail);
     out
 }
 

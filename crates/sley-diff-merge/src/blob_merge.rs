@@ -1,8 +1,8 @@
 //! Three-way blob merge (diff3 conflict markers).
 
 use crate::line_diff::{
-    canonicalize_line, myers_diff_lines, myers_diff_lines_ws, split_lines, DiffAlgorithm,
-    DiffLine, DiffOp, WsIgnore,
+    DiffAlgorithm, DiffLine, DiffOp, WsIgnore, canonicalize_line, diff_lines_with_algorithm,
+    myers_diff_lines, myers_diff_lines_ws, split_lines,
 };
 
 /// Whether to favour one side wholesale for textual conflicts (`-Xours` /
@@ -29,6 +29,10 @@ pub enum ConflictStyle {
     /// `diff3` style: also include the common-ancestor section between `ours`
     /// and the `=======` divider, delimited by `|||||||`.
     Diff3,
+    /// `zdiff3` style: include the common-ancestor section like [`Self::Diff3`],
+    /// but hoist lines shared at the beginning and end of both sides out of the
+    /// conflict block. This is git's zealous diff3 rendering.
+    ZDiff3,
 }
 
 /// Labels and style controlling [`merge_blobs`] conflict markers.
@@ -43,8 +47,7 @@ pub struct MergeBlobOptions<'a> {
     /// Which marker style to emit.
     pub style: ConflictStyle,
     /// How to resolve a textual conflict. [`MergeFavor::Union`] keeps both sides'
-    /// lines with no markers (and a non-conflicted result); other values leave
-    /// markers (favouring ours/theirs is applied by the caller at the file level).
+    /// lines with no markers; ours/theirs select that side's conflict content.
     pub favor: MergeFavor,
     /// Whitespace-insensitivity for the 3-way line matching, mirroring
     /// `-Xignore-space-change`/`-Xignore-all-space`/`-Xignore-space-at-eol` (git's
@@ -80,6 +83,64 @@ pub struct MergeBlobResult {
     pub conflicted: bool,
 }
 
+/// Typed engine request for standalone `merge-file` semantics.
+#[derive(Debug, Clone, Copy)]
+pub struct MergeFileOptions<'a> {
+    pub ours_label: &'a str,
+    pub base_label: &'a str,
+    pub theirs_label: &'a str,
+    pub style: ConflictStyle,
+    pub favor: MergeFavor,
+    pub marker_size: usize,
+    pub algorithm: DiffAlgorithm,
+}
+
+impl Default for MergeFileOptions<'_> {
+    fn default() -> Self {
+        Self {
+            ours_label: "ours",
+            base_label: "base",
+            theirs_label: "theirs",
+            style: ConflictStyle::Merge,
+            favor: MergeFavor::None,
+            marker_size: 7,
+            algorithm: DiffAlgorithm::Myers,
+        }
+    }
+}
+
+/// Standalone file-merge result, including the exact number of unresolved
+/// conflict sections used as `merge-file`'s exit status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeFileOutcome {
+    pub content: Vec<u8>,
+    pub conflicts: usize,
+}
+
+/// Merge three file/blob payloads without repository or terminal concerns.
+pub fn merge_file(
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    options: &MergeFileOptions<'_>,
+) -> MergeFileOutcome {
+    let blob_options = MergeBlobOptions {
+        ours_label: options.ours_label,
+        base_label: options.base_label,
+        theirs_label: options.theirs_label,
+        style: options.style,
+        favor: options.favor,
+        ws_ignore: WsIgnore::EMPTY,
+        marker_size: options.marker_size,
+    };
+    let (result, conflicts) =
+        merge_blobs_internal(base, ours, theirs, &blob_options, options.algorithm);
+    MergeFileOutcome {
+        content: result.content,
+        conflicts,
+    }
+}
+
 /// Perform a 3-way merge of three blobs using the diff3 algorithm.
 ///
 /// `base` is the common ancestor; `ours` and `theirs` are the two sides. The
@@ -100,6 +161,16 @@ pub fn merge_blobs(
     theirs: &[u8],
     options: &MergeBlobOptions<'_>,
 ) -> MergeBlobResult {
+    merge_blobs_internal(base, ours, theirs, options, DiffAlgorithm::Myers).0
+}
+
+fn merge_blobs_internal(
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    options: &MergeBlobOptions<'_>,
+    algorithm: DiffAlgorithm,
+) -> (MergeBlobResult, usize) {
     let base_lines = split_lines(base);
     let ours_lines = split_lines(ours);
     let theirs_lines = split_lines(theirs);
@@ -108,15 +179,26 @@ pub fn merge_blobs(
     // ranges, computed via Myers. Under `ws_ignore`, lines that differ only by
     // ignored whitespace match, so whitespace-only changes are absorbed into the
     // stable spans rather than surfacing as conflicts.
-    let ours_matches = matching_regions(&base_lines, &ours_lines, options.ws_ignore);
-    let theirs_matches = matching_regions(&base_lines, &theirs_lines, options.ws_ignore);
+    let ours_matches = matching_regions(&base_lines, &ours_lines, options.ws_ignore, algorithm);
+    let theirs_matches = matching_regions(&base_lines, &theirs_lines, options.ws_ignore, algorithm);
 
     // Intersect the two match lists to get segments of base that are unchanged
     // on BOTH sides, each carrying the exact aligned side indices. Between these
     // common-stable segments lie the (potentially conflicting) changed regions.
     let stable = common_stable_segments(&ours_matches, &theirs_matches);
+    let stable = if options.style == ConflictStyle::Merge {
+        simplify_conflict_separators(
+            stable,
+            &base_lines,
+            &ours_lines,
+            &theirs_lines,
+            options.ws_ignore,
+        )
+    } else {
+        stable
+    };
 
-    let mut writer = MergeWriter::new(options);
+    let mut writer = MergeWriter::new(options, ours);
     // Cursors: next unconsumed line in base, ours, theirs.
     let mut base_idx = 0usize;
     let mut our_idx = 0usize;
@@ -260,7 +342,11 @@ fn refine_conflict_items(ours: &[DiffLine<'_>], theirs: &[DiffLine<'_>]) -> Vec<
     while idx < raw.len() {
         match &raw[idx] {
             RefineItem::Context(range) => {
-                let small = range.len() <= 3;
+                let small = ours[range.clone()]
+                    .iter()
+                    .filter(|line| line.content.iter().any(u8::is_ascii_alphanumeric))
+                    .count()
+                    <= 3;
                 let prev_conflict = matches!(out.last(), Some(RefineItem::Conflict(..)));
                 let next_conflict = matches!(raw.get(idx + 1), Some(RefineItem::Conflict(..)));
                 if small && prev_conflict && next_conflict {
@@ -313,13 +399,14 @@ fn matching_regions(
     base: &[DiffLine<'_>],
     side: &[DiffLine<'_>],
     ws_ignore: WsIgnore,
+    algorithm: DiffAlgorithm,
 ) -> Vec<MatchRegion> {
     let ops = if ws_ignore.is_empty() {
-        myers_diff_lines(base, side)
+        diff_lines_with_algorithm(base, side, algorithm)
     } else {
         // The 3-way content merge uses the Myers line diff (git's ll-merge xdl
         // default); the whitespace flags affect only the equality test.
-        myers_diff_lines_ws(base, side, ws_ignore, DiffAlgorithm::Myers)
+        myers_diff_lines_ws(base, side, ws_ignore, algorithm)
     };
     let mut regions = Vec::new();
     let mut base_idx = 0usize;
@@ -378,19 +465,77 @@ fn common_stable_segments(ours: &[MatchRegion], theirs: &[MatchRegion]) -> Vec<S
     segments
 }
 
+/// Git's `xdl_simplify_non_conflicts(XDL_MERGE_ZEALOUS_ALNUM)` absorbs a common
+/// span between two genuine conflicts when at most three of its lines contain
+/// alphanumeric content. Removing that span from the stable anchors lets the
+/// existing side-to-side refinement fold it into one larger conflict. Blank or
+/// punctuation-only lines therefore have zero separator cost.
+fn simplify_conflict_separators<'a>(
+    stable: Vec<StableSegment>,
+    base: &[DiffLine<'a>],
+    ours: &[DiffLine<'a>],
+    theirs: &[DiffLine<'a>],
+    ws_ignore: WsIgnore,
+) -> Vec<StableSegment> {
+    stable
+        .iter()
+        .enumerate()
+        .filter_map(|(index, segment)| {
+            let previous = index.checked_sub(1).and_then(|index| stable.get(index));
+            let next = stable.get(index + 1);
+            let before = changed_span_conflicts(
+                &base[previous.map_or(0, |item| item.base_start + item.len)..segment.base_start],
+                &ours[previous.map_or(0, |item| item.ours_start + item.len)..segment.ours_start],
+                &theirs
+                    [previous.map_or(0, |item| item.theirs_start + item.len)..segment.theirs_start],
+                ws_ignore,
+            );
+            let after = changed_span_conflicts(
+                &base[segment.base_start + segment.len
+                    ..next.map_or(base.len(), |item| item.base_start)],
+                &ours[segment.ours_start + segment.len
+                    ..next.map_or(ours.len(), |item| item.ours_start)],
+                &theirs[segment.theirs_start + segment.len
+                    ..next.map_or(theirs.len(), |item| item.theirs_start)],
+                ws_ignore,
+            );
+            let alnum_lines = base[segment.base_start..segment.base_start + segment.len]
+                .iter()
+                .filter(|line| line.content.iter().any(u8::is_ascii_alphanumeric))
+                .count();
+            (!(before && after && alnum_lines <= 3)).then_some(*segment)
+        })
+        .collect()
+}
+
+fn changed_span_conflicts(
+    base: &[DiffLine<'_>],
+    ours: &[DiffLine<'_>],
+    theirs: &[DiffLine<'_>],
+    ws_ignore: WsIgnore,
+) -> bool {
+    !regions_match(ours, base, ws_ignore)
+        && !regions_match(theirs, base, ws_ignore)
+        && !regions_match(ours, theirs, ws_ignore)
+}
+
 /// Accumulates merged output and renders conflict markers byte-for-byte like
 /// upstream git.
 struct MergeWriter<'a> {
     out: Vec<u8>,
     conflicted: bool,
+    conflicts: usize,
+    crlf: bool,
     options: &'a MergeBlobOptions<'a>,
 }
 
 impl<'a> MergeWriter<'a> {
-    fn new(options: &'a MergeBlobOptions<'a>) -> Self {
+    fn new(options: &'a MergeBlobOptions<'a>, ours: &[u8]) -> Self {
         Self {
             out: Vec::new(),
             conflicted: false,
+            conflicts: 0,
+            crlf: ours.windows(2).any(|window| window == b"\r\n"),
             options,
         }
     }
@@ -414,6 +559,14 @@ impl<'a> MergeWriter<'a> {
         base: &[DiffLine<'_>],
         theirs: &[DiffLine<'_>],
     ) {
+        if self.options.favor == MergeFavor::Ours {
+            self.emit_section(ours);
+            return;
+        }
+        if self.options.favor == MergeFavor::Theirs {
+            self.emit_section(theirs);
+            return;
+        }
         // Union: keep both sides' lines (ours then theirs) with no markers, and do
         // NOT flag a conflict — git's `XDL_MERGE_FAVOR_UNION`.
         if self.options.favor == MergeFavor::Union {
@@ -422,19 +575,45 @@ impl<'a> MergeWriter<'a> {
             self.emit_section(theirs);
             return;
         }
+
+        // zdiff3 keeps the diff3 ancestor section, but moves context common to
+        // both sides at either edge outside the conflict markers. The base
+        // section deliberately remains the whole base region; that is how xdiff
+        // retains the useful ancestor context while shrinking only the side
+        // sections.
+        let (prefix, suffix) = if self.options.style == ConflictStyle::ZDiff3 {
+            let prefix = common_prefix_len(ours, theirs);
+            let suffix = common_suffix_len(ours, theirs, prefix);
+            (prefix, suffix)
+        } else {
+            (0, 0)
+        };
+        if prefix != 0 {
+            self.emit_section(&ours[..prefix]);
+        }
+        let ours_inner = &ours[prefix..ours.len() - suffix];
+        let theirs_inner = &theirs[prefix..theirs.len() - suffix];
+
         self.conflicted = true;
+        self.conflicts += 1;
         self.write_marker(b'<', self.options.ours_label);
-        self.emit_section(ours);
-        if self.options.style == ConflictStyle::Diff3 {
+        self.emit_section(ours_inner);
+        if matches!(
+            self.options.style,
+            ConflictStyle::Diff3 | ConflictStyle::ZDiff3
+        ) {
             self.ensure_newline();
             self.write_marker(b'|', self.options.base_label);
             self.emit_section(base);
         }
         self.ensure_newline();
         self.write_divider();
-        self.emit_section(theirs);
+        self.emit_section(theirs_inner);
         self.ensure_newline();
         self.write_marker(b'>', self.options.theirs_label);
+        if suffix != 0 {
+            self.emit_section(&ours[ours.len() - suffix..]);
+        }
     }
 
     /// Emit a conflict with git's zealous refinement applied. The default
@@ -449,8 +628,10 @@ impl<'a> MergeWriter<'a> {
         base: &[DiffLine<'_>],
         theirs: &[DiffLine<'_>],
     ) {
-        if self.options.style == ConflictStyle::Diff3
-            || self.options.favor != MergeFavor::None
+        if matches!(
+            self.options.style,
+            ConflictStyle::Diff3 | ConflictStyle::ZDiff3
+        ) || self.options.favor != MergeFavor::None
             || ours.is_empty()
             || theirs.is_empty()
         {
@@ -476,7 +657,7 @@ impl<'a> MergeWriter<'a> {
     /// markers always start a fresh line even after a no-newline final line.
     fn ensure_newline(&mut self) {
         if !self.out.is_empty() && self.out.last() != Some(&b'\n') {
-            self.out.push(b'\n');
+            self.write_line_terminator();
         }
     }
 
@@ -491,7 +672,7 @@ impl<'a> MergeWriter<'a> {
             self.out.push(b' ');
             self.out.extend_from_slice(label.as_bytes());
         }
-        self.out.push(b'\n');
+        self.write_line_terminator();
     }
 
     /// Write the `=======` divider line (never labelled).
@@ -499,13 +680,107 @@ impl<'a> MergeWriter<'a> {
         for _ in 0..self.options.marker_size {
             self.out.push(b'=');
         }
-        self.out.push(b'\n');
+        self.write_line_terminator();
     }
 
-    fn finish(self) -> MergeBlobResult {
-        MergeBlobResult {
+    fn write_line_terminator(&mut self) {
+        if self.crlf {
+            self.out.extend_from_slice(b"\r\n");
+        } else {
+            self.out.push(b'\n');
+        }
+    }
+
+    fn finish(self) -> (MergeBlobResult, usize) {
+        let result = MergeBlobResult {
             content: self.out,
             conflicted: self.conflicted,
+        };
+        (result, self.conflicts)
+    }
+}
+
+fn common_prefix_len(a: &[DiffLine<'_>], b: &[DiffLine<'_>]) -> usize {
+    a.iter()
+        .zip(b)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn common_suffix_len(a: &[DiffLine<'_>], b: &[DiffLine<'_>], prefix: usize) -> usize {
+    let max = a.len().min(b.len()).saturating_sub(prefix);
+    let mut len = 0;
+    while len < max && a[a.len() - 1 - len] == b[b.len() - 1 - len] {
+        len += 1;
+    }
+    len
+}
+
+#[cfg(test)]
+mod merge_file_tests {
+    use super::*;
+
+    fn options() -> MergeFileOptions<'static> {
+        MergeFileOptions {
+            ours_label: "ours",
+            base_label: "base",
+            theirs_label: "theirs",
+            ..MergeFileOptions::default()
         }
+    }
+
+    #[test]
+    fn zealous_merge_absorbs_small_alphanumeric_separator() {
+        let base = b"a\nbase-one\ncontext\nbase-two\nz\n";
+        let ours = b"a\nours-one\ncontext\nours-two\nz\n";
+        let theirs = b"a\ntheirs-one\ncontext\ntheirs-two\nz\n";
+        let outcome = merge_file(base, ours, theirs, &options());
+        assert_eq!(outcome.conflicts, 1);
+        assert_eq!(
+            outcome
+                .content
+                .windows(7)
+                .filter(|window| *window == b"=======")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn zealous_alnum_absorbs_more_than_three_blank_lines() {
+        let base = b"a\nbase-one\n\n\n\n\nbase-two\nz\n";
+        let ours = b"a\nours-one\n\n\n\n\nours-two\nz\n";
+        let theirs = b"a\ntheirs-one\n\n\n\n\ntheirs-two\nz\n";
+        let outcome = merge_file(base, ours, theirs, &options());
+        assert_eq!(outcome.conflicts, 1);
+    }
+
+    #[test]
+    fn diff3_does_not_apply_zealous_conflict_coalescing() {
+        let base = b"a\nbase-one\ncontext\nbase-two\nz\n";
+        let ours = b"a\nours-one\ncontext\nours-two\nz\n";
+        let theirs = b"a\ntheirs-one\ncontext\ntheirs-two\nz\n";
+        let mut options = options();
+        options.style = ConflictStyle::Diff3;
+        let outcome = merge_file(base, ours, theirs, &options);
+        assert_eq!(outcome.conflicts, 2);
+    }
+
+    #[test]
+    fn conflict_markers_follow_crlf_input() {
+        let base = b"one\r\nbase\r\nthree";
+        let ours = b"one\r\nours\r\nthree";
+        let theirs = b"one\r\ntheirs\r\nthree";
+        let outcome = merge_file(base, ours, theirs, &options());
+        assert!(outcome.content.windows(9).any(|line| line == b"<<<<<<< o"));
+        assert!(
+            outcome
+                .content
+                .split(|byte| *byte == b'\n')
+                .filter(|line| line.starts_with(b"<<<<<<<")
+                    || line.starts_with(b"=======")
+                    || line.starts_with(b">>>>>>>"))
+                .all(|line| line.ends_with(b"\r"))
+        );
     }
 }

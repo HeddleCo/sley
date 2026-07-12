@@ -1,9 +1,12 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
 use crate::*;
-use sley::plumbing::{sley_rev};
+use sley::plumbing::sley_rev;
 
-pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_commit_tree(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut tree = None;
     let mut parents = Vec::new();
     let mut message_chunks = Vec::new();
@@ -71,7 +74,7 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
     let Some(tree) = tree else {
         return commit_tree_requires_one_tree_error();
     };
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     // git resolves the tree and each `-p` parent as a revision-ish (so a tag,
     // branch, `HEAD^`, abbreviated oid, or `<rev>^{tree}` all work), peeling the
@@ -83,20 +86,35 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
     let tree = match ObjectId::from_hex(format, &tree) {
         Ok(oid) => oid,
         Err(_) => {
-            let tree_rev = resolve_revision_treeish(&git_dir, format, &tree)?;
+            let tree_rev =
+                resolve_revision_treeish(&git_dir, format, &tree, cli_session.replace_objects())?;
             sley_rev::peel_to_tree(&db_resolve, format, &tree_rev)?
         }
     };
-    let parents = parents
+    let resolved_parents = parents
         .iter()
         .map(|parent| match ObjectId::from_hex(format, parent) {
             Ok(oid) => Ok(oid),
             Err(_) => {
-                let resolved = resolve_revision_commitish(&git_dir, format, parent)?;
+                let resolved = resolve_revision_commitish(
+                    &git_dir,
+                    format,
+                    parent,
+                    cli_session.replace_objects(),
+                )?;
                 sley_rev::peel_to_commit(&db_resolve, format, &resolved)
             }
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut parents = Vec::with_capacity(resolved_parents.len());
+    let mut seen_parents = HashSet::with_capacity(resolved_parents.len());
+    for parent in resolved_parents {
+        if seen_parents.insert(parent) {
+            parents.push(parent);
+        } else {
+            eprintln!("error: duplicate parent {parent} ignored");
+        }
+    }
     let message = if message_chunks.is_empty() {
         let mut message = Vec::new();
         io::stdin().read_to_end(&mut message)?;
@@ -104,9 +122,9 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
     } else {
         commit_message_from_prepared_chunks(&message_chunks)
     };
-    let author = commit_identity_from_env("AUTHOR")?;
-    let committer = commit_identity_from_env("COMMITTER")?;
-    let config = read_repo_config(&git_dir).ok();
+    let config = read_repo_config(&git_dir).unwrap_or_default();
+    let author = commit_identity_from_env("AUTHOR", &config)?;
+    let committer = commit_identity_from_env("COMMITTER", &config)?;
     let signature = if gpg_sign {
         let unsigned = Commit {
             tree,
@@ -117,9 +135,9 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
             message: message.clone(),
         };
         let key =
-            commands::signing::signing_key(config.as_ref(), gpg_sign_key.as_deref(), &committer);
+            commands::signing::signing_key(Some(&config), gpg_sign_key.as_deref(), &committer);
         Some(commands::signing::sign_payload(
-            config.as_ref(),
+            Some(&config),
             &unsigned.write(),
             key.as_deref(),
         )?)

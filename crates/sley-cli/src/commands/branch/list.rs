@@ -73,6 +73,7 @@ pub(super) fn run_branch_verbose_list_options(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     options: BranchVerboseListOptions,
 ) -> Result<()> {
     if options.verbosity == 0 {
@@ -82,7 +83,7 @@ pub(super) fn run_branch_verbose_list_options(
             print_branch_list_matching(store, options.mode, &options.patterns, options.ignore_case)
         };
     }
-    print_branch_list_verbose(git_dir, format, store, options)
+    print_branch_list_verbose(git_dir, format, store, replace_objects, options)
 }
 #[derive(Clone, Copy)]
 pub(super) enum BranchListMode {
@@ -91,17 +92,18 @@ pub(super) enum BranchListMode {
     All,
 }
 
-pub(super) fn branch_refs_for_mode(store: &FileRefStore, mode: BranchListMode) -> Result<Vec<sley_refs::Ref>> {
-    match mode {
-        BranchListMode::Local => store.list_refs_with_prefix("refs/heads/"),
-        BranchListMode::Remote => store.list_refs_with_prefix("refs/remotes/"),
-        BranchListMode::All => {
-            let mut refs = store.list_refs_with_prefix("refs/heads/")?;
-            refs.extend(store.list_refs_with_prefix("refs/remotes/")?);
-            refs.sort_by(|left, right| left.name.cmp(&right.name));
-            Ok(refs)
-        }
-    }
+pub(super) fn branch_refs_for_mode(
+    store: &FileRefStore,
+    mode: BranchListMode,
+) -> Result<Vec<sley_refs::Ref>> {
+    let scope = match mode {
+        BranchListMode::Local => sley_refs::branch::BranchListScope::Local,
+        BranchListMode::Remote => sley_refs::branch::BranchListScope::Remote,
+        BranchListMode::All => sley_refs::branch::BranchListScope::All,
+    };
+    sley_refs::branch::list_branches(store, &sley_refs::branch::BranchListOptions::all_in(scope))
+        .map(|outcome| outcome.refs)
+        .map_err(sley_refs::branch::BranchOperationError::into_git_error)
 }
 
 pub(super) fn print_branch_list(store: &FileRefStore, mode: BranchListMode) -> Result<()> {
@@ -209,6 +211,7 @@ pub(super) fn run_branch_general_list_options(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     options: BranchGeneralListOptions,
 ) -> Result<()> {
     let mut refs = branch_sorted_refs(git_dir, format, store, options.mode, options.sort)?;
@@ -229,10 +232,18 @@ pub(super) fn run_branch_general_list_options(
             _ => {}
         }
     }
-    refs = branch_filter_refs_by_reachability(git_dir, format, store, refs, &options.filters)?;
+    refs = branch_filter_refs_by_reachability(
+        git_dir,
+        format,
+        store,
+        replace_objects,
+        refs,
+        &options.filters,
+    )?;
     if let Some(style) = options.column {
         let show_detached = options.patterns.is_empty();
         let rows = collect_branch_rows(
+            store,
             refs,
             store.current_branch_ref()?.as_deref(),
             options.mode,
@@ -246,12 +257,14 @@ pub(super) fn run_branch_general_list_options(
     let worktree_paths = if options.color {
         Some(for_each_ref_worktree_paths(
             git_dir,
+            None,
             store.current_branch_ref()?.as_deref(),
         )?)
     } else {
         None
     };
     print_branch_refs(
+        store,
         refs,
         store.current_branch_ref()?.as_deref(),
         options.mode,
@@ -429,8 +442,9 @@ pub(super) fn print_branch_list_colored(
     mode: BranchListMode,
 ) -> Result<()> {
     let current = store.current_branch_ref()?;
-    let worktree_paths = for_each_ref_worktree_paths(git_dir, current.as_deref())?;
+    let worktree_paths = for_each_ref_worktree_paths(git_dir, None, current.as_deref())?;
     print_branch_refs(
+        store,
         branch_refs_for_mode(store, mode)?,
         current.as_deref(),
         mode,
@@ -465,6 +479,7 @@ pub(super) fn branch_filter_refs_by_reachability(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     refs: Vec<sley_refs::Ref>,
     filters: &BranchListFilters,
 ) -> Result<Vec<sley_refs::Ref>> {
@@ -473,10 +488,14 @@ pub(super) fn branch_filter_refs_by_reachability(
     }
 
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let contains_oids = branch_resolve_filter_revs(git_dir, format, &filters.contains)?;
-    let no_contains_oids = branch_resolve_filter_revs(git_dir, format, &filters.no_contains)?;
-    let merged_oids = branch_resolve_filter_revs(git_dir, format, &filters.merged)?;
-    let no_merged_oids = branch_resolve_filter_revs(git_dir, format, &filters.no_merged)?;
+    let contains_oids =
+        branch_resolve_filter_revs(git_dir, format, replace_objects, &filters.contains)?;
+    let no_contains_oids =
+        branch_resolve_filter_revs(git_dir, format, replace_objects, &filters.no_contains)?;
+    let merged_oids =
+        branch_resolve_filter_revs(git_dir, format, replace_objects, &filters.merged)?;
+    let no_merged_oids =
+        branch_resolve_filter_revs(git_dir, format, replace_objects, &filters.no_merged)?;
     let contains_targets = branch_peel_filter_oids(&db, format, &filters.contains, &contains_oids)?;
     let no_contains_targets =
         branch_peel_filter_oids(&db, format, &filters.no_contains, &no_contains_oids)?;
@@ -519,10 +538,11 @@ pub(super) fn branch_filter_refs_by_reachability(
 pub(super) fn branch_resolve_filter_revs(
     git_dir: &Path,
     format: ObjectFormat,
+    replace_objects: bool,
     revs: &[String],
 ) -> Result<Vec<ObjectId>> {
     revs.iter()
-        .map(|rev| resolve_revision(git_dir, format, rev))
+        .map(|rev| resolve_revision(git_dir, format, rev, replace_objects))
         .collect()
 }
 
@@ -884,7 +904,11 @@ pub(super) fn print_branch_list_matching_push_sorted(
     )
 }
 
-pub(super) fn branch_list_patterns_match(patterns: &[String], name: &str, ignore_case: bool) -> bool {
+pub(super) fn branch_list_patterns_match(
+    patterns: &[String],
+    name: &str,
+    ignore_case: bool,
+) -> bool {
     patterns.is_empty()
         || patterns.iter().any(|pattern| {
             if ignore_case {
@@ -965,10 +989,7 @@ pub(super) fn branch_remote_or_all_mode_unchecked(flag: &str) -> BranchListMode 
     branch_remote_or_all_mode(flag).expect("flag is -r/--remotes/-a/--all")
 }
 
-pub(super) fn print_branch_list_remote_or_all_flag(
-    store: &FileRefStore,
-    flag: &str,
-) -> Result<()> {
+pub(super) fn print_branch_list_remote_or_all_flag(store: &FileRefStore, flag: &str) -> Result<()> {
     print_branch_list(store, branch_remote_or_all_mode_unchecked(flag))
 }
 
@@ -1096,6 +1117,7 @@ pub(super) fn print_branch_list_format(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     mode: BranchListMode,
     patterns: &[String],
     ignore_case: bool,
@@ -1105,6 +1127,7 @@ pub(super) fn print_branch_list_format(
         git_dir,
         format,
         store,
+        replace_objects,
         BranchFormatPrintOptions {
             mode,
             patterns,
@@ -1127,10 +1150,17 @@ pub(super) fn print_branch_list_format_omit_empty(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     options: BranchFormatPrintOptions<'_>,
 ) -> Result<()> {
     print_branch_list_format_omit_empty_with_sort_color(
-        git_dir, format, store, options, None, false,
+        git_dir,
+        format,
+        store,
+        replace_objects,
+        options,
+        None,
+        false,
     )
 }
 
@@ -1138,12 +1168,14 @@ pub(super) fn run_branch_format_list_options(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     options: BranchFormatListOptions,
 ) -> Result<()> {
     print_branch_list_format_omit_empty_with_sort_color(
         git_dir,
         format,
         store,
+        replace_objects,
         BranchFormatPrintOptions {
             mode: options.mode,
             patterns: &options.patterns,
@@ -1160,6 +1192,7 @@ pub(super) fn print_branch_list_format_omit_empty_with_sort_color(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     options: BranchFormatPrintOptions<'_>,
     sort: Option<BranchSort>,
     color: bool,
@@ -1171,7 +1204,7 @@ pub(super) fn print_branch_list_format_omit_empty_with_sort_color(
     let objectname_abbrev = repository_abbrev(git_dir, format)?;
     let objectname_candidates = cat_file_all_object_ids(git_dir, format)?;
     let deltabase = zero_oid(format)?;
-    let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
+    let mailmap = commands::utility::Mailmap::load_default(git_dir, format, replace_objects)?;
     let all_refs = branch_sorted_refs(git_dir, format, store, options.mode, sort)?;
     let ref_names: std::collections::HashSet<String> = all_refs
         .iter()
@@ -1184,7 +1217,7 @@ pub(super) fn print_branch_list_format_omit_empty_with_sort_color(
     if matches!(options.mode, BranchListMode::Local | BranchListMode::All)
         && head_ref.is_none()
         && options.patterns.is_empty()
-        && let Some(refname) = detached_head_branch_line()
+        && let Some(refname) = detached_head_branch_line(store)
         && let Some((oid, _)) = resolve_for_each_ref_target(
             store,
             &sley_refs::Ref {
@@ -1237,7 +1270,7 @@ pub(super) fn print_branch_list_format_omit_empty_with_sort_color(
             continue;
         };
         let worktree_path =
-            for_each_ref_worktree_path(git_dir, head_ref.as_deref(), &reference.name)?;
+            for_each_ref_worktree_path(git_dir, None, head_ref.as_deref(), &reference.name)?;
         print_branch_format_reference(
             &mut stdout,
             &format_spec,
@@ -1420,6 +1453,7 @@ pub(super) fn print_branch_list_filtered_sorted_with_color_detached(
         refs.reverse();
     }
     print_branch_refs(
+        store,
         refs,
         current.as_deref(),
         mode,
@@ -1443,7 +1477,16 @@ pub(super) fn print_branch_list_filtered_version_sorted_with_color(
     if descending {
         refs.reverse();
     }
-    print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
+    print_branch_refs(
+        store,
+        refs,
+        current.as_deref(),
+        mode,
+        color,
+        true,
+        None,
+        include,
+    )
 }
 
 pub(super) fn print_branch_list_filtered_objectname_sorted_with_color(
@@ -1465,7 +1508,16 @@ pub(super) fn print_branch_list_filtered_objectname_sorted_with_color(
         };
         object_order.then_with(|| left.name.cmp(&right.name))
     });
-    print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
+    print_branch_refs(
+        store,
+        refs,
+        current.as_deref(),
+        mode,
+        color,
+        true,
+        None,
+        include,
+    )
 }
 
 pub(super) fn branch_ref_objectname_sort_key(reference: &sley_refs::Ref) -> String {
@@ -1503,7 +1555,16 @@ pub(super) fn print_branch_list_filtered_objecttype_sorted_with_color(
         .into_iter()
         .map(|(reference, _)| reference)
         .collect::<Vec<_>>();
-    print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
+    print_branch_refs(
+        store,
+        refs,
+        current.as_deref(),
+        mode,
+        color,
+        true,
+        None,
+        include,
+    )
 }
 
 pub(super) fn branch_ref_objecttype_sort_key(
@@ -1545,7 +1606,16 @@ pub(super) fn print_branch_list_filtered_objectsize_sorted_with_color(
         .into_iter()
         .map(|(reference, _)| reference)
         .collect::<Vec<_>>();
-    print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
+    print_branch_refs(
+        store,
+        refs,
+        current.as_deref(),
+        mode,
+        color,
+        true,
+        None,
+        include,
+    )
 }
 
 pub(super) fn branch_ref_objectsize_sort_key(
@@ -1588,7 +1658,16 @@ pub(super) fn print_branch_list_filtered_date_sorted_with_color(
         .into_iter()
         .map(|(reference, _)| reference)
         .collect::<Vec<_>>();
-    print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
+    print_branch_refs(
+        store,
+        refs,
+        current.as_deref(),
+        mode,
+        color,
+        true,
+        None,
+        include,
+    )
 }
 
 pub(super) fn branch_ref_date_sort_key(
@@ -1627,10 +1706,22 @@ pub(super) fn print_branch_list_filtered_upstream_sorted_with_color(
         };
         upstream_order.then_with(|| left.name.cmp(&right.name))
     });
-    print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
+    print_branch_refs(
+        store,
+        refs,
+        current.as_deref(),
+        mode,
+        color,
+        true,
+        None,
+        include,
+    )
 }
 
-pub(super) fn branch_ref_upstream_sort_key(config: &GitConfig, reference: &sley_refs::Ref) -> String {
+pub(super) fn branch_ref_upstream_sort_key(
+    config: &GitConfig,
+    reference: &sley_refs::Ref,
+) -> String {
     for_each_ref_upstream(config, &reference.name)
         .map(|upstream| upstream.refname)
         .unwrap_or_default()
@@ -1657,7 +1748,16 @@ pub(super) fn print_branch_list_filtered_push_sorted_with_color(
         };
         push_order.then_with(|| left.name.cmp(&right.name))
     });
-    print_branch_refs(refs, current.as_deref(), mode, color, true, None, include)
+    print_branch_refs(
+        store,
+        refs,
+        current.as_deref(),
+        mode,
+        color,
+        true,
+        None,
+        include,
+    )
 }
 
 pub(super) fn branch_ref_push_sort_key(config: &GitConfig, reference: &sley_refs::Ref) -> String {
@@ -1670,10 +1770,8 @@ pub(super) fn branch_ref_push_sort_key(config: &GitConfig, reference: &sley_refs
 /// branch` prints when HEAD is detached, with the in-progress-operation
 /// variants (bisect / rebase) taking precedence -- mirroring upstream
 /// `wt_status_get_state` + `get_head_description`.
-pub(super) fn detached_head_branch_line() -> Option<String> {
-    let git_dir = crate::session::cli_git_dir().ok()?;
-    let format = repository_object_format(&git_dir).ok()?;
-    let store = FileRefStore::new(&git_dir, format);
+pub(super) fn detached_head_branch_line(store: &FileRefStore) -> Option<String> {
+    let git_dir = store.git_dir();
     let RefTarget::Direct(oid) = store.read_ref("HEAD").ok()?? else {
         return None;
     };
@@ -1738,6 +1836,7 @@ pub(super) fn detached_checkout_label(destination: &str, oid: &ObjectId) -> Stri
 }
 
 pub(super) fn print_branch_refs(
+    store: &FileRefStore,
     refs: Vec<sley_refs::Ref>,
     current: Option<&str>,
     mode: BranchListMode,
@@ -1747,14 +1846,14 @@ pub(super) fn print_branch_refs(
     mut include: impl FnMut(&sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
     let colors = if color {
-        Some(branch_list_colors_from_current_repo()?)
+        Some(branch_list_colors_from_current_repo(store)?)
     } else {
         None
     };
     if matches!(mode, BranchListMode::Local | BranchListMode::All)
         && current.is_none()
         && show_detached
-        && let Some(line) = detached_head_branch_line()
+        && let Some(line) = detached_head_branch_line(store)
     {
         if let Some(colors) = &colors {
             println!("* {}", colors.paint(BranchColorSlot::Current, &line));
@@ -1827,6 +1926,7 @@ pub(super) fn print_branch_refs(
 }
 
 pub(super) fn collect_branch_rows(
+    store: &FileRefStore,
     refs: Vec<sley_refs::Ref>,
     current: Option<&str>,
     mode: BranchListMode,
@@ -1836,14 +1936,14 @@ pub(super) fn collect_branch_rows(
 ) -> Result<Vec<String>> {
     let mut rows = Vec::new();
     let colors = if color {
-        Some(branch_list_colors_from_current_repo()?)
+        Some(branch_list_colors_from_current_repo(store)?)
     } else {
         None
     };
     if matches!(mode, BranchListMode::Local | BranchListMode::All)
         && current.is_none()
         && show_detached
-        && let Some(line) = detached_head_branch_line()
+        && let Some(line) = detached_head_branch_line(store)
     {
         if let Some(colors) = &colors {
             rows.push(format!(
@@ -1936,7 +2036,11 @@ pub(super) fn remote_symbolic_ref_is_dangling(
     }
 }
 
-pub(super) fn remote_branch_display(reference: &sley_refs::Ref, name: &str, mode: BranchListMode) -> String {
+pub(super) fn remote_branch_display(
+    reference: &sley_refs::Ref,
+    name: &str,
+    mode: BranchListMode,
+) -> String {
     let display = if matches!(mode, BranchListMode::All) {
         format!("remotes/{name}")
     } else {
@@ -1989,9 +2093,10 @@ impl BranchListColors {
     }
 }
 
-pub(super) fn branch_list_colors_from_current_repo() -> Result<BranchListColors> {
-    let git_dir = crate::session::cli_git_dir()?;
-    let config = read_repo_config(&git_dir)?;
+pub(super) fn branch_list_colors_from_current_repo(
+    store: &FileRefStore,
+) -> Result<BranchListColors> {
+    let config = read_repo_config(store.git_dir())?;
     Ok(BranchListColors::from_config(&config))
 }
 
@@ -2057,6 +2162,7 @@ pub(super) fn print_branch_list_verbose(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    replace_objects: bool,
     options: BranchVerboseListOptions,
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -2067,12 +2173,12 @@ pub(super) fn print_branch_list_verbose(
         .map(|abbrev| abbrev.map(|width| width.min(format.hex_len())))
         .unwrap_or(repository_abbrev(git_dir, format)?);
     let objectname_candidates = cat_file_all_object_ids(git_dir, format)?;
-    let worktree_paths = for_each_ref_worktree_paths(git_dir, current.as_deref())?;
+    let worktree_paths = for_each_ref_worktree_paths(git_dir, None, current.as_deref())?;
     let mut rows = Vec::new();
     if matches!(options.mode, BranchListMode::Local | BranchListMode::All)
         && current.is_none()
         && options.patterns.is_empty()
-        && let Some(display) = detached_head_branch_line()
+        && let Some(display) = detached_head_branch_line(store)
         && let Some((oid, _)) = resolve_for_each_ref_target(
             store,
             &sley_refs::Ref {
@@ -2097,6 +2203,7 @@ pub(super) fn print_branch_list_verbose(
         git_dir,
         format,
         store,
+        replace_objects,
         branch_refs_for_mode(store, options.mode)?,
         &options.filters,
     )?;
@@ -2133,7 +2240,7 @@ pub(super) fn print_branch_list_verbose(
     }
     let width = rows.iter().map(|row| row.display.len()).max().unwrap_or(0);
     let colors = if options.color {
-        Some(branch_list_colors_from_current_repo()?)
+        Some(branch_list_colors_from_current_repo(store)?)
     } else {
         None
     };
@@ -2183,7 +2290,10 @@ pub(super) struct BranchVerboseRow {
     upstream_track: Option<ForEachRefTrack>,
 }
 
-pub(super) fn branch_verbose_display_name(name: &str, mode: BranchListMode) -> Option<(String, String)> {
+pub(super) fn branch_verbose_display_name(
+    name: &str,
+    mode: BranchListMode,
+) -> Option<(String, String)> {
     if matches!(mode, BranchListMode::Local | BranchListMode::All)
         && let Some(name) = name.strip_prefix("refs/heads/")
     {

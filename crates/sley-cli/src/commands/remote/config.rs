@@ -1,8 +1,8 @@
 //! Repository config read/write and remote name helpers.
 
 use crate::*;
-use std::path::{Path, PathBuf};
 use sley::plumbing::{sley_config, sley_refs};
+use std::path::{Path, PathBuf};
 
 pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
     // Single effective-config reader shared with the library crates: resolves
@@ -13,6 +13,36 @@ pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
     // cannot push into the process env, so it reconstructs the effective
     // `GIT_CONFIG_PARAMETERS` and passes it through.
     sley_config::read_repo_config(git_dir, crate::effective_config_parameters_env().as_deref())
+}
+
+/// Read the complete invocation config in Git precedence order: system,
+/// global, repository, then command-scoped injections. This is the config view
+/// for command behavior; read-modify-write callers must continue to use
+/// [`read_repo_config_on_disk`] so inherited settings are never persisted.
+pub(crate) fn read_effective_repo_config(git_dir: &Path, cwd: &Path) -> Result<GitConfig> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(sley_config::git_dir_for_include_context(git_dir)),
+        repo_current_branch_name(git_dir),
+    );
+    let mut config = sley_config::load_effective_config(&common_git_dir, &context)?;
+    if config
+        .get_bool("extensions", None, "worktreeconfig")
+        .unwrap_or(false)
+    {
+        let worktree =
+            sley_config::load_config_with_includes(&git_dir.join("config.worktree"), &context)?;
+        config.sections.extend(worktree.sections);
+    }
+    let parameters = injected_config_parameters()?;
+    sley_config::append_injected_config_sections_with_includes(
+        &mut config,
+        &parameters,
+        &context,
+        cwd,
+    )?;
+    sley_config::remotes::augment_with_legacy_remote_files(&mut config, git_dir);
+    Ok(config)
 }
 
 /// The repository's on-disk `config` file alone, with NO command-line `-c` /
@@ -32,7 +62,11 @@ pub(crate) fn read_repo_config_on_disk(git_dir: &Path) -> Result<GitConfig> {
 /// [`read_repo_config`] — which reads only the repo's own `config` file — this
 /// layers the global `~/.gitconfig` and system files, as git does for settings
 /// like `branch.autosetuprebase` that are configured outside the cloned repo.
-pub(super) fn clone_effective_config_value(git_dir: &Path, section: &str, key: &str) -> Option<String> {
+pub(super) fn clone_effective_config_value(
+    git_dir: &Path,
+    section: &str,
+    key: &str,
+) -> Option<String> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir).ok()?;
     let context = sley_config::ConfigIncludeContext::new(
         Some(common_git_dir.clone()),

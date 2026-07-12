@@ -3,6 +3,7 @@
 //! Split out of `lib.rs` in the wave-47 mechanical refactor: a pure code move
 //! (no function body changed); all items are re-exported from `lib.rs`.
 use super::*;
+use crate::attributes::SparseMatcher;
 use crate::checkout::*;
 use crate::ignore::*;
 use crate::index::*;
@@ -392,7 +393,13 @@ pub fn worktree_entry_state_by_git_path(
     else {
         return Ok(WorktreeEntryState::Deleted);
     };
-    if worktree_entry.mode == expected_mode && worktree_entry.oid == *expected_oid {
+    let trust_filemode = trust_executable_bit_from_git_dir(git_dir, None);
+    let mode_matches = if trust_filemode {
+        worktree_entry.mode == expected_mode
+    } else {
+        !sley_diff_merge::is_type_change(expected_mode, worktree_entry.mode)
+    };
+    if mode_matches && worktree_entry.oid == *expected_oid {
         Ok(WorktreeEntryState::Clean)
     } else {
         Ok(WorktreeEntryState::Modified)
@@ -404,7 +411,7 @@ pub fn stream_short_status_with_options<F>(
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
     options: ShortStatusOptions,
-    mut emit: F,
+    emit: F,
 ) -> Result<()>
 where
     F: for<'a> FnMut(ShortStatusRow<'a>) -> Result<StreamControl>,
@@ -412,19 +419,40 @@ where
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    stream_short_status_with_database(worktree_root, git_dir, format, &db, options, emit)
+}
+
+/// Stream status rows while reusing a caller-owned object database.
+///
+/// Repository facades should prefer this entry point so status shares decoded
+/// object, pack, and replacement caches with the rest of the session instead
+/// of reopening the object store for every command.
+pub fn stream_short_status_with_database<F>(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    options: ShortStatusOptions,
+    mut emit: F,
+) -> Result<()>
+where
+    F: for<'a> FnMut(ShortStatusRow<'a>) -> Result<StreamControl>,
+{
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
     if !options.include_ignored
         && let Some(()) = stream_short_status_borrowed_head_matches_index_if_possible(
             worktree_root,
             git_dir,
             format,
-            &db,
+            db,
             options.untracked_mode,
             &mut emit,
         )?
     {
         return Ok(());
     }
-    for entry in collect_short_status_with_options(worktree_root, git_dir, format, options)? {
+    for entry in collect_short_status_with_database(worktree_root, git_dir, format, db, options)? {
         if emit(entry.as_row())?.is_stop() {
             break;
         }
@@ -432,7 +460,7 @@ where
     Ok(())
 }
 
-pub(crate) fn collect_short_status_with_options(
+pub fn collect_short_status_with_options(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -441,12 +469,25 @@ pub(crate) fn collect_short_status_with_options(
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    collect_short_status_with_database(worktree_root, git_dir, format, &db, options)
+}
+
+/// Collect status rows while reusing a caller-owned object database.
+pub fn collect_short_status_with_database(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    options: ShortStatusOptions,
+) -> Result<Vec<ShortStatusEntry>> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
     if !options.include_ignored
         && let Some(entries) = short_status_borrowed_head_matches_index_if_possible(
             worktree_root,
             git_dir,
             format,
-            &db,
+            db,
             options.untracked_mode,
         )?
     {
@@ -458,10 +499,10 @@ pub(crate) fn collect_short_status_with_options(
     // comparison can stream directly from the parsed index and avoid building a
     // second path-sorted copy of every tracked entry.
     let (mut parsed_index, mut stat_cache, mut head_matches_index) =
-        read_index_with_stat_cache(git_dir, format, &db)?;
+        read_index_with_stat_cache(git_dir, format, db)?;
     let sparse_checkout_active = sparse_checkout_active_for_status(git_dir, &parsed_index);
     if sparse_checkout_active && parsed_index.entries.iter().any(IndexEntry::is_sparse_dir) {
-        expand_sparse_index(&mut parsed_index, &db, format)?;
+        expand_sparse_index(&mut parsed_index, db, format)?;
         stat_cache = IndexStatCache::from_index_mtime(&parsed_index, stat_cache.index_mtime);
         head_matches_index = false;
     }
@@ -476,7 +517,7 @@ pub(crate) fn collect_short_status_with_options(
             worktree_root,
             git_dir,
             format,
-            &db,
+            db,
             &parsed_index,
             &stat_cache,
             true,
@@ -519,7 +560,7 @@ pub(crate) fn collect_short_status_with_options(
     let head = if head_matches_index {
         None
     } else {
-        Some(head_tree_entries(git_dir, format, &db)?)
+        Some(head_tree_entries(git_dir, format, db)?)
     };
     let known_tracked_paths = index.keys().cloned().collect::<BTreeSet<_>>();
     let tracked_paths = if options.untracked_mode == StatusUntrackedMode::None {
@@ -709,6 +750,36 @@ pub(crate) fn short_status_unmerged_codes(stages: &BTreeSet<u16>) -> (u8, u8) {
     }
 }
 
+/// Apply the invocation-effective `index.sparse` policy before status reads
+/// the index. Git treats status as an index-aware operation: disabling sparse
+/// layout expands and persists a full index, while re-enabling it converts a
+/// compatible cone checkout back to its collapsed representation.
+pub fn prepare_status_index_layout(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    desired_sparse: bool,
+) -> Result<()> {
+    let Some(mut index) = read_repository_index(git_dir, format)? else {
+        return Ok(());
+    };
+    let currently_sparse = index.is_sparse() || index.entries.iter().any(IndexEntry::is_sparse_dir);
+    if !desired_sparse && currently_sparse {
+        expand_sparse_index(&mut index, db, format)?;
+        return write_repository_index_ref(git_dir, format, &index);
+    }
+    if desired_sparse
+        && !currently_sparse
+        && let Some((sparse, mode)) = active_sparse_checkout(git_dir)?
+        && matches!(mode, SparseCheckoutMode::Cone)
+    {
+        let matcher = SparseMatcher::new(&sparse, mode);
+        collapse_to_sparse_index(&mut index, &matcher, db, format)?;
+        return write_repository_index_ref(git_dir, format, &index);
+    }
+    Ok(())
+}
+
 pub(crate) fn sparse_checkout_active_for_status(git_dir: &Path, index: &Index) -> bool {
     index.is_sparse()
         || index.entries.iter().any(IndexEntry::is_sparse_dir)
@@ -724,6 +795,36 @@ pub(crate) fn sparse_checkout_active_for_borrowed_status(
         .iter()
         .any(|entry| entry.mode == SPARSE_DIR_MODE && entry.is_skip_worktree())
         || sparse_checkout_config_enabled(git_dir)
+}
+
+/// A collapsed sparse-directory entry is already a complete description of an
+/// absent out-of-cone subtree. Status can compare its tree object directly to
+/// HEAD and treat the missing worktree directory as clean without inflating the
+/// index. Once any such directory exists on disk, however, individual leaves
+/// may have been vivified or modified and the full-index path is required.
+pub(crate) fn borrowed_sparse_directory_is_materialized(
+    worktree_root: &Path,
+    index: &BorrowedIndex<'_>,
+) -> Result<bool> {
+    let mut absolute = PathBuf::new();
+    for entry in index
+        .entries
+        .iter()
+        .filter(|entry| entry.mode == SPARSE_DIR_MODE && entry.is_skip_worktree())
+    {
+        let path = entry.path.strip_suffix(b"/").unwrap_or(entry.path);
+        set_worktree_path_from_repo_path(worktree_root, path, &mut absolute)?;
+        match fs::symlink_metadata(&absolute) {
+            Ok(_) => return Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn sparse_checkout_config_enabled(git_dir: &Path) -> bool {
@@ -1151,11 +1252,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_if_possible(
         ],
     );
     let sparse_checkout_active = sparse_checkout_active_for_borrowed_status(git_dir, &borrowed);
-    if borrowed
-        .entries
-        .iter()
-        .any(|entry| entry.mode == SPARSE_DIR_MODE && entry.is_skip_worktree())
-    {
+    if borrowed_sparse_directory_is_materialized(worktree_root, &borrowed)? {
         return Ok(None);
     }
     if borrowed
@@ -1441,11 +1538,7 @@ where
         ],
     );
     let sparse_checkout_active = sparse_checkout_active_for_borrowed_status(git_dir, &borrowed);
-    if borrowed
-        .entries
-        .iter()
-        .any(|entry| entry.mode == SPARSE_DIR_MODE && entry.is_skip_worktree())
-    {
+    if borrowed_sparse_directory_is_materialized(worktree_root, &borrowed)? {
         return Ok(None);
     }
     if borrowed
@@ -1717,11 +1810,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_count_if_possible(
         Err(err) => return Err(err),
     };
     let sparse_checkout_active = sparse_checkout_active_for_borrowed_status(git_dir, &borrowed);
-    if borrowed
-        .entries
-        .iter()
-        .any(|entry| entry.mode == SPARSE_DIR_MODE && entry.is_skip_worktree())
-    {
+    if borrowed_sparse_directory_is_materialized(worktree_root, &borrowed)? {
         return Ok(None);
     }
     let Some(head_tree_oid) = resolve_head_tree_oid(git_dir, format, db)? else {
@@ -1910,6 +1999,75 @@ pub(crate) enum TrackedOnlyPrecheckOutcome {
     Clean,
     Deleted,
     Slow,
+}
+
+/// Per-worker cache for the directory-prefix safety check used by tracked
+/// status prechecks.
+///
+/// Index paths are sorted, so thousands of entries commonly share a few
+/// hundred parent directories. Remembering the direct file type of those
+/// directories avoids repeating the same `symlink_metadata` calls for every
+/// file while preserving the rule that a symlink in any parent makes the path
+/// a deletion from Git's point of view.
+#[derive(Debug, Default)]
+pub(crate) struct StatusSymlinkParentCache {
+    directories: HashMap<Vec<u8>, bool>,
+}
+
+impl StatusSymlinkParentCache {
+    pub(crate) fn has_symlink_parent(
+        &mut self,
+        worktree_root: &Path,
+        git_path: &[u8],
+    ) -> Result<bool> {
+        let Some(slash) = git_path.iter().rposition(|byte| *byte == b'/') else {
+            return Ok(false);
+        };
+        let parent = &git_path[..slash];
+        let mut prefix_end = 0usize;
+        loop {
+            let component_end = parent[prefix_end..]
+                .iter()
+                .position(|byte| *byte == b'/')
+                .map_or(parent.len(), |relative| prefix_end + relative);
+            let prefix = &parent[..component_end];
+            if let Some(is_symlink) = self.directories.get(prefix) {
+                if *is_symlink {
+                    return Ok(true);
+                }
+            } else {
+                let mut absolute = worktree_root.to_path_buf();
+                push_repo_path(&mut absolute, prefix)?;
+                let metadata = match fs::symlink_metadata(&absolute) {
+                    Ok(metadata) => metadata,
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        return Ok(false);
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+                let is_symlink = metadata.file_type().is_symlink();
+                self.directories.insert(prefix.to_vec(), is_symlink);
+                if is_symlink {
+                    return Ok(true);
+                }
+            }
+            if component_end == parent.len() {
+                break;
+            }
+            prefix_end = component_end + 1;
+        }
+        Ok(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_directory_count(&self) -> usize {
+        self.directories.len()
+    }
 }
 
 pub(crate) fn short_status_tracked_only_head_matches_index_parallel(
@@ -2452,6 +2610,7 @@ pub(crate) fn tracked_only_non_clean_prechecks_parallel(
     if worker_count == 1 {
         let mut prechecks = Vec::new();
         let mut absolute = PathBuf::new();
+        let mut symlink_parents = StatusSymlinkParentCache::default();
         for (idx, entry) in index.entries.iter().enumerate() {
             if entry.stage() != Stage::Normal {
                 continue;
@@ -2462,6 +2621,7 @@ pub(crate) fn tracked_only_non_clean_prechecks_parallel(
                 stat_cache,
                 sparse_checkout_active,
                 &mut absolute,
+                &mut symlink_parents,
             )? {
                 TrackedOnlyPrecheckOutcome::Clean => {}
                 TrackedOnlyPrecheckOutcome::Deleted => {
@@ -2488,6 +2648,7 @@ pub(crate) fn tracked_only_non_clean_prechecks_parallel(
                 move || -> Result<Vec<TrackedOnlyPrecheck>> {
                     let mut prechecks = Vec::new();
                     let mut absolute = PathBuf::new();
+                    let mut symlink_parents = StatusSymlinkParentCache::default();
                     loop {
                         let chunk_idx = next_chunk.fetch_add(1, Ordering::Relaxed);
                         let Some(range) = chunk_ranges.get(chunk_idx) else {
@@ -2504,6 +2665,7 @@ pub(crate) fn tracked_only_non_clean_prechecks_parallel(
                                 stat_cache,
                                 sparse_checkout_active,
                                 &mut absolute,
+                                &mut symlink_parents,
                             )? {
                                 TrackedOnlyPrecheckOutcome::Clean => {}
                                 TrackedOnlyPrecheckOutcome::Deleted => {
@@ -2545,6 +2707,7 @@ pub(crate) fn tracked_only_borrowed_non_clean_prechecks_parallel(
     if worker_count == 1 {
         let mut prechecks = Vec::new();
         let mut absolute = PathBuf::new();
+        let mut symlink_parents = StatusSymlinkParentCache::default();
         for (idx, entry) in index.entries.iter().enumerate() {
             if entry.stage() != Stage::Normal {
                 continue;
@@ -2555,6 +2718,7 @@ pub(crate) fn tracked_only_borrowed_non_clean_prechecks_parallel(
                 stat_cache,
                 sparse_checkout_active,
                 &mut absolute,
+                &mut symlink_parents,
             )? {
                 TrackedOnlyPrecheckOutcome::Clean => {}
                 TrackedOnlyPrecheckOutcome::Deleted => {
@@ -2581,6 +2745,7 @@ pub(crate) fn tracked_only_borrowed_non_clean_prechecks_parallel(
                 move || -> Result<Vec<TrackedOnlyPrecheck>> {
                     let mut prechecks = Vec::new();
                     let mut absolute = PathBuf::new();
+                    let mut symlink_parents = StatusSymlinkParentCache::default();
                     loop {
                         let chunk_idx = next_chunk.fetch_add(1, Ordering::Relaxed);
                         let Some(range) = chunk_ranges.get(chunk_idx) else {
@@ -2597,6 +2762,7 @@ pub(crate) fn tracked_only_borrowed_non_clean_prechecks_parallel(
                                 stat_cache,
                                 sparse_checkout_active,
                                 &mut absolute,
+                                &mut symlink_parents,
                             )? {
                                 TrackedOnlyPrecheckOutcome::Clean => {}
                                 TrackedOnlyPrecheckOutcome::Deleted => {
@@ -2629,6 +2795,7 @@ pub(crate) fn tracked_only_stat_precheck(
     stat_cache: &IndexStatCache,
     sparse_checkout_active: bool,
     absolute: &mut PathBuf,
+    symlink_parents: &mut StatusSymlinkParentCache,
 ) -> Result<TrackedOnlyPrecheckOutcome> {
     // Skip-worktree handling mirrors git's clear_skip_worktree_from_present_files:
     // when core.sparseCheckout is DISABLED the bit is honored literally, so the
@@ -2643,7 +2810,7 @@ pub(crate) fn tracked_only_stat_precheck(
         return Ok(TrackedOnlyPrecheckOutcome::Slow);
     }
     let git_path = index_entry.path.as_bytes();
-    if crate::index_io::git_path_has_symlink_parent(worktree_root, git_path)? {
+    if symlink_parents.has_symlink_parent(worktree_root, git_path)? {
         return Ok(TrackedOnlyPrecheckOutcome::Deleted);
     }
     set_worktree_path_from_repo_path(worktree_root, git_path, absolute)?;
@@ -2683,6 +2850,7 @@ pub(crate) fn tracked_only_borrowed_stat_precheck(
     stat_cache: &IndexStatCache,
     sparse_checkout_active: bool,
     absolute: &mut PathBuf,
+    symlink_parents: &mut StatusSymlinkParentCache,
 ) -> Result<TrackedOnlyPrecheckOutcome> {
     // See tracked_only_stat_precheck: when core.sparseCheckout is disabled the
     // skip-worktree bit is honored literally (worktree side always clean); when
@@ -2694,7 +2862,7 @@ pub(crate) fn tracked_only_borrowed_stat_precheck(
     if sley_index::is_gitlink(index_entry.mode) {
         return Ok(TrackedOnlyPrecheckOutcome::Slow);
     }
-    if crate::index_io::git_path_has_symlink_parent(worktree_root, index_entry.path)? {
+    if symlink_parents.has_symlink_parent(worktree_root, index_entry.path)? {
         return Ok(TrackedOnlyPrecheckOutcome::Deleted);
     }
     set_worktree_path_from_repo_path(worktree_root, index_entry.path, absolute)?;
@@ -2787,5 +2955,50 @@ pub(crate) fn status_sort_category(entry: &ShortStatusEntry) -> u8 {
         (b'?', b'?') => 1,
         (b'!', b'!') => 2,
         _ => 0,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn symlink_parent_cache_reuses_directories_and_detects_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "sley-status-parent-cache-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("regular/nested")).expect("create regular directories");
+        let mut cache = StatusSymlinkParentCache::default();
+        assert!(
+            !cache
+                .has_symlink_parent(&root, b"regular/nested/one")
+                .expect("check regular path")
+        );
+        assert_eq!(cache.cached_directory_count(), 2);
+        assert!(
+            !cache
+                .has_symlink_parent(&root, b"regular/nested/two")
+                .expect("check sibling path")
+        );
+        assert_eq!(
+            cache.cached_directory_count(),
+            2,
+            "a sibling path must reuse both cached parent directories"
+        );
+
+        fs::create_dir_all(root.join("target")).expect("create symlink target");
+        symlink("target", root.join("linked")).expect("create directory symlink");
+        assert!(
+            cache
+                .has_symlink_parent(&root, b"linked/child")
+                .expect("check symlink parent")
+        );
+
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 }

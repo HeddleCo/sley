@@ -9,6 +9,7 @@ use sley_core::{DateMode, GitError, ObjectId, Result};
 use sley_strbuf_expand::{
     AtomTable, ExpandFormat, ExpandSegment, MagicPrefix, PaddingAlign, PaddingSpec,
 };
+use std::collections::HashMap;
 use std::io::Write;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +79,122 @@ pub enum ForEachRefAtomIdentityRole {
     Committer,
     Tagger,
     Creator,
+}
+
+/// A date atom used as a `for-each-ref --sort` key.
+///
+/// Bare date atoms are sorted numerically by their timestamp. Once a date
+/// format is supplied, Git sorts the rendered value bytewise instead. Keeping
+/// the parsed mode here lets command frontends share that distinction without
+/// reimplementing the ref-filter date grammar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForEachRefDateSort {
+    pub peeled: bool,
+    pub role: ForEachRefAtomIdentityRole,
+    pub mode: DateMode,
+    pub descending: bool,
+}
+
+/// Parse a date sort atom, returning `None` when `value` names another atom.
+pub fn parse_for_each_ref_date_sort(value: &str) -> Result<Option<ForEachRefDateSort>> {
+    let (value, descending) = value
+        .strip_prefix('-')
+        .map(|value| (value, true))
+        .unwrap_or((value, false));
+    let (value, peeled) = value
+        .strip_prefix('*')
+        .map(|value| (value, true))
+        .unwrap_or((value, false));
+    let (atom, modifier) = value
+        .split_once(':')
+        .map(|(atom, modifier)| (atom, Some(modifier)))
+        .unwrap_or((value, None));
+    let role = match atom {
+        "authordate" => ForEachRefAtomIdentityRole::Author,
+        "committerdate" => ForEachRefAtomIdentityRole::Committer,
+        "taggerdate" => ForEachRefAtomIdentityRole::Tagger,
+        "creatordate" => ForEachRefAtomIdentityRole::Creator,
+        _ => return Ok(None),
+    };
+    let mode = DateMode::parse_atom_modifier(modifier).ok_or_else(|| {
+        GitError::Command(format!(
+            "unrecognized %({atom}) argument: {}",
+            modifier.unwrap_or("")
+        ))
+    })?;
+    Ok(Some(ForEachRefDateSort {
+        peeled,
+        role,
+        mode,
+        descending,
+    }))
+}
+
+/// Select the ref that Git's `%(is-base:<tip>)` heuristic marks.
+///
+/// Histories are ordered from each commit towards its first parent. The best
+/// candidate is the one whose first-parent history intersects the tip history
+/// closest to the tip; candidate order breaks ties, matching ref-array order.
+pub fn select_for_each_ref_is_base_candidate(
+    tip_first_parent_history: &[ObjectId],
+    candidate_first_parent_histories: &[Vec<ObjectId>],
+) -> Option<usize> {
+    let tip_positions = tip_first_parent_history
+        .iter()
+        .enumerate()
+        .map(|(position, oid)| (*oid, position))
+        .collect::<HashMap<_, _>>();
+
+    candidate_first_parent_histories
+        .iter()
+        .enumerate()
+        .filter_map(|(candidate, history)| {
+            history
+                .iter()
+                .filter_map(|oid| tip_positions.get(oid).copied())
+                .min()
+                .map(|tip_distance| (tip_distance, candidate))
+        })
+        .min()
+        .map(|(_, candidate)| candidate)
+}
+
+/// Whether `name` is one of Git's enumerable root refs.
+///
+/// Root-ref syntax alone is broader than the ref-filter surface: `FETCH_HEAD`
+/// and `MERGE_HEAD` are pseudorefs and are deliberately excluded, while HEAD,
+/// `*_HEAD`, and Git's named root refs are included when they resolve.
+pub fn is_for_each_ref_root_ref(name: &str) -> bool {
+    let root_syntax = !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte == b'-' || byte == b'_');
+    if !root_syntax || matches!(name, "FETCH_HEAD" | "MERGE_HEAD") {
+        return false;
+    }
+    name.ends_with("_HEAD")
+        || matches!(
+            name,
+            "HEAD"
+                | "AUTO_MERGE"
+                | "BISECT_EXPECTED_REV"
+                | "NOTES_MERGE_PARTIAL"
+                | "NOTES_MERGE_REF"
+                | "MERGE_AUTOSTASH"
+        )
+}
+
+/// Parse Git's `#rrggbb` color spelling used by `%(color:<value>)` atoms.
+pub fn parse_for_each_ref_hex_color(value: &str) -> Option<(u8, u8, u8)> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    Some((
+        u8::from_str_radix(&hex[0..2], 16).ok()?,
+        u8::from_str_radix(&hex[2..4], 16).ok()?,
+        u8::from_str_radix(&hex[4..6], 16).ok()?,
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1245,6 +1362,30 @@ mod tests {
     use sley_core::ObjectFormat;
 
     #[test]
+    fn ref_filter_root_refs_exclude_pseudorefs() {
+        for name in ["HEAD", "ORIG_HEAD", "AUTO_MERGE", "BISECT_EXPECTED_REV"] {
+            assert!(is_for_each_ref_root_ref(name), "{name}");
+        }
+        for name in ["FETCH_HEAD", "MERGE_HEAD", "DANGLING", "refs/heads/main"] {
+            assert!(!is_for_each_ref_root_ref(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn ref_filter_hex_color_requires_six_hex_digits() {
+        assert_eq!(
+            parse_for_each_ref_hex_color("#aa22ac"),
+            Some((0xaa, 0x22, 0xac))
+        );
+        assert_eq!(
+            parse_for_each_ref_hex_color("#AA22AC"),
+            Some((0xaa, 0x22, 0xac))
+        );
+        assert_eq!(parse_for_each_ref_hex_color("#abc"), None);
+        assert_eq!(parse_for_each_ref_hex_color("#gg22ac"), None);
+    }
+
+    #[test]
     fn format_parser_decodes_literals_atoms_and_percent_escapes() {
         let format =
             ForEachRefFormat::parse("refs/%%/%(refname)%09%(objectname)%q").expect("valid format");
@@ -1407,6 +1548,49 @@ mod tests {
         assert_eq!(
             for_each_ref_identity_date(ident, &DateMode::IsoStrict).as_deref(),
             Some("2024-06-03T10:30:01-05:30")
+        );
+    }
+
+    #[test]
+    fn date_sort_parser_preserves_custom_format_semantics() {
+        let sort = parse_for_each_ref_date_sort("-*creatordate:format:%H:%M:%S")
+            .expect("valid date sort")
+            .expect("recognized date atom");
+        assert!(sort.peeled);
+        assert!(sort.descending);
+        assert_eq!(sort.role, ForEachRefAtomIdentityRole::Creator);
+        assert_eq!(
+            sort.mode,
+            DateMode::Strftime {
+                template: "%H:%M:%S".to_string(),
+                local: false,
+            }
+        );
+        assert!(
+            parse_for_each_ref_date_sort("refname")
+                .expect("non-date sort is not an error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn is_base_selection_minimizes_tip_first_parent_distance_and_keeps_ref_order() {
+        let oid =
+            |hex: &str| ObjectId::from_hex(ObjectFormat::Sha1, hex).expect("valid test object id");
+        let root = oid("0000000000000000000000000000000000000001");
+        let near = oid("0000000000000000000000000000000000000002");
+        let tip = oid("0000000000000000000000000000000000000003");
+        let left = oid("0000000000000000000000000000000000000004");
+        let right = oid("0000000000000000000000000000000000000005");
+        let histories = vec![vec![left, near, root], vec![right, near, root], vec![root]];
+        assert_eq!(
+            select_for_each_ref_is_base_candidate(&[tip, near, root], &histories),
+            Some(0),
+            "nearest intersection wins and the first candidate breaks a tie"
+        );
+        assert_eq!(
+            select_for_each_ref_is_base_candidate(&[tip], &histories),
+            None
         );
     }
 

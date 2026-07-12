@@ -1,24 +1,23 @@
 //! Checkout/reset ref updates and worktree resolution.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
 use std::path::Path;
+use std::path::PathBuf;
 
-use sley::{GitError, ObjectFormat, ObjectId, Result, ReferenceTarget as RefTarget};
 use sley::plumbing::sley_object::{Commit, ObjectType};
 use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
-use sley::plumbing::sley_refs::{FileRefStore, ReflogEntry, RefUpdate, branch_ref_name};
+use sley::plumbing::sley_refs::{FileRefStore, RefUpdate, ReflogEntry, branch_ref_name};
+use sley::{GitError, ObjectFormat, ObjectId, ReferenceTarget as RefTarget, Result};
 
 use crate::commands::remote::read_repo_config;
+use crate::commit_subject_bytes;
 use crate::format_log_abbrev_oid;
 use crate::log_output_encoding;
 use crate::log_reencode_message;
-use crate::commit_subject_bytes;
 use crate::revision::resolve_revision;
 use crate::setup;
 use crate::sley_rev;
 use crate::sley_worktree;
-
 
 pub(crate) fn update_reset_head_ref(
     git_dir: &Path,
@@ -110,6 +109,7 @@ pub(crate) fn checkout_create_or_reset_branch(
     git_dir: &Path,
     start_git_dir: &Path,
     format: ObjectFormat,
+    replace_objects: bool,
     branch: &str,
     start: &str,
     force: bool,
@@ -130,7 +130,8 @@ pub(crate) fn checkout_create_or_reset_branch(
     // The start point (often the implicit "HEAD") is resolved against the
     // worktree the command runs from — `git worktree add` from a linked
     // worktree branches off *that* worktree's HEAD.
-    let start_oid = match resolve_checkout_start_oid(start_git_dir, format, start) {
+    let start_oid = match resolve_checkout_start_oid(start_git_dir, format, start, replace_objects)
+    {
         Ok(Some(start_oid)) => start_oid,
         Ok(None) => {
             let mut tx = store.transaction();
@@ -145,7 +146,7 @@ pub(crate) fn checkout_create_or_reset_branch(
         }
         Err(err) => return Err(err),
     };
-    let db = FileObjectDatabase::from_git_dir(start_git_dir, format);
+    let db = crate::repository::open_object_database(start_git_dir, format, replace_objects)?;
     let start_oid = sley_rev::peel_to_commit(&db, format, &start_oid)?;
     if let Some(existing) = existing {
         let old_oid = match existing {
@@ -195,11 +196,14 @@ pub(crate) fn resolve_checkout_start_oid(
     git_dir: &Path,
     format: ObjectFormat,
     start: &str,
+    replace_objects: bool,
 ) -> Result<Option<ObjectId>> {
-    if let Some(oid) = resolve_checkout_merge_base_start_oid(git_dir, format, start)? {
+    if let Some(oid) =
+        resolve_checkout_merge_base_start_oid(git_dir, format, start, replace_objects)?
+    {
         return Ok(Some(oid));
     }
-    match resolve_revision(git_dir, format, start) {
+    match resolve_revision(git_dir, format, start, replace_objects) {
         Ok(oid) => Ok(Some(oid)),
         Err(_) if start == "HEAD" || start == "@" => {
             let store = FileRefStore::new(git_dir, format);
@@ -216,6 +220,7 @@ pub(crate) fn resolve_checkout_merge_base_start_oid(
     git_dir: &Path,
     format: ObjectFormat,
     start: &str,
+    replace_objects: bool,
 ) -> Result<Option<ObjectId>> {
     let Some((left, right)) = start.split_once("...") else {
         return Ok(None);
@@ -225,9 +230,10 @@ pub(crate) fn resolve_checkout_merge_base_start_oid(
     }
     let left = if left.is_empty() { "HEAD" } else { left };
     let right = if right.is_empty() { "HEAD" } else { right };
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let left = sley_rev::peel_to_commit(&db, format, &resolve_revision(git_dir, format, left)?)?;
-    let right = sley_rev::peel_to_commit(&db, format, &resolve_revision(git_dir, format, right)?)?;
+    let db = crate::repository::open_object_database(git_dir, format, replace_objects)?;
+    let resolver = sley_rev::RevisionResolver::new(git_dir, format, &db);
+    let left = sley_rev::peel_to_commit(&db, format, &resolver.resolve(left)?)?;
+    let right = sley_rev::peel_to_commit(&db, format, &resolver.resolve(right)?)?;
     let bases = sley_rev::merge_bases(git_dir, format, &db, &left, &right)?;
     match bases.as_slice() {
         [base] => Ok(Some(*base)),
@@ -242,9 +248,11 @@ pub(crate) fn resolve_checkout_merge_base_start_oid(
     }
 }
 
-
-pub(crate) fn require_work_tree(git_dir: &Path) -> Result<PathBuf> {
-    if let Some(result) = setup::setup_git_directory() {
+pub(crate) fn require_work_tree(
+    cli_session: &crate::session::CliSession,
+    git_dir: &Path,
+) -> Result<PathBuf> {
+    if let Some(result) = setup::setup_git_directory(cli_session) {
         if result.worktree_config_bogus {
             eprintln!("warning: core.bare and core.worktree do not make sense");
             eprintln!("fatal: unable to set up work tree using invalid config");

@@ -1,5 +1,7 @@
+pub mod history;
 pub mod rebase;
 pub mod replay;
+pub mod stash;
 
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag};
@@ -252,7 +254,7 @@ fn commit_tree_with_amend_with_odb(
     let old_oid = parent.unwrap_or(zero_oid(format)?);
     let reflog = refs
         .should_write_reflog_for_update(&updated_ref, false)?
-        .then(|| ReflogEntry {
+        .then_some(ReflogEntry {
             old_oid,
             new_oid: oid,
             committer: options.committer,

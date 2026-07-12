@@ -9,8 +9,8 @@ use std::cmp::Ordering;
 use std::path::Path;
 
 use sley::GitError;
-use sley::Result;
 use sley::NameStatusEntry;
+use sley::Result;
 use sley_pathspec::wildmatch;
 
 /// Parse an orderfile into its list of glob patterns, mirroring

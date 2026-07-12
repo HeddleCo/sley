@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod bisect;
+pub mod format_patch;
 pub mod graph;
 pub mod revlist;
 mod setup;
@@ -10,7 +11,14 @@ pub mod diff_options;
 use sley_config::GitConfig;
 use sley_core::{DateMode, GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 
-pub use diff_options::{DiffFilter, DiffOptions, DiffOutputFormat, DiffRelativeMode, DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleDiffFormat, SubmoduleIgnoreMode, diff_pickaxe_requires_non_empty_error, diff_stat_count_option, diff_stat_parse_width_option, parse_color_moved_mode, parse_color_moved_ws, parse_diff_filter, parse_diff_rename_limit, parse_similarity_threshold, parse_submodule_ignore_mode, parse_unified_count, resolve_diff_context, setup_diff_options};
+pub use diff_options::{
+    DiffFilter, DiffOptions, DiffOutputFormat, DiffRelativeMode, DiffStatWidths, DirstatMode,
+    DirstatOptions, SubmoduleDiffFormat, SubmoduleIgnoreMode,
+    diff_pickaxe_requires_non_empty_error, diff_stat_count_option, diff_stat_parse_width_option,
+    parse_color_moved_mode, parse_color_moved_ws, parse_diff_filter, parse_diff_rename_limit,
+    parse_similarity_threshold, parse_submodule_ignore_mode, parse_unified_count,
+    resolve_diff_context, setup_diff_options,
+};
 pub use setup::{
     MatchedRef, NoWalkMode, PseudoRefResolver, RevisionOptions, RevisionOrder,
     RevisionSetupContext, RevisionSymmetricRange, RevisionTip, SetupRevisions,
@@ -321,7 +329,22 @@ pub fn resolve_revision_with_disambiguation(
 ) -> Result<ObjectId> {
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    resolve_revision_inner(git_dir, format, &db, rev, None, disambiguation)
+    resolve_revision_with_reader_and_disambiguation(git_dir, format, &db, rev, disambiguation)
+}
+
+/// Resolve a revision with a caller-owned object reader and short-object
+/// disambiguation policy.
+///
+/// Commands that resolve several revision arguments can retain one repository
+/// object database instead of reopening it for every argument.
+pub fn resolve_revision_with_reader_and_disambiguation<R: ObjectReader>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reader: &R,
+    rev: &str,
+    disambiguation: ObjectDisambiguation,
+) -> Result<ObjectId> {
+    resolve_revision_inner(git_dir, format, reader, rev, None, disambiguation)
 }
 
 /// `commit-ish` variant of [`resolve_revision_with_reader`]: a ref still wins
@@ -912,6 +935,9 @@ fn resolve_revision_ref_candidate(refs: &FileRefStore, name: &str) -> Result<Opt
             Some(RefTarget::Direct(oid)) => return Ok(Some(oid)),
             Some(RefTarget::Symbolic(target)) => {
                 if validate_symref_target(&target).is_err() {
+                    if name == "HEAD" {
+                        return Err(GitError::broken_reference(name, target));
+                    }
                     eprintln!("warning: ignoring dangling symref {name}");
                     return Ok(None);
                 }
@@ -1296,7 +1322,10 @@ fn reflog_entry_timezone(entry: &ReflogEntry) -> Result<&str> {
 
 fn reflog_entry_rfc2822_date(entry: &ReflogEntry) -> Result<String> {
     DateMode::Rfc2822
-        .render(reflog_entry_timestamp(entry)?, reflog_entry_timezone(entry)?)
+        .render(
+            reflog_entry_timestamp(entry)?,
+            reflog_entry_timezone(entry)?,
+        )
         .ok_or_else(|| GitError::InvalidFormat("invalid reflog timestamp".into()))
 }
 
@@ -1320,6 +1349,20 @@ fn parse_reflog_selector_date(value: &str) -> Option<i64> {
         let now = i64::try_from(now).ok()?;
         return Some(now.saturating_sub(years.saturating_mul(365 * 86_400)));
     }
+    parse_reflog_absolute_selector_date(value).or_else(|| {
+        // Git's approxidate scanner ignores unrecognised words and punctuation
+        // while retaining any date it can recognize later in the string (for
+        // example `3.hot.dogs.on.2001-09-17`). Preserve that useful fuzziness
+        // without accepting total nonsense: only a suffix which is itself one
+        // of the supported absolute forms is eligible.
+        value
+            .char_indices()
+            .skip(1)
+            .find_map(|(index, _)| parse_reflog_absolute_selector_date(&value[index..]))
+    })
+}
+
+fn parse_reflog_absolute_selector_date(value: &str) -> Option<i64> {
     parse_reflog_iso_selector_date(value)
         .or_else(|| parse_reflog_month_selector_date(value))
         .or_else(|| parse_reflog_rfc_selector_date(value))
@@ -3994,6 +4037,38 @@ impl<'a, R: ObjectReader> RevWalk<'a, R> {
     }
 }
 
+/// Reusable graph-backed lookup for commit ancestry metadata.
+///
+/// The commit-graph is loaded lazily and retained across calls to [`Self::get`].
+/// Commits covered by the graph avoid object reads entirely; uncovered commits
+/// fall back to one commit-object read and parse. This is useful for custom
+/// priority walks that need to manage their own queue while sharing the same
+/// metadata acceleration as [`RevWalk`].
+pub struct CommitMetadataReader<'a, R: ObjectReader> {
+    graph: CommitGraphContext<'a>,
+    reader: &'a R,
+    format: ObjectFormat,
+}
+
+impl<'a, R: ObjectReader> CommitMetadataReader<'a, R> {
+    /// Create a metadata reader for one repository walk.
+    pub fn new(git_dir: &'a Path, format: ObjectFormat, reader: &'a R) -> Self {
+        Self {
+            graph: CommitGraphContext::load(git_dir, format),
+            reader,
+            format,
+        }
+    }
+
+    /// Resolve one commit's parents and committer timestamp.
+    ///
+    /// Returns graph data when available, otherwise reads and parses the commit
+    /// object. Shallow grafts are honored in both paths.
+    pub fn get(&mut self, oid: &ObjectId) -> Result<CommitMetadata> {
+        commit_metadata_lookup(&mut self.graph, self.reader, self.format, oid)
+    }
+}
+
 /// Walk history from `starts`, returning [`CommitMetadata`] (id + parents +
 /// committer time) for every reachable commit, in discovery order.
 ///
@@ -4216,6 +4291,101 @@ impl<'a, R: ObjectReader> CommitReachability<'a, R> {
         })
     }
 
+    /// Test several candidate tips against the same required/excluded targets.
+    ///
+    /// Unlike repeated [`Self::target_match`] calls, this computes each
+    /// overlapping ancestor subgraph once and memoizes its result for the
+    /// remainder of the batch. Ref filters commonly have many names pointing
+    /// at the same tip or at commits on the same history, making this the
+    /// preferred operation when all candidates are known up front.
+    pub fn target_matches(
+        &mut self,
+        starts: impl IntoIterator<Item = ObjectId>,
+        required_targets: &HashSet<ObjectId>,
+        excluded_targets: &HashSet<ObjectId>,
+        first_parent: bool,
+    ) -> Result<HashMap<ObjectId, ReachabilityTargetMatch>> {
+        let starts = starts.into_iter().collect::<HashSet<_>>();
+        let mut memo = HashMap::new();
+        let mut parents = HashMap::<ObjectId, Vec<ObjectId>>::new();
+
+        for start in &starts {
+            if memo.contains_key(start) {
+                continue;
+            }
+            // An explicit post-order stack avoids recursion limits on the deep
+            // histories that `tag --contains` is expected to handle.
+            let mut pending = vec![(*start, false)];
+            while let Some((oid, expanded)) = pending.pop() {
+                if memo.contains_key(&oid) {
+                    continue;
+                }
+                if !expanded {
+                    // With only one side of the predicate active, reaching a
+                    // target is conclusive; do not continue below it merely to
+                    // populate memo entries the caller cannot observe.
+                    if (excluded_targets.is_empty() && required_targets.contains(&oid))
+                        || (required_targets.is_empty() && excluded_targets.contains(&oid))
+                        || (required_targets.is_empty() && excluded_targets.is_empty())
+                    {
+                        memo.insert(
+                            oid,
+                            ReachabilityTargetMatch {
+                                reached_required: required_targets.is_empty()
+                                    || required_targets.contains(&oid),
+                                reached_excluded: excluded_targets.contains(&oid),
+                            },
+                        );
+                        continue;
+                    }
+                    let oid_parents = match parents.get(&oid) {
+                        Some(oid_parents) => oid_parents.clone(),
+                        None => {
+                            let oid_parents = self.parent_ids(&oid, first_parent)?;
+                            parents.insert(oid, oid_parents.clone());
+                            oid_parents
+                        }
+                    };
+                    pending.push((oid, true));
+                    pending.extend(
+                        oid_parents
+                            .into_iter()
+                            .filter(|parent| !memo.contains_key(parent))
+                            .map(|parent| (parent, false)),
+                    );
+                    continue;
+                }
+
+                let mut reached_required =
+                    required_targets.is_empty() || required_targets.contains(&oid);
+                let mut reached_excluded = excluded_targets.contains(&oid);
+                if let Some(oid_parents) = parents.get(&oid) {
+                    for parent in oid_parents {
+                        let parent_match = memo.get(parent).ok_or_else(|| {
+                            GitError::InvalidObject(format!(
+                                "commit ancestry cycle involving {oid} and {parent}"
+                            ))
+                        })?;
+                        reached_required |= parent_match.reached_required;
+                        reached_excluded |= parent_match.reached_excluded;
+                    }
+                }
+                memo.insert(
+                    oid,
+                    ReachabilityTargetMatch {
+                        reached_required,
+                        reached_excluded,
+                    },
+                );
+            }
+        }
+
+        Ok(starts
+            .into_iter()
+            .filter_map(|start| memo.get(&start).copied().map(|matched| (start, matched)))
+            .collect())
+    }
+
     fn enqueue_parents(
         &mut self,
         oid: &ObjectId,
@@ -4230,6 +4400,18 @@ impl<'a, R: ObjectReader> CommitReachability<'a, R> {
             }
         }
         Ok(())
+    }
+
+    fn parent_ids(&mut self, oid: &ObjectId, first_parent: bool) -> Result<Vec<ObjectId>> {
+        if first_parent {
+            Ok(self
+                .graph
+                .commit_first_parent(self.reader, oid)?
+                .into_iter()
+                .collect())
+        } else {
+            Ok(self.graph.commit_parent_ids(self.reader, oid)?.collect())
+        }
     }
 }
 
@@ -5452,8 +5634,8 @@ pub struct ResolvedTreePath {
 /// `path` is walked component by component. The result is the blob id for a
 /// file path or the subtree id for a directory path; an empty `path` resolves
 /// to the tree itself. Missing components and attempts to descend through a
-/// non-tree entry both report a git-style "path '<path>' does not exist in
-/// '<rev>'" error.
+/// non-tree entry both report a git-style "path '`<path>`' does not exist in
+/// '`<rev>`'" error.
 pub fn resolve_rev_path<R: ObjectReader>(
     git_dir: &Path,
     format: sley_core::ObjectFormat,
@@ -6644,12 +6826,31 @@ mod tests {
     use sley_core::ObjectFormat;
     use sley_object::EncodedObject;
     use sley_odb::{ObjectDatabase, ObjectWriter};
-    use sley_refs::{RefTarget, RefUpdate, ReflogEntry};
+    use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry};
     use std::cell::Cell;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn revision_head_reports_invalid_symbolic_target_as_broken_reference() {
+        let git_dir = temp_git_dir();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/invalid.lock\n")
+            .expect("test operation should succeed");
+        let refs = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+
+        let error = resolve_revision_ref_candidate(&refs, "HEAD")
+            .expect_err("invalid HEAD target must be reported as broken");
+        assert!(matches!(
+            error,
+            GitError::NotFound(sley_core::NotFoundKind::BrokenReference {
+                name,
+                target
+            }) if name == "HEAD" && target == "refs/heads/invalid.lock"
+        ));
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
 
     #[test]
     fn setup_revisions_parses_ranges_carets_and_not() {
@@ -6754,6 +6955,32 @@ mod tests {
                 .positives
                 .iter()
                 .any(|tip| tip.oid == fixture.skipped)
+        );
+    }
+
+    #[test]
+    fn setup_revisions_all_includes_detached_head() {
+        let fixture = setup_revisions_fixture();
+        let tip_object = fixture
+            .db
+            .read_object(&fixture.tip)
+            .expect("tip object should exist");
+        let tree = Commit::parse(ObjectFormat::Sha1, &tip_object.body)
+            .expect("tip commit should parse")
+            .tree;
+        let mut db = FileObjectDatabase::from_git_dir(&fixture.git_dir, ObjectFormat::Sha1);
+        let detached = write_test_commit(&mut db, tree, vec![fixture.tip], b"detached\n");
+        fs::write(fixture.git_dir.join("HEAD"), format!("{detached}\n"))
+            .expect("detached HEAD should be written");
+
+        let setup = run_setup(&fixture, ["--all"]).expect("--all should parse");
+        assert!(
+            setup
+                .options
+                .positives
+                .iter()
+                .any(|tip| tip.oid == detached && tip.rev == "HEAD"),
+            "detached HEAD must be included alongside refs"
         );
     }
 
@@ -8684,6 +8911,90 @@ mod tests {
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
+    #[test]
+    fn batched_target_matches_share_overlapping_ancestry() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let (db, all) = build_history(&git_dir, format);
+        let (root, a, c, e, m1, f, oct) = (all[0], all[1], all[3], all[5], all[6], all[7], all[9]);
+        let reader = CountingReader::new(&db);
+        let mut reachability = CommitReachability::new(&git_dir, format, &reader);
+        let required = HashSet::from([a]);
+        let excluded = HashSet::from([e]);
+
+        let matches = reachability
+            .target_matches([oct, m1, c, f, root], &required, &excluded, false)
+            .expect("test operation should succeed");
+        assert_eq!(
+            matches[&c],
+            ReachabilityTargetMatch {
+                reached_required: true,
+                reached_excluded: false,
+            }
+        );
+        assert_eq!(
+            matches[&f],
+            ReachabilityTargetMatch {
+                reached_required: false,
+                reached_excluded: true,
+            }
+        );
+        assert_eq!(
+            matches[&oct],
+            ReachabilityTargetMatch {
+                reached_required: true,
+                reached_excluded: true,
+            }
+        );
+        assert_eq!(
+            matches[&root],
+            ReachabilityTargetMatch {
+                reached_required: false,
+                reached_excluded: false,
+            }
+        );
+        assert!(
+            reader.reads.get() <= 10,
+            "each commit in the overlapping ancestry should be read at most once"
+        );
+
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn batched_target_matches_honor_first_parent_and_empty_required_set() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let (db, all) = build_history(&git_dir, format);
+        let (a, e, oct) = (all[1], all[5], all[9]);
+
+        let mut reachability = CommitReachability::new(&git_dir, format, &db);
+        let first_parent = reachability
+            .target_matches([oct], &HashSet::from([a]), &HashSet::from([e]), true)
+            .expect("test operation should succeed");
+        assert_eq!(
+            first_parent[&oct],
+            ReachabilityTargetMatch {
+                reached_required: true,
+                reached_excluded: false,
+            }
+        );
+
+        let mut reachability = CommitReachability::new(&git_dir, format, &db);
+        let empty_required = reachability
+            .target_matches([oct], &HashSet::new(), &HashSet::from([e]), false)
+            .expect("test operation should succeed");
+        assert_eq!(
+            empty_required[&oct],
+            ReachabilityTargetMatch {
+                reached_required: true,
+                reached_excluded: true,
+            }
+        );
+
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
     type WalkResult = (String, String, bool, Vec<String>, Vec<String>, Vec<String>);
 
     /// Run is_ancestor, merge_bases (both orders), and the `A..B`/`A...B` ranges
@@ -9012,6 +9323,44 @@ mod tests {
     }
 
     #[test]
+    fn commit_metadata_reader_uses_graph_without_object_reads() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let commits = build_linear_history(&git_dir, 3);
+        write_commit_graph_file(&git_dir, format, &db, &commits);
+
+        let mut reader = CommitMetadataReader::new(&git_dir, format, &PanicReader);
+        let metadata = reader
+            .get(&commits[2])
+            .expect("graph-backed metadata lookup should succeed");
+        assert_eq!(metadata.oid, commits[2]);
+        assert_eq!(metadata.parents, vec![commits[1]]);
+        assert_eq!(metadata.commit_time, 102);
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn commit_metadata_reader_falls_back_to_one_object_read() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let commits = build_linear_history(&git_dir, 3);
+        remove_commit_graph(&git_dir);
+
+        let counting = CountingReader::new(&db);
+        let mut reader = CommitMetadataReader::new(&git_dir, format, &counting);
+        let metadata = reader
+            .get(&commits[2])
+            .expect("object-backed metadata lookup should succeed");
+        assert_eq!(metadata.oid, commits[2]);
+        assert_eq!(metadata.parents, vec![commits[1]]);
+        assert_eq!(metadata.commit_time, 102);
+        assert_eq!(counting.reads.get(), 1);
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
     fn commit_graph_tree_oid_returns_tree_without_object_read() {
         let git_dir = temp_git_dir();
         let format = ObjectFormat::Sha1;
@@ -9264,5 +9613,14 @@ mod tests {
         let got = walk_oids(walk);
         assert_eq!(got.len(), 3, "pathspec must not prune in STAGE-A");
         fs::remove_dir_all(git_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn reflog_approxidate_ignores_unknown_words_before_absolute_date() {
+        assert_eq!(
+            parse_reflog_selector_date("3.hot.dogs.on.2001-09-17"),
+            parse_reflog_selector_date("2001-09-17")
+        );
+        assert_eq!(parse_reflog_selector_date("utter.bogosity"), None);
     }
 }

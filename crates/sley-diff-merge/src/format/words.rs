@@ -101,15 +101,12 @@ pub fn parse_color_value(value: &str) -> Option<String> {
             "normal" => fg_seen = true,
             "reset" => return Some("\x1b[m".to_string()),
             _ => {
-                if let Some(code) = code(word) {
-                    if !fg_seen {
-                        fg = Some(code);
-                        fg_seen = true;
-                    } else {
-                        bg = Some(code);
-                    }
+                let code = code(word)?;
+                if !fg_seen {
+                    fg = Some(code);
+                    fg_seen = true;
                 } else {
-                    return None;
+                    bg = Some(code);
                 }
             }
         }

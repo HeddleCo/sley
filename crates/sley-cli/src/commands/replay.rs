@@ -11,6 +11,7 @@
 use crate::commands::merge_rebase::{
     MergePathResult, MergeTreeMap, commit_tree_oid, head_commit_oid,
     merge_refuse_if_current_working_directory_becomes_file, three_way_merge_trees_styled,
+    three_way_merge_trees_styled_with_strategy_options,
 };
 use crate::*;
 use sley_sequencer::replay::{self, ReplayAction, ReplayOpts, TodoItem};
@@ -83,16 +84,19 @@ fn usage_text(action: ReplayAction) -> &'static str {
     }
 }
 
-pub(crate) fn cmd_cherry_pick(args: &[String]) -> Result<()> {
-    run_replay(ReplayAction::Pick, args)
+pub(crate) fn cmd_cherry_pick(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    run_replay(cli_session, ReplayAction::Pick, args)
 }
 
-pub(crate) fn cmd_revert(args: &[String]) -> Result<()> {
-    run_replay(ReplayAction::Revert, args)
+pub(crate) fn cmd_revert(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    run_replay(cli_session, ReplayAction::Revert, args)
 }
 
-pub(crate) fn cmd_replay(args: &[String]) -> Result<()> {
-    run_git_replay(args)
+pub(crate) fn cmd_replay(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    run_git_replay(cli_session, args)
 }
 
 const REPLAY_USAGE: &str = "\
@@ -140,7 +144,7 @@ struct GitReplayPlan {
     reflog_message: Vec<u8>,
 }
 
-fn run_git_replay(args: &[String]) -> Result<()> {
+fn run_git_replay(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let parsed = parse_git_replay_args(args)?;
     if parsed.onto.is_some() && parsed.advance.is_some() {
         eprintln!("fatal: options '--onto' and '--advance' cannot be used together");
@@ -179,12 +183,14 @@ fn run_git_replay(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root =
         sley_worktree::worktree_root_for_git_dir(&git_dir)?.unwrap_or_else(|| cwd.clone());
+    let config = read_repo_config(&git_dir)?;
+    let config = crate::commands::merge_rebase::effective_config_with_overrides(&config);
     let ctx = ReplayCtx {
         action: if parsed.revert.is_some() {
             ReplayAction::Revert
@@ -195,6 +201,9 @@ fn run_git_replay(args: &[String]) -> Result<()> {
         common_git_dir,
         worktree_root,
         format,
+        config,
+        lazy_fetch: cli_session.lazy_fetch(),
+        replace_objects: cli_session.replace_objects(),
     };
     let plan = build_git_replay_plan(&ctx, parsed)?;
     let new_oid = replay_commits_to_base(&ctx, &plan)?;
@@ -320,7 +329,7 @@ fn build_git_replay_plan(ctx: &ReplayCtx, parsed: GitReplayArgs) -> Result<GitRe
     }
     let ref_action = match parsed.ref_action {
         Some(action) => action,
-        None => match config_value(&ctx.git_dir, "replay", "refAction").as_deref() {
+        None => match config_value(&ctx.config, "replay", "refAction").as_deref() {
             Some("print") => ReplayRefAction::Print,
             Some("update") | None => ReplayRefAction::Update,
             Some(value) => {
@@ -332,10 +341,11 @@ fn build_git_replay_plan(ctx: &ReplayCtx, parsed: GitReplayArgs) -> Result<GitRe
     let (action, base, default_target, old_oid, reflog_message) = match mode {
         ReplayModeKind::Onto => {
             let onto = parsed.onto.as_ref().expect("--onto mode has value");
-            let base = resolve_revision(&ctx.git_dir, ctx.format, onto).map_err(|_| {
-                eprintln!("fatal: '{onto}' is not a valid commit-ish for --onto");
-                GitError::Exit(128)
-            })?;
+            let base = resolve_revision(&ctx.git_dir, ctx.format, onto, ctx.replace_objects)
+                .map_err(|_| {
+                    eprintln!("fatal: '{onto}' is not a valid commit-ish for --onto");
+                    GitError::Exit(128)
+                })?;
             let target = replay_target_from_revision(&refs, &parsed.rev_args)?;
             let old_oid = read_direct_ref(&refs, ctx.format, &target)?;
             (
@@ -469,8 +479,8 @@ fn select_git_replay_commits(
         && !rev_args[0].contains("..")
         && !rev_args[0].starts_with('^')
     {
-        let tip = resolve_revision(&ctx.git_dir, ctx.format, &rev_args[0])?;
-        let db = ctx.db();
+        let tip = resolve_revision(&ctx.git_dir, ctx.format, &rev_args[0], ctx.replace_objects)?;
+        let db = ctx.db()?;
         let excluded = rev_list_walk_commits(&db, ctx.format, [*base], false)?
             .into_iter()
             .map(|record| record.oid)
@@ -503,7 +513,7 @@ fn replay_one_commit_to(
     head: &ObjectId,
     oid: &ObjectId,
 ) -> Result<ObjectId> {
-    let db = ctx.db();
+    let db = ctx.db()?;
     let object = db.read_object(oid)?;
     if object.object_type != ObjectType::Commit {
         return Err(GitError::InvalidObject(format!(
@@ -543,6 +553,8 @@ fn replay_one_commit_to(
     let ours_map = sley_diff_merge::flatten_tree(&db, ctx.format, &head_tree)?;
     let (results, conflicts) = three_way_merge_trees_styled(
         &db,
+        &ctx.config,
+        ctx.lazy_fetch,
         ctx.format,
         &base_map,
         &ours_map,
@@ -566,7 +578,7 @@ fn replay_one_commit_to(
     }
     let author = match action {
         ReplayAction::Pick => commit.author.clone(),
-        ReplayAction::Revert => commit_identity_from_env("AUTHOR")?,
+        ReplayAction::Revert => commit_identity_from_env("AUTHOR", &ctx.config)?,
     };
     let message = match action {
         ReplayAction::Pick => commit.message.clone(),
@@ -580,14 +592,14 @@ fn replay_one_commit_to(
             &ReplayOpts::default(),
         )?,
     };
-    let mut writer = ctx.db();
+    let mut writer = ctx.db()?;
     sley_sequencer::create_commit(
         &mut writer,
         sley_sequencer::CommitCreate {
             tree: new_tree,
             parents: vec![*head],
             author,
-            committer: commit_identity_from_env("COMMITTER")?,
+            committer: commit_identity_from_env("COMMITTER", &ctx.config)?,
             message,
             encoding: commit.encoding.clone(),
             signature: None,
@@ -698,7 +710,7 @@ fn emit_or_update_replay_ref(
         reflog: Some(ReflogEntry {
             old_oid,
             new_oid: *new_oid,
-            committer: commit_identity_from_env("COMMITTER")?,
+            committer: commit_identity_from_env("COMMITTER", &ctx.config)?,
             message: plan.reflog_message.clone(),
         }),
     });
@@ -918,11 +930,14 @@ struct ReplayCtx {
     common_git_dir: PathBuf,
     worktree_root: PathBuf,
     format: ObjectFormat,
+    config: GitConfig,
+    lazy_fetch: bool,
+    replace_objects: bool,
 }
 
 impl ReplayCtx {
-    fn db(&self) -> FileObjectDatabase {
-        FileObjectDatabase::from_git_dir(&self.common_git_dir, self.format)
+    fn db(&self) -> Result<FileObjectDatabase> {
+        crate::repository::open_object_database(&self.git_dir, self.format, self.replace_objects)
     }
 
     fn refs(&self) -> FileRefStore {
@@ -934,19 +949,27 @@ impl ReplayCtx {
     }
 }
 
-fn run_replay(action: ReplayAction, args: &[String]) -> Result<()> {
+fn run_replay(
+    cli_session: &crate::session::CliSession,
+    action: ReplayAction,
+    args: &[String],
+) -> Result<()> {
     let parsed = parse_replay_args(action, args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
+    let config = read_repo_config(&git_dir)?;
+    let config = crate::commands::merge_rebase::effective_config_with_overrides(&config);
     let ctx = ReplayCtx {
         action,
         git_dir,
         common_git_dir,
         worktree_root,
         format,
+        config,
+        lazy_fetch: cli_session.lazy_fetch(),
+        replace_objects: cli_session.replace_objects(),
     };
 
     let me = action.name();
@@ -1007,7 +1030,7 @@ fn run_replay(action: ReplayAction, args: &[String]) -> Result<()> {
     if action == ReplayAction::Revert && opts.commit_use_reference {
         // git also flips this from the revert.reference config.
     } else if action == ReplayAction::Revert
-        && config_bool(&ctx.git_dir, "revert", "reference").unwrap_or(false)
+        && config_bool(&ctx.config, "revert", "reference").unwrap_or(false)
     {
         opts.commit_use_reference = true;
     }
@@ -1030,8 +1053,8 @@ fn run_replay(action: ReplayAction, args: &[String]) -> Result<()> {
     sequencer_pick_revisions(&ctx, &opts, &parsed.rev_args)
 }
 
-fn config_bool(git_dir: &Path, section: &str, key: &str) -> Option<bool> {
-    let value = config_value(git_dir, section, key)?;
+fn config_bool(config: &GitConfig, section: &str, key: &str) -> Option<bool> {
+    let value = config_value(config, section, key)?;
     match value.to_ascii_lowercase().as_str() {
         "true" | "yes" | "on" | "1" | "" => Some(true),
         "false" | "no" | "off" | "0" => Some(false),
@@ -1040,14 +1063,14 @@ fn config_bool(git_dir: &Path, section: &str, key: &str) -> Option<bool> {
 }
 
 /// Effective-config lookup (repo + global/system + `-c`/env injection).
-fn config_value(git_dir: &Path, section: &str, key: &str) -> Option<String> {
-    if let Some(config) = crate::commands::merge_rebase::effective_config_with_overrides()
-        && let Some(value) = config.get(section, None, key)
-    {
-        return Some(value.to_string());
-    }
-    let config = read_repo_config(git_dir).ok()?;
+fn config_value(config: &GitConfig, section: &str, key: &str) -> Option<String> {
     config.get(section, None, key).map(str::to_string)
+}
+
+fn config_value_at_git_dir(git_dir: &Path, section: &str, key: &str) -> Option<String> {
+    let config = read_repo_config(git_dir).ok()?;
+    let config = crate::commands::merge_rebase::effective_config_with_overrides(&config);
+    config_value(&config, section, key)
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,7 +1093,7 @@ fn select_revisions(
     action: ReplayAction,
     rev_args: &[String],
 ) -> Result<RevSelection> {
-    let db = ctx.db();
+    let db = ctx.db()?;
     let config = read_repo_config(&ctx.git_dir)?;
     let cwd = env::current_dir()?;
     let setup_args = rev_args
@@ -1099,10 +1122,12 @@ fn select_revisions(
     }
     let mut options = setup.options;
     if !options.has_revisions() && options.max_count.is_some() {
-        let oid = resolve_revision(&ctx.git_dir, ctx.format, "HEAD").map_err(|_| {
-            eprintln!("fatal: bad revision 'HEAD'");
-            GitError::Exit(128)
-        })?;
+        let oid = resolve_revision(&ctx.git_dir, ctx.format, "HEAD", ctx.replace_objects).map_err(
+            |_| {
+                eprintln!("fatal: bad revision 'HEAD'");
+                GitError::Exit(128)
+            },
+        )?;
         options.positives.push(sley_rev::RevisionTip {
             oid,
             rev: "HEAD".to_string(),
@@ -1260,7 +1285,7 @@ fn sequencer_pick_revisions(ctx: &ReplayCtx, opts: &ReplayOpts, rev_args: &[Stri
         ctx.git_dir.join("CHERRY_PICK_HEAD").exists() || ctx.git_dir.join("REVERT_HEAD").exists();
     if let Some(in_progress) = replay::in_progress_error(&ctx.git_dir, advise_skip) {
         eprintln!("error: {}", in_progress.error);
-        if config_bool(&ctx.git_dir, "advice", "sequencerInUse").unwrap_or(true) {
+        if config_bool(&ctx.config, "advice", "sequencerInUse").unwrap_or(true) {
             for line in in_progress.hint.lines() {
                 eprintln!("hint: {line}");
             }
@@ -1312,7 +1337,7 @@ fn check_no_unmerged(ctx: &ReplayCtx) -> std::result::Result<(), ReplayHalt> {
 }
 
 fn make_todo_item(ctx: &ReplayCtx, action: ReplayAction, oid: &ObjectId) -> Result<TodoItem> {
-    let db = ctx.db();
+    let db = ctx.db()?;
     let object = db.read_object(oid)?;
     let commit = Commit::parse(ctx.format, &object.body)?;
     let subject = commit_subject(&commit.message);
@@ -1379,7 +1404,10 @@ fn do_pick_commit(
     _is_single: bool,
 ) -> std::result::Result<PickFlow, ReplayHalt> {
     let action = item.action;
-    let db = ctx.db();
+    let db = ctx.db().map_err(|err| {
+        eprintln!("error: {err}");
+        ReplayHalt::Fatal
+    })?;
     let commit_object = read_object_or_fatal(ctx, &db, &item.oid)?;
     let commit = Commit::parse(ctx.format, &commit_object.body).map_err(|err| {
         eprintln!("error: {err}");
@@ -1400,7 +1428,7 @@ fn do_pick_commit(
             "error: your local changes would be overwritten by {}.",
             action.name()
         );
-        if config_bool(&ctx.git_dir, "advice", "commitBeforeMerge").unwrap_or(true) {
+        if config_bool(&ctx.config, "advice", "commitBeforeMerge").unwrap_or(true) {
             eprintln!("hint: commit your changes or stash them to proceed.");
         }
         return Err(ReplayHalt::Fatal);
@@ -1476,7 +1504,7 @@ fn do_pick_commit(
         }
     };
     if opts.signoff {
-        let signoff = commit_signoff_from_env().map_err(print_fatal_error)?;
+        let signoff = commit_signoff_from_env(&ctx.config).map_err(print_fatal_error)?;
         message = append_signoff_before_comments(message, &signoff);
     }
 
@@ -1487,13 +1515,13 @@ fn do_pick_commit(
                 Some(parent) => tree_map_of_commit(ctx, &db, parent)?,
                 None => MergeTreeMap::new(),
             };
-            let theirs =
-                sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree).map_err(print_fatal_error)?;
+            let theirs = sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree)
+                .map_err(print_fatal_error)?;
             (base, theirs, label.clone(), parent_label.clone())
         }
         ReplayAction::Revert => {
-            let base =
-                sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree).map_err(print_fatal_error)?;
+            let base = sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree)
+                .map_err(print_fatal_error)?;
             let theirs = match &parent {
                 Some(parent) => tree_map_of_commit(ctx, &db, parent)?,
                 None => MergeTreeMap::new(),
@@ -1501,14 +1529,18 @@ fn do_pick_commit(
             (base, theirs, parent_label.clone(), label.clone())
         }
     };
-    let ours_map = sley_diff_merge::flatten_tree(&db, ctx.format, &index_tree).map_err(print_fatal_error)?;
+    let ours_map =
+        sley_diff_merge::flatten_tree(&db, ctx.format, &index_tree).map_err(print_fatal_error)?;
 
-    let style = match config_value(&ctx.git_dir, "merge", "conflictstyle").as_deref() {
-        Some("diff3") | Some("zdiff3") => sley_diff_merge::ConflictStyle::Diff3,
+    let style = match config_value(&ctx.config, "merge", "conflictstyle").as_deref() {
+        Some("diff3") => sley_diff_merge::ConflictStyle::Diff3,
+        Some("zdiff3") => sley_diff_merge::ConflictStyle::ZDiff3,
         _ => sley_diff_merge::ConflictStyle::Merge,
     };
-    let (results, conflicts) = three_way_merge_trees_styled(
+    let (results, conflicts) = three_way_merge_trees_styled_with_strategy_options(
         &db,
+        &ctx.config,
+        ctx.lazy_fetch,
         ctx.format,
         &base_map,
         &ours_map,
@@ -1517,6 +1549,7 @@ fn do_pick_commit(
         &theirs_label,
         &ancestor_label,
         style,
+        &opts.strategy_options,
     )
     .map_err(print_fatal_error)?;
 
@@ -1535,7 +1568,7 @@ fn do_pick_commit(
     let cleanup_mode = opts
         .default_msg_cleanup
         .clone()
-        .or_else(|| config_value(&ctx.git_dir, "commit", "cleanup"));
+        .or_else(|| config_value(&ctx.config, "commit", "cleanup"));
 
     if !conflicts.is_empty() {
         apply_merge_results_to_index_and_worktree(ctx, &db, &ours_map, &results)
@@ -1667,9 +1700,12 @@ fn do_pick_commit(
         ReplayAction::Pick => {
             commit_author_for_commit_encoding(&commit, &target_encoding).into_owned()
         }
-        ReplayAction::Revert => commit_identity_from_env("AUTHOR").map_err(print_fatal_error)?,
+        ReplayAction::Revert => {
+            commit_identity_from_env("AUTHOR", &ctx.config).map_err(print_fatal_error)?
+        }
     };
-    let committer = commit_identity_from_env("COMMITTER").map_err(print_fatal_error)?;
+    let committer =
+        commit_identity_from_env("COMMITTER", &ctx.config).map_err(print_fatal_error)?;
     let reflog_message = format!("{}: {subject}", action.name()).into_bytes();
     let new_oid = commit_and_advance_head(
         ctx,
@@ -1784,11 +1820,17 @@ fn prepare_replay_commit_message(
     } else {
         fs::write(&path, message)?;
     }
-    commands::commit::run_prepare_commit_msg_hook(&path, source, Vec::new(), set_no_editor_env)?;
+    commands::commit::run_prepare_commit_msg_hook(
+        &ctx.git_dir,
+        &path,
+        source,
+        Vec::new(),
+        set_no_editor_env,
+    )?;
     if edit {
         launch_editor(&ctx.git_dir, &path)?;
         let path_arg = path.to_string_lossy().into_owned();
-        commands::hooks::run_hook_l("commit-msg", &[path_arg.as_str()])?;
+        commands::hooks::run_hook_l_at(&ctx.git_dir, "commit-msg", &[path_arg.as_str()])?;
     }
     let edited = fs::read(&path)?;
     Ok(strip_comment_lines(&edited, comment_char(&ctx.git_dir)))
@@ -1797,7 +1839,7 @@ fn prepare_replay_commit_message(
 pub(crate) fn launch_editor(git_dir: &Path, path: &Path) -> Result<()> {
     let editor = env::var("GIT_EDITOR")
         .ok()
-        .or_else(|| config_value(git_dir, "core", "editor"))
+        .or_else(|| config_value_at_git_dir(git_dir, "core", "editor"))
         .or_else(|| {
             env::var("VISUAL")
                 .ok()
@@ -1824,7 +1866,7 @@ pub(crate) fn launch_editor(git_dir: &Path, path: &Path) -> Result<()> {
 }
 
 pub(crate) fn comment_char(git_dir: &Path) -> u8 {
-    match config_value(git_dir, "core", "commentChar").as_deref() {
+    match config_value_at_git_dir(git_dir, "core", "commentChar").as_deref() {
         Some(value) if value.eq_ignore_ascii_case("auto") => b'#',
         Some(value) => value.bytes().next().unwrap_or(b'#'),
         None => b'#',
@@ -2116,7 +2158,7 @@ fn apply_merge_results_to_index_and_worktree(
     results: &BTreeMap<Vec<u8>, MergePathResult>,
 ) -> Result<()> {
     let index_path = sley_worktree::repository_index_path(&ctx.git_dir);
-    let old_index = if index_path.exists() {
+    let mut old_index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, ctx.format)?
     } else {
         Index {
@@ -2126,6 +2168,24 @@ fn apply_merge_results_to_index_and_worktree(
             checksum: None,
         }
     };
+    let physical_sparse_index = old_index
+        .entries
+        .iter()
+        .any(sley_index::IndexEntry::is_sparse_dir)
+        .then(|| old_index.clone());
+    // The sequencer merge operates on leaf paths. Expand a sparse index only
+    // in memory so unchanged leaves retain their skip-worktree state when the
+    // result index is rebuilt after a pick. Otherwise every leaf represented
+    // by a synthetic sparse-directory row is re-created as an ordinary entry
+    // and status reports the entire excluded cone as deleted.
+    if old_index.is_sparse() {
+        for entry in &mut old_index.entries {
+            if entry.mode == sley_index::SPARSE_DIR_MODE && entry.path.as_bytes().ends_with(b"/") {
+                entry.set_skip_worktree(true);
+            }
+        }
+        sley_worktree::expand_sparse_index_view(&mut old_index, db, ctx.format)?;
+    }
     let mut old_entries: BTreeMap<Vec<u8>, IndexEntry> = BTreeMap::new();
     for entry in &old_index.entries {
         if index_entry_stage(entry) == 0 {
@@ -2209,7 +2269,7 @@ fn apply_merge_results_to_index_and_worktree(
                     let content = if sley_index::is_gitlink(*mode) {
                         Vec::new()
                     } else {
-                        crate::commands::merge_rebase::merge_read_blob(db, oid)?
+                        crate::commands::merge_rebase::merge_read_blob(db, oid, ctx.lazy_fetch)?
                     };
                     crate::commands::merge_rebase::merge_write_worktree_file(
                         &ctx.worktree_root,
@@ -2247,16 +2307,17 @@ fn apply_merge_results_to_index_and_worktree(
             sley_worktree::fill_index_entry_stat_cache(entry, &metadata);
         }
     }
-    fs::write(
-        &index_path,
-        Index {
-            version: 2,
-            entries,
-            extensions: Vec::new(),
-            checksum: None,
-        }
-        .write(ctx.format)?,
-    )?;
+    let mut index = Index {
+        version: 2,
+        entries,
+        extensions: Vec::new(),
+        checksum: None,
+    };
+    if let Some(physical) = physical_sparse_index.as_ref() {
+        replay_restore_unchanged_sparse_directories(&mut index, physical, db, ctx.format)?;
+    }
+    index.upgrade_version_for_flags();
+    fs::write(&index_path, index.write(ctx.format)?)?;
     // git's sequencer runs `read_and_refresh_cache` around each pick, so a
     // stage-0 entry reused from the old index (its content unchanged by the
     // merge, so its worktree file was not rewritten above) is re-stat'd against
@@ -2276,6 +2337,53 @@ fn apply_merge_results_to_index_and_worktree(
         /* ignore_missing */ true,
         /* really_refresh */ false,
     )?;
+    Ok(())
+}
+
+/// Restore physical sparse-directory rows whose represented subtree was not
+/// changed by the merge. The sequencer computes against a full semantic view,
+/// but an in-cone pick must not turn unrelated sparse directories into persisted
+/// leaf entries (nor advertise an expansion that Git never performed).
+fn replay_restore_unchanged_sparse_directories(
+    index: &mut Index,
+    physical: &Index,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<()> {
+    let mut restored = false;
+    for sparse in physical
+        .entries
+        .iter()
+        .filter(|entry| entry.is_sparse_dir())
+    {
+        let prefix = sparse.path.as_bytes();
+        let expected = sley_diff_merge::flatten_tree(db, format, &sparse.oid)?;
+        let actual = index
+            .entries
+            .iter()
+            .filter(|entry| entry.path.as_bytes().starts_with(prefix))
+            .collect::<Vec<_>>();
+        if actual.len() != expected.len()
+            || actual.iter().any(|entry| {
+                entry.stage() != sley_index::Stage::Normal
+                    || expected.get(&entry.path.as_bytes()[prefix.len()..])
+                        != Some(&(entry.mode, entry.oid))
+            })
+        {
+            continue;
+        }
+        index
+            .entries
+            .retain(|entry| !entry.path.as_bytes().starts_with(prefix));
+        index.entries.push(sparse.clone());
+        restored = true;
+    }
+    if restored {
+        index
+            .entries
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        index.set_sparse_extension();
+    }
     Ok(())
 }
 
@@ -2304,7 +2412,7 @@ fn append_conflicts_hint(message: &mut Vec<u8>, conflicts: &[Vec<u8>], cleanup: 
 }
 
 fn print_conflict_advice(ctx: &ReplayCtx, opts: &ReplayOpts, help_msg: Option<&str>) {
-    if !config_bool(&ctx.git_dir, "advice", "mergeConflict").unwrap_or(true) {
+    if !config_bool(&ctx.config, "advice", "mergeConflict").unwrap_or(true) {
         return;
     }
     let lines: Vec<String> = if let Some(msg) = help_msg {
@@ -2350,7 +2458,7 @@ fn fast_forward_to(ctx: &ReplayCtx, target: &ObjectId, head: Option<&ObjectId>) 
         Some(RefTarget::Symbolic(branch)) => branch,
         _ => "HEAD".to_string(),
     };
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let committer = commit_identity_from_env("COMMITTER", &ctx.config)?;
     let old_oid = head.copied().unwrap_or_else(|| ObjectId::null(ctx.format));
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
@@ -2385,7 +2493,7 @@ fn commit_and_advance_head(
     reflog_message: Vec<u8>,
     encoding: Option<Vec<u8>>,
 ) -> Result<ObjectId> {
-    let mut db = ctx.db();
+    let mut db = ctx.db()?;
     let new_oid = sley_sequencer::create_commit(
         &mut db,
         sley_sequencer::CommitCreate {
@@ -2488,7 +2596,12 @@ fn read_populate_todo(ctx: &ReplayCtx) -> Result<Vec<TodoItem>> {
             eprintln!("error: {message}");
             return Err(fatal_failed(ctx.action));
         }
-        let oid = match resolve_revision(&ctx.git_dir, ctx.format, &line.object_name) {
+        let oid = match resolve_revision(
+            &ctx.git_dir,
+            ctx.format,
+            &line.object_name,
+            ctx.replace_objects,
+        ) {
             Ok(oid) => oid,
             Err(_) => {
                 let errors = vec![
@@ -2549,7 +2662,7 @@ fn continue_single_pick(ctx: &ReplayCtx, opts: &ReplayOpts) -> Result<()> {
         }
     }
     let head = ctx.head_oid();
-    let db = ctx.db();
+    let db = ctx.db()?;
     let head_tree = match &head {
         Some(oid) => commit_tree_oid(&db, ctx.format, oid)?,
         None => ObjectId::empty_tree(ctx.format),
@@ -2580,9 +2693,9 @@ fn continue_single_pick(ctx: &ReplayCtx, opts: &ReplayOpts) -> Result<()> {
         let commit = Commit::parse(ctx.format, &object.body)?;
         commit_author_for_commit_encoding(&commit, &target_encoding).into_owned()
     } else {
-        commit_identity_from_env("AUTHOR")?
+        commit_identity_from_env("AUTHOR", &ctx.config)?
     };
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let committer = commit_identity_from_env("COMMITTER", &ctx.config)?;
     let subject = commit_subject(&message);
     let new_oid = commit_and_advance_head(
         ctx,
@@ -2612,7 +2725,7 @@ fn sequencer_skip(ctx: &ReplayCtx) -> Result<()> {
         let head = ctx.head_oid();
         if !replay::rollback_is_safe(&ctx.git_dir, head.as_ref()) {
             eprintln!("error: there is nothing to skip");
-            if config_bool(&ctx.git_dir, "advice", "resolveConflict").unwrap_or(true) {
+            if config_bool(&ctx.config, "advice", "resolveConflict").unwrap_or(true) {
                 eprintln!("hint: have you committed already?");
                 eprintln!("hint: try \"git {} --continue\"", ctx.action.name());
             }
@@ -2695,11 +2808,25 @@ fn sequencer_rollback(ctx: &ReplayCtx) -> Result<()> {
 /// on-disk content diverges from the (stage-0) index. Conflicted paths are
 /// reset outright. Clears the in-progress branch state on success.
 fn reset_merge(ctx: &ReplayCtx, target: &ObjectId) -> Result<()> {
-    reset_merge_in(&ctx.git_dir, &ctx.worktree_root, ctx.format, Some(target))
+    reset_merge_in(
+        &ctx.git_dir,
+        &ctx.worktree_root,
+        ctx.format,
+        Some(target),
+        &ctx.config,
+        ctx.lazy_fetch,
+    )
 }
 
 fn reset_merge_target(ctx: &ReplayCtx, target: Option<&ObjectId>) -> Result<()> {
-    reset_merge_in(&ctx.git_dir, &ctx.worktree_root, ctx.format, target)
+    reset_merge_in(
+        &ctx.git_dir,
+        &ctx.worktree_root,
+        ctx.format,
+        target,
+        &ctx.config,
+        ctx.lazy_fetch,
+    )
 }
 
 pub(crate) fn reset_merge_in(
@@ -2707,6 +2834,8 @@ pub(crate) fn reset_merge_in(
     worktree_root: &Path,
     format: ObjectFormat,
     target: Option<&ObjectId>,
+    config: &GitConfig,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let target_map = match target {
@@ -2717,7 +2846,7 @@ pub(crate) fn reset_merge_in(
         None => MergeTreeMap::new(),
     };
     let index_path = sley_worktree::repository_index_path(git_dir);
-    let old_index = if index_path.exists() {
+    let mut old_index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
@@ -2727,6 +2856,19 @@ pub(crate) fn reset_merge_in(
             checksum: None,
         }
     };
+    // `reset --merge` reasons about tracked leaves, not the sparse index's
+    // synthetic 040000 directory rows. Expanding only the in-memory view keeps
+    // those rows from being mistaken for deletions (and from producing bogus
+    // "unable to rmdir" warnings) while preserving the destination's sparse
+    // worktree policy.
+    if old_index.is_sparse() {
+        for entry in &mut old_index.entries {
+            if entry.mode == sley_index::SPARSE_DIR_MODE && entry.path.as_bytes().ends_with(b"/") {
+                entry.set_skip_worktree(true);
+            }
+        }
+        sley_worktree::expand_sparse_index_view(&mut old_index, &db, format)?;
+    }
     let mut stage0: BTreeMap<Vec<u8>, IndexEntry> = BTreeMap::new();
     let mut conflicted: BTreeSet<Vec<u8>> = BTreeSet::new();
     for entry in &old_index.entries {
@@ -2824,9 +2966,12 @@ pub(crate) fn reset_merge_in(
         {
             entries.push(old.clone());
         } else {
-            entries.push(crate::commands::merge_rebase::merge_index_entry(
-                path, *mode, *oid, 0,
-            ));
+            let mut replacement =
+                crate::commands::merge_rebase::merge_index_entry(path, *mode, *oid, 0);
+            if stage0.get(path).is_some_and(IndexEntry::is_skip_worktree) {
+                replacement.set_skip_worktree(true);
+            }
+            entries.push(replacement);
         }
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -2842,7 +2987,7 @@ pub(crate) fn reset_merge_in(
         let content = if sley_index::is_gitlink(*mode) {
             Vec::new()
         } else {
-            crate::commands::merge_rebase::merge_read_blob(&db, oid)?
+            crate::commands::merge_rebase::merge_read_blob(&db, oid, lazy_fetch)?
         };
         crate::commands::merge_rebase::merge_write_worktree_file(
             worktree_root,
@@ -2876,7 +3021,7 @@ pub(crate) fn reset_merge_in(
             Some(RefTarget::Symbolic(branch)) => branch,
             _ => "HEAD".to_string(),
         };
-        let committer = commit_identity_from_env("COMMITTER")?;
+        let committer = commit_identity_from_env("COMMITTER", config)?;
         let old_oid = current_head.unwrap_or_else(|| ObjectId::null(format));
         let mut tx = refs.transaction();
         tx.update(RefUpdate {

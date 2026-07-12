@@ -6,7 +6,7 @@
 //! per fetched ref. `--diag-url` is a faithful port of `connect.c`'s
 //! `parse_connect_url` diagnostics and never connects.
 
-use crate::commands::remote::ls_remote_git_dir;
+use crate::commands::remote::{RemoteCommandContext, ls_remote_git_dir};
 use crate::*;
 use sley::plumbing::sley_remote::{apply_shallow_info, compute_local_deepen, read_shallow};
 
@@ -21,6 +21,7 @@ struct FetchPackFlags {
     stdin_refs: bool,
     keep_pack: bool,
     depth: Option<u32>,
+    filter: Option<String>,
     diag_url: bool,
 }
 
@@ -68,7 +69,10 @@ fn parse_sought_entry(format: ObjectFormat, raw: &str) -> SoughtRef {
     }
 }
 
-pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_fetch_pack(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut flags = FetchPackFlags::default();
     let mut index = 0;
     while index < args.len() {
@@ -105,11 +109,12 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
                 if let Some(value) = arg.strip_prefix("--depth=") {
                     let depth = value.parse::<i64>().unwrap_or(0);
                     flags.depth = Some(depth.clamp(0, i64::from(INFINITE_DEPTH)) as u32);
+                } else if let Some(filter) = arg.strip_prefix("--filter=") {
+                    flags.filter = Some(filter.to_string());
                 } else if arg.starts_with("--upload-pack=")
                     || arg.starts_with("--exec=")
                     || arg.starts_with("--shallow-since=")
                     || arg.starts_with("--shallow-exclude=")
-                    || arg.starts_with("--filter=")
                 {
                     // Accepted but unused by the in-process local transport.
                 } else {
@@ -128,8 +133,8 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
 
     // Upstream fetch-pack is RUN_SETUP: repository discovery precedes
     // everything, including --diag-url.
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let remote_context = RemoteCommandContext::require_repository(cli_session)?;
+    let git_dir = remote_context.required_git_dir()?.to_path_buf();
     let format = repository_object_format(&git_dir)?;
 
     if flags.diag_url {
@@ -151,7 +156,7 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
         }
     }
 
-    let remote_git_dir = ls_remote_git_dir(&dest)?;
+    let remote_git_dir = ls_remote_git_dir(&remote_context, &dest)?;
     let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
     let remote_format = repository_object_format(&remote_common_git_dir)?;
     if remote_format != format {
@@ -162,6 +167,22 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
         )));
     }
     let advertisements = sley_remote::local_fetch_advertisements(&remote_git_dir, format)?;
+    let remote_config = read_repo_config(&remote_common_git_dir)?;
+    let transfer_filter = match flags.filter.as_deref() {
+        None => None,
+        Some(_)
+            if !remote_config
+                .get_bool("uploadpack", None, "allowfilter")
+                .unwrap_or(false) =>
+        {
+            eprintln!("warning: filtering not recognized by server, ignoring");
+            None
+        }
+        Some(spec) => Some(
+            sley_remote::pack_filter_from_spec(spec)
+                .ok_or_else(|| GitError::InvalidFormat(format!("invalid filter-spec '{spec}'")))?,
+        ),
+    };
 
     // filter_refs: name matches first, then the raw-oid pass over advertised
     // tips (or the uploadpack.allow*sha1inwant escape hatches).
@@ -209,7 +230,6 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
             .iter()
             .map(|advertisement| advertisement.oid)
             .collect();
-        let remote_config = read_repo_config(&remote_common_git_dir)?;
         let allow_unadvertised = [
             "allowtipsha1inwant",
             "allowreachablesha1inwant",
@@ -272,7 +292,7 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
             deepen_plan.as_ref(),
             false,
             false,
-            None,
+            transfer_filter,
             None,
             false,
             None,

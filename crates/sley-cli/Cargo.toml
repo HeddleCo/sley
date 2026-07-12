@@ -14,6 +14,10 @@ path = "src/lib.rs"
 name = "sley"
 path = "src/main.rs"
 
+[[bin]]
+name = "scalar"
+path = "src/scalar_main.rs"
+
 [dependencies]
 encoding_rs = "0.8"
 filetime = "0.2"
@@ -41,7 +45,7 @@ sley-transport = { workspace = true, features = ["http-client", "tls-rustls"] }
 sley-unpack-trees.workspace = true
 
 [features]
-default = ["mmap", "fast-sha1", "testkit"]
+default = ["mmap", "fast-sha1", "testkit", "git-compat-i18n"]
 testkit = ["dep:sley-testkit"]
 # The (de)compression backend is the default-on zlib-rs (pure Rust, ~zlib-ng
 # speed, no C). The `pure-rust` miniz_oxide fallback is a leaf-crate feature on
@@ -61,6 +65,10 @@ mmap = ["sley/mmap"]
 tls-rustls = ["sley-transport/tls-rustls"]
 tls-native-tls = ["sley-transport/tls-native-tls"]
 tls-platform-verifier = ["sley-transport/tls-platform-verifier"]
+# Materialize Sley-owned shell libraries/adapters for Git's installed-layout
+# contract (`git --exec-path`). Default-on: upstream scripts source
+# `git-sh-i18n` before command dispatch, so an otherwise ordinary CLI build
+# must not depend on a separately selected feature or an installed Git.
 git-compat-i18n = ["dep:sley-i18n"]
 
 # Integration tests build low-level fixtures (commit-graph parsing, raw ODB

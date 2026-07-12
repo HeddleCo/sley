@@ -10,10 +10,6 @@ use sley_protocol::ReceivePackCommand;
 
 use crate::proc_receive::ReceivePackCommandState;
 
-pub fn hook_exists(git_dir: &Path, hook_name: &str) -> bool {
-    find_hook_path(git_dir, hook_name).is_some()
-}
-
 pub fn run_pre_receive(
     git_dir: &Path,
     commands: &[ReceivePackCommand],
@@ -147,11 +143,7 @@ pub fn run_push_to_checkout(
 fn find_hook_path(git_dir: &Path, hook_name: &str) -> Option<PathBuf> {
     let common = repository_common_dir(git_dir);
     let path = common.join("hooks").join(hook_name);
-    if path.is_file() {
-        Some(path)
-    } else {
-        None
-    }
+    if path.is_file() { Some(path) } else { None }
 }
 
 fn spawn_hook(
@@ -198,10 +190,10 @@ fn spawn_hook(
     let mut child = command
         .spawn()
         .map_err(|err| GitError::Io(format!("cannot spawn hook {}: {err}", path.display())))?;
-    if let Some(input) = stdin {
-        if let Some(mut hook_stdin) = child.stdin.take() {
-            let _ = hook_stdin.write_all(input);
-        }
+    if let Some(input) = stdin
+        && let Some(mut hook_stdin) = child.stdin.take()
+    {
+        let _ = hook_stdin.write_all(input);
     }
     let status = child.wait().map_err(|err| GitError::Io(err.to_string()))?;
     if capture_stderr {
@@ -276,18 +268,14 @@ fn post_receive_hook_stdin(commands: &[ReceivePackCommandState]) -> Vec<u8> {
     out
 }
 
-fn receive_update_hook_order<'a>(
-    commands: &'a [ReceivePackCommand],
-) -> Vec<&'a ReceivePackCommand> {
+fn receive_update_hook_order(commands: &[ReceivePackCommand]) -> Vec<&ReceivePackCommand> {
     let mut ordered = Vec::with_capacity(commands.len());
     ordered.extend(commands.iter().filter(|c| c.new_id.is_null()));
     ordered.extend(commands.iter().filter(|c| !c.new_id.is_null()));
     ordered
 }
 
-fn receive_stream_hook_order_commands<'a>(
-    commands: &'a [ReceivePackCommand],
-) -> Vec<&'a ReceivePackCommand> {
+fn receive_stream_hook_order_commands(commands: &[ReceivePackCommand]) -> Vec<&ReceivePackCommand> {
     let mut existing: Vec<_> = commands
         .iter()
         .filter(|command| !command.old_id.is_null())
@@ -297,9 +285,9 @@ fn receive_stream_hook_order_commands<'a>(
     existing
 }
 
-fn receive_stream_hook_order<'a>(
-    commands: &'a [ReceivePackCommandState],
-) -> Vec<&'a ReceivePackCommandState> {
+fn receive_stream_hook_order(
+    commands: &[ReceivePackCommandState],
+) -> Vec<&ReceivePackCommandState> {
     let mut existing: Vec<_> = commands
         .iter()
         .filter(|state| !state.command.old_id.is_null())

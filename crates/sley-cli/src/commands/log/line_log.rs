@@ -37,6 +37,8 @@ pub(super) struct LineLogOutputCtx<'a> {
     /// `--until`/`--before` upper time bound (commits newer than this are
     /// pruned). `None` == no upper bound.
     pub(super) min_age: Option<i64>,
+    pub(super) lazy_fetch: bool,
+    pub(super) replace_objects: bool,
     /// `-S`/`-G`/`--find-object` pickaxe: like upstream's `-L` + pickaxe, this
     /// suppresses the *diff pairs* of a commit whose whole-file diff does not
     /// match (the commit header still prints, matching git's pipeline where
@@ -95,12 +97,14 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
         color_moved,
         userdiff,
         output_path,
+        lazy_fetch,
+        replace_objects,
     } = ctx;
 
     // `-L` line-log shares git's `log.mailmap` default (true) and the default
     // pretty-format identity mapping.
     let use_mailmap = config.get_bool("log", None, "mailmap").unwrap_or(true);
-    let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
+    let mailmap = commands::utility::Mailmap::load_default(git_dir, format, replace_objects)?;
 
     // Reachable commits from the tip, in topological order (child before
     // parent) — git forces `topo_order` for `-L`. The line-log engine walks the
@@ -343,6 +347,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                 diff_colors.as_ref(),
                 color_moved,
                 userdiff,
+                lazy_fetch,
             )?;
             if !patch_block.is_empty() {
                 msg.extend_from_slice(&patch_block);
@@ -436,6 +441,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                         diff_colors.as_ref(),
                         color_moved,
                         userdiff,
+                        lazy_fetch,
                     )?;
                     if !patch_block.is_empty() {
                         stdout.write_all(diff_opts.block_separator())?;
@@ -492,6 +498,7 @@ pub(super) fn run_line_log_output(ctx: LineLogOutputCtx<'_>) -> Result<()> {
                         diff_colors.as_ref(),
                         color_moved,
                         userdiff,
+                        lazy_fetch,
                     )?;
                     patch_block_nonempty = !patch_block.is_empty();
                 }
@@ -559,6 +566,7 @@ fn render_line_log_diff(
     colors: Option<&commands::diff_words::DiffColors>,
     color_moved: Option<sley_diff_merge::render::ColorMoved>,
     userdiff: Option<&commands::userdiff::UserdiffResolver>,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let files = match files {
         Some(f) if !f.is_empty() => f,
@@ -601,6 +609,7 @@ fn render_line_log_diff(
                     anchors: &[],
                     allow_textconv: false,
                     db,
+                    lazy_fetch,
                     worktree_root: None,
                     use_worktree_new: false,
                     format,
@@ -612,6 +621,7 @@ fn render_line_log_diff(
                     colors,
                     word_diff: word_request.as_ref(),
                     line_indicators: diff_opts.line_indicators,
+                    suppress_blank_empty: false,
                     no_index_contents: None,
                     submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                     submodule_dirt: None,

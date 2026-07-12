@@ -72,7 +72,11 @@ mod non_unix_cache_tests {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CredentialOpType { Initial, Helper, Response }
+pub enum CredentialOpType {
+    Initial,
+    Helper,
+    Response,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CredentialCapability {
@@ -134,8 +138,11 @@ impl Default for GitCredential {
             configured: false,
             username_from_proto: false,
             use_http_path: false,
-            sanitize_prompt: false,
-            protect_protocol: false,
+            // Git enables both defenses in CREDENTIAL_INIT. Configuration may
+            // explicitly opt out, but an unconfigured credential must never
+            // put control bytes into a prompt or a credential-protocol line.
+            sanitize_prompt: true,
+            protect_protocol: true,
             helpers: Vec::new(),
             capa_authtype: CredentialCapability::default(),
             capa_state: CredentialCapability::default(),
@@ -171,10 +178,17 @@ pub fn credential_has_capability(capa: &CredentialCapability, op_type: Credentia
     }
 }
 
-pub fn credential_announce_capabilities(credential: &GitCredential, writer: &mut impl Write) -> Result<()> {
+pub fn credential_announce_capabilities(
+    credential: &GitCredential,
+    writer: &mut impl Write,
+) -> Result<()> {
     writeln!(writer, "version 0").map_err(|e| GitError::Io(e.to_string()))?;
-    if credential.capa_authtype.request_initial { writeln!(writer, "capability authtype").map_err(|e| GitError::Io(e.to_string()))?; }
-    if credential.capa_state.request_initial { writeln!(writer, "capability state").map_err(|e| GitError::Io(e.to_string()))?; }
+    if credential.capa_authtype.request_initial {
+        writeln!(writer, "capability authtype").map_err(|e| GitError::Io(e.to_string()))?;
+    }
+    if credential.capa_state.request_initial {
+        writeln!(writer, "capability state").map_err(|e| GitError::Io(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -187,7 +201,11 @@ pub fn credential_clear_secrets(credential: &mut GitCredential) {
     credential.credential = None;
 }
 
-pub fn credential_read(credential: &mut GitCredential, reader: &mut impl BufRead, op_type: CredentialOpType) -> Result<()> {
+pub fn credential_read(
+    credential: &mut GitCredential,
+    reader: &mut impl BufRead,
+    op_type: CredentialOpType,
+) -> Result<()> {
     let mut line = String::new();
     loop {
         line.clear();
@@ -196,20 +214,36 @@ pub fn credential_read(credential: &mut GitCredential, reader: &mut impl BufRead
             Ok(_) => {}
             Err(err) => return Err(GitError::Io(err.to_string())),
         }
-        if line == "\n" || line == "\r\n" { break; }
-        if line.ends_with('\n') { line.pop(); if line.ends_with('\r') { line.pop(); } }
+        if line == "\n" || line == "\r\n" {
+            break;
+        }
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
         apply_credential_line(credential, &line, op_type)?;
     }
     Ok(())
 }
 
-pub(crate) fn apply_credential_line(credential: &mut GitCredential, line: &str, op_type: CredentialOpType) -> Result<()> {
+pub(crate) fn apply_credential_line(
+    credential: &mut GitCredential,
+    line: &str,
+    op_type: CredentialOpType,
+) -> Result<()> {
     let Some((key, value)) = line.split_once('=') else {
         eprintln!("warning: invalid credential line: {line}");
-        return Err(GitError::InvalidFormat("credential line is missing = delimiter".into()));
+        return Err(GitError::InvalidFormat(
+            "credential line is missing = delimiter".into(),
+        ));
     };
     match key {
-        "username" => { credential.username = Some(value.to_string()); credential.username_from_proto = true; }
+        "username" => {
+            credential.username = Some(value.to_string());
+            credential.username_from_proto = true;
+        }
         "password" => credential.password = Some(value.to_string()),
         "credential" => credential.credential = Some(value.to_string()),
         "protocol" => credential.protocol = Some(value.to_string()),
@@ -238,49 +272,138 @@ fn parse_bool(value: &str) -> bool {
     sley_config::parse_config_bool(value).unwrap_or(!value.is_empty())
 }
 
-pub fn credential_write(credential: &GitCredential, writer: &mut impl Write, op_type: CredentialOpType) -> Result<()> {
-    if credential_has_capability(&credential.capa_authtype, op_type) { write_item(writer, "capability[]", Some("authtype"), false)?; }
-    if credential_has_capability(&credential.capa_state, op_type) { write_item(writer, "capability[]", Some("state"), false)?; }
+pub fn credential_write(
+    credential: &GitCredential,
+    writer: &mut impl Write,
+    op_type: CredentialOpType,
+) -> Result<()> {
     if credential_has_capability(&credential.capa_authtype, op_type) {
-        write_item(writer, "authtype", credential.authtype.as_deref(), false)?;
-        write_item(writer, "credential", credential.credential.as_deref(), false)?;
-        if credential.ephemeral { write_item(writer, "ephemeral", Some("1"), false)?; }
+        write_item(credential, writer, "capability[]", Some("authtype"), false)?;
     }
-    write_item(writer, "protocol", credential.protocol.as_deref(), true)?;
-    write_item(writer, "host", credential.host.as_deref(), true)?;
-    write_item(writer, "path", credential.path.as_deref(), false)?;
-    write_item(writer, "username", credential.username.as_deref(), false)?;
-    write_item(writer, "password", credential.password.as_deref(), false)?;
-    write_item(writer, "oauth_refresh_token", credential.oauth_refresh_token.as_deref(), false)?;
-    if credential.password_expiry_utc != TIME_MAX {
-        write_item(writer, "password_expiry_utc", Some(&credential.password_expiry_utc.to_string()), false)?;
-    }
-    for value in &credential.wwwauth { write_item(writer, "wwwauth[]", Some(value.as_str()), false)?; }
     if credential_has_capability(&credential.capa_state, op_type) {
-        if credential.multistage { write_item(writer, "continue", Some("1"), false)?; }
-        for value in &credential.state_to_send { write_item(writer, "state[]", Some(value.as_str()), false)?; }
+        write_item(credential, writer, "capability[]", Some("state"), false)?;
+    }
+    if credential_has_capability(&credential.capa_authtype, op_type) {
+        write_item(
+            credential,
+            writer,
+            "authtype",
+            credential.authtype.as_deref(),
+            false,
+        )?;
+        write_item(
+            credential,
+            writer,
+            "credential",
+            credential.credential.as_deref(),
+            false,
+        )?;
+        if credential.ephemeral {
+            write_item(credential, writer, "ephemeral", Some("1"), false)?;
+        }
+    }
+    write_item(
+        credential,
+        writer,
+        "protocol",
+        credential.protocol.as_deref(),
+        true,
+    )?;
+    write_item(credential, writer, "host", credential.host.as_deref(), true)?;
+    write_item(
+        credential,
+        writer,
+        "path",
+        credential.path.as_deref(),
+        false,
+    )?;
+    write_item(
+        credential,
+        writer,
+        "username",
+        credential.username.as_deref(),
+        false,
+    )?;
+    write_item(
+        credential,
+        writer,
+        "password",
+        credential.password.as_deref(),
+        false,
+    )?;
+    write_item(
+        credential,
+        writer,
+        "oauth_refresh_token",
+        credential.oauth_refresh_token.as_deref(),
+        false,
+    )?;
+    if credential.password_expiry_utc != TIME_MAX {
+        write_item(
+            credential,
+            writer,
+            "password_expiry_utc",
+            Some(&credential.password_expiry_utc.to_string()),
+            false,
+        )?;
+    }
+    for value in &credential.wwwauth {
+        write_item(credential, writer, "wwwauth[]", Some(value.as_str()), false)?;
+    }
+    if credential_has_capability(&credential.capa_state, op_type) {
+        if credential.multistage {
+            write_item(credential, writer, "continue", Some("1"), false)?;
+        }
+        for value in &credential.state_to_send {
+            write_item(credential, writer, "state[]", Some(value.as_str()), false)?;
+        }
     }
     Ok(())
 }
 
-fn write_item(writer: &mut impl Write, key: &str, value: Option<&str>, required: bool) -> Result<()> {
+fn write_item(
+    credential: &GitCredential,
+    writer: &mut impl Write,
+    key: &str,
+    value: Option<&str>,
+    required: bool,
+) -> Result<()> {
     let Some(value) = value else {
-        if required { return Err(GitError::InvalidFormat(format!("credential value for {key} is missing"))); }
+        if required {
+            return Err(GitError::InvalidFormat(format!(
+                "credential value for {key} is missing"
+            )));
+        }
         return Ok(());
     };
-    if value.contains('\n') { return Err(GitError::InvalidFormat(format!("credential value for {key} contains newline"))); }
-    if value.contains('\r') { return Err(GitError::InvalidFormat(format!("credential value for {key} contains carriage return"))); }
+    if value.contains('\n') {
+        return Err(GitError::InvalidFormat(format!(
+            "credential value for {key} contains newline"
+        )));
+    }
+    if credential.protect_protocol && value.contains('\r') {
+        return Err(GitError::InvalidFormat(format!(
+            "fatal: credential value for {key} contains carriage return\n\
+             If this is intended, set `credential.protectProtocol=false`"
+        )));
+    }
     writeln!(writer, "{key}={value}").map_err(|e| GitError::Io(e.to_string()))?;
     Ok(())
 }
 
 pub fn credential_helper_specs(config: Option<&GitConfig>) -> Vec<String> {
-    let Some(config) = config else { return Vec::new(); };
+    let Some(config) = config else {
+        return Vec::new();
+    };
     let mut specs = Vec::new();
     for section in &config.sections {
-        if section.name != "credential" || section.subsection.is_some() { continue; }
+        if section.name != "credential" || section.subsection.is_some() {
+            continue;
+        }
         for entry in &section.entries {
-            if !entry.key.eq_ignore_ascii_case("helper") { continue; }
+            if !entry.key.eq_ignore_ascii_case("helper") {
+                continue;
+            }
             match entry.value.as_deref() {
                 Some("") | None => specs.clear(),
                 Some(value) => specs.push(value.to_string()),
@@ -292,18 +415,28 @@ pub fn credential_helper_specs(config: Option<&GitConfig>) -> Vec<String> {
 
 pub fn credential_helper_command(spec: &str, op: &str) -> Option<Command> {
     let spec = spec.trim();
-    if spec.is_empty() { return None; }
+    if spec.is_empty() {
+        return None;
+    }
     if let Some(shell) = spec.strip_prefix('!') {
         let mut command = Command::new("sh");
-        command.arg("-c").arg(format!("{shell} \"$@\"")).arg("sh").arg(op);
+        command
+            .arg("-c")
+            .arg(format!("{shell} \"$@\""))
+            .arg("sh")
+            .arg(op);
         return Some(command);
     }
     let mut tokens = spec.split_whitespace();
     let head = tokens.next()?;
     if head.starts_with('/') {
         let mut cmd = head.to_string();
-        for arg in tokens { cmd.push(' '); cmd.push_str(arg); }
-        cmd.push(' '); cmd.push_str(op);
+        for arg in tokens {
+            cmd.push(' ');
+            cmd.push_str(arg);
+        }
+        cmd.push(' ');
+        cmd.push_str(op);
         let mut command = Command::new("sh");
         command.arg("-c").arg(cmd);
         return Some(command);
@@ -317,45 +450,88 @@ pub fn credential_helper_command(spec: &str, op: &str) -> Option<Command> {
     Some(command)
 }
 
-fn credential_do(credential: &mut GitCredential, helper: &str, operation: &str, want_output: bool) -> Result<()> {
+fn credential_do(
+    credential: &mut GitCredential,
+    helper: &str,
+    operation: &str,
+    want_output: bool,
+) -> Result<()> {
     let Some(mut command) = credential_helper_command(helper, operation) else {
         return Err(GitError::Command("empty credential helper".into()));
     };
     command.stdin(Stdio::piped());
-    command.stdout(if want_output { Stdio::piped() } else { Stdio::null() });
+    command.stdout(if want_output {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
     let mut child = command.spawn().map_err(|e| GitError::Io(e.to_string()))?;
     if let Some(mut stdin) = child.stdin.take() {
-        let op_type = if want_output { CredentialOpType::Helper } else { CredentialOpType::Response };
+        let op_type = if want_output {
+            CredentialOpType::Helper
+        } else {
+            CredentialOpType::Response
+        };
         credential_write(credential, &mut stdin, op_type)?;
     }
     if want_output {
-        let mut stdout = child.stdout.take().expect("piped");
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| GitError::Io("credential helper stdout was not piped".into()))?;
         let mut input = Vec::new();
-        stdout.take((MAX_GIT_CREDENTIAL_RESPONSE_BYTES as u64).saturating_add(1)).read_to_end(&mut input).map_err(|e| GitError::Io(e.to_string()))?;
+        stdout
+            .take((MAX_GIT_CREDENTIAL_RESPONSE_BYTES as u64).saturating_add(1))
+            .read_to_end(&mut input)
+            .map_err(|e| GitError::Io(e.to_string()))?;
         if input.len() > MAX_GIT_CREDENTIAL_RESPONSE_BYTES {
-            return Err(GitError::InvalidFormat(format!("credential helper response exceeds maximum size of {} bytes (64 KiB)", MAX_GIT_CREDENTIAL_RESPONSE_BYTES)));
+            return Err(GitError::InvalidFormat(format!(
+                "credential helper response exceeds maximum size of {} bytes (64 KiB)",
+                MAX_GIT_CREDENTIAL_RESPONSE_BYTES
+            )));
         }
         let status = child.wait().map_err(|e| GitError::Io(e.to_string()))?;
-        if !status.success() { return Err(GitError::Command(format!("credential helper '{helper}' failed"))); }
+        if !status.success() {
+            return Err(GitError::Command(format!(
+                "credential helper '{helper}' failed"
+            )));
+        }
         let mut reader = io::Cursor::new(input);
         credential_read(credential, &mut reader, CredentialOpType::Helper)?;
     } else {
         let status = child.wait().map_err(|e| GitError::Io(e.to_string()))?;
-        if !status.success() { return Err(GitError::Command(format!("credential helper '{helper}' failed"))); }
+        if !status.success() {
+            return Err(GitError::Command(format!(
+                "credential helper '{helper}' failed"
+            )));
+        }
     }
     Ok(())
 }
 
-pub fn credential_apply_config(config: Option<&GitConfig>, stack: Option<&ConfigStack>, credential: &mut GitCredential) -> Result<()> {
+pub fn credential_apply_config(
+    config: Option<&GitConfig>,
+    stack: Option<&ConfigStack>,
+    credential: &mut GitCredential,
+) -> Result<()> {
     url::credential_apply_config(config, stack, credential)
 }
 
-pub fn credential_fill(config: Option<&GitConfig>, stack: Option<&ConfigStack>, credential: &mut GitCredential, all_capabilities: bool) -> Result<()> {
-    if credential.is_full() { return Ok(()); }
+pub fn credential_fill(
+    config: Option<&GitConfig>,
+    stack: Option<&ConfigStack>,
+    credential: &mut GitCredential,
+    all_capabilities: bool,
+) -> Result<()> {
+    if credential.is_full() {
+        return Ok(());
+    }
     credential_next_state(credential);
     credential.multistage = false;
     credential_apply_config(config, stack, credential)?;
-    if all_capabilities { credential_set_all_capabilities(credential, CredentialOpType::Initial); }
+    if all_capabilities {
+        credential_set_all_capabilities(credential, CredentialOpType::Initial);
+    }
     let helpers = credential.helpers.clone();
     for helper in helpers {
         credential_do(credential, &helper, "get", true)?;
@@ -363,7 +539,10 @@ pub fn credential_fill(config: Option<&GitConfig>, stack: Option<&ConfigStack>, 
             credential_clear_secrets(credential);
             credential.password_expiry_utc = TIME_MAX;
         }
-        if credential.is_full() { credential.wwwauth.clear(); return Ok(()); }
+        if credential.is_full() {
+            credential.wwwauth.clear();
+            return Ok(());
+        }
         if credential.quit {
             return Err(GitError::InvalidFormat(format!(
                 "fatal: credential helper '{helper}' told us to quit"
@@ -376,22 +555,39 @@ pub fn credential_fill(config: Option<&GitConfig>, stack: Option<&ConfigStack>, 
     Ok(())
 }
 
-pub fn credential_approve(config: Option<&GitConfig>, stack: Option<&ConfigStack>, credential: &mut GitCredential) -> Result<()> {
-    if credential.approved { return Ok(()); }
-    if ((!credential.username.is_some() || !credential.password.is_some()) && credential.credential.is_none()) || credential.password_expiry_utc < now() {
+pub fn credential_approve(
+    config: Option<&GitConfig>,
+    stack: Option<&ConfigStack>,
+    credential: &mut GitCredential,
+) -> Result<()> {
+    if credential.approved {
+        return Ok(());
+    }
+    if ((!credential.username.is_some() || !credential.password.is_some())
+        && credential.credential.is_none())
+        || credential.password_expiry_utc < now()
+    {
         return Ok(());
     }
     credential_next_state(credential);
     credential_apply_config(config, stack, credential)?;
-    for helper in credential.helpers.clone() { let _ = credential_do(credential, &helper, "store", false); }
+    for helper in credential.helpers.clone() {
+        let _ = credential_do(credential, &helper, "store", false);
+    }
     credential.approved = true;
     Ok(())
 }
 
-pub fn credential_reject(config: Option<&GitConfig>, stack: Option<&ConfigStack>, credential: &mut GitCredential) -> Result<()> {
+pub fn credential_reject(
+    config: Option<&GitConfig>,
+    stack: Option<&ConfigStack>,
+    credential: &mut GitCredential,
+) -> Result<()> {
     credential_next_state(credential);
     credential_apply_config(config, stack, credential)?;
-    for helper in credential.helpers.clone() { let _ = credential_do(credential, &helper, "erase", false); }
+    for helper in credential.helpers.clone() {
+        let _ = credential_do(credential, &helper, "erase", false);
+    }
     credential_clear_secrets(credential);
     credential.username = None;
     credential.oauth_refresh_token = None;
@@ -400,22 +596,38 @@ pub fn credential_reject(config: Option<&GitConfig>, stack: Option<&ConfigStack>
     Ok(())
 }
 
-pub fn credential_fill_simple(config: Option<&GitConfig>, mut request: GitCredential) -> Result<Option<GitCredential>> {
+pub fn credential_fill_simple(
+    config: Option<&GitConfig>,
+    mut request: GitCredential,
+) -> Result<Option<GitCredential>> {
     for spec in credential_helper_specs(config) {
-        if request.username.is_some() && request.password.is_some() { break; }
+        if request.username.is_some() && request.password.is_some() {
+            break;
+        }
         let helper = spec;
         let mut working = request.clone();
         working.helpers = vec![helper.clone()];
         if credential_do(&mut working, &helper, "get", true).is_ok() {
-            if let Some(username) = working.username { request.username = Some(username); }
-            if let Some(password) = working.password { request.password = Some(password); }
+            if let Some(username) = working.username {
+                request.username = Some(username);
+            }
+            if let Some(password) = working.password {
+                request.password = Some(password);
+            }
         }
     }
-    if request.username.is_some() && request.password.is_some() { Ok(Some(request)) } else { Ok(None) }
+    if request.username.is_some() && request.password.is_some() {
+        Ok(Some(request))
+    } else {
+        Ok(None)
+    }
 }
 
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 pub fn parse_legacy_git_credential(input: &[u8]) -> Result<GitCredential> {
@@ -424,4 +636,41 @@ pub fn parse_legacy_git_credential(input: &[u8]) -> Result<GitCredential> {
 
 pub fn encode_legacy_git_credential(credential: &GitCredential) -> Result<Vec<u8>> {
     crate::encode_legacy_git_credential_impl(credential)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_defaults_enable_protocol_and_prompt_protection() {
+        let credential = GitCredential::default();
+        assert!(credential.sanitize_prompt);
+        assert!(credential.protect_protocol);
+    }
+
+    #[test]
+    fn credential_write_rejects_carriage_return_unless_explicitly_disabled() {
+        let mut credential = GitCredential {
+            protocol: Some("https".into()),
+            host: Some("example\r.com".into()),
+            ..GitCredential::default()
+        };
+        let error = credential_write(&credential, &mut Vec::new(), CredentialOpType::Response)
+            .expect_err("protected credential must reject a carriage return");
+        assert_eq!(
+            error,
+            GitError::InvalidFormat(
+                "fatal: credential value for host contains carriage return\n\
+                 If this is intended, set `credential.protectProtocol=false`"
+                    .into()
+            )
+        );
+
+        credential.protect_protocol = false;
+        let mut output = Vec::new();
+        credential_write(&credential, &mut output, CredentialOpType::Response)
+            .expect("explicitly disabled protection must permit a carriage return");
+        assert_eq!(output, b"protocol=https\nhost=example\r.com\n");
+    }
 }

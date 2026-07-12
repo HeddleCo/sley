@@ -2,7 +2,9 @@
 #![allow(clippy::expect_used)]
 
 use crate::*;
-use sley::plumbing::{sley_config, sley_core, sley_diff_merge, sley_formats, sley_odb, sley_pack, sley_rev};
+use sley::plumbing::{
+    sley_config, sley_core, sley_diff_merge, sley_formats, sley_odb, sley_pack, sley_rev,
+};
 
 const COMMIT_GRAPH_USAGE: &str = "\
 usage: git commit-graph verify [--object-dir <dir>] [--shallow] [--[no-]progress]
@@ -12,15 +14,18 @@ usage: git commit-graph verify [--object-dir <dir>] [--shallow] [--[no-]progress
                        <split-options>
 ";
 
-pub(crate) fn cmd_commit_graph(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_commit_graph(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let Some(subcommand) = args.first().map(String::as_str) else {
         // No sub-command ⇒ usage error (exit 129) with the usage block.
         eprint!("{COMMIT_GRAPH_USAGE}");
         return Err(GitError::Exit(129));
     };
     match subcommand {
-        "write" => cmd_commit_graph_write(&args[1..]),
-        "verify" => cmd_commit_graph_verify(&args[1..]),
+        "write" => cmd_commit_graph_write(cli_session, &args[1..]),
+        "verify" => cmd_commit_graph_verify(cli_session, &args[1..]),
         other => {
             // Unknown sub-command ⇒ git's `error: unknown subcommand: \`<x>'`
             // plus the usage block, exit 129.
@@ -67,9 +72,9 @@ impl CommitGraphSplitOptions {
     }
 }
 
-fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+fn cmd_commit_graph_write(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     let mut source = CommitGraphSource::AllPacks;
@@ -121,7 +126,7 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
                 let value = iter
                     .next()
                     .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
-                object_dir = Some(resolve_cli_path(&cwd, value));
+                object_dir = Some(resolve_cli_path(cwd, value));
             }
             "--progress" => progress = true,
             "--no-progress" => progress = false,
@@ -129,7 +134,7 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
                 let value = value
                     .strip_prefix("--object-dir=")
                     .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
-                object_dir = Some(resolve_cli_path(&cwd, value));
+                object_dir = Some(resolve_cli_path(cwd, value));
             }
             value if value.starts_with("--split=") => {
                 let strategy = value.strip_prefix("--split=").unwrap_or_default();
@@ -215,6 +220,7 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
         CommitGraphSource::Reachable => {
             return write_reachable_commit_graph(
                 &git_dir,
+                &db,
                 &object_dir,
                 format,
                 changed_paths,
@@ -224,10 +230,14 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
                 &existing_filters,
                 split,
                 progress,
+                repo_config.as_ref(),
+                cli_session.replace_objects(),
             );
         }
         CommitGraphSource::AllPacks => commit_graph_packed_commit_starts(&db, &object_dir, format)?,
-        CommitGraphSource::StdinPacks => commit_graph_stdin_packs_starts(&db, &object_dir, format)?,
+        CommitGraphSource::StdinPacks => {
+            commit_graph_stdin_packs_starts(cwd, &db, &object_dir, format)?
+        }
         CommitGraphSource::StdinCommits => {
             let starts = commit_graph_stdin_commits_starts(&db, format)?;
             // git's `read_one_commit` loop drives a "Collecting commits from
@@ -269,8 +279,8 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
     )?;
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
-    let shared_read_mode = commit_graph_shared_read_mode(&git_dir);
-    let split_layers_owner_writable = !commit_graph_has_shared_repository(&git_dir);
+    let shared_read_mode = commit_graph_shared_read_mode(repo_config.as_ref());
+    let split_layers_owner_writable = !commit_graph_has_shared_repository(repo_config.as_ref());
     if split.mode == CommitGraphSplitMode::Off {
         write_commit_graph_file(&graph_dir.join("commit-graph"), &graph, shared_read_mode)?;
         remove_split_commit_graphs(&object_dir)?;
@@ -339,9 +349,9 @@ fn write_commit_graph_file(path: &Path, bytes: &[u8], shared_read_mode: u32) -> 
 /// applying `core.sharedRepository`. Defaults to `0o444` (all-read); a
 /// configured numeric/symbolic mode drops the group/other read bit for any
 /// class the mode grants no access (mirrors git's `adjust_shared_perm`).
-fn commit_graph_shared_read_mode(git_dir: &Path) -> u32 {
+fn commit_graph_shared_read_mode(config: Option<&sley_config::GitConfig>) -> u32 {
     const BASE: u32 = 0o444;
-    let Ok(config) = read_repo_config(git_dir) else {
+    let Some(config) = config else {
         return BASE;
     };
     let Some(value) = config.get("core", None, "sharedRepository") else {
@@ -366,11 +376,8 @@ fn commit_graph_shared_read_mode(git_dir: &Path) -> u32 {
     read
 }
 
-fn commit_graph_has_shared_repository(git_dir: &Path) -> bool {
-    let Ok(config) = read_repo_config(git_dir) else {
-        return false;
-    };
-    config.get("core", None, "sharedRepository").is_some()
+fn commit_graph_has_shared_repository(config: Option<&sley_config::GitConfig>) -> bool {
+    config.is_some_and(|config| config.get("core", None, "sharedRepository").is_some())
 }
 
 fn commit_graph_parse_max_new_filters(value: &str) -> Result<usize> {
@@ -761,6 +768,7 @@ fn graph_file_checksum(bytes: &[u8], format: ObjectFormat) -> Result<ObjectId> {
 /// (matching git, which produces a header-only graph for an empty repo).
 fn write_reachable_commit_graph(
     git_dir: &Path,
+    db: &FileObjectDatabase,
     object_dir: &Path,
     format: ObjectFormat,
     changed_paths: bool,
@@ -770,10 +778,12 @@ fn write_reachable_commit_graph(
     existing_filters: &HashMap<ObjectId, CommitGraphExistingBloomFilter>,
     split: CommitGraphSplitOptions,
     progress: bool,
+    repo_config: Option<&sley_config::GitConfig>,
+    replace_objects: bool,
 ) -> Result<()> {
     let graph = commit_graph_for_reachable_refs(
         git_dir,
-        object_dir,
+        db,
         format,
         changed_paths,
         bloom_settings,
@@ -781,11 +791,12 @@ fn write_reachable_commit_graph(
         max_new_filters,
         existing_filters,
         progress,
+        replace_objects,
     )?;
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
-    let shared_read_mode = commit_graph_shared_read_mode(git_dir);
-    let split_layers_owner_writable = !commit_graph_has_shared_repository(git_dir);
+    let shared_read_mode = commit_graph_shared_read_mode(repo_config);
+    let split_layers_owner_writable = !commit_graph_has_shared_repository(repo_config);
     if split.mode == CommitGraphSplitMode::Off {
         write_commit_graph_file(&graph_dir.join("commit-graph"), &graph, shared_read_mode)?;
         remove_split_commit_graphs(object_dir)?;
@@ -825,6 +836,7 @@ fn commit_graph_packed_commit_starts(
 /// `--stdin-packs`: read pack index paths from stdin and seed from the commits
 /// in those packs. A missing/invalid pack is a fatal "error adding pack".
 fn commit_graph_stdin_packs_starts(
+    cwd: &Path,
     db: &FileObjectDatabase,
     object_dir: &Path,
     format: ObjectFormat,
@@ -838,7 +850,7 @@ fn commit_graph_stdin_packs_starts(
         if line.is_empty() {
             continue;
         }
-        let pack_path = resolve_cli_path(&env::current_dir()?, line);
+        let pack_path = resolve_cli_path(cwd, line);
         // git resolves the named pack relative to the object dir's pack/ dir
         // when it is not an absolute existing path.
         let candidates = [pack_path.clone(), object_dir.join("pack").join(line)];
@@ -922,9 +934,12 @@ fn commit_graph_stdin_commits_starts(
     Ok(starts)
 }
 
-fn cmd_commit_graph_verify(args: &[String]) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+fn cmd_commit_graph_verify(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     // git: opts.progress defaults to isatty(2); --progress forces on,
@@ -938,7 +953,7 @@ fn cmd_commit_graph_verify(args: &[String]) -> Result<()> {
                 let value = iter
                     .next()
                     .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
-                object_dir = Some(resolve_cli_path(&cwd, value));
+                object_dir = Some(resolve_cli_path(cwd, value));
             }
             "--progress" => progress = true,
             "--no-progress" => progress = false,
@@ -947,7 +962,7 @@ fn cmd_commit_graph_verify(args: &[String]) -> Result<()> {
                 let value = value
                     .strip_prefix("--object-dir=")
                     .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
-                object_dir = Some(resolve_cli_path(&cwd, value));
+                object_dir = Some(resolve_cli_path(cwd, value));
             }
             other => {
                 return Err(GitError::Unsupported(format!(
@@ -1610,7 +1625,7 @@ fn decode_graph_commit(parsed: &ParsedGraph<'_>, index: usize) -> Result<GraphCo
 
 fn commit_graph_for_reachable_refs(
     git_dir: &Path,
-    object_dir: &Path,
+    db: &FileObjectDatabase,
     format: ObjectFormat,
     changed_paths: bool,
     bloom_settings: sley_formats::CommitGraphBloomSettings,
@@ -1618,8 +1633,8 @@ fn commit_graph_for_reachable_refs(
     max_new_filters: Option<usize>,
     existing_filters: &HashMap<ObjectId, CommitGraphExistingBloomFilter>,
     progress: bool,
+    replace_objects: bool,
 ) -> Result<Vec<u8>> {
-    let db = FileObjectDatabase::new(object_dir, format);
     let store = FileRefStore::new(git_dir, format);
     let mut starts = Vec::new();
     let mut seen_starts = HashSet::new();
@@ -1627,20 +1642,20 @@ fn commit_graph_for_reachable_refs(
         let RefTarget::Direct(oid) = reference.target else {
             continue;
         };
-        if let Ok(commit) = sley_rev::peel_to_commit(&db, format, &oid)
+        if let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid)
             && seen_starts.insert(commit)
         {
             starts.push(commit);
         }
     }
-    if let Ok(head) = resolve_revision(git_dir, format, "HEAD")
-        && let Ok(commit) = sley_rev::peel_to_commit(&db, format, &head)
+    if let Ok(head) = resolve_revision(git_dir, format, "HEAD", replace_objects)
+        && let Ok(commit) = sley_rev::peel_to_commit(db, format, &head)
         && seen_starts.insert(commit)
     {
         starts.push(commit);
     }
     commit_graph_from_starts(
-        &db,
+        db,
         format,
         starts,
         changed_paths,

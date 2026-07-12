@@ -2,7 +2,7 @@
 
 use sley::{ReferenceTarget, Repository};
 use sley_testkit::engine_parity::{
-    git_oid_line, git_symbolic_ref_line, EngineOutput, EngineParityCase,
+    EngineOutput, EngineParityCase, git_oid_line, git_symbolic_ref_line,
 };
 
 fn reference_exists_output(repo: &Repository, name: &str) -> EngineOutput {
@@ -15,10 +15,7 @@ fn reference_exists_output(repo: &Repository, name: &str) -> EngineOutput {
 
 fn head_symbolic_output(repo: &Repository) -> EngineOutput {
     let head = repo.head().expect("head");
-    let target = head
-        .symbolic_target
-        .expect("symbolic HEAD")
-        .to_string();
+    let target = head.symbolic_target.expect("symbolic HEAD").to_string();
     EngineOutput::stdout(git_symbolic_ref_line(&target))
 }
 
@@ -108,10 +105,7 @@ fn head_branch_name_unborn_matches_oracle() {
         |fixture| {
             let sym = fixture.oracle_ok(&["symbolic-ref", "HEAD"]);
             let sym = String::from_utf8_lossy(&sym);
-            let branch = sym
-                .trim()
-                .strip_prefix("refs/heads/")
-                .expect("branch ref");
+            let branch = sym.trim().strip_prefix("refs/heads/").expect("branch ref");
             let mut stdout = branch.as_bytes().to_vec();
             stdout.push(b'\n');
             EngineOutput::stdout(stdout)
@@ -546,10 +540,7 @@ fn head_branch_name_after_commit_matches_oracle() {
         |fixture| {
             let sym = fixture.oracle_ok(&["symbolic-ref", "HEAD"]);
             let sym = String::from_utf8_lossy(&sym);
-            let branch = sym
-                .trim()
-                .strip_prefix("refs/heads/")
-                .expect("branch ref");
+            let branch = sym.trim().strip_prefix("refs/heads/").expect("branch ref");
             let mut stdout = branch.as_bytes().to_vec();
             stdout.push(b'\n');
             EngineOutput::stdout(stdout)

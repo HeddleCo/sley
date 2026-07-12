@@ -195,6 +195,7 @@ pub(super) struct LogDiffContext<'a> {
     pub(super) pickaxe_ignore_case: bool,
     pub(super) pickaxe_text: bool,
     pub(super) pickaxe_all: bool,
+    pub(super) lazy_fetch: bool,
 }
 
 impl LogDiffContext<'_> {
@@ -348,7 +349,7 @@ impl LogDiffContext<'_> {
 
         let opts = self.opts;
         let stat_entries = if opts.numstat || opts.stat || opts.compact_summary || opts.shortstat {
-            collect_diff_stat_entries(&entries, self.db, None, false)?
+            collect_diff_stat_entries(&entries, self.db, None, false, self.lazy_fetch)?
         } else {
             Vec::new()
         };
@@ -422,6 +423,7 @@ impl LogDiffContext<'_> {
                         anchors: &[],
                         allow_textconv: true,
                         db: self.db,
+                        lazy_fetch: self.lazy_fetch,
                         worktree_root: None,
                         use_worktree_new: false,
                         format: self.format,
@@ -434,6 +436,10 @@ impl LogDiffContext<'_> {
                         colors: None,
                         word_diff: word_request.as_ref(),
                         line_indicators: opts.line_indicators,
+                        suppress_blank_empty: self
+                            .config
+                            .get_bool("diff", None, "suppressblankempty")
+                            .unwrap_or(false),
                         no_index_contents: None,
                         submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
                         submodule_dirt: None,
@@ -518,7 +524,7 @@ impl LogDiffContext<'_> {
         }
         if opts.name_status {
             for path in &paths {
-                commands::combined::write_combined_name_status(out, path, false)?;
+                commands::combined::write_combined_name_status(out, path, false, false)?;
             }
         }
         if opts.name_only {
@@ -527,7 +533,7 @@ impl LogDiffContext<'_> {
             }
         }
         let stat_entries = if opts.numstat || opts.stat || opts.compact_summary || opts.shortstat {
-            collect_diff_stat_entries(&first_parent_entries, self.db, None, false)?
+            collect_diff_stat_entries(&first_parent_entries, self.db, None, false, self.lazy_fetch)?
         } else {
             Vec::new()
         };
@@ -586,6 +592,7 @@ impl LogDiffContext<'_> {
             dst_prefix: "b/",
             patch_abbrev: self.patch_abbrev,
             raw_abbrev: self.raw_abbrev,
+            lazy_fetch: self.lazy_fetch,
         }
     }
 

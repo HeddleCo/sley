@@ -1748,12 +1748,12 @@ pub fn apply_clean_filter_with_attributes_cow<'a>(
     )
 }
 
-/// How the safecrlf check should learn whether this path's *current index blob*
+/// How clean conversion should learn whether this path's *current index blob*
 /// already contains a CRLF (git's `has_crlf_in_index`). Only consulted on the
 /// `text=auto` / `core.autocrlf` path.
 pub enum SafeCrlfIndexBlob<'a> {
-    /// No index blob is available (the staging caller has none, or safecrlf is
-    /// off) — treated as "no CRLF in index".
+    /// No index blob is available (the staging caller has none, or conversion
+    /// is explicitly renormalizing) — treated as "no CRLF in index".
     None,
     /// The path's current index blob, read on demand from this object database
     /// only when the auto-crlf decision actually needs it.
@@ -1775,9 +1775,10 @@ impl SafeCrlfIndexBlob<'_> {
 /// [`apply_clean_filter_with_attributes_cow`] plus git's additive `core.safecrlf`
 /// round-trip warning (convert.c `crlf_to_git`).
 ///
-/// The conversion result is byte-for-byte identical to the plain variant;
-/// `flags`/`index_blob` only drive the stderr warning git prints when a
-/// CRLF<->LF round-trip would not be reversible. The warning is computed on the
+/// `flags` drives the stderr warning git prints when a CRLF<->LF round-trip
+/// would not be reversible. `index_blob` also implements git's "new safer
+/// autocrlf" rule: normal cleaning preserves CRLF for an auto-text path whose
+/// current index blob already contains CRLF. The warning is computed on the
 /// *post-driver, pre-EOL-conversion* content, matching git's ordering in
 /// `convert_to_git` (apply_filter -> crlf_to_git).
 pub fn apply_clean_filter_with_attributes_cow_safecrlf<'a>(
@@ -1816,15 +1817,19 @@ pub(crate) fn apply_clean_filter_cow_inner<'a>(
     // encode_to_git → crlf_to_git): the worktree charset is decoded to UTF-8 so
     // the line-ending stats and conversion below see real LF/CRLF bytes.
     data = encode_to_git(config, &plan.encoding, path, data, write_object)?;
+    let index_has_crlf = plan.text == TextDecision::Auto && index_blob.has_crlf();
     // The safecrlf check scans the (post-driver) buffer once for line-ending
     // stats. Gate it tightly so the extra scan never runs on the dominant
     // pass-through paths: only when safecrlf is enabled, the path is a real
     // conversion candidate (not `CRLF_BINARY`), and the buffer is non-empty.
     if flags != ConvFlags::Off && !data.is_empty() && plan.safecrlf_applies() {
         let old_stats = gather_convert_stats(&data);
-        plan.check_safe_crlf_stats(&old_stats, index_blob.has_crlf(), flags, path)?;
+        plan.check_safe_crlf_stats(&old_stats, index_has_crlf, flags, path)?;
     }
-    if plan.convert_eol(&data) {
+    // convert.c's CONV_EOL_RENORMALIZE flag bypasses this safeguard by not
+    // consulting the current index blob. Callers express that as
+    // `SafeCrlfIndexBlob::None`.
+    if plan.convert_eol(&data) && !(plan.text == TextDecision::Auto && index_has_crlf) {
         data = convert_crlf_to_lf_cow(data);
     }
     if plan.ident {
@@ -2014,11 +2019,21 @@ pub(crate) fn run_driver_maybe_delayed<'a>(
                 return Ok(DriverFilterResult::Content(content));
             }
             Err(err) => {
+                // Git surfaces a malformed process-filter handshake before its
+                // generic external-filter failure. An immediate EOF (for a
+                // missing command) is intentionally left as the generic
+                // failure plus the path-specific required-filter fatal below.
+                if err.message.starts_with("Unexpected line") {
+                    eprintln!("error: {}", err.message);
+                }
                 if err.protocol {
                     eprintln!("error: external filter '{}' failed", process);
                 }
                 if driver.required {
-                    return Err(GitError::Command(err.message));
+                    let path = String::from_utf8_lossy(path);
+                    let name = String::from_utf8_lossy(&driver.name);
+                    eprintln!("fatal: {path}: {direction} filter '{name}' failed");
+                    return Err(GitError::Exit(128));
                 }
                 return Ok(DriverFilterResult::Content(content));
             }

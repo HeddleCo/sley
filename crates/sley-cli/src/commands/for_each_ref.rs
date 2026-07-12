@@ -6,8 +6,13 @@ use sley::plumbing::{sley_object, sley_refs, sley_rev};
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
 
-pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
-    for_each_ref_core(args, "git for-each-ref")
+pub(crate) fn cmd_for_each_ref(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let git_dir = cli_session.git_dir()?;
+    let config = identity_effective_config_for(cli_session).unwrap_or_default();
+    for_each_ref_core_with_config(cli_session, &git_dir, args, "git for-each-ref", &config)
 }
 
 /// The `-h` usage banner, matching git's parse_options output byte-for-byte.
@@ -58,7 +63,14 @@ fn print_for_each_ref_usage(usage_cmd: &str) {
 /// The shared core of `git for-each-ref` and its clone `git refs list` (see
 /// builtin/refs.c::cmd_refs_list, which calls for_each_ref_core). The only
 /// per-command difference is the program name printed in the `-h` usage banner.
-pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> {
+pub(crate) fn for_each_ref_core_with_config(
+    cli_session: &crate::session::CliSession,
+    git_dir: &Path,
+    args: &[String],
+    usage_cmd: &str,
+    effective_config: &GitConfig,
+) -> Result<()> {
+    let git_dir = git_dir.to_path_buf();
     let mut format_spec = "%(objectname) %(objecttype)\t%(refname)".to_string();
     let mut count = None;
     let mut omit_empty = false;
@@ -285,14 +297,12 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         );
     }
     if start_after.is_some() && sort_explicit {
-        return Err(GitError::Command(
-            "cannot use --start-after with custom sort options".into(),
-        ));
+        eprintln!("fatal: cannot use --start-after with custom sort options");
+        return Err(GitError::Exit(128));
     }
     if start_after.is_some() && !patterns.is_empty() {
-        return Err(GitError::Command(
-            "cannot use --start-after with patterns".into(),
-        ));
+        eprintln!("fatal: cannot use --start-after with patterns");
+        return Err(GitError::Exit(128));
     }
     if sorts.is_empty() {
         sorts.push(ForEachRefSort::Refname);
@@ -303,6 +313,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         return Err(GitError::Exit(129));
     }
     let format_spec = ForEachRefFormat::parse(&format_spec)?;
+    let is_base_targets = for_each_ref_is_base_targets(&format_spec)?;
     // git: a bare %(raw) atom is incompatible with --python/--shell/--tcl.
     if matches!(
         quote,
@@ -313,16 +324,16 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         return Err(GitError::Exit(128));
     }
     let needs = ForEachRefNeeds::analyze(&format_spec);
-    let git_dir = crate::session::cli_git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let objectname_abbrev = repository_abbrev(&git_dir, format)?;
+    let db =
+        crate::repository::open_object_database(&git_dir, format, cli_session.replace_objects())?;
     let points_at = points_at_revs
         .iter()
-        .map(|rev| resolve_revision(&git_dir, format, rev))
+        .map(|rev| for_each_ref_resolve_revision(&git_dir, format, &db, rev))
         .collect::<Result<Vec<_>>>()?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let mut reachability = sley_rev::CommitReachability::new(&git_dir, format, &db);
-    for_each_ref_validate_ahead_behind(&format_spec, &git_dir, format)?;
+    for_each_ref_validate_ahead_behind(&format_spec, &git_dir, format, &db)?;
     for_each_ref_validate_describe(&format_spec)?;
     // The abbreviation candidate set is only needed by `%(objectname:short...)`;
     // enumerating every object id is otherwise pure overhead.
@@ -334,14 +345,14 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
     let contains_targets = contains_revs
         .iter()
         .map(|rev| {
-            let oid = resolve_revision(&git_dir, format, rev)?;
+            let oid = for_each_ref_resolve_revision(&git_dir, format, &db, rev)?;
             sley_rev::peel_to_commit(&db, format, &oid)
         })
         .collect::<Result<Vec<_>>>()?;
     let no_contains_targets = no_contains_revs
         .iter()
         .map(|rev| {
-            let oid = resolve_revision(&git_dir, format, rev)?;
+            let oid = for_each_ref_resolve_revision(&git_dir, format, &db, rev)?;
             sley_rev::peel_to_commit(&db, format, &oid)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -349,7 +360,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
     let no_contains_target_set = no_contains_targets.iter().copied().collect::<HashSet<_>>();
     let merged_filter = merged_filter
         .map(|(rev, include)| {
-            let oid = resolve_revision(&git_dir, format, &rev)?;
+            let oid = for_each_ref_resolve_revision(&git_dir, format, &db, &rev)?;
             let commit = sley_rev::peel_to_commit(&db, format, &oid)?;
             let reachable = reachability.reachable_oids([commit], false)?;
             Ok::<_, GitError>((reachable, include))
@@ -357,9 +368,10 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         .transpose()?;
     let store = FileRefStore::new(&git_dir, format);
     let head_ref = store.current_branch_ref()?;
+    let main_worktree_root = worktree_root_for_git_dir(cli_session, &git_dir).ok();
     // Discover worktree paths once instead of re-scanning $GIT_DIR/worktrees per ref.
     let worktree_paths = if needs.worktree {
-        for_each_ref_worktree_paths(&git_dir, head_ref.as_deref())?
+        for_each_ref_worktree_paths(&git_dir, main_worktree_root.as_deref(), head_ref.as_deref())?
     } else {
         HashMap::new()
     };
@@ -367,9 +379,9 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
         // git resolves %(upstream)/%(push)/sort keys against the *full* config
         // layering (system + global + repo + includes + command-line `-c`
         // overrides), not just the repository file — e.g. `-c push.default=simple`
-        // must win over a repo-level `push.default`. identity_effective_config()
-        // builds exactly that layered view rooted at the current repo.
-        identity_effective_config().unwrap_or_default()
+        // must win over a repo-level `push.default`. The command entry point
+        // supplies that layered view from its explicit invocation session.
+        effective_config.clone()
     } else {
         GitConfig::default()
     };
@@ -377,7 +389,12 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
     // mailmap.{file,blob} config. Avoid probing those paths for formats that
     // never request mailmap rewriting.
     let mailmap = if needs.mailmap {
-        commands::utility::Mailmap::load_default(&git_dir, format)?
+        commands::utility::Mailmap::load_default_with_config(
+            &git_dir,
+            format,
+            effective_config,
+            cli_session.replace_objects(),
+        )?
     } else {
         commands::utility::Mailmap::default()
     };
@@ -399,12 +416,11 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
     let warn_ambiguous_refs = config
         .get_bool("core", None, "warnambiguousrefs")
         .unwrap_or(true);
-    if include_root_refs && let Some(target) = store.read_ref("HEAD")? {
-        refs.push(sley_refs::Ref {
-            name: "HEAD".to_string(),
-            target,
-        });
+    if include_root_refs {
+        append_for_each_ref_root_refs(&git_dir, &store, &mut refs)?;
     }
+    let is_base_refs =
+        for_each_ref_compute_is_base_refs(&refs, &is_base_targets, &store, &git_dir, format, &db)?;
     sort_for_each_refs(
         &mut refs,
         &sorts,
@@ -414,6 +430,7 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             config: &config,
             db: &db,
             git_dir: &git_dir,
+            main_worktree_root: main_worktree_root.as_deref(),
             head_ref: head_ref.as_deref(),
             format,
         },
@@ -691,7 +708,12 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
             warn_ambiguous_refs,
         };
         let mut line = Vec::new();
-        print_for_each_ref_format(&mut line, &format_spec, &format_context)?;
+        print_for_each_ref_format_with_is_bases(
+            &mut line,
+            &format_spec,
+            &format_context,
+            &is_base_refs,
+        )?;
         if !omit_empty || !line.is_empty() {
             stdout.write_all(&line)?;
             stdout.write_all(b"\n")?;
@@ -702,7 +724,23 @@ pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> 
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+fn append_for_each_ref_root_refs(
+    _git_dir: &std::path::Path,
+    store: &FileRefStore,
+    refs: &mut Vec<sley_refs::Ref>,
+) -> Result<()> {
+    for reference in store.list_root_refs()? {
+        if !sley_ref_filter::is_for_each_ref_root_ref(&reference.name)
+            || refs.iter().any(|existing| existing.name == reference.name)
+        {
+            continue;
+        }
+        refs.push(reference);
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
 enum ForEachRefSort {
     Refname,
     RefnameDescending,
@@ -786,6 +824,7 @@ enum ForEachRefSort {
     PeeledTaggerDateDescending,
     PeeledCreatorDate,
     PeeledCreatorDateDescending,
+    FormattedDate(ForEachRefDateSort),
     VersionRefname,
     VersionRefnameDescending,
 }
@@ -865,10 +904,21 @@ fn for_each_ref_validate_describe(format_spec: &ForEachRefFormat) -> Result<()> 
     Ok(())
 }
 
+fn for_each_ref_resolve_revision(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    rev: &str,
+) -> Result<ObjectId> {
+    warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
+    sley_rev::RevisionResolver::new(git_dir, format, db).resolve(rev)
+}
+
 fn for_each_ref_validate_ahead_behind(
     format_spec: &ForEachRefFormat,
     git_dir: &Path,
     format: ObjectFormat,
+    db: &FileObjectDatabase,
 ) -> Result<()> {
     for segment in format_spec.segments() {
         let ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw(placeholder)) = segment else {
@@ -886,12 +936,148 @@ fn for_each_ref_validate_ahead_behind(
             eprintln!("fatal: expected format: %(ahead-behind:<committish>)");
             return Err(GitError::Exit(128));
         };
-        if resolve_revision(git_dir, format, base).is_err() {
+        if for_each_ref_resolve_revision(git_dir, format, db, base).is_err() {
             eprintln!("fatal: failed to find '{base}'");
             return Err(GitError::Exit(128));
         }
     }
     Ok(())
+}
+
+fn for_each_ref_is_base_targets(format_spec: &ForEachRefFormat) -> Result<Vec<String>> {
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    for segment in format_spec.segments() {
+        let ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw(placeholder)) = segment else {
+            continue;
+        };
+        let target = if placeholder == "is-base" {
+            None
+        } else {
+            placeholder.strip_prefix("is-base:")
+        };
+        let Some(target) = target.filter(|target| !target.is_empty()) else {
+            if placeholder == "is-base" || placeholder == "is-base:" {
+                eprintln!("fatal: expected format: %(is-base:<committish>)");
+                return Err(GitError::Exit(128));
+            }
+            continue;
+        };
+        if seen.insert(target.to_string()) {
+            targets.push(target.to_string());
+        }
+    }
+    Ok(targets)
+}
+
+fn for_each_ref_compute_is_base_refs(
+    refs: &[sley_refs::Ref],
+    targets: &[String],
+    store: &FileRefStore,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+) -> Result<HashMap<String, String>> {
+    if targets.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut candidate_names = Vec::new();
+    let mut candidate_histories = Vec::new();
+    for reference in refs {
+        let Some(commit) = for_each_ref_commit_oid_gently(store, db, format, reference)? else {
+            continue;
+        };
+        candidate_names.push(reference.name.clone());
+        candidate_histories.push(for_each_ref_first_parent_history(db, format, commit)?);
+    }
+
+    let mut selected = HashMap::new();
+    for target in targets {
+        let tip = for_each_ref_resolve_revision(git_dir, format, db, target)
+            .and_then(|oid| sley_rev::peel_to_commit(db, format, &oid));
+        let tip = match tip {
+            Ok(tip) => tip,
+            Err(_) => {
+                eprintln!("fatal: failed to find '{target}'");
+                return Err(GitError::Exit(128));
+            }
+        };
+        let tip_history = for_each_ref_first_parent_history(db, format, tip)?;
+        if let Some(candidate) =
+            select_for_each_ref_is_base_candidate(&tip_history, &candidate_histories)
+        {
+            selected.insert(target.clone(), candidate_names[candidate].clone());
+        }
+    }
+    Ok(selected)
+}
+
+fn for_each_ref_commit_oid_gently(
+    store: &FileRefStore,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    reference: &sley_refs::Ref,
+) -> Result<Option<ObjectId>> {
+    let Some((mut oid, _)) = resolve_for_each_ref_target(store, reference)? else {
+        return Ok(None);
+    };
+    let mut seen = HashSet::new();
+    while seen.insert(oid) {
+        let object = match db.read_object(&oid) {
+            Ok(object) => object,
+            Err(_) => return Ok(None),
+        };
+        match object.object_type {
+            ObjectType::Commit => return Ok(Some(oid)),
+            ObjectType::Tag => {
+                let tag = match Tag::parse_ref(format, &object.body) {
+                    Ok(tag) => tag,
+                    Err(_) => return Ok(None),
+                };
+                let target = match db.read_object(&tag.object) {
+                    Ok(target) => target,
+                    Err(_) => return Ok(None),
+                };
+                if tag.object_type != target.object_type {
+                    eprintln!(
+                        "error: object {} is a {}, not a {}",
+                        tag.object,
+                        target.object_type.as_str(),
+                        tag.object_type.as_str()
+                    );
+                    eprintln!("error: bad tag pointer to {} in {oid}", tag.object);
+                    return Ok(None);
+                }
+                oid = tag.object;
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+fn for_each_ref_first_parent_history(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    start: ObjectId,
+) -> Result<Vec<ObjectId>> {
+    let mut history = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = Some(start);
+    while let Some(oid) = current {
+        if !seen.insert(oid) {
+            break;
+        }
+        history.push(oid);
+        let object = db.read_object(&oid)?;
+        if object.object_type != ObjectType::Commit {
+            break;
+        }
+        let commit = Commit::parse_ref(format, &object.body)?;
+        current = commit.parents.first().copied();
+    }
+    Ok(history)
 }
 
 impl ForEachRefNeeds {
@@ -1226,7 +1412,11 @@ fn parse_for_each_ref_sort(value: &str) -> Result<ForEachRefSort> {
         "version:tag" | "v:tag" => Ok(ForEachRefSort::VersionRefname),
         "-version:tag" | "-v:tag" => Ok(ForEachRefSort::VersionRefnameDescending),
         other => {
-            if let Some((field, descending)) = parse_for_each_ref_identity_sort(other) {
+            if let Some(date) = parse_for_each_ref_date_sort(other)?
+                && !matches!(date.mode, DateMode::Default)
+            {
+                Ok(ForEachRefSort::FormattedDate(date))
+            } else if let Some((field, descending)) = parse_for_each_ref_identity_sort(other) {
                 Ok(if descending {
                     ForEachRefSort::IdentityDescending(field)
                 } else {
@@ -1247,6 +1437,7 @@ struct ForEachRefSortContext<'a> {
     config: &'a GitConfig,
     db: &'a FileObjectDatabase,
     git_dir: &'a Path,
+    main_worktree_root: Option<&'a Path>,
     head_ref: Option<&'a str>,
     format: ObjectFormat,
 }
@@ -1263,7 +1454,7 @@ fn sort_for_each_refs(
     for reference in refs.drain(..) {
         let keys = sorts
             .iter()
-            .map(|sort| for_each_ref_sort_key(&reference, *sort, &context, object_headers))
+            .map(|sort| for_each_ref_sort_key(&reference, sort, &context, object_headers))
             .collect::<Result<Vec<_>>>()?;
         keyed.push((reference, keys));
     }
@@ -1291,7 +1482,10 @@ fn compare_for_each_ref_sort_keys(
 }
 
 impl ForEachRefSort {
-    fn descending(self) -> bool {
+    fn descending(&self) -> bool {
+        if let ForEachRefSort::FormattedDate(date) = self {
+            return date.descending;
+        }
         matches!(
             self,
             ForEachRefSort::RefnameDescending
@@ -1339,7 +1533,7 @@ impl ForEachRefSort {
         )
     }
 
-    fn needs_config(self) -> bool {
+    fn needs_config(&self) -> bool {
         matches!(
             self,
             ForEachRefSort::Upstream
@@ -1406,7 +1600,7 @@ fn for_each_ref_read_object_header(
 
 fn for_each_ref_sort_key(
     reference: &sley_refs::Ref,
-    sort: ForEachRefSort,
+    sort: &ForEachRefSort,
     context: &ForEachRefSortContext<'_>,
     object_headers: &mut ForEachRefObjectHeaderCache,
 ) -> Result<ForEachRefSortKey> {
@@ -1421,7 +1615,7 @@ fn for_each_ref_sort_key(
                     for_each_ref_sort_peeled_contents(reference, context)?
                 }
             };
-            ForEachRefSortKey::Text(for_each_ref_sort_identity_key(contents.as_ref(), field))
+            ForEachRefSortKey::Text(for_each_ref_sort_identity_key(contents.as_ref(), *field))
         }
         ForEachRefSort::VersionRefname | ForEachRefSort::VersionRefnameDescending => {
             ForEachRefSortKey::Version(reference.name.clone())
@@ -1443,8 +1637,13 @@ fn for_each_ref_sort_key(
         ),
         ForEachRefSort::WorktreePath | ForEachRefSort::WorktreePathDescending => {
             ForEachRefSortKey::Text(
-                for_each_ref_worktree_path(context.git_dir, context.head_ref, &reference.name)?
-                    .unwrap_or_default(),
+                for_each_ref_worktree_path(
+                    context.git_dir,
+                    context.main_worktree_root,
+                    context.head_ref,
+                    &reference.name,
+                )?
+                .unwrap_or_default(),
             )
         }
         ForEachRefSort::Tag | ForEachRefSort::TagDescending => ForEachRefSortKey::Text(
@@ -1713,6 +1912,24 @@ fn for_each_ref_sort_key(
                 ForEachRefDateSortField::Creator,
             ))
         }
+        ForEachRefSort::FormattedDate(date) => {
+            let contents = if date.peeled {
+                for_each_ref_sort_peeled_contents(reference, context)?
+            } else {
+                for_each_ref_sort_contents(reference, context)?
+            };
+            let identity = contents.as_ref().and_then(|contents| match date.role {
+                ForEachRefAtomIdentityRole::Author => contents.author.as_deref(),
+                ForEachRefAtomIdentityRole::Committer => contents.committer.as_deref(),
+                ForEachRefAtomIdentityRole::Tagger => contents.tagger.as_deref(),
+                ForEachRefAtomIdentityRole::Creator => contents.creator.as_deref(),
+            });
+            ForEachRefSortKey::Text(
+                identity
+                    .and_then(|identity| for_each_ref_identity_date(identity, &date.mode))
+                    .unwrap_or_default(),
+            )
+        }
     };
     Ok(match (key, context.ignore_case) {
         (ForEachRefSortKey::Text(value), true) => {
@@ -1866,8 +2083,7 @@ fn for_each_ref_pattern_glob_matches(name: &str, pattern: &str, ignore_case: boo
             // INCLUDING '/', so paired patterns like `refs/heads/*/**` reach
             // nested refs (`refs/heads/feature/topic`) that a single `*` cannot.
             [b'*', b'*', rest @ ..] => {
-                matches_from(rest, name)
-                    || (!name.is_empty() && matches_from(pattern, &name[1..]))
+                matches_from(rest, name) || (!name.is_empty() && matches_from(pattern, &name[1..]))
             }
             // A single `*` matches within one path segment only: it never
             // consumes '/', matching git's per-segment wildmatch.

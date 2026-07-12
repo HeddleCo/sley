@@ -4,14 +4,13 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use sley::{GitError, ObjectFormat, Result};
 use sley::plumbing::sley_object::{Commit, ObjectType};
 use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
+use sley::{GitError, ObjectFormat, Result};
 
 use crate::sley_rev;
 
 use crate::revision::resolve_revision;
-
 
 pub(crate) fn commit_message_requires_value_error() -> Result<()> {
     eprintln!("error: switch `m' requires a value");
@@ -220,7 +219,10 @@ pub(crate) enum CommitCleanupMode {
 /// `scissors` → `SCISSORS` with an editor else `SPACE`. Unknown values are
 /// rejected earlier by [`validate_commit_cleanup_mode`], so we treat them as the
 /// default here.
-pub(crate) fn resolve_commit_cleanup_mode(arg: Option<&str>, use_editor: bool) -> CommitCleanupMode {
+pub(crate) fn resolve_commit_cleanup_mode(
+    arg: Option<&str>,
+    use_editor: bool,
+) -> CommitCleanupMode {
     let editor_default = if use_editor {
         CommitCleanupMode::Strip
     } else {
@@ -326,10 +328,15 @@ pub(crate) fn commit_locate_scissors(message: &[u8], comment_char: &str) -> usiz
     }
 }
 
-pub(crate) fn read_reused_commit(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<Commit> {
+pub(crate) fn read_reused_commit(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+    replace_objects: bool,
+) -> Result<Commit> {
     let result = (|| {
-        let oid = resolve_revision(git_dir, format, rev)?;
-        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let db = crate::repository::open_object_database(git_dir, format, replace_objects)?;
+        let oid = sley_rev::RevisionResolver::new(git_dir, format, &db).resolve(rev)?;
         let commit_oid = sley_rev::peel_to_commit(&db, format, &oid)?;
         let object = db.read_object(&commit_oid)?;
         if object.object_type != ObjectType::Commit {

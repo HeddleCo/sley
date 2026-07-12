@@ -14,6 +14,158 @@ use crate::types_admin::*;
 /// git's `INDEX_FORMAT_DEFAULT` (read-cache.c).
 const INDEX_FORMAT_DEFAULT: u32 = 3;
 
+/// One index-row mutation produced by an apply-like worktree operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApplyIndexMutation {
+    /// Replace every stage of `path` with one fresh stage-zero entry.
+    Upsert {
+        path: Vec<u8>,
+        mode: u32,
+        oid: ObjectId,
+    },
+    /// Remove every index entry at `path`.
+    Remove { path: Vec<u8> },
+}
+
+impl ApplyIndexMutation {
+    /// Repository-relative path affected by this mutation.
+    pub fn path(&self) -> &[u8] {
+        match self {
+            Self::Upsert { path, .. } | Self::Remove { path } => path,
+        }
+    }
+}
+
+/// Controls for applying a batch of patch-driven index mutations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApplyIndexOptions {
+    /// Invalidate the cache-tree extension after changing index rows.
+    pub invalidate_cache_tree: bool,
+}
+
+impl Default for ApplyIndexOptions {
+    fn default() -> Self {
+        Self {
+            invalidate_cache_tree: true,
+        }
+    }
+}
+
+/// Deterministic outcome of an index-mutation batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplyIndexOutcome {
+    /// Paths touched, in caller mutation order.
+    pub touched_paths: Vec<Vec<u8>>,
+    /// Number of mutations applied.
+    pub mutation_count: usize,
+}
+
+/// Apply patch-driven upserts/removals and restore canonical index ordering.
+///
+/// This is the reusable index half of `apply --index`/`--cached`: all stages at
+/// an affected path are replaced or removed, fresh entries carry zero stat
+/// data until the caller's worktree refresh, and stale cache-tree data is
+/// invalidated once after the complete batch.
+pub fn apply_index_mutations(
+    index: &mut Index,
+    mutations: &[ApplyIndexMutation],
+    options: ApplyIndexOptions,
+) -> Result<ApplyIndexOutcome> {
+    for mutation in mutations {
+        index
+            .entries
+            .retain(|entry| entry.path.as_bytes() != mutation.path());
+        if let ApplyIndexMutation::Upsert { path, mode, oid } = mutation {
+            index.entries.push(IndexEntry {
+                ctime_seconds: 0,
+                ctime_nanoseconds: 0,
+                mtime_seconds: 0,
+                mtime_nanoseconds: 0,
+                dev: 0,
+                ino: 0,
+                mode: *mode,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                oid: *oid,
+                flags: (path.len().min(0x0fff)) as u16,
+                flags_extended: 0,
+                path: BString::from(path.as_slice()),
+            });
+        }
+    }
+    index
+        .entries
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    if options.invalidate_cache_tree && !mutations.is_empty() {
+        index.set_cache_tree(None)?;
+    }
+    Ok(ApplyIndexOutcome {
+        touched_paths: mutations
+            .iter()
+            .map(|mutation| mutation.path().to_vec())
+            .collect(),
+        mutation_count: mutations.len(),
+    })
+}
+
+#[cfg(test)]
+mod apply_index_mutation_tests {
+    use super::*;
+
+    fn oid(byte: u8) -> ObjectId {
+        ObjectId::from_raw(ObjectFormat::Sha1, &[byte; 20]).expect("valid sha1")
+    }
+
+    fn entry(path: &[u8], stage: u16, byte: u8) -> IndexEntry {
+        IndexEntry {
+            ctime_seconds: 1,
+            ctime_nanoseconds: 2,
+            mtime_seconds: 3,
+            mtime_nanoseconds: 4,
+            dev: 5,
+            ino: 6,
+            mode: 0o100644,
+            uid: 7,
+            gid: 8,
+            size: 9,
+            oid: oid(byte),
+            flags: (path.len() as u16) | (stage << 12),
+            flags_extended: 0,
+            path: BString::from(path),
+        }
+    }
+
+    #[test]
+    fn batch_replaces_all_stages_sorts_and_reports_paths() {
+        let mut index = Index {
+            version: 2,
+            entries: vec![entry(b"z", 0, 1), entry(b"a", 2, 2), entry(b"a", 3, 3)],
+            extensions: Vec::new(),
+            checksum: None,
+        };
+        let mutations = vec![
+            ApplyIndexMutation::Upsert {
+                path: b"a".to_vec(),
+                mode: 0o100755,
+                oid: oid(4),
+            },
+            ApplyIndexMutation::Remove {
+                path: b"z".to_vec(),
+            },
+        ];
+        let outcome = apply_index_mutations(&mut index, &mutations, ApplyIndexOptions::default())
+            .expect("apply mutations");
+        assert_eq!(outcome.mutation_count, 2);
+        assert_eq!(outcome.touched_paths, vec![b"a".to_vec(), b"z".to_vec()]);
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].path.as_bytes(), b"a");
+        assert_eq!(index.entries[0].mode, 0o100755);
+        assert_eq!(index.entries[0].oid, oid(4));
+        assert_eq!(index.entries[0].mtime_seconds, 0);
+    }
+}
+
 /// Pick the base version for a freshly-created index, mirroring git's
 /// `get_index_format_default`: `GIT_INDEX_VERSION` wins when set (warning +
 /// default on a malformed / out-of-range value), otherwise `feature.manyFiles`
@@ -146,6 +298,7 @@ pub fn update_index_paths_with_index(
         options,
         None,
         false,
+        IndexCleanMode::Normal,
     )
 }
 
@@ -214,6 +367,7 @@ pub fn update_index_ordered_paths_filtered_with_index(
         options,
         Some(config),
         verbose,
+        IndexCleanMode::Normal,
     )
 }
 
@@ -290,6 +444,44 @@ pub fn update_index_paths_filtered_with_index(
         options,
         Some(config),
         false,
+        IndexCleanMode::Normal,
+    )
+}
+
+/// Reapply the configured clean conversion to tracked paths even when their
+/// current index blobs contain CRLF. This is the engine operation behind
+/// `git add --renormalize`: unlike a normal add, it deliberately bypasses the
+/// "new safer autocrlf" safeguard while preserving the regular filtered index
+/// update and object-writing path.
+pub fn renormalize_index_paths_filtered(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    config: &GitConfig,
+) -> Result<UpdateIndexResult> {
+    let git_dir = git_dir.as_ref();
+    let index = read_index_or_fresh(git_dir, format)?;
+    let options = UpdateIndexOptions {
+        add: true,
+        remove: true,
+        force_remove: false,
+        chmod: None,
+        info_only: false,
+        ignore_skip_worktree_entries: false,
+        allow_skip_worktree_entries: false,
+    };
+    let ordered = ordered_paths_from_plain(paths, options);
+    update_index_paths_impl(
+        worktree_root.as_ref(),
+        git_dir,
+        format,
+        index,
+        &ordered,
+        options,
+        Some(config),
+        false,
+        IndexCleanMode::Renormalize,
     )
 }
 
@@ -402,6 +594,68 @@ pub fn add_update_all_tracked_filtered(
     Ok(actions)
 }
 
+/// Collect the worktree changes that a regular `add` invocation can stage,
+/// relative to a caller-owned index.
+///
+/// Unlike general status, this operation deliberately does not compare the
+/// index to `HEAD`: staged differences are irrelevant when deciding what a
+/// subsequent add can update. That distinction also lets a sparse index keep
+/// absent, out-of-cone trees collapsed. Their sparse-directory entries act as
+/// tracked boundaries for the untracked walk, while the tracked precheck treats
+/// an absent skip-worktree directory as clean.
+pub fn collect_index_worktree_status_with_index(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    index: &Index,
+) -> Result<Vec<ShortStatusEntry>> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let index_mtime = fs::metadata(index_path)
+        .ok()
+        .and_then(|metadata| file_mtime_parts(&metadata));
+    let stat_cache = IndexStatCache::from_index_mtime_only(index_mtime);
+    let sparse_checkout_active = sparse_checkout_active_for_status(git_dir, index);
+    let mut entries = short_status_tracked_only_head_matches_index_parallel(
+        worktree_root,
+        git_dir,
+        format,
+        index,
+        &stat_cache,
+        sparse_checkout_active,
+        StatusUntrackedMode::All,
+    )?;
+    let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
+    let untracked = status_untracked_paths_from_index(
+        worktree_root,
+        git_dir,
+        index,
+        &stat_cache,
+        &mut ignores,
+        StatusUntrackedMode::All,
+        None,
+    )?;
+    append_untracked_status_entries(&mut entries, untracked);
+    entries.sort_by(|left, right| {
+        status_sort_category(left)
+            .cmp(&status_sort_category(right))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(entries)
+}
+
+/// Add-specific name retained for callers that use the index/worktree query to
+/// resolve staging actions.
+pub fn collect_add_worktree_status_with_index(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    index: &Index,
+) -> Result<Vec<ShortStatusEntry>> {
+    collect_index_worktree_status_with_index(worktree_root, git_dir, format, index)
+}
+
 pub fn add_exact_tracked_path_from_disk(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
@@ -485,19 +739,13 @@ pub fn add_exact_tracked_path_from_disk(
             clean_filter
                 .matcher
                 .attributes_for_path(git_path, &clean_filter.requested, false);
-        // git's index update folds in `global_conv_flags_eol`, so `git add`
-        // emits the `core.safecrlf` round-trip warning (default: warn). The
-        // current index blob (`entry.oid`) drives the auto-crlf
-        // `has_crlf_in_index` decision. Mirror the slow `add_update_tracked_path`
-        // path here so the exact-patch fast path does not silently drop the
-        // warning (upstream t0020 'safecrlf: print warning only once').
+        // The current index blob drives git's `has_crlf_in_index` decision for
+        // both the "new safer autocrlf" conversion guard and safecrlf warnings.
+        // It must therefore be available even when `core.safecrlf=false`.
         let conv_flags = ConvFlags::from_config(&clean_filter.config);
-        let index_blob = match conv_flags {
-            ConvFlags::Off => SafeCrlfIndexBlob::None,
-            _ => SafeCrlfIndexBlob::Lookup {
-                odb: &odb,
-                oid: entry.oid,
-            },
+        let index_blob = SafeCrlfIndexBlob::Lookup {
+            odb: &odb,
+            oid: entry.oid,
         };
         apply_clean_filter_cow_inner(
             &clean_filter.config,
@@ -886,17 +1134,12 @@ pub(crate) fn add_update_tracked_path(
             clean_filter
                 .matcher
                 .attributes_for_path(git_path, &clean_filter.requested, false);
-        // git's `add -u` index update folds in `global_conv_flags_eol`, so emit
-        // the `core.safecrlf` round-trip warning (default: warn). The current
-        // index blob (`entry.oid`) drives the auto-crlf `has_crlf_in_index`
-        // decision.
+        // The current index blob drives git's `has_crlf_in_index` decision for
+        // both the "new safer autocrlf" conversion guard and safecrlf warnings.
         let conv_flags = ConvFlags::from_config(&clean_filter.config);
-        let index_blob = match conv_flags {
-            ConvFlags::Off => SafeCrlfIndexBlob::None,
-            _ => SafeCrlfIndexBlob::Lookup {
-                odb,
-                oid: entry.oid,
-            },
+        let index_blob = SafeCrlfIndexBlob::Lookup {
+            odb,
+            oid: entry.oid,
         };
         apply_clean_filter_cow_inner(
             &clean_filter.config,
@@ -1092,6 +1335,12 @@ pub(crate) fn write_pending_large_blobs(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexCleanMode {
+    Normal,
+    Renormalize,
+}
+
 pub(crate) fn update_index_paths_impl(
     worktree_root: &Path,
     git_dir: &Path,
@@ -1101,6 +1350,7 @@ pub(crate) fn update_index_paths_impl(
     options: UpdateIndexOptions,
     clean_config: Option<&GitConfig>,
     verbose: bool,
+    clean_mode: IndexCleanMode,
 ) -> Result<UpdateIndexResult> {
     let odb = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut large_policy = LargeObjectPolicy::from_config(git_dir, None)?;
@@ -1118,9 +1368,6 @@ pub(crate) fn update_index_paths_impl(
     let trust_symlinks = clean_config
         .map(trust_symlinks)
         .unwrap_or_else(|| trust_symlinks_from_git_dir(git_dir, None));
-    if options.allow_skip_worktree_entries {
-        expand_sparse_index(&mut index, &odb, format)?;
-    }
     let sparse_checkout_active = sparse_checkout_config_enabled(git_dir)
         || index.is_sparse()
         || index.entries.iter().any(IndexEntry::is_sparse_dir);
@@ -1165,7 +1412,9 @@ pub(crate) fn update_index_paths_impl(
         })?;
         let git_path = git_path_bytes(relative)?;
         if index_sparse_dir_contains_path(&index, &git_path) {
-            expand_sparse_index(&mut index, &odb, format)?;
+            expand_sparse_index_directories(&mut index, &odb, format, |directory| {
+                git_path.starts_with(directory)
+            })?;
         }
         let existing_range = index_entries_path_range(&index.entries, &git_path);
         if path_mode.force_remove {
@@ -1320,14 +1569,17 @@ pub(crate) fn update_index_paths_impl(
             symlink_target_bytes(&absolute)?
         } else {
             let body = fs::read(&absolute)?;
-            // The safecrlf auto-crlf decision needs the path's *current* index
-            // blob (git's `has_crlf_in_index`); the stage-0 entry, if any, has it.
-            let index_blob = match conv_flags {
-                ConvFlags::Off => SafeCrlfIndexBlob::None,
-                _ => stage0_oid_in_range(&index.entries, existing_range.clone()).map_or(
-                    SafeCrlfIndexBlob::None,
-                    |oid| SafeCrlfIndexBlob::Lookup { odb: &odb, oid },
-                ),
+            // Normal add consults the current stage-0 blob for git's "new safer
+            // autocrlf" rule. `--renormalize` deliberately bypasses that guard
+            // so the clean policy is reapplied to legacy CRLF blobs.
+            let index_blob = match clean_mode {
+                IndexCleanMode::Renormalize => SafeCrlfIndexBlob::None,
+                IndexCleanMode::Normal => {
+                    stage0_oid_in_range(&index.entries, existing_range.clone()).map_or(
+                        SafeCrlfIndexBlob::None,
+                        |oid| SafeCrlfIndexBlob::Lookup { odb: &odb, oid },
+                    )
+                }
             };
             match (clean_config, &clean_filter) {
                 (Some(config), Some(UpdateIndexCleanFilter::Full(matcher))) => {
@@ -1366,7 +1618,7 @@ pub(crate) fn update_index_paths_impl(
         if is_symlink {
             entry.mode = 0o120000;
         }
-        if let Some(mode) = preferred_unmerged_mode_for_untrusted_worktree(
+        if let Some(mode) = preferred_index_mode_for_untrusted_worktree(
             &index.entries[existing_range.clone()],
             trust_filemode,
             trust_symlinks,
@@ -1381,7 +1633,7 @@ pub(crate) fn update_index_paths_impl(
             // that is not a regular file (a symlink/gitlink has no such bit). It
             // writes the blob first, reports the error, and still writes the
             // other index updates.
-            if is_symlink {
+            if entry.mode & 0o170000 != 0o100000 {
                 eprintln!(
                     "fatal: git update-index: cannot chmod {}x '{}'",
                     if executable { '+' } else { '-' },
@@ -1547,7 +1799,7 @@ pub fn refresh_index_paths_with_options(
             index_dirty = true;
         }
         let absolute = worktree_root.join(repo_path_to_os_path(entry.path.as_bytes())?);
-        let Ok(metadata) = fs::metadata(&absolute) else {
+        let Ok(metadata) = fs::symlink_metadata(&absolute) else {
             if ignore_missing {
                 continue;
             }
@@ -1591,7 +1843,8 @@ pub fn refresh_index_paths_with_options(
                 }
             }
         }
-        if !metadata.is_file() {
+        let is_symlink = metadata.file_type().is_symlink();
+        if !(metadata.is_file() || is_symlink) {
             if !quiet {
                 print_update_index_needs_update(entry.path.as_bytes());
             }
@@ -1607,10 +1860,19 @@ pub fn refresh_index_paths_with_options(
         if stat_cache.reuse_index_entry(entry, &metadata).is_some() {
             continue;
         }
-        let body = fs::read(&absolute)?;
+        let body = if is_symlink {
+            symlink_target_bytes(&absolute)?
+        } else {
+            fs::read(&absolute)?
+        };
         let object = EncodedObject::new(ObjectType::Blob, body);
         let oid = object.object_id(format)?;
-        if oid != entry.oid || file_mode_with_trust(&metadata, trust_filemode) != entry.mode {
+        let worktree_mode = if is_symlink {
+            sley_index::SYMLINK_MODE
+        } else {
+            file_mode_with_trust(&metadata, trust_filemode)
+        };
+        if oid != entry.oid || worktree_mode != entry.mode {
             if !quiet {
                 print_update_index_needs_update(entry.path.as_bytes());
             }
@@ -1619,12 +1881,15 @@ pub fn refresh_index_paths_with_options(
                 && !selected_paths.is_empty()
                 && selected_paths.contains(entry.path.as_bytes())
             {
-                let updated_entry = index_entry_from_metadata_with_filemode(
+                let mut updated_entry = index_entry_from_metadata_with_filemode(
                     entry.path.clone(),
                     oid,
                     &metadata,
                     trust_filemode,
                 );
+                if is_symlink {
+                    updated_entry.mode = sley_index::SYMLINK_MODE;
+                }
                 if updated_entry != *entry {
                     *entry = updated_entry;
                     index_dirty = true;
@@ -1632,12 +1897,15 @@ pub fn refresh_index_paths_with_options(
             }
             continue;
         }
-        let updated_entry = index_entry_from_metadata_with_filemode(
+        let mut updated_entry = index_entry_from_metadata_with_filemode(
             entry.path.clone(),
             oid,
             &metadata,
             trust_filemode,
         );
+        if is_symlink {
+            updated_entry.mode = sley_index::SYMLINK_MODE;
+        }
         if updated_entry != *entry {
             *entry = updated_entry;
             index_dirty = true;
@@ -1686,7 +1954,7 @@ pub(crate) fn refresh_all_index_paths_parallel(
                 let entry = &mut index.entries[idx];
                 let path = entry.path.as_bytes().to_vec();
                 let absolute = worktree_root.join(repo_path_to_os_path(&path)?);
-                let Ok(metadata) = fs::metadata(&absolute) else {
+                let Ok(metadata) = fs::symlink_metadata(&absolute) else {
                     if ignore_missing {
                         continue;
                     }
@@ -1724,7 +1992,8 @@ pub(crate) fn refresh_all_index_paths_parallel(
                         }
                     }
                 }
-                if !metadata.is_file() {
+                let is_symlink = metadata.file_type().is_symlink();
+                if !(metadata.is_file() || is_symlink) {
                     if !quiet {
                         print_update_index_needs_update(&path);
                     }
@@ -1734,23 +2003,34 @@ pub(crate) fn refresh_all_index_paths_parallel(
                 if stat_cache.reuse_index_entry(entry, &metadata).is_some() {
                     continue;
                 }
-                let body = fs::read(&absolute)?;
+                let body = if is_symlink {
+                    symlink_target_bytes(&absolute)?
+                } else {
+                    fs::read(&absolute)?
+                };
                 let object = EncodedObject::new(ObjectType::Blob, body);
                 let oid = object.object_id(format)?;
-                if oid != entry.oid || file_mode_with_trust(&metadata, trust_filemode) != entry.mode
-                {
+                let worktree_mode = if is_symlink {
+                    sley_index::SYMLINK_MODE
+                } else {
+                    file_mode_with_trust(&metadata, trust_filemode)
+                };
+                if oid != entry.oid || worktree_mode != entry.mode {
                     if !quiet {
                         print_update_index_needs_update(&path);
                     }
                     needs_update = true;
                     continue;
                 }
-                let updated_entry = index_entry_from_metadata_with_filemode(
+                let mut updated_entry = index_entry_from_metadata_with_filemode(
                     entry.path.clone(),
                     oid,
                     &metadata,
                     trust_filemode,
                 );
+                if is_symlink {
+                    updated_entry.mode = sley_index::SYMLINK_MODE;
+                }
                 if updated_entry != *entry {
                     *entry = updated_entry;
                     index_dirty = true;
@@ -1779,15 +2059,60 @@ pub fn update_index_again(
 ) -> Result<UpdateIndexResult> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
-    let index_path = repository_index_path(git_dir);
-    if !index_path.exists() {
+    let (entry_count, again_paths) =
+        select_index_again_paths(worktree_root, git_dir, format, paths)?;
+    if again_paths.is_empty() {
         return Ok(UpdateIndexResult {
-            entries: 0,
+            entries: entry_count,
             updated: Vec::new(),
         });
     }
-    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    update_index_paths(worktree_root, git_dir, format, &again_paths, options)
+}
+
+/// Apply `--[no-]skip-worktree` only to the paths selected by `--again`.
+///
+/// Git treats `--again` as a path selector for the other update-index mode in
+/// effect.  It must not re-stage a missing out-of-cone file when the requested
+/// operation is only to clear its skip-worktree bit.
+pub fn set_index_skip_worktree_again(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    skip_worktree: bool,
+) -> Result<UpdateIndexResult> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let (entry_count, again_paths) =
+        select_index_again_paths(worktree_root, git_dir, format, paths)?;
+    if again_paths.is_empty() {
+        return Ok(UpdateIndexResult {
+            entries: entry_count,
+            updated: Vec::new(),
+        });
+    }
+    set_index_skip_worktree_paths(worktree_root, git_dir, format, &again_paths, skip_worktree)
+}
+
+fn select_index_again_paths(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+) -> Result<(usize, Vec<PathBuf>)> {
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok((0, Vec::new()));
+    }
+    let mut index = Index::parse(&fs::read(&index_path)?, format)?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    // `--again` compares logical index entries with HEAD.  A collapsed sparse
+    // directory is an index storage node, not a tracked path; comparing it to
+    // the flattened HEAD map incorrectly selects every out-of-cone directory
+    // for a worktree update.  Expand only the temporary comparison view, with
+    // no observable full-index transition.
+    expand_sparse_index_in_memory(&mut index, &db, format)?;
     let head_entries = head_tree_entries(git_dir, format, &db)?;
     let selected_paths = selected_git_paths(worktree_root, paths)?;
     let mut again_paths = Vec::new();
@@ -1807,13 +2132,7 @@ pub fn update_index_again(
             again_paths.push(worktree_root.join(repo_path_to_os_path(entry.path.as_bytes())?));
         }
     }
-    if again_paths.is_empty() {
-        return Ok(UpdateIndexResult {
-            entries: index.entries.len(),
-            updated: Vec::new(),
-        });
-    }
-    update_index_paths(worktree_root, git_dir, format, &again_paths, options)
+    Ok((index.entries.len(), again_paths))
 }
 
 pub fn set_index_assume_unchanged_paths(
@@ -2265,7 +2584,7 @@ pub(crate) fn update_cache_tree_for_git_paths(
 ///
 /// This is for commands that have just materialized a complete staged tree
 /// (read-tree, checkout/reset, write-tree/commit). Incremental index mutators
-/// should use [`update_cache_tree_for_git_paths`] so untouched valid subtrees
+/// should use `update_cache_tree_for_git_paths` so untouched valid subtrees
 /// can be preserved and touched paths become invalid, matching git-add.
 pub fn refresh_cache_tree(index: &mut Index, odb: &FileObjectDatabase) {
     match build_cache_tree_for_index_update(&index.entries, b"", &[], odb) {
@@ -3349,6 +3668,52 @@ pub(crate) fn invalidate_untracked_cache_for_git_paths(
     index.set_untracked_cache(format, Some(&cache))
 }
 
+/// Carry index extensions whose semantics survive a checkout index rebuild.
+///
+/// `TREE`, `REUC`, split-index, sparse-index, fsmonitor, and layout extensions
+/// describe the old entry table or its serialization and must be rebuilt or
+/// discarded. The untracked-directory cache is independent of entry layout,
+/// so Git preserves it while invalidating the directory nodes touched by paths
+/// whose logical index state changed.
+pub fn preserve_checkout_index_extensions(
+    previous: &Index,
+    next: &mut Index,
+    format: ObjectFormat,
+) -> Result<()> {
+    let Some(cache) = previous.untracked_cache(format)? else {
+        return Ok(());
+    };
+    next.set_untracked_cache(format, Some(&cache))?;
+
+    type Fingerprint = (Stage, u32, ObjectId, bool, bool);
+    fn entries_by_path(index: &Index) -> BTreeMap<Vec<u8>, Vec<Fingerprint>> {
+        let mut entries = BTreeMap::<Vec<u8>, Vec<Fingerprint>>::new();
+        for entry in &index.entries {
+            entries
+                .entry(entry.path.as_bytes().to_vec())
+                .or_default()
+                .push((
+                    entry.stage(),
+                    entry.mode,
+                    entry.oid,
+                    entry.is_skip_worktree(),
+                    entry.is_intent_to_add(),
+                ));
+        }
+        entries
+    }
+
+    let previous_entries = entries_by_path(previous);
+    let next_entries = entries_by_path(next);
+    let mut paths = previous_entries
+        .keys()
+        .chain(next_entries.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    paths.retain(|path| previous_entries.get(path) != next_entries.get(path));
+    invalidate_untracked_cache_for_git_paths(next, format, &paths.into_iter().collect::<Vec<_>>())
+}
+
 pub(crate) fn invalidate_untracked_cache_dir_for_path(root: &mut UntrackedCacheDir, path: &[u8]) {
     invalidate_untracked_cache_node(root);
     let mut current = root;
@@ -3377,6 +3742,24 @@ pub fn update_index_cacheinfo(
     add: bool,
     verbose: bool,
 ) -> Result<UpdateIndexResult> {
+    update_index_cacheinfo_with_options(
+        git_dir,
+        format,
+        entries,
+        UpdateIndexCacheInfoOptions {
+            add,
+            replace: false,
+            verbose,
+        },
+    )
+}
+
+pub fn update_index_cacheinfo_with_options(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    entries: &[CacheInfoEntry],
+    options: UpdateIndexCacheInfoOptions,
+) -> Result<UpdateIndexResult> {
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let mut index = if index_path.exists() {
@@ -3389,17 +3772,36 @@ pub fn update_index_cacheinfo(
             checksum: None,
         }
     };
+    if index.entries.iter().any(IndexEntry::is_sparse_dir) {
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        expand_sparse_index_directories(&mut index, &db, format, |directory| {
+            entries
+                .iter()
+                .any(|entry| entry.path.starts_with(directory))
+        })?;
+    }
     let mut updated = Vec::new();
     let mut reports: Vec<String> = Vec::new();
     let mut untracked_cache_invalidation_paths = Vec::new();
     for cacheinfo in entries {
-        if !add
+        if !options.add
             && !index
                 .entries
                 .iter()
                 .any(|existing| existing.path == cacheinfo.path)
         {
             let path = String::from_utf8_lossy(&cacheinfo.path);
+            eprintln!("error: {path}: cannot add to the index - missing --add option?");
+            eprintln!("fatal: git update-index: --cacheinfo cannot add {path}");
+            return Err(GitError::Exit(128));
+        }
+        if !options.replace
+            && index.entries.iter().any(|existing| {
+                index_paths_have_directory_file_conflict(existing.path.as_bytes(), &cacheinfo.path)
+            })
+        {
+            let path = String::from_utf8_lossy(&cacheinfo.path);
+            eprintln!("error: '{path}' appears as both a file and as a directory");
             eprintln!("error: {path}: cannot add to the index - missing --add option?");
             eprintln!("fatal: git update-index: --cacheinfo cannot add {path}");
             return Err(GitError::Exit(128));
@@ -3421,10 +3823,21 @@ pub fn update_index_cacheinfo(
             flags_extended: 0,
             path: BString::from(cacheinfo.path.as_slice()),
         };
+        if options.replace {
+            remove_index_entries_under_dir(&mut index.entries, &cacheinfo.path);
+            remove_index_dir_name_conflicts(&mut index.entries, &cacheinfo.path);
+        }
         index.entries.retain(|existing| {
             existing.path != cacheinfo.path || index_entry_stage(existing) != cacheinfo.stage
         });
         index.entries.push(entry);
+        // A following `--cacheinfo` record in the same invocation may need the
+        // D/F replacement helpers, whose binary searches require index order.
+        index.entries.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| index_entry_stage(left).cmp(&index_entry_stage(right)))
+        });
         untracked_cache_invalidation_paths.push(cacheinfo.path.clone());
         updated.push(cacheinfo.oid);
         // git's add_cacheinfo() calls report("add '%s'") *after* the entry is
@@ -3434,16 +3847,13 @@ pub fn update_index_cacheinfo(
             String::from_utf8_lossy(&cacheinfo.path)
         ));
     }
-    index
-        .entries
-        .sort_by(|left, right| left.path.cmp(&right.path));
     // git refuses to write an index entry whose object id is the null oid:
     // do_write_index() emits `error: cache entry has null sha1: <path>` and
     // returns nonzero, leaving the on-disk index untouched. The verbose `add`
     // line has already been printed by then.
     let null_entry = index.entries.iter().find(|entry| entry.oid.is_null());
     if let Some(entry) = null_entry {
-        if verbose {
+        if options.verbose {
             flush_update_index_reports(&reports)?;
         }
         eprintln!(
@@ -3461,13 +3871,23 @@ pub fn update_index_cacheinfo(
         &untracked_cache_invalidation_paths,
     )?;
     write_repository_index_ref(git_dir, format, &index)?;
-    if verbose {
+    if options.verbose {
         flush_update_index_reports(&reports)?;
     }
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated,
     })
+}
+
+fn index_paths_have_directory_file_conflict(left: &[u8], right: &[u8]) -> bool {
+    fn is_directory_prefix(prefix: &[u8], path: &[u8]) -> bool {
+        path.len() > prefix.len()
+            && path.starts_with(prefix)
+            && path.get(prefix.len()) == Some(&b'/')
+    }
+
+    is_directory_prefix(left, right) || is_directory_prefix(right, left)
 }
 
 pub(crate) fn flush_update_index_reports(reports: &[String]) -> Result<()> {

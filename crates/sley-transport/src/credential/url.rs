@@ -25,10 +25,7 @@ pub(crate) fn credential_match(
         && field_matches(want.username.as_deref(), have.username.as_deref())
         && (!match_password
             || (field_matches(want.password.as_deref(), have.password.as_deref())
-                && field_matches(
-                    want.credential.as_deref(),
-                    have.credential.as_deref(),
-                )))
+                && field_matches(want.credential.as_deref(), have.credential.as_deref())))
 }
 
 fn field_matches(want: Option<&str>, have: Option<&str>) -> bool {
@@ -89,8 +86,11 @@ pub(crate) enum EncodeMode {
 pub(crate) fn percent_encode(input: &str, mode: EncodeMode, out: &mut String) {
     for ch in input.chars() {
         let encode = match mode {
-            EncodeMode::Slash => ch == '/',
-            EncodeMode::HostAndPort => matches!(ch, '/' | '?' | '#' | '[' | ']' | '@'),
+            EncodeMode::Slash => ch == '/' || !is_rfc3986_reserved_or_unreserved(ch),
+            EncodeMode::HostAndPort => {
+                matches!(ch, '/' | '?' | '#' | '[' | ']' | '@')
+                    || !is_rfc3986_reserved_or_unreserved(ch)
+            }
             EncodeMode::Path | EncodeMode::StorePath => false,
             EncodeMode::Unreserved => !is_rfc3986_unreserved(ch),
         };
@@ -155,12 +155,13 @@ fn url_decode(input: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push((hi << 4) | lo);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -182,14 +183,6 @@ pub(crate) fn credential_from_url_gently(
     allow_partial_url: bool,
     quiet: bool,
 ) -> Result<GitCredential> {
-    if url.bytes().any(|byte| matches!(byte, b'\n' | b'\r')) {
-        if !quiet {
-            eprintln!("warning: url contains newline or carriage return: {url}");
-        }
-        return Err(GitError::InvalidFormat(
-            "url contains newline or carriage return".into(),
-        ));
-    }
     let proto_end = url.find("://");
     if !allow_partial_url && (proto_end.is_none() || proto_end == Some(0)) {
         if !quiet {
@@ -245,6 +238,22 @@ pub(crate) fn credential_from_url_gently(
         credential.username_from_proto = true;
     }
     credential.password = password.filter(|value| !value.is_empty());
+    for (name, value) in [
+        ("username", credential.username.as_deref()),
+        ("password", credential.password.as_deref()),
+        ("protocol", credential.protocol.as_deref()),
+        ("host", credential.host.as_deref()),
+        ("path", credential.path.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.contains('\n')) {
+            if !quiet {
+                eprintln!("warning: url contains a newline in its {name} component: {url}");
+            }
+            return Err(GitError::InvalidFormat(format!(
+                "url contains a newline in its {name} component"
+            )));
+        }
+    }
     Ok(credential)
 }
 
@@ -253,8 +262,15 @@ pub(crate) fn credential_from_potentially_partial_url(url: &str) -> Result<GitCr
 }
 
 pub(crate) fn credential_from_url(credential: &mut GitCredential, url: &str) -> Result<()> {
-    *credential = credential_from_url_gently(url, false, false)?;
-    Ok(())
+    match credential_from_url_gently(url, false, false) {
+        Ok(parsed) => {
+            *credential = parsed;
+            Ok(())
+        }
+        Err(_) => Err(GitError::InvalidFormat(format!(
+            "fatal: credential url cannot be parsed: {url}"
+        ))),
+    }
 }
 
 pub(crate) fn collect_credential_config_stack(
@@ -369,7 +385,7 @@ fn apply_sorted_helpers(
         .into_iter()
         .map(|(key, (score, value))| (score, key, value))
         .collect();
-    helpers.sort_by(|a, b| b.0.cmp(&a.0));
+    helpers.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     for (_, _, helper) in helpers {
         if helper.is_empty() {
             credential.helpers.clear();
@@ -406,9 +422,7 @@ fn apply_subsection_credential_entry(
     credential: &mut GitCredential,
     entry: &sley_config::ConfigEntry,
 ) -> Result<()> {
-    if entry.key.eq_ignore_ascii_case("username")
-        && !credential.username_from_proto
-    {
+    if entry.key.eq_ignore_ascii_case("username") && !credential.username_from_proto {
         credential.username = entry.value.clone();
     } else if entry.key.eq_ignore_ascii_case("usehttppath") {
         credential.use_http_path = parse_bool(entry.value.as_deref());
@@ -443,9 +457,7 @@ fn apply_subsection_credential_stack_entry(
     credential: &mut GitCredential,
     entry: &sley_config::ConfigStackEntry,
 ) -> Result<()> {
-    if entry.key.eq_ignore_ascii_case("username")
-        && !credential.username_from_proto
-    {
+    if entry.key.eq_ignore_ascii_case("username") && !credential.username_from_proto {
         credential.username = entry.value.clone();
     } else if entry.key.eq_ignore_ascii_case("usehttppath") {
         credential.use_http_path = parse_bool(entry.value.as_deref());
@@ -482,15 +494,28 @@ fn urlmatch_score(partial: &str, url: &str) -> Option<UrlMatchScore> {
     }
     let path_len = match (base.path.as_deref(), target.path.as_deref()) {
         (None | Some(""), _) => 1,
-        (Some(base_path), Some(target_path)) if target_path.starts_with(base_path) => base_path.len(),
-        (Some(base_path), Some(target_path)) if base_path == target_path => base_path.len(),
+        (Some(base_path), Some(target_path)) if path_prefix_matches(base_path, target_path) => {
+            base_path.len()
+        }
         _ => return None,
+    };
+    let user_matched = match base.username.as_deref() {
+        Some(base_user) if target.username.as_deref() != Some(base_user) => return None,
+        Some(_) => true,
+        None => false,
     };
     Some(UrlMatchScore {
         host_len: base.host.as_deref().map(str::len).unwrap_or(0),
         path_len,
-        user_matched: false,
+        user_matched,
     })
+}
+
+fn path_prefix_matches(base: &str, target: &str) -> bool {
+    target == base
+        || target
+            .strip_prefix(base)
+            .is_some_and(|remainder| remainder.starts_with('/'))
 }
 
 fn host_matches(url_host: &str, pattern_host: &str) -> bool {
@@ -543,4 +568,52 @@ pub(crate) fn credential_apply_config(
 
 pub(crate) fn parse_timestamp(value: &str) -> i64 {
     value.parse::<i64>().unwrap_or(TIME_MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoded_newline_makes_a_full_url_invalid() {
+        let error = credential_from_url_gently(
+            "https://one.example.com?%0ahost=two.example.com/",
+            false,
+            true,
+        )
+        .expect_err("decoded newline must invalidate a credential URL");
+        assert_eq!(
+            error,
+            GitError::InvalidFormat("url contains a newline in its path component".into())
+        );
+    }
+
+    #[test]
+    fn carriage_return_survives_url_parsing_for_protocol_protection() {
+        let credential = credential_from_url_gently("https://example%0d.com/", false, true)
+            .expect("carriage return is checked by credential protocol protection");
+        assert_eq!(credential.host.as_deref(), Some("example\r.com"));
+    }
+
+    #[test]
+    fn urlmatch_path_prefix_stops_at_component_boundary() {
+        let target = "https://example.com/org/repo.git";
+        assert!(urlmatch_score("https://example.com/org", target).is_some());
+        assert!(urlmatch_score("https://example.com/org/", target).is_some());
+        assert!(urlmatch_score("https://example.com/o", target).is_none());
+    }
+
+    #[test]
+    fn credential_format_sanitizes_username_control_bytes_and_spaces() {
+        let credential = GitCredential {
+            protocol: Some("https".into()),
+            host: Some("example.org".into()),
+            username: Some("\u{7}latrix Lestrange".into()),
+            ..GitCredential::default()
+        };
+        assert_eq!(
+            credential_format(&credential),
+            "https://%07latrix%20Lestrange@example.org"
+        );
+    }
 }

@@ -1510,6 +1510,7 @@ name = "sley-worktree"
 version = "0.4.4"
 dependencies = [
  "encoding_rs",
+ "same-file",
  "sley-config",
  "sley-core",
  "sley-diff-merge",
@@ -1521,6 +1522,9 @@ dependencies = [
  "sley-pathspec",
  "sley-refs",
  "sley-rev",
+ "sley-submodule",
+ "sley-unpack-trees",
+ "tempfile",
 ]
 
 [[package]]

@@ -6,14 +6,14 @@ use std::path::{Path, PathBuf};
 
 use sley_core::{GitError, Result};
 
-use super::url::{
-    credential_from_url_gently, credential_match, percent_encode, EncodeMode,
-};
-use super::{credential_read, CredentialOpType, GitCredential};
+use super::url::{EncodeMode, credential_from_url_gently, credential_match, percent_encode};
+use super::{CredentialOpType, GitCredential, credential_read};
 
 pub struct CredentialStoreOptions {
     pub file: Option<PathBuf>,
 }
+
+type OtherLineCallback<'a> = dyn FnMut(&str) -> Result<()> + 'a;
 
 pub fn cmd_credential_store(args: &[String]) -> Result<()> {
     let mut file: Option<PathBuf> = None;
@@ -24,7 +24,9 @@ pub fn cmd_credential_store(args: &[String]) -> Result<()> {
         if arg == "--file" {
             idx += 1;
             let Some(path) = args.get(idx) else {
-                return Err(GitError::Command("credential-store --file requires a value".into()));
+                return Err(GitError::Command(
+                    "credential-store --file requires a value".into(),
+                ));
             };
             file = Some(PathBuf::from(path));
         } else if let Some(path) = arg.strip_prefix("--file=") {
@@ -44,14 +46,19 @@ pub fn cmd_credential_store(args: &[String]) -> Result<()> {
         ));
     }
     let op = &positional[0];
-    let files = store_file_list(file)?;
+    let options = CredentialStoreOptions { file };
+    let files = store_file_list(options.file)?;
     if files.is_empty() {
         return Err(GitError::Command(
             "unable to set up default path; use --file".into(),
         ));
     }
     let mut credential = GitCredential::default();
-    credential_read(&mut credential, &mut io::stdin().lock(), CredentialOpType::Helper)?;
+    credential_read(
+        &mut credential,
+        &mut io::stdin().lock(),
+        CredentialOpType::Helper,
+    )?;
     match op.as_str() {
         "get" => lookup_credential(&files, &mut credential)?,
         "erase" => remove_credential(&files, &credential)?,
@@ -161,7 +168,7 @@ fn parse_credential_file(
     path: &Path,
     credential: &GitCredential,
     want_match: bool,
-    mut other_cb: Option<&mut dyn FnMut(&str) -> Result<()>>,
+    mut other_cb: Option<&mut OtherLineCallback<'_>>,
     match_password: bool,
 ) -> Result<bool> {
     let Ok(file) = fs::File::open(path) else {

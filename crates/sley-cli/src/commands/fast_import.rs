@@ -19,8 +19,8 @@
 //! ```
 //!
 //! Plus the surrounding `git -c fastimport.unpacklimit=<n> fast-import`
-//! invocation: sley writes objects loose first, then preserves an import pack
-//! when the batch exceeds the configured unpack limit.
+//! invocation: Sley stages stream objects, then writes them loose or preserves
+//! one import pack according to the configured unpack limit.
 //!
 //! Supported subset of the grammar: `commit`, `author`, `committer`, `data`
 //! (both delimited `data <<DELIM` and counted `data <n>` forms), `from`, `mark`,
@@ -29,13 +29,15 @@
 //! `done` are accepted. Anything else is a hard `unsupported command` error so a
 //! caller never silently gets a wrong result — full grammar is out of scope.
 //!
-//! Native Rust only: objects are written straight to the loose object store and
-//! branch refs are updated through the ref transaction layer; no shell-out.
+//! Native Rust only: objects are persisted through the ODB and refs are
+//! published transactionally at checkpoint/end-of-stream; no shell-out.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use crate::*;
-use sley::plumbing::{sley_config, sley_pack, sley_refs, sley_rev};
+use sley::plumbing::{sley_config, sley_odb, sley_pack, sley_refs, sley_rev};
+use std::cell::RefCell;
 use std::io::{BufRead, Write};
+use std::sync::Arc;
 
 #[derive(Default)]
 struct FastImportOptions {
@@ -90,16 +92,20 @@ struct CommitBuild {
     /// Tree entries keyed by full path, seeded from the parent commit's tree and
     /// mutated by `M`/`D` filemodify lines.
     tree: BTreeMap<Vec<u8>, TreeEntry>,
+    /// The inherited tree can be referenced directly when the commit made no
+    /// file changes. `None` means the map must be materialized (a new root or
+    /// any mutating file command).
+    unchanged_tree_oid: Option<ObjectId>,
     author: Vec<u8>,
     committer: Vec<u8>,
     encoding: Option<Vec<u8>>,
+    signature_headers: Vec<Vec<u8>>,
     message: Vec<u8>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FastImportUpdateStatus {
-    Updated,
-    Rejected,
+struct FastImportCommitTree {
+    oid: ObjectId,
+    entries: Arc<BTreeMap<Vec<u8>, TreeEntry>>,
 }
 
 struct FastImportPackState {
@@ -163,7 +169,161 @@ impl FastImportPackState {
     }
 }
 
-pub(crate) fn cmd_fast_import(args: &[String]) -> Result<()> {
+/// Read-through object overlay for one import stream.
+///
+/// Git's fast-import writes into an open pack and only decides at the final
+/// checkpoint whether a small pack should be unpacked. Writing every object
+/// loose first is observably equivalent, but turns a large import into one
+/// temp-file/rename pair per object. Keep new objects in memory so commands in
+/// the same stream can resolve marks and parents, then persist them once at a
+/// checkpoint as either one pack or (for a small import) loose objects.
+struct FastImportDatabase {
+    persistent: FileObjectDatabase,
+    persistent_presence: RefCell<sley_odb::ObjectPresenceChecker>,
+    staged: HashMap<ObjectId, Arc<EncodedObject>>,
+    staged_body_bytes: usize,
+    recent_commit_trees: HashMap<ObjectId, FastImportCommitTree>,
+    recent_commit_tree_order: VecDeque<ObjectId>,
+}
+
+impl FastImportDatabase {
+    // Bound the closed-world overlay independently of stream length. Pack
+    // writing adds transient buffers, so keep the retained body budget modest;
+    // one individual object may still exceed it because parsing that object is
+    // inherently atomic.
+    const MAX_STAGED_BODY_BYTES: usize = 64 * 1024 * 1024;
+    const MAX_STAGED_OBJECTS: usize = 100_000;
+    const RECENT_COMMIT_TREE_LIMIT: usize = 8;
+    const MAX_CACHED_COMMIT_TREE_ENTRIES: usize = 4096;
+    const MAX_CACHED_COMMIT_TREE_BYTES: usize = 1024 * 1024;
+
+    fn new(persistent: FileObjectDatabase) -> Self {
+        let persistent_presence = RefCell::new(persistent.presence_checker());
+        Self {
+            persistent,
+            persistent_presence,
+            staged: HashMap::new(),
+            staged_body_bytes: 0,
+            recent_commit_trees: HashMap::new(),
+            recent_commit_tree_order: VecDeque::new(),
+        }
+    }
+
+    fn object_format(&self) -> ObjectFormat {
+        self.persistent.object_format()
+    }
+
+    fn contains(&self, oid: &ObjectId) -> Result<bool> {
+        Ok(self.staged.contains_key(oid)
+            || self
+                .persistent_presence
+                .borrow_mut()
+                .contains_without_refresh(oid)?)
+    }
+
+    fn stage(&mut self, oid: ObjectId, object: EncodedObject) {
+        self.staged_body_bytes = self.staged_body_bytes.saturating_add(object.body.len());
+        self.staged.insert(oid, Arc::new(object));
+    }
+
+    fn should_flush_staged(&self) -> bool {
+        Self::staging_budget_exceeded(self.staged.len(), self.staged_body_bytes)
+    }
+
+    fn staging_budget_exceeded(object_count: usize, body_bytes: usize) -> bool {
+        object_count >= Self::MAX_STAGED_OBJECTS || body_bytes >= Self::MAX_STAGED_BODY_BYTES
+    }
+
+    fn take_staged(&mut self, oid: &ObjectId) -> Option<Arc<EncodedObject>> {
+        let object = self.staged.remove(oid)?;
+        self.staged_body_bytes = self.staged_body_bytes.saturating_sub(object.body.len());
+        Some(object)
+    }
+
+    fn persist_staged_loose(&mut self, oids: &[ObjectId]) -> Result<()> {
+        for oid in oids {
+            if let Some(object) = self.take_staged(oid) {
+                self.persistent.write_object(object.as_ref().clone())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn discard_staged(&mut self, oids: &[ObjectId]) {
+        for oid in oids {
+            self.take_staged(oid);
+        }
+    }
+
+    fn refresh_persistent_presence(&mut self) {
+        self.persistent_presence = RefCell::new(self.persistent.presence_checker());
+    }
+
+    fn remember_commit_tree(
+        &mut self,
+        commit_oid: ObjectId,
+        tree_oid: ObjectId,
+        entries: Arc<BTreeMap<Vec<u8>, TreeEntry>>,
+    ) {
+        let estimated_bytes = entries.iter().fold(0usize, |total, (path, entry)| {
+            total
+                .saturating_add(path.len())
+                .saturating_add(entry.name.as_bytes().len())
+                .saturating_add(mem::size_of::<TreeEntry>())
+        });
+        if entries.len() > Self::MAX_CACHED_COMMIT_TREE_ENTRIES
+            || estimated_bytes > Self::MAX_CACHED_COMMIT_TREE_BYTES
+        {
+            return;
+        }
+        if self.recent_commit_trees.contains_key(&commit_oid) {
+            return;
+        }
+        while self.recent_commit_tree_order.len() >= Self::RECENT_COMMIT_TREE_LIMIT {
+            if let Some(expired) = self.recent_commit_tree_order.pop_front() {
+                self.recent_commit_trees.remove(&expired);
+            }
+        }
+        self.recent_commit_tree_order.push_back(commit_oid);
+        self.recent_commit_trees.insert(
+            commit_oid,
+            FastImportCommitTree {
+                oid: tree_oid,
+                entries,
+            },
+        );
+    }
+
+    fn recent_commit_tree(&self, commit_oid: &ObjectId) -> Option<&FastImportCommitTree> {
+        self.recent_commit_trees.get(commit_oid)
+    }
+}
+
+impl sley_odb::ObjectReader for FastImportDatabase {
+    fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
+        self.staged
+            .get(oid)
+            .cloned()
+            .map_or_else(|| self.persistent.read_object(oid), Ok)
+    }
+
+    fn is_shallow_graft(&self, oid: &ObjectId) -> bool {
+        self.persistent.is_shallow_graft(oid)
+    }
+
+    fn has_shallow_grafts(&self) -> bool {
+        self.persistent.has_shallow_grafts()
+    }
+
+    fn is_promised_object(&self, oid: &ObjectId) -> bool {
+        self.persistent.is_promised_object(oid)
+    }
+}
+
+pub(crate) fn cmd_fast_import(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     // Accept and ignore the options test_commit_bulk pairs us with; reject
     // anything we don't model so a caller never gets a silently-wrong import.
     let mut require_done = false;
@@ -238,9 +398,9 @@ pub(crate) fn cmd_fast_import(args: &[String]) -> Result<()> {
         }
     }
 
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
-    let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let mut db = FastImportDatabase::new(FileObjectDatabase::from_git_dir(&git_dir, format));
     let store = FileRefStore::new(&git_dir, format);
     let pack_policy = fast_import_pack_policy(&git_dir, options.export_pack_edges.is_some())?;
     let mut pack_state = FastImportPackState::new(
@@ -258,6 +418,7 @@ pub(crate) fn cmd_fast_import(args: &[String]) -> Result<()> {
     load_mark_imports(&mut marks, format, &options.import_marks)?;
     load_submodule_rewrites(format, &mut options)?;
     let mut ref_states: HashMap<String, FastImportRefState> = HashMap::new();
+    let mut dirty_refs: HashSet<String> = HashSet::new();
     let mut saw_done = false;
     let mut features_allowed = true;
     let mut failed_ref_update = false;
@@ -286,16 +447,16 @@ pub(crate) fn cmd_fast_import(args: &[String]) -> Result<()> {
         } else if let Some(rest) = line_after(&line, b"commit ") {
             features_allowed = false;
             let ref_name = resolve_commit_ref(&store, rest)?;
-            failed_ref_update |= handle_commit(
+            handle_commit(
                 &mut parser,
                 &mut db,
                 &store,
-                &git_dir,
                 format,
                 &options,
                 &mut marks,
                 &mut pack_state,
                 &mut ref_states,
+                &mut dirty_refs,
                 ref_name,
                 &mut cat_blob_out,
             )?;
@@ -308,12 +469,12 @@ pub(crate) fn cmd_fast_import(args: &[String]) -> Result<()> {
                 &mut parser,
                 &mut db,
                 &store,
-                &git_dir,
                 format,
                 options.date_format,
                 &mut marks,
                 &mut pack_state,
-                &ref_states,
+                &mut ref_states,
+                &mut dirty_refs,
                 rest,
             )?;
         } else if let Some(rest) = line_after(&line, b"alias") {
@@ -333,10 +494,10 @@ pub(crate) fn cmd_fast_import(args: &[String]) -> Result<()> {
                 &mut parser,
                 &db,
                 &store,
-                &git_dir,
                 format,
                 &marks,
                 &mut ref_states,
+                &mut dirty_refs,
                 rest,
             )?;
         } else if let Some(rest) = line_after(&line, b"cat-blob ") {
@@ -371,6 +532,15 @@ pub(crate) fn cmd_fast_import(args: &[String]) -> Result<()> {
             // `checkpoint` asks fast-import to flush durable state, including a
             // currently-open pack when pack mode is active.
             flush_fast_import_pack(&git_dir, &mut db, format, &mut pack_state)?;
+            failed_ref_update |= flush_fast_import_refs(
+                &store,
+                &git_dir,
+                &db,
+                format,
+                options.force,
+                &ref_states,
+                &mut dirty_refs,
+            )?;
             if line.as_slice() == b"done" {
                 saw_done = true;
                 break;
@@ -389,6 +559,12 @@ pub(crate) fn cmd_fast_import(args: &[String]) -> Result<()> {
                 String::from_utf8_lossy(&line).trim_end()
             )));
         }
+        if db.should_flush_staged() {
+            // Object durability is independent of the ref checkpoint: publish
+            // no branch here, but close the current object batch before an
+            // unbounded stream can grow the in-memory overlay without limit.
+            flush_fast_import_pack(&git_dir, &mut db, format, &mut pack_state)?;
+        }
     }
 
     if require_done && !saw_done {
@@ -397,6 +573,15 @@ pub(crate) fn cmd_fast_import(args: &[String]) -> Result<()> {
         ));
     }
     flush_fast_import_pack(&git_dir, &mut db, format, &mut pack_state)?;
+    failed_ref_update |= flush_fast_import_refs(
+        &store,
+        &git_dir,
+        &db,
+        format,
+        options.force,
+        &ref_states,
+        &mut dirty_refs,
+    )?;
     export_marks_if_requested(&marks, &options)?;
     if failed_ref_update {
         return Err(GitError::Command(
@@ -768,7 +953,7 @@ fn fast_import_pack_policy(
     let Ok(config) = GitConfig::read(common_git_dir.join("config")) else {
         return Ok(FastImportPackPolicy {
             force_pack: false,
-            unpack_limit: None,
+            unpack_limit: Some(100),
         });
     };
     Ok(config
@@ -776,7 +961,10 @@ fn fast_import_pack_policy(
         .and_then(fast_import_unpack_limit_policy)
         .unwrap_or(FastImportPackPolicy {
             force_pack: false,
-            unpack_limit: None,
+            // builtin/fast-import.c defaults `unpack_limit` to 100. The
+            // absence of config must therefore still use pack-backed import
+            // for a large stream.
+            unpack_limit: Some(100),
         }))
 }
 
@@ -797,20 +985,33 @@ fn fast_import_unpack_limit_policy(value: &str) -> Option<FastImportPackPolicy> 
 }
 
 fn write_fast_import_object(
-    db: &mut FileObjectDatabase,
+    db: &mut FastImportDatabase,
     pack_state: &mut FastImportPackState,
     object: EncodedObject,
 ) -> Result<ObjectId> {
     let oid = object.object_id(db.object_format())?;
     let existed = db.contains(&oid)?;
-    let written = db.write_object(object)?;
-    pack_state.record_object(written, !existed);
+    if existed {
+        // fast-import's active-pack object count includes an object emitted by
+        // the stream even when an equivalent loose object already exists. That
+        // count controls unpackLimit, and the existing object may consequently
+        // be copied into the preserved pack.
+        pack_state.record_object(oid, false);
+        return Ok(oid);
+    }
+    if pack_state.tracks_pending_objects() {
+        db.stage(oid, object);
+        pack_state.record_object(oid, false);
+    } else {
+        let written = db.persistent.write_object(object)?;
+        pack_state.record_object(written, true);
+    }
     Ok(oid)
 }
 
 fn flush_fast_import_pack(
     git_dir: &Path,
-    db: &mut FileObjectDatabase,
+    db: &mut FastImportDatabase,
     format: ObjectFormat,
     pack_state: &mut FastImportPackState,
 ) -> Result<()> {
@@ -820,6 +1021,7 @@ fn flush_fast_import_pack(
     }
 
     if !pack_state.should_pack_pending() {
+        db.persist_staged_loose(&pack_state.pending)?;
         pack_state.clear_pending();
         return Ok(());
     }
@@ -839,10 +1041,20 @@ fn flush_fast_import_pack(
             object: object.as_ref(),
         })
         .collect::<Vec<_>>();
-    let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
-    let install = db.install_written_pack(&written)?;
-    prune_fast_import_packed_loose(db, &pending_loose, &install.object_ids)?;
-    db.refresh_read_cache();
+    // Git fast-import writes its active pack in input order without a later
+    // repack-style delta search (`verify-pack` reports the imported commits as
+    // non-delta). Running the general packer's sliding window here costs more
+    // CPU and produces a different storage profile for no command-level gain.
+    let pack_options = sley_pack::PackWriteOptions::new()
+        .with_depth(0)
+        .with_reorder(false);
+    let written =
+        PackFile::write_packed_with_known_ids_and_options(&inputs, format, &pack_options)?;
+    let install = db.persistent.install_written_pack(&written)?;
+    prune_fast_import_packed_loose(&db.persistent, &pending_loose, &install.object_ids)?;
+    db.discard_staged(&install.object_ids);
+    db.persistent.refresh_read_cache();
+    db.refresh_persistent_presence();
 
     if let Some(path) = &pack_state.export_edges
         && !edges.is_empty()
@@ -906,12 +1118,11 @@ fn write_progress(out: &mut impl Write, line: &[u8]) -> io::Result<()> {
 }
 
 /// Apply git fast-import's implicit-parent rule: a `commit` with no `from`
-/// inherits the branch's *current* tip (the value the ref holds at this point in
-/// the stream — including a tip written by an earlier commit in the same stream,
-/// since `update_branch` commits each ref update immediately) as both its parent
-/// and its starting tree. Idempotent: once the base is fixed, this is a no-op.
+/// inherits the branch's *current* in-stream tip (including a tip created by an
+/// earlier commit that has not reached a checkpoint yet) as both its parent and
+/// its starting tree. Idempotent: once the base is fixed, this is a no-op.
 fn default_base_from_branch(
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     store: &FileRefStore,
     format: ObjectFormat,
     ref_states: &HashMap<String, FastImportRefState>,
@@ -919,6 +1130,7 @@ fn default_base_from_branch(
     base_fixed: &mut bool,
     parents: &mut Vec<ObjectId>,
     tree: &mut BTreeMap<Vec<u8>, TreeEntry>,
+    unchanged_tree_oid: &mut Option<ObjectId>,
 ) -> Result<()> {
     if *base_fixed {
         return Ok(());
@@ -928,7 +1140,7 @@ fn default_base_from_branch(
         match state {
             FastImportRefState::Empty => {}
             FastImportRefState::Tip(tip) => {
-                seed_tree_from_commit(db, format, tip, tree)?;
+                *unchanged_tree_oid = Some(seed_tree_from_commit(db, format, tip, tree)?);
                 parents.clear();
                 parents.push(*tip);
             }
@@ -936,7 +1148,7 @@ fn default_base_from_branch(
         return Ok(());
     }
     if let Some(tip) = resolve_ref_peeled(store, ref_name)? {
-        seed_tree_from_commit(db, format, &tip, tree)?;
+        *unchanged_tree_oid = Some(seed_tree_from_commit(db, format, &tip, tree)?);
         parents.clear();
         parents.push(tip);
     }
@@ -963,23 +1175,26 @@ fn resolve_commit_ref(store: &FileRefStore, operand: &[u8]) -> Result<String> {
 
 fn handle_commit(
     parser: &mut StreamParser<impl BufRead>,
-    db: &mut FileObjectDatabase,
+    db: &mut FastImportDatabase,
     store: &FileRefStore,
-    git_dir: &Path,
     format: ObjectFormat,
     options: &FastImportOptions,
     marks: &mut HashMap<u64, ObjectId>,
     pack_state: &mut FastImportPackState,
     ref_states: &mut HashMap<String, FastImportRefState>,
+    dirty_refs: &mut HashSet<String>,
     ref_name: String,
     query_out: &mut dyn Write,
-) -> Result<bool> {
+) -> Result<()> {
     let mut author: Option<Vec<u8>> = None;
     let mut committer: Option<Vec<u8>> = None;
     let mut encoding: Option<Vec<u8>> = None;
+    let mut signature_headers = Vec::new();
     let mut message: Option<Vec<u8>> = None;
     let mut parents: Vec<ObjectId> = Vec::new();
     let mut tree: BTreeMap<Vec<u8>, TreeEntry> = BTreeMap::new();
+    let mut unchanged_tree_oid = None;
+    let mut tree_changed = false;
     let mut commit_mark: Option<u64> = None;
     let mut deferred_get_mark: Option<Vec<u8>> = None;
     // Whether this commit's parent/tree base has been fixed yet. `from`,
@@ -1002,6 +1217,9 @@ fn handle_commit(
         } else if let Some(rest) = line_after(&line, b"committer ") {
             committer = Some(parse_fast_import_ident(rest, options.date_format)?);
             parser.next_command_line()?;
+        } else if let Some(rest) = line_after(&line, b"gpgsig ") {
+            parser.next_command_line()?;
+            signature_headers.push(read_fast_import_signature(parser, rest)?);
         } else if let Some(rest) = line_after(&line, b"encoding ") {
             encoding = Some(trim_ascii(rest).to_vec());
             parser.next_command_line()?;
@@ -1014,7 +1232,7 @@ fn handle_commit(
             // fixes the base, so the implicit default below is suppressed.
             let oid = resolve_committish(db, store, format, marks, ref_states, rest)?;
             if oid != zero_oid(format)? {
-                seed_tree_from_commit(db, format, &oid, &mut tree)?;
+                unchanged_tree_oid = Some(seed_tree_from_commit(db, format, &oid, &mut tree)?);
                 parents.clear();
                 parents.push(oid);
             }
@@ -1036,6 +1254,7 @@ fn handle_commit(
                 &mut base_fixed,
                 &mut parents,
                 &mut tree,
+                &mut unchanged_tree_oid,
             )?;
             apply_filemodify(
                 parser,
@@ -1047,6 +1266,7 @@ fn handle_commit(
                 rest,
                 &mut tree,
             )?;
+            tree_changed = true;
         } else if let Some(rest) = line_after(&line, b"D ") {
             parser.next_command_line()?;
             default_base_from_branch(
@@ -1058,8 +1278,10 @@ fn handle_commit(
                 &mut base_fixed,
                 &mut parents,
                 &mut tree,
+                &mut unchanged_tree_oid,
             )?;
             apply_filedelete(rest, &mut tree)?;
+            tree_changed = true;
         } else if let Some(rest) = line_after(&line, b"C ") {
             parser.next_command_line()?;
             default_base_from_branch(
@@ -1071,8 +1293,10 @@ fn handle_commit(
                 &mut base_fixed,
                 &mut parents,
                 &mut tree,
+                &mut unchanged_tree_oid,
             )?;
             apply_filecopy(rest, &mut tree)?;
+            tree_changed = true;
         } else if let Some(rest) = line_after(&line, b"R ") {
             parser.next_command_line()?;
             default_base_from_branch(
@@ -1084,8 +1308,10 @@ fn handle_commit(
                 &mut base_fixed,
                 &mut parents,
                 &mut tree,
+                &mut unchanged_tree_oid,
             )?;
             apply_filerename(rest, &mut tree)?;
+            tree_changed = true;
         } else if let Some(rest) = line_after(&line, b"N ") {
             parser.next_command_line()?;
             default_base_from_branch(
@@ -1097,10 +1323,12 @@ fn handle_commit(
                 &mut base_fixed,
                 &mut parents,
                 &mut tree,
+                &mut unchanged_tree_oid,
             )?;
             apply_notemodify(
                 parser, db, store, marks, pack_state, ref_states, format, rest, &mut tree,
             )?;
+            tree_changed = true;
         } else if let Some(rest) = line_after(&line, b"ls ") {
             parser.next_command_line()?;
             default_base_from_branch(
@@ -1112,6 +1340,7 @@ fn handle_commit(
                 &mut base_fixed,
                 &mut parents,
                 &mut tree,
+                &mut unchanged_tree_oid,
             )?;
             handle_ls_line(
                 db,
@@ -1155,9 +1384,11 @@ fn handle_commit(
                 &mut base_fixed,
                 &mut parents,
                 &mut tree,
+                &mut unchanged_tree_oid,
             )?;
             tree.clear();
             base_fixed = true;
+            tree_changed = true;
         } else {
             // First non-commit-body line ends this commit.
             break;
@@ -1174,6 +1405,7 @@ fn handle_commit(
         &mut base_fixed,
         &mut parents,
         &mut tree,
+        &mut unchanged_tree_oid,
     )?;
 
     let committer = committer
@@ -1185,28 +1417,25 @@ fn handle_commit(
     let build = CommitBuild {
         parents,
         tree,
+        unchanged_tree_oid: if tree_changed {
+            None
+        } else {
+            unchanged_tree_oid
+        },
         author,
         committer,
         encoding,
+        signature_headers,
         message,
     };
     let oid = write_commit(db, pack_state, build, marks, commit_mark)?;
     pack_state.record_edge(&ref_name, oid);
-    let status = update_commit_branch(
-        store,
-        git_dir,
-        db,
-        format,
-        &ref_name,
-        oid,
-        options.force,
-        ref_states.contains_key(&ref_name),
-    )?;
+    dirty_refs.insert(ref_name.clone());
     ref_states.insert(ref_name, FastImportRefState::Tip(oid));
     if let Some(rest) = deferred_get_mark {
         handle_get_mark_line(format, marks, &rest, query_out)?;
     }
-    Ok(status == FastImportUpdateStatus::Rejected)
+    Ok(())
 }
 
 fn parse_fast_import_ident(ident: &[u8], date_format: FastImportDateFormat) -> Result<Vec<u8>> {
@@ -1340,38 +1569,137 @@ fn validate_fast_import_raw_date(date: &[u8], strict: bool) -> Result<()> {
     Ok(())
 }
 
+fn read_fast_import_signature(
+    parser: &mut StreamParser<impl BufRead>,
+    spec: &[u8],
+) -> Result<Vec<u8>> {
+    let (object_hash, format) = split_field(trim_ascii(spec));
+    let header = match object_hash {
+        b"sha1" => b"gpgsig".as_slice(),
+        b"sha256" => b"gpgsig-sha256".as_slice(),
+        _ => {
+            return Err(GitError::Command(format!(
+                "fast-import: unsupported signature hash {}",
+                String::from_utf8_lossy(object_hash)
+            )));
+        }
+    };
+    if trim_ascii(format).is_empty() {
+        return Err(GitError::Command(
+            "fast-import: gpgsig missing signature format".into(),
+        ));
+    }
+    let Some(data_line) = parser.next_non_comment_command_line()? else {
+        return Err(GitError::Command(
+            "fast-import: gpgsig missing data block".into(),
+        ));
+    };
+    if line_after(&data_line, b"data").is_none() {
+        return Err(GitError::Command(
+            "fast-import: gpgsig must be followed by data".into(),
+        ));
+    }
+    let signature = parser.read_data(&data_line)?;
+    Ok(fold_fast_import_signature_header(header, &signature))
+}
+
+fn fold_fast_import_signature_header(header: &[u8], signature: &[u8]) -> Vec<u8> {
+    let mut lines = signature.split(|byte| *byte == b'\n');
+    let first = lines.next().unwrap_or_default();
+    let mut out = Vec::with_capacity(header.len() + signature.len() + 4);
+    out.extend_from_slice(header);
+    out.push(b' ');
+    out.extend_from_slice(first);
+    out.push(b'\n');
+    for continuation in lines {
+        out.push(b' ');
+        out.extend_from_slice(continuation);
+        out.push(b'\n');
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_fast_import_commit_body(
+    tree: ObjectId,
+    parents: &[ObjectId],
+    author: &[u8],
+    committer: &[u8],
+    encoding: Option<&[u8]>,
+    signature_headers: &[Vec<u8>],
+    message: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("tree {tree}\n").as_bytes());
+    for parent in parents {
+        out.extend_from_slice(format!("parent {parent}\n").as_bytes());
+    }
+    out.extend_from_slice(b"author ");
+    out.extend_from_slice(author);
+    out.extend_from_slice(b"\ncommitter ");
+    out.extend_from_slice(committer);
+    out.push(b'\n');
+    for header in signature_headers {
+        out.extend_from_slice(header);
+    }
+    if let Some(encoding) = encoding {
+        out.extend_from_slice(b"encoding ");
+        out.extend_from_slice(encoding);
+        out.push(b'\n');
+    }
+    out.push(b'\n');
+    out.extend_from_slice(message);
+    out
+}
+
 fn write_commit(
-    db: &mut FileObjectDatabase,
+    db: &mut FastImportDatabase,
     pack_state: &mut FastImportPackState,
     build: CommitBuild,
     marks: &mut HashMap<u64, ObjectId>,
     commit_mark: Option<u64>,
 ) -> Result<ObjectId> {
+    let CommitBuild {
+        parents,
+        tree,
+        unchanged_tree_oid,
+        author,
+        committer,
+        encoding,
+        signature_headers,
+        message,
+    } = build;
+    let tree = Arc::new(tree);
     // Build the tree object from the accumulated entries (git tree ordering is
     // handled by Tree::write, which sorts on the canonical key).
-    let tree_oid = write_tree_from_map(db, pack_state, &build.tree)?;
-    let commit = Commit {
-        tree: tree_oid,
-        parents: build.parents,
-        author: build.author,
-        committer: build.committer,
-        encoding: build.encoding,
-        message: build.message,
+    let tree_oid = match unchanged_tree_oid {
+        Some(tree_oid) => tree_oid,
+        None => write_tree_from_map(db, pack_state, tree.as_ref())?,
     };
+    let commit = write_fast_import_commit_body(
+        tree_oid,
+        &parents,
+        &author,
+        &committer,
+        encoding.as_deref(),
+        &signature_headers,
+        &message,
+    );
     let oid = write_fast_import_object(
         db,
         pack_state,
-        EncodedObject::new(ObjectType::Commit, commit.write()),
+        EncodedObject::new(ObjectType::Commit, commit),
     )?;
     if let Some(mark) = commit_mark {
         marks.insert(mark, oid);
     }
+    db.remember_commit_tree(oid, tree_oid, tree);
     Ok(oid)
 }
 
 fn handle_blob(
     parser: &mut StreamParser<impl BufRead>,
-    db: &mut FileObjectDatabase,
+    db: &mut FastImportDatabase,
     pack_state: &mut FastImportPackState,
     marks: &mut HashMap<u64, ObjectId>,
     _rest: &[u8],
@@ -1410,14 +1738,14 @@ fn handle_blob(
 
 fn handle_tag(
     parser: &mut StreamParser<impl BufRead>,
-    db: &mut FileObjectDatabase,
+    db: &mut FastImportDatabase,
     store: &FileRefStore,
-    git_dir: &Path,
     format: ObjectFormat,
     date_format: FastImportDateFormat,
     marks: &mut HashMap<u64, ObjectId>,
     pack_state: &mut FastImportPackState,
-    ref_states: &HashMap<String, FastImportRefState>,
+    ref_states: &mut HashMap<String, FastImportRefState>,
+    dirty_refs: &mut HashSet<String>,
     operand: &[u8],
 ) -> Result<()> {
     let tag_operand = trim_ascii(operand);
@@ -1479,12 +1807,14 @@ fn handle_tag(
     if let Some(mark) = tag_mark {
         marks.insert(mark, oid);
     }
-    update_ref_direct(store, git_dir, format, &tag_ref, oid)
+    dirty_refs.insert(tag_ref.clone());
+    ref_states.insert(tag_ref, FastImportRefState::Tip(oid));
+    Ok(())
 }
 
 fn handle_alias(
     parser: &mut StreamParser<impl BufRead>,
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     store: &FileRefStore,
     format: ObjectFormat,
     marks: &mut HashMap<u64, ObjectId>,
@@ -1521,12 +1851,12 @@ fn handle_alias(
 
 fn handle_reset(
     parser: &mut StreamParser<impl BufRead>,
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     store: &FileRefStore,
-    git_dir: &Path,
     format: ObjectFormat,
     marks: &HashMap<u64, ObjectId>,
     ref_states: &mut HashMap<String, FastImportRefState>,
+    dirty_refs: &mut HashSet<String>,
     operand: &[u8],
 ) -> Result<()> {
     let ref_name = parse_fast_import_ref_name(operand)?;
@@ -1547,15 +1877,17 @@ fn handle_reset(
     };
 
     let Some(from) = from else {
+        // A bare reset only clears fast-import's in-memory branch state; unlike
+        // `from <zero-oid>` it does not request deletion of an existing ref.
         ref_states.insert(ref_name, FastImportRefState::Empty);
         return Ok(());
     };
     let oid = resolve_committish(db, store, format, marks, ref_states, &from)?;
     if oid == zero_oid(format)? {
-        delete_ref_if_exists(store, &ref_name)?;
+        dirty_refs.insert(ref_name.clone());
         ref_states.insert(ref_name, FastImportRefState::Empty);
     } else {
-        update_ref_direct(store, git_dir, format, &ref_name, oid)?;
+        dirty_refs.insert(ref_name.clone());
         ref_states.insert(ref_name, FastImportRefState::Tip(oid));
     }
     Ok(())
@@ -1598,7 +1930,7 @@ fn delete_ref_if_exists(store: &FileRefStore, name: &str) -> Result<()> {
 /// `<dataref>` is `inline` (an inline `data` block follows) or an oid/mark.
 fn apply_filemodify(
     parser: &mut StreamParser<impl BufRead>,
-    db: &mut FileObjectDatabase,
+    db: &mut FastImportDatabase,
     marks: &HashMap<u64, ObjectId>,
     pack_state: &mut FastImportPackState,
     format: ObjectFormat,
@@ -1762,7 +2094,7 @@ fn delete_tree_prefix(tree: &mut BTreeMap<Vec<u8>, TreeEntry>, prefix: &[u8]) {
 }
 
 fn replace_tree_prefix(
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     format: ObjectFormat,
     tree: &mut BTreeMap<Vec<u8>, TreeEntry>,
     prefix: &[u8],
@@ -1824,7 +2156,7 @@ fn join_path(prefix: &[u8], rest: &[u8]) -> Vec<u8> {
 /// notes-writing commands later re-fan as needed.
 fn apply_notemodify(
     parser: &mut StreamParser<impl BufRead>,
-    db: &mut FileObjectDatabase,
+    db: &mut FastImportDatabase,
     store: &FileRefStore,
     marks: &HashMap<u64, ObjectId>,
     pack_state: &mut FastImportPackState,
@@ -1877,7 +2209,7 @@ fn apply_notemodify(
 
 /// Resolve a `from`/`merge` committish: a mark (`:N`), a full ref, or a hex oid.
 fn resolve_committish(
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     store: &FileRefStore,
     format: ObjectFormat,
     marks: &HashMap<u64, ObjectId>,
@@ -1897,7 +2229,7 @@ fn resolve_committish(
 }
 
 fn resolve_committish_base(
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     store: &FileRefStore,
     format: ObjectFormat,
     marks: &HashMap<u64, ObjectId>,
@@ -1982,7 +2314,7 @@ fn split_fast_import_revision_suffix(text: &str) -> Result<(&str, Option<FastImp
 }
 
 fn apply_fast_import_revision_suffix(
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     format: ObjectFormat,
     oid: &mut ObjectId,
     suffix: Option<FastImportRevSuffix>,
@@ -2019,7 +2351,7 @@ fn apply_fast_import_revision_suffix(
 }
 
 fn ensure_fast_import_commitish(
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     format: ObjectFormat,
     oid: &ObjectId,
 ) -> Result<()> {
@@ -2028,7 +2360,7 @@ fn ensure_fast_import_commitish(
 }
 
 fn read_fast_import_commit(
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     format: ObjectFormat,
     oid: &ObjectId,
 ) -> Result<Commit> {
@@ -2071,7 +2403,7 @@ fn resolve_dataref(
 }
 
 fn resolve_objectish(
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     store: &FileRefStore,
     format: ObjectFormat,
     marks: &HashMap<u64, ObjectId>,
@@ -2087,7 +2419,7 @@ fn resolve_objectish(
 }
 
 fn resolve_typed_dataref(
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     format: ObjectFormat,
     marks: &HashMap<u64, ObjectId>,
     dataref: &[u8],
@@ -2106,7 +2438,7 @@ fn resolve_typed_dataref(
 }
 
 fn resolve_gitlink_dataref(
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     format: ObjectFormat,
     marks: &HashMap<u64, ObjectId>,
     dataref: &[u8],
@@ -2122,7 +2454,7 @@ fn resolve_gitlink_dataref(
 }
 
 fn handle_cat_blob_line(
-    db: &mut FileObjectDatabase,
+    db: &mut FastImportDatabase,
     store: &FileRefStore,
     format: ObjectFormat,
     marks: &HashMap<u64, ObjectId>,
@@ -2158,7 +2490,7 @@ fn handle_get_mark_line(
 }
 
 fn handle_ls_line(
-    db: &mut FileObjectDatabase,
+    db: &mut FastImportDatabase,
     store: &FileRefStore,
     format: ObjectFormat,
     marks: &HashMap<u64, ObjectId>,
@@ -2193,7 +2525,7 @@ fn handle_ls_line(
 }
 
 fn resolve_cat_blob_dataref(
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     store: &FileRefStore,
     format: ObjectFormat,
     marks: &HashMap<u64, ObjectId>,
@@ -2213,7 +2545,7 @@ fn resolve_cat_blob_dataref(
 }
 
 fn resolve_ls_root_tree(
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     store: &FileRefStore,
     format: ObjectFormat,
     marks: &HashMap<u64, ObjectId>,
@@ -2232,7 +2564,7 @@ fn resolve_ls_root_tree(
 }
 
 fn object_to_tree_oid(
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     format: ObjectFormat,
     mut oid: ObjectId,
 ) -> Result<ObjectId> {
@@ -2258,7 +2590,7 @@ fn object_to_tree_oid(
 }
 
 fn write_ls_result(
-    db: &mut FileObjectDatabase,
+    db: &mut FastImportDatabase,
     pack_state: &mut FastImportPackState,
     tree: &BTreeMap<Vec<u8>, TreeEntry>,
     path: &[u8],
@@ -2331,11 +2663,15 @@ fn mark_ref_matches(dataref: &[u8], mark: u64) -> bool {
 /// only ever modifies top-level blobs, but recursion keeps `from` correct when a
 /// parent tree has subdirectories.
 fn seed_tree_from_commit(
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     format: ObjectFormat,
     commit_oid: &ObjectId,
     tree: &mut BTreeMap<Vec<u8>, TreeEntry>,
-) -> Result<()> {
+) -> Result<ObjectId> {
+    if let Some(recent) = db.recent_commit_tree(commit_oid) {
+        tree.clone_from(recent.entries.as_ref());
+        return Ok(recent.oid);
+    }
     let object = db.read_object(commit_oid)?;
     if object.object_type != ObjectType::Commit {
         return Err(GitError::Command(format!(
@@ -2343,11 +2679,12 @@ fn seed_tree_from_commit(
         )));
     }
     let commit = Commit::parse(format, &object.body)?;
-    seed_tree_entries(db, format, &commit.tree, &[], tree)
+    seed_tree_entries(db, format, &commit.tree, &[], tree)?;
+    Ok(commit.tree)
 }
 
 fn seed_tree_entries(
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     format: ObjectFormat,
     tree_oid: &ObjectId,
     prefix: &[u8],
@@ -2386,7 +2723,7 @@ fn seed_tree_entries(
 /// Build (and write) the nested tree objects from a flat path→entry map, then
 /// return the root tree oid.
 fn write_tree_from_map(
-    db: &mut FileObjectDatabase,
+    db: &mut FastImportDatabase,
     pack_state: &mut FastImportPackState,
     entries: &BTreeMap<Vec<u8>, TreeEntry>,
 ) -> Result<ObjectId> {
@@ -2395,7 +2732,7 @@ fn write_tree_from_map(
 }
 
 fn write_tree_level(
-    db: &mut FileObjectDatabase,
+    db: &mut FastImportDatabase,
     pack_state: &mut FastImportPackState,
     entries: &BTreeMap<Vec<u8>, TreeEntry>,
     prefix: &[u8],
@@ -2467,32 +2804,52 @@ fn tree_sort_key(entry: &TreeEntry) -> Vec<u8> {
     key
 }
 
-fn update_commit_branch(
+/// Persist the final value of every branch changed since the last checkpoint.
+///
+/// fast-import keeps branch tips in memory and writes each ref once at a
+/// checkpoint/end-of-stream. Besides avoiding thousands of lock/rename cycles,
+/// this is the durability boundary Git exposes: a malformed stream before its
+/// first checkpoint may leave unreferenced objects, but must not publish a
+/// partially imported branch.
+fn flush_fast_import_refs(
     store: &FileRefStore,
     git_dir: &Path,
-    db: &FileObjectDatabase,
+    db: &FastImportDatabase,
     format: ObjectFormat,
-    ref_name: &str,
-    new_oid: ObjectId,
     force: bool,
-    already_touched_in_stream: bool,
-) -> Result<FastImportUpdateStatus> {
-    let old_oid = match store.read_ref(ref_name)? {
-        Some(RefTarget::Direct(oid)) => oid,
-        _ => zero_oid(format)?,
-    };
-    if !already_touched_in_stream
-        && !force
-        && old_oid != zero_oid(format)?
-        && !sley_rev::is_ancestor(git_dir, format, db, &old_oid, &new_oid)?
-    {
-        eprintln!(
-            "warning: not updating {ref_name} (new tip {new_oid} does not contain {old_oid})"
-        );
-        return Ok(FastImportUpdateStatus::Rejected);
+    ref_states: &HashMap<String, FastImportRefState>,
+    dirty_refs: &mut HashSet<String>,
+) -> Result<bool> {
+    let mut names = dirty_refs.drain().collect::<Vec<_>>();
+    names.sort();
+    let mut rejected = false;
+    for ref_name in names {
+        let Some(state) = ref_states.get(&ref_name).copied() else {
+            continue;
+        };
+        match state {
+            FastImportRefState::Empty => delete_ref_if_exists(store, &ref_name)?,
+            FastImportRefState::Tip(new_oid) => {
+                let old_oid = match store.read_ref(&ref_name)? {
+                    Some(RefTarget::Direct(oid)) => oid,
+                    _ => zero_oid(format)?,
+                };
+                if !force
+                    && ref_name.starts_with("refs/heads/")
+                    && old_oid != zero_oid(format)?
+                    && !sley_rev::is_ancestor(git_dir, format, db, &old_oid, &new_oid)?
+                {
+                    eprintln!(
+                        "warning: not updating {ref_name} (new tip {new_oid} does not contain {old_oid})"
+                    );
+                    rejected = true;
+                    continue;
+                }
+                update_ref_direct(store, git_dir, format, &ref_name, new_oid)?;
+            }
+        }
     }
-    update_ref_direct(store, git_dir, format, ref_name, new_oid)?;
-    Ok(FastImportUpdateStatus::Updated)
+    Ok(rejected)
 }
 
 /// Update a ref to the supplied oid. A reflog entry is written (git's
@@ -2893,6 +3250,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn staged_overlay_has_object_and_body_size_flush_bounds() {
+        assert!(!FastImportDatabase::staging_budget_exceeded(
+            99_999,
+            64 * 1024 * 1024 - 1
+        ));
+        assert!(FastImportDatabase::staging_budget_exceeded(100_000, 0));
+        assert!(FastImportDatabase::staging_budget_exceeded(
+            0,
+            64 * 1024 * 1024
+        ));
+    }
+
+    #[test]
     fn parse_filemode_normalizes_short_forms() {
         assert_eq!(parse_filemode("644").expect("644"), 0o100644);
         assert_eq!(parse_filemode("755").expect("755"), 0o100755);
@@ -2954,6 +3324,50 @@ mod tests {
         let mut out = Vec::new();
         write_progress(&mut out, b"progress checkpoint").expect("write progress");
         assert_eq!(out, b"progress checkpoint\n");
+    }
+
+    #[test]
+    fn signature_data_folds_into_raw_commit_header() {
+        let signature = b"-----BEGIN SSH SIGNATURE-----\nc2ln\n-----END SSH SIGNATURE-----";
+        let header = fold_fast_import_signature_header(b"gpgsig", signature);
+        assert_eq!(
+            header,
+            b"gpgsig -----BEGIN SSH SIGNATURE-----\n c2ln\n -----END SSH SIGNATURE-----\n"
+        );
+
+        let tree = ObjectId::empty_tree(ObjectFormat::Sha1);
+        let body = write_fast_import_commit_body(
+            tree,
+            &[],
+            b"A <a@example.com> 1 +0000",
+            b"C <c@example.com> 1 +0000",
+            None,
+            &[header],
+            b"signed\n",
+        );
+        assert!(body.windows(7).any(|window| window == b"gpgsig "));
+        assert!(body.ends_with(b"\nsigned\n"));
+
+        let canonical = Commit {
+            tree,
+            parents: Vec::new(),
+            author: b"A <a@example.com> 1 +0000".to_vec(),
+            committer: b"C <c@example.com> 1 +0000".to_vec(),
+            encoding: Some(b"ISO-8859-1".to_vec()),
+            message: b"ordinary\n".to_vec(),
+        };
+        assert_eq!(
+            write_fast_import_commit_body(
+                tree,
+                &[],
+                &canonical.author,
+                &canonical.committer,
+                canonical.encoding.as_deref(),
+                &[],
+                &canonical.message,
+            ),
+            canonical.write(),
+        );
     }
 
     #[test]

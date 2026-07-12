@@ -18,8 +18,8 @@
 
 use crate::*;
 use sley::plumbing::sley_object::TreeEntries;
-use std::cell::{Ref, RefCell};
 use sley::plumbing::{sley_diff_merge, sley_rev, sley_worktree};
+use std::cell::{Ref, RefCell};
 
 /// How the per-object diff (for commits) is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +87,8 @@ struct ShowOptions {
     first_parent: bool,
     /// `--combined-all-paths` (only meaningful with `-c`/`--cc`).
     combined_all_paths: bool,
+    /// Configured `diff.interHunkContext` used by patch rendering.
+    interhunk: usize,
     /// Whether the `commit <oid>` line (medium/full-oneline) uses an abbreviated
     /// oid. `--oneline` always abbreviates regardless of this flag.
     abbrev_commit: bool,
@@ -114,6 +116,9 @@ struct ShowOptions {
     patch_with_extra: bool,
     /// Full 40/64-hex `index` lines in patches (`--full-index`).
     patch_full_index: bool,
+    /// Emit applicable binary patches. `--binary` also implies full index
+    /// lines and keeps the default patch body alongside stat/raw output.
+    patch_binary: bool,
     /// Explicit patch abbreviation width (`--abbrev=<n>` affects this too).
     patch_abbrev: Option<usize>,
     /// Rename detection toggle (on by default, `--no-renames` disables).
@@ -211,6 +216,8 @@ struct ShowContext<'a> {
     decorations: &'a HashMap<ObjectId, Vec<String>>,
     diff_pathspec: Option<&'a DiffPathspec>,
     mailmap: RefCell<Option<commands::utility::Mailmap>>,
+    lazy_fetch: bool,
+    replace_objects: bool,
 }
 
 impl ShowContext<'_> {
@@ -220,6 +227,7 @@ impl ShowContext<'_> {
             *self.mailmap.borrow_mut() = Some(commands::utility::Mailmap::load_default(
                 self.git_dir,
                 self.format,
+                self.replace_objects,
             )?);
         }
         Ok(Ref::map(self.mailmap.borrow(), |mailmap| {
@@ -286,6 +294,7 @@ impl Default for ShowOptions {
             merge_mode: None,
             first_parent: false,
             combined_all_paths: false,
+            interhunk: 0,
             abbrev_commit: false,
             abbrev_len: Some(7),
             stat: false,
@@ -298,6 +307,7 @@ impl Default for ShowOptions {
             raw: false,
             patch_with_extra: false,
             patch_full_index: false,
+            patch_binary: false,
             patch_abbrev: None,
             detect_renames: true,
             renames_explicit: false,
@@ -398,7 +408,7 @@ impl super::grep_args::GrepArgOptions for ShowOptions {
     }
 }
 
-pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_show(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let profile_enabled = show_profile_enabled();
     let profile_start = std::time::Instant::now();
     let mut profile_last = profile_start;
@@ -410,11 +420,14 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
         &mut profile_last,
     );
 
-    let repo = RepositoryContext::discover_current()?;
-    let git_dir = repo.git_dir();
-    let format = repo.format();
+    let repo = RepositoryContext::from_session(cli_session)?;
+    let repository = repo.repository();
+    let git_dir = repository.git_dir();
+    let format = repository.object_format();
     let config = repo.config();
-    let db = repo.objects();
+    options.interhunk =
+        super::diff::resolve_diff_interhunk_context(None, Some(&repo), cli_session)?;
+    let db = repository.object_database();
     show_profile_mark(
         profile_enabled,
         "discover",
@@ -429,7 +442,7 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
                 .unwrap_or(false),
         );
     }
-    show_warn_graft_file_deprecated(git_dir, config);
+    crate::repository::warn_graft_file_deprecated(git_dir, config);
 
     // Ref decorations feed the `commit`/oneline header and the `%d`/`%D`
     // placeholders. `git show` leaves them off unless `--decorate` is given, but a
@@ -499,6 +512,7 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
             repo.cwd(),
             worktree_root,
             &setup.pathspecs,
+            repo.pathspec_magic(),
         )?)
     };
 
@@ -510,7 +524,8 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
         profile_start,
         &mut profile_last,
     );
-    let show_userdiff_attributes = worktree_root_for_git_dir(git_dir)
+    let show_userdiff_attributes = repo
+        .worktree_root()
         .ok()
         .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
         .transpose()?;
@@ -528,6 +543,8 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
         decorations: &decorations,
         diff_pathspec: diff_pathspec.as_ref(),
         mailmap: RefCell::new(None),
+        lazy_fetch: cli_session.lazy_fetch(),
+        replace_objects: cli_session.replace_objects(),
     };
     let grep_kind = log_grep_pattern_kind_from_config(
         config,
@@ -574,23 +591,6 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
     stdout.flush()?;
     show_profile_mark(profile_enabled, "flush", profile_start, &mut profile_last);
     Ok(())
-}
-
-fn show_warn_graft_file_deprecated(git_dir: &Path, config: &GitConfig) {
-    if config
-        .get_bool("advice", None, "graftFileDeprecated")
-        .unwrap_or(true)
-        && git_dir.join("info").join("grafts").exists()
-    {
-        eprintln!("hint: Support for <GIT_DIR>/info/grafts is deprecated");
-        eprintln!("hint: and will be removed in a future Git version.");
-        eprintln!("hint: ");
-        eprintln!("hint: Please use \"git replace --convert-graft-file\"");
-        eprintln!("hint: to convert the grafts into replace refs.");
-        eprintln!("hint: ");
-        eprintln!("hint: Turn this message off by running");
-        eprintln!("hint: \"git config set advice.graftFileDeprecated false\"");
-    }
 }
 
 fn show_profile_enabled() -> bool {
@@ -1226,7 +1226,14 @@ fn write_commit_trailer(
         return if combined_merge {
             write_show_combined(stdout, context, &layout, commit, entries)
         } else if layout.is_merge && !first_parent_merge {
-            write_merge_stat(stdout, context.db, context.config, options, entries)
+            write_merge_stat(
+                stdout,
+                context.db,
+                context.config,
+                options,
+                entries,
+                context.lazy_fetch,
+            )
         } else {
             write_commit_diff(
                 stdout,
@@ -1236,6 +1243,7 @@ fn write_commit_trailer(
                 context.config,
                 options,
                 entries,
+                context.lazy_fetch,
             )
         };
     }
@@ -1282,9 +1290,10 @@ fn write_merge_stat(
     config: &GitConfig,
     options: &ShowOptions,
     entries: &[sley_diff_merge::NameStatusEntry],
+    lazy_fetch: bool,
 ) -> Result<()> {
     let color = diff_color_enabled(config);
-    let stat_entries = collect_diff_stat_entries(entries, db, None, false)?;
+    let stat_entries = collect_diff_stat_entries(entries, db, None, false, lazy_fetch)?;
     if options.numstat {
         for entry in &stat_entries {
             write_diff_numstat_materialized_entry(stdout, entry.entry, entry.stats, false)?;
@@ -1331,7 +1340,7 @@ fn write_show_combined(
     let db = context.db;
     let stat_entries =
         if options.numstat || options.stat || options.compact_summary || options.shortstat {
-            collect_diff_stat_entries(entries, db, None, false)?
+            collect_diff_stat_entries(entries, db, None, false, context.lazy_fetch)?
         } else {
             Vec::new()
         };
@@ -1360,19 +1369,30 @@ fn write_show_combined(
         dst_prefix: "b/",
         patch_abbrev: options.patch_abbrev.unwrap_or(7).min(format.hex_len()),
         raw_abbrev: None,
+        lazy_fetch: context.lazy_fetch,
     };
 
     // `--name-only`/`--name-status` print the combined name (status) listing.
     match options.diff_mode {
         ShowDiffMode::NameOnly => {
             for path in &paths {
+                if options.combined_all_paths {
+                    for parent in &path.parents {
+                        write!(stdout, "{}\t", status_quote_path(&parent.path, false))?;
+                    }
+                }
                 writeln!(stdout, "{}", status_quote_path(&path.path, false))?;
             }
             return Ok(());
         }
         ShowDiffMode::NameStatus => {
             for path in &paths {
-                commands::combined::write_combined_name_status(stdout, path, false)?;
+                commands::combined::write_combined_name_status(
+                    stdout,
+                    path,
+                    options.combined_all_paths,
+                    false,
+                )?;
             }
             return Ok(());
         }
@@ -1385,7 +1405,14 @@ fn write_show_combined(
     // = !has_diff_extras()`).
     let stat_active = merge_renders_stat(options);
     if stat_active {
-        write_merge_stat(stdout, db, context.config, options, entries)?;
+        write_merge_stat(
+            stdout,
+            db,
+            context.config,
+            options,
+            entries,
+            context.lazy_fetch,
+        )?;
     }
     if options.has_diff_extras() && !options.patch_with_extra {
         return Ok(());
@@ -1482,6 +1509,7 @@ fn write_commit_diff(
     config: &GitConfig,
     options: &ShowOptions,
     entries: &[sley_diff_merge::NameStatusEntry],
+    lazy_fetch: bool,
 ) -> Result<()> {
     match options.diff_mode {
         ShowDiffMode::None => Ok(()),
@@ -1503,9 +1531,9 @@ fn write_commit_diff(
             }
             Ok(())
         }
-        ShowDiffMode::Patch => {
-            write_commit_diff_patch(stdout, git_dir, db, format, config, options, entries)
-        }
+        ShowDiffMode::Patch => write_commit_diff_patch(
+            stdout, git_dir, db, format, config, options, entries, lazy_fetch,
+        ),
     }
 }
 
@@ -1520,6 +1548,7 @@ fn write_commit_diff_patch(
     config: &GitConfig,
     options: &ShowOptions,
     entries: &[sley_diff_merge::NameStatusEntry],
+    lazy_fetch: bool,
 ) -> Result<()> {
     let repository_abbrev = repository_abbrev(git_dir, format)?;
     let raw_abbrev = repository_abbrev;
@@ -1537,7 +1566,7 @@ fn write_commit_diff_patch(
     let show_patch = options.shows_patch_body();
     let stat_entries =
         if options.numstat || options.stat || options.compact_summary || options.shortstat {
-            collect_diff_stat_entries(entries, db, None, false)?
+            collect_diff_stat_entries(entries, db, None, false, lazy_fetch)?
         } else {
             Vec::new()
         };
@@ -1549,8 +1578,8 @@ fn write_commit_diff_patch(
     let mut stat_widths = options.stat_widths;
     stat_widths.resolve_config(config);
     if show_patch {
-        let userdiff_attributes = worktree_root_for_git_dir(git_dir)
-            .ok()
+        let userdiff_attributes = sley_worktree::worktree_root_for_git_dir(git_dir)?
+            .as_deref()
             .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
             .transpose()?;
         let userdiff = commands::userdiff::UserdiffResolver::with_attributes(
@@ -1591,6 +1620,7 @@ fn write_commit_diff_patch(
                         quote_path_fully: true,
                     },
                     widths: Some(stat_widths),
+                    config: None,
                 },
                 prefix_already_written: false,
                 after_stat: None,
@@ -1598,11 +1628,15 @@ fn write_commit_diff_patch(
             |_| false,
             |stdout, entry| {
                 let patch_options = DiffRenderOptions {
-                line_indicators: sley_diff_merge::render::LineIndicators::default(),
-                    binary: false,
+                    line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                    suppress_blank_empty: config
+                        .get_bool("diff", None, "suppressblankempty")
+                        .unwrap_or(false),
+                    binary: options.patch_binary,
                     anchors: &options.anchored,
                     allow_textconv: options.textconv != Some(false),
                     db,
+                    lazy_fetch,
                     worktree_root: None,
                     use_worktree_new: false,
                     format,
@@ -1619,7 +1653,7 @@ fn write_commit_diff_patch(
                     submodule_dirt: None,
                     ws_error: None,
                     color_moved: None,
-                    interhunk: 0,
+                    interhunk: options.interhunk,
                     ws_ignore: options.ws_ignore,
                     diff_algorithm: options.diff_algorithm,
                     ignore_blank_lines: options.ignore_blank_lines,
@@ -1662,6 +1696,7 @@ fn write_commit_diff_patch(
                         quote_path_fully: true,
                     },
                     widths: Some(stat_widths),
+                    config: None,
                 },
                 prefix_already_written: false,
                 after_stat: None,
@@ -1910,6 +1945,13 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
                 options.patch_abbrev = Some(parsed);
             }
             "--full-index" => options.patch_full_index = true,
+            "--binary" => {
+                options.patch_binary = true;
+                options.patch_full_index = true;
+                options.patch_with_extra = true;
+                options.restore_patch();
+            }
+            "--no-binary" => options.patch_binary = false,
             // --- date ------------------------------------------------------------
             "--date" => {
                 let value = iter

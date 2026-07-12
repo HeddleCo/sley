@@ -7,8 +7,12 @@ The matrix compares:
 * sley_cli: release `sley` process, including process startup
 * sley_harness: direct in-process harness calls for matching Sley APIs
 
-By default repositories are cached under /private/tmp/sley-human-common-repos and
+By default repositories are cached below the platform temporary directory and
 results are persisted under bench-results/human-common/<timestamp>.
+
+Git and the Sley CLI are admitted to timing only after their exit status,
+stdout, and stderr are byte-identical for the case. Their warmups and measured
+runs then alternate which target executes first on every repetition.
 """
 
 from __future__ import annotations
@@ -328,43 +332,100 @@ def safe_component(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in value)
 
 
-def timed_process(
-    argv: list[str],
-    cwd: Path,
+def paired_order(index: int) -> tuple[str, str]:
+    """Alternate which process runs first to reduce cache/order bias."""
+    return ("git", "sley_cli") if index % 2 == 0 else ("sley_cli", "git")
+
+
+def timed_process_pair(
+    cases: dict[str, tuple[list[str], Path]],
     warmup: int,
     repeat: int,
     env: dict[str, str],
-) -> dict[str, Any]:
-    for _ in range(warmup):
-        proc = run(
-            argv,
-            cwd=cwd,
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if proc.returncode != 0:
-            return error_record(proc)
+) -> dict[str, dict[str, Any]]:
+    """Time a Git/Sley pair in alternating order for every warmup and trial."""
+    results: dict[str, list[dict[str, Any]]] = {"git": [], "sley_cli": []}
+    for index in range(warmup):
+        for mode in paired_order(index):
+            argv, cwd = cases[mode]
+            proc = run(
+                argv,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if proc.returncode != 0:
+                return {
+                    mode: error_record(proc),
+                    paired_mode(mode): {
+                        "error": {
+                            "returncode": -1,
+                            "stderr": f"paired warmup failed in {mode}",
+                            "stdout": "",
+                        }
+                    },
+                }
 
-    runs = []
     for index in range(repeat):
-        start = time.perf_counter_ns()
-        proc = run(
-            argv,
-            cwd=cwd,
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            check=False,
+        for mode in paired_order(index):
+            argv, cwd = cases[mode]
+            start = time.perf_counter_ns()
+            proc = run(
+                argv,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            elapsed = time.perf_counter_ns() - start
+            if proc.returncode != 0:
+                failed = error_record(proc)
+                failed["failed_run"] = index
+                return {
+                    mode: failed,
+                    paired_mode(mode): {
+                        "error": {
+                            "returncode": -1,
+                            "stderr": f"paired timing failed in {mode}",
+                            "stdout": "",
+                        }
+                    },
+                }
+            results[mode].append(
+                {"index": index, "order": paired_order(index).index(mode), "ns": elapsed}
+            )
+    return {mode: {"runs": runs} for mode, runs in results.items()}
+
+
+def paired_mode(mode: str) -> str:
+    return "sley_cli" if mode == "git" else "git"
+
+
+def verify_process_pair(
+    cases: dict[str, tuple[list[str], Path]], env: dict[str, str]
+) -> None:
+    """Require byte-identical command output before admitting a timed case."""
+    outputs: dict[str, subprocess.CompletedProcess[bytes]] = {}
+    for mode in ("git", "sley_cli"):
+        argv, cwd = cases[mode]
+        outputs[mode] = run(argv, cwd=cwd, env=env, check=False)
+    git = outputs["git"]
+    sley = outputs["sley_cli"]
+    if (
+        git.returncode != sley.returncode
+        or git.stdout != sley.stdout
+        or git.stderr != sley.stderr
+    ):
+        raise RuntimeError(
+            "common-command case is not byte-identical before timing\n"
+            f"git: rc={git.returncode} stdout={decode(git.stdout)!r} "
+            f"stderr={decode(git.stderr)!r}\n"
+            f"sley: rc={sley.returncode} stdout={decode(sley.stdout)!r} "
+            f"stderr={decode(sley.stderr)!r}"
         )
-        elapsed = time.perf_counter_ns() - start
-        if proc.returncode != 0:
-            record = error_record(proc)
-            record["failed_run"] = index
-            return record
-        runs.append({"index": index, "ns": elapsed})
-    return {"runs": runs}
 
 
 def timed_harness(
@@ -445,13 +506,22 @@ def run_timing_matrix(
             if not command_available(repo, command):
                 records.append(skip_record(repo, command, "missing HEAD~1"))
                 continue
+            cases: dict[str, tuple[list[str], Path]] = {}
             for mode in ["git", "sley_cli"]:
                 bench_repo = case_repo_path(
                     repo_path, repo, command, mode, "timing", scratch_root, git_bin
                 )
                 argv = process_argv(mode, command, bench_repo, sley_bin, git_bin)
-                print(f"timing {repo['size']} {repo['name']} {mode} {command['name']}")
-                result = timed_process(argv, bench_repo, warmup, repeat, env)
+                cases[mode] = (argv, bench_repo)
+
+            print(
+                f"paired timing {repo['size']} {repo['name']} "
+                f"git/sley_cli {command['name']}"
+            )
+            verify_process_pair(cases, env)
+            paired_results = timed_process_pair(cases, warmup, repeat, env)
+            for mode in ["git", "sley_cli"]:
+                result = paired_results[mode]
                 records.append(make_timing_record(repo, command, mode, result))
 
             print(f"timing {repo['size']} {repo['name']} sley_harness {command['name']}")
@@ -760,7 +830,7 @@ def main() -> int:
     parser.add_argument(
         "--cache-dir",
         type=Path,
-        default=Path("/private/tmp/sley-human-common-repos"),
+        default=Path(tempfile.gettempdir()) / "sley-human-common-repos",
     )
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument(
@@ -806,7 +876,7 @@ def main() -> int:
     git_version = decode(run([str(git_bin), "--version"]).stdout).strip()
     repos = ensure_repos(args.cache_dir, args.update_repos, sizes, git_bin)
     with tempfile.TemporaryDirectory(
-        prefix="sley-human-common-write-", dir="/private/tmp"
+        prefix="sley-human-common-write-", dir=tempfile.gettempdir()
     ) as scratch:
         scratch_root = Path(scratch)
         timing = run_timing_matrix(

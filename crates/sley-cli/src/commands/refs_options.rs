@@ -1,7 +1,12 @@
 use super::{ReflogFormat, ReflogShowOptions};
 use crate::*;
 
-pub(super) fn setup_reflog_show_options(args: &[String]) -> Result<ReflogShowOptions> {
+pub(super) fn setup_reflog_show_options(
+    store: &FileRefStore,
+    git_dir: &Path,
+    object_format: ObjectFormat,
+    args: &[String],
+) -> Result<ReflogShowOptions> {
     let mut args = args;
     if args.first().is_some_and(|arg| arg == "show") {
         args = &args[1..];
@@ -145,7 +150,12 @@ pub(super) fn setup_reflog_show_options(args: &[String]) -> Result<ReflogShowOpt
         ));
     }
     let display = refs.first().cloned().unwrap_or_else(|| "HEAD".to_string());
-    let reference = reflog_reference_name(refs.first().map(String::as_str))?;
+    let reference = reflog_reference_name(
+        store,
+        git_dir,
+        object_format,
+        refs.first().map(String::as_str),
+    )?;
     Ok(ReflogShowOptions {
         reference,
         display,

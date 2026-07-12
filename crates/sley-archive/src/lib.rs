@@ -163,7 +163,7 @@ impl<'a> ArchiveConvert<'a> {
         })
     }
 
-    /// Install the `export-subst` keyword expander (see [`ArchiveConvert::subst`]).
+    /// Install the `export-subst` keyword expander (see `ArchiveConvert::subst`).
     /// Pass a closure that renders a `$Format:<fmt>$` inner format against the
     /// archived commit; only call this when archiving a *commit* (git only runs
     /// `format_subst` when a commit is available).
@@ -173,7 +173,7 @@ impl<'a> ArchiveConvert<'a> {
     }
 
     /// Install the `diff` userdiff binary-tristate resolver (see
-    /// [`ArchiveConvert::diff_binary`]). The closure maps a tree-relative path to
+    /// `ArchiveConvert::diff_binary`). The closure maps a tree-relative path to
     /// the path's `diff` driver `binary` flag.
     pub fn with_diff_binary(mut self, resolver: impl Fn(&[u8]) -> Option<bool> + 'a) -> Self {
         self.diff_binary = Some(Box::new(resolver));

@@ -169,9 +169,12 @@ impl Default for DiffFilesOptions {
     }
 }
 
-pub(crate) fn cmd_diff_files(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_diff_files(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = parse_diff_files_args(args)?;
-    run_diff_files(options)
+    run_diff_files(cli_session, options)
 }
 
 /// Parse `diff-files` arguments. Output-mode and rename/copy flags share their
@@ -502,7 +505,7 @@ fn parse_diff_files_context(value: &str) -> Result<usize> {
 }
 
 /// Run the index-vs-worktree diff and render it according to `options`.
-fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
+fn run_diff_files(cli_session: &crate::session::CliSession, o: DiffFilesOptions) -> Result<()> {
     // Combined-diff output (`-c`/`--cc`) requires unmerged index stages, which
     // this index-vs-worktree path does not reconstruct; reject it rather than
     // print a non-combined diff that upstream git would never emit here.
@@ -520,7 +523,7 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
             "diff reverse output is not supported for this output mode".into(),
         ));
     }
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
@@ -549,7 +552,7 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
     let pathspec = if o.path_args.is_empty() {
         DiffPathspec::default()
     } else {
-        DiffPathspec::new(cwd, worktree_root, &o.path_args)?
+        DiffPathspec::new(cwd, worktree_root, &o.path_args, repo.pathspec_magic())?
     };
 
     let options = sley_diff_merge::DiffNameStatusOptions {
@@ -677,6 +680,8 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
                 interhunk,
                 diff_algorithm,
                 indent_heuristic,
+                config: repo.config(),
+                lazy_fetch: cli_session.lazy_fetch(),
             },
         )?;
     }
@@ -699,6 +704,8 @@ struct DiffFilesRenderContext<'a> {
     interhunk: usize,
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
     indent_heuristic: bool,
+    config: &'a GitConfig,
+    lazy_fetch: bool,
 }
 
 fn render_diff_files_entries(
@@ -738,10 +745,16 @@ fn render_diff_files_entries(
     // --no-refresh`-restored file: shown `M` in raw/name-status, empty in stat)
     // must be excluded. The raw and name output keep the full set.
     let content_entries = if show_numstat || show_stat || show_shortstat {
-        collect_diff_stat_entries(entries, context.db, worktree_root, use_worktree_new)?
-            .into_iter()
-            .filter(diff_files_stat_entry_has_content_change)
-            .collect::<Vec<_>>()
+        collect_diff_stat_entries(
+            entries,
+            context.db,
+            worktree_root,
+            use_worktree_new,
+            context.lazy_fetch,
+        )?
+        .into_iter()
+        .filter(diff_files_stat_entry_has_content_change)
+        .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
@@ -773,6 +786,7 @@ fn render_diff_files_entries(
                     quote_path_fully: true,
                 },
                 widths: None,
+                config: Some(context.config),
             },
             after_stat: None,
             prefix_already_written: false,
@@ -781,10 +795,12 @@ fn render_diff_files_entries(
         |stdout, entry| {
             let patch_options = DiffRenderOptions {
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                suppress_blank_empty: false,
                 binary: false,
                 anchors: &[],
                 allow_textconv: false,
                 db: context.db,
+                lazy_fetch: context.lazy_fetch,
                 worktree_root,
                 use_worktree_new,
                 format: context.format,

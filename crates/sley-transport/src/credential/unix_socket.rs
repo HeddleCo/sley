@@ -22,9 +22,12 @@ impl UnixSockaddrContext {
     }
 }
 
-fn unix_sockaddr_setup(path: &Path, disallow_chdir: bool) -> io::Result<(PathBuf, UnixSockaddrContext)> {
+fn unix_sockaddr_setup(
+    path: &Path,
+    disallow_chdir: bool,
+) -> io::Result<(PathBuf, UnixSockaddrContext)> {
     let path_str = path.as_os_str().as_encoded_bytes();
-    if path_str.len() + 1 <= SUN_PATH_MAX {
+    if path_str.len() < SUN_PATH_MAX {
         return Ok((path.to_path_buf(), UnixSockaddrContext { orig_dir: None }));
     }
     if disallow_chdir {
@@ -94,10 +97,8 @@ mod tests {
 
     #[test]
     fn connect_and_listen_with_long_path() {
-        let base = std::env::temp_dir().join(format!(
-            "sley-cred-socket-test-{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("sley-cred-socket-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("create temp dir");
         let socket = long_socket_path(&base);
@@ -118,7 +119,9 @@ mod tests {
 
         let mut client = unix_stream_connect(&socket).expect("connect long socket path");
         client.write_all(b"ping").expect("write");
-        client.shutdown(std::net::Shutdown::Write).expect("shutdown");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown");
         let mut response = String::new();
         client.read_to_string(&mut response).expect("read response");
         assert_eq!(response, "pong");
@@ -128,10 +131,8 @@ mod tests {
 
     #[test]
     fn listen_unlinks_stale_socket() {
-        let base = std::env::temp_dir().join(format!(
-            "sley-cred-stale-socket-{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("sley-cred-stale-socket-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("create temp dir");
         let socket = base.join("socket");

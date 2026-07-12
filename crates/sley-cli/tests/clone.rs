@@ -1298,6 +1298,54 @@ fn clone_local_repository_config_options_match_upstream_git() {
 }
 
 #[test]
+fn clone_config_promisors_precede_generated_origin_like_upstream_git() {
+    let root = unique_temp_dir("clone-promisor-config-order");
+    let source = root.join("source");
+    fs::create_dir_all(&source).expect("create source repo");
+    create_source_repo(&source);
+    let source_arg = source.to_str().expect("source path is utf8");
+    let expected_repo = root.join("expected");
+    let actual_repo = root.join("actual");
+    let expected_args = [
+        "clone",
+        "-q",
+        "--no-local",
+        "--filter=blob:none",
+        "-c",
+        "remote.unused_lop.promisor=true",
+        "-c",
+        "remote.lop.promisor=true",
+        source_arg,
+        expected_repo.to_str().expect("expected path is utf8"),
+    ];
+    let mut actual_args = expected_args;
+    actual_args[actual_args.len() - 1] = actual_repo.to_str().expect("actual path is utf8");
+    assert_same_output(
+        run(sley_testkit::oracle_git(), &root, &expected_args),
+        run(sley_testkit::sley_bin!(), &root, &actual_args),
+        &actual_args,
+    );
+
+    let query = [
+        "config",
+        "get",
+        "--all",
+        "--show-names",
+        "--regexp",
+        "^remote\\..*\\.promisor$",
+    ];
+    let expected = run_success(sley_testkit::oracle_git(), &expected_repo, &query);
+    let actual = run_success(sley_testkit::oracle_git(), &actual_repo, &query);
+    assert_eq!(actual, expected);
+    assert_eq!(
+        String::from_utf8(actual).expect("promisor config is utf8"),
+        "remote.unused_lop.promisor true\nremote.lop.promisor true\nremote.origin.promisor true\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn clone_local_repository_template_options_match_upstream_git() {
     let root = unique_temp_dir("clone-local-template-options");
     let source = root.join("source");
@@ -2738,6 +2786,110 @@ fn clone_local_repository_submodule_hint_flags_match_upstream_git() {
             assert_same_output(actual, expected, &actual_args);
         }
     };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn clone_also_filter_submodules_marks_nested_clone_promisor_like_upstream_git() {
+    let root = unique_temp_dir("clone-also-filter-submodules-promisor");
+    let source = root.join("source");
+    let submodule = source.join("sub");
+    let expected_repo = root.join("expected");
+    let actual_repo = root.join("actual");
+    fs::create_dir_all(&source).expect("create source repo");
+    create_source_repo(&source);
+    fs::create_dir_all(&submodule).expect("create submodule repo");
+    create_source_repo(&submodule);
+    run_success(
+        sley_testkit::oracle_git(),
+        &source,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "./sub",
+        ],
+    );
+    run_success(
+        sley_testkit::oracle_git(),
+        &source,
+        &[
+            "-c",
+            "user.name=Example User",
+            "-c",
+            "user.email=example@example.invalid",
+            "commit",
+            "-m",
+            "add submodule",
+            "-q",
+        ],
+    );
+    for repo in [&source, &submodule] {
+        run_success(
+            sley_testkit::oracle_git(),
+            repo,
+            &["config", "uploadpack.allowFilter", "true"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            repo,
+            &["config", "uploadpack.allowAnySHA1InWant", "true"],
+        );
+    }
+
+    let source_url = format!("file://{}", source.display());
+    let expected_arg = expected_repo.to_str().expect("expected path is utf8");
+    let actual_arg = actual_repo.to_str().expect("actual path is utf8");
+    let expected = run(
+        sley_testkit::oracle_git(),
+        &root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            "--also-filter-submodules",
+            "--recurse-submodules",
+            &source_url,
+            expected_arg,
+        ],
+    );
+    let actual = run(
+        sley_testkit::sley_bin!(),
+        &root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            "--also-filter-submodules",
+            "--recurse-submodules",
+            &source_url,
+            actual_arg,
+        ],
+    );
+    assert_same_output(actual, expected, &["clone", "--also-filter-submodules"]);
+
+    for args in [
+        vec!["config", "--get", "remote.origin.promisor"],
+        vec!["config", "--get", "remote.origin.partialclonefilter"],
+    ] {
+        let expected = run(
+            sley_testkit::oracle_git(),
+            &expected_repo.join("sub"),
+            &args,
+        );
+        let actual = run(sley_testkit::oracle_git(), &actual_repo.join("sub"), &args);
+        assert_same_output(actual, expected, &args);
+    }
+    let promisor_packs = repository_promisor_sidecars(&actual_repo.join(".git/modules/sub"));
+    assert!(
+        !promisor_packs.is_empty(),
+        "filtered submodule clone should retain a promisor pack sidecar"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 

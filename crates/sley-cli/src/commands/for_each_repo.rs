@@ -47,7 +47,10 @@ const LOCAL_REPO_ENV: &[&str] = &[
     "GIT_COMMON_DIR",
 ];
 
-pub(crate) fn cmd_for_each_repo(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_for_each_repo(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut config_key: Option<String> = None;
     let mut keep_going = false;
     let mut index = 0;
@@ -97,7 +100,7 @@ pub(crate) fn cmd_for_each_repo(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     };
 
-    let values = match read_repo_paths(&config_key)? {
+    let values = match read_repo_paths(cli_session, &config_key)? {
         ConfigOutcome::BadKey => {
             return usage_error(Some(&format!("got bad config --config={config_key}")));
         }
@@ -157,15 +160,14 @@ enum ConfigOutcome {
 
 /// Read every value of the multi-valued config key from the effective config
 /// (system + global + repository + `-c`/`GIT_CONFIG_PARAMETERS` overrides).
-fn read_repo_paths(key: &str) -> Result<ConfigOutcome> {
+fn read_repo_paths(cli_session: &crate::session::CliSession, key: &str) -> Result<ConfigOutcome> {
     let canonical = match sley_config::canonicalize_config_key(key) {
         Ok(canonical) => canonical,
         Err(_) => return Ok(ConfigOutcome::BadKey),
     };
     let (section, subsection, variable) = split_canonical_key(&canonical);
 
-    let cwd = env::current_dir().map_err(|err| GitError::Io(err.to_string()))?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd).ok();
+    let git_dir = cli_session.git_dir().ok();
     let common_git_dir = git_dir
         .as_ref()
         .and_then(|dir| common_git_dir_for_git_dir(dir).ok());
@@ -181,7 +183,7 @@ fn read_repo_paths(key: &str) -> Result<ConfigOutcome> {
         &mut config,
         &parameters,
         &context,
-        &cwd,
+        cli_session.cwd(),
     )
     .map_err(|err| GitError::Io(err.to_string()))?;
 

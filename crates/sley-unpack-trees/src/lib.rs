@@ -38,9 +38,9 @@
 //! in `unpack-trees.c` (`oneway_merge`, `twoway_merge`, `threeway_merge`,
 //! `bind_merge`). D/F conflict markers, stat writeback for updated entries, and
 //! the submodule move-head probe hook are modeled here now. The remaining
-//! upstream machinery that still needs follow-up — sparse-checkout / sparse
-//! directories, full apply-phase D/F and ignored-file handling, and real
-//! submodule worktree mutation — is flagged with precise
+//! upstream machinery that still needs follow-up — sparse-directory by-OID
+//! traversal, sparse-orphan warning collection, full apply-phase D/F and
+//! ignored-file handling, and real submodule worktree mutation — is flagged with precise
 //! `// TODO(unpack-trees):` markers at the exact spot upstream invokes it, so a
 //! later wave can wire it in without re-deriving the control flow.
 
@@ -115,6 +115,10 @@ pub struct CacheEntry {
     /// git's `ce_stat_data`, carried forward from the source index on a kept
     /// entry. `None` when sourced from a tree or pending a worktree write.
     pub stat: Option<StatInfo>,
+    /// The logical entry is outside the sparse-checkout cone. Unpack-trees
+    /// still merges it in memory, but must not materialize or remove its
+    /// worktree path.
+    skip_worktree: bool,
     /// git's `o->df_conflict_entry` sentinel marker. When `true`, this slot is
     /// not a real entry: it is the directory/file (D/F) conflict placeholder
     /// that `unpack_trees` synthesizes for a tree slot whose path is a
@@ -134,6 +138,7 @@ impl CacheEntry {
             oid,
             stage: 0,
             stat: None,
+            skip_worktree: false,
             df_conflict: false,
         }
     }
@@ -145,6 +150,7 @@ impl CacheEntry {
             oid,
             stage: 0,
             stat,
+            skip_worktree: false,
             df_conflict: false,
         }
     }
@@ -156,18 +162,20 @@ impl CacheEntry {
             oid,
             stage,
             stat: None,
+            skip_worktree: false,
             df_conflict: false,
         }
     }
 
     /// git's `o->df_conflict_entry`: the D/F-conflict sentinel placed into a
-    /// tree slot by [`unpack_trees`]. See [`CacheEntry::df_conflict`].
+    /// tree slot by [`unpack_trees`]. See `CacheEntry::df_conflict`.
     pub fn df_conflict_marker() -> Self {
         Self {
             mode: 0,
             oid: ObjectId::null(ObjectFormat::Sha1),
             stage: 0,
             stat: None,
+            skip_worktree: false,
             df_conflict: true,
         }
     }
@@ -176,6 +184,20 @@ impl CacheEntry {
     /// `ce == o->df_conflict_entry`).
     pub fn is_df_conflict(&self) -> bool {
         self.df_conflict
+    }
+
+    fn with_skip_worktree(mut self, skip_worktree: bool) -> Self {
+        self.skip_worktree = skip_worktree;
+        self
+    }
+
+    /// Whether this result entry is outside the sparse-checkout cone.
+    ///
+    /// Consumers serializing an [`UnpackTreesResult`] must preserve this bit;
+    /// otherwise an unpack-trees transition silently expands the sparse index
+    /// and a later command may materialize paths that should remain absent.
+    pub fn is_skip_worktree(&self) -> bool {
+        self.skip_worktree
     }
 }
 
@@ -230,6 +252,10 @@ pub struct UnpackTreesOptions {
     pub update: bool,
     /// `o->index_only`: never touch or stat the working tree.
     pub index_only: bool,
+    /// Apply sparse-checkout policy during this worktree update. A raw
+    /// skip-worktree bit is not enough: plumbing can set it while sparse
+    /// checkout is disabled, in which case Git still updates the path.
+    pub apply_sparse_checkout: bool,
     /// `o->reset`: how aggressively to discard untracked files in the way.
     pub reset: ResetType,
     /// `o->head_idx`: which source slot is "head/ours" in a 3-way merge.
@@ -259,6 +285,7 @@ impl UnpackTreesOptions {
             merge: true,
             update: false,
             index_only: false,
+            apply_sparse_checkout: false,
             reset: ResetType::None,
             head_idx: 1,
             aggressive: false,
@@ -298,6 +325,16 @@ pub trait WorktreeProbe {
     /// git's `verify_absent(… ERROR_WOULD_LOSE_UNTRACKED_REMOVED …)`: would
     /// removing `path` discard an untracked working-tree file at that name?
     fn verify_absent_remove(&self, path: &[u8], reset: ResetType) -> Result<()>;
+
+    /// Sparse checkout's delayed `verify_absent` probe for a newly-added,
+    /// in-cone path. Returning `true` records Git's warning-only condition;
+    /// the checkout continues and the writer decides how to materialize the
+    /// tracked result. This is separate from `verify_absent_overwrite` because
+    /// sparse unpack reports these paths after tree traversal rather than
+    /// aborting the transition.
+    fn sparse_checkout_path_present(&self, _path: &[u8]) -> Result<bool> {
+        Ok(false)
+    }
 
     /// git's `check_submodule_move_head` (`unpack-trees.c`): would moving this
     /// gitlink's HEAD from `old_oid` (`None` when the submodule is newly
@@ -381,6 +418,18 @@ pub trait WorktreeWriter {
     /// not `lstat` the written path); the entry then keeps an all-zero stat,
     /// which git treats as "needs a refresh / racily clean".
     fn write_blob(&mut self, path: &[u8], mode: u32, oid: &ObjectId) -> Result<Option<StatInfo>>;
+    /// Materialize a validated set of independent writes. The default keeps
+    /// the historical sequential contract; checkout consumers may override it
+    /// with a deterministic worker queue while preserving result order.
+    fn write_blobs(
+        &mut self,
+        entries: &[(Vec<u8>, u32, ObjectId)],
+    ) -> Result<Vec<Option<StatInfo>>> {
+        entries
+            .iter()
+            .map(|(path, mode, oid)| self.write_blob(path, *mode, oid))
+            .collect()
+    }
     /// Remove `path` from the working tree (idempotent on an absent target).
     /// This is git's `unlink_entry`.
     fn remove_path(&mut self, path: &[u8]) -> Result<()>;
@@ -413,6 +462,7 @@ pub struct UnpackTreesState {
     /// git's `o->internal.nontrivial_merge`: set when threeway_merge falls
     /// through to emitting conflict stages.
     nontrivial_merge: bool,
+    sparse_checkout_present_paths: Vec<Vec<u8>>,
 }
 
 impl UnpackTreesState {
@@ -421,6 +471,7 @@ impl UnpackTreesState {
             result: Vec::new(),
             removals: Vec::new(),
             nontrivial_merge: false,
+            sparse_checkout_present_paths: Vec::new(),
         }
     }
 
@@ -448,14 +499,21 @@ impl UnpackTreesState {
 
 /// The outcome of an [`unpack_trees`] run: the resulting index rows (sorted by
 /// path then stage, the order git's `ls-files --stage` emits) and the
-/// working-tree removals the merge decided on. Pass it to [`check_updates`] to
-/// apply the worktree side.
+/// working-tree removals the merge decided on. A removal may accompany a
+/// retained skip-worktree result row when the sparse cone contracts. Pass it
+/// to [`check_updates`] to apply the worktree side.
 #[derive(Debug, Clone)]
 pub struct UnpackTreesResult {
     /// Resulting index entries, sorted `(path, stage)`.
     pub entries: Vec<ResultEntry>,
-    /// Paths the merge removed (index + worktree).
+    /// Paths whose worktree copies the merge removed. Paths absent from
+    /// `entries` are removed from the index too; retained skip-worktree rows
+    /// represent sparse-cone contraction and remain in the index.
     pub removed_paths: Vec<Vec<u8>>,
+    /// Newly-added in-cone paths that were already present in the worktree.
+    /// Git completes the transition but renders these as a sparse-checkout
+    /// warning rather than treating them as fatal untracked collisions.
+    pub sparse_checkout_present_paths: Vec<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -762,16 +820,16 @@ pub fn threeway_merge<P: WorktreeProbe + ?Sized>(
     if head_match == 0 || remote_match == 0 {
         for stage in stages.iter().take(opts.head_idx).skip(1) {
             if let Some(s) = stage.as_ref().filter(|e| !e.is_df_conflict()) {
-                keep_entry(s, path, state)?;
+                keep_conflicted_entry(s, path, state)?;
                 break;
             }
         }
     }
     if let Some(head) = head {
-        keep_entry(head, path, state)?;
+        keep_conflicted_entry(head, path, state)?;
     }
     if let Some(remote) = remote {
-        keep_entry(remote, path, state)?;
+        keep_conflicted_entry(remote, path, state)?;
     }
     Ok(())
 }
@@ -799,12 +857,18 @@ fn merged_entry<P: WorktreeProbe + ?Sized>(
     // filled by the apply phase's post-write `lstat`); the `same(old)` branch
     // below copies the old entry's stat over, mirroring git's
     // `copy_cache_entry(merge, old)`.
-    let mut merge = CacheEntry::stage0(ce.mode, ce.oid);
+    let mut merge = CacheEntry::stage0(ce.mode, ce.oid)
+        .with_skip_worktree(ce.skip_worktree || old.is_some_and(|entry| entry.skip_worktree));
 
     match old {
         None => {
             // New index entry: verify it won't clobber an untracked file.
-            if opts.merge && opts.update && !opts.index_only {
+            // Git initially tags every new sparse-checkout entry with
+            // CE_NEW_SKIP_WORKTREE. That makes this first verify_absent call a
+            // no-op; the later sparse-pattern pass performs the real check
+            // once the final cone is known and reports an in-cone collision as
+            // a warning instead of aborting the whole transition.
+            if opts.merge && opts.update && !opts.index_only && !opts.apply_sparse_checkout {
                 probe.verify_absent_overwrite(path, &merge, opts.reset)?;
             }
             // git's `check_submodule_move_head(o, ce, NULL, oid_to_hex(&ce->oid))`:
@@ -839,8 +903,27 @@ fn merged_entry<P: WorktreeProbe + ?Sized>(
         }
     }
 
-    state.add_entry(path, merge, update && opts.update && !opts.index_only);
+    let update_worktree = update
+        && opts.update
+        && !opts.index_only
+        && !(opts.apply_sparse_checkout && merge.skip_worktree);
+    state.add_entry(path, merge, update_worktree);
     Ok(())
+}
+
+/// Add one stage of a non-trivial merge result.
+///
+/// Git's sparse-pattern pass always clears CE_SKIP_WORKTREE on unmerged
+/// entries: conflicts must remain visible so the user can resolve them even
+/// when their path is outside the cone. Keep this rule in the engine instead
+/// of making every serializer rediscover it.
+fn keep_conflicted_entry(
+    entry: &CacheEntry,
+    path: &[u8],
+    state: &mut UnpackTreesState,
+) -> Result<()> {
+    let entry = entry.clone().with_skip_worktree(false);
+    keep_entry(&entry, path, state)
 }
 
 /// git's `deleted_entry`: drop the path. Runs verify_absent (untracked-removed)
@@ -869,7 +952,9 @@ fn deleted_entry<P: WorktreeProbe + ?Sized>(
             }
         }
     }
-    state.add_removal(path);
+    if !(opts.apply_sparse_checkout && old.is_some_and(|entry| entry.skip_worktree)) {
+        state.add_removal(path);
+    }
     Ok(())
 }
 
@@ -939,10 +1024,82 @@ pub type FlatTree = BTreeMap<Vec<u8>, (u32, ObjectId)>;
 /// `intent-to-add`-style entry whose stat git stores as all-zero.
 pub type IndexInputEntry = (u32, ObjectId, Option<StatInfo>);
 
-/// The current index as a flat stage-0 map: path → `(mode, oid, stat)`.
-/// Consumers build this from the on-disk index's stage-0 entries, carrying
-/// each entry's cached `lstat` data so the merge preserves it.
-pub type FlatIndex = BTreeMap<Vec<u8>, IndexInputEntry>;
+/// The current index as a flat stage-0 map plus its sparse worktree policy.
+///
+/// Collapsed sparse directories are expanded only in this logical view. Their
+/// prefixes remain recorded here so entries changed or newly added below them
+/// participate in the merge without being materialized in the worktree.
+#[derive(Debug, Clone, Default)]
+pub struct FlatIndex {
+    entries: BTreeMap<Vec<u8>, IndexInputEntry>,
+    skip_worktree_paths: std::collections::BTreeSet<Vec<u8>>,
+    sparse_directory_prefixes: Vec<Vec<u8>>,
+    sparse_checkout_decisions: BTreeMap<Vec<u8>, bool>,
+}
+
+impl FlatIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, path: Vec<u8>, entry: IndexInputEntry) -> Option<IndexInputEntry> {
+        self.entries.insert(path, entry)
+    }
+
+    /// Record an ordinary full-index entry carrying CE_SKIP_WORKTREE.
+    pub fn mark_skip_worktree(&mut self, path: Vec<u8>) {
+        self.skip_worktree_paths.insert(path);
+    }
+
+    /// Record the trailing-slash prefix of a collapsed sparse directory.
+    pub fn mark_sparse_directory(&mut self, prefix: Vec<u8>) {
+        self.sparse_directory_prefixes.push(prefix);
+    }
+
+    /// Set the desired post-transition sparse state for one logical path.
+    ///
+    /// This is deliberately separate from [`FlatIndex::mark_skip_worktree`]:
+    /// the latter describes the index *before* unpack-trees, while this method
+    /// describes the current sparse-checkout patterns. Keeping both states is
+    /// what lets the engine plan expand (skip -> present) and collapse
+    /// (present -> skip) worktree transitions without conflating old flags
+    /// with the new cone.
+    pub fn set_sparse_checkout_skip(&mut self, path: Vec<u8>, skip: bool) {
+        self.sparse_checkout_decisions.insert(path, skip);
+    }
+
+    fn was_skip_worktree(&self, path: &[u8]) -> bool {
+        self.skip_worktree_paths.contains(path)
+            || self
+                .sparse_directory_prefixes
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+    }
+
+    fn should_skip_worktree(&self, path: &[u8]) -> bool {
+        self.sparse_checkout_decisions
+            .get(path)
+            .copied()
+            .unwrap_or_else(|| self.was_skip_worktree(path))
+    }
+}
+
+impl std::ops::Deref for FlatIndex {
+    type Target = BTreeMap<Vec<u8>, IndexInputEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl FromIterator<(Vec<u8>, IndexInputEntry)> for FlatIndex {
+    fn from_iter<T: IntoIterator<Item = (Vec<u8>, IndexInputEntry)>>(iter: T) -> Self {
+        Self {
+            entries: iter.into_iter().collect(),
+            ..Self::default()
+        }
+    }
+}
 
 /// Whether a tree slot for `path` should be git's `o->df_conflict_entry` marker.
 ///
@@ -986,6 +1143,85 @@ fn df_conflict_slot(tree: &FlatTree, path: &[u8]) -> bool {
     false
 }
 
+/// Checkout-specific controls for a two-tree index/worktree transition.
+///
+/// The engine derives `initial_checkout` from the supplied index and fixes the
+/// remaining unpack-trees mode to Git's checkout contract: merge and worktree
+/// updates enabled, index-only disabled, and the two-way merge primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckoutTransitionOptions {
+    /// Repository object format, used for the empty old tree of an unborn HEAD.
+    pub format: ObjectFormat,
+    /// Permit tracked and untracked paths in the way to be overwritten (`-f`).
+    pub overwrite_untracked: bool,
+    /// Apply current sparse-checkout decisions during the transition.
+    pub apply_sparse_checkout: bool,
+}
+
+impl CheckoutTransitionOptions {
+    /// Construct safe, non-forcing checkout transition options.
+    pub fn new(format: ObjectFormat) -> Self {
+        Self {
+            format,
+            overwrite_untracked: false,
+            apply_sparse_checkout: false,
+        }
+    }
+}
+
+/// A validated checkout transition plan before its worktree writes are applied.
+///
+/// Consumers may inspect the pure merge result for additional repository-level
+/// safety checks, then call [`CheckoutTransitionPlan::apply`] exactly once.
+#[derive(Debug)]
+pub struct CheckoutTransitionPlan {
+    result: UnpackTreesResult,
+    unpack_options: UnpackTreesOptions,
+}
+
+impl CheckoutTransitionPlan {
+    /// Pure resulting index entries and planned worktree removals.
+    pub fn result(&self) -> &UnpackTreesResult {
+        &self.result
+    }
+
+    /// Apply planned removals and writes, returning the stat-refreshed result.
+    pub fn apply<W: WorktreeWriter>(mut self, writer: &mut W) -> Result<UnpackTreesResult> {
+        check_updates(&mut self.result, &self.unpack_options, writer)?;
+        Ok(self.result)
+    }
+}
+
+/// Plan Git's checkout/switch two-tree transition.
+///
+/// `old_tree` is absent for an unborn HEAD. The operation owns checkout's
+/// unpack-trees semantics rather than requiring each porcelain caller to
+/// reconstruct `MergeFn::TwoWay`, reset mode, initial-checkout detection, and
+/// update/index-only flags independently.
+pub fn plan_checkout_transition<P: WorktreeProbe + ?Sized>(
+    index: &FlatIndex,
+    old_tree: Option<FlatTree>,
+    new_tree: FlatTree,
+    options: CheckoutTransitionOptions,
+    probe: &P,
+) -> Result<CheckoutTransitionPlan> {
+    let mut unpack_options = UnpackTreesOptions::new(options.format);
+    unpack_options.merge = true;
+    unpack_options.update = true;
+    unpack_options.index_only = false;
+    unpack_options.apply_sparse_checkout = options.apply_sparse_checkout;
+    unpack_options.initial_checkout = index.is_empty();
+    if options.overwrite_untracked {
+        unpack_options.reset = ResetType::OverwriteUntracked;
+    }
+    let trees = [old_tree.unwrap_or_default(), new_tree];
+    let result = unpack_trees(index, &trees, MergeFn::TwoWay, &unpack_options, probe)?;
+    Ok(CheckoutTransitionPlan {
+        result,
+        unpack_options,
+    })
+}
+
 /// Run git's `unpack_trees`: walk the union of paths across `index` and the
 /// supplied `trees`, dispatch each path's source slice to `merge_fn`, and
 /// accumulate the resulting index plus worktree removals.
@@ -1019,7 +1255,7 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
     if merge_fn == MergeFn::ThreeWay && opts.head_idx == 1 && trees.len() >= 3 {
         effective.head_idx = trees.len() - 1;
     }
-    if merge_fn == MergeFn::ThreeWay && effective.head_idx + 1 >= trees.len() + 1 {
+    if merge_fn == MergeFn::ThreeWay && effective.head_idx + 1 > trees.len() {
         return Err(GitError::InvalidFormat(format!(
             "unpack_trees: invalid head_idx {} for {} tree(s)",
             effective.head_idx,
@@ -1051,9 +1287,10 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
         // directory in the index is handled by descending into it, and
         // `find_cache_entry` returns nothing for a directory prefix, so the
         // index slot is simply absent when this path is not a real index leaf.
-        src[0] = index
-            .get(path)
-            .map(|(mode, oid, stat)| CacheEntry::stage0_with_stat(*mode, *oid, *stat));
+        src[0] = index.get(path).map(|(mode, oid, stat)| {
+            CacheEntry::stage0_with_stat(*mode, *oid, *stat)
+                .with_skip_worktree(index.was_skip_worktree(path))
+        });
         for (i, tree) in trees.iter().enumerate() {
             let slot = i + 1;
             let stage = if !opts.merge {
@@ -1067,7 +1304,15 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
             };
             src[i + 1] = match tree.get(path) {
                 // A real leaf in this tree: take it at its slot's stage.
-                Some((mode, oid)) => Some(CacheEntry::staged(*mode, *oid, stage)),
+                Some((mode, oid)) => {
+                    Some(CacheEntry::staged(*mode, *oid, stage).with_skip_worktree(
+                        if opts.apply_sparse_checkout && opts.update && !opts.index_only {
+                            index.should_skip_worktree(path)
+                        } else {
+                            index.was_skip_worktree(path)
+                        },
+                    ))
+                }
                 // Not a leaf here. If this path is a *directory* in this tree
                 // (some `path/…` exists) — git's `dirmask` bit — or an *ancestor
                 // directory* of this path is a *file* leaf in this tree — git's
@@ -1088,9 +1333,139 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
         }
     }
 
+    // A two-way D/F transition can provisionally produce both a file and one
+    // of its descendants: the new tree contributes the file while a staged
+    // local addition below the old directory is carried through. Git resolves
+    // that collision according to the physical shape of the input index. An
+    // expanded index preserves the staged descendant (and therefore omits the
+    // colliding new file); a collapsed sparse directory has no individual
+    // descendant to preserve, so the new file wins. The flat logical view has
+    // both in either case, so restore that physical-index distinction before
+    // any worktree updates are planned.
+    if merge_fn == MergeFn::TwoWay {
+        let result_paths = state
+            .result
+            .iter()
+            .filter(|entry| entry.entry.stage == 0)
+            .map(|entry| entry.path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut losing_paths = std::collections::BTreeSet::new();
+        for ancestor in &result_paths {
+            let mut prefix = ancestor.clone();
+            prefix.push(b'/');
+            let has_descendant = result_paths
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|path| path.starts_with(&prefix));
+            if !has_descendant {
+                continue;
+            }
+
+            let was_collapsed_sparse_dir = index
+                .sparse_directory_prefixes
+                .iter()
+                .any(|sparse_prefix| sparse_prefix == &prefix);
+            // Git's hierarchical tree traversal can encounter a same-prefix
+            // sibling (for example `dir-` or `dir.x`) between the file `dir`
+            // and the directory `dir/`. In a full checkout that ordering keeps
+            // the staged descendant; without such a sibling the replacement
+            // file wins. Sparse checkout's pattern pass expands the directory
+            // and consistently preserves the descendant. This distinction is
+            // lost when all trees are flattened into byte-sorted paths, so
+            // derive it from the same path set here.
+            let has_tree_ordering_prefix_sibling = index
+                .keys()
+                .chain(trees.iter().flat_map(|tree| tree.keys()))
+                .any(|candidate| {
+                    candidate.len() > ancestor.len()
+                        && candidate.starts_with(ancestor)
+                        && candidate[ancestor.len()] < b'/'
+                });
+            let preserve_descendants = !was_collapsed_sparse_dir
+                && (opts.apply_sparse_checkout || has_tree_ordering_prefix_sibling);
+
+            if !preserve_descendants {
+                losing_paths.extend(
+                    result_paths
+                        .range(prefix.clone()..)
+                        .take_while(|path| path.starts_with(&prefix))
+                        .cloned(),
+                );
+            } else {
+                losing_paths.insert(ancestor.clone());
+            }
+        }
+        state
+            .result
+            .retain(|entry| !losing_paths.contains(&entry.path));
+    }
+
+    // Sparse-checkout loop #2 in upstream applies the newly-computed pattern
+    // decision after the logical tree merge. That ordering matters when the
+    // content is unchanged: the merge primitive may carry the old entry
+    // through, but a changed cone must still materialize or remove its
+    // worktree copy. Do that as one result pass, keeping all pattern matching
+    // outside this I/O-free crate.
+    let mut sparse_removals = Vec::new();
+    if opts.apply_sparse_checkout && opts.update && !opts.index_only {
+        for result in &mut state.result {
+            if result.entry.stage != 0 {
+                result.entry.skip_worktree = false;
+                continue;
+            }
+            let path = result.path.as_slice();
+            let Some((old_mode, old_oid, old_stat)) = index.get(path) else {
+                // New entries already received should_skip_worktree in their
+                // tree slot. Sparse checkout deliberately delayed their
+                // untracked-file check until the final cone was known.
+                let should_skip = index.should_skip_worktree(path);
+                result.entry.skip_worktree = should_skip;
+                if !should_skip && probe.sparse_checkout_path_present(path)? {
+                    state
+                        .sparse_checkout_present_paths
+                        .push(result.path.clone());
+                    // Git keeps the tracked index entry but leaves the
+                    // pre-existing untracked worktree path untouched. The
+                    // caller renders the warning after the transition.
+                    result.wt_update = false;
+                }
+                continue;
+            };
+            let was_skip = index.was_skip_worktree(path);
+            let should_skip = index.should_skip_worktree(path);
+            result.entry.skip_worktree = should_skip;
+            if was_skip == should_skip {
+                continue;
+            }
+
+            if was_skip {
+                // Expanding the cone: the old path was deliberately absent, so
+                // verify it is still safe to materialize and force a write even
+                // when the tree/index object identity was unchanged.
+                probe.verify_absent_overwrite(path, &result.entry, opts.reset)?;
+                result.entry.stat = None;
+                result.wt_update = true;
+            } else {
+                // Collapsing the cone: do not hide a dirty tracked file. Once it is
+                // verified, retain the index row with skip-worktree and schedule
+                // only its worktree copy for removal.
+                let old = CacheEntry::stage0_with_stat(*old_mode, *old_oid, *old_stat);
+                probe.verify_uptodate(path, &old)?;
+                result.wt_update = false;
+                sparse_removals.push(result.path.clone());
+            }
+        }
+    }
+    for path in sparse_removals {
+        if !state.removals.iter().any(|removal| removal.path == path) {
+            state.add_removal(&path);
+        }
+    }
+
     let UnpackTreesState {
         mut result,
         removals,
+        mut sparse_checkout_present_paths,
         ..
     } = state;
     result.sort_by(|a, b| {
@@ -1100,9 +1475,12 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
     });
 
     let removed_paths = removals.into_iter().map(|r| r.path).collect();
+    sparse_checkout_present_paths.sort();
+    sparse_checkout_present_paths.dedup();
     Ok(UnpackTreesResult {
         entries: result,
         removed_paths,
+        sparse_checkout_present_paths,
     })
 }
 
@@ -1133,13 +1511,27 @@ pub fn check_updates<W: WorktreeWriter>(
     for path in &result.removed_paths {
         writer.remove_path(path)?;
     }
+    let writes = result
+        .entries
+        .iter()
+        .filter(|entry| entry.wt_update && entry.entry.stage == 0)
+        .map(|entry| (entry.path.clone(), entry.entry.mode, entry.entry.oid))
+        .collect::<Vec<_>>();
+    let mut stats = writer.write_blobs(&writes)?.into_iter();
     for entry in &mut result.entries {
         if entry.wt_update && entry.entry.stage == 0 {
-            let stat = writer.write_blob(&entry.path, entry.entry.mode, &entry.entry.oid)?;
+            let stat = stats.next().ok_or_else(|| {
+                GitError::Transaction("worktree writer returned too few batch results".into())
+            })?;
             // git's fill_stat_cache_info: stamp the freshly-written file's
             // lstat onto the entry so a follow-up diff-files reports it clean.
             entry.entry.stat = stat;
         }
+    }
+    if stats.next().is_some() {
+        return Err(GitError::Transaction(
+            "worktree writer returned too many batch results".into(),
+        ));
     }
     Ok(())
 }
@@ -1193,6 +1585,187 @@ mod tests {
 
     fn opts() -> UnpackTreesOptions {
         UnpackTreesOptions::new(ObjectFormat::Sha1)
+    }
+
+    #[test]
+    fn sparse_descendants_merge_logically_without_worktree_updates() {
+        let mut index = idx(&[(b"outside/changed", 1), (b"outside/deleted", 2)]);
+        index.mark_sparse_directory(b"outside/".to_vec());
+        let old = flat(&[(b"outside/changed", 1), (b"outside/deleted", 2)]);
+        let new = flat(&[(b"outside/changed", 3), (b"outside/added", 4)]);
+        let mut options = opts();
+        options.update = true;
+        options.apply_sparse_checkout = true;
+
+        let result = unpack_trees(
+            &index,
+            &[old, new],
+            MergeFn::TwoWay,
+            &options,
+            &NullWorktree,
+        )
+        .expect("merge collapsed sparse-directory descendants");
+
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| (entry.path.as_slice(), entry.entry.oid, entry.wt_update))
+                .collect::<Vec<_>>(),
+            [
+                (b"outside/added".as_slice(), oid(4), false),
+                (b"outside/changed".as_slice(), oid(3), false),
+            ]
+        );
+        assert!(
+            result.removed_paths.is_empty(),
+            "an absent skip-worktree descendant must not schedule a worktree removal"
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .all(|entry| entry.entry.is_skip_worktree()),
+            "the logical result must retain skip-worktree for serialization"
+        );
+    }
+
+    #[derive(Default)]
+    struct RejectAbsentProbe {
+        absent_checks: std::cell::Cell<usize>,
+        sparse_present: bool,
+    }
+
+    impl WorktreeProbe for RejectAbsentProbe {
+        fn verify_uptodate(&self, _path: &[u8], _ce: &CacheEntry) -> Result<()> {
+            Ok(())
+        }
+
+        fn verify_absent_overwrite(
+            &self,
+            _path: &[u8],
+            _merge: &CacheEntry,
+            _reset: ResetType,
+        ) -> Result<()> {
+            self.absent_checks.set(self.absent_checks.get() + 1);
+            Err(GitError::Exit(128))
+        }
+
+        fn verify_absent_remove(&self, _path: &[u8], _reset: ResetType) -> Result<()> {
+            Ok(())
+        }
+
+        fn sparse_checkout_path_present(&self, _path: &[u8]) -> Result<bool> {
+            Ok(self.sparse_present)
+        }
+    }
+
+    #[test]
+    fn new_sparse_descendant_does_not_probe_or_update_worktree() {
+        // A dirty/untracked path may exist outside the cone. Git tags the new
+        // entry CE_NEW_SKIP_WORKTREE before the first verify_absent call, so
+        // the merge succeeds and leaves that worktree path alone.
+        let mut index = FlatIndex::new();
+        index.mark_sparse_directory(b"outside/".to_vec());
+        let target = flat(&[(b"outside/added", 1)]);
+        let mut options = opts();
+        options.update = true;
+        options.apply_sparse_checkout = true;
+        let probe = RejectAbsentProbe::default();
+
+        let result = unpack_trees(&index, &[target], MergeFn::OneWay, &options, &probe)
+            .expect("out-of-cone addition must not inspect an unwritten path");
+
+        assert_eq!(probe.absent_checks.get(), 0);
+        assert_eq!(result.entries.len(), 1);
+        assert!(result.entries[0].entry.is_skip_worktree());
+        assert!(!result.entries[0].wt_update);
+    }
+
+    #[test]
+    fn new_in_cone_sparse_path_defers_absent_check_to_warning_outcome() {
+        let mut index = FlatIndex::new();
+        index.set_sparse_checkout_skip(b"selected/file".to_vec(), false);
+        let target = flat(&[(b"selected/file", 1)]);
+        let mut options = opts();
+        options.update = true;
+        options.apply_sparse_checkout = true;
+        let probe = RejectAbsentProbe {
+            sparse_present: true,
+            ..RejectAbsentProbe::default()
+        };
+
+        let result = unpack_trees(&index, &[target], MergeFn::OneWay, &options, &probe)
+            .expect("present in-cone sparse addition is warning-only");
+
+        assert_eq!(probe.absent_checks.get(), 0);
+        assert_eq!(
+            result.sparse_checkout_present_paths,
+            vec![b"selected/file".to_vec()]
+        );
+        assert!(
+            !result.entries[0].wt_update,
+            "the warning outcome must preserve the untracked worktree path"
+        );
+        assert!(!result.entries[0].entry.is_skip_worktree());
+    }
+
+    #[test]
+    fn sparse_decision_expands_unchanged_entry_into_worktree() {
+        let mut index = idx(&[(b"outside/file", 1)]);
+        index.mark_skip_worktree(b"outside/file".to_vec());
+        index.set_sparse_checkout_skip(b"outside/file".to_vec(), false);
+        let target = flat(&[(b"outside/file", 1)]);
+        let mut options = opts();
+        options.update = true;
+        options.apply_sparse_checkout = true;
+
+        let mut result = unpack_trees(&index, &[target], MergeFn::OneWay, &options, &NullWorktree)
+            .expect("expand unchanged sparse entry");
+
+        assert!(!result.entries[0].entry.is_skip_worktree());
+        assert!(result.entries[0].wt_update);
+        let mut writer = RecordingWriter::default();
+        check_updates(&mut result, &options, &mut writer).expect("materialize expanded entry");
+        assert_eq!(writer.ops, vec![(b"outside/file".to_vec(), "write")]);
+    }
+
+    #[test]
+    fn sparse_decision_collapses_unchanged_entry_out_of_worktree() {
+        let mut index = idx(&[(b"outside/file", 1)]);
+        index.set_sparse_checkout_skip(b"outside/file".to_vec(), true);
+        let target = flat(&[(b"outside/file", 1)]);
+        let mut options = opts();
+        options.update = true;
+        options.apply_sparse_checkout = true;
+
+        let mut result = unpack_trees(&index, &[target], MergeFn::OneWay, &options, &NullWorktree)
+            .expect("collapse unchanged sparse entry");
+
+        assert!(result.entries[0].entry.is_skip_worktree());
+        assert!(!result.entries[0].wt_update);
+        assert_eq!(result.removed_paths, vec![b"outside/file".to_vec()]);
+        let mut writer = RecordingWriter::default();
+        check_updates(&mut result, &options, &mut writer).expect("remove collapsed entry");
+        assert_eq!(writer.ops, vec![(b"outside/file".to_vec(), "remove")]);
+    }
+
+    #[test]
+    fn explicit_skip_bit_does_not_suppress_update_without_sparse_checkout() {
+        // t7012: update-index --skip-worktree is legal without enabling sparse
+        // checkout. read-tree -u must still restore a changed, absent file.
+        let mut index = idx(&[(b"file", 2)]);
+        index.mark_skip_worktree(b"file".to_vec());
+        let target = flat(&[(b"file", 1)]);
+        let mut options = opts();
+        options.update = true;
+
+        let mut result = unpack_trees(&index, &[target], MergeFn::OneWay, &options, &NullWorktree)
+            .expect("update explicit skip bit outside sparse checkout");
+        assert!(result.entries[0].wt_update);
+        let mut writer = RecordingWriter::default();
+        check_updates(&mut result, &options, &mut writer).expect("write explicitly skipped path");
+        assert_eq!(writer.ops, vec![(b"file".to_vec(), "write")]);
     }
 
     /// A `WorktreeWriter` that records the order of `write_blob` / `remove_path`
@@ -1368,6 +1941,174 @@ mod tests {
     }
 
     #[test]
+    fn twoway_df_collision_preserves_staged_descendant_in_expanded_index() {
+        let index = idx(&[(b"folder/local", 9)]);
+        let old = flat(&[(b"folder/tracked", 1)]);
+        let new = flat(&[(b"folder", 2)]);
+        let mut options = opts();
+        options.apply_sparse_checkout = true;
+
+        let result = unpack_trees(
+            &index,
+            &[old, new],
+            MergeFn::TwoWay,
+            &options,
+            &NullWorktree,
+        )
+        .expect("preserve staged descendant across D/F checkout");
+
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"folder/local".as_slice()]
+        );
+    }
+
+    #[test]
+    fn twoway_df_collision_preserves_descendant_across_prefix_sibling() {
+        let index = idx(&[(b"folder/local", 9), (b"folder.x", 3)]);
+        let old = flat(&[(b"folder/tracked", 1), (b"folder.x", 3)]);
+        let new = flat(&[(b"folder", 2), (b"folder.x", 3)]);
+
+        let result = unpack_trees(&index, &[old, new], MergeFn::TwoWay, &opts(), &NullWorktree)
+            .expect("tree-ordering sibling preserves staged descendant");
+
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"folder.x".as_slice(), b"folder/local".as_slice()]
+        );
+    }
+
+    #[test]
+    fn twoway_df_collision_prefers_file_without_prefix_sibling() {
+        let index = idx(&[(b"folder/local", 9)]);
+        let old = flat(&[(b"folder/tracked", 1)]);
+        let new = flat(&[(b"folder", 2)]);
+
+        let result = unpack_trees(&index, &[old, new], MergeFn::TwoWay, &opts(), &NullWorktree)
+            .expect("plain D/F transition prefers target file");
+
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"folder".as_slice()]
+        );
+    }
+
+    #[test]
+    fn twoway_df_collision_ignores_prefix_sibling_sorted_after_directory() {
+        let index = idx(&[(b"folder/local", 9), (b"folder0", 3)]);
+        let old = flat(&[(b"folder/tracked", 1), (b"folder0", 3)]);
+        let new = flat(&[(b"folder", 2), (b"folder0", 3)]);
+
+        let result = unpack_trees(&index, &[old, new], MergeFn::TwoWay, &opts(), &NullWorktree)
+            .expect("later prefix sibling does not intervene in D/F traversal");
+
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"folder".as_slice(), b"folder0".as_slice()]
+        );
+    }
+
+    #[test]
+    fn twoway_df_collision_prefers_file_for_collapsed_sparse_directory() {
+        let mut index = idx(&[(b"folder/local", 9)]);
+        index.mark_sparse_directory(b"folder/".to_vec());
+        let old = flat(&[(b"folder/tracked", 1)]);
+        let new = flat(&[(b"folder", 2)]);
+
+        let result = unpack_trees(&index, &[old, new], MergeFn::TwoWay, &opts(), &NullWorktree)
+            .expect("collapsed sparse directory yields to target file");
+
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"folder".as_slice()]
+        );
+    }
+
+    #[test]
+    fn checkout_transition_derives_initial_checkout_from_empty_index() {
+        let new = flat(&[(b"a", 1)]);
+        let plan = plan_checkout_transition(
+            &FlatIndex::new(),
+            None,
+            new,
+            CheckoutTransitionOptions::new(ObjectFormat::Sha1),
+            &NullWorktree,
+        )
+        .expect("plan unborn checkout");
+        assert_eq!(plan.result().entries.len(), 1);
+        assert_eq!(plan.result().entries[0].path, b"a");
+        assert!(plan.result().entries[0].wt_update);
+    }
+
+    #[test]
+    fn checkout_transition_honors_staged_deletion_in_existing_index() {
+        let index = idx(&[(b"local", 9)]);
+        let old = flat(&[(b"a", 1)]);
+        let new = flat(&[(b"a", 1)]);
+        let plan = plan_checkout_transition(
+            &index,
+            Some(old),
+            new,
+            CheckoutTransitionOptions::new(ObjectFormat::Sha1),
+            &NullWorktree,
+        )
+        .expect("plan checkout with staged deletion");
+        let paths = plan
+            .result()
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_slice())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![b"local".as_slice()]);
+    }
+
+    #[test]
+    fn checkout_transition_apply_refreshes_written_entry_stat() {
+        let index = idx(&[(b"a", 1)]);
+        let old = flat(&[(b"a", 1)]);
+        let new = flat(&[(b"a", 2)]);
+        let plan = plan_checkout_transition(
+            &index,
+            Some(old),
+            new,
+            CheckoutTransitionOptions::new(ObjectFormat::Sha1),
+            &NullWorktree,
+        )
+        .expect("plan checkout update");
+        let mut writer = RecordingWriter::default();
+        let result = plan.apply(&mut writer).expect("apply checkout update");
+        assert_eq!(writer.ops, vec![(b"a".to_vec(), "write")]);
+        assert_eq!(
+            result.entries[0].entry.stat,
+            Some(StatInfo {
+                size: 1,
+                mtime_seconds: 1001,
+                ..StatInfo::default()
+            })
+        );
+    }
+
+    #[test]
     fn threeway_resolves_when_one_side_unchanged() {
         // base=a@1, ours=a@2 (changed), theirs=a@1 (unchanged) → take ours.
         let index = idx(&[(b"a", 2)]);
@@ -1405,6 +2146,44 @@ mod tests {
         .expect("threeway conflict");
         let stages: Vec<u8> = res.entries.iter().map(|e| e.entry.stage).collect();
         assert_eq!(stages, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn threeway_conflict_clears_skip_worktree_on_every_stage() {
+        // Sparse-checkout starts with the path omitted, but an unmerged path
+        // must be made visible for conflict resolution. Git's
+        // mark_new_skip_worktree pass clears both skip flags on every
+        // non-stage-zero entry.
+        let mut index = idx(&[(b"outside/conflict", 2)]);
+        index.mark_skip_worktree(b"outside/conflict".to_vec());
+        let base = flat(&[(b"outside/conflict", 1)]);
+        let ours = flat(&[(b"outside/conflict", 2)]);
+        let theirs = flat(&[(b"outside/conflict", 3)]);
+
+        let result = unpack_trees(
+            &index,
+            &[base, ours, theirs],
+            MergeFn::ThreeWay,
+            &opts(),
+            &NullWorktree,
+        )
+        .expect("threeway sparse conflict");
+
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.entry.stage)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .all(|entry| !entry.entry.is_skip_worktree()),
+            "conflicted paths must be present despite the sparse definition"
+        );
     }
 
     #[test]

@@ -11,21 +11,18 @@
 //! - `[alias "<name>"] command = <value>` — subsection, case-*sensitive* name.
 //!   An empty subsection (`alias..<key>`) is treated as the plain form.
 
+use crate::sley_config;
 use sley::plumbing::sley_config::ConfigIncludeContext;
+use sley::plumbing::sley_core;
 use sley::{GitConfig, GitError, Result};
 use std::env;
 use std::fs;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use crate::sley_config;
-use sley::plumbing::sley_core;
 
 use crate::commands::remote::repo_current_branch_name;
-use crate::{
-    common_git_dir_for_git_dir, injected_config_parameters,
-    worktree_root_for_git_dir,
-};
+use crate::{common_git_dir_for_git_dir, injected_config_parameters, worktree_root_for_git_dir};
 
 /// A safety backstop on alias-expansion iterations. git relies purely on its
 /// loop/recursion detection; this guards against a pathological config that
@@ -64,8 +61,11 @@ pub(crate) enum AliasLookup {
 /// Look up `command` against the `alias.*` config, faithfully reproducing git's
 /// `config_alias_cb`: the *last* matching entry wins; a matched entry with no
 /// value is a hard error.
-pub(crate) fn alias_lookup(command: &str) -> Result<AliasLookup> {
-    let config = load_alias_config()?;
+pub(crate) fn alias_lookup(
+    cli_session: &crate::session::CliSession,
+    command: &str,
+) -> Result<AliasLookup> {
+    let config = load_alias_config(cli_session)?;
     let mut found: Option<String> = None;
     for section in &config.sections {
         if !section.name.eq_ignore_ascii_case("alias") {
@@ -117,8 +117,10 @@ pub(crate) fn alias_lookup(command: &str) -> Result<AliasLookup> {
 /// `git help -a`. Mirrors `list_aliases`: plain entries contribute their key,
 /// subsection entries contribute the subsection name (only for the `command`
 /// key). The last value for a name wins, then names are sorted.
-pub(crate) fn list_aliases() -> Result<Vec<(String, String)>> {
-    let config = load_alias_config()?;
+pub(crate) fn list_aliases(
+    cli_session: &crate::session::CliSession,
+) -> Result<Vec<(String, String)>> {
+    let config = load_alias_config(cli_session)?;
     let mut aliases: Vec<(String, String)> = Vec::new();
     for section in &config.sections {
         if !section.name.eq_ignore_ascii_case("alias") {
@@ -155,9 +157,9 @@ pub(crate) fn list_aliases() -> Result<Vec<(String, String)>> {
 /// Load the effective config (system + global + repository) with the
 /// command-line `-c` / `GIT_CONFIG_PARAMETERS` overrides folded in, so alias
 /// lookups see `git -c alias.x=… x` just like file-defined aliases.
-fn load_alias_config() -> Result<GitConfig> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd).ok();
+fn load_alias_config(cli_session: &crate::session::CliSession) -> Result<GitConfig> {
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir().ok();
     let common_git_dir = git_dir
         .as_ref()
         .and_then(|dir| common_git_dir_for_git_dir(dir).ok());
@@ -171,7 +173,7 @@ fn load_alias_config() -> Result<GitConfig> {
         &mut config,
         &parameters,
         &context,
-        &cwd,
+        cwd,
     )?;
     Ok(config)
 }
@@ -180,7 +182,11 @@ fn load_alias_config() -> Result<GitConfig> {
 /// `prepare_shell_cmd` argv (`sh -c '<body> "$@"' '<body>' <args…>`) so the
 /// alias body sees its arguments as `$@`/`$1`/`$*`, and emitting the
 /// `trace: start_command:` line git's `run_command` prints under `GIT_TRACE`.
-pub(crate) fn run_shell_alias(command: &str, extra_args: &[String]) -> Result<()> {
+pub(crate) fn run_shell_alias(
+    cli_session: &crate::session::CliSession,
+    command: &str,
+    extra_args: &[String],
+) -> Result<()> {
     let shell = match env::var("GIT_SHELL_PATH") {
         Ok(shell) => shell,
         Err(_) => "/bin/sh".into(),
@@ -217,7 +223,7 @@ pub(crate) fn run_shell_alias(command: &str, extra_args: &[String]) -> Result<()
         "SLEY_TRACE2_DEPTH",
         (sley_core::trace2::depth() + 1).to_string(),
     );
-    configure_shell_alias_worktree_env(&mut process)?;
+    configure_shell_alias_worktree_env(cli_session, &mut process)?;
     // Propagate the effective config-injection parameters (`-c` / `--config-env`
     // folded onto any inherited `GIT_CONFIG_PARAMETERS`) to the subprocess git,
     // exactly as upstream git does by mutating its own env before running the
@@ -239,16 +245,19 @@ pub(crate) fn run_shell_alias(command: &str, extra_args: &[String]) -> Result<()
     }
 }
 
-fn configure_shell_alias_worktree_env(process: &mut ProcessCommand) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let Ok(git_dir) = crate::session::cli_git_dir_from(&cwd) else {
+fn configure_shell_alias_worktree_env(
+    cli_session: &crate::session::CliSession,
+    process: &mut ProcessCommand,
+) -> Result<()> {
+    let cwd = cli_session.cwd();
+    let Ok(git_dir) = cli_session.git_dir() else {
         return Ok(());
     };
-    let Ok(root) = worktree_root_for_git_dir(&git_dir) else {
+    let Ok(root) = worktree_root_for_git_dir(cli_session, &git_dir) else {
         return Ok(());
     };
     let root = canonical_or_self(root);
-    let cwd = canonical_or_self(cwd);
+    let cwd = canonical_or_self(cwd.to_path_buf());
     let Ok(prefix_path) = cwd.strip_prefix(&root) else {
         return Ok(());
     };

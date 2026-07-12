@@ -277,7 +277,6 @@ pub fn killed_paths(
     }
     let mut paths = BTreeSet::new();
     collect_killed_paths(
-        worktree_root,
         git_dir,
         worktree_root,
         &[],
@@ -289,7 +288,6 @@ pub fn killed_paths(
 }
 
 fn collect_killed_paths(
-    root: &Path,
     git_dir: &Path,
     dir: &Path,
     dir_git_path: &[u8],
@@ -317,7 +315,7 @@ fn collect_killed_paths(
         }
         if directories.contains(&git_path) {
             if file_type.is_dir() {
-                collect_killed_paths(root, git_dir, &path, &git_path, exact, directories, paths)?;
+                collect_killed_paths(git_dir, &path, &git_path, exact, directories, paths)?;
             } else if file_type.is_file() || file_type.is_symlink() {
                 paths.insert(git_path);
             }
@@ -930,6 +928,7 @@ pub(crate) fn collect_status_untracked_paths_from_borrowed_index_parallel(
 
 pub(crate) trait StatusTrackedLookup {
     fn tracked_kind(&self, git_path: &[u8]) -> Option<StatusTrackedKind>;
+    fn tracked_oid(&self, git_path: &[u8]) -> Option<ObjectId>;
     fn tracked_directory_kind(&self, git_path: &[u8]) -> Option<StatusTrackedDirectoryKind>;
 }
 
@@ -968,6 +967,10 @@ impl StatusTrackedLookup for IndexStatusLookup<'_> {
         self.stat_cache.entries.get(git_path).map(|entry| {
             StatusTrackedKind::from_mode_and_skip(entry.mode, entry.is_skip_worktree())
         })
+    }
+
+    fn tracked_oid(&self, git_path: &[u8]) -> Option<ObjectId> {
+        self.stat_cache.entries.get(git_path).map(|entry| entry.oid)
     }
 
     fn tracked_directory_kind(&self, git_path: &[u8]) -> Option<StatusTrackedDirectoryKind> {
@@ -1011,6 +1014,15 @@ impl StatusTrackedLookup for BorrowedIndexLookup<'_> {
             .map(|entry| {
                 StatusTrackedKind::from_mode_and_skip(entry.mode, entry.is_skip_worktree())
             })
+    }
+
+    fn tracked_oid(&self, git_path: &[u8]) -> Option<ObjectId> {
+        let start = self.entries.partition_point(|entry| entry.path < git_path);
+        self.entries[start..]
+            .iter()
+            .take_while(|entry| entry.path == git_path)
+            .find(|entry| entry.stage() == Stage::Normal)
+            .map(|entry| entry.oid)
     }
 
     fn tracked_directory_kind(&self, git_path: &[u8]) -> Option<StatusTrackedDirectoryKind> {
@@ -1091,9 +1103,11 @@ pub(crate) fn collect_status_untracked_paths<T: StatusTrackedLookup + ?Sized>(
         return Ok(());
     }
     let ignore_len = context.ignores.patterns.len();
-    let mut entries = read_dir_entries_with_ignore_patterns(
+    let mut entries = read_status_dir_entries_with_ignore_patterns(
         dir,
         dir_git_path,
+        context.git_dir,
+        context.tracked,
         context.ignores,
         context.profile.as_deref_mut(),
     )?;
@@ -1208,9 +1222,11 @@ pub(crate) fn collect_status_untracked_frontier_dir<T: StatusTrackedLookup + ?Si
     if is_same_path(dir, context.git_dir) {
         return Ok(());
     }
-    let mut entries = read_dir_entries_with_ignore_patterns(
+    let mut entries = read_status_dir_entries_with_ignore_patterns(
         dir,
         dir_git_path,
+        context.git_dir,
+        context.tracked,
         context.ignores,
         context.profile.as_deref_mut(),
     )?;
@@ -1335,9 +1351,11 @@ where
         return Ok(StreamControl::Continue);
     }
     let ignore_len = context.ignores.patterns.len();
-    let mut entries = read_dir_entries_with_ignore_patterns(
+    let mut entries = read_status_dir_entries_with_ignore_patterns(
         dir,
         dir_git_path,
+        context.git_dir,
+        context.tracked,
         context.ignores,
         context.profile.as_deref_mut(),
     )?;
@@ -1513,9 +1531,11 @@ pub(crate) fn status_untracked_directory_has_file<T: StatusTrackedLookup + ?Size
         return Ok(false);
     }
     let ignore_len = context.ignores.patterns.len();
-    let mut entries = read_dir_entries_with_ignore_patterns(
+    let mut entries = read_status_dir_entries_with_ignore_patterns(
         dir,
         dir_git_path,
+        context.git_dir,
+        context.tracked,
         context.ignores,
         context.profile.as_deref_mut(),
     )?;
@@ -1629,6 +1649,43 @@ pub(crate) fn read_dir_entries_with_ignore_patterns(
     Ok(entries)
 }
 
+pub(crate) fn read_status_dir_entries_with_ignore_patterns<T: StatusTrackedLookup + ?Sized>(
+    dir: &Path,
+    base: &[u8],
+    git_dir: &Path,
+    tracked: &T,
+    matcher: &mut IgnoreMatcher,
+    profile: Option<&mut StatusProfileCounters>,
+) -> Result<Vec<StatusDirEntry>> {
+    read_skip_worktree_ignore_patterns(git_dir, base, tracked, matcher)?;
+    read_dir_entries_with_ignore_patterns(dir, base, matcher, profile)
+}
+
+fn read_skip_worktree_ignore_patterns<T: StatusTrackedLookup + ?Sized>(
+    git_dir: &Path,
+    base: &[u8],
+    tracked: &T,
+    matcher: &mut IgnoreMatcher,
+) -> Result<()> {
+    let mut source = base.to_vec();
+    if !source.is_empty() {
+        source.push(b'/');
+    }
+    source.extend_from_slice(b".gitignore");
+    if tracked.tracked_kind(&source) != Some(StatusTrackedKind::SkipWorktree) {
+        return Ok(());
+    }
+    let Some(oid) = tracked.tracked_oid(&source) else {
+        return Ok(());
+    };
+    let db = FileObjectDatabase::from_git_dir(git_dir, oid.format());
+    let object = read_expected_object(&db, &oid, ObjectType::Blob)?;
+    for (line, raw) in object.body.split(|byte| *byte == b'\n').enumerate() {
+        matcher.push_raw_pattern(raw, base, &source, line + 1);
+    }
+    Ok(())
+}
+
 pub(crate) fn build_untracked_cache(
     worktree_root: &Path,
     git_dir: &Path,
@@ -1705,39 +1762,73 @@ pub(crate) fn emit_untracked_cache_trace(old: Option<&UntrackedCache>, new: &Unt
         sley_core::trace2::perf_read_directory_data("opendir", dir_count);
         return;
     }
-    if old_root.exclude_oid != new_root.exclude_oid {
-        sley_core::trace2::perf_read_directory_data("node-creation", 0);
-        sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 1);
-        sley_core::trace2::perf_read_directory_data("directory-invalidation", 1);
-        sley_core::trace2::perf_read_directory_data("opendir", dir_count);
-        return;
+    let mut events = UntrackedCacheTraversalEvents::default();
+    collect_untracked_cache_traversal_events(Some(old_root), new_root, false, true, &mut events);
+    sley_core::trace2::perf_read_directory_data("node-creation", events.node_creation);
+    sley_core::trace2::perf_read_directory_data(
+        "gitignore-invalidation",
+        events.gitignore_invalidation,
+    );
+    sley_core::trace2::perf_read_directory_data(
+        "directory-invalidation",
+        events.directory_invalidation,
+    );
+    sley_core::trace2::perf_read_directory_data("opendir", events.opendir);
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UntrackedCacheTraversalEvents {
+    pub(crate) node_creation: usize,
+    pub(crate) gitignore_invalidation: usize,
+    pub(crate) directory_invalidation: usize,
+    pub(crate) opendir: usize,
+}
+
+/// Derive trace2 read-directory counters from the old/new canonical UNTR
+/// trees. New nodes are opened; a changed directory stat opens that directory;
+/// an invalid node is reopened; and a changed per-directory ignore source
+/// forces its whole cached subtree open.
+pub(crate) fn collect_untracked_cache_traversal_events(
+    old: Option<&UntrackedCacheDir>,
+    new: &UntrackedCacheDir,
+    ancestor_ignore_invalidated: bool,
+    is_root: bool,
+    events: &mut UntrackedCacheTraversalEvents,
+) {
+    let is_new = old.is_none();
+    if is_new && !is_root {
+        events.node_creation += 1;
     }
-    let invalid_dir_count = count_invalid_untracked_cache_dirs(old_root);
-    if invalid_dir_count > 0 {
-        sley_core::trace2::perf_read_directory_data("node-creation", 0);
-        sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 0);
-        sley_core::trace2::perf_read_directory_data("directory-invalidation", 0);
-        sley_core::trace2::perf_read_directory_data("opendir", invalid_dir_count);
-        return;
+    let exclude_changed = old.is_some_and(|old| old.exclude_oid != new.exclude_oid);
+    let was_invalid = old.is_some_and(|old| !old.valid);
+    // Explicit index invalidation already requires reopening the node; Git does
+    // not also classify its inevitably stale stat as a directory invalidation.
+    let stat_changed = old.is_some_and(|old| old.valid && old.stat != new.stat);
+    if exclude_changed {
+        events.gitignore_invalidation += 1;
     }
-    if old_root.stat != new_root.stat {
-        sley_core::trace2::perf_read_directory_data("node-creation", 0);
-        sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 0);
-        sley_core::trace2::perf_read_directory_data("directory-invalidation", 1);
-        sley_core::trace2::perf_read_directory_data("opendir", 1);
-        return;
+    if stat_changed {
+        events.directory_invalidation += 1;
     }
-    if old.root == new.root {
-        sley_core::trace2::perf_read_directory_data("node-creation", 0);
-        sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 0);
-        sley_core::trace2::perf_read_directory_data("directory-invalidation", 0);
-        sley_core::trace2::perf_read_directory_data("opendir", 0);
-        return;
+    if ancestor_ignore_invalidated || is_new || exclude_changed || stat_changed || was_invalid {
+        events.opendir += 1;
     }
-    sley_core::trace2::perf_read_directory_data("node-creation", 0);
-    sley_core::trace2::perf_read_directory_data("gitignore-invalidation", 0);
-    sley_core::trace2::perf_read_directory_data("directory-invalidation", 1);
-    sley_core::trace2::perf_read_directory_data("opendir", dir_count);
+
+    let force_children = ancestor_ignore_invalidated || is_new || exclude_changed;
+    for new_child in &new.dirs {
+        let old_child = old.and_then(|old| {
+            old.dirs
+                .iter()
+                .find(|old_child| old_child.name == new_child.name)
+        });
+        collect_untracked_cache_traversal_events(
+            old_child,
+            new_child,
+            force_children,
+            false,
+            events,
+        );
+    }
 }
 
 pub(crate) fn count_untracked_cache_dirs(dir: &UntrackedCacheDir) -> usize {
@@ -1746,15 +1837,6 @@ pub(crate) fn count_untracked_cache_dirs(dir: &UntrackedCacheDir) -> usize {
         .iter()
         .map(count_untracked_cache_dirs)
         .sum::<usize>()
-}
-
-pub(crate) fn count_invalid_untracked_cache_dirs(dir: &UntrackedCacheDir) -> usize {
-    usize::from(!dir.valid)
-        + dir
-            .dirs
-            .iter()
-            .map(count_invalid_untracked_cache_dirs)
-            .sum::<usize>()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1771,7 +1853,14 @@ pub(crate) fn build_untracked_cache_dir<T: StatusTrackedLookup + ?Sized>(
     check_only: bool,
 ) -> Result<UntrackedCacheDir> {
     let ignore_len = ignores.patterns.len();
-    let mut entries = read_dir_entries_with_ignore_patterns(dir, dir_git_path, ignores, None)?;
+    let mut entries = read_status_dir_entries_with_ignore_patterns(
+        dir,
+        dir_git_path,
+        git_dir,
+        tracked,
+        ignores,
+        None,
+    )?;
     sort_status_dir_entries(&mut entries);
     let exclude_path = if dir_git_path.is_empty() {
         b".gitignore".to_vec()
@@ -1781,10 +1870,14 @@ pub(crate) fn build_untracked_cache_dir<T: StatusTrackedLookup + ?Sized>(
         path.extend_from_slice(b".gitignore");
         path
     };
-    let exclude_oid = if tracked.tracked_kind(&exclude_path).is_some() {
-        None
-    } else {
-        per_directory_ignore_oid(dir, format)?
+    let exclude_kind = tracked.tracked_kind(&exclude_path);
+    let exclude_oid = match exclude_kind {
+        // A skip-worktree .gitignore is absent from disk by design. Git carries
+        // its blob id into the UNTR node so sparse status still invalidates and
+        // applies the correct per-directory rules without materializing it.
+        Some(StatusTrackedKind::SkipWorktree) => tracked.tracked_oid(&exclude_path),
+        Some(StatusTrackedKind::File | StatusTrackedKind::Gitlink) => None,
+        None => per_directory_ignore_oid(dir, format)?,
     };
     let mut node = UntrackedCacheDir {
         name: name.to_vec(),
@@ -1873,10 +1966,27 @@ pub(crate) fn build_untracked_cache_dir<T: StatusTrackedLookup + ?Sized>(
     })();
     ignores.truncate(ignore_len);
     result?;
+    if exclude_kind == Some(StatusTrackedKind::SkipWorktree)
+        && !untracked_cache_dir_has_observed_content(&node)
+    {
+        // Git loads a sparse/skip-worktree ignore blob to classify the walk,
+        // but leaves the UNTR node's exclude OID null until that directory has
+        // relevant untracked content. The first later population then records
+        // the blob and is a real gitignore-invalidation traversal event.
+        node.exclude_oid = None;
+    }
     if worktree_root == dir {
         node.name.clear();
     }
     Ok(node)
+}
+
+fn untracked_cache_dir_has_observed_content(dir: &UntrackedCacheDir) -> bool {
+    !dir.untracked.is_empty()
+        || dir
+            .dirs
+            .iter()
+            .any(untracked_cache_dir_has_observed_content)
 }
 
 pub(crate) fn component_name_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
@@ -2021,7 +2131,11 @@ pub(crate) fn untracked_normal_rollup_path(
         }
         prefix.extend_from_slice(segment);
         if index_has_path_under(index, &prefix) {
-            break;
+            // This directory itself cannot be rolled up because it contains
+            // tracked entries, but a wholly-untracked child still can. Keep
+            // walking until the first untracked directory below the tracked
+            // prefix instead of falling back to the leaf path.
+            continue;
         }
         if !ignores.is_ignored(&prefix, true) {
             let mut directory = prefix;

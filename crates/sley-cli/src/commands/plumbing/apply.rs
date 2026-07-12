@@ -65,7 +65,69 @@ enum WsAction {
     Fix,
 }
 
-pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
+struct ApplyContext {
+    cwd: PathBuf,
+    git_dir: PathBuf,
+    worktree_root: PathBuf,
+    format: ObjectFormat,
+    objects: FileObjectDatabase,
+    config: GitConfig,
+    lazy_fetch: bool,
+}
+
+impl ApplyContext {
+    fn open(cli_session: &crate::session::CliSession, require_repository: bool) -> Result<Self> {
+        let cwd = cli_session.cwd().to_path_buf();
+        let repository = cli_session.open_repository().ok();
+        if repository.is_none() && require_repository {
+            return Err(GitError::repository_not_found("not a git repository"));
+        }
+        let (git_dir, worktree_root, format, objects, config) = match repository {
+            Some(repository) => {
+                let git_dir = repository.git_dir().to_path_buf();
+                let worktree_root = repository.workdir().ok_or_else(|| {
+                    GitError::Unsupported("apply requires a repository worktree".into())
+                })?;
+                let format = repository.object_format();
+                let objects = repository.objects_mut();
+                let config = read_repo_config(&git_dir)?;
+                (git_dir, worktree_root, format, objects, config)
+            }
+            None => {
+                let git_dir = cwd.join(".git");
+                let context = sley_config::ConfigIncludeContext::new(None, None);
+                let mut config = sley_config::load_pre_dispatch_config(None, &context)
+                    .map_err(report_config_setup_error)?;
+                let parameters = injected_config_parameters()?;
+                sley_config::append_injected_config_sections_with_includes(
+                    &mut config,
+                    &parameters,
+                    &context,
+                    &cwd,
+                )
+                .map_err(report_config_setup_error)?;
+                (
+                    git_dir.clone(),
+                    cwd.clone(),
+                    ObjectFormat::Sha1,
+                    FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1),
+                    config,
+                )
+            }
+        };
+        Ok(Self {
+            cwd,
+            git_dir,
+            worktree_root,
+            format,
+            objects,
+            config,
+            lazy_fetch: cli_session.lazy_fetch(),
+        })
+    }
+}
+
+pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut check = false;
     let mut apply = false;
     let mut stat = false;
@@ -198,11 +260,16 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         eprintln!("error: options '--reject' and '--3way' cannot be used together");
         return Err(GitError::Exit(128));
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-    let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    // Plain textual apply remains usable outside a repository. Index/object
+    // modes require the optional session repository to have opened.
+    let require_repository =
+        update_index || cached || three_way || intent_to_add || build_fake_ancestor.is_some();
+    let apply_context = ApplyContext::open(cli_session, require_repository)?;
+    let cwd = &apply_context.cwd;
+    let git_dir = &apply_context.git_dir;
+    let worktree_root = &apply_context.worktree_root;
+    let format = apply_context.format;
+    let db = &apply_context.objects;
     // git's `state->prefix`: the current directory relative to the work tree,
     // with a trailing slash (empty at the top level). Prepended to the names of
     // non-toplevel-relative (traditional) patches so that `git apply` from a
@@ -243,11 +310,14 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     } else {
         worktree_root.clone()
     };
-    let repo_config = read_repo_config(&git_dir)?;
+    let repo_config = &apply_context.config;
     let trust_filemode = repo_config
         .get_bool("core", None, "fileMode")
         .unwrap_or(true);
-    let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(&git_dir)?;
+    let ws_resolver = commands::diff::WhitespaceRuleResolver::from_git_dir_with_config(
+        git_dir,
+        Some(repo_config),
+    )?;
     // `apply.whitespace` config supplies the default whitespace action when the
     // command line did not give an explicit `--whitespace=`.
     if !ws_action_explicit
@@ -357,7 +427,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         });
     }
     if let Some(path) = build_fake_ancestor {
-        write_apply_fake_ancestor_index(&git_dir, format, &patches, &inputs, &path)?;
+        write_apply_fake_ancestor_index(git_dir, format, &patches, &inputs, &path)?;
         return Ok(());
     }
     if stat || numstat || summary {
@@ -384,10 +454,33 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     let touch_index = update_index || cached || (three_way && has_gitlink_patch);
     let verify_worktree_match = update_index && !cached;
     let mut index = if touch_index {
-        Some(read_apply_index(&git_dir, format)?)
+        Some(read_apply_index(git_dir, format)?)
     } else {
         None
     };
+    // A sparse directory is an on-disk stand-in for the leaves below it.  An
+    // apply that addresses one of those leaves must open just that directory
+    // before looking up the preimage.  Keeping this path-directed is important:
+    // in-cone patches continue to operate without an observable expansion,
+    // while an out-of-cone --index/--cached apply records ensure_full_index and
+    // leaves the selected directory partially expanded, exactly like Git.
+    if let Some(index) = index.as_mut()
+        && index
+            .entries
+            .iter()
+            .any(sley_index::IndexEntry::is_sparse_dir)
+    {
+        sley_worktree::expand_sparse_index_directories(index, db, format, |directory| {
+            patches.iter().any(|patch| {
+                patch
+                    .old_path
+                    .as_deref()
+                    .into_iter()
+                    .chain(patch.new_path.as_deref())
+                    .any(|path| path.starts_with(directory))
+            })
+        })?;
+    }
     let index_modes: HashMap<Vec<u8>, u32> = index
         .as_ref()
         .map(|index| {
@@ -441,13 +534,13 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             }
             let base = read_patch_base(
                 &worktree_base,
-                &worktree_root,
-                &git_dir,
+                worktree_root,
+                git_dir,
                 format,
-                &repo_config,
+                repo_config,
                 patch,
                 index.as_ref(),
-                &db,
+                db,
                 verify_worktree_match,
             )?;
             apply_patch_whitespace(
@@ -518,15 +611,17 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
     // direct apply below when the pre-image blobs are not available.
     if three_way
         && apply_three_way_path(
-            &git_dir,
-            &worktree_root,
+            git_dir,
+            worktree_root,
             format,
-            &db,
+            db,
+            repo_config,
             &patches,
             cached,
             check,
             merge_favor,
             union,
+            apply_context.lazy_fetch,
         )?
     {
         return Ok(());
@@ -554,13 +649,13 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
             }
             let base = read_patch_base(
                 &worktree_base,
-                &worktree_root,
-                &git_dir,
+                worktree_root,
+                git_dir,
                 format,
-                &repo_config,
+                repo_config,
                 patch,
                 index.as_ref(),
-                &db,
+                db,
                 verify_worktree_match,
             )?;
             let content = match sley_diff_merge::apply_file_patch_with_options(
@@ -600,19 +695,19 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         }
         let base = read_patch_base(
             &worktree_base,
-            &worktree_root,
-            &git_dir,
+            worktree_root,
+            git_dir,
             format,
-            &repo_config,
+            repo_config,
             patch,
             index.as_ref(),
-            &db,
+            db,
             verify_worktree_match,
         )?;
         // Binary patches reconstruct the postimage from the recorded blob OIDs
         // (and the `GIT binary patch` payload), not from textual hunks.
         if patch.is_binary {
-            match apply_binary_outcome(&db, format, patch, &base)? {
+            match apply_binary_outcome(db, format, patch, &base)? {
                 BinaryApply::Deletion => {
                     if let Some(old) = &patch.old_path {
                         actions.push(ApplyAction::Remove { path: old.clone() });
@@ -762,6 +857,7 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         worktree_umask_complement(&worktree_base)
     };
     let mut index_paths = Vec::new();
+    let mut index_mutations = Vec::new();
     // git's `write_out_results` runs in two phases: every removal happens before
     // any creation. This matters when a directory's tracked children are removed
     // and the directory is then (re)created as a gitlink — single-phase ordering
@@ -785,38 +881,45 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                 if !cached {
                     apply_write_worktree_file(
                         &worktree_base,
-                        &worktree_root,
-                        &git_dir,
+                        worktree_root,
+                        git_dir,
                         format,
-                        &repo_config,
+                        repo_config,
                         path,
                         content,
                         *mode,
                         umask_complement,
                     )?;
                 }
-                if let Some(index) = index.as_mut() {
+                if index.is_some() {
                     let oid =
                         db.write_object(EncodedObject::new(ObjectType::Blob, content.clone()))?;
-                    apply_index_upsert(index, path, *index_mode, oid);
+                    index_mutations.push(sley_worktree::ApplyIndexMutation::Upsert {
+                        path: path.clone(),
+                        mode: *index_mode,
+                        oid,
+                    });
                 }
             }
             ApplyAction::Remove { path } => {
                 if !cached {
                     merge_remove_worktree_file(&worktree_base, path)?;
                 }
-                if let Some(index) = index.as_mut() {
-                    index
-                        .entries
-                        .retain(|entry| entry.path.as_bytes() != path.as_slice());
+                if index.is_some() {
+                    index_mutations
+                        .push(sley_worktree::ApplyIndexMutation::Remove { path: path.clone() });
                 }
             }
             ApplyAction::Gitlink { path, oid } => {
                 if !cached {
                     apply_gitlink_worktree_dir(&worktree_base, path)?;
                 }
-                if let Some(index) = index.as_mut() {
-                    apply_index_upsert(index, path, 0o160000, *oid);
+                if index.is_some() {
+                    index_mutations.push(sley_worktree::ApplyIndexMutation::Upsert {
+                        path: path.clone(),
+                        mode: 0o160000,
+                        oid: *oid,
+                    });
                 }
             }
             ApplyAction::GitlinkRemove { path } => {
@@ -826,10 +929,9 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
                     // is silent).
                     let _ = fs::remove_dir(worktree_base.join(rel));
                 }
-                if let Some(index) = index.as_mut() {
-                    index
-                        .entries
-                        .retain(|entry| entry.path.as_bytes() != path.as_slice());
+                if index.is_some() {
+                    index_mutations
+                        .push(sley_worktree::ApplyIndexMutation::Remove { path: path.clone() });
                 }
             }
         }
@@ -839,15 +941,13 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         ));
     }
     if let Some(mut index) = index {
-        index
-            .entries
-            .sort_by(|left, right| left.path.cmp(&right.path));
-        // Apply mutates entries after parsing the index; any carried TREE
-        // extension now describes the old entry set/content and must not be
-        // trusted by later write-tree/commit operations.
-        index.set_cache_tree(None)?;
+        sley_worktree::apply_index_mutations(
+            &mut index,
+            &index_mutations,
+            sley_worktree::ApplyIndexOptions::default(),
+        )?;
         fs::write(
-            sley_worktree::repository_index_path(&git_dir),
+            sley_worktree::repository_index_path(git_dir),
             index.write(format)?,
         )?;
         // git's `apply --index`/`--3way` runs `refresh_index` before writing, so
@@ -861,8 +961,8 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
         // block via `touch_index` without setting `update_index`.
         if !cached {
             sley_worktree::refresh_index_paths(
-                &worktree_root,
-                &git_dir,
+                worktree_root,
+                git_dir,
                 format,
                 &[],
                 /* quiet */ true,
@@ -1852,27 +1952,6 @@ fn apply_gitlink_worktree_dir(worktree_base: &Path, path: &[u8]) -> Result<()> {
     }
 }
 
-fn apply_index_upsert(index: &mut Index, path: &[u8], mode: u32, oid: ObjectId) {
-    index.entries.retain(|entry| entry.path.as_bytes() != path);
-    let flags = (path.len().min(0x0fff)) as u16;
-    index.entries.push(IndexEntry {
-        ctime_seconds: 0,
-        ctime_nanoseconds: 0,
-        mtime_seconds: 0,
-        mtime_nanoseconds: 0,
-        dev: 0,
-        ino: 0,
-        mode,
-        uid: 0,
-        gid: 0,
-        size: 0,
-        oid,
-        flags,
-        flags_extended: 0,
-        path: BString::from(path),
-    });
-}
-
 fn metadata_to_git_mode(metadata: &fs::Metadata) -> u32 {
     if metadata.file_type().is_symlink() {
         return 0o120000;
@@ -1971,10 +2050,16 @@ fn read_patch_base(
         }
         return Ok(blob);
     }
-    Ok(
+    let Some(blob) =
         read_worktree_patch_blob_bytes(worktree_base, filter_worktree_root, git_dir, config, old)?
-            .unwrap_or_default(),
-    )
+    else {
+        eprintln!(
+            "error: {}: No such file or directory",
+            String::from_utf8_lossy(old)
+        );
+        return Err(GitError::Exit(1));
+    };
+    Ok(blob)
 }
 
 /// Write a worktree file for `git apply`, mirroring git's `try_create_file`: a
@@ -2206,11 +2291,13 @@ fn apply_three_way_path(
     worktree_root: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
+    config: &GitConfig,
     patches: &[sley_diff_merge::FilePatch],
     cached: bool,
     check: bool,
     favor: sley_diff_merge::MergeFavor,
     union: bool,
+    lazy_fetch: bool,
 ) -> Result<bool> {
     // `--union` keeps both sides of every textual conflict with no markers
     // (git's `merge=union`); it overrides any `--ours`/`--theirs` favouring.
@@ -2220,7 +2307,6 @@ fn apply_three_way_path(
         favor
     };
     // `merge.conflictStyle` selects the diff3 marker layout.
-    let config = read_repo_config(git_dir)?;
     let style = match config.get("merge", None, "conflictstyle") {
         Some("diff3") | Some("zdiff3") => sley_diff_merge::ConflictStyle::Diff3,
         _ => sley_diff_merge::ConflictStyle::Merge,
@@ -2344,6 +2430,8 @@ fn apply_three_way_path(
     let (results, conflicts, _info) =
         commands::merge_rebase::three_way_merge_trees_inner_with_info(
             db,
+            config,
+            lazy_fetch,
             format,
             &base_map,
             &ours_map,
@@ -2364,6 +2452,7 @@ fn apply_three_way_path(
             &ours_map,
             &results,
             cached,
+            lazy_fetch,
         )?;
     }
 
@@ -2374,7 +2463,7 @@ fn apply_three_way_path(
         // records the preimage and replays any previously-recorded resolution
         // into the worktree. A no-op unless rerere.enabled.
         if !check && !cached {
-            commands::rerere::repo_rerere(git_dir, format, None)?;
+            commands::rerere::repo_rerere(git_dir, worktree_root, format, None)?;
         }
         // git exits non-zero, leaving conflict markers + a conflicted index.
         Err(GitError::Exit(1))
@@ -2427,6 +2516,7 @@ fn apply_write_three_way(
     ours_map: &commands::merge_rebase::MergeTreeMap,
     results: &std::collections::BTreeMap<Vec<u8>, commands::merge_rebase::MergePathResult>,
     cached: bool,
+    lazy_fetch: bool,
 ) -> Result<()> {
     use commands::merge_rebase::{MergePathResult, merge_index_entry};
     let mut entries = Vec::new();
@@ -2474,7 +2564,7 @@ fn apply_write_three_way(
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
                 if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = commands::merge_rebase::merge_read_blob(db, oid)?;
+                    let content = commands::merge_rebase::merge_read_blob(db, oid, lazy_fetch)?;
                     merge_write_worktree_file(worktree_root, path, &content, *mode)?;
                 }
             }

@@ -38,11 +38,41 @@ fn git(cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) {
-    assert!(git(cwd, args).status.success(), "git {args:?} failed");
+    let output = git(cwd, args);
+    assert!(
+        output.status.success(),
+        "git {args:?} failed in {}:\n{}",
+        cwd.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn sley(cwd: &Path, args: &[&str]) -> Output {
     run_env(sley_testkit::sley_bin!(), cwd, args)
+}
+
+fn sley_with_trace(cwd: &Path, args: &[&str], trace: &Path) -> Output {
+    Command::new(sley_testkit::sley_bin!())
+        .current_dir(cwd)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Tester")
+        .env("GIT_AUTHOR_EMAIL", "tester@example.com")
+        .env("GIT_COMMITTER_NAME", "Tester")
+        .env("GIT_COMMITTER_EMAIL", "tester@example.com")
+        .env("GIT_AUTHOR_DATE", "@1790000000 -0500")
+        .env("GIT_COMMITTER_DATE", "@1790000000 -0500")
+        .env("GIT_TRACE2_EVENT", trace)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run sley {args:?}: {err}"))
+}
+
+fn assert_trace2_data(trace: &Path, category: &str, key: &str, value: usize) {
+    let contents = fs::read_to_string(trace).expect("read trace2 event file");
+    let expected = format!("\"category\":\"{category}\",\"key\":\"{key}\",\"value\":\"{value}\"");
+    assert!(
+        contents.lines().any(|line| line.contains(&expected)),
+        "missing trace2 data {category}/{key}={value}:\n{contents}"
+    );
 }
 
 fn git_available() -> bool {
@@ -310,5 +340,225 @@ fn grep_only_matching_match_git() {
     assert_same(&repo, &["grep", "-o", r"[0-9]\{3\}", "--", "nums.txt"]);
     assert_same(&repo, &["grep", "-o", "-E", "[0-9]+", "--", "nums.txt"]);
 
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn grep_historical_partial_submodule_lazy_fetch_matches_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("grep-partial-submodule");
+    let source = root.join("source");
+    let submodule = source.join("sub");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    git_ok(&root, &["init", "-q", source.to_str().unwrap_or("source")]);
+    fs::write(source.join("super-file"), "Some content for super-file\n")
+        .expect("write superproject file");
+    git_ok(&source, &["add", "super-file"]);
+    git_ok(&source, &["commit", "-qm", "superproject"]);
+
+    git_ok(
+        &source,
+        &["init", "-q", submodule.to_str().unwrap_or("sub")],
+    );
+    fs::write(submodule.join("sub-file"), "Some content for sub-file\n")
+        .expect("write submodule file");
+    git_ok(&submodule, &["add", "sub-file"]);
+    git_ok(&submodule, &["commit", "-qm", "submodule"]);
+    git_ok(
+        &source,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "./sub",
+        ],
+    );
+    git_ok(&source, &["commit", "-qm", "add submodule"]);
+    fs::write(
+        submodule.join("sub-file"),
+        "Some content for sub-file\nSome more content for sub-file\n",
+    )
+    .expect("update submodule file");
+    git_ok(&submodule, &["add", "sub-file"]);
+    git_ok(&submodule, &["commit", "-qm", "update submodule"]);
+    git_ok(&source, &["add", "sub"]);
+    git_ok(&source, &["commit", "-qm", "update gitlink"]);
+    for repo in [&source, &submodule] {
+        git_ok(repo, &["config", "uploadpack.allowFilter", "true"]);
+        git_ok(repo, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    }
+
+    let source_url = format!("file://{}", source.display());
+    let clone_args = |destination: &Path| {
+        vec![
+            "-c".to_string(),
+            "protocol.file.allow=always".to_string(),
+            "clone".to_string(),
+            "-q".to_string(),
+            "--filter=blob:none".to_string(),
+            "--also-filter-submodules".to_string(),
+            "--recurse-submodules".to_string(),
+            source_url.clone(),
+            destination.to_string_lossy().into_owned(),
+        ]
+    };
+    let expected_args = clone_args(&expected);
+    let expected_refs = expected_args.iter().map(String::as_str).collect::<Vec<_>>();
+    assert!(
+        git(&root, &expected_refs).status.success(),
+        "oracle filtered recursive clone should succeed"
+    );
+    let actual_args = clone_args(&actual);
+    let actual_refs = actual_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let cloned = sley(&root, &actual_refs);
+    assert!(
+        cloned.status.success(),
+        "sley filtered recursive clone failed: {}",
+        String::from_utf8_lossy(&cloned.stderr)
+    );
+
+    let args = ["grep", "-e", "content", "--recurse-submodules", "HEAD^"];
+    let expected_grep = git(&expected, &args);
+    let actual_grep = sley(&actual, &args);
+    assert_eq!(actual_grep.status.code(), expected_grep.status.code());
+    assert_eq!(actual_grep.stdout, expected_grep.stdout);
+    assert_eq!(
+        String::from_utf8_lossy(&actual_grep.stdout),
+        "HEAD^:sub/sub-file:Some content for sub-file\nHEAD^:super-file:Some content for super-file\n"
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn grep_revision_batches_pathspec_selected_promisor_blobs() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("grep-promisor-batch");
+    let source = root.join("source");
+    let clone = root.join("clone");
+    git_ok(&root, &["init", "-q", source.to_str().unwrap_or("source")]);
+    fs::create_dir_all(source.join("a")).expect("create source a");
+    fs::create_dir_all(source.join("b")).expect("create source b");
+    fs::write(source.join("a/matches.txt"), "needle in haystack\n").expect("write match");
+    fs::write(source.join("a/nomatch.txt"), "nothing to see here\n").expect("write nonmatch");
+    fs::write(source.join("b/matches.md"), "needle again\n").expect("write second match");
+    git_ok(&source, &["add", "."]);
+    git_ok(&source, &["commit", "-qm", "initial"]);
+    git_ok(&source, &["config", "uploadpack.allowFilter", "true"]);
+    git_ok(
+        &source,
+        &["config", "uploadpack.allowAnySHA1InWant", "true"],
+    );
+
+    let source_url = format!("file://{}", source.display());
+    let cloned = sley(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--no-checkout",
+            "--filter=blob:none",
+            &source_url,
+            clone.to_str().unwrap_or("clone"),
+        ],
+    );
+    assert!(
+        cloned.status.success(),
+        "sley filtered clone failed: {}",
+        String::from_utf8_lossy(&cloned.stderr)
+    );
+
+    let pathspec_trace = root.join("pathspec.trace");
+    let pathspec = sley_with_trace(
+        &clone,
+        &["grep", "-c", "needle", "HEAD", "--", "a/*.txt"],
+        &pathspec_trace,
+    );
+    assert!(pathspec.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&pathspec.stdout),
+        "HEAD:a/matches.txt:1\n"
+    );
+    assert_trace2_data(&pathspec_trace, "promisor", "fetch_count", 2);
+    assert_trace2_data(&pathspec_trace, "pack-objects", "written", 2);
+
+    let all_trace = root.join("all.trace");
+    let all = sley_with_trace(&clone, &["grep", "-c", "needle", "HEAD"], &all_trace);
+    assert!(all.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&all.stdout),
+        "HEAD:a/matches.txt:1\nHEAD:b/matches.md:1\n"
+    );
+    assert_trace2_data(&all_trace, "promisor", "fetch_count", 1);
+    assert_trace2_data(&all_trace, "pack-objects", "written", 1);
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn grep_recursive_submodule_replace_config_is_repository_scoped() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("grep-submodule-replacements");
+    let repo = root.join("base");
+    let submodule = repo.join("sub");
+    git_ok(&root, &["init", "-q", repo.to_str().unwrap_or("base")]);
+    git_ok(&repo, &["init", "-q", submodule.to_str().unwrap_or("sub")]);
+    fs::write(repo.join("a"), "A\n").expect("write a");
+    fs::write(repo.join("b"), "B\n").expect("write b");
+    fs::write(submodule.join("c"), "C\n").expect("write c");
+    fs::write(submodule.join("d"), "D\n").expect("write d");
+    git_ok(&submodule, &["add", "c", "d"]);
+    git_ok(&submodule, &["commit", "-qm", "submodule files"]);
+    git_ok(
+        &repo,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "./sub",
+        ],
+    );
+    git_ok(&repo, &["add", "a", "b", "sub"]);
+    git_ok(&repo, &["commit", "-qm", "superproject files"]);
+
+    let object_id = |cwd: &Path, revision: &str| {
+        let output = git(cwd, &["rev-parse", revision]);
+        assert!(output.status.success(), "rev-parse {revision} failed");
+        String::from_utf8(output.stdout)
+            .expect("object id is utf8")
+            .trim()
+            .to_string()
+    };
+    let a = object_id(&repo, "HEAD:a");
+    let b = object_id(&repo, "HEAD:b");
+    let c = object_id(&submodule, "HEAD:c");
+    let d = object_id(&submodule, "HEAD:d");
+    git_ok(&repo, &["replace", &a, &b]);
+    git_ok(&submodule, &["replace", &c, &d]);
+
+    let grep_a = ["grep", "--cached", "--recurse-submodules", "A"];
+    let grep_c = ["grep", "--cached", "--recurse-submodules", "C"];
+    assert_same(&repo, &grep_a);
+    assert_same(&repo, &grep_c);
+
+    git_ok(&repo, &["config", "core.useReplaceRefs", "false"]);
+    assert_same(&repo, &grep_a);
+    assert_same(&repo, &grep_c);
+
+    git_ok(&submodule, &["config", "core.useReplaceRefs", "false"]);
+    assert_same(&repo, &grep_a);
+    assert_same(&repo, &grep_c);
+
+    git_ok(&repo, &["config", "--unset", "core.useReplaceRefs"]);
+    assert_same(&repo, &grep_a);
+    assert_same(&repo, &grep_c);
     fs::remove_dir_all(&root).ok();
 }

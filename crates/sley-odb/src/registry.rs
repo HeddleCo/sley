@@ -1,34 +1,17 @@
-use flate2::Compression;
-use flate2::read::ZlibDecoder;
-use flate2::write::ZlibEncoder;
-use flate2::{Decompress, FlushDecompress};
 use parking_lot::RwLock;
-use std::sync::Mutex;
-use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
-use sley_formats::{Bundle, BundleReference};
-use sley_object::{
-    Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object,
-    tree_entry_object_type,
-};
-use sley_pack::{
-    MultiPackIndex, MultiPackIndexOidLookup, PackBitmapIndex, PackBitmapWriter, PackFile,
-    PackIndex, PackIndexByteSource, PackIndexEntry, PackIndexViewData, PackInput,
-    PackReverseIndex, PackStreamIndexBuild, PackWrite, PackWriteOptions, PackWriteSummary,
-};
+use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_pack::{MultiPackIndex, MultiPackIndexOidLookup, PackIndex, PackIndexViewData};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::{env, fs};
 
-use crate::{
-    grafted_parents, implied_empty_tree_object, unique_temp_path, with_missing_object_context,
-    ObjectReader, ObjectWriter,
+use crate::loose::collect_loose_object_ids;
+use crate::pack::{
+    FileObjectDatabase, LruOffsetCache, PackBytesCache, PackData, PackHeaderTypeCache,
+    delta_base_cache_budget, load_pack_data, load_pack_index_data,
 };
-
-use crate::loose::{collect_loose_object_ids, LooseObjectStore};
-use crate::pack::{FileObjectDatabase, PackData, PackBytesCache, PackHeaderTypeCache, PackHeaderTypeCaches, PackDeltaCaches, DecodedObjectCache, LruOffsetCache, delta_base_cache_budget, load_pack_index_data, load_pack_data, promisor_pack_object_ids};
 
 #[derive(Debug)]
 pub(crate) struct RegisteredPack {
@@ -53,8 +36,7 @@ impl RegisteredPack {
     }
 
     pub(crate) fn index(&self, format: ObjectFormat) -> Result<Arc<PackIndexViewData>> {
-        if let Some(index) = self.index.read().as_ref()
-        {
+        if let Some(index) = self.index.read().as_ref() {
             return Ok(Arc::clone(index));
         }
         let index_bytes = load_pack_index_data(&self.idx)?;
@@ -72,8 +54,7 @@ impl RegisteredPack {
         {
             return Ok(Arc::clone(bytes));
         }
-        if let Some(bytes) = pack_bytes.read().get(&self.pack)
-        {
+        if let Some(bytes) = pack_bytes.read().get(&self.pack) {
             let bytes = Arc::clone(bytes);
             if let Ok(mut local_cache) = self.data.lock() {
                 *local_cache = Some(Arc::clone(&bytes));
@@ -84,7 +65,9 @@ impl RegisteredPack {
         if let Ok(mut local_cache) = self.data.lock() {
             *local_cache = Some(Arc::clone(&bytes));
         }
-        pack_bytes.write().insert(self.pack.clone(), Arc::clone(&bytes));
+        pack_bytes
+            .write()
+            .insert(self.pack.clone(), Arc::clone(&bytes));
         Ok(bytes)
     }
 }
@@ -171,21 +154,30 @@ impl PackLookup {
         }
     }
 
-    pub(crate) fn pack_index(&self, database: &FileObjectDatabase) -> Result<Arc<PackIndexViewData>> {
+    pub(crate) fn pack_index(
+        &self,
+        database: &FileObjectDatabase,
+    ) -> Result<Arc<PackIndexViewData>> {
         match &self.registered {
             Some(pack) => pack.index(database.format),
             None => database.cached_pack_index(&self.pack.with_extension("idx")),
         }
     }
 
-    pub(crate) fn delta_cache(&self, database: &FileObjectDatabase) -> Option<Arc<Mutex<LruOffsetCache>>> {
+    pub(crate) fn delta_cache(
+        &self,
+        database: &FileObjectDatabase,
+    ) -> Option<Arc<Mutex<LruOffsetCache>>> {
         match &self.registered {
             Some(pack) => Some(Arc::clone(&pack.delta_cache)),
             None => database.pack_delta_cache(&self.pack),
         }
     }
 
-    pub(crate) fn header_type_cache(&self, database: &FileObjectDatabase) -> Option<PackHeaderTypeCache> {
+    pub(crate) fn header_type_cache(
+        &self,
+        database: &FileObjectDatabase,
+    ) -> Option<PackHeaderTypeCache> {
         match &self.registered {
             Some(pack) => Some(Arc::clone(&pack.header_type_cache)),
             None => database.pack_header_type_cache(&self.pack),
@@ -220,6 +212,22 @@ impl ObjectPresenceChecker {
     }
 
     pub fn contains(&mut self, oid: &ObjectId) -> Result<bool> {
+        self.contains_inner(oid, true)
+    }
+
+    /// Check object presence without refreshing prepared pack/loose snapshots
+    /// after a miss.
+    ///
+    /// This is intended for closed-world batches such as one fast-import
+    /// checkpoint: the caller tracks its own staged writes and recreates the
+    /// checker after installing a pack. Avoiding a directory/registry rescan on
+    /// every known-new object keeps a large batch at one repository scan while
+    /// [`Self::contains`] retains its live-filesystem semantics.
+    pub fn contains_without_refresh(&mut self, oid: &ObjectId) -> Result<bool> {
+        self.contains_inner(oid, false)
+    }
+
+    fn contains_inner(&mut self, oid: &ObjectId, refresh_on_miss: bool) -> Result<bool> {
         if oid.format() != self.db.format {
             return Err(GitError::InvalidObjectId(format!(
                 "object {oid} uses {}, store uses {}",
@@ -233,13 +241,16 @@ impl ObjectPresenceChecker {
         if self.find_packed(oid, false)? {
             return Ok(true);
         }
-        if self.find_packed(oid, true)? {
+        if refresh_on_miss && self.find_packed(oid, true)? {
             return Ok(true);
         }
         for alternate in &self.db.alternates {
             if FileObjectDatabase::without_alternates(alternate, self.db.format).contains(oid)? {
                 return Ok(true);
             }
+        }
+        if !refresh_on_miss {
+            return Ok(false);
         }
         // Preserve the regular contains() reprepare-on-miss behavior for loose
         // objects that appeared after the fanout cache was populated.
@@ -511,9 +522,8 @@ pub(crate) fn collect_loose_object_ids_with_prefix(
     if prefix.len() < 2 {
         return Ok(());
     }
-    let fanout_hex = std::str::from_utf8(&prefix[..2]).map_err(|_| {
-        GitError::InvalidObjectId("object id prefix must be ASCII hex".into())
-    })?;
+    let fanout_hex = std::str::from_utf8(&prefix[..2])
+        .map_err(|_| GitError::InvalidObjectId("object id prefix must be ASCII hex".into()))?;
     let fanout_dir = objects_dir.join(fanout_hex);
     let entries = match fs::read_dir(&fanout_dir) {
         Ok(entries) => entries,
@@ -621,13 +631,10 @@ pub(crate) fn collect_multi_pack_index_prefix_matches(
     if start >= end || end > midx.objects.len() {
         return;
     }
-    let lower = lower_bound_pack_index_entries(
-        &midx.objects,
-        start,
-        end,
-        floor.as_bytes(),
-        |entry| &entry.oid,
-    );
+    let lower =
+        lower_bound_pack_index_entries(&midx.objects, start, end, floor.as_bytes(), |entry| {
+            &entry.oid
+        });
     for entry in &midx.objects[lower..end] {
         if entry.oid.hex_prefix_matches(prefix) {
             oids.insert(entry.oid.clone());
@@ -650,13 +657,10 @@ pub(crate) fn collect_pack_index_prefix_matches(
     if start >= end || end > index.entries.len() {
         return;
     }
-    let lower = lower_bound_pack_index_entries(
-        &index.entries,
-        start,
-        end,
-        floor.as_bytes(),
-        |entry| &entry.oid,
-    );
+    let lower =
+        lower_bound_pack_index_entries(&index.entries, start, end, floor.as_bytes(), |entry| {
+            &entry.oid
+        });
     for entry in &index.entries[lower..end] {
         if entry.oid.hex_prefix_matches(prefix) {
             oids.insert(entry.oid.clone());
@@ -697,7 +701,10 @@ pub(crate) fn lower_bound_pack_index_entries<T>(
     lo
 }
 
-pub(crate) fn object_id_floor_for_hex_prefix(format: ObjectFormat, prefix: &[u8]) -> Result<ObjectId> {
+pub(crate) fn object_id_floor_for_hex_prefix(
+    format: ObjectFormat,
+    prefix: &[u8],
+) -> Result<ObjectId> {
     let mut hex = String::with_capacity(format.hex_len());
     for &byte in prefix {
         hex.push(char::from(byte.to_ascii_lowercase()));
@@ -737,7 +744,10 @@ fn pack_dir_modified(pack_dir: &Path) -> Result<Option<std::time::SystemTime>> {
 /// parse each index into a registered pack. An `.idx` without its `.pack` is
 /// skipped (an orphan index cannot serve objects), matching the prior per-read
 /// behavior.
-pub(crate) fn scan_pack_registry(pack_dir: &Path, _format: ObjectFormat) -> Result<PackRegistrySnapshot> {
+pub(crate) fn scan_pack_registry(
+    pack_dir: &Path,
+    _format: ObjectFormat,
+) -> Result<PackRegistrySnapshot> {
     let modified = pack_dir_modified(pack_dir)?;
     let entries = match fs::read_dir(pack_dir) {
         Ok(entries) => entries,
@@ -822,7 +832,10 @@ fn pack_sort_modified(metadata: &fs::Metadata) -> (u64, u32) {
 
 /// Whether two pack registries reference the same pack/index paths (order is
 /// already normalized by [`scan_pack_registry`]).
-pub(crate) fn same_registered_pack_set(left: &[Arc<RegisteredPack>], right: &[Arc<RegisteredPack>]) -> bool {
+pub(crate) fn same_registered_pack_set(
+    left: &[Arc<RegisteredPack>],
+    right: &[Arc<RegisteredPack>],
+) -> bool {
     left.len() == right.len()
         && left
             .iter()

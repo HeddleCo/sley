@@ -191,7 +191,7 @@ impl ConfigModeTracker {
     }
 }
 
-pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut action = None;
     let mut subcommand = None;
     let mut modes = ConfigModeTracker::default();
@@ -377,6 +377,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             "--show-origin" => display.show_origin = true,
             "--show-scope" => display.show_scope = true,
             "--fixed-value" => fixed_value = true,
+            "--no-fixed-value" => fixed_value = false,
             "--comment" => {
                 let value = iter
                     .next()
@@ -695,7 +696,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         eprintln!("error: only one config file at a time");
         return Err(GitError::Exit(129));
     }
-    let repo_git_dir = crate::session::cli_git_dir();
+    let repo_git_dir = cli_session.git_dir();
     if repo_git_dir.is_err() {
         if use_local {
             eprintln!("fatal: --local can only be used inside a git repository");
@@ -728,7 +729,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         let git_dir = repo_git_dir?;
         let common = common_git_dir_for_git_dir(&git_dir).unwrap_or_else(|_| git_dir.clone());
         ConfigSource::ScopedFile {
-            path: config_display_path(common.join("config")),
+            path: config_display_path(cli_session.cwd(), common.join("config")),
             scope: sley_config::ConfigScope::Local,
         }
     } else if use_worktree {
@@ -749,7 +750,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             common.join("config")
         };
         ConfigSource::ScopedFile {
-            path: config_display_path(path),
+            path: config_display_path(cli_session.cwd(), path),
             scope: sley_config::ConfigScope::Local,
         }
     } else if let Some(value) = effective_file {
@@ -765,7 +766,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     };
 
     if action == ConfigAction::Edit {
-        config_edit(&source, editor_repo_git_dir.as_deref())?;
+        config_edit(cli_session, &source, editor_repo_git_dir.as_deref())?;
         return Ok(());
     }
 
@@ -887,7 +888,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     // scope. Explicit sources contribute exactly their own entries. Reads also
     // validate the injection stream here, surfacing a bogus `-c`/env entry the
     // same way git does.
-    let loaded = load_read_entries(&source, action, respect_includes_opt)?;
+    let loaded = load_read_entries(cli_session, &source, action, respect_includes_opt)?;
     let mut entries = loaded.entries;
     if matches!(source, ConfigSource::Repository(_)) {
         let parameters = crate::injected_config_parameters()?;
@@ -895,7 +896,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         if respect_includes_opt == Some(false) {
             stack.push_parameters(&parameters);
         } else {
-            let context = config_include_context();
+            let context = config_include_context(cli_session);
             stack
                 .push_parameters_with_includes(&parameters, &context)
                 .map_err(|err| report_config_parse_error(err, None))?;
@@ -1010,8 +1011,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 .filter(|entry| entry.matches(&key.section, key.subsection.as_deref(), &key.key))
             {
                 let meta = ConfigValueMeta::of(entry);
-                let Some(value) = format_config_entry_value(entry, value_type, &name)?
-                else {
+                let Some(value) = format_config_entry_value(entry, value_type, &name)? else {
                     continue;
                 };
                 selected = Some((meta, value));
@@ -1148,8 +1148,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             let mut stdout = io::stdout();
             let mut wrote = false;
             for entry in values {
-                let Some(formatted) = format_config_entry_value(entry, value_type, &name)?
-                else {
+                let Some(formatted) = format_config_entry_value(entry, value_type, &name)? else {
                     continue;
                 };
                 wrote = true;
@@ -1210,11 +1209,12 @@ struct LoadedEntries {
 /// sources (git's `respect_includes = !source.file`), but by default for
 /// stdin and blob sources.
 fn load_read_entries(
+    cli_session: &crate::session::CliSession,
     source: &ConfigSource,
     action: ConfigAction,
     respect_includes_opt: Option<bool>,
 ) -> Result<LoadedEntries> {
-    let context = config_include_context();
+    let context = config_include_context(cli_session);
     let respect_repository_includes = respect_includes_opt.unwrap_or(true);
     let mut stack = sley_config::ConfigStack::new();
     let mut tail_error = None;
@@ -1231,7 +1231,7 @@ fn load_read_entries(
                 Ok(common) => common,
                 Err(_) => git_dir.clone(),
             };
-            let local_path = config_display_path(common.join("config"));
+            let local_path = config_display_path(cli_session.cwd(), common.join("config"));
             stack
                 .push_file(
                     &local_path,
@@ -1241,7 +1241,8 @@ fn load_read_entries(
                 )
                 .map_err(|err| report_config_parse_error(err, Some(&local_path)))?;
             if worktree_config_extension_enabled(&common) {
-                let worktree_path = config_display_path(git_dir.join("config.worktree"));
+                let worktree_path =
+                    config_display_path(cli_session.cwd(), git_dir.join("config.worktree"));
                 stack
                     .push_file(
                         &worktree_path,
@@ -1288,7 +1289,7 @@ fn load_read_entries(
                 .map_err(|err| report_config_parse_error(err, None))?;
         }
         ConfigSource::Blob(spec) => {
-            let bytes = read_config_blob(spec)?;
+            let bytes = read_config_blob(cli_session, spec)?;
             let (parsed, tail) = parse_blob_config_bytes(&bytes, action, spec)?;
             tail_error = tail;
             stack
@@ -1409,7 +1410,11 @@ fn config_write_path(source: &ConfigSource) -> Option<PathBuf> {
 /// Open the selected config file in the user's editor. The edited path comes
 /// from the command's file/scope source, while `core.editor` is resolved from
 /// the ambient repository config, matching git's `git config --edit -f <file>`.
-fn config_edit(source: &ConfigSource, repo_git_dir: Option<&Path>) -> Result<()> {
+fn config_edit(
+    cli_session: &crate::session::CliSession,
+    source: &ConfigSource,
+    repo_git_dir: Option<&Path>,
+) -> Result<()> {
     let Some(path) = config_write_path(source) else {
         match source {
             ConfigSource::Stdin => eprintln!("fatal: editing stdin is not supported"),
@@ -1417,7 +1422,7 @@ fn config_edit(source: &ConfigSource, repo_git_dir: Option<&Path>) -> Result<()>
         }
         return Err(GitError::Exit(128));
     };
-    let editor = config_editor_command(repo_git_dir)?;
+    let editor = config_editor_command(cli_session, repo_git_dir)?;
     if editor == ":" {
         return Ok(());
     }
@@ -1441,14 +1446,17 @@ fn config_edit(source: &ConfigSource, repo_git_dir: Option<&Path>) -> Result<()>
     Ok(())
 }
 
-fn config_editor_command(repo_git_dir: Option<&Path>) -> Result<String> {
+fn config_editor_command(
+    cli_session: &crate::session::CliSession,
+    repo_git_dir: Option<&Path>,
+) -> Result<String> {
     if let Ok(editor) = env::var("GIT_EDITOR") {
         return Ok(editor);
     }
     if let Some(editor) = global_config_value("core.editor")? {
         return Ok(editor);
     }
-    if let Some(editor) = config_core_editor(repo_git_dir)? {
+    if let Some(editor) = config_core_editor(cli_session, repo_git_dir)? {
         return Ok(editor);
     }
     if let Ok(editor) = env::var("VISUAL")
@@ -1470,19 +1478,24 @@ fn config_terminal_allows_visual() -> bool {
     }
 }
 
-fn config_core_editor(repo_git_dir: Option<&Path>) -> Result<Option<String>> {
+fn config_core_editor(
+    cli_session: &crate::session::CliSession,
+    repo_git_dir: Option<&Path>,
+) -> Result<Option<String>> {
     match repo_git_dir {
         Some(git_dir) => {
             let source = ConfigSource::Repository(git_dir.to_path_buf());
-            let loaded = load_read_entries(&source, ConfigAction::Get, None)?;
+            let loaded = load_read_entries(cli_session, &source, ConfigAction::Get, None)?;
             Ok(config_core_editor_from_entries(&loaded.entries))
         }
-        None => config_core_editor_from_default_layers(),
+        None => config_core_editor_from_default_layers(cli_session),
     }
 }
 
-fn config_core_editor_from_default_layers() -> Result<Option<String>> {
-    let context = config_include_context();
+fn config_core_editor_from_default_layers(
+    cli_session: &crate::session::CliSession,
+) -> Result<Option<String>> {
+    let context = config_include_context(cli_session);
     let mut stack = sley_config::ConfigStack::new();
     for (path, scope) in sley_config::default_config_layer_paths() {
         stack
@@ -1666,12 +1679,10 @@ fn config_source_display_name(source: &ConfigSource, path: &Path) -> String {
 
 /// Include-condition context shared by every layer: the repository (when one
 /// is discoverable) supplies `gitdir:` and `onbranch:`.
-fn config_include_context() -> sley_config::ConfigIncludeContext {
-    let Ok(cwd) = env::current_dir() else {
-        return sley_config::ConfigIncludeContext::default();
-    };
-    let start = logical_cwd_for_include_context(&cwd);
-    match crate::session::cli_git_dir_from(&start) {
+fn config_include_context(
+    cli_session: &crate::session::CliSession,
+) -> sley_config::ConfigIncludeContext {
+    match cli_session.git_dir() {
         Ok(git_dir) => sley_config::ConfigIncludeContext::new(
             Some(sley_config::git_dir_for_include_context(&git_dir)),
             repo_current_branch_name(&git_dir),
@@ -1680,26 +1691,11 @@ fn config_include_context() -> sley_config::ConfigIncludeContext {
     }
 }
 
-fn logical_cwd_for_include_context(cwd: &Path) -> PathBuf {
-    let Some(pwd) = env::var_os("PWD").map(PathBuf::from) else {
-        return cwd.to_path_buf();
-    };
-    if !pwd.is_absolute() {
-        return cwd.to_path_buf();
-    }
-    match (fs::canonicalize(&pwd), fs::canonicalize(cwd)) {
-        (Ok(pwd_real), Ok(cwd_real)) if pwd_real == cwd_real => pwd,
-        _ => cwd.to_path_buf(),
-    }
-}
-
 /// Display a config path the way git reports it: relative to the working
 /// directory when it lies underneath (git's repo paths are themselves
 /// relative, e.g. `.git/config` at the worktree root).
-fn config_display_path(path: PathBuf) -> PathBuf {
-    if let Ok(cwd) = env::current_dir()
-        && let Ok(relative) = path.strip_prefix(&cwd)
-    {
+fn config_display_path(cwd: &Path, path: PathBuf) -> PathBuf {
+    if let Ok(relative) = path.strip_prefix(cwd) {
         return relative.to_path_buf();
     }
     path
@@ -1766,8 +1762,8 @@ fn has_multiple_worktrees(common_git_dir: &Path) -> bool {
 }
 
 /// Read the config blob for `--blob=<spec>` (a blob id or `<rev>:<path>`).
-fn read_config_blob(spec: &str) -> Result<Vec<u8>> {
-    let repo = crate::repository::RepositoryContext::discover_current()?;
+fn read_config_blob(cli_session: &crate::session::CliSession, spec: &str) -> Result<Vec<u8>> {
+    let repo = crate::repository::RepositoryContext::from_session(cli_session)?;
     let oid = if let Some((rev, path)) = sley_rev::split_rev_path_spec(spec) {
         match repo.resolve_path(rev, path) {
             Ok(resolved) => resolved.oid,
@@ -2066,103 +2062,7 @@ fn format_config_color_value(value: &str) -> Result<String> {
 /// (no diagnostic) when the value is not a valid color, so callers like
 /// `--list --type=color` can silently skip it.
 pub(crate) fn try_format_config_color_value(value: &str) -> std::result::Result<String, ()> {
-    let mut codes = Vec::new();
-    let mut color_slot = 0usize;
-    for token in value.split_whitespace() {
-        if token.eq_ignore_ascii_case("normal") {
-            continue;
-        }
-        if let Some(code) = config_color_attribute_code(token) {
-            codes.push(code.to_string());
-            continue;
-        }
-        if color_slot >= 2 {
-            return Err(());
-        }
-        let foreground = color_slot == 0;
-        codes.extend(config_color_code(token, foreground).ok_or(())?);
-        color_slot += 1;
-    }
-    if codes.is_empty() {
-        return Ok(String::new());
-    }
-    Ok(format!("\x1b[{}m", codes.join(";")))
-}
-
-fn config_color_attribute_code(token: &str) -> Option<u8> {
-    match token.to_ascii_lowercase().as_str() {
-        "bold" => Some(1),
-        "dim" => Some(2),
-        "italic" => Some(3),
-        "ul" | "underline" => Some(4),
-        "blink" => Some(5),
-        "reverse" => Some(7),
-        "strike" => Some(9),
-        _ => None,
-    }
-}
-
-fn config_color_code(token: &str, foreground: bool) -> Option<Vec<String>> {
-    if let Some((red, green, blue)) = parse_config_hex_color(token) {
-        let prefix = if foreground { "38" } else { "48" };
-        return Some(vec![
-            prefix.into(),
-            "2".into(),
-            red.to_string(),
-            green.to_string(),
-            blue.to_string(),
-        ]);
-    }
-    if let Ok(value) = token.parse::<u8>() {
-        if value < 16 {
-            let base = match (foreground, value < 8) {
-                (true, true) => 30,
-                (false, true) => 40,
-                (true, false) => 90 - 8,
-                (false, false) => 100 - 8,
-            };
-            return Some(vec![(base + value).to_string()]);
-        }
-        let prefix = if foreground { "38" } else { "48" };
-        return Some(vec![prefix.into(), "5".into(), value.to_string()]);
-    }
-    let color = match token.to_ascii_lowercase().as_str() {
-        "black" => 0,
-        "red" => 1,
-        "green" => 2,
-        "yellow" => 3,
-        "blue" => 4,
-        "magenta" => 5,
-        "cyan" => 6,
-        "white" => 7,
-        "brightblack" | "bright-black" | "gray" | "grey" => 8,
-        "brightred" | "bright-red" => 9,
-        "brightgreen" | "bright-green" => 10,
-        "brightyellow" | "bright-yellow" => 11,
-        "brightblue" | "bright-blue" => 12,
-        "brightmagenta" | "bright-magenta" => 13,
-        "brightcyan" | "bright-cyan" => 14,
-        "brightwhite" | "bright-white" => 15,
-        _ => return None,
-    };
-    let base = match (foreground, color < 8) {
-        (true, true) => 30,
-        (false, true) => 40,
-        (true, false) => 90 - 8,
-        (false, false) => 100 - 8,
-    };
-    Some(vec![(base + color).to_string()])
-}
-
-fn parse_config_hex_color(token: &str) -> Option<(u8, u8, u8)> {
-    let hex = token.strip_prefix('#')?;
-    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
-    let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
-    let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
-    Some((red, green, blue))
+    try_git_color_spec_to_ansi(value).map_err(|_| ())
 }
 
 fn config_bad_color_value(value: &str) -> GitError {
@@ -2882,8 +2782,7 @@ fn config_subcommand_get(
         {
             continue;
         }
-        let Some(value) = format_config_entry_value(entry, value_type, &name)?
-        else {
+        let Some(value) = format_config_entry_value(entry, value_type, &name)? else {
             continue;
         };
         matches.push(ConfigGetMatch {

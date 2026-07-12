@@ -39,7 +39,7 @@ pub(crate) fn restore_index_entry_maybe_delayed(
     entry: &IndexEntry,
     smudge_config: Option<&GitConfig>,
     stat_cache: Option<&IndexStatCache>,
-    mut delayed: Option<&mut DelayedCheckoutQueue>,
+    delayed: Option<&mut DelayedCheckoutQueue>,
 ) -> Result<Option<IndexEntry>> {
     // A gitlink (mode 160000) names a commit in the submodule's repository, not
     // a blob here — reading it as a blob fails ("not found: blob object"). git's
@@ -81,7 +81,7 @@ pub(crate) fn restore_index_entry_maybe_delayed(
             )? {
                 SmudgeFilterResult::Content(body) => body,
                 SmudgeFilterResult::Delayed { process } => {
-                    let Some(queue) = delayed.as_deref_mut() else {
+                    let Some(queue) = delayed else {
                         return Err(GitError::InvalidFormat(
                             "smudge filter requested delay without a checkout queue".into(),
                         ));
@@ -252,7 +252,14 @@ pub(crate) fn trust_symlinks(config: &GitConfig) -> bool {
     config.get_bool("core", None, "symlinks").unwrap_or(true)
 }
 
-pub(crate) fn preferred_unmerged_mode_for_untrusted_worktree(
+/// Preserve the index's trustworthy file type/mode when repository settings
+/// say the worktree cannot represent or report it reliably.
+///
+/// A normal stage-0 entry is authoritative for an ordinary tracked update.  If
+/// the path is conflicted, Git prefers our stage and then the base stage.  This
+/// matters for `core.symlinks=false`: a checked-out symlink is a regular file
+/// containing link text, but updating it must keep mode 120000 in the index.
+pub(crate) fn preferred_index_mode_for_untrusted_worktree(
     entries: &[IndexEntry],
     trust_filemode: bool,
     trust_symlinks: bool,
@@ -262,7 +269,8 @@ pub(crate) fn preferred_unmerged_mode_for_untrusted_worktree(
     }
     let preferred = entries
         .iter()
-        .find(|entry| entry.stage() == Stage::Ours)
+        .find(|entry| entry.stage() == Stage::Normal)
+        .or_else(|| entries.iter().find(|entry| entry.stage() == Stage::Ours))
         .or_else(|| entries.iter().find(|entry| entry.stage() == Stage::Base))?;
     if (!trust_symlinks && preferred.mode == 0o120000)
         || (!trust_filemode && matches!(preferred.mode, 0o100644 | 0o100755))
@@ -494,14 +502,32 @@ impl IndexStatCache {
         git_path: &[u8],
         worktree_metadata: &fs::Metadata,
     ) -> Option<TrackedEntry> {
+        self.reuse_tracked_entry_with_filemode(git_path, worktree_metadata, true)
+    }
+
+    pub(crate) fn reuse_tracked_entry_with_filemode(
+        &self,
+        git_path: &[u8],
+        worktree_metadata: &fs::Metadata,
+        trust_filemode: bool,
+    ) -> Option<TrackedEntry> {
         let entry = self.entries.get(git_path)?;
-        self.reuse_index_entry(entry, worktree_metadata)
+        self.reuse_index_entry_with_filemode(entry, worktree_metadata, trust_filemode)
     }
 
     pub(crate) fn reuse_index_entry(
         &self,
         entry: &IndexEntry,
         worktree_metadata: &fs::Metadata,
+    ) -> Option<TrackedEntry> {
+        self.reuse_index_entry_with_filemode(entry, worktree_metadata, true)
+    }
+
+    pub(crate) fn reuse_index_entry_with_filemode(
+        &self,
+        entry: &IndexEntry,
+        worktree_metadata: &fs::Metadata,
+        trust_filemode: bool,
     ) -> Option<TrackedEntry> {
         // Gitlink: reusable as-is whenever the worktree path is a directory (a
         // submodule is never re-hashed; its cached stat is ignored). Routes
@@ -516,7 +542,10 @@ impl IndexStatCache {
                 sley_index::GitlinkStatVerdict::TypeChanged => None,
             };
         }
-        if entry.mode != worktree_entry_mode(worktree_metadata) {
+        let worktree_mode = worktree_entry_mode(worktree_metadata);
+        if (trust_filemode && entry.mode != worktree_mode)
+            || (!trust_filemode && sley_diff_merge::is_type_change(entry.mode, worktree_mode))
+        {
             return None;
         }
         if !worktree_entry_is_uptodate(entry, worktree_metadata) {
@@ -531,7 +560,7 @@ impl IndexStatCache {
         })
     }
 
-    fn reuse_index_entry_for_checkout(
+    pub(crate) fn reuse_index_entry_for_checkout(
         &self,
         entry: &IndexEntry,
         worktree_metadata: &fs::Metadata,
@@ -558,6 +587,22 @@ impl IndexStatCache {
             mode: entry.mode,
             oid: entry.oid,
         })
+    }
+
+    /// Whether checkout's cheap stat comparison matched but the entry is racy.
+    ///
+    /// Git's `ie_match_stat` resolves this case with a content comparison. It
+    /// must not be treated like an ordinary stat mismatch: doing so rewrites and
+    /// counts an already-clean path when the worktree and index mtimes happen to
+    /// be identical.
+    pub(crate) fn is_racy_checkout_stat_match(
+        &self,
+        entry: &IndexEntry,
+        worktree_metadata: &fs::Metadata,
+    ) -> bool {
+        entry.mode == worktree_entry_mode(worktree_metadata)
+            && worktree_entry_is_uptodate(entry, worktree_metadata)
+            && self.is_racily_clean(entry)
     }
 
     pub(crate) fn reuse_index_entry_ref(
@@ -644,7 +689,10 @@ pub(crate) fn resolve_head_commit_oid(
     format: ObjectFormat,
 ) -> Result<Option<ObjectId>> {
     let refs = FileRefStore::new(git_dir, format);
-    sley_refs::resolve_ref_peeled(&refs, "HEAD")
+    // A direct all-zero HEAD is Git's invalid/unborn sentinel, not a commit
+    // that callers should try to materialize. Treat it like a missing HEAD so
+    // branch checkout and status use an empty old tree.
+    Ok(sley_refs::resolve_ref_peeled(&refs, "HEAD")?.filter(|oid| !oid.is_null()))
 }
 
 pub(crate) fn status_row_is_untracked_or_ignored(entry: ShortStatusRow<'_>) -> bool {
@@ -812,7 +860,7 @@ pub(crate) fn head_tree_entries(
             _ => None,
         },
     };
-    let Some(commit_oid) = commit_oid else {
+    let Some(commit_oid) = commit_oid.filter(|oid| !oid.is_null()) else {
         return Ok(BTreeMap::new());
     };
     let object = read_expected_object(db, &commit_oid, ObjectType::Commit)?;
@@ -912,8 +960,10 @@ pub(crate) fn worktree_entries_with_submodule_dirt(
     // a second traversal of every directory).
     let mut attr_matcher = AttributeMatcher::from_worktree_base(worktree_root);
     let attr_requested = filter_attribute_names();
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut context = WorktreeEntriesWalk {
         git_dir,
+        odb: &odb,
         format,
         config: &config,
         matcher: &mut attr_matcher,
@@ -946,8 +996,10 @@ pub(crate) fn status_worktree_entries_with_submodule_dirt(
     let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
     let mut attr_matcher = AttributeMatcher::from_worktree_base(worktree_root);
     let attr_requested = filter_attribute_names();
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut context = WorktreeEntriesWalk {
         git_dir,
+        odb: &odb,
         format,
         config: &config,
         matcher: &mut attr_matcher,
@@ -1019,9 +1071,10 @@ pub(crate) fn worktree_entry_for_git_path(
         }));
     }
 
-    if let Some(tracked) =
-        stat_cache.and_then(|cache| cache.reuse_tracked_entry(git_path, &metadata))
-    {
+    let trust_filemode = trust_executable_bit_from_git_dir(git_dir, None);
+    if let Some(tracked) = stat_cache.and_then(|cache| {
+        cache.reuse_tracked_entry_with_filemode(git_path, &metadata, trust_filemode)
+    }) {
         return Ok(Some(tracked));
     }
 
@@ -1031,8 +1084,18 @@ pub(crate) fn worktree_entry_for_git_path(
     } else {
         let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
         let body = fs::read(&absolute)?;
-        let clean = apply_clean_filter(worktree_root, git_dir, &config, git_path, &body)?;
-        let oid = match stat_cache.and_then(|cache| cache.index_entry(git_path)) {
+        let index_entry = stat_cache.and_then(|cache| cache.index_entry(git_path));
+        let checks = filter_attribute_checks(worktree_root, git_path)?;
+        let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+        let clean = apply_clean_filter_for_index_comparison(
+            &config,
+            &checks,
+            git_path,
+            &body,
+            &odb,
+            Some(*expected_oid),
+        )?;
+        let oid = match index_entry {
             Some(index_entry) => clean_filtered_oid_for_status(
                 format,
                 &body,
@@ -1123,8 +1186,15 @@ pub(crate) fn worktree_entry_for_index_entry_with_attributes(
             clean_filter
                 .matcher
                 .attributes_for_path(git_path, &clean_filter.requested, false);
-        let clean =
-            apply_clean_filter_with_attributes(&clean_filter.config, &checks, git_path, &body)?;
+        let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+        let clean = apply_clean_filter_for_index_comparison(
+            &clean_filter.config,
+            &checks,
+            git_path,
+            &body,
+            &odb,
+            Some(index_entry.oid),
+        )?;
         let oid = clean_filtered_oid_for_status(
             format,
             &body,
@@ -1213,8 +1283,15 @@ pub(crate) fn worktree_entry_for_index_entry_ref_with_attributes(
             clean_filter
                 .matcher
                 .attributes_for_path(git_path, &clean_filter.requested, false);
-        let clean =
-            apply_clean_filter_with_attributes(&clean_filter.config, &checks, git_path, &body)?;
+        let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+        let clean = apply_clean_filter_for_index_comparison(
+            &clean_filter.config,
+            &checks,
+            git_path,
+            &body,
+            &odb,
+            Some(index_entry.oid),
+        )?;
         let oid = clean_filtered_oid_for_status(
             format,
             &body,
@@ -1243,6 +1320,33 @@ pub(crate) fn clean_filtered_oid_for_status(
         return EncodedObject::new(ObjectType::Blob, raw_body.to_vec()).object_id(format);
     }
     Ok(clean_oid)
+}
+
+/// Apply clean conversion for an index/worktree comparison. Unlike a new-file
+/// clean, this supplies the current index blob so auto-text paths obey Git's
+/// safer-autocrlf rule and an already-CRLF blob is not reported dirty merely
+/// because `core.autocrlf` was enabled later.
+fn apply_clean_filter_for_index_comparison(
+    config: &GitConfig,
+    checks: &[AttributeCheck],
+    git_path: &[u8],
+    body: &[u8],
+    odb: &FileObjectDatabase,
+    index_oid: Option<ObjectId>,
+) -> Result<Vec<u8>> {
+    let index_blob = index_oid.map_or(SafeCrlfIndexBlob::None, |oid| SafeCrlfIndexBlob::Lookup {
+        odb,
+        oid,
+    });
+    Ok(apply_clean_filter_with_attributes_cow_safecrlf(
+        config,
+        checks,
+        git_path,
+        body,
+        ConvFlags::Off,
+        index_blob,
+    )?
+    .into_owned())
 }
 
 #[derive(Default)]
@@ -1278,9 +1382,16 @@ impl StatCleanFilterValidator {
                 .matcher
                 .attributes_for_path(git_path, &clean_filter.requested, false);
         let body = fs::read(absolute_path)?;
+        let odb = FileObjectDatabase::from_git_dir(git_dir, format);
         if !clean_encoding_needs_stat_match_validation(&clean_filter.config, &checks) {
-            let clean =
-                apply_clean_filter_with_attributes(&clean_filter.config, &checks, git_path, &body)?;
+            let clean = apply_clean_filter_for_index_comparison(
+                &clean_filter.config,
+                &checks,
+                git_path,
+                &body,
+                &odb,
+                Some(index_oid),
+            )?;
             let oid = EncodedObject::new(ObjectType::Blob, clean).object_id(format)?;
             let oid = clean_or_raw_oid_for_index(format, &body, oid, index_oid)?;
             return Ok(Some(sley_diff_merge::IndexWorktreeValidatedEntry {
@@ -1289,8 +1400,14 @@ impl StatCleanFilterValidator {
             }));
         }
         validate_clean_encoding_for_stat_match(&clean_filter.config, &checks, git_path, &body)?;
-        let clean =
-            apply_clean_filter_with_attributes(&clean_filter.config, &checks, git_path, &body)?;
+        let clean = apply_clean_filter_for_index_comparison(
+            &clean_filter.config,
+            &checks,
+            git_path,
+            &body,
+            &odb,
+            Some(index_oid),
+        )?;
         let oid = EncodedObject::new(ObjectType::Blob, clean).object_id(format)?;
         let oid = clean_or_raw_oid_for_index(format, &body, oid, index_oid)?;
         Ok(Some(sley_diff_merge::IndexWorktreeValidatedEntry {
@@ -1387,6 +1504,7 @@ pub(crate) fn tracked_only_clean_filter_with_config<'a>(
 
 pub(crate) struct WorktreeEntriesWalk<'a> {
     git_dir: &'a Path,
+    odb: &'a FileObjectDatabase,
     format: ObjectFormat,
     config: &'a GitConfig,
     matcher: &'a mut AttributeMatcher,
@@ -1618,12 +1736,18 @@ pub(crate) fn collect_worktree_entries(
                     context
                         .matcher
                         .attributes_for_path(&git_path, context.requested, false);
-                let clean =
-                    apply_clean_filter_with_attributes(context.config, &checks, &git_path, &body)?;
-                let oid = match context
+                let index_entry = context
                     .stat_cache
-                    .and_then(|cache| cache.index_entry(&git_path))
-                {
+                    .and_then(|cache| cache.index_entry(&git_path));
+                let clean = apply_clean_filter_for_index_comparison(
+                    context.config,
+                    &checks,
+                    &git_path,
+                    &body,
+                    context.odb,
+                    index_entry.map(|entry| entry.oid),
+                )?;
+                let oid = match index_entry {
                     Some(index_entry) => clean_filtered_oid_for_status(
                         context.format,
                         &body,
@@ -1802,10 +1926,27 @@ pub(crate) fn worktree_path(root: &Path, path: &[u8]) -> Result<PathBuf> {
 
 pub(crate) fn remove_worktree_file(root: &Path, path: &[u8]) -> Result<()> {
     let file = worktree_path(root, path)?;
-    if !file.exists() {
-        return Ok(());
-    }
-    if file.is_dir() {
+    // Use lstat semantics. `Path::is_dir` follows symlinks, so a symlink to a
+    // directory was previously sent to `remove_dir` and failed with ENOTDIR;
+    // a dangling symlink was missed entirely by `exists`. Checkout removes the
+    // directory entry itself, never the symlink target.
+    let metadata = match fs::symlink_metadata(&file) {
+        Ok(metadata) => metadata,
+        // A D/F transition can ask to remove `dir/child` after `dir` has
+        // already become a file. There is no child entry to remove; lstat
+        // reports ENOTDIR rather than ENOENT, and both mean the requested leaf
+        // is absent.
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.is_dir() {
         // A tracked path that is a directory on disk is a gitlink: upstream
         // checkout/reset never recurses into a submodule's working tree. It
         // rmdirs the path when empty (remove_scheduled_dirs) and leaves a

@@ -215,18 +215,25 @@ struct LineBlame {
     charge_seq: usize,
 }
 
-pub(crate) fn cmd_blame(args: &[String]) -> Result<()> {
-    run_blame(args, false)
+pub(crate) fn cmd_blame(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    run_blame(cli_session, args, false)
 }
 
 /// `git annotate` — `git blame` with the annotate-compatible output mode forced
 /// on (equivalent to `git blame -c`). Shares all of blame's parsing and the
 /// scoreboard; only the output format differs.
-pub(crate) fn cmd_annotate(args: &[String]) -> Result<()> {
-    run_blame(args, true)
+pub(crate) fn cmd_annotate(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    run_blame(cli_session, args, true)
 }
 
-fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
+fn run_blame(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+    force_compat: bool,
+) -> Result<()> {
     let mut options = match parse_blame_args(args)? {
         BlameArgs::Run(mut options) => {
             if force_compat {
@@ -240,7 +247,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         }
     };
 
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
@@ -335,7 +342,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
     let repo_path = if bare {
         normalize_repo_path(&path)?
     } else {
-        blame_repo_relative_path(cwd, git_dir, &path)?
+        blame_repo_relative_path(cli_session, cwd, git_dir, &path)?
     };
 
     // Decide whether to build the fake working-tree / `--contents` commit, the
@@ -354,13 +361,26 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         // `cached_blob` produces. `--contents` is always a regular-file image.
         let (raw, mode) = match &options.contents_from {
             Some(spec) => (read_contents_file(cwd, spec)?, 0o100644),
-            None => read_worktree_image(db, format, &repo, &start_commit, &repo_path)?,
+            None => read_worktree_image(
+                db,
+                format,
+                &repo,
+                &start_commit,
+                &repo_path,
+                cli_session.lazy_fetch(),
+            )?,
         };
         let blob = textconv.convert(&repo_path, mode, raw)?;
         // The porcelain `previous` pointer is the real parent when it has the
         // path; a brand-new (only-staged) file has no such parent.
-        let previous = read_path_blob(db, format, &start_commit, &repo_path)?
-            .map(|_| (start_commit, repo_path.clone()));
+        let previous = read_path_blob(
+            db,
+            format,
+            &start_commit,
+            &repo_path,
+            cli_session.lazy_fetch(),
+        )?
+        .map(|_| (start_commit, repo_path.clone()));
         let (name, email) = if options.contents_from.is_some() {
             (
                 "External file (--contents)".to_string(),
@@ -388,7 +408,13 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
     } else {
         // No fake commit: read the final image straight from the start rev's tree
         // and convert it through textconv, matching the committed-blob path.
-        match read_path_blob(db, format, &start_commit, &repo_path)? {
+        match read_path_blob(
+            db,
+            format,
+            &start_commit,
+            &repo_path,
+            cli_session.lazy_fetch(),
+        )? {
             Some((blob, mode)) => (textconv.convert(&repo_path, mode, blob)?, false, None),
             None => {
                 // git reports the repository-relative path here, not the literal
@@ -449,6 +475,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         &ignore_set,
         diff_algorithm,
         &grafts,
+        cli_session.lazy_fetch(),
     )?;
 
     // Resolve the -L ranges against the real line count, then render. The
@@ -472,6 +499,7 @@ fn run_blame(args: &[String], force_compat: bool) -> Result<()> {
         marks,
         &output_encoding,
         color_plan.as_ref(),
+        cli_session.replace_objects(),
     )
 }
 
@@ -1018,17 +1046,22 @@ fn parse_abbrev_value(value: &str) -> Result<usize> {
 
 /// Convert the user-supplied (cwd-relative) path into a repository-root
 /// relative path. Outside-of-worktree paths are reported the way git does.
-fn blame_repo_relative_path(cwd: &Path, git_dir: &Path, path: &str) -> Result<String> {
+fn blame_repo_relative_path(
+    cli_session: &crate::session::CliSession,
+    cwd: &Path,
+    git_dir: &Path,
+    path: &str,
+) -> Result<String> {
     let input = Path::new(path);
     if input.is_absolute() {
-        let root = fs::canonicalize(worktree_root_for_git_dir(git_dir)?)?;
+        let root = fs::canonicalize(worktree_root_for_git_dir(cli_session, git_dir)?)?;
         let absolute = fs::canonicalize(input)?;
         let relative = absolute
             .strip_prefix(&root)
             .map_err(|_| GitError::InvalidPath(format!("{path} is outside the repository")))?;
         return normalize_repo_path(&relative.to_string_lossy());
     }
-    let prefix = worktree_prefix(cwd, git_dir)?;
+    let prefix = worktree_prefix(cli_session, cwd, git_dir)?;
     // Join the prefix and the argument, then normalize `.`/`..`/duplicate
     // separators so the result is a clean repo-relative path with forward
     // slashes (the form tree entries use).
@@ -1114,12 +1147,13 @@ fn read_path_blob(
     format: ObjectFormat,
     commit: &ObjectId,
     repo_path: &str,
+    lazy_fetch: bool,
 ) -> Result<Option<(Vec<u8>, u32)>> {
     let tree_oid = sley_rev::peel_to_tree(db, format, commit)?;
     let Some((blob_oid, mode)) = lookup_tree_path(db, format, &tree_oid, repo_path)? else {
         return Ok(None);
     };
-    let object = read_object_maybe_prefetch_promisor(db, &blob_oid)?;
+    let object = read_object_maybe_prefetch_promisor(db, &blob_oid, lazy_fetch)?;
     if object.object_type != ObjectType::Blob {
         return Ok(None);
     }
@@ -1132,6 +1166,7 @@ fn read_index_blob(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     repo_path: &str,
+    lazy_fetch: bool,
 ) -> Result<Option<(Vec<u8>, u32)>> {
     let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
         return Ok(None);
@@ -1141,7 +1176,7 @@ fn read_index_blob(
     }) else {
         return Ok(None);
     };
-    let object = read_object_maybe_prefetch_promisor(db, &entry.oid)?;
+    let object = read_object_maybe_prefetch_promisor(db, &entry.oid, lazy_fetch)?;
     if object.object_type != ObjectType::Blob {
         return Ok(None);
     }
@@ -1339,13 +1374,14 @@ fn read_worktree_image(
     repo: &RepositoryContext,
     start_commit: &ObjectId,
     repo_path: &str,
+    lazy_fetch: bool,
 ) -> Result<(Vec<u8>, u32)> {
     // `verify_working_tree_path`: an untracked path (absent from the start
     // commit's tree and from the index in *any* stage) is the "no such path"
     // fatal, even when a file by that name exists on disk. An unmerged path
     // (stages 1/2/3, no stage 0) still counts as known, so a conflicted file
     // blames against HEAD rather than erroring.
-    let committed = read_path_blob(db, format, start_commit, repo_path)?;
+    let committed = read_path_blob(db, format, start_commit, repo_path, lazy_fetch)?;
     let in_index = path_in_index_any_stage(repo.git_dir(), format, repo_path)?;
     if committed.is_none() && !in_index {
         eprintln!("fatal: no such path '{repo_path}' in HEAD");
@@ -1362,53 +1398,71 @@ fn read_worktree_image(
     // byte-identical to a verbatim read.
     if let Ok(root) = repo.worktree_root() {
         let absolute = root.join(repo_path);
-        if let Ok(meta) = std::fs::symlink_metadata(&absolute) {
-            if meta.file_type().is_symlink() {
-                if let Ok(target) = std::fs::read_link(&absolute) {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::ffi::OsStrExt as _;
-                        return Ok((target.as_os_str().as_bytes().to_vec(), 0o120000));
+        match std::fs::symlink_metadata(&absolute) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    if let Ok(target) = std::fs::read_link(&absolute) {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::ffi::OsStrExt as _;
+                            return Ok((target.as_os_str().as_bytes().to_vec(), 0o120000));
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            return Ok((
+                                target.to_string_lossy().replace('\\', "/").into_bytes(),
+                                0o120000,
+                            ));
+                        }
                     }
-                    #[cfg(not(unix))]
-                    {
-                        return Ok((
-                            target.to_string_lossy().replace('\\', "/").into_bytes(),
-                            0o120000,
-                        ));
-                    }
+                } else if let Ok(bytes) = std::fs::read(&absolute) {
+                    // git's `convert_to_git` honors `has_crlf_in_index`: an auto
+                    // (`core.autocrlf` / `text=auto`) path whose recorded blob
+                    // already holds CRLF is left unconverted (the "safer autocrlf"
+                    // rule), so a file committed with CRLF still blames against its
+                    // CRLF blob. Mirror that by skipping the CRLF→LF clean when the
+                    // committed blob already contains CRLF — the one case where the
+                    // raw work-tree CRLF already matches the recorded image. When the
+                    // recorded blob is LF (the common case), cleaning the work-tree
+                    // copy normalizes its CRLF back to the committed LF form.
+                    let recorded_has_crlf = committed
+                        .as_ref()
+                        .is_some_and(|(blob, _)| blob.windows(2).any(|w| w == b"\r\n"));
+                    let image = if recorded_has_crlf {
+                        bytes
+                    } else {
+                        sley_worktree::apply_clean_filter(
+                            &root,
+                            repo.git_dir(),
+                            repo.config(),
+                            repo_path.as_bytes(),
+                            &bytes,
+                        )?
+                    };
+                    return Ok((image, 0o100644));
                 }
-            } else if let Ok(bytes) = std::fs::read(&absolute) {
-                // git's `convert_to_git` honors `has_crlf_in_index`: an auto
-                // (`core.autocrlf` / `text=auto`) path whose recorded blob
-                // already holds CRLF is left unconverted (the "safer autocrlf"
-                // rule), so a file committed with CRLF still blames against its
-                // CRLF blob. Mirror that by skipping the CRLF→LF clean when the
-                // committed blob already contains CRLF — the one case where the
-                // raw work-tree CRLF already matches the recorded image. When the
-                // recorded blob is LF (the common case), cleaning the work-tree
-                // copy normalizes its CRLF back to the committed LF form.
-                let recorded_has_crlf = committed
-                    .as_ref()
-                    .is_some_and(|(blob, _)| blob.windows(2).any(|w| w == b"\r\n"));
-                let image = if recorded_has_crlf {
-                    bytes
-                } else {
-                    sley_worktree::apply_clean_filter(
-                        &root,
-                        repo.git_dir(),
-                        repo.config(),
-                        repo_path.as_bytes(),
-                        &bytes,
-                    )?
-                };
-                return Ok((image, 0o100644));
             }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                // With no positive revision, blame constructs a fake
+                // worktree commit and requires the named path to exist in the
+                // worktree even when HEAD/the index still contains it.  A
+                // sparse-checkout path is therefore an lstat failure, not an
+                // invitation to fall back to its staged or committed blob.
+                eprintln!("fatal: Cannot lstat '{repo_path}': No such file or directory");
+                return Err(GitError::Exit(128));
+            }
+            Err(_) => {}
         }
     }
-    // The path is tracked but unreadable from the work tree (e.g. staged then
-    // removed): fall back to the staged copy, then the committed blob.
-    if let Some((blob, mode)) = read_index_blob(repo.git_dir(), db, format, repo_path)? {
+    // A non-regular path that was present but unreadable can still be supplied
+    // by the staged image, then by the committed image.
+    if let Some((blob, mode)) = read_index_blob(repo.git_dir(), db, format, repo_path, lazy_fetch)?
+    {
         return Ok((blob, mode));
     }
     if let Some((blob, mode)) = committed {
@@ -1533,6 +1587,7 @@ fn compute_blame(
     ignore_set: &HashSet<ObjectId>,
     diff_algorithm: sley_diff_merge::DiffAlgorithm,
     grafts: &HashMap<ObjectId, Vec<ObjectId>>,
+    lazy_fetch: bool,
 ) -> Result<(Vec<LineBlame>, PreviousMap)> {
     let final_lines = sley_diff_merge::split_lines(final_blob);
     let line_count = final_lines.len();
@@ -1628,6 +1683,7 @@ fn compute_blame(
                 &origin.path,
                 &mut blob_cache,
                 textconv,
+                lazy_fetch,
             )?
         };
         let Some(child_blob) = child_blob else {
@@ -1665,7 +1721,7 @@ fn compute_blame(
                 break;
             }
             let Some(parent_origin) =
-                find_parent_origin(db, format, &origin, parent, copy_level > 1)?
+                find_parent_origin(db, format, &origin, parent, copy_level > 1, lazy_fetch)?
             else {
                 continue;
             };
@@ -1686,6 +1742,7 @@ fn compute_blame(
                 &parent_origin.path,
                 &mut blob_cache,
                 textconv,
+                lazy_fetch,
             )?;
             let Some(parent_blob) = parent_blob else {
                 // Path absent in this parent: it preserves nothing, so all
@@ -1725,7 +1782,7 @@ fn compute_blame(
                     break;
                 }
                 let Some(parent_origin) =
-                    find_parent_origin(db, format, &origin, parent, copy_level > 1)?
+                    find_parent_origin(db, format, &origin, parent, copy_level > 1, lazy_fetch)?
                 else {
                     continue;
                 };
@@ -1736,6 +1793,7 @@ fn compute_blame(
                     &parent_origin.path,
                     &mut blob_cache,
                     textconv,
+                    lazy_fetch,
                 )?;
                 let Some(parent_blob) = parent_blob else {
                     continue;
@@ -1767,6 +1825,7 @@ fn compute_blame(
                 &mut owned,
                 &final_lines,
                 textconv,
+                lazy_fetch,
             )?;
             for (copy_origin, entries) in copied {
                 queue_entries(&mut suspects, &mut queue, copy_origin, entries);
@@ -2124,8 +2183,9 @@ fn find_parent_origin(
     origin: &OriginKey,
     parent: &ObjectId,
     allow_whole_copy: bool,
+    lazy_fetch: bool,
 ) -> Result<Option<OriginKey>> {
-    if read_path_blob(db, format, parent, &origin.path)?.is_some() {
+    if read_path_blob(db, format, parent, &origin.path, lazy_fetch)?.is_some() {
         return Ok(Some(OriginKey {
             commit: *parent,
             path: origin.path.clone(),
@@ -2180,13 +2240,15 @@ fn find_copies_in_parents(
     owned: &mut Vec<BlameEntry>,
     final_lines: &[sley_diff_merge::DiffLine<'_>],
     textconv: &TextconvContext,
+    lazy_fetch: bool,
 ) -> Result<Vec<(OriginKey, Vec<BlameEntry>)>> {
     let mut copied_by_origin: Vec<(OriginKey, Vec<BlameEntry>)> = Vec::new();
     for parent in parents {
         if owned.is_empty() {
             break;
         }
-        let candidate_paths = copy_candidate_paths(db, format, origin, parent, copy_level)?;
+        let candidate_paths =
+            copy_candidate_paths(db, format, origin, parent, copy_level, lazy_fetch)?;
         for path in candidate_paths {
             if owned.is_empty() {
                 break;
@@ -2194,7 +2256,7 @@ fn find_copies_in_parents(
             if path == origin.path {
                 continue;
             }
-            let Some((raw, mode)) = read_path_blob(db, format, parent, &path)? else {
+            let Some((raw, mode)) = read_path_blob(db, format, parent, &path, lazy_fetch)? else {
                 continue;
             };
             let blob = textconv.convert(&path, mode, raw)?;
@@ -2233,10 +2295,12 @@ fn copy_candidate_paths(
     origin: &OriginKey,
     parent: &ObjectId,
     copy_level: u8,
+    lazy_fetch: bool,
 ) -> Result<Vec<String>> {
     let parent_tree = sley_rev::peel_to_tree(db, format, parent)?;
     let use_all = copy_level >= 3
-        || (copy_level >= 2 && read_path_blob(db, format, parent, &origin.path)?.is_none());
+        || (copy_level >= 2
+            && read_path_blob(db, format, parent, &origin.path, lazy_fetch)?.is_none());
     if use_all {
         let mut out = Vec::new();
         collect_tree_blob_paths(db, format, &parent_tree, Vec::new(), &mut out)?;
@@ -3015,6 +3079,7 @@ fn cached_blob(
     repo_path: &str,
     cache: &mut HashMap<(ObjectId, String), Option<Vec<u8>>>,
     textconv: &TextconvContext,
+    lazy_fetch: bool,
 ) -> Result<Option<Vec<u8>>> {
     let key = (*commit, repo_path.to_string());
     if let Some(hit) = cache.get(&key) {
@@ -3022,7 +3087,7 @@ fn cached_blob(
     }
     // The cache stores the *converted* form so textconv runs once per
     // (commit, path); upstream's fill_origin_blob caches likewise.
-    let blob = match read_path_blob(db, format, commit, repo_path)? {
+    let blob = match read_path_blob(db, format, commit, repo_path, lazy_fetch)? {
         Some((raw, mode)) => Some(textconv.convert(repo_path, mode, raw)?),
         None => None,
     };
@@ -3301,6 +3366,7 @@ fn render_blame(
     marks: BlameMarks,
     output_encoding: &str,
     color: Option<&ColorPlan>,
+    replace_objects: bool,
 ) -> Result<()> {
     if options.incremental {
         return render_incremental(
@@ -3325,6 +3391,7 @@ fn render_blame(
             fake,
             previous_map,
             marks,
+            replace_objects,
         );
     }
 
@@ -3332,7 +3399,7 @@ fn render_blame(
 
     // git blame *always* reads the mailmap (`read_mailmap`, no flag) and maps the
     // displayed author name/email through it.
-    let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
+    let mailmap = commands::utility::Mailmap::load_default(git_dir, format, replace_objects)?;
 
     // Column widths are computed over the displayed lines only, matching git
     // (e.g. `-L 2,2` does not pad the line number to the whole file's width).
@@ -3470,7 +3537,7 @@ fn render_blame(
 
 #[allow(clippy::too_many_arguments)]
 fn render_porcelain(
-    _git_dir: &Path,
+    git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
     lines: &[LineBlame],
@@ -3479,7 +3546,12 @@ fn render_porcelain(
     fake: Option<&FakeCommit>,
     previous_map: &PreviousMap,
     marks: BlameMarks,
+    replace_objects: bool,
 ) -> Result<()> {
+    // Git's porcelain metadata is built from the same mailmapped commit-info
+    // records as its human-readable output. This applies to both author and
+    // committer fields, even though porcelain has no explicit mailmap option.
+    let mailmap = commands::utility::Mailmap::load_default(git_dir, format, replace_objects)?;
     // git's MORE_THAN_ONE_PATH: a commit blamed for lines via two or more
     // distinct paths repeats its `previous`/`filename` info on every group so a
     // porcelain consumer can attribute each line to the right path. Computed
@@ -3545,6 +3617,7 @@ fn render_porcelain(
             &multi_path,
             &mut shown,
             options.line_porcelain,
+            &mailmap,
         )?;
 
         for offset in 0..group_len {
@@ -3570,6 +3643,7 @@ fn render_porcelain(
                         &multi_path,
                         &mut shown,
                         true,
+                        &mailmap,
                     )?;
                 }
             }
@@ -3608,8 +3682,11 @@ fn emit_porcelain_details(
     multi_path: &HashSet<ObjectId>,
     shown: &mut HashSet<ObjectId>,
     repeat: bool,
+    mailmap: &commands::utility::Mailmap,
 ) -> Result<()> {
-    let emitted = emit_one_suspect_detail(handle, db, format, blame, options, fake, shown, repeat)?;
+    let emitted = emit_one_suspect_detail(
+        handle, db, format, blame, options, fake, shown, repeat, mailmap,
+    )?;
     if emitted || multi_path.contains(&blame.commit) {
         write_filename_info(handle, blame, fake, previous_map)?;
     }
@@ -3628,6 +3705,7 @@ fn emit_one_suspect_detail(
     fake: Option<&FakeCommit>,
     shown: &mut HashSet<ObjectId>,
     repeat: bool,
+    mailmap: &commands::utility::Mailmap,
 ) -> Result<bool> {
     if !repeat && shown.contains(&blame.commit) {
         return Ok(false);
@@ -3661,23 +3739,15 @@ fn emit_one_suspect_detail(
 
     let object = db.read_object(&blame.commit)?;
     let commit = Commit::parse(format, &object.body)?;
+    let (author_name, author_email) = mailmap.rewrite_identity(&commit.author);
+    let (committer_name, committer_email) = mailmap.rewrite_identity(&commit.committer);
     let author = Signature::from_ident_line(&commit.author);
     let committer = Signature::from_ident_line(&commit.committer);
-    writeln!(
-        handle,
-        "author {}",
-        author
-            .as_ref()
-            .map(|sig| String::from_utf8_lossy(sig.name.as_bytes()).into_owned())
-            .unwrap_or_default()
-    )?;
+    writeln!(handle, "author {}", String::from_utf8_lossy(&author_name))?;
     writeln!(
         handle,
         "author-mail <{}>",
-        author
-            .as_ref()
-            .map(|sig| String::from_utf8_lossy(sig.email.as_bytes()).into_owned())
-            .unwrap_or_default()
+        String::from_utf8_lossy(&author_email)
     )?;
     writeln!(
         handle,
@@ -3695,18 +3765,12 @@ fn emit_one_suspect_detail(
     writeln!(
         handle,
         "committer {}",
-        committer
-            .as_ref()
-            .map(|sig| String::from_utf8_lossy(sig.name.as_bytes()).into_owned())
-            .unwrap_or_default()
+        String::from_utf8_lossy(&committer_name)
     )?;
     writeln!(
         handle,
         "committer-mail <{}>",
-        committer
-            .as_ref()
-            .map(|sig| String::from_utf8_lossy(sig.email.as_bytes()).into_owned())
-            .unwrap_or_default()
+        String::from_utf8_lossy(&committer_email)
     )?;
     writeln!(
         handle,

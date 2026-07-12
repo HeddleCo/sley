@@ -120,6 +120,15 @@ impl<'repo> BlobStore<'repo> {
 }
 
 impl Repository {
+    /// Borrow the repository's session-scoped object database without cloning
+    /// its shared handle.
+    ///
+    /// Engine operations which accept an [`ObjectReader`] by reference can use
+    /// this view and share the repository's decoded-object and pack caches.
+    pub fn object_database(&self) -> &FileObjectDatabase {
+        self.objects.as_ref()
+    }
+
     /// Session-scoped object database handle (shared across clones of this repo).
     pub fn objects(&self) -> Arc<FileObjectDatabase> {
         Arc::clone(&self.objects)

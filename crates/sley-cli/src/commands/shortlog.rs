@@ -7,7 +7,7 @@
 //! unless `--summary` is requested, the folded subject of every commit indented
 //! beneath a `Name (count):` header.
 
-use sley::plumbing::{sley_rev};
+use sley::plumbing::sley_rev;
 // Command modules pull their shared plumbing from the crate root. A glob import
 // works because a submodule can access its ancestor module's items (including
 // private ones), so every helper, type, and re-export visible at the crate root
@@ -79,10 +79,13 @@ impl Default for ShortlogOptions {
 /// One author/committer bucket: the display key plus its subjects (oldest first).
 struct ShortlogEntry {
     key: String,
-    subjects: Vec<String>,
+    subjects: Vec<Vec<u8>>,
 }
 
-pub(crate) fn cmd_shortlog(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_shortlog(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut options = parse_shortlog_args(args)?;
     if options.groups.is_empty() {
         options.groups.push(ShortlogGroup::Author);
@@ -92,9 +95,9 @@ pub(crate) fn cmd_shortlog(args: &[String]) -> Result<()> {
     let mut index: HashMap<String, usize> = HashMap::new();
 
     if !options.has_input_specs {
-        read_shortlog_from_stdin(&options, &mut groups, &mut index)?;
+        read_shortlog_from_stdin(cli_session, &options, &mut groups, &mut index)?;
     } else {
-        read_shortlog_from_revisions(&options, &mut groups, &mut index)?;
+        read_shortlog_from_revisions(cli_session, &options, &mut groups, &mut index)?;
     }
 
     sort_shortlog_groups(&mut groups, options.numbered);
@@ -190,7 +193,7 @@ fn parse_shortlog_args(args: &[String]) -> Result<ShortlogOptions> {
                 options.setup_args.push(arg.clone());
                 options.setup_args.push(value.clone());
             }
-            "--all" | "--branches" => {
+            "--all" | "--branches" | "--tags" | "--remotes" => {
                 options.setup_args.push(arg.clone());
                 options.has_input_specs = true;
             }
@@ -230,6 +233,16 @@ fn parse_shortlog_args(args: &[String]) -> Result<ShortlogOptions> {
                     parse_shortlog_count(rest)?;
                     options.setup_args.push(value.to_string());
                 } else if value.starts_with("--exclude=") {
+                    options.setup_args.push(value.to_string());
+                    options.has_input_specs = true;
+                } else if value.starts_with("--glob=")
+                    || value.starts_with("--branches=")
+                    || value.starts_with("--tags=")
+                    || value.starts_with("--remotes=")
+                {
+                    // These are revision pseudo-options, not shortlog display
+                    // options. Queue them intact for the shared revision setup
+                    // parser, just as `--all` and the bare selectors above are.
                     options.setup_args.push(value.to_string());
                     options.has_input_specs = true;
                 } else if let Some(option) = shortlog_boolean_option_with_value(value) {
@@ -326,11 +339,12 @@ fn shortlog_unknown_short_option(tail: &str) -> Result<()> {
 /// Resolve every revision argument, walk the graph, apply filters/limit, and
 /// fold each commit's subject into its author (or committer) bucket.
 fn read_shortlog_from_revisions(
+    cli_session: &crate::session::CliSession,
     options: &ShortlogOptions,
     groups: &mut Vec<ShortlogEntry>,
     index: &mut HashMap<String, usize>,
 ) -> Result<()> {
-    let repo = match RepositoryContext::discover_current() {
+    let repo = match RepositoryContext::from_session(cli_session) {
         Ok(repo) => repo,
         Err(err) => {
             if !options.setup_args.is_empty() {
@@ -367,7 +381,11 @@ fn read_shortlog_from_revisions(
     }
 
     // git's shortlog *always* mailmaps the grouping identity (no flag needed).
-    let mailmap = commands::utility::Mailmap::load_default(repo.git_dir(), format)?;
+    let mailmap = commands::utility::Mailmap::load_default(
+        repo.git_dir(),
+        format,
+        cli_session.replace_objects(),
+    )?;
 
     let author_filters = parse_log_filter_patterns(&options.author_patterns, options.regexp_mode)?;
     let grep_filters = parse_log_filter_patterns(&options.grep_patterns, options.regexp_mode)?;
@@ -385,9 +403,12 @@ fn read_shortlog_from_revisions(
         }
     }
 
-    // `walk_commits` yields newest-first; prepending into each bucket therefore
-    // leaves subjects oldest-first, matching git's output ordering.
-    let commits = rev_list_walk_commits(db, format, starts, setup.options.first_parent)?;
+    // Multiple ref-selector tips do not enter the raw graph walk in a stable
+    // commit-date order. Apply the same default ordering pass used by rev-list
+    // before prepending subjects, which leaves each bucket oldest-first like
+    // git shortlog.
+    let walked = rev_list_walk_commits(db, format, starts, setup.options.first_parent)?;
+    let commits = rev_list_date_order(walked.iter().collect())?;
     let mut emitted = 0usize;
     for record in &commits {
         if excluded.contains(&record.oid) {
@@ -436,6 +457,7 @@ fn read_shortlog_from_revisions(
 /// paragraphs — is ignored, and `--max-count`/`-<n>` has no effect here, exactly
 /// as upstream (it is a revision-walk concept).
 fn read_shortlog_from_stdin(
+    cli_session: &crate::session::CliSession,
     options: &ShortlogOptions,
     groups: &mut Vec<ShortlogEntry>,
     index: &mut HashMap<String, usize>,
@@ -444,29 +466,37 @@ fn read_shortlog_from_stdin(
         eprintln!("fatal: stdin shortlog does not support multiple groups");
         return Err(GitError::Exit(128));
     }
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input)?;
+    let mut input = Vec::new();
+    io::stdin().read_to_end(&mut input)?;
 
     // git's shortlog always mailmaps. The stdin path may run outside a repo
     // (`git log ... | git shortlog`), so prefer the repo mailmap when one is
     // discoverable and fall back to a cwd-relative `.mailmap` otherwise.
-    let mailmap = match RepositoryContext::discover_current() {
+    let mailmap = match RepositoryContext::from_session(cli_session) {
         Ok(repo) => {
             let format = repo.format();
-            commands::utility::Mailmap::load_default(repo.git_dir(), format)?
+            commands::utility::Mailmap::load_default(
+                repo.git_dir(),
+                format,
+                cli_session.replace_objects(),
+            )?
         }
         Err(_) => commands::utility::Mailmap::load_cwd()?,
     };
 
     // git matches both the human `git log` headers and the raw commit-object
     // headers, so a `git cat-file commit` stream works too.
-    let (pretty_label, raw_label) = match options.groups.first().unwrap_or(&ShortlogGroup::Author) {
-        ShortlogGroup::Author => ("Author: ", "author "),
-        ShortlogGroup::Committer => ("Commit: ", "committer "),
-        ShortlogGroup::Trailer(_) | ShortlogGroup::Format(_) => return Ok(()),
-    };
+    let (pretty_label, raw_label): (&[u8], &[u8]) =
+        match options.groups.first().unwrap_or(&ShortlogGroup::Author) {
+            ShortlogGroup::Author => (b"Author: ", b"author "),
+            ShortlogGroup::Committer => (b"Commit: ", b"committer "),
+            ShortlogGroup::Trailer(_) | ShortlogGroup::Format(_) => return Ok(()),
+        };
 
-    let lines: Vec<&str> = input.lines().collect();
+    let lines: Vec<&[u8]> = input
+        .split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .collect();
     let mut idx = 0;
     while idx < lines.len() {
         let Some(identity) = lines[idx]
@@ -493,16 +523,18 @@ fn read_shortlog_from_stdin(
             idx += 1;
             line
         } else {
-            ""
+            b""
         };
         // The identity is taken verbatim after the prefix — git does NOT trim it,
         // so the extra alignment spaces in `--format=fuller` (`Author:     X`)
         // become part of the grouping key, matching upstream byte-for-byte. The
         // summary, by contrast, has both ends trimmed.
-        if let Some(key) = shortlog_stdin_identity_key(identity, options.email, &mailmap) {
+        if let Some(key) =
+            shortlog_stdin_identity_key(&String::from_utf8_lossy(identity), options.email, &mailmap)
+        {
             // stdin records arrive newest-first (matching `git log`); prepend so
             // each group lists oldest-first like the revision-walk path.
-            push_shortlog_commit_front(groups, index, key, summary.trim().to_string());
+            push_shortlog_commit_front(groups, index, key, trim_ascii_whitespace(summary).to_vec());
         }
     }
     Ok(())
@@ -514,7 +546,7 @@ fn push_shortlog_commit_front(
     groups: &mut Vec<ShortlogEntry>,
     index: &mut HashMap<String, usize>,
     key: String,
-    subject: String,
+    subject: Vec<u8>,
 ) {
     match index.get(&key) {
         Some(&pos) => groups[pos].subjects.insert(0, subject),
@@ -568,7 +600,11 @@ fn write_shortlog(
                 Some(wrap) if wrap.width > 0 => {
                     write_shortlog_wrapped(out, subject, wrap)?;
                 }
-                _ => writeln!(out, "      {subject}")?,
+                _ => {
+                    out.write_all(b"      ")?;
+                    out.write_all(subject)?;
+                    out.write_all(b"\n")?;
+                }
             }
         }
         writeln!(out)?;
@@ -580,58 +616,126 @@ fn write_shortlog(
 /// line by `indent1` and continuation lines by `indent2` (git's `strbuf_add_wrapped_text`).
 fn write_shortlog_wrapped(
     out: &mut impl Write,
-    subject: &str,
+    subject: &[u8],
     wrap: ShortlogWrap,
 ) -> io::Result<()> {
-    for line in wrap_shortlog_text(subject, wrap.width, wrap.indent1, wrap.indent2) {
-        writeln!(out, "{line}")?;
+    for line in wrap_shortlog_bytes(subject, wrap.width, wrap.indent1, wrap.indent2) {
+        out.write_all(&line)?;
+        out.write_all(b"\n")?;
     }
     Ok(())
 }
 
-/// Greedy word-wrap matching git's behaviour: break on spaces, never exceed
-/// `width` columns where possible, indent the first line by `indent1` and the
-/// rest by `indent2`. A single word longer than the available width is emitted on
-/// its own (over-long) line rather than split.
-fn wrap_shortlog_text(text: &str, width: usize, indent1: usize, indent2: usize) -> Vec<String> {
-    let words: Vec<&str> = text.split(' ').filter(|word| !word.is_empty()).collect();
-    if words.is_empty() {
-        return vec![" ".repeat(indent1)];
+/// Greedy word-wrap matching git's behaviour: break on horizontal whitespace,
+/// never exceed `width` display columns where possible, indent the first line
+/// by `indent1` and the rest by `indent2`. Tabs are preserved within a physical
+/// line and advance to the next eight-column stop; this is observable for
+/// subjects containing tabular text. A single word longer than the available
+/// width is emitted on its own (over-long) line rather than split.
+fn wrap_shortlog_bytes(text: &[u8], width: usize, indent1: usize, indent2: usize) -> Vec<Vec<u8>> {
+    let mut fields = Vec::new();
+    let mut offset = 0;
+    while offset < text.len() {
+        let separator_start = offset;
+        while offset < text.len() && matches!(text[offset], b' ' | b'\t') {
+            offset += 1;
+        }
+        let separator = &text[separator_start..offset];
+        let word_start = offset;
+        while offset < text.len() && !matches!(text[offset], b' ' | b'\t') {
+            offset += 1;
+        }
+        if word_start < offset {
+            fields.push((separator, &text[word_start..offset]));
+        }
+    }
+    if fields.is_empty() {
+        return vec![vec![b' '; indent1]];
     }
     let mut lines = Vec::new();
-    let mut current = String::new();
+    let mut current = Vec::new();
     let mut current_indent = indent1;
     let mut column = indent1;
     let mut first_word_on_line = true;
-    for word in words {
-        let word_len = word.chars().count();
+    for (separator, word) in fields {
         let needed = if first_word_on_line {
-            current_indent + word_len
+            shortlog_display_column(current_indent, word)
         } else {
-            column + 1 + word_len
+            shortlog_display_column(shortlog_display_column(column, separator), word)
         };
         if !first_word_on_line && needed > width {
             lines.push(current);
-            current = String::new();
+            current = Vec::new();
             current_indent = indent2;
             column = indent2;
             first_word_on_line = true;
         }
         if first_word_on_line {
-            current.push_str(&" ".repeat(current_indent));
-            current.push_str(word);
-            column = current_indent + word_len;
+            current.extend(std::iter::repeat_n(b' ', current_indent));
+            current.extend_from_slice(word);
+            column = shortlog_display_column(current_indent, word);
             first_word_on_line = false;
         } else {
-            current.push(' ');
-            current.push_str(word);
-            column += 1 + word_len;
+            current.extend_from_slice(separator);
+            current.extend_from_slice(word);
+            column = needed;
         }
     }
     if !current.is_empty() || lines.is_empty() {
         lines.push(current);
     }
     lines
+}
+
+fn shortlog_display_column(mut column: usize, text: &[u8]) -> usize {
+    let mut offset = 0;
+    while offset < text.len() {
+        if text[offset] == b'\t' {
+            column = (column / 8 + 1) * 8;
+            offset += 1;
+        } else {
+            column += 1;
+            offset += utf8_scalar_len(&text[offset..]);
+        }
+    }
+    column
+}
+
+/// Length of the next valid UTF-8 scalar, or one byte for malformed input.
+/// Git preserves malformed commit bytes and treats each as one display column.
+fn utf8_scalar_len(bytes: &[u8]) -> usize {
+    let max = bytes.len().min(4);
+    for len in 1..=max {
+        if let Ok(text) = std::str::from_utf8(&bytes[..len])
+            && text.chars().count() == 1
+        {
+            return len;
+        }
+    }
+    1
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::wrap_shortlog_bytes;
+
+    #[test]
+    fn wrapping_preserves_tabs_and_breaks_at_display_column() {
+        assert_eq!(
+            wrap_shortlog_bytes(b"a\t\t\t\t\t\t\t\t12\t34\t56\t78", 76, 6, 9),
+            vec![
+                b"      a\t\t\t\t\t\t\t\t12\t34".to_vec(),
+                b"         56\t78".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wrapping_preserves_malformed_utf8_bytes() {
+        let subject = b"Th\xf8\x9d\x84\x9es has malformed bytes";
+        let lines = wrap_shortlog_bytes(subject, 76, 6, 9);
+        assert_eq!(lines, vec![[b"      ".as_slice(), subject].concat()]);
+    }
 }
 
 /// Build the display key for the revision-walk path. `raw` is a full identity line
@@ -657,18 +761,16 @@ fn shortlog_group_keys(
     for group in &options.groups {
         match group {
             ShortlogGroup::Author => {
-                keys.push(shortlog_identity_key(
-                    &record.commit.author,
-                    options.email,
-                    mailmap,
-                ));
+                let author = commit_author_for_commit_encoding(&record.commit, "UTF-8");
+                keys.push(shortlog_identity_key(&author, options.email, mailmap));
             }
             ShortlogGroup::Committer => {
-                keys.push(shortlog_identity_key(
+                let committer = commit_message_for_output(
                     &record.commit.committer,
-                    options.email,
-                    mailmap,
-                ));
+                    record.commit.encoding.as_deref(),
+                    "UTF-8",
+                );
+                keys.push(shortlog_identity_key(&committer, options.email, mailmap));
             }
             ShortlogGroup::Trailer(token) => {
                 keys.extend(shortlog_trailer_group_keys(
@@ -696,7 +798,7 @@ fn shortlog_commit_subject(
     record: &sley_rev::CommitRecord,
     options: &ShortlogOptions,
     mailmap: &commands::utility::Mailmap,
-) -> Result<String> {
+) -> Result<Vec<u8>> {
     match &options.format {
         Some(format) => {
             let rendered = shortlog_render_format(
@@ -706,9 +808,12 @@ fn shortlog_commit_subject(
                 options.abbrev_len,
                 mailmap,
             )?;
-            Ok(shortlog_subject_from_text(&rendered))
+            Ok(shortlog_subject_from_text(&rendered).into_bytes())
         }
-        None => Ok(shortlog_subject(&record.commit.message)),
+        None => {
+            let message = commit_message_for_commit_encoding(&record.commit, "UTF-8");
+            Ok(shortlog_subject_bytes(&message))
+        }
     }
 }
 
@@ -809,6 +914,50 @@ fn shortlog_stdin_identity_key(
 fn shortlog_subject(message: &[u8]) -> String {
     let text = String::from_utf8_lossy(message);
     shortlog_subject_from_text(&text)
+}
+
+fn shortlog_subject_bytes(message: &[u8]) -> Vec<u8> {
+    let lines = message.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+    let mut folded = Vec::new();
+    let mut started = false;
+    for line in lines {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let trimmed_end = trim_ascii_whitespace_end(line);
+        if !started {
+            if trimmed_end.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            started = true;
+            folded.extend_from_slice(trimmed_end);
+            continue;
+        }
+        if trimmed_end.iter().all(u8::is_ascii_whitespace) {
+            break;
+        }
+        folded.push(b' ');
+        folded.extend_from_slice(trimmed_end);
+    }
+    trim_ascii_whitespace_start(&folded).to_vec()
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    trim_ascii_whitespace_end(trim_ascii_whitespace_start(bytes))
+}
+
+fn trim_ascii_whitespace_start(bytes: &[u8]) -> &[u8] {
+    let first = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    &bytes[first..]
+}
+
+fn trim_ascii_whitespace_end(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(0, |index| index + 1);
+    &bytes[..end]
 }
 
 fn shortlog_subject_from_text(text: &str) -> String {

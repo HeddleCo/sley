@@ -4,7 +4,7 @@
 //! a path.
 //!
 //! The builtin table below is generated mechanically from the upstream
-//! `builtin_drivers[]` (git 2.54.0): the `PATTERNS`/`IPATTERN` macro expansion
+//! `builtin_drivers[]` (git 2.55.0): the `PATTERNS`/`IPATTERN` macro expansion
 //! was evaluated by a C compiler and each driver's name, `REG_ICASE` flag,
 //! funcname pattern, and word regex (with the macro-appended
 //! `|[^[:space:]]|[\xc0-\xff][\x80-\xbf]+` tail) dumped verbatim, so the byte
@@ -12,12 +12,12 @@
 
 use crate::*;
 pub(crate) use sley::plumbing::sley_diff_merge::format::CompiledFuncname;
+use sley::plumbing::{sley_config, sley_worktree};
 #[cfg(test)]
 use sley_grep::{Regex, RegexMode};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use sley::plumbing::{sley_config, sley_worktree};
 
 /// One row of the upstream builtin driver table.
 pub(crate) struct BuiltinDriver {
@@ -182,7 +182,7 @@ static BUILTIN_DRIVERS: &[BuiltinDriver] = &[
     BuiltinDriver {
         name: "scheme",
         icase: false,
-        funcname: Some(b"^[\t ]*(\\(((define|def(struct|syntax|class|method|rules|record|proto|alias)?)[-*/ \t]|(library|module|struct|class)[*+ \t]).*)$"),
+        funcname: Some(b"^(\\(.*)$\n^[\t ]*(\\(((define|def(struct|syntax|class|method|rules|record|proto|alias)?)[-*/ \t]|(library|module|struct|class)[*+ \t]).*)$\n^  ?(\\([Dd][Ee][Ff].*)$"),
         word_regex: Some(b"\\|([^|\\\\]|\\\\.)*\\||([^][)(}{ \t])+|[^[:space:]]|[\xc0-\xff][\x80-\xbf]+"),
     },
     BuiltinDriver {
@@ -546,9 +546,15 @@ mod tests {
         let driver = BUILTIN_DRIVERS
             .iter()
             .find(|driver| driver.name == "java")
-            .unwrap();
-        let funcname =
-            CompiledFuncname::compile(driver.funcname.unwrap(), true, driver.icase).unwrap();
+            .expect("Java driver should be built in");
+        let funcname = CompiledFuncname::compile(
+            driver
+                .funcname
+                .expect("Java driver should define a funcname pattern"),
+            true,
+            driver.icase,
+        )
+        .expect("Java funcname pattern should compile");
         assert_eq!(
             funcname.match_line(b"\tpublic static void main(String RIGHT[])\n"),
             Some(b"public static void main(String RIGHT[])".to_vec())
@@ -558,6 +564,34 @@ mod tests {
             funcname.match_line(b"public class Beer\n"),
             Some(b"public class Beer".to_vec())
         );
+    }
+
+    #[test]
+    fn scheme_heading_covers_top_level_and_common_lisp_forms() {
+        let driver = BUILTIN_DRIVERS
+            .iter()
+            .find(|driver| driver.name == "scheme")
+            .expect("Scheme driver should be built in");
+        let funcname = CompiledFuncname::compile(
+            driver
+                .funcname
+                .expect("Scheme driver should define a funcname pattern"),
+            true,
+            driver.icase,
+        )
+        .expect("Scheme funcname pattern should compile");
+
+        for line in [
+            b"(eval-when (:compile-toplevel :load-toplevel) ; RIGHT\n".as_slice(),
+            b"(defun some-func (x y z) RIGHT\n".as_slice(),
+            b"  (defun nested-func (x) ; RIGHT\n".as_slice(),
+        ] {
+            assert!(
+                funcname.match_line(line).is_some(),
+                "expected Scheme heading for {}",
+                String::from_utf8_lossy(line)
+            );
+        }
     }
 
     #[test]

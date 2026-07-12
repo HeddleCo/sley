@@ -29,7 +29,10 @@ pub(crate) fn head_commit_oid(refs: &FileRefStore) -> Result<Option<ObjectId>> {
     }
 }
 
-pub(crate) fn cmd_merge_base(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_merge_base(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut all = false;
     let mut is_ancestor = false;
     let mut independent = false;
@@ -86,16 +89,16 @@ pub(crate) fn cmd_merge_base(args: &[String]) -> Result<()> {
             "merge-base requires at least one commit for this mode".into(),
         ));
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let db =
+        crate::repository::open_object_database(&git_dir, format, cli_session.replace_objects())?;
     if fork_point {
         let commit = if let Some(commit) = revs.get(1) {
-            let oid = resolve_revision(&git_dir, format, commit)?;
+            let oid = resolve_revision(&git_dir, format, commit, cli_session.replace_objects())?;
             sley_rev::peel_to_commit(&db, format, &oid)?
         } else {
-            let oid = resolve_revision(&git_dir, format, "HEAD")?;
+            let oid = resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects())?;
             sley_rev::peel_to_commit(&db, format, &oid)?
         };
         if let Some(base) = merge_base_fork_point(&git_dir, format, &db, revs[0], &commit)? {
@@ -106,7 +109,7 @@ pub(crate) fn cmd_merge_base(args: &[String]) -> Result<()> {
     }
     let mut commits = Vec::with_capacity(revs.len());
     for rev in &revs {
-        let oid = resolve_revision(&git_dir, format, rev)?;
+        let oid = resolve_revision(&git_dir, format, rev, cli_session.replace_objects())?;
         commits.push(sley_rev::peel_to_commit(&db, format, &oid)?);
     }
     if is_ancestor {
@@ -183,10 +186,12 @@ pub(crate) fn merge_bases_default_many(
     let candidates = common.clone();
     let candidate_depths = candidates
         .iter()
-        .map(|candidate| Ok((
-            candidate.clone(),
-            sley_rev::ancestor_depths(git_dir, format, db, candidate)?,
-        )))
+        .map(|candidate| {
+            Ok((
+                candidate.clone(),
+                sley_rev::ancestor_depths(git_dir, format, db, candidate)?,
+            ))
+        })
         .collect::<Result<HashMap<_, _>>>()?;
     common.retain(|candidate| {
         !candidates.iter().any(|other| {
@@ -332,10 +337,12 @@ pub(crate) fn merge_base_fork_point(
     }
     let candidate_depths = candidates
         .iter()
-        .map(|candidate| Ok((
-            candidate.clone(),
-            sley_rev::ancestor_depths(git_dir, format, db, candidate)?,
-        )))
+        .map(|candidate| {
+            Ok((
+                candidate.clone(),
+                sley_rev::ancestor_depths(git_dir, format, db, candidate)?,
+            ))
+        })
         .collect::<Result<HashMap<_, _>>>()?;
     let all_candidates = candidates.clone();
     candidates.retain(|candidate| {

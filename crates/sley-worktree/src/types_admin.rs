@@ -64,6 +64,14 @@ pub struct ApplySparseResult {
     /// matching git's data-loss-avoiding behavior. The caller surfaces these as
     /// git's "The following paths are not up to date …" warning. Sorted by path.
     pub not_up_to_date: Vec<Vec<u8>>,
+    /// Paths with non-zero-stage index entries. Sparse application deliberately
+    /// leaves these entries and their worktree files alone; the CLI renders
+    /// Git's corresponding "paths are unmerged" warning. Sorted and unique.
+    pub unmerged: Vec<Vec<u8>>,
+    /// Out-of-cone tracked directory prefixes that could not be removed because
+    /// they still contained non-ignored untracked files. Paths include a trailing
+    /// slash, matching Git's sparse-directory spelling.
+    pub untracked_sparse_directories: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +98,14 @@ pub struct CacheInfoEntry {
     pub oid: ObjectId,
     pub path: Vec<u8>,
     pub stage: u16,
+}
+
+/// Options for applying `update-index --cacheinfo` records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateIndexCacheInfoOptions {
+    pub add: bool,
+    pub replace: bool,
+    pub verbose: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -689,6 +705,93 @@ pub struct CheckoutResult {
     pub files: usize,
 }
 
+/// Typed local-change report produced after a branch checkout.
+///
+/// This is independent of the index's full or sparse representation; callers
+/// render the same entries for ordinary, sparse-checkout, and sparse-index
+/// repositories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutChangeSummary {
+    pub changes: Vec<sley_diff_merge::NameStatusEntry>,
+}
+
+/// Deterministic worker selection for checkout materialization.
+///
+/// A zero `worker_count` means the caller should stay sequential.  Otherwise
+/// exactly `worker_count` workers consume a shared queue; path-conflicting
+/// entries are serialized by the materializer while independent top-level
+/// paths may be written concurrently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParallelCheckoutPlan {
+    pub worker_count: usize,
+    pub item_count: usize,
+    pub threshold: usize,
+}
+
+/// One path that could not be restored during an otherwise partially
+/// successful index checkout.
+#[derive(Debug)]
+pub struct CheckoutPathFailure {
+    pub path: Vec<u8>,
+    pub error: GitError,
+}
+
+/// Typed result of a path checkout after every independent entry and delayed
+/// filter has had a chance to complete.
+#[derive(Debug)]
+pub struct CheckoutIndexPathOutcome {
+    pub restored: usize,
+    pub failures: Vec<CheckoutPathFailure>,
+}
+
+/// One independent blob/symlink checkout requested by an unpack-trees
+/// consumer. Gitlinks remain with the caller because recursive submodule
+/// movement has repository-level semantics beyond file materialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutMaterializationEntry {
+    pub path: Vec<u8>,
+    pub mode: u32,
+    pub oid: ObjectId,
+}
+
+/// Stat data produced by a completed checkout materialization batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutMaterializationOutcome {
+    pub stats: BTreeMap<Vec<u8>, Option<sley_unpack_trees::StatInfo>>,
+}
+
+impl ParallelCheckoutPlan {
+    pub fn from_config(config: &GitConfig, item_count: usize) -> Self {
+        let requested = config
+            .get("checkout", None, "workers")
+            .and_then(sley_config::parse_config_int)
+            .unwrap_or(1);
+        let threshold = config
+            .get("checkout", None, "thresholdForParallelism")
+            .and_then(sley_config::parse_config_int)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(100);
+        let available = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let requested = match requested {
+            0 => available,
+            value if value > 0 => usize::try_from(value).unwrap_or(usize::MAX),
+            _ => 1,
+        };
+        let worker_count = if requested > 1 && item_count >= threshold && item_count > 1 {
+            requested.min(item_count)
+        } else {
+            0
+        };
+        Self {
+            worker_count,
+            item_count,
+            threshold,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreResult {
     pub restored: usize,
@@ -704,6 +807,17 @@ pub enum CheckoutStage {
 pub enum CheckoutConflictStyle {
     Merge,
     Diff3,
+}
+
+/// How an index-backed path checkout treats entries outside the sparse cone.
+///
+/// Git's default path checkout honors `CE_SKIP_WORKTREE`; the explicit
+/// `--ignore-skip-worktree-bits` mode selects those entries too and clears the
+/// bit when their worktree copies are materialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckoutIndexSparsePolicy {
+    Honor,
+    Ignore,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1089,6 +1203,10 @@ pub struct RemoveOptions {
     pub force: bool,
     pub dry_run: bool,
     pub ignore_unmatch: bool,
+    /// `git rm --sparse`: permit pathspecs to select skip-worktree entries and
+    /// expand a collapsed sparse-directory entry when leaf selection requires
+    /// it. Without this opt-in, out-of-cone matches are rejected.
+    pub sparse: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

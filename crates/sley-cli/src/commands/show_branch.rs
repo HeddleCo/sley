@@ -23,7 +23,7 @@
 //! can see its ancestor module's private items, so nothing has to be re-listed.
 
 use crate::*;
-use sley::plumbing::{sley_rev};
+use sley::plumbing::sley_rev;
 
 /// git's `REV_SHIFT`: the two low flag bits are reserved (`UNINTERESTING`
 /// occupies bit 0), so ref `i` is tracked by bit `i + REV_SHIFT`.
@@ -109,13 +109,17 @@ struct HeadInfo {
     oid: ObjectId,
 }
 
-pub(crate) fn cmd_show_branch(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_show_branch(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let options = parse_args(args)?;
 
     let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let db =
+        crate::repository::open_object_database(&git_dir, format, cli_session.replace_objects())?;
     let refs = FileRefStore::new(git_dir.clone(), format);
 
     let mut state = TraversalState::new(&db, format);
@@ -1096,7 +1100,9 @@ fn resolve_to_commit(
     if let Some(oid) = resolve_ref_by_search_path(refs, rev) {
         return sley_rev::peel_to_commit(db, format, &oid).ok();
     }
-    let oid = resolve_revision(git_dir, format, rev).ok()?;
+    let oid = sley_rev::RevisionResolver::new(git_dir, format, db)
+        .resolve(rev)
+        .ok()?;
     sley_rev::peel_to_commit(db, format, &oid).ok()
 }
 

@@ -5,8 +5,12 @@ use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_worktree};
 
 pub(crate) type MergeTreeMap = BTreeMap<Vec<u8>, (u32, ObjectId)>;
 
-pub(crate) fn merge_read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
-    let object = crate::read_object_maybe_prefetch_promisor(db, oid)?;
+pub(crate) fn merge_read_blob(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+    lazy_fetch: bool,
+) -> Result<Vec<u8>> {
+    let object = crate::read_object_maybe_prefetch_promisor(db, oid, lazy_fetch)?;
     if object.object_type != ObjectType::Blob {
         return Err(GitError::InvalidObject(format!(
             "expected blob {oid}, found {}",
@@ -20,11 +24,12 @@ pub(crate) fn merge_worktree_content(
     db: &FileObjectDatabase,
     mode: u32,
     oid: &ObjectId,
+    lazy_fetch: bool,
 ) -> Result<Vec<u8>> {
     if sley_index::is_gitlink(mode) {
         Ok(Vec::new())
     } else {
-        merge_read_blob(db, oid)
+        merge_read_blob(db, oid, lazy_fetch)
     }
 }
 
@@ -33,6 +38,7 @@ fn prefetch_content_merge_blobs(
     base: &MergeTreeMap,
     ours: &MergeTreeMap,
     theirs: &MergeTreeMap,
+    lazy_fetch: bool,
 ) -> Result<()> {
     let mut paths = BTreeSet::new();
     paths.extend(base.keys().cloned());
@@ -56,7 +62,7 @@ fn prefetch_content_merge_blobs(
             continue;
         }
         for (_, oid) in [base_entry, ours_entry, theirs_entry].into_iter().flatten() {
-            let _ = merge_read_blob(db, oid)?;
+            let _ = merge_read_blob(db, oid, lazy_fetch)?;
         }
     }
     Ok(())
@@ -174,7 +180,13 @@ fn merge_unlink_path_in_the_way(full: &Path) -> Result<()> {
 /// directory (directory-rename D/F). Best-effort: errors are swallowed so a
 /// genuine I/O problem surfaces from the subsequent checkout instead.
 pub(crate) fn clear_merge_df_blockers(worktree_root: &Path, results: &MergePathResults) {
-    for path in results.keys() {
+    for (path, result) in results {
+        // Deleted paths do not require an ancestor directory. Considering them
+        // here can unlink a surviving HEAD file merely because its former
+        // child appears as `Resolved(None)` in the flattened merge result.
+        if !matches!(result, MergePathResult::Resolved(Some(_))) {
+            continue;
+        }
         if !path.contains(&b'/') {
             continue;
         }
@@ -386,6 +398,17 @@ pub(crate) type MergeConflictPaths = Vec<Vec<u8>>;
 pub(crate) type MergeInfoMessages = Vec<sley_diff_merge::MergeInfoMessage>;
 pub(crate) type MergePathFavorResolver<'a> = dyn Fn(&[u8]) -> sley_diff_merge::MergeFavor + 'a;
 pub(crate) type MergePathMarkerSizeResolver<'a> = dyn Fn(&[u8]) -> usize + 'a;
+pub(crate) type MergePathBinaryResolver<'a> = dyn Fn(&[u8]) -> bool + 'a;
+
+/// Complete engine outcome for a three-way merge. Most porcelain adapters only
+/// need the reshaped path results; `git merge` additionally persists `tree` as
+/// the `AUTO_MERGE` pseudo-ref when conflicts remain.
+pub(crate) struct ThreeWayMergeOutcome {
+    pub(crate) results: MergePathResults,
+    pub(crate) conflicts: MergeConflictPaths,
+    pub(crate) info_messages: MergeInfoMessages,
+    pub(crate) tree: ObjectId,
+}
 
 /// 3-way merge of three flattened trees. Writes any cleanly-merged blob content
 /// to the ODB and returns per-path results plus the sorted list of conflicted
@@ -399,6 +422,8 @@ pub(crate) type MergePathMarkerSizeResolver<'a> = dyn Fn(&[u8]) -> usize + 'a;
 /// case) because the library merge runs with rename detection enabled.
 pub(crate) fn three_way_merge_trees(
     db: &FileObjectDatabase,
+    config: &GitConfig,
+    lazy_fetch: bool,
     format: ObjectFormat,
     base: &MergeTreeMap,
     ours: &MergeTreeMap,
@@ -408,6 +433,8 @@ pub(crate) fn three_way_merge_trees(
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
     three_way_merge_trees_with_favor(
         db,
+        config,
+        lazy_fetch,
         format,
         base,
         ours,
@@ -424,6 +451,8 @@ pub(crate) fn three_way_merge_trees(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_way_merge_trees_styled(
     db: &FileObjectDatabase,
+    config: &GitConfig,
+    lazy_fetch: bool,
     format: ObjectFormat,
     base: &MergeTreeMap,
     ours: &MergeTreeMap,
@@ -433,7 +462,40 @@ pub(crate) fn three_way_merge_trees_styled(
     ancestor_label: &str,
     style: sley_diff_merge::ConflictStyle,
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
-    three_way_merge_trees_inner(
+    three_way_merge_trees_styled_with_strategy_options(
+        db,
+        config,
+        lazy_fetch,
+        format,
+        base,
+        ours,
+        theirs,
+        ours_label,
+        theirs_label,
+        ancestor_label,
+        style,
+        &[],
+    )
+}
+
+/// Styled three-way merge for sequencer operations, preserving the replayed
+/// command's `-X` strategy options instead of dropping them at the CLI seam.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn three_way_merge_trees_styled_with_strategy_options(
+    db: &FileObjectDatabase,
+    config: &GitConfig,
+    lazy_fetch: bool,
+    format: ObjectFormat,
+    base: &MergeTreeMap,
+    ours: &MergeTreeMap,
+    theirs: &MergeTreeMap,
+    ours_label: &str,
+    theirs_label: &str,
+    ancestor_label: &str,
+    style: sley_diff_merge::ConflictStyle,
+    strategy_options: &[String],
+) -> Result<(MergePathResults, MergeConflictPaths)> {
+    let (results, conflicts, _) = three_way_merge_trees_inner_with_info_opts(
         db,
         format,
         base,
@@ -442,9 +504,18 @@ pub(crate) fn three_way_merge_trees_styled(
         ours_label,
         theirs_label,
         ancestor_label,
-        sley_diff_merge::MergeFavor::None,
+        merge_favor_from_strategy_opts(strategy_options),
         style,
-    )
+        merge_ws_ignore_from_strategy_opts(strategy_options),
+        RenameMergeConfig {
+            detect_renames: true,
+            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_limit: merge_rename_limit_config(config),
+            directory_renames: directory_renames_config(config),
+            lazy_fetch,
+        },
+    )?;
+    Ok((results, conflicts))
 }
 
 /// Delegates to [`sley_diff_merge::virtual_ancestor_entry_map`].
@@ -464,6 +535,8 @@ pub(crate) fn virtual_ancestor_entry_map(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_way_merge_trees_with_favor(
     db: &FileObjectDatabase,
+    config: &GitConfig,
+    lazy_fetch: bool,
     format: ObjectFormat,
     base: &MergeTreeMap,
     ours: &MergeTreeMap,
@@ -474,6 +547,8 @@ pub(crate) fn three_way_merge_trees_with_favor(
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
     three_way_merge_trees_inner(
         db,
+        config,
+        lazy_fetch,
         format,
         base,
         ours,
@@ -504,9 +579,25 @@ pub(crate) fn merge_favor_from_strategy_opts(opts: &[String]) -> sley_diff_merge
     favor
 }
 
+pub(crate) fn merge_ws_ignore_from_strategy_opts(opts: &[String]) -> sley_diff_merge::WsIgnore {
+    let mut whitespace = sley_diff_merge::WsIgnore::EMPTY;
+    for opt in opts {
+        match opt.as_str() {
+            "ignore-space-change" => whitespace.space_change = true,
+            "ignore-all-space" => whitespace.all_space = true,
+            "ignore-space-at-eol" => whitespace.space_at_eol = true,
+            "ignore-cr-at-eol" => whitespace.cr_at_eol = true,
+            _ => {}
+        }
+    }
+    whitespace
+}
+
 #[allow(clippy::too_many_arguments)]
 fn three_way_merge_trees_inner(
     db: &FileObjectDatabase,
+    config: &GitConfig,
+    lazy_fetch: bool,
     format: ObjectFormat,
     base: &MergeTreeMap,
     ours: &MergeTreeMap,
@@ -519,6 +610,8 @@ fn three_way_merge_trees_inner(
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
     let (results, conflicts, _) = three_way_merge_trees_inner_with_info(
         db,
+        config,
+        lazy_fetch,
         format,
         base,
         ours,
@@ -535,6 +628,8 @@ fn three_way_merge_trees_inner(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_way_merge_trees_inner_with_info(
     db: &FileObjectDatabase,
+    config: &GitConfig,
+    lazy_fetch: bool,
     format: ObjectFormat,
     base: &MergeTreeMap,
     ours: &MergeTreeMap,
@@ -563,8 +658,9 @@ pub(crate) fn three_way_merge_trees_inner_with_info(
         RenameMergeConfig {
             detect_renames: true,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
-            rename_limit: merge_rename_limit_config(),
-            directory_renames: directory_renames_config(),
+            rename_limit: merge_rename_limit_config(config),
+            directory_renames: directory_renames_config(config),
+            lazy_fetch,
         },
     )
 }
@@ -580,6 +676,7 @@ pub(crate) struct RenameMergeConfig {
     pub(crate) rename_threshold: u8,
     pub(crate) rename_limit: usize,
     pub(crate) directory_renames: sley_diff_merge::DirectoryRenames,
+    pub(crate) lazy_fetch: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -665,10 +762,48 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts_and_path_resolvers(
     path_favor: Option<&MergePathFavorResolver<'_>>,
     path_marker_size: Option<&MergePathMarkerSizeResolver<'_>>,
 ) -> Result<(MergePathResults, MergeConflictPaths, MergeInfoMessages)> {
+    let outcome = three_way_merge_trees_outcome_with_info_opts_and_path_resolvers(
+        db,
+        format,
+        base,
+        ours,
+        theirs,
+        ours_label,
+        theirs_label,
+        ancestor_label,
+        favor,
+        style,
+        ws_ignore,
+        renames,
+        path_favor,
+        path_marker_size,
+        None,
+    )?;
+    Ok((outcome.results, outcome.conflicts, outcome.info_messages))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn three_way_merge_trees_outcome_with_info_opts_and_path_resolvers(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    base: &MergeTreeMap,
+    ours: &MergeTreeMap,
+    theirs: &MergeTreeMap,
+    ours_label: &str,
+    theirs_label: &str,
+    ancestor_label: &str,
+    favor: sley_diff_merge::MergeFavor,
+    style: sley_diff_merge::ConflictStyle,
+    ws_ignore: sley_diff_merge::WsIgnore,
+    renames: RenameMergeConfig,
+    path_favor: Option<&MergePathFavorResolver<'_>>,
+    path_marker_size: Option<&MergePathMarkerSizeResolver<'_>>,
+    path_is_binary: Option<&MergePathBinaryResolver<'_>>,
+) -> Result<ThreeWayMergeOutcome> {
     // The shared merge engine only sees an object database, while the CLI knows
     // how to hydrate promised blobs. Fetch just the blobs a non-trivial textual
     // merge will inspect, preserving partial-clone laziness for unrelated blobs.
-    prefetch_content_merge_blobs(db, base, ours, theirs)?;
+    prefetch_content_merge_blobs(db, base, ours, theirs, renames.lazy_fetch)?;
 
     let merge = sley_diff_merge::merge_entry_maps(
         db,
@@ -683,6 +818,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts_and_path_resolvers(
             favor,
             path_favor,
             path_marker_size,
+            path_is_binary,
             detect_renames: renames.detect_renames,
             rename_threshold: renames.rename_threshold,
             rename_limit: renames.rename_limit,
@@ -699,6 +835,7 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts_and_path_resolvers(
         },
     )?;
 
+    let tree = merge.tree;
     let mut results = BTreeMap::new();
     let mut conflicts = Vec::new();
     let info_messages = merge.info_messages.clone();
@@ -720,7 +857,9 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts_and_path_resolvers(
             conflicts.push(entry.path.clone());
             if advisory_location {
                 let worktree = match entry.result {
-                    Some((mode, oid)) => Some((mode, merge_read_blob(db, &oid)?)),
+                    Some((mode, oid)) => {
+                        Some((mode, merge_read_blob(db, &oid, renames.lazy_fetch)?))
+                    }
                     None => None,
                 };
                 results.insert(
@@ -756,5 +895,10 @@ pub(crate) fn three_way_merge_trees_inner_with_info_opts_and_path_resolvers(
             .entry(path)
             .or_insert(MergePathResult::Resolved(None));
     }
-    Ok((results, conflicts, info_messages))
+    Ok(ThreeWayMergeOutcome {
+        results,
+        conflicts,
+        info_messages,
+        tree,
+    })
 }

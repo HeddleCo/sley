@@ -3,15 +3,14 @@
 
 use std::io::{self, BufWriter, Write};
 
-use sley::{GitError, ObjectFormat, ObjectId, Result};
 use sley::plumbing::sley_object::{
     ObjectType, TreeEntries, TreeEntry, TreeEntryRef, tree_entry_object_type,
 };
 use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
+use sley::{GitError, ObjectFormat, ObjectId, Result};
 
 use crate::sley_object;
 use crate::status_format::write_status_quoted_path;
-
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TreePrintOptions<'a> {

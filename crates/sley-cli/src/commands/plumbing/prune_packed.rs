@@ -2,7 +2,10 @@
 
 use crate::*;
 
-pub(crate) fn cmd_prune_packed(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_prune_packed(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut dry_run = false;
     let mut positional = 0usize;
     let mut iter = args.iter();
@@ -32,7 +35,7 @@ pub(crate) fn cmd_prune_packed(args: &[String]) -> Result<()> {
         return prune_packed_usage();
     }
 
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let objects_dir = repository_objects_dir(&git_dir);
     let packed = prune_packed_object_ids(&objects_dir.join("pack"), format)?;

@@ -303,7 +303,7 @@ impl Graph {
         self.update_boundary(commit, parents, false);
     }
 
-    /// As [`update`], but marks the commit as a `--boundary` commit so it is
+    /// As [`Self::update`], but marks the commit as a `--boundary` commit so it is
     /// drawn with `o` instead of `*` (upstream `graph->commit->object.flags &
     /// BOUNDARY`). Boundary commits are leaves in the drawn graph — callers
     /// pass no shown parents.

@@ -2,17 +2,17 @@ use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use std::io::{Read, Write};
 
 use crate::pktline::{
-    PktLineFrame, ProtocolVersion, line, line_from_str, parse_oid_argument, parse_protocol_v2_line_text,
-    read_pkt_line_frame, read_pkt_line_frames_until_flush, read_pkt_line_frames_until_response_end,
-    trim_trailing_lf, validate_capability_name, validate_protocol_v2_line,
-    validate_protocol_v2_token, write_pkt_line_frame, write_pkt_line_payload,
+    PktLineFrame, ProtocolVersion, line, line_from_str, parse_oid_argument,
+    parse_protocol_v2_line_text, read_pkt_line_frame, read_pkt_line_frames_until_flush,
+    read_pkt_line_frames_until_response_end, trace_packet_read_payload, trim_trailing_lf,
+    validate_capability_name, validate_protocol_v2_line, validate_protocol_v2_token,
+    write_pkt_line_frame, write_pkt_line_payload,
 };
 use crate::sideband::{
-    SideBandChannel, SideBandDemux, SideBandPacket, encode_sideband_packet, parse_and_demux_sideband_packets, parse_sideband_packet, write_sideband_payload,
+    SideBandChannel, SideBandDemux, SideBandPacket, encode_sideband_packet,
+    parse_and_demux_sideband_packets, parse_sideband_packet, write_sideband_payload,
 };
-use crate::v0::{
-    RefAdvertisement, RefAdvertisementSet, TransportHandshake,
-};
+use crate::v0::{RefAdvertisement, RefAdvertisementSet, TransportHandshake};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolV2CommandRequest {
@@ -171,6 +171,18 @@ pub struct ProtocolV2FetchSidebandAllResponse {
 pub struct ProtocolV2FetchResponseHeader {
     pub sections: Vec<ProtocolV2FetchResponseSection>,
     pub has_packfile: bool,
+}
+
+/// The acknowledgment phase of a multi-round protocol-v2 fetch.
+///
+/// When `has_following_sections` is true, the delimiter after
+/// `acknowledgments` has already been consumed and the reader is positioned at
+/// the next response section. Otherwise the response ended with a flush and
+/// the client must send another negotiation request.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProtocolV2FetchNegotiationResponse {
+    pub acknowledgments: Vec<ProtocolV2FetchAcknowledgment>,
+    pub has_following_sections: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -595,6 +607,24 @@ pub fn write_protocol_v2_advertisement(
     Ok(())
 }
 
+/// Trace a previously discovered v2 advertisement as incoming packets at the
+/// current logical protocol consumer. Smart HTTP discovers capabilities in its
+/// remote-helper phase, then forwards that handshake to `fetch`; replaying the
+/// packet trace at that in-process boundary preserves Git's observable
+/// `fetch< version 2` trace without putting a second advertisement on the HTTP
+/// RPC wire.
+pub fn trace_protocol_v2_advertisement_read(handshake: &TransportHandshake) -> Result<()> {
+    for frame in encode_protocol_v2_advertisement(handshake)? {
+        match frame {
+            PktLineFrame::Data(payload) => trace_packet_read_payload(&payload),
+            PktLineFrame::Flush => trace_packet_read_payload(b"0000"),
+            PktLineFrame::Delimiter => trace_packet_read_payload(b"0001"),
+            PktLineFrame::ResponseEnd => trace_packet_read_payload(b"0002"),
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_protocol_v2_command_request(
     frames: &[PktLineFrame],
 ) -> Result<ProtocolV2CommandRequest> {
@@ -913,9 +943,7 @@ fn skip_leading_protocol_v2_advertisement_if_present(
             let packet = parse_sideband_packet(payload)?;
             let demuxed = match packet.channel {
                 SideBandChannel::Data => PktLineFrame::Data(packet.data),
-                SideBandChannel::Progress => {
-                    read_protocol_v2_fetch_metadata_frame(reader, true)?
-                }
+                SideBandChannel::Progress => read_protocol_v2_fetch_metadata_frame(reader, true)?,
                 SideBandChannel::Fatal => {
                     let message = String::from_utf8_lossy(&packet.data).into_owned();
                     return Err(GitError::InvalidFormat(format!(
@@ -1366,6 +1394,80 @@ pub fn read_protocol_v2_fetch_response_header(
             PktLineFrame::ResponseEnd => {
                 return Err(GitError::InvalidFormat(
                     "fetch response contains response-end".into(),
+                ));
+            }
+        }
+    }
+}
+
+/// Read and validate the acknowledgment-only prefix of a multi-round fetch.
+///
+/// A server that says `ready` must delimit the acknowledgment section before
+/// sending the pack, except when the client requested `wait-for-done`. A server
+/// that has not said `ready` must flush the response so the client can continue
+/// negotiation. Keeping this request-dependent validation here preserves the
+/// generic response parser's support for valid `ready` + flush intermediate
+/// responses.
+pub fn read_protocol_v2_fetch_negotiation_response(
+    format: ObjectFormat,
+    reader: &mut impl Read,
+    sideband_all: bool,
+    wait_for_done: bool,
+) -> Result<ProtocolV2FetchNegotiationResponse> {
+    let mut pending = skip_leading_protocol_v2_advertisement_if_present(reader, sideband_all)?;
+    let first = if let Some(frame) = pending.take() {
+        frame
+    } else {
+        read_protocol_v2_fetch_metadata_frame(reader, sideband_all)?
+    };
+    let PktLineFrame::Data(header) = first else {
+        return Err(GitError::InvalidFormat(
+            "fetch negotiation response is missing acknowledgments".into(),
+        ));
+    };
+    if parse_fetch_section_header(&header)? != "acknowledgments" {
+        return Err(GitError::InvalidFormat(
+            "fetch negotiation response must begin with acknowledgments".into(),
+        ));
+    }
+
+    let mut acknowledgments = Vec::new();
+    loop {
+        match read_protocol_v2_fetch_metadata_frame(reader, sideband_all)? {
+            PktLineFrame::Data(line) => {
+                acknowledgments.push(parse_fetch_acknowledgment(format, &line)?);
+            }
+            PktLineFrame::Delimiter => {
+                let ready = acknowledgments
+                    .iter()
+                    .any(|ack| matches!(ack, ProtocolV2FetchAcknowledgment::Ready));
+                if !ready {
+                    return Err(GitError::InvalidFormat(
+                        "expected no other sections to be sent after no 'ready'".into(),
+                    ));
+                }
+                return Ok(ProtocolV2FetchNegotiationResponse {
+                    acknowledgments,
+                    has_following_sections: true,
+                });
+            }
+            PktLineFrame::Flush => {
+                let ready = acknowledgments
+                    .iter()
+                    .any(|ack| matches!(ack, ProtocolV2FetchAcknowledgment::Ready));
+                if ready && !wait_for_done {
+                    return Err(GitError::InvalidFormat(
+                        "expected packfile to be sent after 'ready'".into(),
+                    ));
+                }
+                return Ok(ProtocolV2FetchNegotiationResponse {
+                    acknowledgments,
+                    has_following_sections: false,
+                });
+            }
+            PktLineFrame::ResponseEnd => {
+                return Err(GitError::InvalidFormat(
+                    "fetch negotiation response contains response-end".into(),
                 ));
             }
         }
@@ -2461,11 +2563,15 @@ fn format_protocol_v2_fetch_section_lines(
         ProtocolV2FetchResponseSection::ShallowInfo(entries) => entries
             .iter()
             .map(|entry| match entry {
+                // Unlike most protocol-v2 text records, upload-pack writes
+                // shallow-info entries without a trailing LF. The pkt-line
+                // length is therefore 0034/0036 for SHA-1 and 004c/004e for
+                // SHA-256, matching Git's byte-level wire contract.
                 ProtocolV2FetchShallowInfo::Shallow(oid) => {
-                    Ok(line_from_str(&format!("shallow {oid}")))
+                    Ok(format!("shallow {oid}").into_bytes())
                 }
                 ProtocolV2FetchShallowInfo::Unshallow(oid) => {
-                    Ok(line_from_str(&format!("unshallow {oid}")))
+                    Ok(format!("unshallow {oid}").into_bytes())
                 }
             })
             .collect(),
@@ -2587,4 +2693,3 @@ pub(crate) fn parse_u64_argument(label: &str, value: &str, prefix: &str) -> Resu
         .parse::<u64>()
         .map_err(|err| GitError::InvalidFormat(err.to_string()))
 }
-

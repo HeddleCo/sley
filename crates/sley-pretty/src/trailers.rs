@@ -8,10 +8,7 @@ struct TrailerItem {
 
 /// Render `%(trailers)` for `message` under `options`, mirroring git's
 /// `format_trailers_from_commit` + `format_trailers`.
-pub fn format_trailers_from_commit(
-    message: &[u8],
-    options: &ForEachRefTrailerOptions,
-) -> Vec<u8> {
+pub fn format_trailers_from_commit(message: &[u8], options: &ForEachRefTrailerOptions) -> Vec<u8> {
     let text = String::from_utf8_lossy(message);
     let block = trailer_block(&text);
     // Fast path: unmodified whole block.

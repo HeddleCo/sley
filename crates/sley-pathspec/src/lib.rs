@@ -27,7 +27,7 @@ use std::path::Path;
 ///
 /// Mirrors git's `struct pathspec_item` for the subset sley needs today.
 /// Construct with [`PathspecElement::parse`]; query with
-/// [`PathspecElement::matches`].
+/// [`PathspecElement::matches_path`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathspecElement {
     /// The match pattern with any magic prefix stripped (git's `item.match`).

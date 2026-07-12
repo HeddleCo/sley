@@ -114,6 +114,28 @@ fn assert_same_state(upstream: &Path, rust: &Path, expected_file: &[u8]) {
 }
 
 #[test]
+fn checkout_existing_branch_recovers_from_null_direct_head() {
+    let root = unique_temp_dir("checkout-null-direct-head");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    prepare_repo(&upstream);
+    prepare_repo(&rust);
+    let zero = format!("{}\n", "0".repeat(40));
+    fs::write(upstream.join(".git/HEAD"), &zero).expect("invalidate upstream HEAD");
+    fs::write(rust.join(".git/HEAD"), &zero).expect("invalidate sley HEAD");
+
+    let args = ["checkout", "main", "--"];
+    let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+    let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+    assert_same_output(actual, expected, &args);
+    assert_same_state(&upstream, &rust, b"main\n");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn checkout_branch_creation_and_quiet_match_upstream_git() {
     let root = unique_temp_dir("checkout-branch-create");
     let upstream = root.join("upstream");

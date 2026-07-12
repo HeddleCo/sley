@@ -2,7 +2,7 @@
 
 use sley::{ConfigEditScope, Repository};
 use sley_testkit::engine_parity::{
-    assert_stdout_eq, EngineOutput, EngineParityCase, git_config_get_all_lines, git_config_line,
+    EngineOutput, EngineParityCase, assert_stdout_eq, git_config_get_all_lines, git_config_line,
 };
 
 #[test]
@@ -141,11 +141,7 @@ fn unset_user_name_matches_oracle() {
         |sley, oracle| {
             // `git config --get` exits 1 when the key is absent; the library
             // reports `None` as empty stdout with exit 0.
-            assert_stdout_eq(
-                sley,
-                oracle,
-                "config-unset-user-name: stdout differed",
-            );
+            assert_stdout_eq(sley, oracle, "config-unset-user-name: stdout differed");
             assert_eq!(sley.exit_code, 0);
             assert_eq!(oracle.exit_code, 1);
         },
@@ -264,11 +260,7 @@ fn init_default_branch_matches_oracle() {
         },
         |fixture| fixture.oracle(&["config", "--get", "init.defaultBranch"]),
         |sley, oracle| {
-            assert_stdout_eq(
-                sley,
-                oracle,
-                "config-init-defaultbranch: stdout differed",
-            );
+            assert_stdout_eq(sley, oracle, "config-init-defaultbranch: stdout differed");
             assert_eq!(sley.exit_code, 0);
             assert_eq!(oracle.exit_code, 1);
         },
@@ -364,7 +356,9 @@ fn config_string_api_matches_oracle() {
         },
         |fixture| {
             let repo = Repository::discover(fixture.path()).expect("discover");
-            let value = repo.config_string("custom", "value").expect("config_string");
+            let value = repo
+                .config_string("custom", "value")
+                .expect("config_string");
             EngineOutput::stdout(git_config_line(value.as_deref()))
         },
         |fixture| fixture.oracle(&["config", "--get", "custom.value"]),

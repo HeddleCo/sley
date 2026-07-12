@@ -1,23 +1,23 @@
 //! Clone command and helpers.
 #![allow(clippy::expect_used)]
 
+use super::CLONE_UNBORN_BRANCH;
 use super::config::{
     clone_effective_config_value, read_repo_config, read_repo_config_on_disk, validate_remote_name,
     write_repo_config,
 };
 use super::fetch::{
-    configured_server_options, fetch_bundle, fetch_local_repository, fetch_source_is_git,
-    fetch_source_is_ssh, parse_shallow_since,
+    StdoutProgress, configured_server_options, fetch_bundle, fetch_local_repository,
+    fetch_source_is_git, fetch_source_is_ssh, parse_shallow_since,
     repo_config_with_clone_transport_policy, repo_config_with_transport_policy, run_fetch,
-    transport_policy_config_for_clone, transport_policy_config_for_cwd, StdoutProgress,
+    transport_policy_config_for_clone,
 };
 use super::fetch::{check_transport_allowed_url, ls_remote_resolved_url};
 use super::pack::{
-    configured_legacy_protocol, configured_protocol_version, trace_configured_local_protocol_version,
-    trace_protocol_v2_ls_refs_request,
+    configured_legacy_protocol, configured_protocol_version,
+    trace_configured_local_protocol_version, trace_protocol_v2_ls_refs_request,
 };
-use super::resolve::{local_repository_git_dir_path, ls_remote_git_dir};
-use super::CLONE_UNBORN_BRANCH;
+use super::resolve::{RemoteCommandContext, local_repository_git_dir_path, ls_remote_git_dir};
 use crate::commands::config_cmd::{
     ConfigKey, SimpleConfigRegex, config_set_value, parse_config_key,
 };
@@ -28,10 +28,11 @@ use crate::remote::{
 use crate::*;
 use sley::plumbing::sley_odb::ObjectReader;
 use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 
-pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut explicit_bare = None::<bool>;
     let mut mirror = false;
@@ -479,6 +480,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             value => positional.push(value.to_string()),
         }
     }
+    let progress = progress.unwrap_or_else(|| io::stderr().is_terminal()) && !quiet;
     if positional.is_empty() || positional.len() > 2 {
         return Err(GitError::Command(
             "clone currently supports: clone [-q|-v] [--bare|--mirror] [--progress|--no-progress] [--single-branch] [--reject-shallow|--no-reject-shallow] [--depth <depth>|--no-depth] [--shallow-since <time>|--no-shallow-since] [--shallow-exclude <revision>|--no-shallow-exclude] [--recurse-submodules|--recursive|--no-recurse-submodules|--no-recursive] [--no-sparse] [--no-filter] [--also-filter-submodules|--no-also-filter-submodules] [--remote-submodules|--no-remote-submodules] [--shallow-submodules|--no-shallow-submodules] [--bundle-uri <uri>|--no-bundle-uri] [-s|--shared|--no-shared] [--reference <repo>|--no-reference] [--reference-if-able <repo>|--no-reference-if-able] [--dissociate|--no-dissociate] [--separate-git-dir <gitdir>|--no-separate-git-dir] [--template <dir>|--no-template|--no-jobs] [--revision <rev>|--no-revision] [-4|--ipv4|-6|--ipv6] [-l|--local|--no-local] [--hardlinks|--no-hardlinks] [--ref-format=files|--no-ref-format] [-c <key=value>] [-u|--upload-pack <path>] [--server-option <value>] [-j|--jobs <n>] [--origin <name>|--no-origin] [--branch <name>|--no-branch] [--tags|--no-tags] <repository> [<directory>]"
@@ -495,6 +497,11 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         eprintln!("fatal: the option '--also-filter-submodules' requires '--recurse-submodules'");
         return Err(GitError::Exit(128));
     }
+    let submodule_filter = if also_filter_submodules {
+        partial_clone_filter.as_deref()
+    } else {
+        None
+    };
     if bundle_uri.is_some() && (depth.is_some() || deepen_since.is_some() || !deepen_not.is_empty())
     {
         eprintln!(
@@ -530,8 +537,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     trace_index_pack_fsck_objects_if_configured();
     trace_pack_objects_filter(partial_clone_filter.as_deref());
     let repository_arg = positional[0].clone();
-    let cwd = env::current_dir()?;
-    let transport_config = transport_policy_config_for_clone()?;
+    let cwd = cli_session.cwd().to_path_buf();
+    let remote_context = RemoteCommandContext::from_session(cli_session);
+    let transport_config = transport_policy_config_for_clone(&cwd)?;
     let rewritten_repository = rewrite_url_with_config(&transport_config, &repository_arg, false);
     let rewrite_applied = rewritten_repository != repository_arg;
     let bundle_source_path = clone_bundle_path(&cwd, &rewritten_repository);
@@ -550,7 +558,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let env_worktree = if bare {
         None
     } else {
-        explicit_work_tree().and_then(|value| {
+        cli_session.explicit_work_tree().and_then(|value| {
             if value.as_os_str().is_empty() {
                 None
             } else {
@@ -580,6 +588,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     } else {
         repository.clone()
     };
+    let remote_helper =
+        clone_remote_helper_spec(&transport_config, &repository, &origin, &config_overrides);
     if !server_options_from_cli {
         server_options = configured_server_options(&transport_config, &origin)?;
     } else if configured_legacy_protocol(Some(&transport_config)) {
@@ -589,8 +599,10 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     }
     let mut ssh_options = sley_remote::ssh_transport_options_from_config(&transport_config);
     ssh_options.ip_version = ssh_ip_version;
-    let resolved_repository = ls_remote_resolved_url(&repository)?;
-    check_transport_allowed_url(&resolved_repository, Some(&transport_config))?;
+    if remote_helper.is_none() {
+        let resolved_repository = ls_remote_resolved_url(&remote_context, &repository)?;
+        check_transport_allowed_url(&resolved_repository, Some(&transport_config))?;
+    }
     // An empty `--template=` (or `--template ""`) disables templating entirely,
     // matching upstream git's `copy_templates()`, which returns immediately when
     // the template directory is the empty string. Resolving "" against the cwd
@@ -616,6 +628,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
 
     if let Some(bundle_path) = bundle_source_path.as_deref() {
         clone_bundle_repository(CloneBundleOptions {
+            cli_session,
             repository: &repository,
             remote_url: &remote_config_url,
             bundle_path,
@@ -638,10 +651,40 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
+    if remote_helper.is_some() {
+        clone_remote_helper_repository(CloneRemoteHelperOptions {
+            cli_session,
+            context: &remote_context,
+            repository: &repository,
+            remote_url: &remote_config_url,
+            destination: &checkout_destination,
+            destination_display: &destination_display,
+            git_dir_override: clone_git_dir_override.as_deref(),
+            core_worktree: clone_core_worktree.as_deref(),
+            origin: &origin,
+            quiet,
+            bare,
+            checkout,
+            sparse,
+            template: template.as_deref(),
+            template_config,
+            separate_git_dir: separate_git_dir.as_deref(),
+            config_overrides: &config_overrides,
+            submodule_active: &submodule_active,
+            ref_storage,
+            tag_opt: tag_opt.as_deref(),
+            branch: branch.as_deref(),
+            submodules: &reference_alternates,
+            depth,
+        })?;
+        return Ok(());
+    }
+
     let reject_shallow_config =
         option_reject_shallow.or(clone_reject_shallow_config(&config_overrides)?);
     if sley_remote::remote_url_is_http(&repository).unwrap_or(false) {
         clone_http_repository(CloneHttpOptions {
+            context: &remote_context,
             repository: &repository,
             remote_url: &remote_config_url,
             destination: &checkout_destination,
@@ -667,23 +710,29 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             reference_alternates: &reference_alternates,
             bundle_uri: bundle_uri.as_ref(),
             depth,
+            deepen_since,
+            deepen_not: &deepen_not,
             ref_storage,
             progress,
             ssh_options,
+            upload_pack_command: upload_pack.as_deref(),
             reject_shallow: reject_shallow_config.unwrap_or(false),
         })?;
         return recurse_clone_submodules(
+            cli_session,
             &checkout_destination,
             &submodule_active,
             bare,
             checkout,
             depth,
+            submodule_filter,
             quiet,
             &reference_alternates,
         );
     }
-    if fetch_source_is_ssh(&repository)? {
+    if fetch_source_is_ssh(&remote_context, &repository)? {
         clone_ssh_repository(CloneHttpOptions {
+            context: &remote_context,
             repository: &repository,
             remote_url: &remote_config_url,
             destination: &checkout_destination,
@@ -709,23 +758,29 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             reference_alternates: &reference_alternates,
             bundle_uri: bundle_uri.as_ref(),
             depth,
+            deepen_since,
+            deepen_not: &deepen_not,
             ref_storage,
             progress,
             ssh_options,
+            upload_pack_command: upload_pack.as_deref(),
             reject_shallow: reject_shallow_config.unwrap_or(false),
         })?;
         return recurse_clone_submodules(
+            cli_session,
             &checkout_destination,
             &submodule_active,
             bare,
             checkout,
             depth,
+            submodule_filter,
             quiet,
             &reference_alternates,
         );
     }
-    if fetch_source_is_git(&repository)? {
+    if fetch_source_is_git(&remote_context, &repository)? {
         clone_git_repository(CloneHttpOptions {
+            context: &remote_context,
             repository: &repository,
             remote_url: &remote_config_url,
             destination: &checkout_destination,
@@ -751,35 +806,40 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             reference_alternates: &reference_alternates,
             bundle_uri: bundle_uri.as_ref(),
             depth,
+            deepen_since,
+            deepen_not: &deepen_not,
             ref_storage,
             progress,
             ssh_options,
+            upload_pack_command: upload_pack.as_deref(),
             reject_shallow: reject_shallow_config.unwrap_or(false),
         })?;
         return recurse_clone_submodules(
+            cli_session,
             &checkout_destination,
             &submodule_active,
             bare,
             checkout,
             depth,
+            submodule_filter,
             quiet,
             &reference_alternates,
         );
     }
 
-    let remote_git_dir = ls_remote_git_dir(&repository)?;
+    let remote_git_dir = ls_remote_git_dir(&remote_context, &repository)?;
     // A local clone reads the source repository directly, so it is subject to the
     // same `safe.directory` ownership check git applies when opening any repo.
     // The source is identified by its git directory (a clone needs no worktree),
     // so an exception is added as `<source>/.git`.
     crate::ownership::ensure_valid_ownership(None, &remote_git_dir, None)?;
-    let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
+    let remote_common_git_dir = cli_session.common_git_dir(&remote_git_dir)?;
     let format = repository_object_format(&remote_common_git_dir)?;
     validate_local_clone_source_refs(&remote_common_git_dir, format)?;
     let source_has_promisor = source_repository_has_promisor_remote(&remote_common_git_dir)?;
     if source_has_promisor {
-        let clone_lazy_fetch_reenabled = env::var("GIT_NO_LAZY_FETCH").ok().as_deref() == Some("0")
-            && crate::global_lazy_fetch_enabled();
+        let clone_lazy_fetch_reenabled =
+            env::var("GIT_NO_LAZY_FETCH").ok().as_deref() == Some("0") && cli_session.lazy_fetch();
         if !clone_lazy_fetch_reenabled {
             eprintln!("fatal: lazy fetching disabled; some objects may be missing");
             return Err(GitError::Exit(128));
@@ -832,7 +892,13 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         (Some(_), None, _) => String::new(),
         _ => clone_remote_head_branch(&remote_common_git_dir, format)?.unwrap_or_default(),
     };
-    let alternates = clone_alternates(&remote_git_dir, shared, &reference_alternates)?;
+    let alternates = clone_alternates(
+        cli_session,
+        remote_context.resolution(),
+        &remote_git_dir,
+        shared,
+        &reference_alternates,
+    )?;
     let source_alternates_git_dir = remote_common_git_dir.clone();
     let revision_oid = revision
         .as_deref()
@@ -905,6 +971,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     // when the source advertises filtering (`uploadpack.allowFilter`),
     // otherwise warns exactly like a server without the capability.
     let mut fetch_filter = None::<sley_odb::PackObjectFilter>;
+    let mut fetch_filter_auto = false;
     if let Some(filter) = partial_clone_filter.as_deref() {
         if local_mechanism {
             eprintln!("warning: --filter is ignored in local clones; use file:// instead.");
@@ -914,14 +981,26 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 .as_ref()
                 .and_then(|config| config.get_bool("uploadpack", None, "allowfilter"))
                 .unwrap_or(false);
-            let parsed_filter =
-                sley_remote::pack_filter_from_spec_for_clone(filter, &remote_common_git_dir, format)?;
+            let parsed_filter = if filter.eq_ignore_ascii_case("auto") {
+                fetch_filter_auto = true;
+                None
+            } else {
+                sley_remote::pack_filter_from_spec_for_clone(
+                    filter,
+                    &remote_common_git_dir,
+                    format,
+                )?
+            };
             match (remote_allows_filter, remote_config.as_ref(), parsed_filter) {
                 (true, Some(config), Some(parsed)) => {
                     validate_server_filter_policy(config, filter)?;
                     fetch_filter = Some(parsed);
                 }
-                _ => eprintln!("warning: filtering not recognized by server, ignoring"),
+                (true, Some(_), None) if fetch_filter_auto => {}
+                _ => {
+                    fetch_filter_auto = false;
+                    eprintln!("warning: filtering not recognized by server, ignoring");
+                }
             }
         }
     }
@@ -967,6 +1046,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         clone_bare_or_mirror_local_repository(
             &destination,
             CloneLocalOptions {
+                cli_session,
+                context: &remote_context,
                 format,
                 origin: &origin,
                 repository: &repository,
@@ -1015,6 +1096,11 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             if local_source {
                 apply_clone_source_alternates(git_dir, &source_alternates_git_dir)?;
             }
+            // Git persists clone `-c` entries before adding the generated
+            // origin section. Section order is observable through
+            // `git config --show-names --regexp` and establishes promisor
+            // priority before the default partial-clone remote is moved last.
+            apply_clone_config_overrides(git_dir, &config_overrides)?;
             configure_clone_remote(
                 git_dir,
                 &origin,
@@ -1024,7 +1110,6 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 tag_opt.as_deref(),
                 partial_clone_filter.as_deref(),
             )?;
-            apply_clone_config_overrides(git_dir, &config_overrides)?;
             apply_clone_default_submodule_path_config(git_dir)?;
             apply_clone_submodule_active(git_dir, &submodule_active)?;
             read_repo_config(git_dir)
@@ -1036,6 +1121,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         let layout = RepositoryBootstrap::init(InitOptions {
             git_dir_override: clone_git_dir_override.clone(),
             core_worktree: clone_core_worktree.clone(),
+            object_dir: None,
             worktree: checkout_destination.clone(),
             object_format: format,
             object_format_explicit: false,
@@ -1076,7 +1162,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 &git_dir,
                 format,
                 revision_oid,
-                committer_identity_for_reflog()?,
+                committer_identity_for_reflog(&transport_config)?,
                 format!("clone: from {repository}").into_bytes(),
                 &config,
             )?;
@@ -1088,7 +1174,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 &git_dir,
                 format,
                 revision_oid,
-                committer_identity_for_reflog()?,
+                committer_identity_for_reflog(&transport_config)?,
                 format!("clone: from {repository}").into_bytes(),
             )?;
             remove_clone_worktree_files(&checkout_destination, &git_dir, format)?;
@@ -1112,13 +1198,18 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         checkout_branch: &checkout_branch,
         remote_head_branch: &remote_head_branch,
         single_branch,
+        // A plain local clone installs objects by hardlink/copy and upstream
+        // does not run the transfer progress machinery for that path. Keep
+        // progress enabled for `file://` and explicit `--no-local`, which do
+        // use the in-process fetch transport.
+        progress: progress && !local_source,
         // A non-local path clone (`--no-local` / `file://`) honors `--depth`
         // through the in-process transport; a plain local clone had its depth
         // warned-and-ignored above, leaving `None` (a full clone).
         depth,
         deepen_since,
         deepen_not,
-        committer: committer_identity_for_reflog()?,
+        committer: committer_identity_for_reflog(&transport_config)?,
         // `--branch=<tag>` checks the tag's commit out detached; otherwise a
         // detached source HEAD is honored only for the default (no `--branch`)
         // case.
@@ -1131,12 +1222,14 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         },
         checkout,
         filter: fetch_filter,
+        filter_auto: fetch_filter_auto,
         // A `--branch=<tag>` is satisfied by the detached checkout, so the
         // remote-tracking-branch lookup (and its "Remote branch not found"
         // mapping) must be bypassed.
         branch_explicit: branch_explicit && branch_tag_oid.is_none(),
         ref_storage,
         ssh_options: None,
+        upload_pack_command: None,
         reject_shallow: reject_shallow_config.unwrap_or(false),
     };
     let mut credentials = sley_remote::NoCredentials;
@@ -1171,7 +1264,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 };
                 // A detached source HEAD may sit on commits unreachable from
                 // any ref; copy its closure so the detached checkout works.
-                if let Some(detached) = clone_options.detached_head.as_ref() {
+                if branch_tag_oid.is_none()
+                    && let Some(detached) = clone_options.detached_head.as_ref()
+                {
                     copy_local_revision_objects(
                         &remote_common_git_dir_for_head,
                         git_dir,
@@ -1183,7 +1278,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             },
             configure_branch: &mut |git_dir, branch| {
                 configure_clone_branch(git_dir, branch, &origin)?;
-                repo_config_with_transport_policy(git_dir)
+                repo_config_with_transport_policy(&remote_context, git_dir)
             },
             credentials: &mut credentials,
             progress: &mut progress_sink,
@@ -1219,24 +1314,24 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     if let Some(separate_git_dir) = separate_git_dir.as_deref() {
         apply_clone_separate_git_dir(&checkout_destination, &git_dir, separate_git_dir)?;
     }
-    if !local_source {
-        emit_explicit_clone_progress(progress, quiet, outcome.empty);
-    }
     if !quiet && local_source {
         eprintln!("done.");
     }
     recurse_clone_submodules(
+        cli_session,
         &checkout_destination,
         &submodule_active,
         bare,
         checkout,
         depth,
+        submodule_filter,
         quiet,
         &reference_alternates,
     )
 }
 
 struct CloneBundleOptions<'a> {
+    cli_session: &'a crate::session::CliSession,
     repository: &'a str,
     remote_url: &'a str,
     bundle_path: &'a Path,
@@ -1257,6 +1352,309 @@ struct CloneBundleOptions<'a> {
     ref_storage: RefStorageFormat,
 }
 
+fn clone_remote_helper_spec(
+    config: &GitConfig,
+    repository: &str,
+    origin: &str,
+    overrides: &[GlobalConfigOverride],
+) -> Option<sley_remote::RemoteHelperSpec> {
+    if let Some(spec) = sley_remote::resolve_remote_helper(config, repository) {
+        return Some(spec);
+    }
+    let vcs_key = format!("remote.{origin}.vcs");
+    let vcs = overrides
+        .iter()
+        .rev()
+        .find(|entry| entry.key.eq_ignore_ascii_case(&vcs_key))?;
+    let mut config = config.clone();
+    config.sections.push(ConfigSection::new(
+        "remote",
+        Some(origin.to_string()),
+        vec![
+            ConfigEntry::new("url", Some(repository.to_string())),
+            ConfigEntry::new("vcs", Some(vcs.value.clone())),
+        ],
+    ));
+    sley_remote::resolve_remote_helper(&config, origin)
+}
+
+struct CloneRemoteHelperOptions<'a> {
+    cli_session: &'a crate::session::CliSession,
+    context: &'a RemoteCommandContext,
+    repository: &'a str,
+    remote_url: &'a str,
+    destination: &'a Path,
+    destination_display: &'a Path,
+    git_dir_override: Option<&'a Path>,
+    core_worktree: Option<&'a str>,
+    origin: &'a str,
+    quiet: bool,
+    bare: bool,
+    checkout: bool,
+    sparse: bool,
+    template: Option<&'a Path>,
+    template_config: bool,
+    separate_git_dir: Option<&'a Path>,
+    config_overrides: &'a [GlobalConfigOverride],
+    submodule_active: &'a [String],
+    ref_storage: RefStorageFormat,
+    tag_opt: Option<&'a str>,
+    branch: Option<&'a str>,
+    submodules: &'a [CloneReferenceAlternate],
+    depth: Option<u32>,
+}
+
+fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Result<()> {
+    if options.depth.is_some() {
+        return Err(GitError::Unsupported(
+            "shallow clone through import/export remote helpers is not supported yet".into(),
+        ));
+    }
+    if !options.quiet {
+        if options.bare {
+            eprintln!(
+                "Cloning into bare repository '{}'...",
+                options.destination_display.display()
+            );
+        } else {
+            eprintln!(
+                "Cloning into '{}'...",
+                options.destination_display.display()
+            );
+        }
+    }
+    let initial_branch = options
+        .branch
+        .map(str::to_string)
+        .unwrap_or_else(clone_default_branch_name);
+    let layout = RepositoryBootstrap::init(InitOptions {
+        git_dir_override: options.git_dir_override.map(Path::to_path_buf),
+        core_worktree: options.core_worktree.map(str::to_string),
+        object_dir: None,
+        worktree: options.destination.to_path_buf(),
+        object_format: ObjectFormat::Sha1,
+        object_format_explicit: false,
+        bare: options.bare,
+        initial_branch: if options.bare {
+            initial_branch.clone()
+        } else {
+            CLONE_UNBORN_BRANCH.to_string()
+        },
+        template_dir: None,
+        copy_template_config: false,
+        separate_git_dir: None,
+        shared_repository: None,
+        ref_storage: options.ref_storage,
+        ref_storage_explicit: options.ref_storage != RefStorageFormat::Files,
+    })?;
+    let git_dir = layout.git_dir;
+    let helper_config = transport_policy_config_for_clone(options.context.cwd())?;
+    let helper_spec = clone_remote_helper_spec(
+        &helper_config,
+        options.repository,
+        options.origin,
+        options.config_overrides,
+    )
+    .ok_or_else(|| {
+        GitError::Unsupported(format!(
+            "remote helper disappeared while cloning {}",
+            options.repository
+        ))
+    })?;
+    let discovery =
+        super::helper::discover_remote_helper_for_clone(&helper_config, &git_dir, helper_spec)?;
+    let format = discovery.object_format();
+
+    // Discovery is protocol-only. Before changing the provisional repository's
+    // format, prove neither Sley nor the helper installed any object or
+    // object-bearing ref. HEAD is the format-neutral unborn symbolic ref made
+    // by init; helper-private marks/config live outside refs/objects and remain
+    // available because the live process keeps this same GIT_DIR.
+    let provisional_repository = sley::Repository::open(&git_dir)?;
+    let has_refs = !provisional_repository.references().list_refs()?.is_empty();
+    let objects_dir = git_dir.join("objects");
+    let has_loose_objects = fs::read_dir(&objects_dir)?
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name != "info" && name != "pack"
+        });
+    let has_packed_objects = fs::read_dir(objects_dir.join("pack"))?.next().is_some();
+    if has_refs || has_loose_objects || has_packed_objects {
+        return Err(GitError::InvalidFormat(
+            "remote helper mutated provisional repository before object-format discovery".into(),
+        ));
+    }
+    if format != ObjectFormat::Sha1 {
+        let mut config = read_repo_config_on_disk(&git_dir)?;
+        crate::set_config_value(&mut config, "core", None, "repositoryformatversion", "1");
+        crate::set_config_value(
+            &mut config,
+            "extensions",
+            None,
+            "objectformat",
+            format.name(),
+        );
+        write_repo_config(&git_dir, &config)?;
+    }
+    let identity_config = read_repo_config(&git_dir)?;
+    apply_clone_template(&git_dir, options.template, options.template_config)?;
+    let configured_fetch = if options.bare {
+        None
+    } else if let Some(branch) = options.branch {
+        Some(format!(
+            "+refs/heads/{branch}:refs/remotes/{}/{branch}",
+            options.origin
+        ))
+    } else {
+        Some(format!("+refs/heads/*:refs/remotes/{}/*", options.origin))
+    };
+    configure_clone_remote(
+        &git_dir,
+        options.origin,
+        options.remote_url,
+        configured_fetch,
+        false,
+        options.tag_opt,
+        None,
+    )?;
+    apply_clone_config_overrides(&git_dir, options.config_overrides)?;
+    apply_clone_submodule_active(&git_dir, options.submodule_active)?;
+
+    let mut refspecs = if options.bare {
+        vec!["+refs/heads/*:refs/heads/*".to_string()]
+    } else if let Some(branch) = options.branch {
+        vec![format!(
+            "+refs/heads/{branch}:refs/remotes/{}/{branch}",
+            options.origin
+        )]
+    } else {
+        vec![format!("+refs/heads/*:refs/remotes/{}/*", options.origin)]
+    };
+    if options.tag_opt != Some("--no-tags") {
+        refspecs.push("+refs/tags/*:refs/tags/*".to_string());
+    }
+    let fetch_options = FetchOptions {
+        quiet: true,
+        progress: None,
+        auto_follow_tags: options.tag_opt != Some("--no-tags"),
+        fetch_all_tags: false,
+        prune: false,
+        prune_tags: false,
+        dry_run: false,
+        force: false,
+        append: false,
+        write_fetch_head: false,
+        tag_option_explicit: options.tag_opt.is_some(),
+        prune_option_explicit: false,
+        prune_tags_option_explicit: false,
+        refmap: None,
+        depth: None,
+        merge_srcs: Vec::new(),
+        filter: None,
+        filter_auto: false,
+        refetch: false,
+        cloning: true,
+        record_promisor_refs: false,
+        update_shallow: false,
+        reject_shallow: false,
+        deepen_relative: false,
+        update_head_ok: false,
+        deepen_since: None,
+        deepen_not: Vec::new(),
+        ssh_options: None,
+        upload_pack_command: None,
+        atomic: false,
+        negotiation_restrict: None,
+        negotiation_include: None,
+    };
+    let outcome = super::helper::fetch_with_discovered_remote_helper(
+        options.context,
+        discovery,
+        &git_dir,
+        format,
+        options.origin,
+        &refspecs,
+        fetch_options,
+    )?;
+    let head_branch = options.branch.map(str::to_string).or_else(|| {
+        outcome
+            .head_symref
+            .as_deref()
+            .and_then(|target| target.strip_prefix("refs/heads/"))
+            .map(str::to_string)
+    });
+    let store = FileRefStore::new(&git_dir, format);
+    let mut empty = true;
+    if let Some(branch) = head_branch {
+        let source_ref = if options.bare {
+            format!("refs/heads/{branch}")
+        } else {
+            format!("refs/remotes/{}/{branch}", options.origin)
+        };
+        if let Some(RefTarget::Direct(oid)) = store.read_ref(&source_ref)? {
+            empty = false;
+            if !options.bare {
+                let branch_ref = format!("refs/heads/{branch}");
+                if store.read_ref(&branch_ref)?.is_none() {
+                    store.create_branch(
+                        &branch,
+                        oid,
+                        committer_identity_for_reflog(&identity_config)?,
+                        format!("branch: Created from {}/{branch}", options.origin).into_bytes(),
+                    )?;
+                }
+                configure_clone_branch(&git_dir, &branch, options.origin)?;
+                let mut transaction = store.transaction();
+                transaction.update(RefUpdate {
+                    name: format!("refs/remotes/{}/HEAD", options.origin),
+                    expected: None,
+                    new: RefTarget::Symbolic(source_ref),
+                    reflog: None,
+                });
+                transaction.commit()?;
+                if options.checkout {
+                    let config = read_repo_config(&git_dir)?;
+                    sley_worktree::checkout_branch_filtered(
+                        options.destination,
+                        &git_dir,
+                        format,
+                        &branch,
+                        committer_identity_for_reflog(&identity_config)?,
+                        &config,
+                    )?;
+                    run_clone_post_checkout_hook(&git_dir, &oid)?;
+                }
+            }
+        }
+    }
+    if empty {
+        warn_cloned_empty_repository();
+    } else if !options.checkout && !options.bare {
+        remove_clone_worktree_files(options.destination, &git_dir, format)?;
+    } else if options.sparse && !options.bare {
+        apply_clone_sparse_checkout(options.destination, &git_dir, format)?;
+    }
+    if let Some(separate_git_dir) = options.separate_git_dir {
+        apply_clone_separate_git_dir(options.destination, &git_dir, separate_git_dir)?;
+    }
+    if !options.quiet && !empty {
+        eprintln!("done.");
+    }
+    recurse_clone_submodules(
+        options.cli_session,
+        options.destination,
+        options.submodule_active,
+        options.bare,
+        options.checkout,
+        options.depth,
+        None,
+        options.quiet,
+        options.submodules,
+    )
+}
+
 fn clone_bundle_path(cwd: &Path, repository: &str) -> Option<PathBuf> {
     let parsed = parse_remote_url(repository).ok()?;
     if parsed.transport != RemoteTransport::Local {
@@ -1275,7 +1673,7 @@ fn clone_bundle_path(cwd: &Path, repository: &str) -> Option<PathBuf> {
     for candidate in [suffixed, base] {
         if candidate.is_file()
             && let Ok(bytes) = fs::read(&candidate)
-            && Bundle::parse(&bytes, ObjectFormat::Sha1).is_ok()
+            && Bundle::parse_standalone(&bytes).is_ok()
         {
             return Some(candidate);
         }
@@ -1296,8 +1694,8 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
         ));
     }
     let bundle_bytes = fs::read(options.bundle_path)?;
-    let format = ObjectFormat::Sha1;
-    let bundle = Bundle::parse(&bundle_bytes, format)?;
+    let bundle = Bundle::parse_standalone(&bundle_bytes)?;
+    let format = bundle.format;
     let bundle_url = options.bundle_path.to_string_lossy().into_owned();
     if !options.quiet {
         eprintln!(
@@ -1316,6 +1714,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
     let layout = RepositoryBootstrap::init(InitOptions {
         git_dir_override: options.git_dir_override.map(Path::to_path_buf),
         core_worktree: options.core_worktree.map(str::to_string),
+        object_dir: None,
         worktree: options.destination.to_path_buf(),
         object_format: format,
         object_format_explicit: false,
@@ -1331,6 +1730,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
         ref_storage_explicit: options.ref_storage != RefStorageFormat::Files,
     })?;
     let git_dir = layout.git_dir;
+    let identity_config = read_repo_config(&git_dir)?;
     apply_clone_template(&git_dir, options.template, options.template_config)?;
     configure_clone_remote(
         &git_dir,
@@ -1354,6 +1754,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
         &bundle,
         FetchOptions {
             quiet: true,
+            progress: None,
             auto_follow_tags: true,
             fetch_all_tags: false,
             prune: false,
@@ -1369,6 +1770,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
             depth: None,
             merge_srcs: Vec::new(),
             filter: None,
+            filter_auto: false,
             refetch: false,
             cloning: true,
             record_promisor_refs: false,
@@ -1379,6 +1781,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
             deepen_since: None,
             deepen_not: Vec::new(),
             ssh_options: None,
+            upload_pack_command: None,
             atomic: false,
             negotiation_restrict: None,
             negotiation_include: None,
@@ -1391,7 +1794,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
             store.create_branch(
                 &branch,
                 oid,
-                committer_identity_for_reflog()?,
+                committer_identity_for_reflog(&identity_config)?,
                 format!("branch: Created from {}/{branch}", options.origin).into_bytes(),
             )?;
             configure_clone_branch(&git_dir, &branch, options.origin)?;
@@ -1402,7 +1805,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
                     &git_dir,
                     format,
                     &branch,
-                    committer_identity_for_reflog()?,
+                    committer_identity_for_reflog(&identity_config)?,
                     &config,
                 )?;
                 run_clone_post_checkout_hook(&git_dir, &oid)?;
@@ -1435,6 +1838,7 @@ fn bundle_clone_head_branch(bundle: &Bundle) -> Option<String> {
 }
 
 struct CloneHttpOptions<'a> {
+    context: &'a RemoteCommandContext,
     repository: &'a str,
     remote_url: &'a str,
     destination: &'a Path,
@@ -1462,9 +1866,12 @@ struct CloneHttpOptions<'a> {
     reference_alternates: &'a [CloneReferenceAlternate],
     bundle_uri: Option<&'a CloneBundleUri>,
     depth: Option<u32>,
+    deepen_since: Option<i64>,
+    deepen_not: &'a [String],
     ref_storage: RefStorageFormat,
-    progress: Option<bool>,
+    progress: bool,
     ssh_options: sley_remote::SshTransportOptions,
+    upload_pack_command: Option<&'a str>,
     reject_shallow: bool,
 }
 
@@ -1587,6 +1994,7 @@ struct NetworkCloneDiscovery {
     advertisements: Vec<sley_protocol::RefAdvertisement>,
     features: sley_protocol::UploadPackFeatures,
     v2_handshake: Option<sley_protocol::TransportHandshake>,
+    object_format: ObjectFormat,
 }
 
 fn clone_network_repository(
@@ -1612,8 +2020,11 @@ fn clone_network_repository(
         )));
     }
 
-    let remote = parse_remote_url(&ls_remote_resolved_url(options.repository)?)?;
-    let transport_config = transport_policy_config_for_clone()?;
+    let remote = parse_remote_url(&ls_remote_resolved_url(
+        options.context,
+        options.repository,
+    )?)?;
+    let transport_config = transport_policy_config_for_clone(options.context.cwd())?;
     if matches!(transport, CloneNetworkTransport::Ssh) {
         trace_configured_local_protocol_version(Some(&transport_config));
     }
@@ -1621,41 +2032,35 @@ fn clone_network_repository(
         CloneNetworkTransport::Http => {
             let client = sley_remote::new_http_client();
             let mut credentials = sley_remote::NoCredentials;
-            let discovered = sley_remote::http_service_advertisements(
+            let discovered = sley_remote::http_discover_upload_pack(
                 &client,
                 &remote,
-                ObjectFormat::Sha1,
-                sley_protocol::GitService::UploadPack,
                 &mut credentials,
                 Some(&transport_config),
             )?;
-            let features = sley_remote::http_upload_pack_features(
-                &discovered.set.refs,
-                discovered.handshake.as_ref(),
-            )?;
             NetworkCloneDiscovery {
-                advertisements: discovered.set.refs,
-                features,
-                v2_handshake: discovered.handshake,
+                advertisements: discovered.advertisements.set.refs,
+                features: discovered.features,
+                v2_handshake: discovered.advertisements.handshake,
+                object_format: discovered.object_format,
             }
         }
         CloneNetworkTransport::Ssh => {
-            let (advertisements, features) =
-                sley_remote::ssh_upload_pack_advertisements_with_options(
-                    &remote,
-                    ObjectFormat::Sha1,
-                    options.ssh_options,
-                )?;
+            let discovered = sley_remote::discover_ssh_upload_pack_advertisements_with_command(
+                &remote,
+                options.ssh_options,
+                options.upload_pack_command,
+            )?;
             NetworkCloneDiscovery {
-                advertisements,
-                features,
+                advertisements: discovered.refs,
+                features: discovered.features,
                 v2_handshake: None,
+                object_format: discovered.object_format,
             }
         }
         CloneNetworkTransport::Git => {
-            let discovered = sley_remote::git_upload_pack_advertisements_with_protocol(
+            let discovered = sley_remote::discover_git_upload_pack_advertisements(
                 &remote,
-                ObjectFormat::Sha1,
                 configured_protocol_version(Some(&transport_config)) == Some(ProtocolVersion::V2),
                 Some(&transport_config),
             )?;
@@ -1663,24 +2068,23 @@ fn clone_network_repository(
                 advertisements: discovered.refs,
                 features: discovered.features,
                 v2_handshake: None,
+                object_format: discovered.object_format,
             }
         }
     };
     let advertisements = discovery.advertisements;
     let features = discovery.features;
     let v2_handshake = discovery.v2_handshake;
-    let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
-    if format != ObjectFormat::Sha1 && matches!(transport, CloneNetworkTransport::Http) {
-        return Err(GitError::Unsupported(format!(
-            "cloning {} repositories over HTTP is not supported yet",
-            format.name()
-        )));
-    }
+    let format = discovery.object_format;
     let mut fetch_filter = None::<sley_odb::PackObjectFilter>;
+    let mut fetch_filter_auto = false;
     let mut configured_partial_clone_filter = None::<&str>;
     if let Some(filter) = options.partial_clone_filter {
         if features.filter {
-            if let Some(parsed) = sley_remote::pack_filter_from_spec(filter) {
+            if filter.eq_ignore_ascii_case("auto") {
+                fetch_filter_auto = true;
+                configured_partial_clone_filter = Some(filter);
+            } else if let Some(parsed) = sley_remote::pack_filter_from_spec(filter) {
                 fetch_filter = Some(parsed);
                 configured_partial_clone_filter = Some(filter);
             }
@@ -1745,22 +2149,27 @@ fn clone_network_repository(
         checkout_branch: &checkout_branch,
         remote_head_branch: &remote_head_branch,
         single_branch,
+        progress: options.progress && !options.quiet,
         depth: options.depth,
-        deepen_since: None,
-        deepen_not: Vec::new(),
-        committer: committer_identity_for_reflog()?,
+        deepen_since: options.deepen_since,
+        deepen_not: options.deepen_not.to_vec(),
+        committer: committer_identity_for_reflog(&transport_config)?,
         detached_head: None,
         checkout: options.checkout,
         filter: fetch_filter,
+        filter_auto: fetch_filter_auto,
         branch_explicit,
         ref_storage: options.ref_storage,
         ssh_options: matches!(transport, CloneNetworkTransport::Ssh).then_some(options.ssh_options),
+        upload_pack_command: matches!(transport, CloneNetworkTransport::Ssh)
+            .then_some(options.upload_pack_command)
+            .flatten(),
         reject_shallow: options.reject_shallow,
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress::new(options.quiet);
-    let http_client = matches!(transport, CloneNetworkTransport::Http)
-        .then(sley_remote::new_http_client);
+    let http_client =
+        matches!(transport, CloneNetworkTransport::Http).then(sley_remote::new_http_client);
     let prefetch_handshake = v2_handshake.clone();
     // Junk-directory cleanup: upstream builtin/clone.c registers `remove_junk`
     // (atexit + signal) that removes the working tree / gitdir it created when the
@@ -1772,101 +2181,101 @@ fn clone_network_repository(
     let dest_pre_existed = options.destination.exists();
     let git_dir_override_pre_existed = options.git_dir_override.map(Path::exists);
     let clone_result = (|| -> Result<()> {
-    let outcome = sley_remote::clone(
-        sley_remote::CloneRequest {
-            destination: options.destination,
-            git_dir_override: options.git_dir_override,
-            core_worktree: options.core_worktree,
-            format,
-            source: &remote_source,
-            options: &clone_options,
-        },
-        sley_remote::CloneServices {
-            configure: &mut |git_dir| {
-                apply_clone_template(git_dir, template, template_config)?;
-                let fetch_refspec = if single_branch {
-                    Some(format!(
-                        "+refs/heads/{checkout_branch}:refs/remotes/{origin}/{checkout_branch}"
-                    ))
-                } else {
-                    Some(format!("+refs/heads/*:refs/remotes/{origin}/*"))
-                };
-                configure_clone_remote(
-                    git_dir,
-                    origin,
-                    remote_url,
-                    fetch_refspec,
-                    false,
-                    tag_opt,
-                    configured_partial_clone_filter,
-                )?;
-                apply_clone_config_overrides(git_dir, config_overrides)?;
-                apply_clone_submodule_active(git_dir, submodule_active)?;
-                let config = repo_config_with_clone_transport_policy(git_dir)?;
-                if options.bundle_uri.is_none()
-                    && matches!(transport, CloneNetworkTransport::Http)
-                    && let (Some(client), Some(remote), Some(handshake)) =
-                        (&http_client, &http_remote, &prefetch_handshake)
-                    && sley_remote::transfer_bundle_uri_enabled(&config)
-                    && sley_remote::handshake_advertises_bundle_uri(handshake)
-                {
-                    // Bundle-URI auto-discovery is best-effort: upstream
-                    // builtin/clone.c ignores the return value of
-                    // `fetch_bundle_uri()` and at most warns, continuing the clone
-                    // with the normal negotiation. Any discovery/prefetch failure
-                    // here must therefore never abort the clone.
-                    let mut bundle_credentials = sley_remote::NoCredentials;
-                    let prefetch = sley_remote::http_remote_bundle_uri_list(
-                        client,
-                        remote,
-                        handshake,
-                        &mut bundle_credentials,
-                        Some(&config),
-                    )
-                    .and_then(|list| {
-                        sley_remote::prefetch_advertised_bundle_uris(git_dir, format, &list)
-                    });
-                    if let Err(err) = prefetch {
-                        eprintln!("warning: failed to fetch bundle URIs: {err}");
+        let outcome = sley_remote::clone(
+            sley_remote::CloneRequest {
+                destination: options.destination,
+                git_dir_override: options.git_dir_override,
+                core_worktree: options.core_worktree,
+                format,
+                source: &remote_source,
+                options: &clone_options,
+            },
+            sley_remote::CloneServices {
+                configure: &mut |git_dir| {
+                    apply_clone_template(git_dir, template, template_config)?;
+                    let fetch_refspec = if single_branch {
+                        Some(format!(
+                            "+refs/heads/{checkout_branch}:refs/remotes/{origin}/{checkout_branch}"
+                        ))
+                    } else {
+                        Some(format!("+refs/heads/*:refs/remotes/{origin}/*"))
+                    };
+                    configure_clone_remote(
+                        git_dir,
+                        origin,
+                        remote_url,
+                        fetch_refspec,
+                        false,
+                        tag_opt,
+                        configured_partial_clone_filter,
+                    )?;
+                    apply_clone_config_overrides(git_dir, config_overrides)?;
+                    apply_clone_submodule_active(git_dir, submodule_active)?;
+                    let config =
+                        repo_config_with_clone_transport_policy(git_dir, options.context.cwd())?;
+                    if options.bundle_uri.is_none()
+                        && matches!(transport, CloneNetworkTransport::Http)
+                        && let (Some(client), Some(remote), Some(handshake)) =
+                            (&http_client, &http_remote, &prefetch_handshake)
+                        && sley_remote::transfer_bundle_uri_enabled(&config)
+                        && sley_remote::handshake_advertises_bundle_uri(handshake)
+                    {
+                        // Bundle-URI auto-discovery is best-effort: upstream
+                        // builtin/clone.c ignores the return value of
+                        // `fetch_bundle_uri()` and at most warns, continuing the clone
+                        // with the normal negotiation. Any discovery/prefetch failure
+                        // here must therefore never abort the clone.
+                        let mut bundle_credentials = sley_remote::NoCredentials;
+                        let prefetch = sley_remote::http_remote_bundle_uri_list(
+                            client,
+                            remote,
+                            handshake,
+                            &mut bundle_credentials,
+                            Some(&config),
+                        )
+                        .and_then(|list| {
+                            sley_remote::prefetch_advertised_bundle_uris(git_dir, format, &list)
+                        });
+                        if let Err(err) = prefetch {
+                            eprintln!("warning: failed to fetch bundle URIs: {err}");
+                        }
                     }
-                }
-                Ok(config)
+                    Ok(config)
+                },
+                configure_branch: &mut |git_dir, branch| {
+                    configure_clone_branch(git_dir, branch, origin)?;
+                    read_repo_config(git_dir)
+                },
+                credentials: &mut credentials,
+                progress: &mut progress,
             },
-            configure_branch: &mut |git_dir, branch| {
-                configure_clone_branch(git_dir, branch, origin)?;
-                read_repo_config(git_dir)
-            },
-            credentials: &mut credentials,
-            progress: &mut progress,
-        },
-    );
-    let outcome = map_clone_missing_branch(outcome, branch_explicit, &checkout_branch, origin)?;
-    let empty = outcome.empty;
-    let git_dir = outcome.git_dir;
+        );
+        let outcome = map_clone_missing_branch(outcome, branch_explicit, &checkout_branch, origin)?;
+        let empty = outcome.empty;
+        let git_dir = outcome.git_dir;
 
-    if empty {
-        warn_cloned_empty_repository();
-    } else if !options.checkout {
-        remove_clone_worktree_files(options.destination, &git_dir, format)?;
-    } else if options.sparse {
-        apply_clone_sparse_checkout(options.destination, &git_dir, format)?;
-    }
-    if options.checkout
-        && !empty
-        && let Some(new_head) = outcome.branch_oid.as_ref()
-    {
-        run_clone_post_checkout_hook(&git_dir, new_head)?;
-    }
-    if let Some(separate_git_dir) = options.separate_git_dir {
-        apply_clone_separate_git_dir(options.destination, &git_dir, separate_git_dir)?;
-    }
-    emit_explicit_clone_progress(options.progress, options.quiet, empty);
-    // An empty-repository clone stops before the checkout that would print
-    // "done."; git emits only the warning in that case.
-    if !options.quiet && !empty {
-        eprintln!("done.");
-    }
-    Ok(())
+        if empty {
+            warn_cloned_empty_repository();
+        } else if !options.checkout {
+            remove_clone_worktree_files(options.destination, &git_dir, format)?;
+        } else if options.sparse {
+            apply_clone_sparse_checkout(options.destination, &git_dir, format)?;
+        }
+        if options.checkout
+            && !empty
+            && let Some(new_head) = outcome.branch_oid.as_ref()
+        {
+            run_clone_post_checkout_hook(&git_dir, new_head)?;
+        }
+        if let Some(separate_git_dir) = options.separate_git_dir {
+            apply_clone_separate_git_dir(options.destination, &git_dir, separate_git_dir)?;
+        }
+        // An empty-repository clone stops before the checkout that would print
+        // "done."; git emits only the warning in that case.
+        if !options.quiet && !empty {
+            eprintln!("done.");
+        }
+        Ok(())
     })();
     if clone_result.is_err() {
         remove_clone_junk_directory(options.destination, dest_pre_existed);
@@ -1902,12 +2311,6 @@ fn remove_clone_junk_directory(path: &Path, pre_existed: bool) {
     }
 }
 
-fn emit_explicit_clone_progress(progress: Option<bool>, quiet: bool, empty: bool) {
-    if progress == Some(true) && !quiet && !empty {
-        eprintln!("Receiving objects: 100% (0/0), done.");
-    }
-}
-
 fn clone_bare_network_repository(
     options: &CloneHttpOptions<'_>,
     transport: CloneNetworkTransport,
@@ -1918,6 +2321,7 @@ fn clone_bare_network_repository(
     let layout = RepositoryBootstrap::init(InitOptions {
         git_dir_override: None,
         core_worktree: None,
+        object_dir: None,
         worktree: options.destination.to_path_buf(),
         object_format: format,
         object_format_explicit: false,
@@ -1947,7 +2351,7 @@ fn clone_bare_network_repository(
         apply_clone_bundle_uri(&git_dir, format, bundle_uri)?;
     }
 
-    let config = repo_config_with_clone_transport_policy(&git_dir)?;
+    let config = repo_config_with_clone_transport_policy(&git_dir, options.context.cwd())?;
     let source = match transport {
         CloneNetworkTransport::Http => sley_remote::FetchSource::Http(remote),
         CloneNetworkTransport::Ssh => sley_remote::FetchSource::Ssh(remote),
@@ -1967,6 +2371,7 @@ fn clone_bare_network_repository(
         refspecs.push("+refs/tags/*:refs/tags/*".to_string());
     }
     run_fetch(
+        options.context.cwd(),
         &git_dir,
         format,
         &config,
@@ -1975,6 +2380,7 @@ fn clone_bare_network_repository(
         &refspecs,
         FetchOptions {
             quiet: true,
+            progress: None,
             auto_follow_tags: options.tag_opt != Some("--no-tags") || options.branch.is_some(),
             fetch_all_tags: options.tag_opt == Some("--tags"),
             prune: false,
@@ -1990,16 +2396,18 @@ fn clone_bare_network_repository(
             depth: options.depth,
             merge_srcs: Vec::new(),
             filter: None,
+            filter_auto: false,
             cloning: true,
             update_shallow: false,
             reject_shallow: options.reject_shallow,
             deepen_relative: false,
             update_head_ok: true,
-            deepen_since: None,
-            deepen_not: Vec::new(),
+            deepen_since: options.deepen_since,
+            deepen_not: options.deepen_not.to_vec(),
             record_promisor_refs: false,
             refetch: false,
             ssh_options: None,
+            upload_pack_command: options.upload_pack_command.map(str::to_string),
             atomic: false,
             negotiation_restrict: None,
             negotiation_include: None,
@@ -2157,6 +2565,9 @@ fn validate_clone_filter(value: &str) -> Result<()> {
 }
 
 pub(super) fn normalize_clone_filter(value: &str) -> Result<String> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok("auto".to_string());
+    }
     if value == "blob:none" {
         return Ok(value.to_string());
     }
@@ -2298,6 +2709,8 @@ impl CloneBundleUri {
 }
 
 struct CloneLocalOptions<'a> {
+    cli_session: &'a crate::session::CliSession,
+    context: &'a RemoteCommandContext,
     format: ObjectFormat,
     ref_storage: RefStorageFormat,
     origin: &'a str,
@@ -2355,6 +2768,7 @@ fn clone_bare_or_mirror_local_repository(
     let layout = RepositoryBootstrap::init(InitOptions {
         git_dir_override: None,
         core_worktree: None,
+        object_dir: None,
         worktree: destination.to_path_buf(),
         object_format: options.format,
         object_format_explicit: false,
@@ -2371,7 +2785,13 @@ fn clone_bare_or_mirror_local_repository(
     apply_clone_template(&git_dir, options.template, options.template_config)?;
     apply_clone_alternates(&git_dir, options.alternates, options.dissociate)?;
     if options.copy_source_alternates {
-        let source_git_dir = common_git_dir_for_git_dir(&ls_remote_git_dir(options.repository)?)?;
+        let source_git_dir =
+            options
+                .cli_session
+                .common_git_dir(&sley_remote::resolve_local_remote_git_dir(
+                    options.context.resolution(),
+                    options.repository,
+                )?)?;
         apply_clone_source_alternates(&git_dir, &source_git_dir)?;
     }
     let remote_refspec = options.mirror.then(|| "+refs/*:refs/*".to_string());
@@ -2394,7 +2814,12 @@ fn clone_bare_or_mirror_local_repository(
 
     if let Some(revision_oid) = options.revision_oid {
         copy_local_revision_objects(
-            &common_git_dir_for_git_dir(&ls_remote_git_dir(options.repository)?)?,
+            &options
+                .cli_session
+                .common_git_dir(&sley_remote::resolve_local_remote_git_dir(
+                    options.context.resolution(),
+                    options.repository,
+                )?)?,
             &git_dir,
             options.format,
             revision_oid,
@@ -2409,6 +2834,7 @@ fn clone_bare_or_mirror_local_repository(
         return Ok(());
     }
 
+    let fetch_context = RemoteCommandContext::for_repository_paths(destination, &git_dir)?;
     let previous_cwd = env::current_dir()?;
     env::set_current_dir(destination)?;
     let mut refspecs = if options.mirror && options.single_branch {
@@ -2434,12 +2860,14 @@ fn clone_bare_or_mirror_local_repository(
         refspecs.push("+refs/tags/*:refs/tags/*".to_string());
     }
     let fetch_result = fetch_local_repository(
+        &fetch_context,
         &git_dir,
         options.format,
         options.origin,
         &refspecs,
         FetchOptions {
             quiet: true,
+            progress: None,
             auto_follow_tags: !options.mirror
                 && (options.tag_opt != Some("--no-tags") || options.branch_explicit),
             fetch_all_tags: options.tag_opt == Some("--tags"),
@@ -2456,6 +2884,7 @@ fn clone_bare_or_mirror_local_repository(
             depth: options.depth,
             merge_srcs: Vec::new(),
             filter: options.fetch_filter,
+            filter_auto: false,
             refetch: false,
             cloning: true,
             record_promisor_refs: true,
@@ -2466,6 +2895,7 @@ fn clone_bare_or_mirror_local_repository(
             deepen_since: None,
             deepen_not: Vec::new(),
             ssh_options: None,
+            upload_pack_command: None,
             atomic: false,
             negotiation_restrict: None,
             negotiation_include: None,
@@ -2474,7 +2904,13 @@ fn clone_bare_or_mirror_local_repository(
     env::set_current_dir(previous_cwd)?;
     fetch_result?;
     if options.copy_source_alternates {
-        let source_git_dir = common_git_dir_for_git_dir(&ls_remote_git_dir(options.repository)?)?;
+        let source_git_dir =
+            options
+                .cli_session
+                .common_git_dir(&sley_remote::resolve_local_remote_git_dir(
+                    options.context.resolution(),
+                    options.repository,
+                )?)?;
         install_local_clone_objects(&source_git_dir, &git_dir, options.local_object_install)?;
     }
     if options.dissociate {
@@ -2639,6 +3075,8 @@ fn copy_clone_template_entries(source: &Path, destination: &Path) -> Result<()> 
 }
 
 fn clone_alternates(
+    cli_session: &crate::session::CliSession,
+    resolution: sley_remote::RemoteResolutionContext<'_>,
     remote_git_dir: &Path,
     shared: bool,
     references: &[CloneReferenceAlternate],
@@ -2648,8 +3086,8 @@ fn clone_alternates(
         push_unique_alternate(&mut alternates, remote_git_dir.join("objects"));
     }
     for reference in references {
-        match ls_remote_git_dir(&reference.path)
-            .and_then(|git_dir| common_git_dir_for_git_dir(&git_dir))
+        match sley_remote::resolve_local_remote_git_dir(resolution, &reference.path)
+            .and_then(|git_dir| cli_session.common_git_dir(&git_dir))
         {
             Ok(reference_git_dir) => {
                 push_unique_alternate(&mut alternates, reference_git_dir.join("objects"));
@@ -3053,11 +3491,13 @@ fn apply_clone_default_submodule_path_config(git_dir: &Path) -> Result<()> {
 /// half-cloned. `active` carries the `--recurse-submodules[=<pathspec>]` values
 /// (`.` = all); a `bare`/no-checkout clone has no worktree to populate.
 fn recurse_clone_submodules(
+    cli_session: &crate::session::CliSession,
     destination: &Path,
     active: &[String],
     bare: bool,
     checkout: bool,
     depth: Option<u32>,
+    filter: Option<&str>,
     quiet: bool,
     references: &[CloneReferenceAlternate],
 ) -> Result<()> {
@@ -3074,7 +3514,9 @@ fn recurse_clone_submodules(
         } else {
             "die"
         };
-        let git_dir = crate::session::cli_git_dir_from(destination)?;
+        let child_session = cli_session.local_repo_env_hidden_child();
+        let git_dir = sley_remote::discover_local_git_dir(destination)?;
+        let git_dir = child_session.common_git_dir(&git_dir)?;
         let mut config = read_repo_config(&git_dir)?;
         set_config_value(
             &mut config,
@@ -3142,11 +3584,15 @@ fn recurse_clone_submodules(
     if let Some(depth) = depth {
         command.arg(format!("--depth={depth}"));
     }
+    if let Some(filter) = filter {
+        command.arg(format!("--filter={filter}"));
+    }
     // Restrict to the matched pathspecs (the all-case `.` forwards none).
     for value in pathspecs {
         command.arg(value);
     }
     let status = command
+        .env_remove("GIT_COMMON_DIR")
         .current_dir(destination)
         .status()
         .map_err(|err| GitError::Io(err.to_string()))?;
@@ -3609,7 +4055,10 @@ fn clone_branch_pointing_at(
 }
 
 /// The remote `HEAD` commit when it is detached (no default branch).
-pub(super) fn remote_head_detached(remote_git_dir: &Path, format: ObjectFormat) -> Option<ObjectId> {
+pub(super) fn remote_head_detached(
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+) -> Option<ObjectId> {
     let remote_store = FileRefStore::new_without_reference_backend_env(remote_git_dir, format);
     match remote_store.read_ref("HEAD").ok()? {
         Some(RefTarget::Direct(oid)) => Some(oid),
@@ -3676,12 +4125,12 @@ fn trace2_config_params_include(config: &GitConfig, key: &str) -> bool {
         .any(|pattern| trace2_config_param_matches(&pattern, key))
 }
 
-fn trace2_clone_remote_url(name: &str, url: &str) {
+fn trace2_clone_remote_url(git_dir: &Path, name: &str, url: &str) {
     if env::var_os("GIT_TRACE2").is_none() && env::var_os("GIT_TRACE2_PERF").is_none() {
         return;
     }
     let key = format!("remote.{name}.url");
-    let Ok(config) = transport_policy_config_for_cwd() else {
+    let Ok(config) = read_repo_config(git_dir) else {
         return;
     };
     if trace2_config_params_include(&config, &key) {
@@ -3726,7 +4175,7 @@ fn configure_clone_remote(
         entries,
     ));
     write_repo_config(git_dir, &config)?;
-    trace2_clone_remote_url(name, url);
+    trace2_clone_remote_url(git_dir, name, url);
     Ok(())
 }
 
@@ -3766,7 +4215,11 @@ fn first_unknown_repository_extension(config: &GitConfig) -> Option<String> {
 /// `remote.<name>.partialclonefilter` (the default for later fetches from it).
 /// A no-op when `name` is not a configured remote (e.g. a bare-URL fetch) or is
 /// already a promisor remote with a recorded filter.
-pub(super) fn register_promisor_remote(git_dir: &Path, name: &str, filter_spec: &str) -> Result<()> {
+pub(super) fn register_promisor_remote(
+    git_dir: &Path,
+    name: &str,
+    filter_spec: &str,
+) -> Result<()> {
     let mut config = read_repo_config_on_disk(git_dir)?;
     if config.get("remote", Some(name), "url").is_none() {
         return Ok(());

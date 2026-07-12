@@ -9,6 +9,7 @@ license.workspace = true
 
 [dependencies]
 encoding_rs = "0.8"
+same-file = "1.0.6"
 sley-config.workspace = true
 sley-core.workspace = true
 sley-diff-merge.workspace = true
@@ -20,6 +21,11 @@ sley-odb.workspace = true
 sley-pathspec.workspace = true
 sley-refs.workspace = true
 sley-rev.workspace = true
+sley-submodule.workspace = true
+sley-unpack-trees.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -7,7 +7,7 @@ use super::{
 };
 use crate::commands::cli_options::{opt_bool, opt_str};
 use crate::*;
-use sley_options::{parse_options, OptFlags, OptValue, OptionSpec, Parsed, ParsedValue};
+use sley_options::{OptFlags, OptValue, OptionSpec, Parsed, ParsedValue, parse_options};
 use sley_submodule::UpdateType;
 
 fn submodule_parse_args<'a>(
@@ -21,21 +21,26 @@ fn submodule_parse_args<'a>(
     }
 }
 
-const SUBMODULE_STATUS_USAGE: &[&str] = &["git submodule status [--cached] [--recursive] [--] [<path>...]"];
-const SUBMODULE_ADD_USAGE: &[&str] =
-    &["git submodule add [-b <branch>] [-f|--force] [--name <name>] [--reference <repository>] [--] <repository> [<path>]"];
+const SUBMODULE_STATUS_USAGE: &[&str] =
+    &["git submodule status [--cached] [--recursive] [--] [<path>...]"];
+const SUBMODULE_ADD_USAGE: &[&str] = &[
+    "git submodule add [-b <branch>] [-f|--force] [--name <name>] [--reference <repository>] [--] <repository> [<path>]",
+];
 const SUBMODULE_UPDATE_USAGE: &[&str] =
     &["git submodule update [--init] [--remote] [--] [<path>...]"];
 const SUBMODULE_INIT_USAGE: &[&str] = &["git submodule init [--] [<path>...]"];
-const SUBMODULE_DEINIT_USAGE: &[&str] = &["git submodule deinit [-f|--force] (--all| [--] <path>...)"];
+const SUBMODULE_DEINIT_USAGE: &[&str] =
+    &["git submodule deinit [-f|--force] (--all| [--] <path>...)"];
 const SUBMODULE_SYNC_USAGE: &[&str] = &["git submodule sync [--recursive] [--] [<path>...]"];
 const SUBMODULE_ABSORBGITDIRS_USAGE: &[&str] = &["git submodule absorbgitdirs [--] [<path>...]"];
 const SUBMODULE_FOREACH_USAGE: &[&str] = &["git submodule foreach [--recursive] <command>"];
 const SUBMODULE_SUMMARY_USAGE: &[&str] =
     &["git submodule summary [--cached|--files] [--summary-limit <n>] [commit] [--] [<path>...]"];
 const SUBMODULE_SET_URL_USAGE: &[&str] = &["git submodule set-url [--] <path> <newurl>"];
-const SUBMODULE_SET_BRANCH_USAGE: &[&str] =
-    &["git submodule set-branch (-d|--default) <path>", "git submodule set-branch (-b|--branch) <branch> <path>"];
+const SUBMODULE_SET_BRANCH_USAGE: &[&str] = &[
+    "git submodule set-branch (-d|--default) <path>",
+    "git submodule set-branch (-b|--branch) <branch> <path>",
+];
 
 const SUBMODULE_QUIET_SPEC: OptionSpec<'static> = OptionSpec {
     short: Some('q'),
@@ -58,7 +63,12 @@ pub(super) fn setup_submodule_status_options(
     static SPECS: &[OptionSpec<'static>] = &[
         opt_bool(None, Some("cached"), OptFlags::NONE, "show cached values"),
         opt_bool(Some('q'), Some("quiet"), OptFlags::NONE, "suppress output"),
-        opt_bool(None, Some("recursive"), OptFlags::NONEG, "traverse submodules recursively"),
+        opt_bool(
+            None,
+            Some("recursive"),
+            OptFlags::NONEG,
+            "traverse submodules recursively",
+        ),
     ];
     let parsed = submodule_parse_args(args, SPECS, SUBMODULE_STATUS_USAGE)?;
     Ok(SubmoduleStatusOptions {
@@ -75,11 +85,22 @@ pub(super) fn setup_submodule_add_options(
 ) -> Result<SubmoduleAddOptions> {
     static SPECS: &[OptionSpec<'static>] = &[
         opt_bool(Some('q'), Some("quiet"), OptFlags::NONE, "suppress output"),
-        opt_bool(Some('f'), Some("force"), OptFlags::NONE, "allow adding otherwise ignored paths"),
+        opt_bool(
+            Some('f'),
+            Some("force"),
+            OptFlags::NONE,
+            "allow adding otherwise ignored paths",
+        ),
         opt_bool(None, Some("progress"), OptFlags::NONE, "show progress"),
         opt_str(None, Some("depth"), "n", OptFlags::NONE, "clone depth"),
         opt_str(None, Some("name"), "name", OptFlags::NONE, "submodule name"),
-        opt_str(None, Some("reference"), "repo", OptFlags::NONE, "reference repository"),
+        opt_str(
+            None,
+            Some("reference"),
+            "repo",
+            OptFlags::NONE,
+            "reference repository",
+        ),
         opt_str(
             None,
             Some("reference-if-able"),
@@ -87,7 +108,12 @@ pub(super) fn setup_submodule_add_options(
             OptFlags::NONE,
             "reference repository if able",
         ),
-        opt_bool(None, Some("dissociate"), OptFlags::NONE, "dissociate from reference"),
+        opt_bool(
+            None,
+            Some("dissociate"),
+            OptFlags::NONE,
+            "dissociate from reference",
+        ),
         OptionSpec {
             short: Some('b'),
             long: Some("branch"),
@@ -158,17 +184,37 @@ pub(super) fn setup_submodule_update_options(
     static SPECS: &[OptionSpec<'static>] = &[
         opt_bool(Some('q'), Some("quiet"), OptFlags::NONE, "suppress output"),
         opt_bool(None, Some("init"), OptFlags::NONE, "initialize submodules"),
-        opt_bool(None, Some("recursive"), OptFlags::NONE, "traverse submodules recursively"),
+        opt_bool(
+            None,
+            Some("recursive"),
+            OptFlags::NONE,
+            "traverse submodules recursively",
+        ),
         opt_bool(Some('f'), Some("force"), OptFlags::NONE, "force update"),
         opt_bool(None, Some("remote"), OptFlags::NONE, "use remote branch"),
         opt_bool(Some('N'), Some("no-fetch"), OptFlags::NONE, "skip fetch"),
         opt_bool(None, Some("checkout"), OptFlags::NONE, "checkout mode"),
         opt_bool(None, Some("merge"), OptFlags::NONE, "merge mode"),
         opt_bool(None, Some("rebase"), OptFlags::NONE, "rebase mode"),
-        opt_bool(None, Some("recommend-shallow"), OptFlags::NONE, "recommend shallow"),
-        opt_bool(None, Some("no-recommend-shallow"), OptFlags::NONEG, "no recommend shallow"),
+        opt_bool(
+            None,
+            Some("recommend-shallow"),
+            OptFlags::NONE,
+            "recommend shallow",
+        ),
+        opt_bool(
+            None,
+            Some("no-recommend-shallow"),
+            OptFlags::NONEG,
+            "no recommend shallow",
+        ),
         opt_bool(None, Some("single-branch"), OptFlags::NONE, "single branch"),
-        opt_bool(None, Some("no-single-branch"), OptFlags::NONEG, "no single branch"),
+        opt_bool(
+            None,
+            Some("no-single-branch"),
+            OptFlags::NONEG,
+            "no single branch",
+        ),
         opt_bool(None, Some("progress"), OptFlags::NONE, "show progress"),
         opt_bool(None, Some("no-progress"), OptFlags::NONEG, "no progress"),
         opt_str(None, Some("depth"), "n", OptFlags::NONE, "clone depth"),
@@ -179,8 +225,20 @@ pub(super) fn setup_submodule_update_options(
             flags: OptFlags::NONE,
             help: "parallel jobs",
         },
-        opt_str(None, Some("filter"), "spec", OptFlags::NONE, "partial clone filter"),
-        opt_str(None, Some("reference"), "repo", OptFlags::NONE, "reference repository"),
+        opt_str(
+            None,
+            Some("filter"),
+            "spec",
+            OptFlags::NONE,
+            "partial clone filter",
+        ),
+        opt_str(
+            None,
+            Some("reference"),
+            "repo",
+            OptFlags::NONE,
+            "reference repository",
+        ),
         opt_str(
             None,
             Some("reference-if-able"),
@@ -188,7 +246,12 @@ pub(super) fn setup_submodule_update_options(
             OptFlags::NONE,
             "reference repository if able",
         ),
-        opt_bool(None, Some("dissociate"), OptFlags::NONE, "dissociate from reference"),
+        opt_bool(
+            None,
+            Some("dissociate"),
+            OptFlags::NONE,
+            "dissociate from reference",
+        ),
         opt_str(
             None,
             Some("super-prefix"),
@@ -305,7 +368,12 @@ pub(super) fn setup_submodule_set_branch_options(
 ) -> Result<(&str, SubmoduleSetBranchAction<'_>, bool)> {
     static SPECS: &[OptionSpec<'static>] = &[
         SUBMODULE_QUIET_SPEC,
-        opt_bool(Some('d'), Some("default"), OptFlags::NONEG, "set default branch"),
+        opt_bool(
+            Some('d'),
+            Some("default"),
+            OptFlags::NONEG,
+            "set default branch",
+        ),
         OptionSpec {
             short: Some('b'),
             long: Some("branch"),
@@ -327,7 +395,9 @@ pub(super) fn setup_submodule_set_branch_options(
         return Err(GitError::Exit(128));
     }
     match (parsed.positionals.as_slice(), branch, default) {
-        ([path], Some(branch), false) => Ok((path, SubmoduleSetBranchAction::Branch(branch), quiet)),
+        ([path], Some(branch), false) => {
+            Ok((path, SubmoduleSetBranchAction::Branch(branch), quiet))
+        }
         ([path], None, true) => Ok((path, SubmoduleSetBranchAction::Default, quiet)),
         _ => submodule_set_branch_usage(),
     }
@@ -355,7 +425,12 @@ pub(super) fn setup_submodule_sync_options(
 ) -> Result<(Vec<&str>, bool, bool, String)> {
     static SPECS: &[OptionSpec<'static>] = &[
         SUBMODULE_QUIET_SPEC,
-        opt_bool(None, Some("recursive"), OptFlags::NONEG, "traverse submodules recursively"),
+        opt_bool(
+            None,
+            Some("recursive"),
+            OptFlags::NONEG,
+            "traverse submodules recursively",
+        ),
         opt_str(
             None,
             Some("super-prefix"),

@@ -1,9 +1,13 @@
 //! Branch-related repository config read/write helpers.
 
 use crate::*;
-use sley::plumbing::{sley_config};
+use sley::plumbing::sley_config;
 
-pub(super) fn rename_branch_config(git_dir: &Path, old_branch: &str, new_branch: &str) -> Result<()> {
+pub(super) fn rename_branch_config(
+    git_dir: &Path,
+    old_branch: &str,
+    new_branch: &str,
+) -> Result<()> {
     let path = git_dir.join("config");
     let contents = match fs::read(&path) {
         Ok(contents) => contents,
@@ -55,7 +59,11 @@ pub(super) fn copy_branch_config(git_dir: &Path, old_branch: &str, new_branch: &
     Ok(())
 }
 
-pub(super) fn copy_branch_config_raw(git_dir: &Path, old_branch: &str, new_branch: &str) -> Result<bool> {
+pub(super) fn copy_branch_config_raw(
+    git_dir: &Path,
+    old_branch: &str,
+    new_branch: &str,
+) -> Result<bool> {
     let path = git_dir.join("config");
     let contents = match fs::read(&path) {
         Ok(contents) => contents,

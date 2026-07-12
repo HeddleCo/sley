@@ -6,11 +6,11 @@
 //! engine backs `git fsck --references`.
 
 use crate::*;
+use sley::plumbing::sley_formats;
 use sley_fsck::SeverityConfig;
 use sley_fsck::content::{MsgId, Severity};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use sley::plumbing::{sley_formats};
 
 /// Resolved options for a verify run (severity table + verbosity).
 pub(crate) struct RefsVerifyOptions {
@@ -361,6 +361,17 @@ fn files_fsck_ref(
     path: &Path,
     file_type: &fs::FileType,
 ) -> bool {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    // A non-dot file ending in `.lock` is transaction state, not a ref. Git's
+    // files backend skips the whole entry before both name and content checks.
+    // A bare `.lock` (and `.name.lock`) is deliberately not skipped: it is an
+    // invalid ref and must still produce the normal name/content findings.
+    if !filename.starts_with('.') && filename.ends_with(".lock") {
+        return false;
+    }
     if opts.verbose {
         eprintln!("Checking {refname}");
     }
@@ -875,7 +886,10 @@ fn verify_reftable(
 }
 
 /// `git refs verify [--strict] [--verbose]`.
-pub(crate) fn cmd_refs_verify(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_refs_verify(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut strict = false;
     let mut verbose = false;
     for arg in args {
@@ -899,7 +913,7 @@ pub(crate) fn cmd_refs_verify(args: &[String]) -> Result<()> {
         }
     }
 
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let common_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let opts = RefsVerifyOptions::from_repo(&git_dir, strict, verbose);

@@ -3,7 +3,10 @@ use super::{StashApplyOptions, StashListFormat, StashListOptions};
 use crate::*;
 use sley_grep::PatternKind;
 
-pub(super) fn setup_stash_apply_options(args: &[String], command: &str) -> Result<StashApplyOptions> {
+pub(super) fn setup_stash_apply_options(
+    args: &[String],
+    command: &str,
+) -> Result<StashApplyOptions> {
     let mut quiet = false;
     let mut reinstate_index = None;
     let mut label_ours = None;
@@ -63,7 +66,9 @@ pub(super) fn setup_stash_apply_options(args: &[String], command: &str) -> Resul
                         || value.starts_with("--no-label-theirs=")
                         || value.starts_with("--no-label-base=")) =>
             {
-                return super::stash_option_takes_no_value_error(&value[5..value.find('=').unwrap()]);
+                return super::stash_option_takes_no_value_error(
+                    &value[5..value.find('=').unwrap()],
+                );
             }
             value if value.starts_with("--quiet=") => {
                 return super::stash_option_takes_no_value_error("quiet");
@@ -731,7 +736,8 @@ pub(super) fn setup_stash_list_options(args: &[String]) -> Result<StashListOptio
         index += 1;
     }
     let author_filters = super::parse_stash_list_filter_patterns(&author_patterns, regexp_mode)?;
-    let committer_filters = super::parse_stash_list_filter_patterns(&committer_patterns, regexp_mode)?;
+    let committer_filters =
+        super::parse_stash_list_filter_patterns(&committer_patterns, regexp_mode)?;
     let reflog_filters = super::parse_stash_list_filter_patterns(&reflog_patterns, regexp_mode)?;
     let grep_filters = super::parse_stash_list_filter_patterns(&grep_patterns, regexp_mode)?;
     Ok(StashListOptions {

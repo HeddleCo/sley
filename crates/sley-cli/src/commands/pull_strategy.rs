@@ -14,7 +14,7 @@
 //! the same kind of "unsupported" error the general pull path produces, so
 //! behaviour only *grows* for the `-s ours` case.
 use crate::*;
-use sley::plumbing::{sley_rev};
+use sley::plumbing::sley_rev;
 
 /// Returns `Some(index)` when `args` carries a `-s`/`--strategy` option, with
 /// `index` pointing at the option itself (its value may live in the same token
@@ -27,7 +27,10 @@ pub(crate) fn pull_has_strategy_option(args: &[String]) -> bool {
 /// `git pull -s ours [--no-rebase] <path-to-self> <branch>` — the only
 /// strategy-pull sley models. The dispatcher calls this when
 /// `pull_has_strategy_option` fired; everything else stays on `cmd_pull`.
-pub(crate) fn cmd_pull_with_strategy(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_pull_with_strategy(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut strategy = None::<String>;
     let mut remote = None::<String>;
     let mut branch = None::<String>;
@@ -78,9 +81,10 @@ pub(crate) fn cmd_pull_with_strategy(args: &[String]) -> Result<()> {
         ));
     };
 
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
+    let config = read_repo_config(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
@@ -90,7 +94,7 @@ pub(crate) fn cmd_pull_with_strategy(args: &[String]) -> Result<()> {
     let remote_is_self = remote == "."
         || fs::canonicalize(&remote)
             .ok()
-            .zip(fs::canonicalize(cwd.clone()).ok())
+            .zip(fs::canonicalize(cwd).ok())
             .is_some_and(|(a, b)| a == b);
     if !remote_is_self {
         return Err(GitError::Command(format!(
@@ -114,8 +118,8 @@ pub(crate) fn cmd_pull_with_strategy(args: &[String]) -> Result<()> {
     fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
 
     let tree = pull_commit_tree_oid(&db, format, &head_oid)?;
-    let author = commit_identity_from_env("AUTHOR")?;
-    let committer = commit_identity_from_env("COMMITTER")?;
+    let author = commit_identity_from_env("AUTHOR", &config)?;
+    let committer = commit_identity_from_env("COMMITTER", &config)?;
     let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let merge_oid = sley_sequencer::create_commit(
         &mut db,

@@ -14,7 +14,7 @@ usage: git reset [--mixed | --soft | --hard | --merge | --keep] [-q] [<commit>]
    or: git reset --patch [<tree-ish>] [--] [<pathspec>...]
 ";
 
-pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut positionals = Vec::new();
     let mut quiet = false;
     let mut recurse_submodules = None;
@@ -182,15 +182,14 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             interhunk: inter_hunk_context.map(|value| value as usize),
             ..commands::add_patch::PatchConfig::default()
         };
-        cfg.reset_interactive =
-            sley_config::read_repo_config(&crate::session::cli_git_dir()?, None)
-                .ok()
-                .and_then(|config| {
-                    config
-                        .get("interactive", None, "reset")
-                        .map(ToString::to_string)
-                })
-                .unwrap_or_default();
+        cfg.reset_interactive = sley_config::read_repo_config(&cli_session.git_dir()?, None)
+            .ok()
+            .and_then(|config| {
+                config
+                    .get("interactive", None, "reset")
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_default();
         return commands::add_patch::run_add_patch(
             commands::add_patch::PatchMode::Reset,
             &positionals,
@@ -199,14 +198,14 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             cfg,
         );
     }
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd().to_path_buf();
+    let git_dir = cli_session.git_dir()?;
     // git's `setup_work_tree()` (builtin/reset.c): every reset that touches the
     // working tree — `--hard`, `--merge`, `--keep` — must run in a work tree, so
     // a bare repository refuses with "this operation must be run in a work
     // tree". `--soft` (HEAD-only) and `--mixed` (index-only) are exempt.
     if matches!(mode, ResetMode::Hard | ResetMode::Merge | ResetMode::Keep) {
-        require_work_tree(&git_dir)?;
+        require_work_tree(cli_session, &git_dir)?;
     }
     let format = repository_object_format(&git_dir)?;
     let reset_config = read_repo_config(&git_dir)?;
@@ -239,11 +238,13 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(128));
         }
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let old_head = match resolve_revision(&git_dir, format, "HEAD") {
-            Ok(oid) => oid,
-            Err(_) => zero_oid(format)?,
-        };
-        let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
+        let old_head =
+            match resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects()) {
+                Ok(oid) => oid,
+                Err(_) => zero_oid(format)?,
+            };
+        let target_oid =
+            resolve_revision_commitish(&git_dir, format, target, cli_session.replace_objects())?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         write_reset_orig_head(&git_dir, &old_head, format)?;
         update_reset_head_ref(
@@ -252,12 +253,12 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             old_head,
             target_commit,
             target,
-            commit_identity_from_env("COMMITTER")?,
+            commit_identity_from_env("COMMITTER", &reset_config)?,
         )?;
         sley_sequencer::replay::remove_branch_state(&git_dir);
         return Ok(());
     }
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     if mode == ResetMode::Merge {
         if pathspec_from_file_provided || has_separator_paths {
             eprintln!("fatal: Cannot do merge reset with paths.");
@@ -272,13 +273,16 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             }
         };
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
+        let target_oid =
+            resolve_revision_commitish(&git_dir, format, target, cli_session.replace_objects())?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         return commands::replay::reset_merge_in(
             &git_dir,
             &worktree_root,
             format,
             Some(&target_commit),
+            &reset_config,
+            cli_session.lazy_fetch(),
         )
         .map_err(|err| match err {
             GitError::Command(message) => {
@@ -313,13 +317,15 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(128));
         }
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let head_oid = resolve_revision(&git_dir, format, "HEAD").map_err(|_| {
-            eprintln!("fatal: You do not have a valid HEAD.");
-            GitError::Exit(128)
-        })?;
+        let head_oid = resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects())
+            .map_err(|_| {
+                eprintln!("fatal: You do not have a valid HEAD.");
+                GitError::Exit(128)
+            })?;
         let old_head = head_oid;
         let head_tree = commands::merge_rebase::commit_tree_oid(&db, format, &head_oid)?;
-        let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
+        let target_oid =
+            resolve_revision_commitish(&git_dir, format, target, cli_session.replace_objects())?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         let target_tree = commands::merge_rebase::commit_tree_oid(&db, format, &target_commit)?;
         write_reset_orig_head(&git_dir, &old_head, format)?;
@@ -356,7 +362,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             old_head,
             target_commit,
             target,
-            commit_identity_from_env("COMMITTER")?,
+            commit_identity_from_env("COMMITTER", &reset_config)?,
         )?;
         sley_sequencer::replay::remove_branch_state(&git_dir);
         return Ok(());
@@ -379,11 +385,14 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             }
         };
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let old_head = match resolve_revision(&git_dir, format, "HEAD") {
-            Ok(oid) => oid,
-            Err(_) => zero_oid(format)?,
-        };
-        if target == "HEAD" && resolve_revision(&git_dir, format, "HEAD").is_err() {
+        let old_head =
+            match resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects()) {
+                Ok(oid) => oid,
+                Err(_) => zero_oid(format)?,
+            };
+        if target == "HEAD"
+            && resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects()).is_err()
+        {
             // `git reset --hard` on an unborn branch: empty the index and
             // remove the (previously tracked) worktree files.
             let index_path = sley_worktree::repository_index_path(&git_dir);
@@ -409,7 +418,8 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             sley_sequencer::replay::remove_branch_state(&git_dir);
             return Ok(());
         }
-        let target_oid = resolve_revision_commitish(&git_dir, format, target)?;
+        let target_oid =
+            resolve_revision_commitish(&git_dir, format, target, cli_session.replace_objects())?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         let target_tree = commands::merge_rebase::commit_tree_oid(&db, format, &target_commit)?;
         if reset_check_cache_tree()
@@ -452,15 +462,14 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
                 reset_process_filter_metadata(&git_dir, format, target, &target_commit),
             )?;
         }
-        apply_reset_sparse_checkout(&worktree_root, &git_dir, format)?;
-        commands::hooks::run_post_index_change_hook(true, false)?;
+        commands::hooks::run_post_index_change_hook(cli_session, true, false)?;
         update_reset_head_ref(
             &git_dir,
             format,
             old_head,
             target_commit,
             target,
-            commit_identity_from_env("COMMITTER")?,
+            commit_identity_from_env("COMMITTER", &reset_config)?,
         )?;
         if !quiet {
             print_reset_hard_head(&git_dir, format, &target_commit)?;
@@ -472,13 +481,19 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
 
     if !saw_separator
         && positionals.len() == 1
-        && let Ok(target_oid) = resolve_revision_commitish(&git_dir, format, &positionals[0])
+        && let Ok(target_oid) = resolve_revision_commitish(
+            &git_dir,
+            format,
+            &positionals[0],
+            cli_session.replace_objects(),
+        )
     {
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let old_head = match resolve_revision(&git_dir, format, "HEAD") {
-            Ok(oid) => oid,
-            Err(_) => zero_oid(format)?,
-        };
+        let old_head =
+            match resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects()) {
+                Ok(oid) => oid,
+                Err(_) => zero_oid(format)?,
+            };
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         // For `git reset -N` capture the paths the *current* index tracks that the
         // target tree does NOT, so they can be re-recorded as intent-to-add after
@@ -506,14 +521,14 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         if refresh {
             refresh_reset_index(&worktree_root, &git_dir, format)?;
         }
-        commands::hooks::run_post_index_change_hook(false, true)?;
+        commands::hooks::run_post_index_change_hook(cli_session, false, true)?;
         update_reset_head_ref(
             &git_dir,
             format,
             old_head,
             target_commit,
             &positionals[0],
-            commit_identity_from_env("COMMITTER")?,
+            commit_identity_from_env("COMMITTER", &reset_config)?,
         )?;
         sley_sequencer::replay::remove_branch_state(&git_dir);
         if !quiet {
@@ -529,7 +544,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     if !saw_separator
         && positionals.is_empty()
         && !pathspec_from_file_provided
-        && resolve_revision(&git_dir, format, "HEAD").is_err()
+        && resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects()).is_err()
     {
         fs::write(
             sley_worktree::repository_index_path(&git_dir),
@@ -556,10 +571,12 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     if !saw_separator
         && positionals.is_empty()
         && !pathspec_from_file_provided
-        && let Ok(head_oid) = resolve_revision_commitish(&git_dir, format, "HEAD")
+        && let Ok(head_oid) =
+            resolve_revision_commitish(&git_dir, format, "HEAD", cli_session.replace_objects())
     {
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let old_head = resolve_revision(&git_dir, format, "HEAD").unwrap_or(head_oid);
+        let old_head = resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects())
+            .unwrap_or(head_oid);
         let target_commit = sley_rev::peel_to_commit(&db, format, &head_oid)?;
         let ita_candidates = if intent_to_add {
             reset_intent_to_add_candidates(&git_dir, &db, format, &target_commit)?
@@ -579,7 +596,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         if refresh {
             refresh_reset_index(&worktree_root, &git_dir, format)?;
         }
-        commands::hooks::run_post_index_change_hook(false, true)?;
+        commands::hooks::run_post_index_change_hook(cli_session, false, true)?;
         sley_sequencer::replay::remove_branch_state(&git_dir);
         if !quiet {
             print_reset_unstaged_changes(&worktree_root, &git_dir, format)?;
@@ -594,7 +611,12 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             [] => {}
             [target] => {
                 let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-                let target_oid = resolve_revision_treeish(&git_dir, format, target)?;
+                let target_oid = resolve_revision_treeish(
+                    &git_dir,
+                    format,
+                    target,
+                    cli_session.replace_objects(),
+                )?;
                 source_tree = Some(sley_rev::peel_to_tree(&db, format, &target_oid)?);
             }
             _ => {
@@ -609,7 +631,12 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     } else {
         let mut values = positionals;
         if values.len() > 1
-            && let Ok(target_oid) = resolve_revision_treeish(&git_dir, format, &values[0])
+            && let Ok(target_oid) = resolve_revision_treeish(
+                &git_dir,
+                format,
+                &values[0],
+                cli_session.replace_objects(),
+            )
         {
             let db = FileObjectDatabase::from_git_dir(&git_dir, format);
             source_tree = Some(sley_rev::peel_to_tree(&db, format, &target_oid)?);
@@ -675,7 +702,9 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     if no_explicit_paths {
         // A bare `git reset` (whole-tree mixed reset to HEAD) records ORIG_HEAD
         // just like the explicit-commit whole-tree paths. Pathspec resets do not.
-        if let Ok(old_head) = resolve_revision(&git_dir, format, "HEAD") {
+        if let Ok(old_head) =
+            resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects())
+        {
             write_reset_orig_head(&git_dir, &old_head, format)?;
         }
         // Whole-tree `--mixed` refreshes the stat-cache by default (see the
@@ -683,7 +712,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         if refresh {
             refresh_reset_index(&worktree_root, &git_dir, format)?;
         }
-        commands::hooks::run_post_index_change_hook(false, true)?;
+        commands::hooks::run_post_index_change_hook(cli_session, false, true)?;
         sley_sequencer::replay::remove_branch_state(&git_dir);
     }
     if !quiet {
@@ -911,54 +940,6 @@ fn reset_check_cache_tree() -> bool {
     )
 }
 
-fn apply_reset_sparse_checkout(
-    worktree_root: &Path,
-    git_dir: &Path,
-    format: ObjectFormat,
-) -> Result<()> {
-    let worktree_config = GitConfig::read(git_dir.join("config.worktree")).unwrap_or_default();
-    let repo_config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
-    let sparse_enabled = worktree_config
-        .get_bool("core", None, "sparseCheckout")
-        .or_else(|| repo_config.get_bool("core", None, "sparseCheckout"))
-        .unwrap_or(false);
-    if !sparse_enabled {
-        return Ok(());
-    }
-    let sparse_file = git_dir.join("info").join("sparse-checkout");
-    if !sparse_file.exists() {
-        return Ok(());
-    }
-    let cone = worktree_config
-        .get_bool("core", None, "sparseCheckoutCone")
-        .or_else(|| repo_config.get_bool("core", None, "sparseCheckoutCone"))
-        .unwrap_or(false);
-    let sparse_index = cone
-        && worktree_config
-            .get_bool("index", None, "sparse")
-            .or_else(|| repo_config.get_bool("index", None, "sparse"))
-            .unwrap_or(false);
-    let bytes = fs::read(sparse_file)?;
-    let mut patterns: Vec<Vec<u8>> = bytes
-        .split(|byte| *byte == b'\n')
-        .map(<[u8]>::to_vec)
-        .collect();
-    if patterns.last().map(Vec::is_empty) == Some(true) {
-        patterns.pop();
-    }
-    let mode = if cone && commands::sparse_checkout::cone_patterns_are_valid(&patterns, true) {
-        sley_worktree::SparseCheckoutMode::Cone
-    } else {
-        sley_worktree::SparseCheckoutMode::Full
-    };
-    let sparse = sley_worktree::SparseCheckout {
-        patterns,
-        sparse_index,
-    };
-    sley_worktree::apply_sparse_checkout_with_mode(worktree_root, git_dir, format, &sparse, mode)?;
-    Ok(())
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResetMode {
     Mixed,
@@ -985,7 +966,27 @@ fn print_reset_unstaged_changes(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<()> {
-    let mut entries = crate::collect_short_status(worktree_root, git_dir, format)?;
+    let parsed_index = sley_worktree::read_repository_index(git_dir, format)?;
+    let mut entries = if let Some(index) = parsed_index.as_ref().filter(|index| {
+        index.is_sparse()
+            || index
+                .entries
+                .iter()
+                .any(sley_index::IndexEntry::is_sparse_dir)
+    }) {
+        // The post-reset summary is an index-to-worktree report. General status
+        // also compares HEAD to the newly reset index and can unnecessarily
+        // inflate a sparse index; use the engine query that computes exactly
+        // the worktree side this summary renders.
+        sley_worktree::collect_index_worktree_status_with_index(
+            worktree_root,
+            git_dir,
+            format,
+            index,
+        )?
+    } else {
+        crate::collect_short_status(worktree_root, git_dir, format)?
+    };
     entries.retain(|entry| matches!(entry.worktree, b'M' | b'T' | b'D'));
     // git's post-reset summary omits skip-worktree paths: `update_index_refresh`
     // never marks a CE_SKIP_WORKTREE entry stat-dirty, so it never appears in the

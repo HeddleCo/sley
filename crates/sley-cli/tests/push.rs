@@ -419,6 +419,13 @@ fn receive_pack_service_updates_bare_repo_with_raw_pack() {
         name: "object-format".into(),
         value: Some("sha1".into()),
     }));
+    assert!(
+        !advertisements.refs[0]
+            .capabilities
+            .iter()
+            .any(|capability| capability.name == "push-options"),
+        "receive-pack must not advertise push-options by default"
+    );
     let report = read_receive_pack_report_status(&mut stdout).expect("parse report status");
     assert_eq!(report.unpack, ReceivePackUnpackStatus::Ok);
     assert_eq!(
@@ -457,6 +464,11 @@ fn receive_pack_service_accepts_push_options() {
     fs::create_dir_all(&remote).expect("create remote");
     fs::create_dir_all(&work).expect("create work");
     create_bare_repo(&remote, None);
+    run_success(
+        sley_testkit::oracle_git(),
+        &remote,
+        &["config", "receive.advertisePushOptions", "true"],
+    );
     create_work_repo(&work, None);
     run_success(
         sley_testkit::oracle_git(),
@@ -585,6 +597,11 @@ fn receive_pack_service_accepts_empty_push_options_section() {
     fs::create_dir_all(&remote).expect("create remote");
     fs::create_dir_all(&work).expect("create work");
     create_bare_repo(&remote, None);
+    run_success(
+        sley_testkit::oracle_git(),
+        &remote,
+        &["config", "receive.advertisePushOptions", "true"],
+    );
     create_work_repo(&work, None);
     run_success(
         sley_testkit::oracle_git(),
@@ -1559,6 +1576,62 @@ fn push_rejects_non_fast_forward_without_force() {
         );
         assert_ne!(remote_head, local_head);
     };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn push_fans_out_to_every_configured_pushurl() {
+    let root = unique_temp_dir("push-multiple-pushurls");
+    fs::create_dir_all(&root).expect("create temp root");
+    let work = root.join("work");
+    fs::create_dir_all(&work).expect("create work");
+    create_work_repo(&work, None);
+    let mut destinations = Vec::new();
+    for index in 1..=3 {
+        let destination = root.join(format!("destination-{index}.git"));
+        fs::create_dir_all(&destination).expect("create destination");
+        create_bare_repo(&destination, None);
+        let url = format!("file://{}", destination.to_string_lossy());
+        run_success(
+            sley_testkit::oracle_git(),
+            &work,
+            &["config", "--add", "remote.them.pushurl", &url],
+        );
+        destinations.push(destination);
+    }
+    run_success(
+        sley_testkit::oracle_git(),
+        &work,
+        &[
+            "config",
+            "--add",
+            "remote.them.push",
+            "+refs/heads/*:refs/heads/*",
+        ],
+    );
+
+    let output = run(sley_testkit::sley_bin!(), &work, &["push", "them"]);
+    assert!(
+        output.status.success(),
+        "fan-out push failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = run_success(
+        sley_testkit::oracle_git(),
+        &work,
+        &["rev-parse", "refs/heads/main"],
+    );
+    for destination in destinations {
+        assert_eq!(
+            run_success(
+                sley_testkit::oracle_git(),
+                &destination,
+                &["rev-parse", "refs/heads/main"],
+            ),
+            expected
+        );
+    }
     let _ = fs::remove_dir_all(&root);
 }
 

@@ -92,7 +92,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q libcurl4-openssl-dev libexpat1-dev libpcre2-dev gettext
           echo "${ORACLE_GIT_TAG#v}" > /tmp/git-src/version
-          make -C /tmp/git-src -j"$(nproc)" prefix=/tmp/git-prefix USE_LIBPCRE2=1 install 2>&1 | tail -3
+          make -C /tmp/git-src -j"$(nproc)" prefix=/tmp/git-prefix USE_LIBPCRE2=1 NO_TCLTK=YesPlease install 2>&1 | tail -3
           echo "/tmp/git-prefix/bin" >> "$GITHUB_PATH"
       - name: Assert pinned oracle on PATH
         run: |
@@ -102,31 +102,15 @@ jobs:
       - name: Build (default features)
         run: cargo build --locked --workspace --tests
 
-      # 2. Format check — REPORT-ONLY (non-blocking).
-      #    The base tree (b069dbe, the CLI-monolith split) is NOT `cargo fmt`-clean,
-      #    so a blocking `cargo fmt --all --check` would fail every PR on day one.
-      #    We surface the diff for visibility and leave the enforcing gate to the
-      #    sley#7 clean-up (which should land a tree-wide `cargo fmt` + flip this
-      #    to blocking). No source can be reformatted from a workflows-only change.
-      - name: Format check (report-only)
-        continue-on-error: true
+      # 2. Formatting is part of the release gate. Keep this check workspace-wide
+      #    so a newly added crate cannot silently fall outside enforcement.
+      - name: Format check
         run: cargo fmt --all --check
 
-      # 3. Clippy gate — scoped to the crates that are ALREADY clippy-clean at
-      #    base, linted with --no-deps so a dirty path-dependency doesn't trip
-      #    the gate. sley has ~6,241 workspace clippy/`unwrap_used` violations
-      #    (sley#7 burn-down); even the boundary/security crates aren't all clean
-      #    yet (sley-remote has 2 `map_entry` findings in src/local.rs at base).
-      #    So the BLOCKING gate is the verified-clean subset — sley-pack (pack
-      #    format parsing) and sley-protocol (protocol parsing) — the untrusted-
-      #    input parsers where strict linting matters most. sley-remote and the
-      #    rest are covered by the report-only workspace pass (step 5) until
-      #    sley#7 cleans them and they graduate into this gate. See the burn-down
-      #    plan in reviews/sley-ci/README.md.
-      - name: Clippy (scoped, blocking)
-        run: |
-          cargo clippy --locked -p sley-pack --all-targets --no-deps -- -D warnings
-          cargo clippy --locked -p sley-protocol --all-targets --no-deps -- -D warnings
+      # 3. Treat every workspace lint as an error. `--no-deps` excludes third-
+      #    party warnings while retaining every Sley target, including tests.
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings
 
       # 4. Run all workspace tests. The suite includes the t-file CLI parity
       #    tests, unit tests across the domain crates, and the upstream
@@ -144,15 +128,10 @@ jobs:
           GIT_COMMITTER_EMAIL: committer@example.com
         run: cargo test --locked --workspace
 
-      # 5. Report-only full-workspace clippy. NON-BLOCKING — surfaces the
-      #    burn-down progress (warning count) without failing CI. Covers
-      #    sley-remote and every crate not yet in the step-3 blocking gate; the
-      #    real gate is step 3 (sley-pack + sley-protocol). As sley#7 cleans
-      #    crates, promote them from here into step 3.
-      - name: Clippy (workspace, report-only)
-        continue-on-error: true
-        run: |
-          cargo clippy --locked --workspace --all-targets --no-deps 2>&1 \
-            | tee /tmp/clippy-report.txt
-          warning_count=$(grep -c 'warning:' /tmp/clippy-report.txt || true)
-          echo "Found $warning_count clippy warnings across workspace (non-blocking)"
+      # 5. Public library documentation must resolve every intra-doc link and
+      #    compile without warnings. Binaries are excluded because Cargo emits a
+      #    filename-collision warning for the intentionally shared `sley` name.
+      - name: API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --no-deps --lib

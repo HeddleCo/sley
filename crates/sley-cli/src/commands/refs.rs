@@ -1,11 +1,10 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
+use sley::plumbing::{sley_config, sley_formats::ReftableWriteOptions, sley_refs, sley_rev};
 use std::cell::RefCell;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-use sley::plumbing::{sley_config, sley_refs, sley_rev};
 
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
@@ -39,7 +38,7 @@ pub(super) enum ReflogFormat {
     Message { final_newline: bool },
 }
 
-pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_reflog(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     if args
         .first()
         .is_some_and(|arg| arg == "-h" || arg == "--help")
@@ -64,30 +63,31 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(129));
     }
     if args.first().is_some_and(|arg| arg == "exists") {
-        return cmd_reflog_exists(&args[1..]);
+        return cmd_reflog_exists(cli_session, &args[1..]);
     }
     if args.first().is_some_and(|arg| arg == "list") {
-        return cmd_reflog_list(&args[1..]);
+        return cmd_reflog_list(cli_session, &args[1..]);
     }
     if args.first().is_some_and(|arg| arg == "delete") {
-        return cmd_reflog_delete(&args[1..]);
+        return cmd_reflog_delete(cli_session, &args[1..]);
     }
     if args.first().is_some_and(|arg| arg == "drop") {
-        return cmd_reflog_drop(&args[1..]);
+        return cmd_reflog_drop(cli_session, &args[1..]);
     }
     if args.first().is_some_and(|arg| arg == "write") {
-        return cmd_reflog_write(&args[1..]);
+        return cmd_reflog_write(cli_session, &args[1..]);
     }
     if args.first().is_some_and(|arg| arg == "expire") {
-        return cmd_reflog_expire(&args[1..]);
+        return cmd_reflog_expire(cli_session, &args[1..]);
     }
     if args.len() == 1 && args[0] == "--all" {
-        return cmd_reflog_all();
+        return cmd_reflog_all(cli_session);
     }
-    let options = setup_reflog_show_options(args)?;
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let cwd = cli_session.cwd();
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
+    let store = FileRefStore::new(&git_dir, format);
+    let options = setup_reflog_show_options(&store, &git_dir, format, args)?;
     let config = read_repo_config(&git_dir)?;
     let abbrev_commit = options.abbrev_commit.unwrap_or(true);
     let abbrev_len = if abbrev_commit {
@@ -95,9 +95,8 @@ pub(crate) fn cmd_reflog(args: &[String]) -> Result<()> {
     } else {
         None
     };
-    let store = FileRefStore::new(&git_dir, format);
     let mut entries = store.read_reflog(&options.reference)?;
-    if !options.pathspecs.is_empty() && !reflog_show_pathspecs_match(&cwd, &options.pathspecs) {
+    if !options.pathspecs.is_empty() && !reflog_show_pathspecs_match(cwd, &options.pathspecs) {
         return Ok(());
     }
     entries.reverse();
@@ -180,9 +179,8 @@ fn reflog_show_message(entry: &ReflogEntry) -> std::borrow::Cow<'_, [u8]> {
     std::borrow::Cow::Borrowed(&entry.message)
 }
 
-fn cmd_reflog_all() -> Result<()> {
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+fn cmd_reflog_all(cli_session: &crate::session::CliSession) -> Result<()> {
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let abbrev_len = repository_abbrev(&git_dir, format)?;
     let store = FileRefStore::new(&git_dir, format);
@@ -252,14 +250,13 @@ fn print_reflog_expire_usage_stdout() {
     );
 }
 
-fn cmd_reflog_exists(args: &[String]) -> Result<()> {
+fn cmd_reflog_exists(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let Some(reference) = args.first() else {
         eprintln!("usage: git reflog exists <ref>");
         eprintln!();
         return Err(GitError::Exit(129));
     };
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     if reflog_path_for_ref(&git_dir, reference)?.is_file() {
         Ok(())
     } else {
@@ -267,7 +264,7 @@ fn cmd_reflog_exists(args: &[String]) -> Result<()> {
     }
 }
 
-fn cmd_reflog_list(args: &[String]) -> Result<()> {
+fn cmd_reflog_list(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut refs = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -290,8 +287,7 @@ fn cmd_reflog_list(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(255));
     }
 
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let mut names = BTreeSet::new();
     collect_repository_reflog_names(&git_dir, &mut names)?;
     for name in names {
@@ -449,7 +445,7 @@ struct ReflogDropOptions {
     all: bool,
 }
 
-fn cmd_reflog_delete(args: &[String]) -> Result<()> {
+fn cmd_reflog_delete(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut options = ReflogDeleteOptions {
         dry_run: false,
         verbose: false,
@@ -486,13 +482,14 @@ fn cmd_reflog_delete(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(255));
     }
 
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let mut exit_code = 0;
     for spec in specs {
-        if let Err(GitError::Exit(code)) = delete_reflog_entry(&store, format, &spec, options) {
+        if let Err(GitError::Exit(code)) =
+            delete_reflog_entry(&store, &git_dir, format, &spec, options)
+        {
             exit_code = code;
         }
     }
@@ -521,11 +518,12 @@ fn reflog_delete_usage<T>() -> Result<T> {
 
 fn delete_reflog_entry(
     store: &FileRefStore,
+    git_dir: &Path,
     format: ObjectFormat,
     spec: &str,
     options: ReflogDeleteOptions,
 ) -> Result<()> {
-    let Some((reference, selector)) = parse_reflog_delete_spec(store, spec) else {
+    let Some((reference, selector)) = parse_reflog_delete_spec(store, git_dir, format, spec) else {
         eprintln!("error: not a reflog: {spec}");
         return Err(GitError::Exit(255));
     };
@@ -576,10 +574,15 @@ fn delete_reflog_entry(
     Ok(())
 }
 
-fn parse_reflog_delete_spec(store: &FileRefStore, spec: &str) -> Option<(String, usize)> {
+fn parse_reflog_delete_spec(
+    store: &FileRefStore,
+    git_dir: &Path,
+    format: ObjectFormat,
+    spec: &str,
+) -> Option<(String, usize)> {
     let spec = spec.strip_suffix('}')?;
     let (reference, selector) = spec.rsplit_once("@{")?;
-    let reference = resolve_reflog_name(store, reference).ok()?;
+    let reference = resolve_reflog_name(store, git_dir, format, reference).ok()?;
     let selector = selector.parse::<usize>().ok().or_else(|| {
         reflog_selector_by_date(store, &reference, selector)
             .ok()
@@ -613,7 +616,7 @@ fn rewrite_reflog_old_oids(entries: &mut [ReflogEntry], zero: ObjectId) {
     }
 }
 
-fn cmd_reflog_drop(args: &[String]) -> Result<()> {
+fn cmd_reflog_drop(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut options = ReflogDropOptions { all: false };
     let mut refs = Vec::new();
     let mut index = 0;
@@ -640,8 +643,9 @@ fn cmd_reflog_drop(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(129));
     }
 
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
+    let format = repository_object_format(&git_dir)?;
+    let store = FileRefStore::new(&git_dir, format);
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let logs_dir = common_git_dir.join("logs");
     if options.all {
@@ -657,7 +661,7 @@ fn cmd_reflog_drop(args: &[String]) -> Result<()> {
     let mut exit_code = 0;
     for reference in refs {
         let display = reference.clone();
-        let reference = reflog_reference_name(Some(&reference))?;
+        let reference = reflog_reference_name(&store, &git_dir, format, Some(&reference))?;
         let path = reflog_path_for_ref(&git_dir, &reference)?;
         let logs_dir = reflog_logs_dir_for_ref(&git_dir, &reference)?;
         if !path.is_file() {
@@ -700,7 +704,7 @@ fn reflog_drop_usage<T>() -> Result<T> {
     Err(GitError::Exit(129))
 }
 
-fn cmd_reflog_write(args: &[String]) -> Result<()> {
+fn cmd_reflog_write(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     if args.len() != 4 {
         eprintln!("usage: git reflog write <ref> <old-oid> <new-oid> <message>");
         eprintln!();
@@ -712,8 +716,7 @@ fn cmd_reflog_write(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let old_oid = parse_reflog_write_oid(format, &args[1], "old")?;
     let new_oid = parse_reflog_write_oid(format, &args[2], "new")?;
@@ -723,12 +726,13 @@ fn cmd_reflog_write(args: &[String]) -> Result<()> {
     validate_reflog_write_object(&db, &new_oid, &zero, "new")?;
 
     let store = FileRefStore::new(&git_dir, format);
+    let identity_config = identity_effective_config_for(cli_session).unwrap_or_default();
     store.append_reflog(
         reference,
         &ReflogEntry {
             old_oid,
             new_oid,
-            committer: commit_identity_from_env("COMMITTER")?,
+            committer: commit_identity_from_env("COMMITTER", &identity_config)?,
             message: normalize_reflog_write_message(&args[3]),
         },
     )
@@ -768,7 +772,24 @@ fn validate_reflog_write_object(
     Err(GitError::Exit(128))
 }
 
-fn cmd_reflog_expire(args: &[String]) -> Result<()> {
+fn cmd_reflog_expire(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
+    let (options, refs) = parse_reflog_expire_options(args)?;
+    let git_dir = cli_session.git_dir()?;
+    expire_reflogs_at(&git_dir, options, refs, cli_session.replace_objects())
+}
+
+/// Path-based reflog expiration for repository maintenance that already owns
+/// repository discovery and must not re-enter CLI global state.
+pub(crate) fn reflog_expire_at(
+    git_dir: &Path,
+    args: &[String],
+    replace_objects: bool,
+) -> Result<()> {
+    let (options, refs) = parse_reflog_expire_options(args)?;
+    expire_reflogs_at(git_dir, options, refs, replace_objects)
+}
+
+fn parse_reflog_expire_options(args: &[String]) -> Result<(ReflogExpireOptions, Vec<String>)> {
     let mut options = ReflogExpireOptions {
         dry_run: false,
         verbose: false,
@@ -833,12 +854,18 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
             value => refs.push(value.to_string()),
         }
     }
+    Ok((options, refs))
+}
 
-    let cwd = env::current_dir()?;
-    let git_dir = crate::session::cli_git_dir_from(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let store = FileRefStore::new(&git_dir, format);
-    let config = load_reflog_expire_config(&git_dir)?;
+fn expire_reflogs_at(
+    git_dir: &Path,
+    mut options: ReflogExpireOptions,
+    refs: Vec<String>,
+    replace_objects: bool,
+) -> Result<()> {
+    let format = repository_object_format(git_dir)?;
+    let store = FileRefStore::new(git_dir, format);
+    let config = load_reflog_expire_config(git_dir)?;
     apply_reflog_expire_config_from(&config, &mut options)?;
     let mut targets: BTreeSet<(PathBuf, String)> = BTreeSet::new();
     // References discovered via `--all` silently skip an empty/missing reflog
@@ -847,9 +874,9 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
     let mut all_discovered: BTreeSet<(PathBuf, String)> = BTreeSet::new();
     if options.all {
         if options.single_worktree {
-            collect_current_worktree_reflog_targets(&git_dir, &mut all_discovered)?;
+            collect_current_worktree_reflog_targets(git_dir, &mut all_discovered)?;
         } else {
-            collect_all_worktree_reflog_targets(&git_dir, &mut all_discovered)?;
+            collect_all_worktree_reflog_targets(git_dir, &mut all_discovered)?;
         }
         targets.extend(all_discovered.iter().cloned());
     }
@@ -858,7 +885,7 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
             eprintln!("error: reflog could not be found: '{original}'");
             return Err(GitError::Exit(255));
         }
-        let reference = resolve_reflog_name(&store, &original).map_err(|_| {
+        let reference = resolve_reflog_name(&store, git_dir, format, &original).map_err(|_| {
             eprintln!("error: reflog could not be found: '{original}'");
             GitError::Exit(255)
         })?;
@@ -866,9 +893,9 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
             eprintln!("error: reflog could not be found: '{original}'");
             return Err(GitError::Exit(255));
         }
-        targets.insert((git_dir.clone(), reference));
+        targets.insert((git_dir.to_path_buf(), reference));
     }
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut context = ReflogExpireRunContext {
         config,
         reachable_by_tip: HashMap::new(),
@@ -882,7 +909,8 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
         };
         // A `--all`-discovered reflog that is empty is not an error.
         let target = (target_git_dir.clone(), reference.clone());
-        if all_discovered.contains(&target) && target_store.read_reflog(&reference)?.is_empty() {
+        let discovered = all_discovered.contains(&target);
+        if discovered && target_store.read_reflog_for_expiry(&reference)?.is_empty() {
             continue;
         }
         let mut target_options = options;
@@ -894,7 +922,9 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
             format,
             &reference,
             target_options,
+            replace_objects,
             &mut context,
+            discovered,
         ) {
             exit_code = code;
         }
@@ -919,9 +949,15 @@ fn expire_reflog_entries(
     format: ObjectFormat,
     reference: &str,
     options: ReflogExpireOptions,
+    replace_objects: bool,
     context: &mut ReflogExpireRunContext,
+    lenient: bool,
 ) -> Result<()> {
-    let mut entries = store.read_reflog(reference)?;
+    let mut entries = if lenient {
+        store.read_reflog_for_expiry(reference)?
+    } else {
+        store.read_reflog(reference)?
+    };
     if entries.is_empty() {
         eprintln!("error: reflog could not be found: '{reference}'");
         return Err(GitError::Exit(255));
@@ -945,7 +981,14 @@ fn expire_reflog_entries(
         if !prune && timestamp < options.expire_unreachable {
             if reachable.is_none() {
                 reachable = Some(reflog_reachable_oids(
-                    store, db, git_dir, format, reference, options, context,
+                    store,
+                    db,
+                    git_dir,
+                    format,
+                    reference,
+                    options,
+                    replace_objects,
+                    context,
                 )?);
             }
             let reachable_from_tip = reachable
@@ -978,6 +1021,7 @@ fn expire_reflog_entries(
         return Ok(());
     }
     if retained.len() == entries.len() && !rewrote_old_oid {
+        store.adjust_reflog_permissions(reference)?;
         return Ok(());
     }
     let old_tip = entries.last().map(|entry| entry.new_oid);
@@ -1001,8 +1045,13 @@ fn expire_reflog_entries(
     Ok(())
 }
 
-fn resolve_reflog_name(store: &FileRefStore, name: &str) -> Result<String> {
-    let direct = reflog_reference_name(Some(name))?;
+fn resolve_reflog_name(
+    store: &FileRefStore,
+    git_dir: &Path,
+    format: ObjectFormat,
+    name: &str,
+) -> Result<String> {
+    let direct = reflog_reference_name(store, git_dir, format, Some(name))?;
     if !store.read_reflog(&direct)?.is_empty() {
         return Ok(direct);
     }
@@ -1102,6 +1151,7 @@ fn reflog_reachable_oids(
     format: ObjectFormat,
     reference: &str,
     options: ReflogExpireOptions,
+    replace_objects: bool,
     context: &mut ReflogExpireRunContext,
 ) -> Result<Option<HashSet<ObjectId>>> {
     if options.expire_unreachable <= options.expire {
@@ -1116,7 +1166,7 @@ fn reflog_reachable_oids(
         }
     } else if let Some(tip) = resolve_ref_to_oid(store, reference)? {
         starts.push(tip);
-    } else if let Ok(tip) = resolve_revision(git_dir, format, reference) {
+    } else if let Ok(tip) = resolve_revision(git_dir, format, reference, replace_objects) {
         starts.push(tip);
     } else {
         return Ok(Some(HashSet::new()));
@@ -1261,7 +1311,6 @@ fn reflog_expire_usage<T>() -> Result<T> {
     Err(GitError::Exit(129))
 }
 
-
 fn reflog_show_pathspecs_match(cwd: &Path, pathspecs: &[String]) -> bool {
     pathspecs.iter().any(|pathspec| cwd.join(pathspec).exists())
 }
@@ -1279,24 +1328,34 @@ fn update_server_info_option_specs() -> &'static [OptionSpec<'static>] {
     SPECS
 }
 
-pub(crate) fn cmd_update_server_info(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_update_server_info(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let git_dir = cli_session.git_dir()?;
+    update_server_info_at(&git_dir, args)
+}
+
+pub(crate) fn update_server_info_at(git_dir: &Path, args: &[String]) -> Result<()> {
     let force = setup_update_server_info_options(args)?;
-    let git_dir = crate::session::cli_git_dir()?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let shared_repository =
+        sley::plumbing::sley_formats::SharedRepositoryPermissions::from_git_dir(&common_git_dir);
 
     let info_dir = common_git_dir.join("info");
-    fs::create_dir_all(&info_dir)?;
+    shared_repository.create_dir_all(&info_dir)?;
     update_server_info_file(
         &info_dir.join("refs"),
         &update_server_info_refs(&store, &db, format)?,
         force,
+        &shared_repository,
     )?;
 
     let objects_info_dir = repository_objects_dir(&common_git_dir).join("info");
-    fs::create_dir_all(&objects_info_dir)?;
+    shared_repository.create_dir_all(&objects_info_dir)?;
     update_server_info_file(
         &objects_info_dir.join("packs"),
         &update_server_info_packs(
@@ -1304,6 +1363,7 @@ pub(crate) fn cmd_update_server_info(args: &[String]) -> Result<()> {
             format,
         )?,
         force,
+        &shared_repository,
     )?;
     Ok(())
 }
@@ -1344,15 +1404,16 @@ fn setup_update_server_info_options(args: &[String]) -> Result<bool> {
     Ok(parsed.last_bool("force", false))
 }
 
-fn update_server_info_file(path: &Path, content: &[u8], force: bool) -> Result<()> {
-    if !force
-        && let Ok(existing) = fs::read(path)
-        && existing == content
-    {
-        return Ok(());
+fn update_server_info_file(
+    path: &Path,
+    content: &[u8],
+    force: bool,
+    shared_repository: &sley::plumbing::sley_formats::SharedRepositoryPermissions,
+) -> Result<()> {
+    if force || !fs::read(path).is_ok_and(|existing| existing == content) {
+        fs::write(path, content)?;
     }
-    fs::write(path, content)?;
-    Ok(())
+    shared_repository.adjust_file(path)
 }
 
 fn update_server_info_refs(
@@ -1427,7 +1488,10 @@ fn update_server_info_usage<T>() -> Result<T> {
     Err(GitError::Exit(129))
 }
 
-pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_update_ref(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     // git's `update-ref` writes an *empty* reflog message when no -m is given
     // (builtin/update-ref.c leaves msg NULL); only -m supplies one.
     let mut message = Vec::new();
@@ -1470,10 +1534,27 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             value => positional.push(value.to_string()),
         }
     }
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
-    let store = FileRefStore::new(&git_dir, format)
-        .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?);
+    let identity_config = identity_effective_config_for(cli_session).unwrap_or_default();
+    let core_fsync = global_config_value("core.fsync")?;
+    let core_fsync_method = global_config_value("core.fsyncMethod")?;
+    let prefer_symlink_refs = global_config_value("core.preferSymlinkRefs")?
+        .as_deref()
+        .and_then(sley_config::parse_config_bool)
+        .or_else(|| identity_config.get_bool("core", None, "preferSymlinkRefs"));
+    let mut store = FileRefStore::new(&git_dir, format)
+        .with_reference_fsync_config(core_fsync.as_deref(), core_fsync_method.as_deref())
+        .with_packed_refs_lock_timeout_millis(packed_refs_lock_timeout_override()?)
+        .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?)
+        .with_reftable_write_options(reftable_write_options_override()?)
+        // `update-ref` is a native ref transaction: its ref and reflog records
+        // share one reftable update index. Other command families still opt in
+        // independently while their combined-table parity is completed.
+        .with_reftable_combined_logs(true);
+    if let Some(prefer_symlink_refs) = prefer_symlink_refs {
+        store = store.with_prefer_symlink_refs(prefer_symlink_refs);
+    }
     if stdin {
         if delete || !positional.is_empty() {
             return Err(GitError::Command(
@@ -1487,6 +1568,7 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             create_reflog,
             batch_updates,
             message,
+            config: &identity_config,
             oid_cache: RefCell::new(HashMap::new()),
             object_type_cache: RefCell::new(HashMap::new()),
         };
@@ -1559,6 +1641,7 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             &store,
             &git_dir,
             format,
+            &identity_config,
             &effective.effective,
             expected_oid.as_ref(),
             &message,
@@ -1608,6 +1691,7 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             &store,
             &git_dir,
             format,
+            &identity_config,
             &name,
             None,
             &message,
@@ -1627,7 +1711,7 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
     let reflog = writes_reflog.then(|| ReflogEntry {
         old_oid,
         new_oid,
-        committer: ref_reflog_committer(),
+        committer: ref_reflog_committer(&identity_config),
         message,
     });
     let tx_name = name.clone();
@@ -1654,6 +1738,12 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             let prefix = format!("could not lock ref {tx_name}: ");
             update_ref_lock_failure(&tx_name, message.trim_start_matches(&prefix))
         }
+        Err(GitError::InvalidFormat(message)) if message == "entry too large" => {
+            eprintln!(
+                "fatal: update_ref failed for ref '{tx_name}': reftable: transaction failure: entry too large"
+            );
+            Err(GitError::Exit(128))
+        }
         Err(err) => Err(err),
     }
 }
@@ -1667,6 +1757,32 @@ fn update_ref_usage() -> Result<()> {
 
 fn reftable_lock_timeout_override() -> Result<Option<u64>> {
     Ok(global_config_value("reftable.lockTimeout")?.and_then(|value| value.parse::<u64>().ok()))
+}
+
+fn packed_refs_lock_timeout_override() -> Result<u64> {
+    Ok(global_config_value("core.packedRefsTimeout")?
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1_000))
+}
+
+fn reftable_write_options_override() -> Result<ReftableWriteOptions> {
+    let mut options = ReftableWriteOptions::default();
+    if let Some(value) = global_config_value("reftable.blockSize")?
+        && let Ok(block_size) = value.parse::<u32>()
+    {
+        options.block_size = block_size;
+    }
+    if let Some(value) = global_config_value("reftable.restartInterval")?
+        && let Ok(restart_interval) = value.parse::<u16>()
+    {
+        options.restart_interval = restart_interval;
+    }
+    if let Some(value) = global_config_value("reftable.indexObjects")?
+        && let Some(index_objects) = sley_config::parse_config_bool(&value)
+    {
+        options.index_objects = index_objects;
+    }
+    Ok(options)
 }
 
 /// The `reference-transaction` hook runner the file backend fires at each
@@ -1718,6 +1834,7 @@ struct UpdateRefStdinContext<'a> {
     format: ObjectFormat,
     create_reflog: bool,
     message: Vec<u8>,
+    config: &'a GitConfig,
     batch_updates: bool,
     oid_cache: RefCell<HashMap<String, ObjectId>>,
     object_type_cache: RefCell<HashMap<ObjectId, ObjectType>>,
@@ -2466,6 +2583,16 @@ fn parse_df_conflict_message(message: &str) -> Option<(String, String)> {
     Some((new_ref.to_string(), existing_ref.to_string()))
 }
 
+fn parse_non_empty_ref_directory_message(message: &str) -> Option<(String, String)> {
+    let rest = message.strip_prefix("cannot lock ref '")?;
+    let (new_ref, rest) = rest.split_once("': there is a non-empty directory '")?;
+    let (path, suffix) = rest.split_once("' blocking reference '")?;
+    suffix
+        .strip_suffix('\'')
+        .filter(|blocked| *blocked == new_ref)?;
+    Some((new_ref.to_string(), path.to_string()))
+}
+
 struct UpdateRefStdinTransaction {
     active: bool,
     explicit: bool,
@@ -2473,7 +2600,7 @@ struct UpdateRefStdinTransaction {
     closed: bool,
     applied: bool,
     originals: BTreeMap<String, Option<RefTarget>>,
-    ref_snapshot: Option<HashMap<String, RefTarget>>,
+    ref_snapshot: Option<sley_refs::RefReadSnapshot>,
     duplicate: Option<String>,
     duplicate_message: Option<String>,
     locks: Vec<PathBuf>,
@@ -2586,6 +2713,22 @@ impl UpdateRefStdinTransaction {
                     }
                     return update_ref_stdin_invalid_ref_format(name);
                 }
+                Err(GitError::InvalidFormat(message))
+                    if message.starts_with(&format!("reference {current} ")) =>
+                {
+                    eprintln!(
+                        "fatal: cannot lock ref '{requested}': unable to resolve reference '{current}': reference broken"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                Err(GitError::NotFound(sley::NotFoundKind::BrokenReference { name, .. }))
+                    if name == current =>
+                {
+                    eprintln!(
+                        "fatal: cannot lock ref '{requested}': unable to resolve reference '{current}': reference broken"
+                    );
+                    return Err(GitError::Exit(128));
+                }
                 Err(err) => return Err(err),
             }
         }
@@ -2607,18 +2750,19 @@ impl UpdateRefStdinTransaction {
             return store.read_ref(name);
         }
         if self.ref_snapshot.is_none() {
-            self.ref_snapshot = Some(
-                store
-                    .list_refs()?
-                    .into_iter()
-                    .map(|reference| (reference.name, reference.target))
-                    .collect(),
-            );
+            self.ref_snapshot = Some(store.read_snapshot_for_update()?);
         }
-        Ok(self
+        match self
             .ref_snapshot
             .as_ref()
-            .and_then(|snapshot| snapshot.get(name).cloned()))
+            .and_then(|snapshot| snapshot.get(name))
+        {
+            Some(sley_refs::RefReadSnapshotValue::Target(target)) => Ok(Some(target.clone())),
+            Some(sley_refs::RefReadSnapshotValue::Broken) => {
+                Err(GitError::broken_reference(name, ""))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Reshape a backend D/F-conflict error into the git-shaped `fatal:` exit-128
@@ -2640,6 +2784,12 @@ impl UpdateRefStdinTransaction {
         let GitError::Transaction(message) = &err else {
             return err;
         };
+        if let Some((new_ref, path)) = parse_non_empty_ref_directory_message(message) {
+            eprintln!(
+                "fatal: cannot lock ref '{requested}': there is a non-empty directory '{path}' blocking reference '{new_ref}'"
+            );
+            return GitError::Exit(128);
+        }
         // Backend message: "cannot lock ref '<new>': '<existing>' exists; cannot create '<new>'".
         let Some((new_ref, existing_ref)) = parse_df_conflict_message(message) else {
             return err;
@@ -2700,22 +2850,7 @@ impl UpdateRefStdinTransaction {
     }
 
     fn original_ref(&mut self, store: &FileRefStore, name: &str) -> Result<Option<RefTarget>> {
-        if name == "HEAD" || !name.starts_with("refs/") {
-            return store.read_ref(name);
-        }
-        if self.ref_snapshot.is_none() {
-            self.ref_snapshot = Some(
-                store
-                    .list_refs()?
-                    .into_iter()
-                    .map(|reference| (reference.name, reference.target))
-                    .collect(),
-            );
-        }
-        Ok(self
-            .ref_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.get(name).cloned()))
+        self.read_ref_for_deref(store, name)
     }
 
     fn is_prepared(&self) -> bool {
@@ -3299,6 +3434,14 @@ fn update_ref_stdin_commit_staged(
     staged: Vec<UpdateRefStdinStagedChange>,
     run_hooks: bool,
 ) -> Result<()> {
+    let warn_symlink_refs = context.store.prefers_symlink_refs()
+        && staged.iter().any(|change| {
+            matches!(
+                change,
+                UpdateRefStdinStagedChange::SymrefCreate(_)
+                    | UpdateRefStdinStagedChange::SymrefUpdate(_)
+            )
+        });
     let zero = zero_oid(context.format)?;
     let hook = ReferenceTransactionHookRunner::new(context.git_dir);
     let mut tx = context.store.transaction();
@@ -3359,7 +3502,7 @@ fn update_ref_stdin_commit_staged(
                 .then(|| ReflogEntry {
                     old_oid,
                     new_oid: write.new_oid,
-                    committer: ref_reflog_committer(),
+                    committer: ref_reflog_committer(context.config),
                     message: context.message.clone(),
                 });
                 tx.update(RefUpdate {
@@ -3405,7 +3548,7 @@ fn update_ref_stdin_commit_staged(
             }
             UpdateRefStdinStagedChange::SymrefCreate(create) => {
                 requested_by_name.insert(create.name.clone(), create.name.clone());
-                validate_ref_name(&create.name)?;
+                sley_refs::validate_ref_name_for_update(&create.name)?;
                 if let Some(current) = context.store.read_ref(&create.name)? {
                     return match current {
                         RefTarget::Symbolic(_) => {
@@ -3424,7 +3567,7 @@ fn update_ref_stdin_commit_staged(
             }
             UpdateRefStdinStagedChange::SymrefUpdate(update) => {
                 requested_by_name.insert(update.name.clone(), update.requested.clone());
-                validate_ref_name(&update.name)?;
+                sley_refs::validate_ref_name_for_update(&update.name)?;
                 let current =
                     update_ref_stdin_current_target(context, &current_refs, &update.name)?;
                 check_update_ref_stdin_symref_expected(
@@ -3449,7 +3592,7 @@ fn update_ref_stdin_commit_staged(
             }
             UpdateRefStdinStagedChange::SymrefDelete(delete) => {
                 requested_by_name.insert(delete.name.clone(), delete.name.clone());
-                validate_ref_name(&delete.name)?;
+                sley_refs::validate_ref_name_for_update(&delete.name)?;
                 let current =
                     update_ref_stdin_current_target(context, &current_refs, &delete.name)?;
                 if let Some(expected) = delete.expected.as_deref() {
@@ -3482,7 +3625,7 @@ fn update_ref_stdin_commit_staged(
             }
             UpdateRefStdinStagedChange::SymrefVerify(verify) => {
                 requested_by_name.insert(verify.name.clone(), verify.name.clone());
-                validate_ref_name(&verify.name)?;
+                sley_refs::validate_ref_name_for_update(&verify.name)?;
                 let current =
                     update_ref_stdin_current_target(context, &current_refs, &verify.name)?;
                 update_ref_stdin_symref_verify_current(
@@ -3493,9 +3636,17 @@ fn update_ref_stdin_commit_staged(
             }
         }
     }
-    match tx.commit() {
+    let result = match tx.commit() {
         Err(GitError::Transaction(message)) => {
-            if let Some((new_ref, existing_ref)) = parse_df_conflict_message(&message) {
+            if let Some((new_ref, path)) = parse_non_empty_ref_directory_message(&message) {
+                let requested = requested_by_name
+                    .get(&new_ref)
+                    .map(String::as_str)
+                    .unwrap_or(new_ref.as_str());
+                eprintln!(
+                    "fatal: cannot lock ref '{requested}': there is a non-empty directory '{path}' blocking reference '{new_ref}'"
+                );
+            } else if let Some((new_ref, existing_ref)) = parse_df_conflict_message(&message) {
                 let requested = requested_by_name
                     .get(&new_ref)
                     .map(String::as_str)
@@ -3509,7 +3660,23 @@ fn update_ref_stdin_commit_staged(
             Err(GitError::Exit(128))
         }
         result => result,
+    };
+    if result.is_ok() && warn_symlink_refs {
+        warn_prefer_symlink_refs_deprecated();
     }
+    result
+}
+
+fn warn_prefer_symlink_refs_deprecated() {
+    eprintln!("warning: 'core.preferSymlinkRefs=true' is nominated for removal.");
+    eprintln!("hint: The use of symbolic links for symbolic refs is deprecated");
+    eprintln!("hint: and will be removed in Git 3.0. The configuration that");
+    eprintln!("hint: tells Git to use them is thus going away. You can unset");
+    eprintln!("hint: it with:");
+    eprintln!("hint:");
+    eprintln!("hint:\tgit config unset core.preferSymlinkRefs");
+    eprintln!("hint:");
+    eprintln!("hint: Git will then use the textual symref format instead.");
 }
 
 fn update_ref_stdin_bad_command(command: &str) -> Result<()> {
@@ -3573,7 +3740,7 @@ fn update_ref_stdin_symref_create(
     name: &str,
     target: &str,
 ) -> Result<()> {
-    validate_ref_name(name)?;
+    sley_refs::validate_ref_name_for_update(name)?;
     if let Some(current) = context.store.read_ref(name)? {
         return match current {
             RefTarget::Symbolic(_) => update_ref_stdin_symref_exists(name, true),
@@ -3604,7 +3771,7 @@ fn update_ref_stdin_symref_update(
     target: &str,
     expected: Option<UpdateRefStdinSymrefExpected>,
 ) -> Result<()> {
-    validate_ref_name(name)?;
+    sley_refs::validate_ref_name_for_update(name)?;
     match expected {
         Some(UpdateRefStdinSymrefExpected::Target(expected)) => {
             update_ref_stdin_symref_verify(context.store, name, Some(&expected))?;
@@ -3684,7 +3851,7 @@ fn update_ref_stdin_symref_reflog(
     Ok(Some(ReflogEntry {
         old_oid,
         new_oid,
-        committer: ref_reflog_committer(),
+        committer: ref_reflog_committer(context.config),
         message: context.message.clone(),
     }))
 }
@@ -4181,7 +4348,7 @@ fn update_ref_stdin_write(
             .then(|| ReflogEntry {
                 old_oid,
                 new_oid: request.new_oid,
-                committer: ref_reflog_committer(),
+                committer: ref_reflog_committer(context.config),
                 message: context.message.clone(),
             });
     let hook = ReferenceTransactionHookRunner::new(context.git_dir);
@@ -4249,6 +4416,7 @@ fn update_ref_delete(
     store: &FileRefStore,
     git_dir: &Path,
     format: ObjectFormat,
+    config: &GitConfig,
     name: &str,
     expected: Option<&ObjectId>,
     message: &[u8],
@@ -4306,7 +4474,7 @@ fn update_ref_delete(
             &ReflogEntry {
                 old_oid: deleted_oid,
                 new_oid: zero_oid(format)?,
-                committer: ref_reflog_committer(),
+                committer: ref_reflog_committer(config),
                 message: message.to_vec(),
             },
         )?;
@@ -4394,7 +4562,11 @@ fn update_ref_should_write_reflog(git_dir: &Path, name: &str, create_reflog: boo
         return Ok(update_ref_log_all_ref_updates_matches(name, &value));
     }
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
-    let Ok(config) = GitConfig::read(common_git_dir.join("config")) else {
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(sley_config::git_dir_for_include_context(&common_git_dir)),
+        sley_config::repo_current_branch_name(&common_git_dir),
+    );
+    let Ok(config) = sley_config::load_effective_config(&common_git_dir, &context) else {
         return Ok(false);
     };
     if let Some(value) = config.get("core", None, "logAllRefUpdates") {
@@ -4406,12 +4578,12 @@ fn update_ref_should_write_reflog(git_dir: &Path, name: &str, create_reflog: boo
     Ok(update_ref_log_all_ref_updates_matches(name, "true"))
 }
 
-fn ref_reflog_committer() -> Vec<u8> {
+fn ref_reflog_committer(config: &GitConfig) -> Vec<u8> {
     let date = match env::var("GIT_COMMITTER_DATE") {
         Ok(date) if !date.is_empty() => date,
         _ => format!("@{} +0000", current_unix_seconds().max(1)),
     };
-    commit_identity_from_env_with_date("COMMITTER", &date).unwrap_or_else(|_| {
+    commit_identity_from_env_with_date("COMMITTER", &date, config).unwrap_or_else(|_| {
         let timestamp = current_unix_seconds().max(1);
         format!("Git Rs <sley@example.invalid> {timestamp} +0000").into_bytes()
     })
@@ -4617,8 +4789,11 @@ fn update_ref_delete_lock_failure(name: &str, reason: &str) -> Result<()> {
     Err(GitError::Exit(1))
 }
 
-pub(crate) fn cmd_show_ref(args: &[String]) -> Result<()> {
-    let git_dir = crate::session::cli_git_dir()?;
+pub(crate) fn cmd_show_ref(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
@@ -4721,7 +4896,8 @@ pub(crate) fn cmd_show_ref(args: &[String]) -> Result<()> {
         }
         for filter in filters {
             if filter == "HEAD" {
-                let oid = resolve_revision(&git_dir, format, "HEAD")?;
+                let oid =
+                    resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects())?;
                 if !quiet {
                     print_show_ref(&oid, filter, hash_only, abbrev);
                     print_show_ref_deref(&db, format, &oid, filter, dereference, abbrev)?;
@@ -4757,7 +4933,9 @@ pub(crate) fn cmd_show_ref(args: &[String]) -> Result<()> {
     }
     let mut matched = false;
     let refs = store.list_refs()?;
-    if include_head && let Ok(oid) = resolve_revision(&git_dir, format, "HEAD") {
+    if include_head
+        && let Ok(oid) = resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects())
+    {
         matched = true;
         if !quiet {
             print_show_ref(&oid, "HEAD", hash_only, abbrev);
@@ -4791,7 +4969,6 @@ pub(crate) fn cmd_show_ref(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
-
 
 fn show_ref_exists(store: &FileRefStore, name: &str) -> Result<bool> {
     store.raw_ref_exists(name)
@@ -4877,8 +5054,11 @@ fn print_show_ref_deref(
     Ok(())
 }
 
-pub(crate) fn cmd_symbolic_ref(args: &[String]) -> Result<()> {
-    let git_dir = crate::session::cli_git_dir()?;
+pub(crate) fn cmd_symbolic_ref(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     let specs = symbolic_ref_option_specs();
@@ -4921,7 +5101,15 @@ pub(crate) fn cmd_symbolic_ref(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
-        [name, target] => update_symbolic_ref(&git_dir, &store, format, name, target, message),
+        [name, target] => update_symbolic_ref(
+            &git_dir,
+            &store,
+            format,
+            &identity_effective_config_for(cli_session).unwrap_or_default(),
+            name,
+            target,
+            message,
+        ),
         _ => Err(GitError::Command(
             "symbolic-ref currently supports: symbolic-ref [--short] [--quiet] <name> or symbolic-ref <name> <ref>"
                 .into(),
@@ -4933,6 +5121,7 @@ fn update_symbolic_ref(
     git_dir: &Path,
     store: &FileRefStore,
     format: ObjectFormat,
+    config: &GitConfig,
     name: &str,
     target: &str,
     message: Vec<u8>,
@@ -4954,7 +5143,7 @@ fn update_symbolic_ref(
     let reflog = symbolic_ref_should_write_reflog(git_dir, name)?.then(|| ReflogEntry {
         old_oid,
         new_oid,
-        committer: ref_reflog_committer(),
+        committer: ref_reflog_committer(config),
         message,
     });
     let hook = ReferenceTransactionHookRunner::new(git_dir);
@@ -5114,18 +5303,28 @@ fn symbolic_ref_usage_error(error: UsageError) -> GitError {
 /// `git refs` command group (builtin/refs.c, git 2.54). Dispatches to the ref
 /// plumbing subcommands. `list` is an exact clone of `for-each-ref` (it calls
 /// the same for_each_ref_core in git); `exists` is a raw ref-existence probe.
-pub(crate) fn cmd_refs(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_refs(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let Some(subcommand) = args.first().map(String::as_str) else {
         eprintln!("error: need a subcommand");
         print_refs_usage();
         return Err(GitError::Exit(129));
     };
     match subcommand {
-        "list" => commands::for_each_ref::for_each_ref_core(&args[1..], "git refs list"),
-        "exists" => cmd_refs_exists(&args[1..]),
-        "verify" => commands::refs_verify::cmd_refs_verify(&args[1..]),
-        "migrate" => cmd_refs_migrate(&args[1..]),
-        "optimize" => commands::pack::cmd_pack_refs(&args[1..]),
+        "list" => {
+            let git_dir = cli_session.git_dir()?;
+            let config = identity_effective_config_for(cli_session).unwrap_or_default();
+            commands::for_each_ref::for_each_ref_core_with_config(
+                cli_session,
+                &git_dir,
+                &args[1..],
+                "git refs list",
+                &config,
+            )
+        }
+        "exists" => cmd_refs_exists(cli_session, &args[1..]),
+        "verify" => commands::refs_verify::cmd_refs_verify(cli_session, &args[1..]),
+        "migrate" => cmd_refs_migrate(cli_session, &args[1..]),
+        "optimize" => commands::pack::cmd_pack_refs(cli_session, &args[1..]),
         "-h" | "--help" => {
             print_refs_usage();
             Err(GitError::Exit(129))
@@ -5138,7 +5337,7 @@ pub(crate) fn cmd_refs(args: &[String]) -> Result<()> {
     }
 }
 
-fn cmd_refs_migrate(args: &[String]) -> Result<()> {
+fn cmd_refs_migrate(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut target_format = None::<RefStorageFormat>;
     let mut dry_run = false;
     let mut include_reflogs = true;
@@ -5185,63 +5384,36 @@ fn cmd_refs_migrate(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(129));
     };
 
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
-    let current_format = refs_migrate_current_format(&common_git_dir)?;
-    if current_format == target_format {
-        eprintln!(
-            "error: repository already uses '{}' format",
-            current_format.name()
-        );
-        return Err(GitError::Exit(1));
-    }
-    if refs_migrate_has_linked_worktrees(&common_git_dir) {
-        eprintln!("error: migrating repositories with worktrees is not supported yet");
-        return Err(GitError::Exit(1));
-    }
-
-    let source = FileRefStore::new(&git_dir, format);
-    let refs = source.list_all_refs()?;
-    let reflogs = if include_reflogs {
-        let mut names = source
-            .list_reflog_names()?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        for reference in &refs {
-            names.insert(reference.name.clone());
+    let outcome = match sley_refs::migration::migrate_ref_storage(
+        sley_refs::migration::MigrateRefStorageOptions {
+            git_dir: &git_dir,
+            common_git_dir: &common_git_dir,
+            object_format: format,
+            target_format,
+            include_reflogs,
+            dry_run,
+        },
+    ) {
+        Ok(outcome) => outcome,
+        Err(sley_refs::migration::MigrateRefStorageError::AlreadyUses(format)) => {
+            eprintln!("error: repository already uses '{}' format", format.name());
+            return Err(GitError::Exit(1));
         }
-        let mut reflogs = Vec::new();
-        for name in names {
-            let entries = source.read_reflog(&name)?;
-            if !entries.is_empty() {
-                reflogs.push((name, entries));
-            }
+        Err(sley_refs::migration::MigrateRefStorageError::LinkedWorktreesUnsupported) => {
+            eprintln!("error: migrating repositories with worktrees is not supported yet");
+            return Err(GitError::Exit(1));
         }
-        reflogs
-    } else {
-        Vec::new()
+        Err(sley_refs::migration::MigrateRefStorageError::Storage(err)) => return Err(err),
     };
-
-    let migration_dir = create_ref_migration_dir(&common_git_dir)?;
-    write_migrated_ref_store(&migration_dir, format, target_format, &refs, &reflogs)?;
-    if dry_run {
+    if let Some(migration_dir) = outcome.dry_run_path {
         println!(
             "Finished dry-run migration of refs, the result can be found at '{}'",
-            refs_migrate_display_path(&git_dir, &common_git_dir, &migration_dir)
+            refs_migrate_display_path(cli_session, &git_dir, &common_git_dir, &migration_dir)
         );
-        return Ok(());
     }
-
-    install_migrated_ref_store(
-        &git_dir,
-        &common_git_dir,
-        &migration_dir,
-        target_format,
-        &refs,
-    )?;
-    update_ref_storage_config(&common_git_dir, target_format)?;
-    let _ = fs::remove_dir_all(&migration_dir);
     Ok(())
 }
 
@@ -5255,207 +5427,13 @@ fn parse_refs_migrate_ref_format(value: &str) -> Result<RefStorageFormat> {
     }
 }
 
-fn refs_migrate_current_format(common_git_dir: &Path) -> Result<RefStorageFormat> {
-    let Ok(config) = GitConfig::read(common_git_dir.join("config")) else {
-        return Ok(RefStorageFormat::Files);
-    };
-    Ok(match config.get("extensions", None, "refStorage") {
-        Some("reftable") => RefStorageFormat::Reftable,
-        Some(value) if value.starts_with("reftable://") => RefStorageFormat::Reftable,
-        _ => RefStorageFormat::Files,
-    })
-}
-
-fn refs_migrate_has_linked_worktrees(common_git_dir: &Path) -> bool {
-    fs::read_dir(common_git_dir.join("worktrees"))
-        .map(|mut entries| entries.any(|entry| entry.is_ok()))
-        .unwrap_or(false)
-}
-
-fn create_ref_migration_dir(common_git_dir: &Path) -> Result<PathBuf> {
-    for attempt in 0..1000u32 {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let path = common_git_dir.join(format!(
-            "ref_migration.{:x}{:x}",
-            std::process::id(),
-            nanos + u128::from(attempt)
-        ));
-        match fs::create_dir(&path) {
-            Ok(()) => return Ok(path),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Err(GitError::Io(
-        "unable to create temporary ref migration directory".into(),
-    ))
-}
-
-fn write_migrated_ref_store(
-    migration_dir: &Path,
-    format: ObjectFormat,
-    target_format: RefStorageFormat,
-    refs: &[Ref],
-    reflogs: &[(String, Vec<ReflogEntry>)],
-) -> Result<()> {
-    if target_format == RefStorageFormat::Reftable {
-        write_ref_migration_config(migration_dir, target_format)?;
-    } else {
-        fs::write(
-            migration_dir.join("HEAD"),
-            b"ref: refs/heads/__sley_migration_placeholder__\n",
-        )?;
-    }
-    let store = FileRefStore::new(migration_dir, format);
-    store.import_snapshot(refs, reflogs, target_format == RefStorageFormat::Files)?;
-    Ok(())
-}
-
-fn write_ref_migration_config(git_dir: &Path, target_format: RefStorageFormat) -> Result<()> {
-    let mut config = GitConfig::default();
-    refs_migrate_set_config_value(&mut config, "core", "repositoryformatversion", "1");
-    if target_format == RefStorageFormat::Reftable {
-        refs_migrate_set_config_value(&mut config, "extensions", "refStorage", "reftable");
-    }
-    fs::write(git_dir.join("config"), config.to_canonical_bytes())?;
-    Ok(())
-}
-
-fn install_migrated_ref_store(
+fn refs_migrate_display_path(
+    cli_session: &crate::session::CliSession,
     git_dir: &Path,
     common_git_dir: &Path,
-    migration_dir: &Path,
-    target_format: RefStorageFormat,
-    refs: &[Ref],
-) -> Result<()> {
-    match target_format {
-        RefStorageFormat::Files => {
-            remove_path_if_exists(&common_git_dir.join("reftable"))?;
-            remove_path_if_exists(&common_git_dir.join("refs"))?;
-            remove_path_if_exists(&common_git_dir.join("logs"))?;
-            remove_path_if_exists(&common_git_dir.join("packed-refs"))?;
-            move_path_if_exists(&migration_dir.join("HEAD"), &git_dir.join("HEAD"))?;
-            for reference in refs {
-                if !reference.name.starts_with("refs/") && reference.name != "HEAD" {
-                    move_path_if_exists(
-                        &migration_dir.join(&reference.name),
-                        &git_dir.join(&reference.name),
-                    )?;
-                }
-            }
-            move_path_if_exists(&migration_dir.join("refs"), &common_git_dir.join("refs"))?;
-            fs::create_dir_all(common_git_dir.join("refs").join("heads"))?;
-            fs::create_dir_all(common_git_dir.join("refs").join("tags"))?;
-            move_path_if_exists(&migration_dir.join("logs"), &common_git_dir.join("logs"))?;
-            move_path_if_exists(
-                &migration_dir.join("packed-refs"),
-                &common_git_dir.join("packed-refs"),
-            )?;
-        }
-        RefStorageFormat::Reftable => {
-            remove_path_if_exists(&common_git_dir.join("reftable"))?;
-            remove_path_if_exists(&common_git_dir.join("refs"))?;
-            remove_path_if_exists(&common_git_dir.join("logs"))?;
-            remove_path_if_exists(&common_git_dir.join("packed-refs"))?;
-            for reference in refs {
-                if !reference.name.starts_with("refs/")
-                    && reference.name != "HEAD"
-                    && reference.name != "FETCH_HEAD"
-                    && reference.name != "MERGE_HEAD"
-                {
-                    remove_path_if_exists(&git_dir.join(&reference.name))?;
-                }
-            }
-            move_path_if_exists(
-                &migration_dir.join("reftable"),
-                &common_git_dir.join("reftable"),
-            )?;
-            fs::write(git_dir.join("HEAD"), b"ref: refs/heads/.invalid\n")?;
-            fs::create_dir_all(common_git_dir.join("refs"))?;
-            fs::write(
-                common_git_dir.join("refs").join("heads"),
-                b"this repository uses the reftable format\n",
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn remove_path_if_exists(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)?,
-        Ok(_) => fs::remove_file(path)?,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
-    }
-    Ok(())
-}
-
-fn move_path_if_exists(from: &Path, to: &Path) -> Result<()> {
-    if !from.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    remove_path_if_exists(to)?;
-    fs::rename(from, to)?;
-    Ok(())
-}
-
-fn update_ref_storage_config(common_git_dir: &Path, target_format: RefStorageFormat) -> Result<()> {
-    let config_path = common_git_dir.join("config");
-    let mut config = GitConfig::read(&config_path).unwrap_or_default();
-    refs_migrate_set_config_value(&mut config, "core", "repositoryformatversion", "1");
-    refs_migrate_set_config_value(
-        &mut config,
-        "extensions",
-        "refStorage",
-        target_format.name(),
-    );
-    fs::write(config_path, config.to_canonical_bytes())?;
-    Ok(())
-}
-
-fn refs_migrate_set_config_value(
-    config: &mut GitConfig,
-    section_name: &str,
-    key_name: &str,
-    value: &str,
-) {
-    let section_idx = config
-        .sections
-        .iter()
-        .rposition(|section| section.name.eq_ignore_ascii_case(section_name))
-        .unwrap_or_else(|| {
-            config.sections.push(ConfigSection::new(
-                section_name.to_string(),
-                None,
-                Vec::new(),
-            ));
-            config.sections.len() - 1
-        });
-    let section = &mut config.sections[section_idx];
-    if let Some(entry) = section
-        .entries
-        .iter_mut()
-        .find(|entry| entry.key.eq_ignore_ascii_case(key_name))
-    {
-        entry.key = key_name.to_string();
-        entry.value = Some(value.to_string());
-        return;
-    }
-    section.entries.push(ConfigEntry::new(
-        key_name.to_string(),
-        Some(value.to_string()),
-    ));
-}
-
-fn refs_migrate_display_path(git_dir: &Path, common_git_dir: &Path, path: &Path) -> String {
-    if let Ok(worktree) = worktree_root_for_git_dir(git_dir) {
+    path: &Path,
+) -> String {
+    if let Ok(worktree) = worktree_root_for_git_dir(cli_session, git_dir) {
         let dot_git = worktree.join(".git");
         if paths_refer_to_same_dir(common_git_dir, &dot_git)
             && let Ok(relative) = path.strip_prefix(common_git_dir)
@@ -5469,7 +5447,7 @@ fn refs_migrate_display_path(git_dir: &Path, common_git_dir: &Path, path: &Path)
 /// `git refs exists <ref>` — exit 0 if the raw ref exists, 2 if it does not
 /// (ENOENT/EISDIR), matching builtin/refs.c::cmd_refs_exists. Does not DWIM and
 /// does not read the pointed-at object.
-fn cmd_refs_exists(args: &[String]) -> Result<()> {
+fn cmd_refs_exists(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     // git: `argc != 1` after option parsing -> die. There are no options other
     // than -h, which parse_options would have consumed in cmd_refs already.
     let refs: Vec<&String> = args.iter().filter(|arg| arg.as_str() != "--").collect();
@@ -5478,7 +5456,7 @@ fn cmd_refs_exists(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     let name = refs[0];
-    let git_dir = crate::session::cli_git_dir()?;
+    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     if store.raw_ref_exists(name)? {

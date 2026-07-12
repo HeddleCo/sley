@@ -1,23 +1,58 @@
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use std::cell::RefCell;
 use std::io::{ErrorKind, Read, Write};
-use std::sync::RwLock;
+use std::marker::PhantomData;
+use std::rc::Rc;
 
-static PACKET_TRACE_IDENTITY: RwLock<Option<String>> = RwLock::new(None);
+thread_local! {
+    static PACKET_TRACE_IDENTITY: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 /// Set the program identity used in subsequent packet traces (the CLI sets this
 /// from the running subcommand). Mirrors `packet_trace_identity(prog)`.
 pub fn set_packet_trace_identity(prog: &str) {
-    if let Ok(mut guard) = PACKET_TRACE_IDENTITY.write() {
-        *guard = Some(prog.to_string());
+    PACKET_TRACE_IDENTITY.with(|identity| {
+        *identity.borrow_mut() = Some(prog.to_string());
+    });
+}
+
+/// Temporarily set the packet-trace identity for the current thread.
+///
+/// Dropping the returned guard restores the previous identity, including across
+/// early returns and errors. The guard is intentionally not `Send`: moving it
+/// to another thread would restore state in the wrong thread-local slot.
+#[must_use = "the guard must be retained for the desired trace-identity scope"]
+pub fn scoped_packet_trace_identity(prog: &str) -> PacketTraceIdentityGuard {
+    let previous =
+        PACKET_TRACE_IDENTITY.with(|identity| identity.borrow_mut().replace(prog.to_string()));
+    PacketTraceIdentityGuard {
+        previous,
+        _not_send: PhantomData,
+    }
+}
+
+/// Restores a packet-trace identity installed by
+/// [`scoped_packet_trace_identity`] when dropped.
+pub struct PacketTraceIdentityGuard {
+    previous: Option<String>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for PacketTraceIdentityGuard {
+    fn drop(&mut self) {
+        PACKET_TRACE_IDENTITY.with(|identity| {
+            *identity.borrow_mut() = self.previous.take();
+        });
     }
 }
 
 fn packet_trace_prefix() -> String {
-    PACKET_TRACE_IDENTITY
-        .read()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .unwrap_or_else(|| "git".to_string())
+    PACKET_TRACE_IDENTITY.with(|identity| {
+        identity
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| "git".to_string())
+    })
 }
 
 /// The destination for `GIT_TRACE_PACKET`: `1`/`2`/`true` → stderr, an absolute
@@ -299,7 +334,9 @@ pub fn parse_pkt_line_stream(mut input: &[u8]) -> Result<Vec<PktLineFrame>> {
     Ok(frames)
 }
 
-pub(crate) fn parse_pkt_line_frames_until_flush_from(mut input: &[u8]) -> Result<(Vec<PktLineFrame>, usize)> {
+pub(crate) fn parse_pkt_line_frames_until_flush_from(
+    mut input: &[u8],
+) -> Result<(Vec<PktLineFrame>, usize)> {
     let mut frames = Vec::new();
     let mut total = 0usize;
     loop {
@@ -326,7 +363,9 @@ pub fn read_pkt_line_frame(reader: &mut impl Read) -> Result<Option<PktLineFrame
         match reader.read(&mut header[read..]) {
             Ok(0) if read == 0 => return Ok(None),
             Ok(0) => {
-                return Err(GitError::InvalidFormat("truncated pkt-line length".into()));
+                return Err(GitError::InvalidFormat(format!(
+                    "{read} bytes of length header were received"
+                )));
             }
             Ok(n) => read += n,
             Err(err) if err.kind() == ErrorKind::Interrupted => {}
@@ -346,7 +385,20 @@ pub fn read_pkt_line_frame(reader: &mut impl Read) -> Result<Option<PktLineFrame
         }
         4..=PKT_LINE_MAX_LEN => {
             let mut payload = vec![0; len - 4];
-            reader.read_exact(&mut payload)?;
+            let mut read = 0usize;
+            while read < payload.len() {
+                match reader.read(&mut payload[read..]) {
+                    Ok(0) => {
+                        return Err(GitError::InvalidFormat(format!(
+                            "{} bytes of body are still expected",
+                            payload.len() - read
+                        )));
+                    }
+                    Ok(n) => read += n,
+                    Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
             PktLineFrame::Data(payload)
         }
         _ => {
@@ -997,4 +1049,41 @@ pub(crate) fn line_from_str(payload: &str) -> Vec<u8> {
 
 pub(crate) fn trim_trailing_lf(input: &[u8]) -> &[u8] {
     input.strip_suffix(b"\n").unwrap_or(input)
+}
+
+#[cfg(test)]
+mod packet_trace_identity_tests {
+    use super::*;
+
+    #[test]
+    fn scoped_packet_identity_restores_nested_state() {
+        set_packet_trace_identity("outer");
+        assert_eq!(packet_trace_prefix(), "outer");
+        {
+            let _inner = scoped_packet_trace_identity("inner");
+            assert_eq!(packet_trace_prefix(), "inner");
+            {
+                let _nested = scoped_packet_trace_identity("nested");
+                assert_eq!(packet_trace_prefix(), "nested");
+            }
+            assert_eq!(packet_trace_prefix(), "inner");
+        }
+        assert_eq!(packet_trace_prefix(), "outer");
+    }
+
+    #[test]
+    fn packet_identity_is_isolated_between_threads() {
+        set_packet_trace_identity("main-thread");
+        let worker = std::thread::spawn(|| {
+            assert_eq!(packet_trace_prefix(), "git");
+            set_packet_trace_identity("worker-thread");
+            {
+                let _scoped = scoped_packet_trace_identity("worker-scoped");
+                assert_eq!(packet_trace_prefix(), "worker-scoped");
+            }
+            assert_eq!(packet_trace_prefix(), "worker-thread");
+        });
+        worker.join().expect("packet identity worker");
+        assert_eq!(packet_trace_prefix(), "main-thread");
+    }
 }

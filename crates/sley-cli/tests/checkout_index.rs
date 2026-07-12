@@ -325,6 +325,43 @@ fn checkout_index_prefix_matches_upstream_git() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[cfg(unix)]
+#[test]
+fn checkout_index_prefix_follows_symlinked_prefix_directory() {
+    use std::os::unix::fs::symlink;
+
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("checkout-index-prefix-symlink");
+    let (upstream, rust) = prepare_pair("prefix-symlink", &root);
+    for repo in [&upstream, &rust] {
+        fs::create_dir(repo.join("tmp1")).expect("create symlink target");
+        symlink("tmp1", repo.join("tmp")).expect("create prefix symlink");
+    }
+
+    let args = ["checkout-index", "--prefix=tmp/orary-", "-f", "-a"];
+    let expected = run(sley_testkit::oracle_git(), &upstream, &args);
+    let actual = run(SLEY, &rust, &args);
+    assert_same_output(actual, expected, &args);
+    for path in ["tmp1/orary-file.txt", "tmp1/orary-dir/nested.txt"] {
+        assert_eq!(
+            fs::read(rust.join(path)).expect("read sley prefixed output"),
+            fs::read(upstream.join(path)).expect("read git prefixed output"),
+            "prefixed file differed at {path}"
+        );
+    }
+    assert!(
+        fs::symlink_metadata(rust.join("tmp"))
+            .expect("stat prefix symlink")
+            .file_type()
+            .is_symlink(),
+        "checkout-index replaced the caller-provided prefix symlink"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn checkout_index_stdin_matches_upstream_git() {
     if !git_available() {
@@ -411,6 +448,53 @@ fn checkout_index_update_stat_matches_upstream_git() {
         let actual = run(sley_testkit::oracle_git(), &rust, &diff_args);
         assert_same_output(actual, expected, &diff_args);
     };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkout_index_update_stat_preserves_sparse_index_layout() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("checkout-index-sparse-update-stat");
+    let (upstream, rust) = prepare_pair("sparse-update-stat", &root);
+    for repo in [&upstream, &rust] {
+        run_success(
+            sley_testkit::oracle_git(),
+            repo,
+            &["sparse-checkout", "init", "--cone", "--sparse-index"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            repo,
+            &["sparse-checkout", "set", "selected"],
+        );
+    }
+
+    let args = ["checkout-index", "-f", "-u", "--all"];
+    let expected = run(sley_testkit::oracle_git(), &upstream, &args);
+    let actual = run(SLEY, &rust, &args);
+    assert_same_output(actual, expected, &args);
+
+    let expected_layout = run_success(
+        sley_testkit::oracle_git(),
+        &upstream,
+        &["ls-files", "--sparse", "--stage"],
+    );
+    let actual_layout = run_success(
+        sley_testkit::oracle_git(),
+        &rust,
+        &["ls-files", "--sparse", "--stage"],
+    );
+    assert_eq!(
+        actual_layout, expected_layout,
+        "sparse index layout changed"
+    );
+    assert!(
+        String::from_utf8_lossy(&actual_layout).contains("\tdir/\n"),
+        "out-of-cone directory was expanded on disk"
+    );
+
     let _ = fs::remove_dir_all(&root);
 }
 

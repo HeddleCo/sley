@@ -5,8 +5,6 @@ use sley::{GitError, ObjectFormat, Result};
 use crate::log_cli::{
     log_days_from_civil, log_parse_date_ymd, log_parse_time_hms, log_parse_timezone_offset_seconds,
 };
-use crate::repo_helpers::repository_object_format;
-use crate::session;
 use crate::sley_refs::{FileRefStore, branch_ref_name};
 use crate::sley_rev;
 
@@ -104,25 +102,24 @@ pub(crate) fn reflog_invalid_integer_error(value: &str) -> GitError {
     GitError::Exit(1)
 }
 
-pub(crate) fn reflog_reference_name(value: Option<&str>) -> Result<String> {
+pub(crate) fn reflog_reference_name(
+    store: &FileRefStore,
+    git_dir: &std::path::Path,
+    format: ObjectFormat,
+    value: Option<&str>,
+) -> Result<String> {
     let Some(value) = value else {
         return Ok("HEAD".to_string());
     };
     if value == "HEAD" || value.starts_with("refs/") {
         return Ok(value.to_string());
     }
-    if let Ok(git_dir) = session::cli_git_dir()
-        && let Ok(format) = repository_object_format(&git_dir)
+    if let Ok(Some(refname)) = sley_rev::resolve_revision_symbolic_full_name(git_dir, format, value)
     {
-        if let Ok(Some(refname)) =
-            sley_rev::resolve_revision_symbolic_full_name(&git_dir, format, value)
-        {
-            return Ok(refname);
-        }
-        let store = FileRefStore::new(&git_dir, format);
-        if store.read_ref(&format!("refs/{value}"))?.is_some() {
-            return Ok(format!("refs/{value}"));
-        }
+        return Ok(refname);
+    }
+    if store.read_ref(&format!("refs/{value}"))?.is_some() {
+        return Ok(format!("refs/{value}"));
     }
     branch_ref_name(value)
 }

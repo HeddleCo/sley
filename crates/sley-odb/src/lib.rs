@@ -5,30 +5,44 @@
 use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 use sley_object::{EncodedObject, ObjectType};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+mod gc;
 mod install;
 mod loose;
+mod midx;
 mod pack;
 mod reachability;
 mod registry;
 mod repack;
 
+pub use gc::*;
 pub use install::*;
 pub use loose::*;
+pub use midx::*;
 // Re-exported so callers of the progress-aware installer can name the counter
 // struct without depending on `sley-pack` directly.
-pub use sley_pack::PackStreamProgress;
 pub use pack::*;
 pub use reachability::*;
 pub use registry::*;
 pub use repack::*;
+pub use sley_pack::PackStreamProgress;
 
 static TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub trait ObjectReader {
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>>;
+
+    /// Return the immediate on-disk delta base for `oid`, when the reader can
+    /// expose storage metadata without decoding the object body.
+    ///
+    /// Transfer-pack generation uses this optional hint to preserve an
+    /// existing delta whose base is already owned by the receiver. Readers
+    /// without pack storage keep the default `None` behavior.
+    fn reusable_delta_base(&self, _oid: &ObjectId) -> Result<Option<ObjectId>> {
+        Ok(None)
+    }
 
     /// Graft-points seam (shallow clones today, replace refs/grafts later):
     /// `true` when history is cut at `oid`, so every walk must treat the
@@ -64,13 +78,26 @@ pub trait ObjectWriter {
     fn write_object(&self, object: EncodedObject) -> Result<ObjectId>;
 }
 
-pub(crate) fn implied_empty_tree_object(format: ObjectFormat, oid: &ObjectId) -> Option<Arc<EncodedObject>> {
-    (*oid == ObjectId::empty_tree(format)).then(|| Arc::new(EncodedObject::new(ObjectType::Tree, Vec::new())))
+pub(crate) fn implied_empty_tree_object(
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Option<Arc<EncodedObject>> {
+    (*oid == ObjectId::empty_tree(format))
+        .then(|| Arc::new(EncodedObject::new(ObjectType::Tree, Vec::new())))
 }
 
-pub(crate) fn with_missing_object_context(err: GitError, oid: ObjectId, context: MissingObjectContext) -> GitError {
-    let kind = err.not_found_kind().and_then(sley_core::NotFoundKind::missing_object_kind);
-    match kind { Some(kind) => GitError::object_kind_not_found_in(oid, kind, context), None => err }
+pub(crate) fn with_missing_object_context(
+    err: GitError,
+    oid: ObjectId,
+    context: MissingObjectContext,
+) -> GitError {
+    let kind = err
+        .not_found_kind()
+        .and_then(sley_core::NotFoundKind::missing_object_kind);
+    match kind {
+        Some(kind) => GitError::object_kind_not_found_in(oid, kind, context),
+        None => err,
+    }
 }
 
 /// Parents of a parsed commit with the graft seam applied: empty when the
@@ -92,17 +119,16 @@ pub(crate) fn unique_temp_path(parent: &Path) -> PathBuf {
     parent.join(format!("tmp_obj_{}_{}", std::process::id(), id))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
-    use std::io::Read;
-    use std::fs;
     use sley_core::BString;
-    use sley_formats::{Bundle, BundleReference, RepositoryLayout};
+    use sley_formats::Bundle;
     use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntry};
-    use sley_pack::{MultiPackIndex, PackFile, PackIndex, PackWrite, PackWriteOptions};
+    use sley_pack::{MultiPackIndex, PackBitmapIndex, PackFile, PackIndex, PackWriteOptions};
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::io::Read;
 
     fn blob_of(byte: u8, len: usize) -> EncodedObject {
         EncodedObject::new(ObjectType::Blob, vec![byte; len])
@@ -118,6 +144,64 @@ mod tests {
             .expect("test operation should succeed")
             .as_ref()
             .clone()
+    }
+
+    #[test]
+    fn injected_replacements_affect_reads_but_not_raw_enumeration() {
+        let root = temp_root("replacement_reads");
+        let db = FileObjectDatabase::new(root.join("objects"), ObjectFormat::Sha1);
+        let original = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"original".to_vec()))
+            .expect("write original");
+        let replacement = db
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"replacement".to_vec(),
+            ))
+            .expect("write replacement");
+        let replacing = db
+            .clone()
+            .with_replacements(ObjectReplacements::new([(original, replacement)]));
+
+        assert_eq!(
+            replacing
+                .read_object(&original)
+                .expect("replacement read")
+                .body,
+            b"replacement"
+        );
+        assert_eq!(
+            replacing
+                .read_object_header(&original)
+                .expect("replacement header"),
+            Some((ObjectType::Blob, 11))
+        );
+        let ids = replacing.object_ids().expect("raw object enumeration");
+        assert!(ids.contains(&original));
+        assert!(ids.contains(&replacement));
+        assert_eq!(
+            db.read_object(&original).expect("raw read").body,
+            b"original"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replacement_policy_rejects_cycles() {
+        let first = sley_core::digest_bytes(ObjectFormat::Sha1, b"first").expect("first oid");
+        let second = sley_core::digest_bytes(ObjectFormat::Sha1, b"second").expect("second oid");
+        let replacements = ObjectReplacements::new([(first, second), (second, first)]);
+        assert!(matches!(
+            replacements.resolve(&first),
+            Err(GitError::InvalidObject(message)) if message.contains("replace depth too high")
+        ));
+    }
+
+    #[test]
+    fn replacement_policy_treats_identity_mapping_as_noop() {
+        let oid = sley_core::digest_bytes(ObjectFormat::Sha1, b"identity").expect("identity oid");
+        let replacements = ObjectReplacements::new([(oid, oid)]);
+        assert_eq!(replacements.resolve(&oid).expect("identity mapping"), oid);
     }
 
     #[test]
@@ -1072,6 +1156,72 @@ mod tests {
     }
 
     #[test]
+    fn incoming_pack_quarantine_discards_rejected_and_promotes_accepted_objects() {
+        let root = temp_root("sley-incoming-pack-quarantine");
+        let git_dir = root.join("repo.git");
+        fs::create_dir_all(git_dir.join("objects/pack")).expect("create object database");
+        let format = ObjectFormat::Sha1;
+        let destination = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let existing = destination
+            .write_object(EncodedObject::new(ObjectType::Blob, b"existing\n".to_vec()))
+            .expect("write existing object");
+        let borrowed_git_dir = root.join("borrowed.git");
+        fs::create_dir_all(borrowed_git_dir.join("objects/pack"))
+            .expect("create borrowed object database");
+        let borrowed_db = FileObjectDatabase::from_git_dir(&borrowed_git_dir, format);
+        let borrowed = borrowed_db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"borrowed\n".to_vec()))
+            .expect("write borrowed object");
+        fs::create_dir_all(git_dir.join("objects/info")).expect("create alternate metadata");
+        fs::write(
+            git_dir.join("objects/info/alternates"),
+            format!("{}\n", borrowed_git_dir.join("objects").display()),
+        )
+        .expect("write destination alternate");
+        let incoming = EncodedObject::new(ObjectType::Blob, b"incoming\n".to_vec());
+        let incoming_oid = incoming.object_id(format).expect("incoming oid");
+        let pack = PackFile::write_packed(&[&incoming], format).expect("write incoming pack");
+
+        {
+            let quarantine =
+                IncomingPackQuarantine::new(&git_dir, format).expect("create rejected quarantine");
+            let db = quarantine.database();
+            db.install_pack(&pack).expect("stage rejected pack");
+            assert!(db.contains(&existing).expect("read alternate object"));
+            assert!(
+                db.contains(&borrowed)
+                    .expect("read destination's borrowed object")
+            );
+            assert!(db.contains(&incoming_oid).expect("read staged object"));
+        }
+        let reopened = FileObjectDatabase::from_git_dir(&git_dir, format);
+        assert!(
+            reopened
+                .contains(&existing)
+                .expect("existing object remains")
+        );
+        assert!(
+            !reopened
+                .contains(&incoming_oid)
+                .expect("rejected object absent")
+        );
+
+        let quarantine =
+            IncomingPackQuarantine::new(&git_dir, format).expect("create accepted quarantine");
+        quarantine
+            .database()
+            .install_pack(&pack)
+            .expect("stage accepted pack");
+        quarantine.promote().expect("promote accepted pack");
+        let reopened = FileObjectDatabase::from_git_dir(&git_dir, format);
+        assert!(
+            reopened
+                .contains(&incoming_oid)
+                .expect("accepted object persists")
+        );
+    }
+
+    #[test]
     fn file_database_streams_raw_pack_install_to_packfile() {
         use std::io::Write as _;
 
@@ -1186,7 +1336,8 @@ mod tests {
             .expect_err("oversized stream should be rejected");
 
         assert!(
-            err.to_string().contains("pack exceeds maximum allowed size"),
+            err.to_string()
+                .contains("pack exceeds maximum allowed size"),
             "unexpected error: {err}"
         );
         let temp_files = fs::read_dir(&pack_dir)
@@ -1212,11 +1363,7 @@ mod tests {
                 entries
                     .filter_map(|entry| entry.ok())
                     .filter(|entry| {
-                        entry
-                            .path()
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            == Some("pack")
+                        entry.path().extension().and_then(|ext| ext.to_str()) == Some("pack")
                     })
                     .count()
             })
@@ -1559,10 +1706,13 @@ mod tests {
         let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         let mut roots = Vec::new();
+        let shared = "streamed reachable shared payload ".repeat(16);
         for idx in 0..(REACHABLE_PACK_STREAMING_MIN_OBJECTS + 5) {
             let object = EncodedObject::new(
                 ObjectType::Blob,
-                format!("streamed reachable blob {idx:04}\n").into_bytes(),
+                // Large enough that the tiny varying suffix remains inside
+                // Git's half-target-minus-object-id delta budget.
+                format!("{shared}{idx:04}\n").into_bytes(),
             );
             roots.push(
                 db.write_object(object)
@@ -1982,6 +2132,43 @@ mod tests {
     }
 
     #[test]
+    fn object_presence_checker_can_hold_a_closed_world_snapshot() {
+        let root = temp_root("sley-presence-checker-closed-world");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let object = EncodedObject::new(ObjectType::Blob, b"added after snapshot\n".to_vec());
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let mut checker = db.presence_checker();
+        assert!(
+            !checker
+                .contains_without_refresh(&oid)
+                .expect("test operation should succeed")
+        );
+
+        // A separate handle simulates an out-of-band writer whose loose-cache
+        // update is not shared with the checker. Closed-world mode deliberately
+        // holds the miss until the caller requests normal refresh semantics.
+        FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1)
+            .write_object(object)
+            .expect("test operation should succeed");
+        assert!(
+            !checker
+                .contains_without_refresh(&oid)
+                .expect("test operation should succeed")
+        );
+        assert!(
+            checker
+                .contains(&oid)
+                .expect("test operation should succeed")
+        );
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
     fn file_database_pack_registry_loads_indexes_lazily_and_refreshes_after_count_change() {
         let root = temp_root("sley-file-odb-pack-registry-refresh");
         let git_dir = root.join(".git");
@@ -2004,10 +2191,7 @@ mod tests {
         assert_eq!(first_registry.fingerprint.idx_count, 1);
         assert_eq!(first_registry.fingerprint.pack_count, 1);
         assert_eq!(first_registry.packs.len(), 1);
-        assert!(
-            first_registry.packs[0]
-                .index.read().is_none()
-        );
+        assert!(first_registry.packs[0].index.read().is_none());
         assert!(
             first_registry.packs[0]
                 .data
@@ -2022,10 +2206,7 @@ mod tests {
             db.contains(&first_oid)
                 .expect("test operation should succeed")
         );
-        assert!(
-            first_registry.packs[0]
-                .index.read().is_some()
-        );
+        assert!(first_registry.packs[0].index.read().is_some());
         assert!(
             first_registry.packs[0]
                 .data
@@ -2404,6 +2585,330 @@ mod tests {
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
+    fn repack_a_unpacks_unreachable_before_pruning(format: ObjectFormat) {
+        let root = temp_root("sley-repack-unpack-unreachable");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        let mut database = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let graph = write_commit_graph(&mut database, b"reachable graph\n");
+        let root_oid = graph[0].0;
+        let unreachable = EncodedObject::new(ObjectType::Blob, b"packed unreachable\n".to_vec());
+        let unreachable_oid = database
+            .write_object(unreachable.clone())
+            .expect("write unreachable");
+
+        let mut source_objects = graph
+            .iter()
+            .map(|(_, object)| object.clone())
+            .collect::<Vec<_>>();
+        source_objects.push(unreachable);
+        let source =
+            PackFile::write_undeltified(&source_objects, format).expect("write source pack");
+        let installed = database.install_pack(&source).expect("install source pack");
+        for oid in graph
+            .iter()
+            .map(|(oid, _)| *oid)
+            .chain(std::iter::once(unreachable_oid))
+        {
+            fs::remove_file(database.loose().object_path(&oid).expect("loose path"))
+                .expect("remove loose source");
+        }
+        fs::OpenOptions::new()
+            .read(true)
+            .open(&installed.pack_path)
+            .expect("open source pack")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(123))
+            .expect("set pack mtime");
+
+        let outcome = repack_reachable_objects_unpack_unreachable(
+            &git_dir,
+            format,
+            &[root_oid],
+            &RepackOptions::default(),
+            None,
+            &[],
+        )
+        .expect("build -A repack");
+        assert_eq!(
+            outcome.unpacked_oids().collect::<Vec<_>>(),
+            vec![unreachable_oid]
+        );
+        install_repack_with_unpacked_unreachable(&git_dir, format, &outcome, true)
+            .expect("install -A repack");
+
+        assert!(!installed.pack_path.exists());
+        let loose_path = database
+            .loose()
+            .object_path(&unreachable_oid)
+            .expect("unreachable loose path");
+        assert!(loose_path.is_file());
+        let mtime = fs::metadata(&loose_path)
+            .expect("loose metadata")
+            .modified()
+            .expect("loose mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("mtime after epoch")
+            .as_secs();
+        assert_eq!(mtime, 123);
+        let reopened = FileObjectDatabase::from_git_dir(&git_dir, format);
+        assert!(reopened.read_object(&root_oid).is_ok());
+        assert!(reopened.read_object(&unreachable_oid).is_ok());
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn sha1_repack_a_unpacks_unreachable_before_pruning() {
+        repack_a_unpacks_unreachable_before_pruning(ObjectFormat::Sha1);
+    }
+
+    #[test]
+    fn sha256_repack_a_unpacks_unreachable_before_pruning() {
+        repack_a_unpacks_unreachable_before_pruning(ObjectFormat::Sha256);
+    }
+
+    fn rewriting_cruft_only_object_creates_loose_copy(format: ObjectFormat) {
+        let root = temp_root("sley-cruft-freshen-loose");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        let object = EncodedObject::new(ObjectType::Blob, b"cruft-only object\n".to_vec());
+        let database = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let oid = database.write_object(object.clone()).expect("write object");
+        let loose_path = database.loose().object_path(&oid).expect("loose path");
+        fs::OpenOptions::new()
+            .read(true)
+            .open(&loose_path)
+            .expect("open loose object")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(100))
+            .expect("set original object mtime");
+
+        let result = repack_cruft(&git_dir, format, &[], None).expect("build cruft repack");
+        assert_eq!(
+            result.cruft.as_ref().map(|cruft| cruft.oids.as_slice()),
+            Some(std::slice::from_ref(&oid))
+        );
+        install_cruft_repack_result(&git_dir, format, &result, true).expect("install cruft repack");
+
+        assert!(!loose_path.exists());
+
+        // Cruft packs preserve an mtime per object. Rewriting an object which
+        // exists only in such a pack must therefore create a loose copy rather
+        // than freshening the pack (and implicitly every object in it).
+        let reopened = FileObjectDatabase::from_git_dir(&git_dir, format);
+        assert_eq!(reopened.write_object(object).expect("rewrite object"), oid);
+        assert!(loose_path.exists());
+        fs::OpenOptions::new()
+            .read(true)
+            .open(&loose_path)
+            .expect("open rewritten loose object")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(200))
+            .expect("set rewritten object mtime");
+
+        // Repacking the same object produces the same pack checksum, but must
+        // replace the mutable `.mtimes` sidecar with the fresher loose mtime.
+        let refreshed = repack_cruft(&git_dir, format, &[], None).expect("refresh cruft repack");
+        assert_eq!(
+            refreshed.cruft.as_ref().map(|cruft| cruft.checksum),
+            result.cruft.as_ref().map(|cruft| cruft.checksum)
+        );
+        install_cruft_repack_result(&git_dir, format, &refreshed, true)
+            .expect("install refreshed cruft repack");
+        let checksum = refreshed.cruft.as_ref().expect("cruft pack").checksum;
+        let mtimes_path = git_dir
+            .join("objects/pack")
+            .join(format!("pack-{}.mtimes", checksum.to_hex()));
+        let mtimes =
+            sley_pack::PackMtimes::parse(&fs::read(mtimes_path).expect("read mtimes"), format, 1)
+                .expect("parse mtimes");
+        assert_eq!(mtimes.mtimes, vec![200]);
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn rewriting_sha1_cruft_only_object_creates_loose_copy() {
+        rewriting_cruft_only_object_creates_loose_copy(ObjectFormat::Sha1);
+    }
+
+    #[test]
+    fn rewriting_sha256_cruft_only_object_creates_loose_copy() {
+        rewriting_cruft_only_object_creates_loose_copy(ObjectFormat::Sha256);
+    }
+
+    fn expired_cruft_pack_survives_source_pruning(format: ObjectFormat) {
+        let root = temp_root("sley-cruft-expire-to");
+        let git_dir = root.join("source.git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create source object directory");
+        let database = FileObjectDatabase::from_git_dir(&git_dir, format);
+
+        let stale = EncodedObject::new(ObjectType::Blob, b"stale cruft\n".to_vec());
+        let stale_oid = database.write_object(stale).expect("write stale object");
+        let recent = EncodedObject::new(ObjectType::Blob, b"recent cruft\n".to_vec());
+        let recent_oid = database.write_object(recent).expect("write recent object");
+        for (oid, mtime) in [(stale_oid, 100), (recent_oid, 200)] {
+            let path = database.loose().object_path(&oid).expect("loose path");
+            fs::OpenOptions::new()
+                .read(true)
+                .open(path)
+                .expect("open loose object")
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime))
+                .expect("set object mtime");
+        }
+
+        // Expiration operates on packed cruft in the real `--expire-to`
+        // workflow. Establish that state first so pruning removes the stale
+        // object's only local copy.
+        let initial = repack_cruft(&git_dir, format, &[], None).expect("build initial cruft pack");
+        install_cruft_repack_result(&git_dir, format, &initial, true)
+            .expect("install initial cruft pack");
+
+        let result = repack_cruft(&git_dir, format, &[], Some(150)).expect("build expiring repack");
+        assert_eq!(
+            result.cruft.as_ref().map(|pack| pack.oids.as_slice()),
+            Some(std::slice::from_ref(&recent_oid))
+        );
+        assert_eq!(
+            result.expired.as_ref().map(|pack| pack.oids.as_slice()),
+            Some(std::slice::from_ref(&stale_oid))
+        );
+
+        // Mirror the CLI's safe order: prune the source first, then prove the
+        // self-contained expired output can still be installed elsewhere.
+        install_cruft_repack_result(&git_dir, format, &result, true)
+            .expect("install source repack");
+        let source = FileObjectDatabase::from_git_dir(&git_dir, format);
+        assert!(source.read_object(&recent_oid).is_ok());
+        assert!(source.read_object(&stale_oid).is_err());
+
+        let destination = root.join("expired.git/objects/pack/pack");
+        install_cruft_pack_at_prefix(
+            format,
+            result.expired.as_ref().expect("expired pack"),
+            &destination,
+        )
+        .expect("install expired pack");
+        let expired = FileObjectDatabase::new(root.join("expired.git/objects"), format);
+        assert!(expired.read_object(&stale_oid).is_ok());
+        assert!(expired.read_object(&recent_oid).is_err());
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn sha1_expired_cruft_pack_survives_source_pruning() {
+        expired_cruft_pack_survives_source_pruning(ObjectFormat::Sha1);
+    }
+
+    #[test]
+    fn sha256_expired_cruft_pack_survives_source_pruning() {
+        expired_cruft_pack_survives_source_pruning(ObjectFormat::Sha256);
+    }
+
+    #[test]
+    fn reachable_repack_reuses_exact_single_pack_bytes() {
+        let root = temp_root("sley-repack-reuse-exact-pack");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let graph = write_commit_graph(&mut db, b"exact pack reuse\n");
+        let commit_oid = graph[0].0;
+        let objects = graph
+            .iter()
+            .map(|(_oid, object)| object.clone())
+            .collect::<Vec<_>>();
+        let undeltified = PackFile::write_undeltified(&objects, format)
+            .expect("write deliberately undeltified source pack");
+        db.install_pack(&undeltified).expect("install source pack");
+        for (oid, _object) in &graph {
+            fs::remove_file(db.loose().object_path(oid).expect("loose path"))
+                .expect("remove duplicate loose object");
+        }
+
+        let result = repack_reachable_objects(&git_dir, format, &[commit_oid])
+            .expect("repack exact reachable set")
+            .expect("reachable objects exist");
+
+        assert_eq!(result.pack, undeltified.pack);
+        assert_eq!(result.idx, undeltified.index);
+        assert_eq!(result.object_count, graph.len());
+        assert!(result.obsolete_packs.is_empty());
+
+        fs::remove_dir_all(root).expect("remove test repository");
+    }
+
+    #[test]
+    fn reachable_repack_does_not_reuse_pack_with_unreachable_object() {
+        let root = temp_root("sley-repack-no-reuse-unreachable");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let graph = write_commit_graph(&mut db, b"reachable payload\n");
+        let commit_oid = graph[0].0;
+        let unreachable = EncodedObject::new(ObjectType::Blob, b"unreachable\n".to_vec());
+        let mut objects = graph
+            .iter()
+            .map(|(_oid, object)| object.clone())
+            .collect::<Vec<_>>();
+        objects.push(unreachable);
+        let source = PackFile::write_undeltified(&objects, format)
+            .expect("write source pack containing unreachable object");
+        db.install_pack(&source).expect("install source pack");
+        for (oid, _object) in &graph {
+            fs::remove_file(db.loose().object_path(oid).expect("loose path"))
+                .expect("remove duplicate loose object");
+        }
+
+        let result = repack_reachable_objects(&git_dir, format, &[commit_oid])
+            .expect("repack reachable subset")
+            .expect("reachable objects exist");
+
+        assert_eq!(result.object_count, graph.len());
+        assert_ne!(result.pack, source.pack);
+        assert_eq!(result.obsolete_packs.len(), 1);
+
+        fs::remove_dir_all(root).expect("remove test repository");
+    }
+
+    #[test]
+    fn reachable_repack_force_rewrite_bypasses_exact_pack_reuse() {
+        let root = temp_root("sley-repack-force-rewrite-exact-pack");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object directory");
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let graph = write_commit_graph(&mut db, b"forced rewrite\n");
+        let commit_oid = graph[0].0;
+        let mut objects = graph
+            .iter()
+            .map(|(_oid, object)| object.clone())
+            .collect::<Vec<_>>();
+        objects.reverse();
+        let source = PackFile::write_undeltified(&objects, format)
+            .expect("write source pack in reverse object order");
+        db.install_pack(&source).expect("install source pack");
+        for (oid, _object) in &graph {
+            fs::remove_file(db.loose().object_path(oid).expect("loose path"))
+                .expect("remove duplicate loose object");
+        }
+        let options = RepackOptions {
+            force_rewrite: true,
+            ..RepackOptions::default()
+        };
+
+        let result =
+            repack_reachable_objects_with_options(&git_dir, format, &[commit_oid], &options)
+                .expect("force rewrite reachable set")
+                .expect("reachable objects exist");
+
+        assert_eq!(result.object_count, graph.len());
+        assert_ne!(result.pack, source.pack);
+        assert_eq!(result.obsolete_packs.len(), 1);
+
+        fs::remove_dir_all(root).expect("remove test repository");
+    }
+
     #[test]
     fn install_repack_result_writes_pack_without_pruning_by_default() {
         let root = temp_root("sley-repack-install-nodelete");
@@ -2436,6 +2941,52 @@ mod tests {
             );
             assert_eq!(read_object_for_assert(&db, oid), *object);
         }
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn install_repack_bitmap_uses_retained_objects_and_writes_valid_index() {
+        let root = temp_root("sley-repack-install-bitmap-cache");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let graph = write_commit_graph(&mut db, b"bitmap cache\n");
+        let commit_oid = graph[0].0;
+
+        let result = repack_all_objects(&git_dir, format)
+            .expect("test operation should succeed")
+            .expect("repository has objects");
+        // Prove bitmap construction uses the objects retained by the repack
+        // result: the pre-repack loose database is no longer available as a
+        // fallback when the bitmap closure is walked.
+        fs::remove_dir_all(git_dir.join("objects")).expect("remove loose database");
+        fs::create_dir_all(git_dir.join("objects")).expect("recreate objects directory");
+        install_repack_result_with_bitmap(
+            &git_dir,
+            format,
+            &result,
+            false,
+            Some(&HashSet::from([commit_oid])),
+            None,
+        )
+        .expect("test operation should succeed");
+
+        let checksum = PackFile::parse(&result.pack, format)
+            .expect("repacked objects are valid")
+            .checksum;
+        let bitmap_path = git_dir
+            .join("objects")
+            .join("pack")
+            .join(format!("pack-{}.bitmap", checksum.to_hex()));
+        let bitmap = fs::read(bitmap_path).expect("bitmap was written");
+        let parsed = PackBitmapIndex::parse(&bitmap, format, result.object_count)
+            .expect("bitmap index is valid");
+        assert!(
+            !parsed.entries.is_empty(),
+            "the commit tip should receive a bitmap"
+        );
 
         fs::remove_dir_all(root).expect("test operation should succeed");
     }

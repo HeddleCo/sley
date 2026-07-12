@@ -3,12 +3,15 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::session;
-
 pub(crate) fn common_git_dir_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
-    if !session::cli_session().is_some_and(|session| session.local_repo_env_hidden())
-        && let Some(common_dir) = env::var_os("GIT_COMMON_DIR")
-    {
+    common_git_dir_for_git_dir_with_env(git_dir, true)
+}
+
+pub(crate) fn common_git_dir_for_git_dir_with_env(
+    git_dir: &Path,
+    honor_environment: bool,
+) -> Result<PathBuf> {
+    if honor_environment && let Some(common_dir) = env::var_os("GIT_COMMON_DIR") {
         return Ok(PathBuf::from(common_dir));
     }
     let commondir = git_dir.join("commondir");

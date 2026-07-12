@@ -2,28 +2,25 @@
 //!
 //! Mirrors upstream `bundle-uri.c` / `connect.c::get_remote_bundle_uri` enough for
 //! clone auto-discovery: issue `command=bundle-uri`, parse `bundle.*=…` lines into a
-//! [`BundleUriList`], download HTTP(S) bundles via `git-remote-https`, and install
-//! them into the destination repository before the main clone fetch.
+//! [`BundleUriList`], download HTTP(S) bundles through Sley's native transport,
+//! and install them into the destination repository before the main clone fetch.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use sley_config::GitConfig;
 use sley_core::{Capability, GitError, ObjectFormat, Result, UPSTREAM_GIT_COMPAT_VERSION};
 use sley_formats::Bundle;
 use sley_odb::{FileObjectDatabase, install_bundle_pack, verify_bundle_prerequisites};
-use sley_refs::{FileRefStore, RefTarget, RefUpdate};
 use sley_protocol::{
     GitService, PktLineFrame, ProtocolV2CommandRequest, TransportHandshake,
     read_protocol_v2_stateless_rpc_payload_frames, smart_http_rpc_request_content_type,
     smart_http_rpc_result_content_type, write_protocol_v2_command_request,
 };
-use sley_transport::{
-    HttpClient, RemoteUrl, http_smart_rpc_url, parse_remote_url,
-};
+use sley_refs::{FileRefStore, RefTarget, RefUpdate};
+use sley_transport::{HttpClient, RemoteUrl, UreqHttpClient, http_smart_rpc_url, parse_remote_url};
 
 use crate::CredentialProvider;
 use crate::http::{
@@ -99,7 +96,9 @@ pub fn transfer_bundle_uri_enabled(config: &GitConfig) -> bool {
 /// `creationtoken` is warned about (not silently zeroed) and otherwise ignored.
 pub fn parse_bundle_uri_line(list: &mut BundleUriList, line: &str) -> Result<()> {
     if line.is_empty() {
-        return Err(GitError::InvalidFormat("bundle-uri: got an empty line".into()));
+        return Err(GitError::InvalidFormat(
+            "bundle-uri: got an empty line".into(),
+        ));
     }
     let Some(equals) = line.find('=') else {
         return Err(GitError::InvalidFormat(
@@ -146,13 +145,12 @@ pub fn parse_bundle_uri_line(list: &mut BundleUriList, line: &str) -> Result<()>
                     }
                 };
             }
-            "heuristic" => {
+            "heuristic"
                 // Unknown heuristics are ignored (upstream loops the known
                 // heuristics and returns 0 without matching).
-                if value == "creationToken" {
+                if value == "creationToken" => {
                     list.creation_token_heuristic = true;
                 }
-            }
             // Any other global `bundle.<key>` is an unknown hint: ignore.
             _ => {}
         }
@@ -265,7 +263,10 @@ fn remote_base_uri(remote: &RemoteUrl) -> String {
         host.to_string()
     };
     match remote.port {
-        Some(port) => format!("{scheme}://{host}:{port}{}", remote.path.trim_end_matches('/')),
+        Some(port) => format!(
+            "{scheme}://{host}:{port}{}",
+            remote.path.trim_end_matches('/')
+        ),
         None => format!("{scheme}://{host}{}", remote.path.trim_end_matches('/')),
     }
 }
@@ -287,7 +288,7 @@ pub fn bundle_uri_fetch_order(list: &BundleUriList) -> Vec<String> {
 fn ordered_bundle_entries(list: &BundleUriList) -> Vec<&BundleUriEntry> {
     let mut entries: Vec<_> = list.bundles.values().collect();
     if list.creation_token_heuristic {
-        entries.sort_by(|left, right| right.creation_token.cmp(&left.creation_token));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.creation_token));
     }
     entries
 }
@@ -310,6 +311,21 @@ pub fn prefetch_advertised_bundle_uris(
     format: ObjectFormat,
     list: &BundleUriList,
 ) -> Result<()> {
+    let client = UreqHttpClient::new();
+    prefetch_advertised_bundle_uris_with_client(&client, git_dir, format, list)
+}
+
+/// Native, injectable variant of [`prefetch_advertised_bundle_uris`].
+///
+/// Supplying the client keeps bundle prefetch available to embedders without
+/// consulting `PATH`, `GIT_EXEC_PATH`, an upstream Git build, or an installed
+/// Git executable. Filesystem bundle URIs do not use `client`.
+pub fn prefetch_advertised_bundle_uris_with_client(
+    client: &dyn HttpClient,
+    git_dir: &Path,
+    format: ObjectFormat,
+    list: &BundleUriList,
+) -> Result<()> {
     if list.bundles.is_empty() {
         return Ok(());
     }
@@ -323,7 +339,8 @@ pub fn prefetch_advertised_bundle_uris(
         if uri.is_empty() {
             continue;
         }
-        match download_bundle_uri_to_temp(uri) {
+        trace2_bundle_uri_download(uri);
+        match download_bundle_uri_to_temp(client, uri) {
             Ok(temp) => downloaded.push((entry.id.clone(), temp)),
             Err(_) => {
                 eprintln!("warning: failed to download bundle from URI '{uri}'");
@@ -381,6 +398,21 @@ pub fn prefetch_advertised_bundle_uris(
     Ok(())
 }
 
+/// Record the compatibility child boundary Git exposes while downloading an
+/// advertised HTTP bundle. Sley performs the transfer in-process, but trace2 is
+/// a public observability surface: callers still expect the logical
+/// `git-remote-https <uri>` child in download order.
+fn trace2_bundle_uri_download(uri: &str) {
+    if let Some(argv) = bundle_uri_trace_argv(uri) {
+        sley_core::trace2::child_start("remote-https", &argv);
+    }
+}
+
+fn bundle_uri_trace_argv(uri: &str) -> Option<[String; 2]> {
+    (uri.starts_with("http://") || uri.starts_with("https://"))
+        .then(|| ["git-remote-https".to_string(), uri.to_string()])
+}
+
 /// Try to unbundle `path` into `db` and create its `refs/bundles/*` refs.
 /// Returns `Ok(true)` when the bundle was applied, `Ok(false)` when it could not
 /// be applied yet because a prerequisite object is still missing (so the caller
@@ -422,15 +454,15 @@ fn create_bundle_refs(ref_store: &FileRefStore, references: &[sley_formats::Bund
     }
 }
 
-/// Download `uri` to a fresh temp file. HTTP(S) URIs go through
-/// `git-remote-https`; `file://` and plain-path URIs are COPIED into a temp file
+/// Download `uri` to a fresh temp file. HTTP(S) URIs use Sley's native client;
+/// `file://` and plain-path URIs are COPIED into a temp file
 /// (never handed back as the original path — the caller deletes the returned
 /// path after installing, and must not delete the user's bundle, cf. upstream
 /// `copy_uri_to_file`).
-fn download_bundle_uri_to_temp(uri: &str) -> Result<PathBuf> {
+fn download_bundle_uri_to_temp(client: &dyn HttpClient, uri: &str) -> Result<PathBuf> {
     let temp = unique_bundle_temp_path();
     if uri.starts_with("http://") || uri.starts_with("https://") {
-        download_https_bundle_uri(uri, &temp)?;
+        download_http_bundle_uri(client, uri, &temp)?;
         return Ok(temp);
     }
     let source = uri.strip_prefix("file://").unwrap_or(uri);
@@ -448,15 +480,11 @@ fn unique_bundle_temp_path() -> PathBuf {
     std::env::temp_dir().join(format!("sley-bundle-uri-{nanos}-{seq}"))
 }
 
-/// Download `uri` into `dest` via `git-remote-https`, speaking the remote-helper
-/// `get` protocol. Upstream `download_https_uri_to_file` sends `capabilities`,
-/// waits for the helper's capability list (which must include `get`), then
-/// `get <uri> <dest>`; success is the helper's exit status (its reply to `get`
-/// is a single blank line, not an `ack`/`done`).
-fn download_https_bundle_uri(uri: &str, dest: &Path) -> Result<()> {
-    // The remote-helper protocol separates the URI and path with a space and
-    // commands with newlines, so neither may contain those (an adversary could
-    // otherwise redirect the download); mirror upstream's validation.
+/// Download a static HTTP(S) bundle through Sley's native HTTP client.
+///
+/// The response is streamed to disk so large bundles are never buffered in
+/// memory. A partial destination is removed on every error.
+fn download_http_bundle_uri(client: &dyn HttpClient, uri: &str, dest: &Path) -> Result<()> {
     if uri.contains(' ') || uri.contains('\n') {
         return Err(GitError::InvalidFormat(format!(
             "bundle-uri: URI is malformed: '{uri}'"
@@ -468,129 +496,28 @@ fn download_https_bundle_uri(uri: &str, dest: &Path) -> Result<()> {
             "bundle-uri: filename is malformed: '{dest_display}'"
         )));
     }
-    let helper = locate_git_remote_https()?;
-    let argv = vec!["git-remote-https".to_string(), uri.to_string()];
-    sley_core::trace2::child_start("git-remote-https", &argv);
-    let mut child = Command::new(&helper)
-        .arg(uri)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|err| GitError::Command(format!("failed to spawn git-remote-https: {err}")))?;
-    let mut stdin = child.stdin.take().expect("git-remote-https stdin");
-    let mut stdout = child.stdout.take().expect("git-remote-https stdout");
-
-    // Negotiate capabilities: the helper must advertise `get`.
-    let capabilities_result = (|| -> Result<bool> {
-        stdin
-            .write_all(b"capabilities\n")
+    let result = (|| -> Result<()> {
+        let mut response = client.get(uri, &[])?;
+        http_check_status(&response, uri)?;
+        let mut output = fs::File::create(dest).map_err(|err| GitError::Io(err.to_string()))?;
+        std::io::copy(&mut response.body, &mut output)
             .map_err(|err| GitError::Io(err.to_string()))?;
-        stdin.flush().map_err(|err| GitError::Io(err.to_string()))?;
-        let mut reader = std::io::BufReader::new(&mut stdout);
-        let mut line = String::new();
-        let mut found_get = false;
-        loop {
-            line.clear();
-            let read = reader
-                .read_line(&mut line)
-                .map_err(|err| GitError::Io(err.to_string()))?;
-            if read == 0 {
-                break;
-            }
-            let trimmed = line.trim_end_matches(['\n', '\r']);
-            if trimmed.is_empty() {
-                break;
-            }
-            if trimmed == "get" {
-                found_get = true;
-            }
-        }
-        Ok(found_get)
+        output
+            .flush()
+            .map_err(|err| GitError::Io(err.to_string()))?;
+        Ok(())
     })();
-    let found_get = match capabilities_result {
-        Ok(found_get) => found_get,
-        Err(err) => {
-            let _ = child.wait();
-            return Err(err);
-        }
-    };
-    if !found_get {
-        let _ = child.wait();
-        return Err(GitError::Command(
-            "bundle-uri: git-remote-https lacks the 'get' capability".into(),
-        ));
-    }
-
-    // Request the download. The helper replies with a single blank line and then
-    // waits for more commands; closing stdin makes it exit, and its exit status
-    // is authoritative for success.
-    let write_result = write!(stdin, "get {uri} {}\n\n", dest.display())
-        .and_then(|()| stdin.flush())
-        .map_err(|err| GitError::Io(err.to_string()));
-    drop(stdin);
-    if let Err(err) = write_result {
-        let _ = child.wait();
-        return Err(err);
-    }
-    let status = child
-        .wait()
-        .map_err(|err| GitError::Command(format!("git-remote-https wait failed: {err}")))?;
-    if !status.success() {
+    if result.is_err() {
         let _ = fs::remove_file(dest);
-        return Err(GitError::Command(format!(
-            "failed to download bundle from URI '{uri}'"
-        )));
     }
-    Ok(())
+    result
 }
 
-fn locate_git_remote_https() -> Result<PathBuf> {
-    // Search the git exec-path directories (from the environment), then `PATH`,
-    // then well-known install locations, for the `git-remote-https` helper.
-    //
-    // IMPORTANT: this must NOT shell out to `git --exec-path` to discover the
-    // exec path. In the upstream test harness the `git` on `PATH` is the sley
-    // shim, so invoking `git --exec-path` re-enters sley, whose git-compat
-    // `--exec-path` handler itself resolves `git` from `PATH` — an unbounded
-    // fork loop. The directories inspected below (in particular the harness's
-    // `GIT_EXEC_PATH`) already contain `git-remote-https`.
-    for dir in git_remote_https_search_dirs() {
-        let candidate = dir.join("git-remote-https");
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    Err(GitError::Command(
-        "git-remote-https is not available on PATH or in GIT_EXEC_PATH".into(),
-    ))
-}
-
-fn git_remote_https_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    for var in ["GIT_TEST_EXEC_PATH", "GIT_BUILD_DIR", "GIT_EXEC_PATH"] {
-        if let Ok(path) = std::env::var(var)
-            && !path.is_empty()
-        {
-            dirs.push(PathBuf::from(path));
-        }
-    }
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            dirs.push(dir);
-        }
-    }
-    for candidate in [
-        "/opt/homebrew/opt/git/libexec/git-core",
-        "/usr/local/libexec/git-core",
-        "/usr/lib/git-core",
-        "/usr/libexec/git-core",
-    ] {
-        dirs.push(PathBuf::from(candidate));
-    }
-    dirs
-}
-
+/// Parse a bundle URI through the transport's standard remote URL parser.
+///
+/// Kept as the bundle-specific facade for embedders even though the in-crate
+/// fetch path currently accepts URI strings directly.
+#[allow(dead_code)]
 pub fn remote_url_from_bundle_uri(uri: &str) -> Result<RemoteUrl> {
     parse_remote_url(uri)
 }
@@ -598,6 +525,37 @@ pub fn remote_url_from_bundle_uri(uri: &str) -> Result<RemoteUrl> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StaticHttpClient {
+        status: u16,
+        body: &'static [u8],
+    }
+
+    impl HttpClient for StaticHttpClient {
+        fn get(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> Result<sley_transport::HttpResponse> {
+            Ok(sley_transport::HttpResponse {
+                status: self.status,
+                content_type: Some("application/octet-stream".into()),
+                body: Box::new(std::io::Cursor::new(self.body)),
+            })
+        }
+
+        fn post(
+            &self,
+            _url: &str,
+            _content_type: &str,
+            _headers: &[(&str, &str)],
+            _body: &[u8],
+        ) -> Result<sley_transport::HttpResponse> {
+            Err(GitError::Unsupported(
+                "unexpected POST in bundle download".into(),
+            ))
+        }
+    }
 
     fn sample_list() -> BundleUriList {
         BundleUriList {
@@ -637,14 +595,68 @@ mod tests {
     }
 
     #[test]
+    fn bundle_uri_trace_models_only_http_remote_helper_boundaries() {
+        assert_eq!(
+            bundle_uri_trace_argv("http://example.test/repo.bundle"),
+            Some([
+                "git-remote-https".to_string(),
+                "http://example.test/repo.bundle".to_string(),
+            ])
+        );
+        assert_eq!(
+            bundle_uri_trace_argv("https://example.test/repo.bundle"),
+            Some([
+                "git-remote-https".to_string(),
+                "https://example.test/repo.bundle".to_string(),
+            ])
+        );
+        assert_eq!(bundle_uri_trace_argv("file:///tmp/repo.bundle"), None);
+    }
+
+    #[test]
+    fn native_http_bundle_download_streams_response_to_file() {
+        let destination = unique_bundle_temp_path();
+        let client = StaticHttpClient {
+            status: 200,
+            body: b"native bundle bytes",
+        };
+        download_http_bundle_uri(&client, "https://example.test/repo.bundle", &destination)
+            .expect("native bundle download");
+        assert_eq!(
+            fs::read(&destination).expect("downloaded bundle"),
+            b"native bundle bytes"
+        );
+        let _ = fs::remove_file(destination);
+    }
+
+    #[test]
+    fn native_http_bundle_download_removes_error_destination() {
+        let destination = unique_bundle_temp_path();
+        fs::write(&destination, b"stale").expect("seed stale destination");
+        let client = StaticHttpClient {
+            status: 404,
+            body: b"not found",
+        };
+        assert!(
+            download_http_bundle_uri(&client, "https://example.test/missing.bundle", &destination)
+                .is_err()
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
     fn parse_bundle_uri_line_accepts_creation_token_heuristic_lines() {
         let mut list = BundleUriList::default();
-        parse_bundle_uri_line(&mut list, "bundle.heuristic=creationToken").expect("test operation should succeed");
+        parse_bundle_uri_line(&mut list, "bundle.heuristic=creationToken")
+            .expect("test operation should succeed");
         assert!(list.creation_token_heuristic);
         parse_bundle_uri_line(&mut list, "bundle.newest.creationtoken=3")
             .expect("test operation should succeed");
-        parse_bundle_uri_line(&mut list, "bundle.newest.uri=http://127.0.0.1/newest.bundle")
-            .expect("test operation should succeed");
+        parse_bundle_uri_line(
+            &mut list,
+            "bundle.newest.uri=http://127.0.0.1/newest.bundle",
+        )
+        .expect("test operation should succeed");
         let entry = list.bundles.get("newest").expect("bundle entry");
         assert_eq!(entry.creation_token, 3);
         assert_eq!(entry.uri.as_deref(), Some("http://127.0.0.1/newest.bundle"));
@@ -652,7 +664,10 @@ mod tests {
 
     #[test]
     fn parse_config_key_splits_subsection_at_last_dot() {
-        assert_eq!(parse_bundle_config_key("bundle.version"), Some((None, "version")));
+        assert_eq!(
+            parse_bundle_config_key("bundle.version"),
+            Some((None, "version"))
+        );
         assert_eq!(parse_bundle_config_key("bundle.mode"), Some((None, "mode")));
         assert_eq!(
             parse_bundle_config_key("bundle.everything.uri"),

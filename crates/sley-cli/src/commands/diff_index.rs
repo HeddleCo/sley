@@ -15,9 +15,9 @@
 //! `write_diff_stat`, etc.). This keeps every output mode byte-identical with
 //! `git diff` for the formats both commands share.
 
+use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_rev};
 use std::io::{self, Write};
 use std::path::Path;
-use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_rev};
 
 use sley::{GitError, ObjectFormat, ObjectId, Result};
 
@@ -43,7 +43,10 @@ struct DiffIndexOutput {
     summary: bool,
 }
 
-pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_diff_index(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut output = DiffIndexOutput::default();
     let mut cached = false;
     let mut match_missing = false;
@@ -238,7 +241,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
         idx += 1;
     }
 
-    let repo = RepositoryContext::discover_current()?;
+    let repo = RepositoryContext::from_session(cli_session)?;
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
@@ -305,7 +308,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             Some(worktree_root) => worktree_root,
             None => repo.worktree_root()?,
         };
-        DiffPathspec::new(cwd, worktree_root, &setup.pathspecs)?
+        DiffPathspec::new(cwd, worktree_root, &setup.pathspecs, repo.pathspec_magic())?
     };
 
     let base_options = sley_diff_merge::DiffNameStatusOptions {
@@ -330,10 +333,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     let entries = if cached {
         if inexact_renames {
             sley_diff_merge::diff_name_status_tree_index_with_options(
-                git_dir,
-                format,
-                &tree_oid,
-                options,
+                git_dir, format, &tree_oid, options,
             )?
         } else {
             sley_diff_merge::diff_name_status_tree_index_with_options(
@@ -383,7 +383,12 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     // worktree-dirty submodule whose checked-out commit still matched the
     // staged oid (t4041/t4060 "submodule contains modified content" cells).
     // Keep the `submodule_diff_config` default (`Untracked`) as-is.
-    let submodule_config = submodule_diff_config(git_dir, worktree_root, ignore_submodules_cli);
+    let submodule_config = submodule_diff_config_with_config(
+        git_dir,
+        worktree_root,
+        ignore_submodules_cli,
+        Some(repo.config()),
+    );
     let mut entries = apply_submodule_ignore_filter(entries, &submodule_config);
     let submodule_dirt = match (!cached, worktree_root) {
         (true, Some(root)) => {
@@ -429,7 +434,10 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     // `--check`: whitespace-error report instead of the diff body (exit 2 on a
     // whitespace error, OR-ing in 1 when `--exit-code`/`--quiet` + changes).
     if check {
-        let resolver = commands::diff::WhitespaceRuleResolver::from_git_dir(git_dir)?;
+        let resolver = commands::diff::WhitespaceRuleResolver::from_git_dir_with_config(
+            git_dir,
+            Some(repo.config()),
+        )?;
         let check_failed = commands::diff::run_diff_check(
             &entries,
             db,
@@ -438,6 +446,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             !cached,
             None,
             &resolver,
+            cli_session.lazy_fetch(),
         )?;
         let mut code = 0;
         if check_failed {
@@ -475,6 +484,8 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
                 indent_heuristic,
                 submodule_format,
                 submodule_dirt: &submodule_dirt,
+                config: repo.config(),
+                lazy_fetch: cli_session.lazy_fetch(),
             },
         )?;
     }
@@ -561,6 +572,8 @@ struct RenderContext<'a> {
     indent_heuristic: bool,
     submodule_format: commands::diff_options::SubmoduleDiffFormat,
     submodule_dirt: &'a HashMap<Vec<u8>, u8>,
+    config: &'a GitConfig,
+    lazy_fetch: bool,
 }
 
 fn render(
@@ -569,51 +582,54 @@ fn render(
     ctx: RenderContext<'_>,
 ) -> Result<()> {
     let mut stdout = io::stdout();
-    // The default (no explicit format flag) is the raw listing — the key
-    // difference from `git diff`, whose default is a patch.
-    let no_format = !output.raw
-        && !output.patch
-        && !output.name_status
-        && !output.name_only
-        && !output.stat
-        && !output.numstat
-        && !output.shortstat
-        && !output.summary;
-    let show_raw = output.raw || no_format;
-    let show_numstat = output.numstat;
-    let show_stat = output.stat;
-    let show_shortstat = output.shortstat;
-    let show_summary = output.summary;
-    let show_name_status = output.name_status;
-    let show_name_only = output.name_only;
-    let show_patch = output.patch;
-    let stat_entries = if show_numstat || show_stat || show_shortstat {
-        collect_diff_stat_entries(entries, ctx.db, ctx.worktree_root, ctx.use_worktree_new)?
+    let selection = sley_diff_merge::porcelain::select_render_formats(
+        sley_diff_merge::porcelain::RenderSelectionOptions {
+            default_output: sley_diff_merge::porcelain::DefaultDiffOutput::Raw,
+            raw: output.raw,
+            patch: output.patch,
+            name_status: output.name_status,
+            name_only: output.name_only,
+            stat: output.stat,
+            numstat: output.numstat,
+            shortstat: output.shortstat,
+            summary: output.summary,
+            auxiliary_format: false,
+            suppress_output: false,
+        },
+    );
+    let stat_entries = if selection.needs_line_stats() {
+        collect_diff_stat_entries(
+            entries,
+            ctx.db,
+            ctx.worktree_root,
+            ctx.use_worktree_new,
+            ctx.lazy_fetch,
+        )?
     } else {
         Vec::new()
     };
 
-    if show_raw {
+    if selection.raw {
         for entry in entries {
             write_diff_raw_entry(&mut stdout, entry, ctx.z, false, ctx.raw_abbrev, ctx.format)?;
         }
     }
-    if show_name_status {
+    if selection.name_status {
         for entry in entries {
             write_name_status_entry(&mut stdout, entry, ctx.z)?;
         }
     }
-    if show_name_only {
+    if selection.name_only {
         for entry in entries {
             write_name_only_entry(&mut stdout, entry, ctx.z)?;
         }
     }
-    if show_numstat {
+    if selection.numstat {
         for entry in &stat_entries {
             write_diff_numstat_materialized_entry(&mut stdout, entry.entry, entry.stats, ctx.z)?;
         }
     }
-    if show_stat {
+    if selection.stat {
         write_diff_stat_materialized(
             &mut stdout,
             &stat_entries,
@@ -623,29 +639,32 @@ fn render(
                 color: false,
                 quote_path_fully: true,
             },
+            Some(ctx.config),
         )?;
     }
-    if show_shortstat {
+    if selection.shortstat {
         write_diff_shortstat_materialized(&mut stdout, &stat_entries)?;
     }
-    if show_summary {
+    if selection.summary {
         for entry in entries {
             write_diff_summary_entry(&mut stdout, entry)?;
         }
     }
-    if show_patch {
+    if selection.patch {
         // git separates a preceding raw/stat block from the patch with one blank
         // line (e.g. `--patch-with-raw`, `--patch-with-stat`).
-        if show_raw || show_numstat || show_stat || show_shortstat || show_summary {
+        if selection.separates_patch_from_prefix() {
             writeln!(stdout)?;
         }
         for entry in entries {
             let options = DiffRenderOptions {
                 line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                suppress_blank_empty: false,
                 binary: false,
                 anchors: &[],
                 allow_textconv: false,
                 db: ctx.db,
+                lazy_fetch: ctx.lazy_fetch,
                 worktree_root: ctx.worktree_root,
                 use_worktree_new: ctx.use_worktree_new,
                 format: ctx.format,
