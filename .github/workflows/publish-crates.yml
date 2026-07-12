@@ -59,30 +59,32 @@ jobs:
           # from `cargo metadata` (normal + build deps) and re-asserted below.
           CRATES=(
             sley-core
-            sley-config
+            sley-i18n
             sley-mmap
-            sley-index
+            sley-procinfo
+            sley-strbuf-expand
+            sley-protocol
+            sley-pathspec
+            sley-options
             sley-object
-            sley-formats
             sley-grep
+            sley-config
+            sley-index
+            sley-ref-filter
+            sley-transport
+            sley-submodule
+            sley-formats
+            sley-refs
             sley-pack
             sley-odb
-            sley-refs
+            sley-fsck
             sley-diff-merge
-            sley-options
-            sley-pathspec
             sley-rev
             sley-worktree
-            sley-sequencer
-            sley-notes
-            sley-strbuf-expand
-            sley-ref-filter
             sley-pretty
-            sley-submodule
-            sley-fsck
-            sley-protocol
-            sley-transport
+            sley-sequencer
             sley-remote
+            sley-notes
             sley
           )
 
@@ -100,8 +102,8 @@ jobs:
             POS[$c]=$i
             i=$((i + 1))
           done
-          if [ "${#CRATES[@]}" -ne 26 ]; then
-            echo "Expected 26 crates, got ${#CRATES[@]}" >&2
+          if [ "${#CRATES[@]}" -ne 28 ]; then
+            echo "Expected 28 crates, got ${#CRATES[@]}" >&2
             exit 1
           fi
           META="$(cargo metadata --format-version 1 --all-features --no-deps)"
