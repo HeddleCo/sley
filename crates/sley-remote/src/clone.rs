@@ -41,8 +41,12 @@ use sley_object::{Commit, ObjectType, Tree};
 use sley_odb::{FileObjectDatabase, ObjectReader};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate};
 use sley_transport::RemoteUrl;
+#[cfg(feature = "http")]
+use sley_transport::{HttpClient, UreqHttpClient};
 
-use crate::fetch::{fetch, FetchOptions, FetchSource};
+use crate::fetch::{FetchOptions, FetchSource};
+#[cfg(not(feature = "http"))]
+use crate::fetch::fetch;
 use crate::{CredentialProvider, ProgressSink};
 
 /// Internal placeholder branch used while clone initializes before it knows
@@ -203,6 +207,38 @@ pub struct CloneServices<'a> {
 /// fetch is reported as [`GitError::NotFound`] for the caller to map (the CLI
 /// turns an explicit `--branch` miss into its own message).
 pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<CloneOutcome> {
+    #[cfg(feature = "http")]
+    {
+        clone_impl(request, services, None)
+    }
+    #[cfg(not(feature = "http"))]
+    {
+        clone_impl(request, services)
+    }
+}
+
+/// Like [`clone`], but drives the smart-HTTP transport through a caller-provided
+/// [`HttpClient`] when `http_client` is `Some`.
+///
+/// `None` is exactly [`clone`] (a default [`UreqHttpClient`]). A `Some` client
+/// owns the entire dial for every smart-HTTP request the clone makes (ref
+/// advertisement, pack fetch, and the partial-clone checkout-blob top-up), so a
+/// host can enforce network policy such as SSRF validation when mirroring a
+/// public URL. Non-HTTP clone sources ignore it.
+#[cfg(feature = "http")]
+pub fn clone_with_http_client(
+    request: CloneRequest<'_>,
+    services: CloneServices<'_>,
+    http_client: Option<&dyn HttpClient>,
+) -> Result<CloneOutcome> {
+    clone_impl(request, services, http_client)
+}
+
+fn clone_impl(
+    request: CloneRequest<'_>,
+    services: CloneServices<'_>,
+    #[cfg(feature = "http")] http_client: Option<&dyn HttpClient>,
+) -> Result<CloneOutcome> {
     let layout = RepositoryBootstrap::init(InitOptions {
         git_dir_override: request.git_dir_override.map(Path::to_path_buf),
         core_worktree: request.core_worktree.map(str::to_string),
@@ -261,22 +297,24 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
         request.options.reject_shallow,
         request.options.ssh_options,
     );
-    fetch(
-        crate::fetch::FetchRequest {
-            git_dir: &git_dir,
-            format: request.format,
-            config: &config,
-            remote_name: request.options.origin,
-            source: &fetch_source,
-            refspecs: &[],
-            options: &fetch_options,
-        },
-        crate::fetch::FetchServices {
-            credentials: services.credentials,
-            progress: services.progress,
-            ref_hook: None,
-        },
-    )?;
+    let fetch_request = crate::fetch::FetchRequest {
+        git_dir: &git_dir,
+        format: request.format,
+        config: &config,
+        remote_name: request.options.origin,
+        source: &fetch_source,
+        refspecs: &[],
+        options: &fetch_options,
+    };
+    let fetch_services = crate::fetch::FetchServices {
+        credentials: services.credentials,
+        progress: services.progress,
+        ref_hook: None,
+    };
+    #[cfg(feature = "http")]
+    crate::fetch::fetch_with_http_client(fetch_request, fetch_services, http_client)?;
+    #[cfg(not(feature = "http"))]
+    fetch(fetch_request, fetch_services)?;
 
     let store = FileRefStore::new(&git_dir, request.format);
     if let Some(detached) = &request.options.detached_head {
@@ -369,6 +407,15 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
     // not change the config `configure_branch` returns.
     let checkout_config = (services.configure_branch)(&git_dir, request.options.checkout_branch)?;
     if request.options.checkout {
+        #[cfg(feature = "http")]
+        fetch_partial_clone_checkout_blobs(
+            &request,
+            &git_dir,
+            branch_oid,
+            services.credentials,
+            http_client,
+        )?;
+        #[cfg(not(feature = "http"))]
         fetch_partial_clone_checkout_blobs(&request, &git_dir, branch_oid, services.credentials)?;
     } else {
         let mut tx = store.transaction();
@@ -443,6 +490,7 @@ fn fetch_partial_clone_checkout_blobs(
     git_dir: &Path,
     commit_oid: ObjectId,
     credentials: &mut dyn CredentialProvider,
+    #[cfg(feature = "http")] http_client: Option<&dyn HttpClient>,
 ) -> Result<()> {
     if request.options.filter.is_none() {
         return Ok(());
@@ -486,6 +534,7 @@ fn fetch_partial_clone_checkout_blobs(
             commit_oid,
             remote,
             credentials,
+            http_client,
         ),
         // SSH/git:// partial clones are gated out by the CLI (the in-process
         // local server is the only transport that advertises object filtering
@@ -505,6 +554,7 @@ fn fetch_http_partial_clone_checkout_blobs(
     commit_oid: ObjectId,
     remote: &RemoteUrl,
     credentials: &mut dyn CredentialProvider,
+    http_client: Option<&dyn HttpClient>,
 ) -> Result<()> {
     let local_db = FileObjectDatabase::from_git_dir(git_dir, request.format);
     let mut wants = Vec::new();
@@ -522,8 +572,16 @@ fn fetch_http_partial_clone_checkout_blobs(
     if wants.is_empty() {
         return Ok(());
     }
-    let http_batch = crate::http::HttpOperationBatch::new();
-    let client = http_batch.client();
+    // Use the caller-injected client when present (host network policy / SSRF
+    // guard); otherwise construct the default ureq-backed client.
+    let default_client;
+    let client: &dyn HttpClient = match http_client {
+        Some(client) => client,
+        None => {
+            default_client = UreqHttpClient::new();
+            &default_client
+        }
+    };
     let discovered = crate::http::http_service_advertisements(
         client,
         remote,
