@@ -104,12 +104,20 @@ pub fn checkout_change_summary(
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let commit = read_commit(&db, format, target_commit)?;
+    // checkout's `show_local_changes()` is a raw `diff-index --name-status`
+    // report. Unlike user-facing `diff -M`, it does not enable rename
+    // detection: a D/F transition that preserves a staged descendant must be
+    // rendered as separate D/A rows even when the blobs happen to match.
+    let options = sley_diff_merge::DiffNameStatusOptions {
+        detect_renames: false,
+        ..Default::default()
+    };
     let changes = sley_diff_merge::diff_name_status_tree_worktree_with_options(
         worktree_root,
         git_dir,
         format,
         &commit.tree,
-        sley_diff_merge::DiffNameStatusOptions::default(),
+        options,
     )?;
     Ok(CheckoutChangeSummary { changes })
 }
@@ -357,10 +365,15 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
     }
     let _process_filter_metadata = set_process_filter_metadata(process_metadata);
     let _process_filter_cwd = set_process_filter_cwd(Some(worktree_root.to_path_buf()));
-    let mut dirty = false;
-    if smudge_config.is_some() {
-        dirty = !modified_index_entries(worktree_root, git_dir, format)?.is_empty();
-    } else {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    // A branch switch must take the two-way unpack path for either unstaged OR
+    // staged changes. Looking only at worktree-vs-index modifications misses a
+    // staged path whose worktree already matches the index; the clean rebuild
+    // would then discard it, especially across a directory/file transition.
+    // The status engine already applies clean filters, so it is also the single
+    // correct dirty predicate when smudge configuration is active.
+    let mut dirty = checkout_index_has_staged_changes(git_dir, format, &db)?;
+    if !dirty {
         stream_short_status(worktree_root, git_dir, format, |entry| {
             if !status_row_is_untracked_or_ignored(entry) {
                 dirty = true;
@@ -374,7 +387,6 @@ pub(crate) fn checkout_commit_to_index_and_worktree_filtered(
             "checkout requires a clean working tree".into(),
         ));
     }
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let commit = read_commit(&db, format, target)?;
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
@@ -1319,35 +1331,39 @@ pub(crate) fn checkout_commit_to_index_and_worktree_sparse(
 
     // Honor skip-worktree: a path whose worktree file is intentionally absent
     // must not be treated as a dirty (deleted) change blocking the checkout.
-    let mut dirty = false;
-    stream_short_status(worktree_root, git_dir, format, |entry| {
-        if previously_skipped.contains(entry.path) {
-            return Ok(StreamControl::Continue);
-        }
-        // Submodule state never blocks a checkout: upstream unpack-trees
-        // treats gitlinks as always up-to-date (ie_match_stat refuses to pay
-        // for a submodule dirtiness probe), so new commits / dirty content in
-        // a submodule must not fail the branch switch.
-        if entry.index_mode.is_some_and(sley_index::is_gitlink)
-            || entry.worktree_mode.is_some_and(sley_index::is_gitlink)
-        {
-            return Ok(StreamControl::Continue);
-        }
-        // An untracked embedded repository where the target tree records a
-        // gitlink is reused as-is (upstream entry.c write_entry: mkdir with
-        // EEXIST is success), so it does not block the checkout either.
-        if entry.index == b'?' && entry.worktree == b'?' {
-            let path = entry.path.strip_suffix(b"/").unwrap_or(entry.path);
-            if target_entries
-                .get(path)
-                .is_some_and(|target| sley_index::is_gitlink(target.mode))
+    // A staged change on such a path still matters and must force the shared
+    // two-way transition instead of being discarded by a clean rebuild.
+    let mut dirty = checkout_index_has_staged_changes(git_dir, format, &db)?;
+    if !dirty {
+        stream_short_status(worktree_root, git_dir, format, |entry| {
+            if previously_skipped.contains(entry.path) && entry.index == b' ' {
+                return Ok(StreamControl::Continue);
+            }
+            // Submodule state never blocks a checkout: upstream unpack-trees
+            // treats gitlinks as always up-to-date (ie_match_stat refuses to pay
+            // for a submodule dirtiness probe), so new commits / dirty content in
+            // a submodule must not fail the branch switch.
+            if entry.index_mode.is_some_and(sley_index::is_gitlink)
+                || entry.worktree_mode.is_some_and(sley_index::is_gitlink)
             {
                 return Ok(StreamControl::Continue);
             }
-        }
-        dirty = true;
-        Ok(StreamControl::Stop)
-    })?;
+            // An untracked embedded repository where the target tree records a
+            // gitlink is reused as-is (upstream entry.c write_entry: mkdir with
+            // EEXIST is success), so it does not block the checkout either.
+            if entry.index == b'?' && entry.worktree == b'?' {
+                let path = entry.path.strip_suffix(b"/").unwrap_or(entry.path);
+                if target_entries
+                    .get(path)
+                    .is_some_and(|target| sley_index::is_gitlink(target.mode))
+                {
+                    return Ok(StreamControl::Continue);
+                }
+            }
+            dirty = true;
+            Ok(StreamControl::Stop)
+        })?;
+    }
     if dirty {
         return Err(GitError::Transaction(
             "checkout requires a clean working tree".into(),
@@ -1433,6 +1449,42 @@ pub(crate) fn skip_worktree_paths(
         .filter(index_entry_skip_worktree)
         .map(|entry| entry.path.into_bytes())
         .collect())
+}
+
+/// Whether the stage-zero index differs from HEAD, using the actual entry table
+/// instead of CACHE_TREE. A command that staged paths may leave that extension
+/// stale until the index is rewritten; trusting it here can misclassify a dirty
+/// checkout as clean and discard staged changes during a branch switch.
+fn checkout_index_has_staged_changes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+) -> Result<bool> {
+    let index_path = repository_index_path(git_dir);
+    let mut index = if index_path.exists() {
+        Index::parse(&fs::read(index_path)?, format)?
+    } else {
+        return Ok(resolve_head_tree_oid(git_dir, format, db)?.is_some());
+    };
+    if index.is_sparse() {
+        for entry in &mut index.entries {
+            if entry.mode == sley_index::SPARSE_DIR_MODE && entry.path.as_bytes().ends_with(b"/") {
+                entry.set_skip_worktree(true);
+            }
+        }
+        expand_sparse_index_view(&mut index, db, format)?;
+    }
+    let index_entries = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == sley_index::Stage::Normal)
+        .map(|entry| (entry.path.as_bytes().to_vec(), (entry.mode, entry.oid)))
+        .collect::<BTreeMap<_, _>>();
+    let head_entries = head_tree_entries(git_dir, format, db)?
+        .into_iter()
+        .map(|(path, entry)| (path, (entry.mode, entry.oid)))
+        .collect::<BTreeMap<_, _>>();
+    Ok(index_entries != head_entries)
 }
 
 pub fn restore_worktree_paths(
@@ -2554,6 +2606,19 @@ pub fn reset_index_and_worktree_to_commit(
     let sparse_matcher = sparse
         .as_ref()
         .map(|(spec, mode)| SparseMatcher::new(spec, *mode));
+    let prior_expanded_sparse_directories =
+        if sparse.as_ref().is_some_and(|(spec, _)| spec.sparse_index) {
+            match fs::read(repository_index_path(git_dir)) {
+                Ok(bytes) => sparse_index_expanded_boundaries(
+                    &Index::parse(&bytes, format)?,
+                    sparse_matcher.as_ref(),
+                ),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+                Err(err) => return Err(err.into()),
+            }
+        } else {
+            BTreeSet::new()
+        };
     refuse_if_current_working_directory_becomes_file(worktree_root, &target_entries)?;
     let config = effective_worktree_config(git_dir, None).unwrap_or_default();
     let attributes = build_tree_attribute_matcher(worktree_root, &db, format, &commit.tree)?;
@@ -2631,6 +2696,15 @@ pub fn reset_index_and_worktree_to_commit(
         && spec.sparse_index
     {
         collapse_to_sparse_index(&mut index, matcher, &db, format)?;
+        if !prior_expanded_sparse_directories.is_empty() {
+            expand_sparse_index_directories_impl(
+                &mut index,
+                &db,
+                format,
+                |prefix| prior_expanded_sparse_directories.contains(prefix),
+                false,
+            )?;
+        }
     }
     refresh_cache_tree(&mut index, &db);
     write_repository_index_ref(git_dir, format, &index)?;
@@ -2848,7 +2922,14 @@ pub(crate) fn prepare_blob_parent_dirs(worktree_root: &Path, file_path: &Path) -
     match fs::symlink_metadata(parent) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => return Ok(()),
         Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        // `lstat("file/child")` reports ENOTDIR when an earlier component is
+        // the D/F blocker we are about to replace. Treat it like an absent
+        // descendant and let the root-to-leaf walk remove that blocker.
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) => {}
         Err(err) => return Err(err.into()),
     }
     // Collect the ancestor chain from worktree_root (exclusive) down to `parent`
@@ -2876,7 +2957,12 @@ pub(crate) fn prepare_blob_parent_dirs(worktree_root: &Path, file_path: &Path) -
                 fs::remove_file(dir)?;
                 fs::create_dir(dir)?;
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
                 fs::create_dir(dir)?;
             }
             Err(err) => return Err(err.into()),
@@ -3447,6 +3533,19 @@ pub(crate) fn expand_sparse_index_in_memory(
     expand_sparse_index_impl(index, db, format, false)
 }
 
+/// Expand a sparse index into a temporary semantic view without emitting the
+/// observable `ensure_full_index` transition.
+///
+/// Use this for read-only matching or validation when the caller neither
+/// writes the expanded index nor changes the repository's sparse layout.
+pub fn expand_sparse_index_view(
+    index: &mut Index,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<bool> {
+    expand_sparse_index_in_memory(index, db, format)
+}
+
 /// Expand only collapsed sparse directories selected by `should_expand`.
 ///
 /// Commands with a restrictive pathspec can operate directly on in-cone
@@ -3458,7 +3557,17 @@ pub fn expand_sparse_index_directories(
     index: &mut Index,
     db: &FileObjectDatabase,
     format: ObjectFormat,
+    should_expand: impl FnMut(&[u8]) -> bool,
+) -> Result<bool> {
+    expand_sparse_index_directories_impl(index, db, format, should_expand, true)
+}
+
+fn expand_sparse_index_directories_impl(
+    index: &mut Index,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
     mut should_expand: impl FnMut(&[u8]) -> bool,
+    emit_trace: bool,
 ) -> Result<bool> {
     if !index.entries.iter().any(IndexEntry::is_sparse_dir) {
         return Ok(false);
@@ -3491,8 +3600,43 @@ pub fn expand_sparse_index_directories(
         index.clear_sparse_extension()?;
     }
     normalize_index_version_for_extended_flags(index);
-    sley_core::trace2::region("index", "ensure_full_index");
+    if emit_trace {
+        sley_core::trace2::region("index", "ensure_full_index");
+    }
     Ok(true)
+}
+
+/// Identify sparse-directory boundaries that the physical index currently
+/// stores as individual out-of-cone leaves. Reset refreshes those leaves but
+/// must not change their expanded/collapsed representation; an explicit
+/// sparse-checkout reapply owns that conversion.
+fn sparse_index_expanded_boundaries(
+    index: &Index,
+    matcher: Option<&SparseMatcher>,
+) -> BTreeSet<Vec<u8>> {
+    let Some(matcher) = matcher else {
+        return BTreeSet::new();
+    };
+    let mut expanded = BTreeSet::new();
+    for entry in index
+        .entries
+        .iter()
+        .filter(|entry| !entry.is_sparse_dir() && !matcher.includes_file(entry.path.as_bytes()))
+    {
+        let path = entry.path.as_bytes();
+        let mut start = 0usize;
+        while let Some(relative) = path[start..].iter().position(|byte| *byte == b'/') {
+            let end = start + relative;
+            let mut probe = path[..=end].to_vec();
+            probe.extend_from_slice(b"__sley_sparse_probe__");
+            if !matcher.includes_file(&probe) {
+                expanded.insert(path[..=end].to_vec());
+                break;
+            }
+            start = end + 1;
+        }
+    }
+    expanded
 }
 
 fn expand_sparse_index_impl(
@@ -3612,7 +3756,13 @@ pub(crate) fn collapse_to_sparse_index(
     let mut dir_has_in_cone: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
     for entry in &index.entries {
         let path = entry.path.as_bytes();
-        let in_cone = matcher.includes_file(path);
+        // An explicitly materialized out-of-cone path (skip-worktree cleared
+        // by update-index/add/mv) prevents its directory from collapsing just
+        // as surely as a pattern-in-cone path. Re-collapsing it would discard
+        // the user's per-leaf sparse override.
+        let in_cone = matcher.includes_file(path)
+            || !entry.is_skip_worktree()
+            || sley_index::is_gitlink(entry.mode);
         let mut start = 0usize;
         while let Some(rel) = path
             .get(start..)
@@ -4066,6 +4216,44 @@ mod sparse_index_expansion_tests {
     use super::*;
 
     #[test]
+    fn mixed_sparse_index_roundtrip_preserves_expanded_boundary() {
+        let oid = ObjectId::from_raw(ObjectFormat::Sha1, &[3; 20]).expect("object id");
+        let mut collapsed =
+            blank_sparse_blob_entry(ObjectFormat::Sha1, b"outside/", SPARSE_DIR_MODE, oid);
+        collapsed.set_skip_worktree(true);
+        let mut expanded = blank_sparse_blob_entry(ObjectFormat::Sha1, b"folder2/a", 0o100644, oid);
+        expanded.set_skip_worktree(true);
+        let mut index = Index {
+            version: 3,
+            entries: vec![expanded, collapsed],
+            extensions: Vec::new(),
+            checksum: None,
+        };
+        index.entries.sort_by(compare_index_key);
+        index.set_sparse_extension();
+        let sparse = SparseCheckout {
+            patterns: vec![b"/*".to_vec(), b"!/*/".to_vec(), b"/deep/".to_vec()],
+            sparse_index: true,
+        };
+        let matcher = SparseMatcher::new(&sparse, SparseCheckoutMode::Cone);
+
+        let encoded = index.write(ObjectFormat::Sha1).expect("serialize index");
+        let decoded = Index::parse(&encoded, ObjectFormat::Sha1).expect("parse index");
+
+        assert!(decoded.entries.iter().any(|entry| entry.is_sparse_dir()));
+        assert!(
+            decoded
+                .entries
+                .iter()
+                .any(|entry| entry.path.as_bytes() == b"folder2/a")
+        );
+        assert_eq!(
+            sparse_index_expanded_boundaries(&decoded, Some(&matcher)),
+            BTreeSet::from([b"folder2/".to_vec()])
+        );
+    }
+
+    #[test]
     fn selective_expansion_leaves_unmatched_sparse_directories_collapsed() {
         let root = tempfile::tempdir().expect("temporary repository");
         let git_dir = root.path().join(".git");
@@ -4113,6 +4301,70 @@ mod sparse_index_expansion_tests {
         assert_eq!(index.entries.len(), 1);
         assert_eq!(index.entries[0].path.as_bytes(), b"outside/file");
         assert!(index.entries[0].is_skip_worktree());
+        assert!(!index.is_sparse());
+    }
+
+    #[test]
+    fn collapse_preserves_materialized_out_of_cone_leaf() {
+        let root = tempfile::tempdir().expect("temporary repository");
+        let git_dir = root.path().join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("object directory");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let blob = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"payload\n".to_vec()))
+            .expect("write blob");
+        let entry = blank_sparse_blob_entry(ObjectFormat::Sha1, b"outside/file", 0o100644, blob);
+        assert!(!entry.is_skip_worktree());
+        let mut index = Index {
+            version: 3,
+            entries: vec![entry],
+            extensions: Vec::new(),
+            checksum: None,
+        };
+        let sparse = SparseCheckout {
+            patterns: vec![b"/*".to_vec(), b"!/*/".to_vec(), b"/deep/".to_vec()],
+            sparse_index: true,
+        };
+        let matcher = SparseMatcher::new(&sparse, SparseCheckoutMode::Cone);
+
+        collapse_to_sparse_index(&mut index, &matcher, &db, ObjectFormat::Sha1)
+            .expect("collapse sparse index");
+
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].path.as_bytes(), b"outside/file");
+        assert!(!index.entries[0].is_sparse_dir());
+        assert!(!index.is_sparse());
+    }
+
+    #[test]
+    fn collapse_preserves_out_of_cone_gitlink_leaf() {
+        let root = tempfile::tempdir().expect("temporary repository");
+        let git_dir = root.path().join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("object directory");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let commit = ObjectId::from_raw(ObjectFormat::Sha1, &[7; 20]).expect("gitlink oid");
+        let mut entry =
+            blank_sparse_blob_entry(ObjectFormat::Sha1, b"outside/module", 0o160000, commit);
+        entry.set_skip_worktree(true);
+        let mut index = Index {
+            version: 3,
+            entries: vec![entry],
+            extensions: Vec::new(),
+            checksum: None,
+        };
+        let sparse = SparseCheckout {
+            patterns: vec![b"/*".to_vec(), b"!/*/".to_vec(), b"/deep/".to_vec()],
+            sparse_index: true,
+        };
+        let matcher = SparseMatcher::new(&sparse, SparseCheckoutMode::Cone);
+
+        collapse_to_sparse_index(&mut index, &matcher, &db, ObjectFormat::Sha1)
+            .expect("preserve gitlink in full index");
+
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].path.as_bytes(), b"outside/module");
+        assert!(sley_index::is_gitlink(index.entries[0].mode));
+        assert!(!index.entries[0].is_sparse_dir());
         assert!(!index.is_sparse());
     }
 }

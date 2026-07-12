@@ -835,6 +835,7 @@ fn refresh_merged_index_stat(
         }
     }
     if changed {
+        index.upgrade_version_for_flags();
         fs::write(&index_path, index.write(format)?)?;
     }
     Ok(())
@@ -3892,15 +3893,27 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
             sley_worktree::fill_index_entry_stat_cache(entry, &metadata);
         }
     }
+    // A conflicted merge replaces the index wholesale, but sparse checkout's
+    // skip-worktree bits are semantic state, not merely an optimization. Keep
+    // them on clean stage-0 paths that were already outside the cone. Conflict
+    // stages remain unskipped so the conflicted path is materialized for the
+    // user, matching unpack-trees/merge-ort.
+    let skipped_paths = sparse_skip_worktree_paths(&git_dir, &db, format)?;
+    for entry in &mut entries {
+        if index_entry_stage(entry) == 0 && skipped_paths.contains(entry.path.as_bytes()) {
+            entry.set_skip_worktree(true);
+        }
+    }
+    let mut index = Index {
+        version: 2,
+        entries,
+        extensions: Vec::new(),
+        checksum: None,
+    };
+    index.upgrade_version_for_flags();
     fs::write(
         sley_worktree::repository_index_path(&git_dir),
-        Index {
-            version: 2,
-            entries,
-            extensions: Vec::new(),
-            checksum: None,
-        }
-        .write(format)?,
+        index.write(format)?,
     )?;
     write_auto_merge_ref(&git_dir, &auto_merge_tree)?;
 
@@ -3943,6 +3956,36 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
     print_merge_conflict_messages(&worktree_root, format, &results);
     println!("Automatic merge failed; fix conflicts and then commit the result.");
     Err(GitError::Exit(1))
+}
+
+/// Return the leaf paths whose current index entries are marked skip-worktree.
+/// A sparse index stores whole excluded directories as synthetic tree entries,
+/// so expand only the in-memory view before collecting paths. The on-disk index
+/// is left untouched until the caller atomically replaces it.
+fn sparse_skip_worktree_paths(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<BTreeSet<Vec<u8>>> {
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    if !index_path.is_file() {
+        return Ok(BTreeSet::new());
+    }
+    let mut index = Index::parse(&fs::read(index_path)?, format)?;
+    if index.is_sparse() {
+        for entry in &mut index.entries {
+            if entry.mode == sley_index::SPARSE_DIR_MODE && entry.path.as_bytes().ends_with(b"/") {
+                entry.set_skip_worktree(true);
+            }
+        }
+        sley_worktree::expand_sparse_index_view(&mut index, db, format)?;
+    }
+    Ok(index
+        .entries
+        .into_iter()
+        .filter(IndexEntry::is_skip_worktree)
+        .map(|entry| entry.path.to_vec())
+        .collect())
 }
 
 /// git's `parse_rename_score` (`diff.c`): parse a `--find-renames`/

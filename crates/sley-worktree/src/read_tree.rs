@@ -87,6 +87,11 @@ pub struct ReadTreeTransitionOutcome {
 pub enum ReadTreeTransitionError {
     /// A tree would introduce a protected or structurally invalid index path.
     InvalidPath(Vec<u8>),
+    /// A prefix/bind read would overlap an existing stage-zero index path.
+    BindOverlap {
+        incoming: Vec<u8>,
+        existing: Vec<u8>,
+    },
     /// Object, index, configuration, or filesystem engine failure.
     Engine(GitError),
 }
@@ -101,6 +106,12 @@ impl std::fmt::Display for ReadTreeTransitionError {
                     String::from_utf8_lossy(path)
                 )
             }
+            Self::BindOverlap { incoming, existing } => write!(
+                formatter,
+                "entry '{}' overlaps with '{}'",
+                String::from_utf8_lossy(incoming),
+                String::from_utf8_lossy(existing)
+            ),
             Self::Engine(error) => error.fmt(formatter),
         }
     }
@@ -110,7 +121,7 @@ impl std::error::Error for ReadTreeTransitionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Engine(error) => Some(error),
-            Self::InvalidPath(_) => None,
+            Self::InvalidPath(_) | Self::BindOverlap { .. } => None,
         }
     }
 }
@@ -170,6 +181,12 @@ pub fn plan_read_tree_transition(
             match options.mode {
                 ReadTreeTransitionMode::Overlay => overlay_tree_leaf(&mut merged, full, value),
                 ReadTreeTransitionMode::Prefix(_) => {
+                    if let Some(existing) = bind_overlap_path(&merged, &full) {
+                        return Err(ReadTreeTransitionError::BindOverlap {
+                            incoming: full,
+                            existing,
+                        });
+                    }
                     merged.insert(full, value);
                 }
             }
@@ -182,6 +199,23 @@ pub fn plan_read_tree_transition(
             .map(|(path, (mode, oid))| (path, ReadTreeEntry::stage_zero(mode, oid)))
             .collect(),
     })
+}
+
+fn bind_overlap_path(merged: &LeafMap, incoming: &[u8]) -> Option<Vec<u8>> {
+    if merged.contains_key(incoming) {
+        return Some(incoming.to_vec());
+    }
+    for (position, byte) in incoming.iter().enumerate() {
+        if *byte == b'/' && merged.contains_key(&incoming[..position]) {
+            return Some(incoming[..position].to_vec());
+        }
+    }
+    let mut descendant_prefix = incoming.to_vec();
+    descendant_prefix.push(b'/');
+    merged
+        .range(descendant_prefix.clone()..)
+        .find(|(candidate, _)| candidate.starts_with(&descendant_prefix))
+        .map(|(candidate, _)| candidate.clone())
 }
 
 /// Validate every leaf path in a tree using the same protected-path rules as
@@ -385,7 +419,9 @@ pub fn read_current_index_stage_zero(
     format: ObjectFormat,
 ) -> Result<BTreeMap<Vec<u8>, (u32, ObjectId)>> {
     let mut out = BTreeMap::new();
-    if let Some(index) = read_repository_index(git_dir, format)? {
+    if let Some(mut index) = read_repository_index(git_dir, format)? {
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        expand_sparse_index_view(&mut index, &db, format)?;
         for entry in index.entries {
             if index_entry_stage(&entry) == 0 {
                 out.insert(entry.path.into_bytes(), (entry.mode, entry.oid));

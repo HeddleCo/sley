@@ -2158,7 +2158,7 @@ fn apply_merge_results_to_index_and_worktree(
     results: &BTreeMap<Vec<u8>, MergePathResult>,
 ) -> Result<()> {
     let index_path = sley_worktree::repository_index_path(&ctx.git_dir);
-    let old_index = if index_path.exists() {
+    let mut old_index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, ctx.format)?
     } else {
         Index {
@@ -2168,6 +2168,24 @@ fn apply_merge_results_to_index_and_worktree(
             checksum: None,
         }
     };
+    let physical_sparse_index = old_index
+        .entries
+        .iter()
+        .any(sley_index::IndexEntry::is_sparse_dir)
+        .then(|| old_index.clone());
+    // The sequencer merge operates on leaf paths. Expand a sparse index only
+    // in memory so unchanged leaves retain their skip-worktree state when the
+    // result index is rebuilt after a pick. Otherwise every leaf represented
+    // by a synthetic sparse-directory row is re-created as an ordinary entry
+    // and status reports the entire excluded cone as deleted.
+    if old_index.is_sparse() {
+        for entry in &mut old_index.entries {
+            if entry.mode == sley_index::SPARSE_DIR_MODE && entry.path.as_bytes().ends_with(b"/") {
+                entry.set_skip_worktree(true);
+            }
+        }
+        sley_worktree::expand_sparse_index_view(&mut old_index, db, ctx.format)?;
+    }
     let mut old_entries: BTreeMap<Vec<u8>, IndexEntry> = BTreeMap::new();
     for entry in &old_index.entries {
         if index_entry_stage(entry) == 0 {
@@ -2289,16 +2307,17 @@ fn apply_merge_results_to_index_and_worktree(
             sley_worktree::fill_index_entry_stat_cache(entry, &metadata);
         }
     }
-    fs::write(
-        &index_path,
-        Index {
-            version: 2,
-            entries,
-            extensions: Vec::new(),
-            checksum: None,
-        }
-        .write(ctx.format)?,
-    )?;
+    let mut index = Index {
+        version: 2,
+        entries,
+        extensions: Vec::new(),
+        checksum: None,
+    };
+    if let Some(physical) = physical_sparse_index.as_ref() {
+        replay_restore_unchanged_sparse_directories(&mut index, physical, db, ctx.format)?;
+    }
+    index.upgrade_version_for_flags();
+    fs::write(&index_path, index.write(ctx.format)?)?;
     // git's sequencer runs `read_and_refresh_cache` around each pick, so a
     // stage-0 entry reused from the old index (its content unchanged by the
     // merge, so its worktree file was not rewritten above) is re-stat'd against
@@ -2318,6 +2337,53 @@ fn apply_merge_results_to_index_and_worktree(
         /* ignore_missing */ true,
         /* really_refresh */ false,
     )?;
+    Ok(())
+}
+
+/// Restore physical sparse-directory rows whose represented subtree was not
+/// changed by the merge. The sequencer computes against a full semantic view,
+/// but an in-cone pick must not turn unrelated sparse directories into persisted
+/// leaf entries (nor advertise an expansion that Git never performed).
+fn replay_restore_unchanged_sparse_directories(
+    index: &mut Index,
+    physical: &Index,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<()> {
+    let mut restored = false;
+    for sparse in physical
+        .entries
+        .iter()
+        .filter(|entry| entry.is_sparse_dir())
+    {
+        let prefix = sparse.path.as_bytes();
+        let expected = sley_diff_merge::flatten_tree(db, format, &sparse.oid)?;
+        let actual = index
+            .entries
+            .iter()
+            .filter(|entry| entry.path.as_bytes().starts_with(prefix))
+            .collect::<Vec<_>>();
+        if actual.len() != expected.len()
+            || actual.iter().any(|entry| {
+                entry.stage() != sley_index::Stage::Normal
+                    || expected.get(&entry.path.as_bytes()[prefix.len()..])
+                        != Some(&(entry.mode, entry.oid))
+            })
+        {
+            continue;
+        }
+        index
+            .entries
+            .retain(|entry| !entry.path.as_bytes().starts_with(prefix));
+        index.entries.push(sparse.clone());
+        restored = true;
+    }
+    if restored {
+        index
+            .entries
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        index.set_sparse_extension();
+    }
     Ok(())
 }
 
@@ -2780,7 +2846,7 @@ pub(crate) fn reset_merge_in(
         None => MergeTreeMap::new(),
     };
     let index_path = sley_worktree::repository_index_path(git_dir);
-    let old_index = if index_path.exists() {
+    let mut old_index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
@@ -2790,6 +2856,19 @@ pub(crate) fn reset_merge_in(
             checksum: None,
         }
     };
+    // `reset --merge` reasons about tracked leaves, not the sparse index's
+    // synthetic 040000 directory rows. Expanding only the in-memory view keeps
+    // those rows from being mistaken for deletions (and from producing bogus
+    // "unable to rmdir" warnings) while preserving the destination's sparse
+    // worktree policy.
+    if old_index.is_sparse() {
+        for entry in &mut old_index.entries {
+            if entry.mode == sley_index::SPARSE_DIR_MODE && entry.path.as_bytes().ends_with(b"/") {
+                entry.set_skip_worktree(true);
+            }
+        }
+        sley_worktree::expand_sparse_index_view(&mut old_index, &db, format)?;
+    }
     let mut stage0: BTreeMap<Vec<u8>, IndexEntry> = BTreeMap::new();
     let mut conflicted: BTreeSet<Vec<u8>> = BTreeSet::new();
     for entry in &old_index.entries {
@@ -2887,9 +2966,12 @@ pub(crate) fn reset_merge_in(
         {
             entries.push(old.clone());
         } else {
-            entries.push(crate::commands::merge_rebase::merge_index_entry(
-                path, *mode, *oid, 0,
-            ));
+            let mut replacement =
+                crate::commands::merge_rebase::merge_index_entry(path, *mode, *oid, 0);
+            if stage0.get(path).is_some_and(IndexEntry::is_skip_worktree) {
+                replacement.set_skip_worktree(true);
+            }
+            entries.push(replacement);
         }
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));

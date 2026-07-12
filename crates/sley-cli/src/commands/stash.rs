@@ -608,7 +608,7 @@ fn apply_stash_via_merge(
     // `ours` (git's `c_tree`) is the current index written as a tree. Reject a
     // half-finished merge — git refuses "cannot apply a stash in the middle of a
     // merge" when the index has unmerged (stage>0) entries.
-    let index = read_repository_index(state.git_dir, format)?.unwrap_or(Index {
+    let mut index = read_repository_index(state.git_dir, format)?.unwrap_or(Index {
         version: 2,
         entries: Vec::new(),
         extensions: Vec::new(),
@@ -622,6 +622,7 @@ fn apply_stash_via_merge(
         eprintln!("error: cannot apply a stash in the middle of a merge");
         return Err(GitError::Exit(1));
     }
+    expand_sparse_stash_index_view(&mut index, db, format)?;
     let ours_map: MergeTreeMap = index
         .entries
         .iter()
@@ -776,6 +777,7 @@ fn unstage_changes_unless_new(
     index.entries = entries;
     index.extensions = Vec::new();
     index.checksum = None;
+    index.upgrade_version_for_flags();
     fs::write(&index_path, index.write(format)?)?;
     Ok(())
 }
@@ -806,16 +808,14 @@ fn reinstate_stash_index(
         })
         .collect();
     entries.sort_by(|left, right| left.path.cmp(&right.path));
-    fs::write(
-        &index_path,
-        Index {
-            version: 2,
-            entries,
-            extensions: Vec::new(),
-            checksum: None,
-        }
-        .write(format)?,
-    )?;
+    let mut index = Index {
+        version: 2,
+        entries,
+        extensions: Vec::new(),
+        checksum: None,
+    };
+    index.upgrade_version_for_flags();
+    fs::write(&index_path, index.write(format)?)?;
     Ok(())
 }
 
@@ -945,7 +945,7 @@ fn apply_stash_merge_results(
     lazy_fetch: bool,
 ) -> Result<()> {
     let index_path = sley_worktree::repository_index_path(git_dir);
-    let old_index = if index_path.exists() {
+    let mut old_index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
@@ -955,6 +955,7 @@ fn apply_stash_merge_results(
             checksum: None,
         }
     };
+    expand_sparse_stash_index_view(&mut old_index, db, format)?;
     let mut old_entries: BTreeMap<Vec<u8>, IndexEntry> = BTreeMap::new();
     for entry in &old_index.entries {
         if index_entry_stage(entry) == 0 {
@@ -1036,17 +1037,34 @@ fn apply_stash_merge_results(
             .cmp(&right.path)
             .then_with(|| index_entry_stage(left).cmp(&index_entry_stage(right)))
     });
-    fs::write(
-        &index_path,
-        Index {
-            version: 2,
-            entries,
-            extensions: Vec::new(),
-            checksum: None,
-        }
-        .write(format)?,
-    )?;
+    let mut index = Index {
+        version: 2,
+        entries,
+        extensions: Vec::new(),
+        checksum: None,
+    };
+    index.upgrade_version_for_flags();
+    fs::write(&index_path, index.write(format)?)?;
     Ok(())
+}
+
+/// Expand a sparse index into semantic leaf entries without touching disk.
+/// Stash tree merges are defined over repository paths; synthetic directory
+/// rows are an index storage detail and would otherwise be treated as files.
+fn expand_sparse_stash_index_view(
+    index: &mut Index,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<()> {
+    if !index.is_sparse() {
+        return Ok(());
+    }
+    for entry in &mut index.entries {
+        if entry.mode == sley_index::SPARSE_DIR_MODE && entry.path.as_bytes().ends_with(b"/") {
+            entry.set_skip_worktree(true);
+        }
+    }
+    sley_worktree::expand_sparse_index_view(index, db, format).map(|_| ())
 }
 
 fn stash_tree_changed_paths(
@@ -2109,12 +2127,17 @@ fn create_stash_commit_at(
         }
         return Err(GitError::Exit(1));
     };
-    let index = read_repository_index(&git_dir, format)?.unwrap_or(Index {
+    let mut index = read_repository_index(&git_dir, format)?.unwrap_or(Index {
         version: 2,
         entries: Vec::new(),
         extensions: Vec::new(),
         checksum: None,
     });
+    // Stash trees contain tracked leaf entries. A sparse index may represent an
+    // excluded subtree with a synthetic `040000 path/` entry, which is not a
+    // valid tree-builder leaf and cannot describe the staged/worktree delta.
+    // Expand only this in-memory snapshot; the repository index stays sparse.
+    expand_sparse_stash_index_view(&mut index, &db, format)?;
     let index_entries = index
         .entries
         .iter()

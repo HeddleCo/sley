@@ -2059,15 +2059,60 @@ pub fn update_index_again(
 ) -> Result<UpdateIndexResult> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
-    let index_path = repository_index_path(git_dir);
-    if !index_path.exists() {
+    let (entry_count, again_paths) =
+        select_index_again_paths(worktree_root, git_dir, format, paths)?;
+    if again_paths.is_empty() {
         return Ok(UpdateIndexResult {
-            entries: 0,
+            entries: entry_count,
             updated: Vec::new(),
         });
     }
-    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    update_index_paths(worktree_root, git_dir, format, &again_paths, options)
+}
+
+/// Apply `--[no-]skip-worktree` only to the paths selected by `--again`.
+///
+/// Git treats `--again` as a path selector for the other update-index mode in
+/// effect.  It must not re-stage a missing out-of-cone file when the requested
+/// operation is only to clear its skip-worktree bit.
+pub fn set_index_skip_worktree_again(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    skip_worktree: bool,
+) -> Result<UpdateIndexResult> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let (entry_count, again_paths) =
+        select_index_again_paths(worktree_root, git_dir, format, paths)?;
+    if again_paths.is_empty() {
+        return Ok(UpdateIndexResult {
+            entries: entry_count,
+            updated: Vec::new(),
+        });
+    }
+    set_index_skip_worktree_paths(worktree_root, git_dir, format, &again_paths, skip_worktree)
+}
+
+fn select_index_again_paths(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+) -> Result<(usize, Vec<PathBuf>)> {
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok((0, Vec::new()));
+    }
+    let mut index = Index::parse(&fs::read(&index_path)?, format)?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    // `--again` compares logical index entries with HEAD.  A collapsed sparse
+    // directory is an index storage node, not a tracked path; comparing it to
+    // the flattened HEAD map incorrectly selects every out-of-cone directory
+    // for a worktree update.  Expand only the temporary comparison view, with
+    // no observable full-index transition.
+    expand_sparse_index_in_memory(&mut index, &db, format)?;
     let head_entries = head_tree_entries(git_dir, format, &db)?;
     let selected_paths = selected_git_paths(worktree_root, paths)?;
     let mut again_paths = Vec::new();
@@ -2087,13 +2132,7 @@ pub fn update_index_again(
             again_paths.push(worktree_root.join(repo_path_to_os_path(entry.path.as_bytes())?));
         }
     }
-    if again_paths.is_empty() {
-        return Ok(UpdateIndexResult {
-            entries: index.entries.len(),
-            updated: Vec::new(),
-        });
-    }
-    update_index_paths(worktree_root, git_dir, format, &again_paths, options)
+    Ok((index.entries.len(), again_paths))
 }
 
 pub fn set_index_assume_unchanged_paths(
@@ -3733,6 +3772,14 @@ pub fn update_index_cacheinfo_with_options(
             checksum: None,
         }
     };
+    if index.entries.iter().any(IndexEntry::is_sparse_dir) {
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        expand_sparse_index_directories(&mut index, &db, format, |directory| {
+            entries
+                .iter()
+                .any(|entry| entry.path.starts_with(directory))
+        })?;
+    }
     let mut updated = Vec::new();
     let mut reports: Vec<String> = Vec::new();
     let mut untracked_cache_invalidation_paths = Vec::new();

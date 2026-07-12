@@ -289,6 +289,19 @@ fn run_checkout_index(
             checksum: None,
         },
     };
+    // checkout-index addresses logical cache entries. Keep the serialized
+    // sparse-directory names only for Git's special explicit-directory error,
+    // then expand a command-local view so `--all` and
+    // `--ignore-skip-worktree-bits` can see the represented leaves without an
+    // observable full-index transition or an on-disk rewrite.
+    let sparse_directory_paths = index
+        .entries
+        .iter()
+        .filter(|entry| entry.is_sparse_dir())
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect::<BTreeSet<_>>();
+    let physical_sparse_index = (!sparse_directory_paths.is_empty()).then(|| index.clone());
+    sley_worktree::expand_sparse_index_view(&mut index, db, format)?;
 
     // The path prefix of the current directory relative to the worktree root is
     // prepended to explicit pathspecs for cache lookup (so `a.txt` from `sub/`
@@ -360,6 +373,20 @@ fn run_checkout_index(
                 .map(|(idx, _)| idx)
                 .collect();
             if positions.is_empty() {
+                let mut sparse_lookup = lookup.clone();
+                if !sparse_lookup.ends_with(b"/") {
+                    sparse_lookup.push(b'/');
+                }
+                if sparse_directory_paths.contains(&sparse_lookup) {
+                    if !options.quiet {
+                        eprintln!(
+                            "git checkout-index: {} is a sparse directory",
+                            String::from_utf8_lossy(&sparse_lookup)
+                        );
+                    }
+                    had_error = true;
+                    continue;
+                }
                 if matches!(options.stage, CheckoutIndexStage::All)
                     && index.entries.iter().any(|entry| entry.path == lookup)
                 {
@@ -381,6 +408,16 @@ fn run_checkout_index(
                         || !checkout_index_entry_skip_worktree(&index.entries[*idx])
                 })
                 .collect();
+            if positions.is_empty() {
+                if !options.quiet {
+                    eprintln!(
+                        "git checkout-index: {} has skip-worktree enabled; use '--ignore-skip-worktree-bits' to checkout",
+                        String::from_utf8_lossy(&lookup)
+                    );
+                }
+                had_error = true;
+                continue;
+            }
             if temp {
                 if checkout_temp_index_entries(&checkout_context, &dir_prefix, &positions, &index)?
                 {
@@ -401,14 +438,35 @@ fn run_checkout_index(
     }
 
     if wrote_index {
-        index.entries.sort_by(|left, right| {
+        let mut index_to_write = if let Some(mut physical) = physical_sparse_index {
+            // The expanded index is a semantic checkout view, not a new
+            // storage layout. `checkout-index -u` updates cached stat data for
+            // physical leaf entries only; collapsed directories remain
+            // collapsed just as Git leaves them, and the `sdir` extension is
+            // preserved.
+            for entry in &mut physical.entries {
+                if entry.is_sparse_dir() {
+                    continue;
+                }
+                if let Some(updated) = index.entries.iter().find(|updated| {
+                    updated.path == entry.path
+                        && checkout_index_entry_stage(updated) == checkout_index_entry_stage(entry)
+                }) {
+                    copy_checkout_index_stat(entry, updated);
+                }
+            }
+            physical
+        } else {
+            index
+        };
+        index_to_write.entries.sort_by(|left, right| {
             left.path.cmp(&right.path).then_with(|| {
                 checkout_index_entry_stage(left).cmp(&checkout_index_entry_stage(right))
             })
         });
         fs::write(
             sley_worktree::repository_index_path(git_dir),
-            index.write(format)?,
+            index_to_write.write(format)?,
         )?;
     }
 
@@ -416,6 +474,18 @@ fn run_checkout_index(
         return Err(GitError::Exit(1));
     }
     Ok(())
+}
+
+fn copy_checkout_index_stat(destination: &mut IndexEntry, source: &IndexEntry) {
+    destination.ctime_seconds = source.ctime_seconds;
+    destination.ctime_nanoseconds = source.ctime_nanoseconds;
+    destination.mtime_seconds = source.mtime_seconds;
+    destination.mtime_nanoseconds = source.mtime_nanoseconds;
+    destination.dev = source.dev;
+    destination.ino = source.ino;
+    destination.uid = source.uid;
+    destination.gid = source.gid;
+    destination.size = source.size;
 }
 
 enum CheckoutOutcome {

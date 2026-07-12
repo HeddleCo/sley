@@ -452,6 +452,53 @@ fn checkout_index_update_stat_matches_upstream_git() {
 }
 
 #[test]
+fn checkout_index_update_stat_preserves_sparse_index_layout() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("checkout-index-sparse-update-stat");
+    let (upstream, rust) = prepare_pair("sparse-update-stat", &root);
+    for repo in [&upstream, &rust] {
+        run_success(
+            sley_testkit::oracle_git(),
+            repo,
+            &["sparse-checkout", "init", "--cone", "--sparse-index"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            repo,
+            &["sparse-checkout", "set", "selected"],
+        );
+    }
+
+    let args = ["checkout-index", "-f", "-u", "--all"];
+    let expected = run(sley_testkit::oracle_git(), &upstream, &args);
+    let actual = run(SLEY, &rust, &args);
+    assert_same_output(actual, expected, &args);
+
+    let expected_layout = run_success(
+        sley_testkit::oracle_git(),
+        &upstream,
+        &["ls-files", "--sparse", "--stage"],
+    );
+    let actual_layout = run_success(
+        sley_testkit::oracle_git(),
+        &rust,
+        &["ls-files", "--sparse", "--stage"],
+    );
+    assert_eq!(
+        actual_layout, expected_layout,
+        "sparse index layout changed"
+    );
+    assert!(
+        String::from_utf8_lossy(&actual_layout).contains("\tdir/\n"),
+        "out-of-cone directory was expanded on disk"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn checkout_index_mix_all_and_paths_matches_upstream_git() {
     if !git_available() {
         return;

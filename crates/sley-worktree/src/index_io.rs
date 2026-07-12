@@ -1916,7 +1916,18 @@ pub(crate) fn remove_worktree_file(root: &Path, path: &[u8]) -> Result<()> {
     // directory entry itself, never the symlink target.
     let metadata = match fs::symlink_metadata(&file) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // A D/F transition can ask to remove `dir/child` after `dir` has
+        // already become a file. There is no child entry to remove; lstat
+        // reports ENOTDIR rather than ENOENT, and both mean the requested leaf
+        // is absent.
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(());
+        }
         Err(err) => return Err(err.into()),
     };
     if metadata.is_dir() {

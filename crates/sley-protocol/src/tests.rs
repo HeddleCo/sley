@@ -5870,7 +5870,7 @@ fn protocol_v2_fetch_response_parses_and_encodes_sections() {
         PktLineFrame::Data(b"ready\n".to_vec()),
         PktLineFrame::Delimiter,
         PktLineFrame::Data(b"shallow-info\n".to_vec()),
-        PktLineFrame::Data(b"shallow 2222222222222222222222222222222222222222\n".to_vec()),
+        PktLineFrame::Data(b"shallow 2222222222222222222222222222222222222222".to_vec()),
         PktLineFrame::Delimiter,
         PktLineFrame::Data(b"wanted-refs\n".to_vec()),
         PktLineFrame::Data(b"3333333333333333333333333333333333333333 refs/heads/main\n".to_vec()),
@@ -5912,6 +5912,56 @@ fn protocol_v2_fetch_response_parses_and_encodes_sections() {
         encode_protocol_v2_fetch_response(&sections).expect("test operation should succeed"),
         frames
     );
+}
+
+#[test]
+fn protocol_v2_fetch_shallow_info_encoding_matches_git_wire_bytes() {
+    let sha1 = ObjectId::from_hex(
+        ObjectFormat::Sha1,
+        "1111111111111111111111111111111111111111",
+    )
+    .expect("valid SHA-1 object id");
+    let sha256 = ObjectId::from_hex(
+        ObjectFormat::Sha256,
+        "2222222222222222222222222222222222222222222222222222222222222222",
+    )
+    .expect("valid SHA-256 object id");
+
+    for (oid, shallow_wire, unshallow_wire) in [
+        (
+            sha1,
+            b"0011shallow-info\n0034shallow 11111111111111111111111111111111111111110000".as_slice(),
+            b"0011shallow-info\n0036unshallow 11111111111111111111111111111111111111110000"
+                .as_slice(),
+        ),
+        (
+            sha256,
+            b"0011shallow-info\n004cshallow 22222222222222222222222222222222222222222222222222222222222222220000"
+                .as_slice(),
+            b"0011shallow-info\n004eunshallow 22222222222222222222222222222222222222222222222222222222222222220000"
+                .as_slice(),
+        ),
+    ] {
+        let mut encoded = Vec::new();
+        write_protocol_v2_fetch_response(
+            &mut encoded,
+            &[ProtocolV2FetchResponseSection::ShallowInfo(vec![
+                ProtocolV2FetchShallowInfo::Shallow(oid),
+            ])],
+        )
+        .expect("encode shallow response");
+        assert_eq!(encoded, shallow_wire);
+
+        encoded.clear();
+        write_protocol_v2_fetch_response(
+            &mut encoded,
+            &[ProtocolV2FetchResponseSection::ShallowInfo(vec![
+                ProtocolV2FetchShallowInfo::Unshallow(oid),
+            ])],
+        )
+        .expect("encode unshallow response");
+        assert_eq!(encoded, unshallow_wire);
+    }
 }
 
 #[test]

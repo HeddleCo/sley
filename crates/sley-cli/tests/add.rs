@@ -1,7 +1,8 @@
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -30,6 +31,33 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
         .args(args)
         .output()
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+}
+
+fn run_with_input_and_trace(
+    program: &str,
+    cwd: &Path,
+    args: &[&str],
+    input: &[u8],
+    trace: &Path,
+) -> Output {
+    let mut child = Command::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .env("GIT_TRACE2_EVENT", trace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"));
+    child
+        .stdin
+        .take()
+        .expect("interactive stdin")
+        .write_all(input)
+        .expect("write interactive input");
+    child
+        .wait_with_output()
+        .expect("interactive command output")
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -177,6 +205,86 @@ fn add_exact_in_cone_file_keeps_sparse_index_collapsed() {
     assert!(!git(&rust, &["ls-files", "ignored.log"]).starts_with(b"ignored.log"));
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn add_interactive_out_of_cone_preparation_matches_sparse_shape_for_both_hashes() {
+    for (label, object_format) in [("sha1", "sha1"), ("sha256", "sha256")] {
+        let root = unique_temp_dir(&format!("add-interactive-sparse-{label}"));
+        let upstream = root.join("upstream");
+        let rust = root.join("rust");
+        for repo in [&upstream, &rust] {
+            fs::create_dir_all(repo).expect("create repository");
+            git(
+                repo,
+                &[
+                    "init",
+                    "-q",
+                    "-b",
+                    "main",
+                    &format!("--object-format={object_format}"),
+                ],
+            );
+            fs::create_dir_all(repo.join("deep")).expect("create in-cone directory");
+            fs::create_dir_all(repo.join("outside/nested")).expect("create out-of-cone directory");
+            fs::write(repo.join("deep/a"), b"inside\n").expect("write in-cone file");
+            fs::write(repo.join("outside/a"), b"outside\n").expect("write outside file");
+            fs::write(repo.join("outside/nested/a"), b"nested\n")
+                .expect("write nested outside file");
+            git(repo, &["add", "."]);
+            run_with_identity(repo, &["commit", "-qm", "base"]);
+            git(
+                repo,
+                &["sparse-checkout", "init", "--cone", "--sparse-index"],
+            );
+            git(repo, &["sparse-checkout", "set", "deep"]);
+            fs::create_dir_all(repo.join("outside")).expect("materialize outside directory");
+            fs::write(repo.join("outside/a"), b"changed\n").expect("modify out-of-cone file");
+        }
+
+        // Merely entering the update menu prepares the semantic sparse view;
+        // the deliberately invalid selections leave the content unstaged.
+        let input = b"u\n2\n3\n\nq\n";
+        let oracle_trace = root.join("oracle-trace.json");
+        let sley_trace = root.join("sley-trace.json");
+        let expected = run_with_input_and_trace(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["add", "-i"],
+            input,
+            &oracle_trace,
+        );
+        let actual = run_with_input_and_trace(
+            sley_testkit::sley_bin!(),
+            &rust,
+            &["add", "-i"],
+            input,
+            &sley_trace,
+        );
+        assert_eq!(
+            actual.status.code(),
+            expected.status.code(),
+            "{label} status"
+        );
+        assert!(
+            fs::read_to_string(&oracle_trace)
+                .expect("read oracle trace")
+                .contains("ensure_full_index"),
+            "oracle must expose sparse preparation for {label}"
+        );
+        assert!(
+            fs::read_to_string(&sley_trace)
+                .expect("read sley trace")
+                .contains("ensure_full_index"),
+            "Sley must expose sparse preparation for {label}"
+        );
+        assert_eq!(
+            git(&rust, &["ls-files", "--sparse", "--stage"]),
+            git(&upstream, &["ls-files", "--sparse", "--stage"]),
+            "{label} sparse index shape differed after add -i"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 fn make_executable(path: &Path) {

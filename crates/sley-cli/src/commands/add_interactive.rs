@@ -10,7 +10,7 @@
 //! this module is therefore confined to the REPL and the byte-exact prompt /
 //! table formatting that the upstream t3701 oracle pins down.
 
-use sley::plumbing::sley_config;
+use sley::plumbing::{sley_config, sley_core, sley_worktree};
 use std::env;
 use std::io::{self, BufRead, Read, Write};
 use std::path::PathBuf;
@@ -21,18 +21,35 @@ use sley::{GitError, Result};
 
 struct AddInteractiveContext {
     git_dir: PathBuf,
+    worktree_root: PathBuf,
+    collapsed_sparse_prefixes: Vec<Vec<u8>>,
     config: GitConfig,
 }
 
 impl AddInteractiveContext {
     fn open(cli_session: &crate::session::CliSession) -> Result<Self> {
         let repository = cli_session.open_repository()?;
-        repository.workdir().ok_or_else(|| {
-            GitError::Unsupported("interactive add requires a repository worktree".into())
-        })?;
+        let worktree_root = repository
+            .workdir()
+            .ok_or_else(|| {
+                GitError::Unsupported("interactive add requires a repository worktree".into())
+            })?
+            .to_path_buf();
         let git_dir = repository.git_dir().to_path_buf();
+        let format = repository.object_format();
+        let collapsed_sparse_prefixes = sley_worktree::read_repository_index(&git_dir, format)?
+            .into_iter()
+            .flat_map(|index| index.entries)
+            .filter(|entry| entry.is_sparse_dir())
+            .map(|entry| entry.path.as_bytes().to_vec())
+            .collect();
         let config = crate::read_repo_config(&git_dir)?;
-        Ok(Self { git_dir, config })
+        Ok(Self {
+            git_dir,
+            worktree_root,
+            collapsed_sparse_prefixes,
+            config,
+        })
     }
 }
 
@@ -242,7 +259,11 @@ enum Filter {
 
 /// Build the modified-files list, mirroring git's `get_modified_files`:
 /// staged side = `diff-index --cached HEAD`, unstaged side = `diff-files`.
-fn get_modified_files(filter: Filter, paths: &[String]) -> Vec<FileItem> {
+fn get_modified_files(
+    context: &AddInteractiveContext,
+    filter: Filter,
+    paths: &[String],
+) -> Vec<FileItem> {
     let mut index_map: Vec<(String, usize, usize, bool)> = Vec::new();
     let mut worktree_map: Vec<(String, usize, usize, bool)> = Vec::new();
 
@@ -269,6 +290,38 @@ fn get_modified_files(filter: Filter, paths: &[String]) -> Vec<FileItem> {
         if let Ok(out) = run_capture(&args) {
             worktree_map = parse_numstat(&out);
         }
+    }
+
+    // Git's add-interactive machinery asks diff-files to refresh paths before
+    // presenting each status/update table. A materialized change beneath a
+    // collapsed sparse directory therefore records ensure_full_index, then
+    // convert_to_sparse keeps only that path expanded. Sley's standalone diff
+    // currently computes the same semantic rows by expanding its index, but it
+    // cannot know that its caller will persist the temporary full view. Restore
+    // the sparse shape here, at the orchestration boundary that owns the child
+    // diff, and publish the transition Git exposes to trace2.
+    let touches_collapsed_sparse_directory =
+        index_map
+            .iter()
+            .chain(worktree_map.iter())
+            .any(|(path, ..)| {
+                context
+                    .collapsed_sparse_prefixes
+                    .iter()
+                    .any(|prefix| path.as_bytes().starts_with(prefix))
+            });
+    if touches_collapsed_sparse_directory {
+        sley_core::trace2::region("index", "ensure_full_index");
+        // Reapply prints an advisory for the intentionally materialized dirty
+        // path. add-interactive's internal conversion is silent, so suppress
+        // the helper's terminal streams while retaining its trace2 events.
+        let _ = Command::new(self_bin())
+            .args(["sparse-checkout", "reapply"])
+            .current_dir(&context.worktree_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 
     // Merge by path, sorted like git (string_list is sorted).
@@ -626,8 +679,8 @@ fn print_menu(style: &InteractiveStyle) {
     }
 }
 
-fn print_status_table(paths: &[String], style: &InteractiveStyle) {
-    let items = get_modified_files(Filter::NoFilter, paths);
+fn print_status_table(context: &AddInteractiveContext, paths: &[String], style: &InteractiveStyle) {
+    let items = get_modified_files(context, Filter::NoFilter, paths);
     let selected = vec![false; items.len()];
     print_list(&items, &selected, false, true, style);
     println!();
@@ -640,7 +693,7 @@ fn run_main_loop(
 ) -> Result<()> {
     let stdin = io::stdin();
     let mut handle = stdin.lock();
-    print_status_table(paths, style);
+    print_status_table(context, paths, style);
     loop {
         print_menu(style);
         style.prompt("What now");
@@ -658,12 +711,12 @@ fn run_main_loop(
             continue;
         }
         match menu_command(cmd) {
-            Some(MenuCmd::Status) => print_status_table(paths, style),
-            Some(MenuCmd::Update) => run_update(&mut handle, paths, style)?,
-            Some(MenuCmd::Revert) => run_revert(&mut handle, paths, style)?,
+            Some(MenuCmd::Status) => print_status_table(context, paths, style),
+            Some(MenuCmd::Update) => run_update(context, &mut handle, paths, style)?,
+            Some(MenuCmd::Revert) => run_revert(context, &mut handle, paths, style)?,
             Some(MenuCmd::AddUntracked) => run_add_untracked(&mut handle, paths, style)?,
             Some(MenuCmd::Patch) => run_patch_menu(context, &mut handle, paths, style)?,
-            Some(MenuCmd::Diff) => run_diff(&mut handle, paths, style)?,
+            Some(MenuCmd::Diff) => run_diff(context, &mut handle, paths, style)?,
             Some(MenuCmd::Quit) => {
                 println!("Bye.");
                 return Ok(());
@@ -719,8 +772,13 @@ fn print_main_help(style: &InteractiveStyle) {
     }
 }
 
-fn run_update(stdin: &mut impl BufRead, paths: &[String], style: &InteractiveStyle) -> Result<()> {
-    let mut items = get_modified_files(Filter::WorktreeOnly, paths);
+fn run_update(
+    context: &AddInteractiveContext,
+    stdin: &mut impl BufRead,
+    paths: &[String],
+    style: &InteractiveStyle,
+) -> Result<()> {
+    let mut items = get_modified_files(context, Filter::WorktreeOnly, paths);
     if items.is_empty() {
         println!();
         return Ok(());
@@ -733,11 +791,16 @@ fn run_update(stdin: &mut impl BufRead, paths: &[String], style: &InteractiveSty
             return Ok(());
         }
     };
-    // Stage each chosen path: `add -- <path>` (handles deletions too).
+    // Interactive update is an explicit user selection and, like Git's
+    // add-interactive machinery, may stage a represented path outside the
+    // sparse cone. Route it through `add --sparse`; the index engine then
+    // expands exactly the selected sparse directory (and records the expected
+    // ensure_full_index transition) while ordinary in-cone selections remain
+    // unexpanded.
     let mut count = 0;
     for &i in &chosen {
         let p = &items[i].path;
-        let _ = run_status(&["add", "--", p.as_str()], None);
+        let _ = run_status(&["add", "--sparse", "--", p.as_str()], None);
         count += 1;
     }
     if count == 1 {
@@ -749,8 +812,13 @@ fn run_update(stdin: &mut impl BufRead, paths: &[String], style: &InteractiveSty
     Ok(())
 }
 
-fn run_revert(stdin: &mut impl BufRead, paths: &[String], style: &InteractiveStyle) -> Result<()> {
-    let mut items = get_modified_files(Filter::IndexOnly, paths);
+fn run_revert(
+    context: &AddInteractiveContext,
+    stdin: &mut impl BufRead,
+    paths: &[String],
+    style: &InteractiveStyle,
+) -> Result<()> {
+    let mut items = get_modified_files(context, Filter::IndexOnly, paths);
     if items.is_empty() {
         println!();
         return Ok(());
@@ -843,8 +911,13 @@ fn get_untracked_files(paths: &[String]) -> Vec<FileItem> {
     items
 }
 
-fn run_diff(stdin: &mut impl BufRead, paths: &[String], style: &InteractiveStyle) -> Result<()> {
-    let mut items = get_modified_files(Filter::IndexOnly, paths);
+fn run_diff(
+    context: &AddInteractiveContext,
+    stdin: &mut impl BufRead,
+    paths: &[String],
+    style: &InteractiveStyle,
+) -> Result<()> {
+    let mut items = get_modified_files(context, Filter::IndexOnly, paths);
     if items.is_empty() {
         println!();
         return Ok(());
@@ -871,7 +944,7 @@ fn run_patch_menu(
     paths: &[String],
     style: &InteractiveStyle,
 ) -> Result<()> {
-    let mut items = get_modified_files(Filter::WorktreeOnly, paths);
+    let mut items = get_modified_files(context, Filter::WorktreeOnly, paths);
     // Drop binary / unmerged entries (best-effort: numstat marks binary).
     items.retain(|i| !i.index_binary && !i.worktree_binary);
     if items.is_empty() {

@@ -2467,8 +2467,15 @@ fn checkout_twoway_dirty(
     // The tree of the HEAD being left (git's `old_branch_info->commit`). `None`
     // when HEAD is unborn — the engine then sees an empty `oldtree` side.
     let old_tree = match commands::merge_rebase::head_commit_oid(&context.refs)? {
-        Some(head) => Some(commands::merge_rebase::commit_tree_oid(db, format, &head)?),
+        // An all-zero direct HEAD is Git's invalid/unborn sentinel. The index
+        // may still contain a complete staged tree; model the old commit side
+        // as empty and let the two-way engine carry those matching entries
+        // into the existing branch instead of trying to read object 0000…0000.
+        Some(head) if !head.is_null() => {
+            Some(commands::merge_rebase::commit_tree_oid(db, format, &head)?)
+        }
         None => None,
+        Some(_) => None,
     };
 
     commands::read_tree::checkout_two_way_engine(

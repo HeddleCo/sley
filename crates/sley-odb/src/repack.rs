@@ -848,7 +848,12 @@ pub fn repack_promisor_objects(
 pub fn repack_loose_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option<RepackResult>> {
     let objects_dir = repository_objects_dir(git_dir);
     let database = FileObjectDatabase::new(objects_dir.clone(), format);
-    let loose_oids = loose_object_ids(&objects_dir, format)?;
+    let mut packed_oids = HashSet::new();
+    collect_packed_object_ids(&objects_dir.join("pack"), format, &mut packed_oids)?;
+    let loose_oids = loose_object_ids(&objects_dir, format)?
+        .into_iter()
+        .filter(|oid| !packed_oids.contains(oid))
+        .collect();
     repack_selected_loose_objects(&database, format, loose_oids)
 }
 
@@ -879,9 +884,11 @@ pub fn repack_reachable_loose_objects(
         present_roots,
         &promisor_oids,
     )?;
+    let mut packed_oids = HashSet::new();
+    collect_packed_object_ids(&objects_dir.join("pack"), format, &mut packed_oids)?;
     let loose_oids = loose_object_ids(&objects_dir, format)?
         .into_iter()
-        .filter(|oid| reachable.contains(oid))
+        .filter(|oid| reachable.contains(oid) && !packed_oids.contains(oid))
         .collect::<Vec<_>>();
     repack_selected_loose_objects(&database, format, loose_oids)
 }
@@ -958,6 +965,23 @@ pub struct GeometricRepackResult {
 pub struct GeometricRepackPlan {
     pub split: usize,
     pub pack_count: usize,
+}
+
+/// Additional object-selection policy for a geometric repack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GeometricRepackOptions {
+    /// Follow references from selected objects into packs outside the
+    /// geometric progression. This is Git's `--stdin-packs=follow` mode and
+    /// lets a new non-cruft pack rescue objects which were once unreachable
+    /// before a bitmap MIDX intentionally excludes cruft packs.
+    pub follow_reachable: bool,
+}
+
+/// Exact pack table and preferred pack for a MIDX written by `git repack`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeometricRepackMidxSelection {
+    pub pack_names: Vec<String>,
+    pub preferred_pack_name: Option<String>,
 }
 
 /// Collect the local non-cruft, non-kept packs eligible for geometric rollup,
@@ -1074,6 +1098,22 @@ pub fn repack_geometric(
     split_factor: u64,
     kept_pack_stems: &HashSet<String>,
 ) -> Result<GeometricRepackResult> {
+    repack_geometric_with_options(
+        git_dir,
+        format,
+        split_factor,
+        kept_pack_stems,
+        GeometricRepackOptions::default(),
+    )
+}
+
+pub fn repack_geometric_with_options(
+    git_dir: &Path,
+    format: ObjectFormat,
+    split_factor: u64,
+    kept_pack_stems: &HashSet<String>,
+    options: GeometricRepackOptions,
+) -> Result<GeometricRepackResult> {
     let objects_dir = repository_objects_dir(git_dir);
     let database = FileObjectDatabase::new(objects_dir.clone(), format);
 
@@ -1117,6 +1157,47 @@ pub fn repack_geometric(
         }
         if seen.insert(*oid) {
             included.push(*oid);
+        }
+    }
+
+    if options.follow_reachable && !included.is_empty() {
+        let mut follow_starts = included.clone();
+        // Packs left above the split are excluded from the new pack, but a
+        // non-MIDX pack is not known to be closed under reachability. Git's
+        // `!pack` stdin marker follows references out of those objects while
+        // still excluding the objects stored in the pack itself.
+        for oid in &excluded_oids {
+            let object = database.read_object(oid)?;
+            match object.object_type {
+                ObjectType::Commit => {
+                    let commit = Commit::parse_ref(format, &object.body)?;
+                    follow_starts.extend(commit.parents.iter().copied());
+                    follow_starts.push(commit.tree);
+                }
+                ObjectType::Tree => {
+                    for entry in TreeEntries::new(format, &object.body) {
+                        let entry = entry?;
+                        if !entry.is_gitlink() {
+                            follow_starts.push(entry.oid);
+                        }
+                    }
+                }
+                ObjectType::Tag => {
+                    follow_starts.push(Tag::parse_ref(format, &object.body)?.object);
+                }
+                ObjectType::Blob => {}
+            }
+        }
+        let followed = collect_reachable_object_ids_excluding_promised_missing(
+            &database,
+            format,
+            follow_starts,
+            &excluded_oids,
+        )?;
+        for oid in followed {
+            if seen.insert(oid) {
+                included.push(oid);
+            }
         }
     }
 
@@ -1170,6 +1251,80 @@ pub fn repack_geometric(
             loose_prune_outcome: LooseObjectPruneOutcome::FollowUpRequired,
         }),
         rolled_up_packs,
+    })
+}
+
+/// Select the explicit pack list used by `repack --write-midx` after a
+/// geometric repack.
+///
+/// Cruft packs are normally retained because they may be needed to close a
+/// bitmap traversal. When `repack.midxMustContainCruft=false`, they can be
+/// omitted after `follow_reachable` copied those dependencies into the new
+/// reachable pack. An existing MIDX pack which is neither still present nor
+/// rolled into the new pack is "unknown" and conservatively keeps cruft in the
+/// replacement MIDX, matching `midx_has_unknown_packs()`.
+pub fn geometric_repack_midx_selection(
+    git_dir: &Path,
+    geometric: &GeometricRepackResult,
+    midx_must_contain_cruft: bool,
+    existing_midx_pack_names: Option<&HashSet<String>>,
+) -> Result<GeometricRepackMidxSelection> {
+    let pack_dir = repository_objects_dir(git_dir).join("pack");
+    let mut non_cruft = Vec::new();
+    let mut cruft = Vec::new();
+    if let Ok(entries) = fs::read_dir(&pack_dir) {
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("idx") {
+                continue;
+            }
+            let Some(name) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(ToString::to_string)
+            else {
+                continue;
+            };
+            if path.with_extension("mtimes").exists() {
+                cruft.push(name);
+            } else {
+                non_cruft.push(name);
+            }
+        }
+    }
+
+    let non_cruft_set: HashSet<&str> = non_cruft.iter().map(String::as_str).collect();
+    let rolled_up: HashSet<String> = geometric
+        .rolled_up_packs
+        .iter()
+        .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
+        .map(|stem| format!("{stem}.idx"))
+        .collect();
+    let existing_has_unknown_pack = existing_midx_pack_names.is_some_and(|existing| {
+        existing.iter().any(|name| {
+            !non_cruft_set.contains(name.as_str()) && !rolled_up.contains(name.as_str())
+        })
+    });
+    let include_cruft = midx_must_contain_cruft
+        || existing_has_unknown_pack
+        || (geometric.result.is_none() && existing_midx_pack_names.is_none());
+
+    let mut pack_names = non_cruft;
+    if include_cruft {
+        pack_names.extend(cruft);
+    }
+    pack_names.sort();
+
+    let preferred_pack_name = geometric.result.as_ref().and_then(|result| {
+        let name = format!("pack-{}.idx", result.pack_checksum);
+        pack_names
+            .iter()
+            .any(|candidate| candidate == &name)
+            .then_some(name)
+    });
+    Ok(GeometricRepackMidxSelection {
+        pack_names,
+        preferred_pack_name,
     })
 }
 
@@ -1963,6 +2118,29 @@ pub fn repack_cruft_with_pack_options(
     options: &RepackOptions,
     cruft_options: &CruftPackOptions,
 ) -> Result<CruftRepackResult> {
+    repack_cruft_with_pack_options_and_recent_roots(
+        git_dir,
+        format,
+        roots,
+        &[],
+        cruft_expiration,
+        options,
+        cruft_options,
+    )
+}
+
+/// Run a cruft repack while treating each explicit root and its closure as
+/// recent. This additive entry point keeps the original
+/// [`repack_cruft_with_pack_options`] signature stable for embedders.
+pub fn repack_cruft_with_pack_options_and_recent_roots(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    recent_roots: &[ObjectId],
+    cruft_expiration: Option<u32>,
+    options: &RepackOptions,
+    cruft_options: &CruftPackOptions,
+) -> Result<CruftRepackResult> {
     let objects_dir = repository_objects_dir(git_dir);
     let database = if options.local {
         FileObjectDatabase::without_alternates(objects_dir.clone(), format)
@@ -2075,6 +2253,13 @@ pub fn repack_cruft_with_pack_options(
                 && !retained_cruft_oids.contains(oid)
         })
         .collect();
+    if options.local {
+        let mut alternate_oids = HashSet::new();
+        for alternate in alternate_object_dirs(&objects_dir) {
+            alternate_oids.extend(object_ids_in_objects_dir(alternate, format)?);
+        }
+        survivors.retain(|oid, _| !alternate_oids.contains(oid));
+    }
 
     // Expiration: rescue older objects reachable from a recent one, drop the rest.
     // Preserve the dropped set as encoded output before installation can prune
@@ -2083,7 +2268,13 @@ pub fn repack_cruft_with_pack_options(
     let mut expired = None;
     if let Some(expiration) = cruft_expiration {
         let before_expiration = survivors.clone();
-        rescue_and_expire_cruft_objects(&database, format, &mut survivors, expiration)?;
+        rescue_and_expire_cruft_objects(
+            &database,
+            format,
+            &mut survivors,
+            expiration,
+            recent_roots,
+        )?;
         let dropped = before_expiration
             .into_iter()
             .filter(|(oid, _)| !survivors.contains_key(oid))
@@ -2264,6 +2455,7 @@ fn rescue_and_expire_cruft_objects(
     format: ObjectFormat,
     survivors: &mut HashMap<ObjectId, u32>,
     expiration: u32,
+    recent_roots: &[ObjectId],
 ) -> Result<()> {
     let recent: Vec<ObjectId> = survivors
         .iter()
@@ -2272,7 +2464,8 @@ fn rescue_and_expire_cruft_objects(
         .collect();
 
     let mut keep: HashSet<ObjectId> = HashSet::new();
-    let mut pending: Vec<ObjectId> = recent.clone();
+    let mut pending: Vec<ObjectId> = recent;
+    pending.extend_from_slice(recent_roots);
     while let Some(oid) = pending.pop() {
         if !keep.insert(oid) {
             continue;
@@ -2489,6 +2682,243 @@ mod tests {
             bytes.push((seed >> 24) as u8);
         }
         bytes
+    }
+
+    #[test]
+    fn geometric_follow_reachable_rescues_once_cruft_dependencies() {
+        let objects_dir = test_objects_dir("geometric-follow-cruft");
+        let git_dir = objects_dir.parent().expect("fixture git directory");
+        let format = ObjectFormat::Sha1;
+        let database = FileObjectDatabase::new(objects_dir.clone(), format);
+        let tree = database
+            .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
+            .expect("write tree");
+        let identity = b"T <t@example.invalid> 1 +0000".to_vec();
+        let parent = database
+            .write_object(EncodedObject::new(
+                ObjectType::Commit,
+                Commit {
+                    tree,
+                    parents: Vec::new(),
+                    author: identity.clone(),
+                    committer: identity.clone(),
+                    encoding: None,
+                    message: b"once cruft\n".to_vec(),
+                }
+                .write(),
+            ))
+            .expect("write parent commit");
+        let child = database
+            .write_object(EncodedObject::new(
+                ObjectType::Commit,
+                Commit {
+                    tree,
+                    parents: vec![parent],
+                    author: identity.clone(),
+                    committer: identity,
+                    encoding: None,
+                    message: b"reachable again\n".to_vec(),
+                }
+                .write(),
+            ))
+            .expect("write child commit");
+        let cruft = build_cruft_pack(
+            &database,
+            format,
+            &HashMap::from([(tree, 1_u32), (parent, 1_u32)]),
+        )
+        .expect("build cruft pack")
+        .expect("non-empty cruft pack");
+        install_cruft_pack_at_prefix(format, &cruft, &objects_dir.join("pack/pack"))
+            .expect("install cruft pack");
+        fs::remove_file(database.loose().object_path(&tree).expect("tree path"))
+            .expect("remove loose tree");
+        fs::remove_file(database.loose().object_path(&parent).expect("parent path"))
+            .expect("remove loose parent");
+
+        let ordinary = repack_geometric(git_dir, format, 2, &HashSet::new())
+            .expect("ordinary geometric repack")
+            .result
+            .expect("pack child");
+        assert_eq!(ordinary.object_count, 1);
+        assert_eq!(ordinary.index_entries[0].oid, child);
+
+        let followed = repack_geometric_with_options(
+            git_dir,
+            format,
+            2,
+            &HashSet::new(),
+            GeometricRepackOptions {
+                follow_reachable: true,
+            },
+        )
+        .expect("follow-reachable geometric repack")
+        .result
+        .expect("pack followed closure");
+        let followed_oids = followed
+            .index_entries
+            .iter()
+            .map(|entry| entry.oid)
+            .collect::<HashSet<_>>();
+        assert_eq!(followed_oids, HashSet::from([tree, parent, child]));
+        fs::remove_dir_all(git_dir).ok();
+    }
+
+    #[test]
+    fn geometric_midx_selection_excludes_cruft_unless_existing_midx_requires_it() {
+        let objects_dir = test_objects_dir("geometric-midx-cruft");
+        let git_dir = objects_dir.parent().expect("fixture git directory");
+        let pack_dir = objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir).expect("create pack directory");
+        let checksum = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("checksum");
+        let reachable_name = format!("pack-{checksum}.idx");
+        fs::write(pack_dir.join(&reachable_name), b"reachable index marker")
+            .expect("write reachable marker");
+        fs::write(pack_dir.join("pack-cruft.idx"), b"cruft index marker")
+            .expect("write cruft marker");
+        fs::write(pack_dir.join("pack-cruft.mtimes"), b"cruft marker")
+            .expect("write mtimes marker");
+        let geometric = GeometricRepackResult {
+            result: Some(RepackResult {
+                pack: Vec::new(),
+                idx: Vec::new(),
+                object_count: 0,
+                obsolete_packs: Vec::new(),
+                packed_loose: Vec::new(),
+                retained_pack_stems: Vec::new(),
+                promisor: false,
+                pack_checksum: checksum,
+                index_entries: Vec::new(),
+                bitmap_cache: Vec::new(),
+                loose_prune_outcome: LooseObjectPruneOutcome::Complete,
+            }),
+            rolled_up_packs: Vec::new(),
+        };
+
+        let excluded = geometric_repack_midx_selection(git_dir, &geometric, false, None)
+            .expect("exclude optional cruft");
+        assert_eq!(excluded.pack_names, vec![reachable_name.clone()]);
+        assert_eq!(excluded.preferred_pack_name, Some(reachable_name.clone()));
+
+        let existing = HashSet::from(["pack-cruft.idx".to_string()]);
+        let retained = geometric_repack_midx_selection(git_dir, &geometric, false, Some(&existing))
+            .expect("retain required cruft");
+        assert_eq!(
+            retained.pack_names,
+            vec![reachable_name, "pack-cruft.idx".to_string()]
+        );
+        fs::remove_dir_all(git_dir).ok();
+    }
+
+    #[test]
+    fn explicit_recent_root_rescues_old_cruft_closure() {
+        let objects_dir = test_objects_dir("recent-root-rescue");
+        let git_dir = objects_dir.parent().expect("fixture git directory");
+        let format = ObjectFormat::Sha1;
+        let database = FileObjectDatabase::new(objects_dir.clone(), format);
+        let tree = database
+            .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
+            .expect("write tree");
+        let identity = b"T <t@example.invalid> 1 +0000".to_vec();
+        let commit = database
+            .write_object(EncodedObject::new(
+                ObjectType::Commit,
+                Commit {
+                    tree,
+                    parents: Vec::new(),
+                    author: identity.clone(),
+                    committer: identity,
+                    encoding: None,
+                    message: b"hook root\n".to_vec(),
+                }
+                .write(),
+            ))
+            .expect("write commit");
+        let mut survivors = HashMap::from([(tree, 1_u32), (commit, 1_u32)]);
+
+        rescue_and_expire_cruft_objects(&database, format, &mut survivors, 100, &[commit])
+            .expect("rescue explicit hook root");
+
+        assert_eq!(
+            survivors.keys().copied().collect::<HashSet<_>>(),
+            HashSet::from([tree, commit])
+        );
+        fs::remove_dir_all(git_dir).ok();
+    }
+
+    #[test]
+    fn local_cruft_repack_excludes_oid_already_present_in_alternate() {
+        let objects_dir = test_objects_dir("local-alternate-dedup");
+        let git_dir = objects_dir.parent().expect("fixture git directory");
+        let alternate_objects = test_objects_dir("local-alternate-source");
+        let local = FileObjectDatabase::new(objects_dir.clone(), ObjectFormat::Sha1);
+        let alternate = FileObjectDatabase::new(alternate_objects.clone(), ObjectFormat::Sha1);
+        let object = EncodedObject::new(ObjectType::Blob, b"duplicate unreachable\n".to_vec());
+        let oid = local
+            .write_object(object.clone())
+            .expect("write local copy");
+        assert_eq!(
+            alternate
+                .write_object(object)
+                .expect("write alternate copy"),
+            oid
+        );
+        fs::create_dir_all(objects_dir.join("info")).expect("create alternates directory");
+        fs::write(
+            objects_dir.join("info/alternates"),
+            format!("{}\n", alternate_objects.display()),
+        )
+        .expect("write alternates file");
+
+        let result = repack_cruft_with_pack_options(
+            git_dir,
+            ObjectFormat::Sha1,
+            &[],
+            None,
+            &RepackOptions {
+                local: true,
+                ..RepackOptions::default()
+            },
+            &CruftPackOptions::default(),
+        )
+        .expect("local cruft repack");
+
+        assert!(result.cruft.is_none());
+        assert!(result.additional_cruft.is_empty());
+        fs::remove_dir_all(git_dir).ok();
+        fs::remove_dir_all(alternate_objects.parent().expect("alternate root")).ok();
+    }
+
+    #[test]
+    fn incremental_repack_skips_loose_copy_already_in_pack() {
+        let objects_dir = test_objects_dir("incremental-unpacked-only");
+        let git_dir = objects_dir.parent().expect("fixture git directory");
+        let format = ObjectFormat::Sha1;
+        let database = FileObjectDatabase::new(objects_dir.clone(), format);
+        let packed_object = EncodedObject::new(ObjectType::Blob, b"already packed\n".to_vec());
+        let packed_oid = database
+            .write_object(packed_object.clone())
+            .expect("write packed object loose copy");
+        let pack = PackFile::write_packed(&[packed_object], format).expect("build source pack");
+        database.install_pack(&pack).expect("install source pack");
+        let new_oid = database
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"new reachable loose object\n".to_vec(),
+            ))
+            .expect("write new loose object");
+
+        let result = repack_reachable_loose_objects(git_dir, format, &[packed_oid, new_oid])
+            .expect("incremental repack")
+            .expect("new loose pack");
+
+        assert_eq!(result.object_count, 1);
+        assert_eq!(result.index_entries[0].oid, new_oid);
+        fs::remove_dir_all(git_dir).ok();
     }
 
     #[test]

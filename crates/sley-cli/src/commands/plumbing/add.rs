@@ -893,7 +893,7 @@ fn refresh_index_after_add(
     let selected = if refresh_paths.is_empty() {
         Vec::new()
     } else {
-        let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        let Some(mut index) = sley_worktree::read_repository_index(git_dir, format)? else {
             if strict_pathspec {
                 for path in refresh_paths {
                     eprintln!(
@@ -905,6 +905,20 @@ fn refresh_index_after_add(
             }
             return Ok(());
         };
+        // Pathspec validation operates on logical tracked paths, not on the
+        // on-disk sparse-index representation.  An exact path such as
+        // `folder1/a` must therefore match the leaf hidden beneath a collapsed
+        // `folder1/` sparse-directory entry.  Expand only this temporary view;
+        // refresh_index_paths_with_options() still owns any observable index
+        // mutation and can preserve the sparse layout on disk.
+        if index
+            .entries
+            .iter()
+            .any(sley_index::IndexEntry::is_sparse_dir)
+        {
+            let odb = sley_odb::FileObjectDatabase::from_git_dir(git_dir, format);
+            sley_worktree::expand_sparse_index_view(&mut index, &odb, format)?;
+        }
         let mut compiled =
             AddCompiledPathspecs::parse(cwd, worktree_root, refresh_paths, pathspec_magic)?;
         let mut selected = Vec::new();
@@ -1413,7 +1427,7 @@ fn resolve_add_regular_actions(
     format: ObjectFormat,
     paths: Vec<PathBuf>,
     options: AddRegularOptions,
-    reusable_index: Option<Index>,
+    mut reusable_index: Option<Index>,
     pathspec_magic: sley_worktree::PathspecMatchMagic,
 ) -> Result<AddRegularResolution> {
     if let Some(exact) = resolve_add_regular_tracked_exact_actions(
@@ -1430,6 +1444,21 @@ fn resolve_add_regular_actions(
             exact_tracked: exact.exact_tracked,
             ignored_paths: Vec::new(),
         });
+    }
+    // `--sparse` explicitly authorizes paths outside the cone. Resolve its
+    // pathspec and worktree changes against logical leaves rather than treating
+    // a materialized collapsed sparse directory as one stageable directory
+    // entry. This is a temporary semantic view; the mutation engine expands
+    // only selected directories in the on-disk index.
+    if options.sparse
+        && let Some(index) = reusable_index.as_mut()
+        && index
+            .entries
+            .iter()
+            .any(sley_index::IndexEntry::is_sparse_dir)
+    {
+        let odb = sley_odb::FileObjectDatabase::from_git_dir(git_dir, format);
+        sley_worktree::expand_sparse_index_view(index, &odb, format)?;
     }
     let mut compiled_pathspecs =
         AddCompiledPathspecs::parse(cwd, worktree_root, &paths, pathspec_magic)?;

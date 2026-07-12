@@ -1700,7 +1700,19 @@ fn finalize_fetch(
         .as_ref()
         .map(sley_odb::IncomingPackQuarantine::database);
     let validation_db = quarantine_db.as_ref().unwrap_or(&main_db);
-    validate_incoming_fetch_objects(validation_db, format, updates, validation)?;
+    let unshallow_received = shallow_info.iter().any(|entry| {
+        matches!(
+            entry,
+            sley_protocol::ProtocolV2FetchShallowInfo::Unshallow(_)
+        )
+    });
+    validate_incoming_fetch_objects(
+        validation_db,
+        format,
+        updates,
+        validation,
+        unshallow_received,
+    )?;
     downgrade_non_commit_for_merge(validation_db, format, updates);
     // Once the incoming graph passes validation it is safe to expose the
     // objects. Git retains a successfully received pack even when a later ref
@@ -1801,10 +1813,11 @@ fn validate_incoming_fetch_objects(
     format: ObjectFormat,
     updates: &[FetchRefUpdate],
     policy: Option<&sley_fsck::FsckPolicy>,
+    require_connectivity: bool,
 ) -> Result<()> {
-    let Some(policy) = policy else {
+    if policy.is_none() && !require_connectivity {
         return Ok(());
-    };
+    }
     let mut seen = HashSet::new();
     let roots = updates
         .iter()
@@ -1814,13 +1827,15 @@ fn validate_incoming_fetch_objects(
     if roots.is_empty() {
         return Ok(());
     }
-    let report = sley_fsck::fsck_objects_with_options(
-        db,
-        format,
-        roots,
-        [],
-        policy.fsck_options(policy.enabled),
+    let options = policy.map_or_else(
+        || sley_fsck::FsckOptions {
+            connectivity_only: true,
+            check_content: false,
+            ..Default::default()
+        },
+        |policy| policy.fsck_options(policy.enabled),
     );
+    let report = sley_fsck::fsck_objects_with_options(db, format, roots, [], options);
     for issue in &report.issues {
         match issue.stream {
             sley_fsck::IssueStream::Stdout => println!("{}", issue.message),
@@ -3452,6 +3467,94 @@ mod tests {
                 .contains(&parent)
                 .expect("parent lookup should succeed"),
             "depth-one transfer should remain genuinely shallow"
+        );
+    }
+
+    #[test]
+    fn invalid_unshallow_is_rejected_before_destination_shallow_mutation() {
+        let remote = temp_repo("remote-invalid-unshallow");
+        let local = temp_repo("local-invalid-unshallow");
+        let parent = commit_on(&remote, "main", "parent");
+        let tip = commit_child_on(&remote, "main", parent, "tip");
+        let source = FetchSource::Local {
+            git_dir: remote.clone(),
+            common_git_dir: remote,
+        };
+        let mut shallow_options = default_options();
+        shallow_options.depth = Some(1);
+        let mut credentials = NoCredentials;
+        let mut progress = SilentProgress;
+
+        fetch(
+            FetchRequest {
+                git_dir: &local,
+                format: ObjectFormat::Sha1,
+                config: &GitConfig::default(),
+                remote_name: "origin",
+                source: &source,
+                refspecs: &["refs/heads/main:refs/remotes/origin/main".to_string()],
+                options: &shallow_options,
+                validation: None,
+            },
+            FetchServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+                ref_hook: None,
+            },
+        )
+        .expect("create depth-one destination");
+        assert_eq!(
+            crate::shallow::read_shallow(&local, ObjectFormat::Sha1)
+                .expect("read initial shallow boundary"),
+            vec![tip]
+        );
+        assert!(
+            !FileObjectDatabase::from_git_dir(&local, ObjectFormat::Sha1)
+                .contains(&parent)
+                .expect("parent lookup"),
+            "the omitted parent makes unshallowing the tip invalid"
+        );
+
+        let store = FileRefStore::new(&local, ObjectFormat::Sha1);
+        let options = default_options();
+        let mut quarantine = Some(
+            sley_odb::IncomingPackQuarantine::new(&local, ObjectFormat::Sha1)
+                .expect("empty incoming quarantine"),
+        );
+        let mut updates = vec![FetchRefUpdate {
+            src: "refs/heads/main".into(),
+            dst: Some("refs/remotes/origin/main".into()),
+            oid: tip,
+            not_for_merge: false,
+            force: false,
+        }];
+        let mut outcome = FetchOutcome::default();
+        let shallow_info = [sley_protocol::ProtocolV2FetchShallowInfo::Unshallow(tip)];
+
+        let result = finalize_fetch(
+            FetchFinalize {
+                git_dir: &local,
+                format: ObjectFormat::Sha1,
+                store: &store,
+                options: &options,
+                fetch_head_source: "origin",
+                default_head_fetch: false,
+                log_all_ref_updates: true,
+                ref_hook: None,
+                opportunistic_dsts: &HashSet::new(),
+                validation: None,
+                quarantine: &mut quarantine,
+                shallow_info: &shallow_info,
+            },
+            &mut updates,
+            &mut outcome,
+        );
+
+        assert!(result.is_err(), "missing parent must reject the unshallow");
+        assert_eq!(
+            crate::shallow::read_shallow(&local, ObjectFormat::Sha1)
+                .expect("destination shallow boundary survives rejection"),
+            vec![tip]
         );
     }
 

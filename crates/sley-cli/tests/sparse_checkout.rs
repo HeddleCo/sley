@@ -255,6 +255,66 @@ fn reapply_after_set_matches_git() {
 }
 
 #[test]
+fn sparse_index_add_new_cone_keeps_materialized_file_without_warning() {
+    if !git_available() {
+        return;
+    }
+    let (git_repo, rs_repo) = paired_repos("sparse-index-add-materialized");
+    assert_parity(
+        &git_repo,
+        &rs_repo,
+        &["sparse-checkout", "set", "--sparse-index", "a"],
+    );
+    git_ok(
+        &git_repo,
+        &["config", "advice.sparseIndexExpanded", "false"],
+    );
+    git_ok(&rs_repo, &["config", "advice.sparseIndexExpanded", "false"]);
+
+    // Recreate an out-of-cone leaf with local content. Adding its directory to
+    // the cone makes it an ordinary in-cone modification; it must be retained
+    // silently rather than reported as a path left despite the sparse rules.
+    write_file(&git_repo, "c/file.txt", "locally modified\n");
+    write_file(&rs_repo, "c/file.txt", "locally modified\n");
+    assert_parity(&git_repo, &rs_repo, &["sparse-checkout", "add", "c"]);
+    assert_eq!(
+        fs::read(rs_repo.join("c/file.txt")).expect("read sley materialized file"),
+        fs::read(git_repo.join("c/file.txt")).expect("read git materialized file"),
+    );
+}
+
+#[test]
+fn recursive_hard_reset_preserves_sparse_index_shape() {
+    let root = unique_temp_dir("sparse-recursive-reset");
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repository directory");
+    build_fixture(&repo);
+
+    let setup = sley(&repo, &["sparse-checkout", "set", "--sparse-index", "a"]);
+    assert!(
+        setup.status.success(),
+        "sparse setup failed: {}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let before = sley(&repo, &["ls-files", "--sparse", "--stage"]);
+    assert!(before.status.success());
+    assert!(String::from_utf8_lossy(&before.stdout).contains("040000"));
+
+    let reset = sley(&repo, &["reset", "--hard", "--recurse-submodules"]);
+    assert!(
+        reset.status.success(),
+        "recursive reset failed: {}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    let after = sley(&repo, &["ls-files", "--sparse", "--stage"]);
+    assert!(after.status.success());
+    assert_eq!(after.stdout, before.stdout, "sparse index shape changed");
+    assert!(repo.join("a/file.txt").exists());
+    assert!(!repo.join("c/file.txt").exists());
+    assert!(!repo.join("d/file.txt").exists());
+}
+
+#[test]
 fn disable_restores_full_worktree_like_git() {
     if !git_available() {
         return;

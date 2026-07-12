@@ -397,7 +397,8 @@ pub fn diff_name_status_head_index_with_options(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head = head_tree_entries(git_dir, format, &db)?;
     let index = read_index_entries(git_dir, format)?;
-    diff_name_status_maps(&head, &index, head.keys().chain(index.keys()), options)
+    let entries = diff_name_status_maps(&head, &index, head.keys().chain(index.keys()), options)?;
+    mark_index_unmerged_entries(entries, git_dir, format)
 }
 
 pub fn diff_name_status_head_index_with_options_and_diagnostics(
@@ -409,13 +410,15 @@ pub fn diff_name_status_head_index_with_options_and_diagnostics(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head = head_tree_entries(git_dir, format, &db)?;
     let index = read_index_entries(git_dir, format)?;
-    diff_name_status_maps_with_renames_and_diagnostics(
+    let mut outcome = diff_name_status_maps_with_renames_and_diagnostics(
         &head,
         &index,
         head.keys().chain(index.keys()),
         options,
         |oid| read_blob_bytes(&db, oid),
-    )
+    )?;
+    outcome.entries = mark_index_unmerged_entries(outcome.entries, git_dir, format)?;
+    Ok(outcome)
 }
 
 /// Read an arbitrary tree object's flattened blob entries (recursively) keyed by
@@ -465,7 +468,8 @@ pub fn diff_name_status_tree_index_with_options(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let tree = tree_entries(tree_oid, format, &db)?;
     let index = read_index_entries(git_dir, format)?;
-    diff_name_status_maps(&tree, &index, tree.keys().chain(index.keys()), options)
+    let entries = diff_name_status_maps(&tree, &index, tree.keys().chain(index.keys()), options)?;
+    mark_index_unmerged_entries(entries, git_dir, format)
 }
 
 pub fn diff_name_status_tree_index_with_options_and_diagnostics(
@@ -478,13 +482,66 @@ pub fn diff_name_status_tree_index_with_options_and_diagnostics(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let tree = tree_entries(tree_oid, format, &db)?;
     let index = read_index_entries(git_dir, format)?;
-    diff_name_status_maps_with_renames_and_diagnostics(
+    let mut outcome = diff_name_status_maps_with_renames_and_diagnostics(
         &tree,
         &index,
         tree.keys().chain(index.keys()),
         options,
         |oid| read_blob_bytes(&db, oid),
-    )
+    )?;
+    outcome.entries = mark_index_unmerged_entries(outcome.entries, git_dir, format)?;
+    Ok(outcome)
+}
+
+/// Replace the tree-vs-index placeholder pair for each conflicted path with a
+/// true `U` record. Stage-zero index maps necessarily omit unmerged paths, so a
+/// naïve comparison classifies an existing conflict as deleted; that also makes
+/// lowercase `--diff-filter=u` fail to exclude it before porcelain rendering.
+fn mark_index_unmerged_entries(
+    entries: Vec<NameStatusEntry>,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<NameStatusEntry>> {
+    let index_path = sley_index::repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(entries);
+    }
+    let index = sley_index::read_repository_index(git_dir, format)?;
+    let unmerged = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() != sley_index::Stage::Normal)
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect::<BTreeSet<_>>();
+    if unmerged.is_empty() {
+        return Ok(entries);
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut marked = Vec::with_capacity(entries.len() + unmerged.len());
+    for mut entry in entries {
+        if unmerged.contains(entry.path.as_bytes()) {
+            seen.insert(entry.path.as_bytes().to_vec());
+            entry.status = NameStatus::Unmerged;
+            entry.old_path = None;
+            entry.old_oid = None;
+            entry.new_oid = None;
+        }
+        marked.push(entry);
+    }
+    for path in unmerged.difference(&seen) {
+        marked.push(NameStatusEntry {
+            status: NameStatus::Unmerged,
+            path: path.clone().into(),
+            old_path: None,
+            old_mode: None,
+            new_mode: None,
+            old_oid: None,
+            new_oid: None,
+        });
+    }
+    marked.sort_by(|left, right| diff_entry_sort_path(left).cmp(diff_entry_sort_path(right)));
+    Ok(marked)
 }
 
 /// Name-status diff of an arbitrary tree against the working tree, the engine
@@ -920,7 +977,8 @@ fn diff_name_status_index_worktree_changes_from_snapshot(
     let IndexSnapshot {
         entries: index,
         stat_cache,
-        ..
+        missing_skip_worktree_entries,
+        present_skip_worktree_entries,
     } = read_index_snapshot(git_dir, format)?;
     // Intent-to-add (`git add -N`) paths are placeholders: git's `run_diff_files`
     // diffs them as a brand-new file (`/dev/null` → worktree), never loading the
@@ -954,8 +1012,8 @@ fn diff_name_status_index_worktree_changes_from_snapshot(
             git_path,
             &index_gitlinks,
             Some(&stat_cache),
-            None,
-            None,
+            Some(&missing_skip_worktree_entries),
+            Some(&present_skip_worktree_entries),
         )?;
         if conflict_stages.is_some() {
             // git's `diff_unmerge` makes a pair with a null old side and the

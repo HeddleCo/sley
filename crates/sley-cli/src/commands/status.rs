@@ -2710,7 +2710,12 @@ fn status_sparse_footer(
             return Ok(Some(StatusSparseFooter::SparseIndex));
         }
         let db = FileObjectDatabase::from_git_dir(git_dir, format);
-        sley_worktree::expand_sparse_index(&mut index, &db, format)?;
+        if sley_worktree::expand_sparse_index(&mut index, &db, format)? {
+            let config = read_repo_config(git_dir).unwrap_or_default();
+            if status_sparse_index_expansion_advice_enabled(&config) {
+                write_status_sparse_index_expansion_advice(&mut io::stderr())?;
+            }
+        }
     }
     let total = index
         .entries
@@ -2727,6 +2732,27 @@ fn status_sparse_footer(
         .count();
     let percent = ((present * 100) / total).min(100) as u8;
     Ok(Some(StatusSparseFooter::Percentage(percent)))
+}
+
+const STATUS_SPARSE_INDEX_EXPANSION_ADVICE: &str = "The sparse index is expanding to a full index, a slow operation.\n\
+Your working directory likely has contents that are outside of\n\
+your sparse-checkout patterns. Use 'git sparse-checkout list' to\n\
+see your sparse-checkout definition and compare it to your working\n\
+directory contents. Cleaning up any merge conflicts or staged\n\
+changes before running 'git sparse-checkout clean' or 'git\n\
+sparse-checkout reapply' may assist in this cleanup.";
+
+fn status_sparse_index_expansion_advice_enabled(config: &GitConfig) -> bool {
+    config
+        .get_bool("advice", None, "sparseIndexExpanded")
+        .unwrap_or(true)
+}
+
+fn write_status_sparse_index_expansion_advice(out: &mut impl Write) -> Result<()> {
+    for line in STATUS_SPARSE_INDEX_EXPANSION_ADVICE.lines() {
+        writeln!(out, "hint: {line}")?;
+    }
+    Ok(())
 }
 
 fn status_sparse_index_has_materialized_sparse_dir(
@@ -3454,5 +3480,34 @@ fn status_branch_tracking_without_ahead_behind(
         }))
     } else {
         Ok(StatusBranchTrackingState::Different)
+    }
+}
+
+#[cfg(test)]
+mod sparse_index_advice_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_index_expansion_advice_defaults_on_and_honors_false() {
+        assert!(status_sparse_index_expansion_advice_enabled(
+            &GitConfig::default()
+        ));
+        let disabled =
+            GitConfig::parse(b"[advice]\n\tsparseIndexExpanded = false\n").expect("parse config");
+        assert!(!status_sparse_index_expansion_advice_enabled(&disabled));
+    }
+
+    #[test]
+    fn sparse_index_expansion_advice_uses_git_hint_bytes() {
+        let mut out = Vec::new();
+        write_status_sparse_index_expansion_advice(&mut out).expect("write advice");
+        assert!(out.starts_with(
+            b"hint: The sparse index is expanding to a full index, a slow operation.\n"
+        ));
+        assert!(out.ends_with(b"sparse-checkout reapply' may assist in this cleanup.\n"));
+        assert!(
+            out.split(|byte| *byte == b'\n')
+                .all(|line| { line.is_empty() || line.starts_with(b"hint: ") })
+        );
     }
 }

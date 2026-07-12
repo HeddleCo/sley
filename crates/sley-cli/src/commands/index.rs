@@ -1159,13 +1159,21 @@ pub(crate) fn cmd_ls_files(
         return Ok(());
     }
     if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
-        let index = ls_files_display_index(
-            repo.object_database(),
-            format,
-            index,
-            sparse && !(deleted || modified),
-            &pathspec,
-        )?;
+        // Sparse-directory entries are always stage zero. `ls-files -u` can
+        // therefore inspect the serialized index directly: expanding it adds
+        // no possible unmerged result and would incorrectly advertise an
+        // `ensure_full_index` transition to interactive patch callers.
+        let index = if unmerged {
+            index
+        } else {
+            ls_files_display_index(
+                repo.object_database(),
+                format,
+                index,
+                sparse && !(deleted || modified),
+                &pathspec,
+            )?
+        };
         let oid_candidates = ls_files_oid_candidates(&index);
         if unmerged {
             write_ls_files_unmerged(
@@ -2232,14 +2240,18 @@ pub(crate) fn cmd_update_index(
             if collect_unresolve_paths {
                 unresolve_paths.push(PathBuf::from(arg));
             } else if !ignore_paths_after_unresolve {
-                paths.push(PathBuf::from(arg));
-                path_modes.push(sley_worktree::UpdateIndexPathMode {
-                    add,
-                    remove,
-                    force_remove,
-                    info_only,
-                    chmod,
-                });
+                if arg.ends_with('/') {
+                    eprintln!("Ignoring path {arg}");
+                } else {
+                    paths.push(PathBuf::from(arg));
+                    path_modes.push(sley_worktree::UpdateIndexPathMode {
+                        add,
+                        remove,
+                        force_remove,
+                        info_only,
+                        chmod,
+                    });
+                }
             }
             idx += 1;
             continue;
@@ -2487,14 +2499,22 @@ pub(crate) fn cmd_update_index(
                 if collect_unresolve_paths {
                     unresolve_paths.push(PathBuf::from(value));
                 } else if !ignore_paths_after_unresolve {
-                    paths.push(PathBuf::from(value));
-                    path_modes.push(sley_worktree::UpdateIndexPathMode {
-                        add,
-                        remove,
-                        force_remove,
-                        info_only,
-                        chmod,
-                    });
+                    // update-index treats a trailing slash as an explicit
+                    // directory spelling.  It ignores that path immediately
+                    // (with this warning) instead of asking the file-update
+                    // engine to lstat/hash a directory.
+                    if value.ends_with('/') {
+                        eprintln!("Ignoring path {value}");
+                    } else {
+                        paths.push(PathBuf::from(value));
+                        path_modes.push(sley_worktree::UpdateIndexPathMode {
+                            add,
+                            remove,
+                            force_remove,
+                            info_only,
+                            chmod,
+                        });
+                    }
                 }
             }
         }
@@ -2686,21 +2706,31 @@ pub(crate) fn cmd_update_index(
             }
         }
     } else if again {
-        sley_worktree::update_index_again(
-            &worktree_root,
-            git_dir.clone(),
-            format,
-            &resolved_paths,
-            sley_worktree::UpdateIndexOptions {
-                add,
-                remove,
-                force_remove,
-                chmod,
-                info_only,
-                ignore_skip_worktree_entries,
-                allow_skip_worktree_entries: false,
-            },
-        )?;
+        if let Some(skip_worktree) = skip_worktree {
+            sley_worktree::set_index_skip_worktree_again(
+                &worktree_root,
+                git_dir.clone(),
+                format,
+                &resolved_paths,
+                skip_worktree,
+            )?;
+        } else {
+            sley_worktree::update_index_again(
+                &worktree_root,
+                git_dir.clone(),
+                format,
+                &resolved_paths,
+                sley_worktree::UpdateIndexOptions {
+                    add,
+                    remove,
+                    force_remove,
+                    chmod,
+                    info_only,
+                    ignore_skip_worktree_entries,
+                    allow_skip_worktree_entries: false,
+                },
+            )?;
+        }
     } else if let Some(index_version) = index_version {
         sley_worktree::set_index_version(git_dir.clone(), format, index_version, verbose)?;
     } else if let Some(fsmonitor_valid) = fsmonitor_valid {

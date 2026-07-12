@@ -458,6 +458,29 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
     } else {
         None
     };
+    // A sparse directory is an on-disk stand-in for the leaves below it.  An
+    // apply that addresses one of those leaves must open just that directory
+    // before looking up the preimage.  Keeping this path-directed is important:
+    // in-cone patches continue to operate without an observable expansion,
+    // while an out-of-cone --index/--cached apply records ensure_full_index and
+    // leaves the selected directory partially expanded, exactly like Git.
+    if let Some(index) = index.as_mut()
+        && index
+            .entries
+            .iter()
+            .any(sley_index::IndexEntry::is_sparse_dir)
+    {
+        sley_worktree::expand_sparse_index_directories(index, db, format, |directory| {
+            patches.iter().any(|patch| {
+                patch
+                    .old_path
+                    .as_deref()
+                    .into_iter()
+                    .chain(patch.new_path.as_deref())
+                    .any(|path| path.starts_with(directory))
+            })
+        })?;
+    }
     let index_modes: HashMap<Vec<u8>, u32> = index
         .as_ref()
         .map(|index| {
@@ -2027,10 +2050,16 @@ fn read_patch_base(
         }
         return Ok(blob);
     }
-    Ok(
+    let Some(blob) =
         read_worktree_patch_blob_bytes(worktree_base, filter_worktree_root, git_dir, config, old)?
-            .unwrap_or_default(),
-    )
+    else {
+        eprintln!(
+            "error: {}: No such file or directory",
+            String::from_utf8_lossy(old)
+        );
+        return Err(GitError::Exit(1));
+    };
+    Ok(blob)
 }
 
 /// Write a worktree file for `git apply`, mirroring git's `try_create_file`: a

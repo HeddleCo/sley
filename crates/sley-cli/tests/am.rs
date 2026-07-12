@@ -73,6 +73,20 @@ fn write(dir: &Path, name: &str, content: &str) {
     fs::write(dir.join(name), content).unwrap_or_else(|err| panic!("write {name}: {err}"));
 }
 
+fn copy_dir_all(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).expect("create destination");
+    for entry in fs::read_dir(src).expect("read source directory") {
+        let entry = entry.expect("directory entry");
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir_all(&from, &to);
+        } else {
+            fs::copy(&from, &to).expect("copy fixture file");
+        }
+    }
+}
+
 /// Initialise a repo on `main` with one commit creating `file.txt`.
 fn init_repo(dir: &Path, initial: &str) {
     fs::create_dir_all(dir).expect("create repo dir");
@@ -192,6 +206,52 @@ fn am_clean_series_matches_git() {
     // Both binaries clean up the series state on success.
     assert!(!git_target.join(".git/rebase-apply").exists());
     assert!(!rs_target.join(".git/rebase-apply").exists());
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn am_in_cone_preserves_sparse_index_layout() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("am-sparse-layout");
+    let source = root.join("source");
+    fs::create_dir_all(source.join("deep")).expect("create source deep");
+    fs::create_dir_all(source.join("other")).expect("create source other");
+    git_ok(&source, &["init", "-q", "-b", "main"]);
+    write(&source.join("deep"), "a", "base\n");
+    write(&source.join("other"), "a", "other\n");
+    git_ok(&source, &["add", "."]);
+    git_ok(&source, &["commit", "-qm", "base"]);
+    write(&source.join("deep"), "a", "changed\n");
+    git_ok(&source, &["commit", "-qam", "changed"]);
+    let patch = root.join("change.patch");
+    let formatted = git(&source, &["format-patch", "-1", "--stdout"]);
+    assert!(formatted.status.success());
+    fs::write(&patch, formatted.stdout).expect("write patch");
+
+    git_ok(&source, &["reset", "--hard", "HEAD^"]);
+    let git_target = root.join("git");
+    let rs_target = root.join("rs");
+    copy_dir_all(&source, &git_target);
+    copy_dir_all(&source, &rs_target);
+    for repo in [&git_target, &rs_target] {
+        // The recursive fixture copy preserves the source index's stat cache,
+        // but the target files have different inode metadata. Refresh first so
+        // sparse-checkout can safely collapse the out-of-cone directory.
+        git_ok(repo, &["update-index", "--refresh"]);
+        git_ok(repo, &["config", "advice.sparseIndexExpanded", "false"]);
+        git_ok(repo, &["sparse-checkout", "set", "--sparse-index", "deep"]);
+    }
+    let patch_arg = patch.to_string_lossy();
+    let expected = git(&git_target, &["am", patch_arg.as_ref()]);
+    let actual = sley(&rs_target, &["am", patch_arg.as_ref()]);
+    assert_outputs_equal("am sparse layout", &expected, &actual);
+    let expected_layout = git(&git_target, &["ls-files", "--sparse"]);
+    let actual_layout = git(&rs_target, &["ls-files", "--sparse"]);
+    assert_eq!(actual_layout.stdout, expected_layout.stdout);
+    assert!(String::from_utf8_lossy(&actual_layout.stdout).contains("other/\n"));
 
     fs::remove_dir_all(&root).ok();
 }

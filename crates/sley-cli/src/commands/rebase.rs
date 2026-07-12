@@ -4996,6 +4996,32 @@ fn apply_merge_results(
     ours_map: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
     with_conflicts: bool,
 ) -> Result<()> {
+    let index_path = sley_worktree::repository_index_path(&ctx.git_dir);
+    let mut old_index = if index_path.is_file() {
+        Index::parse(&fs::read(&index_path)?, ctx.format)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    if old_index.is_sparse() {
+        for entry in &mut old_index.entries {
+            if entry.mode == sley_index::SPARSE_DIR_MODE && entry.path.as_bytes().ends_with(b"/") {
+                entry.set_skip_worktree(true);
+            }
+        }
+        sley_worktree::expand_sparse_index_view(&mut old_index, db, ctx.format)?;
+    }
+    let old_entries: BTreeMap<Vec<u8>, IndexEntry> = old_index
+        .entries
+        .into_iter()
+        .filter(|entry| index_entry_stage(entry) == 0)
+        .map(|entry| (entry.path.as_bytes().to_vec(), entry))
+        .collect();
+
     // Materialize the worktree BEFORE building the index so resolved stage-0
     // entries can record the on-disk stat (git refreshes merged results via
     // fill_stat_cache_info; a zeroed stat makes diff-files report them dirty).
@@ -5033,8 +5059,13 @@ fn apply_merge_results(
     for (path, result) in results {
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
-                let mut entry = merge_index_entry(path, *mode, *oid, 0);
+                let mut entry = match old_entries.get(path) {
+                    Some(old) if old.mode == *mode && old.oid == *oid => old.clone(),
+                    _ => merge_index_entry(path, *mode, *oid, 0),
+                };
                 if !sley_index::is_gitlink(*mode)
+                    && entry.mtime_seconds == 0
+                    && entry.ctime_seconds == 0
                     && let Ok(rel) = std::str::from_utf8(path)
                     && let Ok(metadata) = fs::symlink_metadata(ctx.worktree_root.join(rel))
                 {
@@ -5063,16 +5094,14 @@ fn apply_merge_results(
             .cmp(&right.path)
             .then_with(|| index_entry_stage(left).cmp(&index_entry_stage(right)))
     });
-    fs::write(
-        sley_worktree::repository_index_path(&ctx.git_dir),
-        Index {
-            version: 2,
-            entries,
-            extensions: Vec::new(),
-            checksum: None,
-        }
-        .write(ctx.format)?,
-    )?;
+    let mut index = Index {
+        version: 2,
+        entries,
+        extensions: Vec::new(),
+        checksum: None,
+    };
+    index.upgrade_version_for_flags();
+    fs::write(index_path, index.write(ctx.format)?)?;
     Ok(())
 }
 

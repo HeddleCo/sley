@@ -1216,7 +1216,7 @@ mod tests {
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
-    fn configure_cone_sparse_index(root: &Path, git_dir: &Path, commit: &ObjectId) {
+    fn configure_cone_sparse_index(root: &Path, git_dir: &Path, _commit: &ObjectId) {
         fs::create_dir_all(git_dir.join("info")).expect("create sparse info directory");
         fs::write(
             git_dir.join("config"),
@@ -1225,8 +1225,18 @@ mod tests {
         .expect("write sparse config");
         fs::write(git_dir.join("info/sparse-checkout"), b"/*\n!/*/\n/keep/\n")
             .expect("write cone patterns");
-        reset_index_and_worktree_to_commit(root, git_dir, ObjectFormat::Sha1, commit)
-            .expect("seed sparse index through hard reset");
+        let sparse = SparseCheckout {
+            patterns: vec![b"/*".to_vec(), b"!/*/".to_vec(), b"/keep/".to_vec()],
+            sparse_index: true,
+        };
+        apply_sparse_checkout_with_mode(
+            root,
+            git_dir,
+            ObjectFormat::Sha1,
+            &sparse,
+            SparseCheckoutMode::Cone,
+        )
+        .expect("seed sparse index through explicit sparse-checkout application");
     }
 
     #[test]
@@ -1333,7 +1343,11 @@ mod tests {
         .expect("restore path from replacement tree");
 
         let mut expanded = read_index(&git_dir);
-        assert!(expanded.is_sparse());
+        // Both out-of-cone replacements were explicitly materialized by this
+        // path checkout. Their cleared skip-worktree bits keep the directory
+        // physically expanded until an explicit sparse-checkout reapply.
+        assert!(!expanded.is_sparse());
+        assert!(!expanded.entries.iter().any(IndexEntry::is_sparse_dir));
         expand_sparse_index_in_memory(&mut expanded, &db, ObjectFormat::Sha1)
             .expect("expand resulting sparse index");
         let matching = expanded

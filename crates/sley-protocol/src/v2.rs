@@ -2563,11 +2563,15 @@ fn format_protocol_v2_fetch_section_lines(
         ProtocolV2FetchResponseSection::ShallowInfo(entries) => entries
             .iter()
             .map(|entry| match entry {
+                // Unlike most protocol-v2 text records, upload-pack writes
+                // shallow-info entries without a trailing LF. The pkt-line
+                // length is therefore 0034/0036 for SHA-1 and 004c/004e for
+                // SHA-256, matching Git's byte-level wire contract.
                 ProtocolV2FetchShallowInfo::Shallow(oid) => {
-                    Ok(line_from_str(&format!("shallow {oid}")))
+                    Ok(format!("shallow {oid}").into_bytes())
                 }
                 ProtocolV2FetchShallowInfo::Unshallow(oid) => {
-                    Ok(line_from_str(&format!("unshallow {oid}")))
+                    Ok(format!("unshallow {oid}").into_bytes())
                 }
             })
             .collect(),

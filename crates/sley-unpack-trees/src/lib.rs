@@ -1333,6 +1333,73 @@ pub fn unpack_trees<P: WorktreeProbe + ?Sized>(
         }
     }
 
+    // A two-way D/F transition can provisionally produce both a file and one
+    // of its descendants: the new tree contributes the file while a staged
+    // local addition below the old directory is carried through. Git resolves
+    // that collision according to the physical shape of the input index. An
+    // expanded index preserves the staged descendant (and therefore omits the
+    // colliding new file); a collapsed sparse directory has no individual
+    // descendant to preserve, so the new file wins. The flat logical view has
+    // both in either case, so restore that physical-index distinction before
+    // any worktree updates are planned.
+    if merge_fn == MergeFn::TwoWay {
+        let result_paths = state
+            .result
+            .iter()
+            .filter(|entry| entry.entry.stage == 0)
+            .map(|entry| entry.path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut losing_paths = std::collections::BTreeSet::new();
+        for ancestor in &result_paths {
+            let mut prefix = ancestor.clone();
+            prefix.push(b'/');
+            let has_descendant = result_paths
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|path| path.starts_with(&prefix));
+            if !has_descendant {
+                continue;
+            }
+
+            let was_collapsed_sparse_dir = index
+                .sparse_directory_prefixes
+                .iter()
+                .any(|sparse_prefix| sparse_prefix == &prefix);
+            // Git's hierarchical tree traversal can encounter a same-prefix
+            // sibling (for example `dir-` or `dir.x`) between the file `dir`
+            // and the directory `dir/`. In a full checkout that ordering keeps
+            // the staged descendant; without such a sibling the replacement
+            // file wins. Sparse checkout's pattern pass expands the directory
+            // and consistently preserves the descendant. This distinction is
+            // lost when all trees are flattened into byte-sorted paths, so
+            // derive it from the same path set here.
+            let has_tree_ordering_prefix_sibling = index
+                .keys()
+                .chain(trees.iter().flat_map(|tree| tree.keys()))
+                .any(|candidate| {
+                    candidate.len() > ancestor.len()
+                        && candidate.starts_with(ancestor)
+                        && candidate[ancestor.len()] < b'/'
+                });
+            let preserve_descendants = !was_collapsed_sparse_dir
+                && (opts.apply_sparse_checkout || has_tree_ordering_prefix_sibling);
+
+            if !preserve_descendants {
+                losing_paths.extend(
+                    result_paths
+                        .range(prefix.clone()..)
+                        .take_while(|path| path.starts_with(&prefix))
+                        .cloned(),
+                );
+            } else {
+                losing_paths.insert(ancestor.clone());
+            }
+        }
+        state
+            .result
+            .retain(|entry| !losing_paths.contains(&entry.path));
+    }
+
     // Sparse-checkout loop #2 in upstream applies the newly-computed pattern
     // decision after the logical tree merge. That ordering matters when the
     // content is unchanged: the merge primitive may carry the old entry
@@ -1871,6 +1938,110 @@ mod tests {
             .expect("twoway merge");
         let paths: Vec<_> = res.entries.iter().map(|e| e.path.clone()).collect();
         assert_eq!(paths, vec![b"a".to_vec(), b"local".to_vec()]);
+    }
+
+    #[test]
+    fn twoway_df_collision_preserves_staged_descendant_in_expanded_index() {
+        let index = idx(&[(b"folder/local", 9)]);
+        let old = flat(&[(b"folder/tracked", 1)]);
+        let new = flat(&[(b"folder", 2)]);
+        let mut options = opts();
+        options.apply_sparse_checkout = true;
+
+        let result = unpack_trees(
+            &index,
+            &[old, new],
+            MergeFn::TwoWay,
+            &options,
+            &NullWorktree,
+        )
+        .expect("preserve staged descendant across D/F checkout");
+
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"folder/local".as_slice()]
+        );
+    }
+
+    #[test]
+    fn twoway_df_collision_preserves_descendant_across_prefix_sibling() {
+        let index = idx(&[(b"folder/local", 9), (b"folder.x", 3)]);
+        let old = flat(&[(b"folder/tracked", 1), (b"folder.x", 3)]);
+        let new = flat(&[(b"folder", 2), (b"folder.x", 3)]);
+
+        let result = unpack_trees(&index, &[old, new], MergeFn::TwoWay, &opts(), &NullWorktree)
+            .expect("tree-ordering sibling preserves staged descendant");
+
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"folder.x".as_slice(), b"folder/local".as_slice()]
+        );
+    }
+
+    #[test]
+    fn twoway_df_collision_prefers_file_without_prefix_sibling() {
+        let index = idx(&[(b"folder/local", 9)]);
+        let old = flat(&[(b"folder/tracked", 1)]);
+        let new = flat(&[(b"folder", 2)]);
+
+        let result = unpack_trees(&index, &[old, new], MergeFn::TwoWay, &opts(), &NullWorktree)
+            .expect("plain D/F transition prefers target file");
+
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"folder".as_slice()]
+        );
+    }
+
+    #[test]
+    fn twoway_df_collision_ignores_prefix_sibling_sorted_after_directory() {
+        let index = idx(&[(b"folder/local", 9), (b"folder0", 3)]);
+        let old = flat(&[(b"folder/tracked", 1), (b"folder0", 3)]);
+        let new = flat(&[(b"folder", 2), (b"folder0", 3)]);
+
+        let result = unpack_trees(&index, &[old, new], MergeFn::TwoWay, &opts(), &NullWorktree)
+            .expect("later prefix sibling does not intervene in D/F traversal");
+
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"folder".as_slice(), b"folder0".as_slice()]
+        );
+    }
+
+    #[test]
+    fn twoway_df_collision_prefers_file_for_collapsed_sparse_directory() {
+        let mut index = idx(&[(b"folder/local", 9)]);
+        index.mark_sparse_directory(b"folder/".to_vec());
+        let old = flat(&[(b"folder/tracked", 1)]);
+        let new = flat(&[(b"folder", 2)]);
+
+        let result = unpack_trees(&index, &[old, new], MergeFn::TwoWay, &opts(), &NullWorktree)
+            .expect("collapsed sparse directory yields to target file");
+
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"folder".as_slice()]
+        );
     }
 
     #[test]

@@ -1398,52 +1398,69 @@ fn read_worktree_image(
     // byte-identical to a verbatim read.
     if let Ok(root) = repo.worktree_root() {
         let absolute = root.join(repo_path);
-        if let Ok(meta) = std::fs::symlink_metadata(&absolute) {
-            if meta.file_type().is_symlink() {
-                if let Ok(target) = std::fs::read_link(&absolute) {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::ffi::OsStrExt as _;
-                        return Ok((target.as_os_str().as_bytes().to_vec(), 0o120000));
+        match std::fs::symlink_metadata(&absolute) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    if let Ok(target) = std::fs::read_link(&absolute) {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::ffi::OsStrExt as _;
+                            return Ok((target.as_os_str().as_bytes().to_vec(), 0o120000));
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            return Ok((
+                                target.to_string_lossy().replace('\\', "/").into_bytes(),
+                                0o120000,
+                            ));
+                        }
                     }
-                    #[cfg(not(unix))]
-                    {
-                        return Ok((
-                            target.to_string_lossy().replace('\\', "/").into_bytes(),
-                            0o120000,
-                        ));
-                    }
+                } else if let Ok(bytes) = std::fs::read(&absolute) {
+                    // git's `convert_to_git` honors `has_crlf_in_index`: an auto
+                    // (`core.autocrlf` / `text=auto`) path whose recorded blob
+                    // already holds CRLF is left unconverted (the "safer autocrlf"
+                    // rule), so a file committed with CRLF still blames against its
+                    // CRLF blob. Mirror that by skipping the CRLF→LF clean when the
+                    // committed blob already contains CRLF — the one case where the
+                    // raw work-tree CRLF already matches the recorded image. When the
+                    // recorded blob is LF (the common case), cleaning the work-tree
+                    // copy normalizes its CRLF back to the committed LF form.
+                    let recorded_has_crlf = committed
+                        .as_ref()
+                        .is_some_and(|(blob, _)| blob.windows(2).any(|w| w == b"\r\n"));
+                    let image = if recorded_has_crlf {
+                        bytes
+                    } else {
+                        sley_worktree::apply_clean_filter(
+                            &root,
+                            repo.git_dir(),
+                            repo.config(),
+                            repo_path.as_bytes(),
+                            &bytes,
+                        )?
+                    };
+                    return Ok((image, 0o100644));
                 }
-            } else if let Ok(bytes) = std::fs::read(&absolute) {
-                // git's `convert_to_git` honors `has_crlf_in_index`: an auto
-                // (`core.autocrlf` / `text=auto`) path whose recorded blob
-                // already holds CRLF is left unconverted (the "safer autocrlf"
-                // rule), so a file committed with CRLF still blames against its
-                // CRLF blob. Mirror that by skipping the CRLF→LF clean when the
-                // committed blob already contains CRLF — the one case where the
-                // raw work-tree CRLF already matches the recorded image. When the
-                // recorded blob is LF (the common case), cleaning the work-tree
-                // copy normalizes its CRLF back to the committed LF form.
-                let recorded_has_crlf = committed
-                    .as_ref()
-                    .is_some_and(|(blob, _)| blob.windows(2).any(|w| w == b"\r\n"));
-                let image = if recorded_has_crlf {
-                    bytes
-                } else {
-                    sley_worktree::apply_clean_filter(
-                        &root,
-                        repo.git_dir(),
-                        repo.config(),
-                        repo_path.as_bytes(),
-                        &bytes,
-                    )?
-                };
-                return Ok((image, 0o100644));
             }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                // With no positive revision, blame constructs a fake
+                // worktree commit and requires the named path to exist in the
+                // worktree even when HEAD/the index still contains it.  A
+                // sparse-checkout path is therefore an lstat failure, not an
+                // invitation to fall back to its staged or committed blob.
+                eprintln!("fatal: Cannot lstat '{repo_path}': No such file or directory");
+                return Err(GitError::Exit(128));
+            }
+            Err(_) => {}
         }
     }
-    // The path is tracked but unreadable from the work tree (e.g. staged then
-    // removed): fall back to the staged copy, then the committed blob.
+    // A non-regular path that was present but unreadable can still be supplied
+    // by the staged image, then by the committed image.
     if let Some((blob, mode)) = read_index_blob(repo.git_dir(), db, format, repo_path, lazy_fetch)?
     {
         return Ok((blob, mode));

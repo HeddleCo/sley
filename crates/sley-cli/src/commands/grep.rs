@@ -1618,9 +1618,16 @@ fn grep_index_level(
     out: &mut impl Write,
     printed_file: &mut bool,
 ) -> Result<bool> {
-    let Some(index) = sley_worktree::read_repository_index(source.git_dir, source.format)? else {
+    let Some(mut index) = sley_worktree::read_repository_index(source.git_dir, source.format)?
+    else {
         return Ok(false);
     };
+    // A collapsed sparse-directory is an index storage optimization, not a
+    // searchable file. Expand only this command-local semantic view so cached
+    // grep can inspect the represented blobs while worktree grep still honors
+    // their inherited SKIP_WORKTREE bits. The view API neither writes the index
+    // nor emits Git's observable `ensure_full_index` transition.
+    sley_worktree::expand_sparse_index_view(&mut index, source.db, source.format)?;
     const CE_VALID: u16 = 0x8000;
 
     // git's `clear_skip_worktree_from_present_files`: under sparse checkout a

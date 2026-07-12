@@ -1633,6 +1633,9 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
     let write_bitmap_hash_cache = config
         .get_bool("pack", None, "writeBitmapHashCache")
         .unwrap_or(true);
+    let midx_must_contain_cruft = config
+        .get_bool("repack", None, "midxMustContainCruft")
+        .unwrap_or(true);
     let auto_bare_bitmaps = write_bitmaps.is_none()
         && config_write_bitmaps.is_none()
         && all
@@ -1674,6 +1677,7 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             quiet,
             write_midx,
             write_bitmaps,
+            midx_must_contain_cruft,
             &keep_packs,
             include_kept_objects,
         );
@@ -1704,6 +1708,7 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             &common_git_dir,
             format,
             prune,
+            local,
             cruft_expiration.flatten(),
             expire_to.as_deref(),
             write_midx,
@@ -1952,25 +1957,45 @@ fn cmd_repack_geometric(
     quiet: bool,
     write_midx: bool,
     write_bitmaps: bool,
+    midx_must_contain_cruft: bool,
     keep_packs: &[String],
     _pack_kept_objects: bool,
 ) -> Result<()> {
     let kept_stems: HashSet<String> = keep_packs.iter().cloned().collect();
-    let geometric = sley_odb::repack_geometric(common_git_dir, format, split_factor, &kept_stems)?;
+    let existing_midx_pack_names = read_ordinary_midx_pack_names(common_git_dir, format)?;
+    let geometric = sley_odb::repack_geometric_with_options(
+        common_git_dir,
+        format,
+        split_factor,
+        &kept_stems,
+        sley_odb::GeometricRepackOptions {
+            follow_reachable: write_midx && !midx_must_contain_cruft,
+        },
+    )?;
 
     if geometric.result.is_none() {
         if !quiet {
             println!("Nothing new to pack.");
         }
-        // Even with nothing new, `--write-midx` (re)writes the MIDX so it stays
-        // current with the on-disk packs — but only when packs exist AND the
-        // existing MIDX (if any) does not already cover them. An up-to-date MIDX
-        // is left byte-for-byte untouched (builtin/repack.c midx_has_unknown_packs).
-        if write_midx
-            && pack_dir_has_packs(common_git_dir, format)?
-            && !midx_covers_current_packs(common_git_dir, format)?
-        {
-            cmd_multi_pack_index_write(cli_session, &[])?;
+        // With no new pack and no previous MIDX, Git conservatively includes
+        // cruft because a reachable pack may refer into it. With an existing
+        // MIDX, preserve its proven exclusion unless it names an unknown pack.
+        if write_midx && pack_dir_has_packs(common_git_dir, format)? {
+            let selection = sley_odb::geometric_repack_midx_selection(
+                common_git_dir,
+                &geometric,
+                midx_must_contain_cruft,
+                existing_midx_pack_names.as_ref(),
+            )?;
+            let mut midx_args = Vec::new();
+            if write_bitmaps {
+                midx_args.push("--bitmap".to_string());
+            }
+            cmd_multi_pack_index_write_with_pack_names(
+                cli_session,
+                &midx_args,
+                Some(selection.pack_names),
+            )?;
         }
         return Ok(());
     }
@@ -1992,28 +2017,44 @@ fn cmd_repack_geometric(
     )?;
 
     if write_midx && pack_dir_has_packs(common_git_dir, format)? {
+        let selection = sley_odb::geometric_repack_midx_selection(
+            common_git_dir,
+            &geometric,
+            midx_must_contain_cruft,
+            existing_midx_pack_names.as_ref(),
+        )?;
         let mut midx_args: Vec<String> = Vec::new();
         if write_bitmaps {
             midx_args.push("--bitmap".to_string());
         }
-        cmd_multi_pack_index_write(cli_session, &midx_args)?;
+        if let Some(preferred) = selection.preferred_pack_name {
+            midx_args.push(format!("--preferred-pack={preferred}"));
+        }
+        cmd_multi_pack_index_write_with_pack_names(
+            cli_session,
+            &midx_args,
+            Some(selection.pack_names),
+        )?;
     }
     let _ = git_dir;
     Ok(())
 }
 
-/// Parse a `--cruft-expiration` value. Returns `None` for "never" (zero), else
-/// the UNIX-seconds cutoff (`now`/`all` → u32::MAX so everything expires).
-///
-/// git's expiry timestamp is UNSIGNED (`timestamp_t`); `parse_expiry_date`
-/// renders the `now`/`all` sentinel as `u64::MAX` (which is `-1` reinterpreted
-/// as `i64`). We interpret the value as unsigned so the sentinel saturates to
-/// `u32::MAX` (everything older than "the end of time" expires) rather than
-/// collapsing to `0`.
+/// Parse pack-objects' cruft cutoff. Unlike config expiry dates, the
+/// `--cruft-expiration` and `--unpack-unreachable` callbacks use `approxidate`,
+/// so `now` is the actual current timestamp and future-dated objects remain
+/// recent. `all` retains the explicit expire-everything sentinel.
 fn parse_cruft_expiration(spec: &str) -> Result<Option<u32>> {
-    let ts = crate::commands::approxidate::parse_expiry_date(spec)
-        .ok_or_else(|| GitError::Command(format!("malformed expiration date '{spec}'")))?;
-    let ts = ts as u64;
+    if matches!(spec, "never" | "false") {
+        return Ok(None);
+    }
+    let ts = if spec == "all" {
+        u64::MAX
+    } else {
+        crate::commands::approxidate::parse_approxidate(spec)
+            .ok_or_else(|| GitError::Command(format!("malformed expiration date '{spec}'")))?
+            .max(0) as u64
+    };
     Ok(if ts == 0 {
         None
     } else if ts >= u32::MAX as u64 {
@@ -2082,6 +2123,7 @@ fn cmd_repack_cruft(
     common_git_dir: &Path,
     format: ObjectFormat,
     prune: bool,
+    local: bool,
     cruft_expiration: Option<u32>,
     expire_to: Option<&str>,
     write_midx: bool,
@@ -2099,7 +2141,7 @@ fn cmd_repack_cruft(
     )?;
     let keep_pack_stems: HashSet<String> = keep_packs.iter().cloned().collect();
     let options = sley_odb::RepackOptions {
-        local: false,
+        local,
         force_rewrite: false,
         pack_kept_objects,
         keep_pack_stems,
@@ -2112,7 +2154,7 @@ fn cmd_repack_cruft(
     };
     let window_arg = format!("--window={}", cruft_options.pack_write.window);
     trace2_child_start(&["pack-objects", &window_arg, "--cruft"]);
-    let result = repack_cruft_or_bad_object(sley_odb::repack_cruft_with_pack_options(
+    let result = repack_cruft_or_bad_object(repack_cruft_with_lazy_recent_hooks(
         common_git_dir,
         format,
         &roots,
@@ -2132,6 +2174,48 @@ fn cmd_repack_cruft(
         cmd_multi_pack_index_write(cli_session, &[])?;
     }
     Ok(())
+}
+
+/// Build a cruft result first to determine whether pack-objects has any cruft
+/// candidates. Git does not invoke `gc.recentObjectsHook` for an empty cruft
+/// side, so only enumerate configured roots when that preliminary plan contains
+/// surviving or expired unreachable objects. Both passes are read-only; callers
+/// install files only after the hook-backed result succeeds.
+fn repack_cruft_with_lazy_recent_hooks(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    cruft_expiration: Option<u32>,
+    options: &sley_odb::RepackOptions,
+    cruft_options: &sley_odb::CruftPackOptions,
+) -> Result<sley_odb::CruftRepackResult> {
+    let preliminary = sley_odb::repack_cruft_with_pack_options(
+        common_git_dir,
+        format,
+        roots,
+        cruft_expiration,
+        options,
+        cruft_options,
+    )?;
+    let has_cruft_candidates = preliminary.cruft.is_some()
+        || !preliminary.additional_cruft.is_empty()
+        || preliminary.expired.is_some();
+    if cruft_expiration.is_none() || !has_cruft_candidates {
+        return Ok(preliminary);
+    }
+    let recent_roots = prune_recent_hook_roots(common_git_dir, format)?;
+    if recent_roots.is_empty() {
+        return Ok(preliminary);
+    }
+    sley_odb::repack_cruft_with_pack_options_and_recent_roots(
+        common_git_dir,
+        format,
+        roots,
+        &recent_roots,
+        cruft_expiration,
+        options,
+        cruft_options,
+    )
 }
 
 fn repack_cruft_or_bad_object(
@@ -2226,40 +2310,22 @@ fn pack_dir_has_packs(common_git_dir: &Path, format: ObjectFormat) -> Result<boo
     Ok(false)
 }
 
-/// True when a `multi-pack-index` exists and already names exactly the set of
-/// non-cruft `.idx` files currently on disk — i.e. rewriting it would be a
-/// no-op, so an up-to-date MIDX must be left untouched (its mtime preserved).
-fn midx_covers_current_packs(common_git_dir: &Path, format: ObjectFormat) -> Result<bool> {
+/// Snapshot the ordinary MIDX pack table before a repack mutates pack files.
+/// The engine uses this to distinguish cruft which was already required for a
+/// bitmap closure from cruft which a new follow-reachable pack can supersede.
+fn read_ordinary_midx_pack_names(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Option<HashSet<String>>> {
     let pack_dir = repository_objects_dir(common_git_dir).join("pack");
     let midx_path = pack_dir.join("multi-pack-index");
     let Ok(midx_bytes) = fs::read(&midx_path) else {
-        return Ok(false);
+        return Ok(None);
     };
     let Ok(midx) = MultiPackIndex::parse(&midx_bytes, format) else {
-        return Ok(false);
+        return Ok(None);
     };
-    let midx_names: HashSet<String> = midx.pack_names.into_iter().collect();
-
-    // The MIDX indexes only non-cruft packs; compare against the current
-    // non-cruft `.idx` basenames.
-    let mut current: HashSet<String> = HashSet::new();
-    let Ok(entries) = fs::read_dir(&pack_dir) else {
-        return Ok(false);
-    };
-    for entry in entries {
-        let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("idx") {
-            continue;
-        }
-        // Skip cruft packs (`.mtimes` sidecar): the MIDX excludes them by default.
-        if path.with_extension("mtimes").exists() {
-            continue;
-        }
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            current.insert(name.to_string());
-        }
-    }
-    Ok(midx_names == current)
+    Ok(Some(midx.pack_names.into_iter().collect()))
 }
 
 #[derive(Debug, Default)]
@@ -2444,7 +2510,7 @@ fn gc_run_locked(
                 pack_kept_objects: false,
                 keep_pack_stems,
             };
-            let result = sley_odb::repack_cruft_with_pack_options(
+            let result = repack_cruft_with_lazy_recent_hooks(
                 &common_git_dir,
                 format,
                 &roots,
@@ -6008,29 +6074,11 @@ fn prune_recent_object_roots(
 
 fn prune_recent_hook_roots(common_git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
     let config = read_repo_config(common_git_dir)?;
-    let mut roots = Vec::new();
-    for hook in config
-        .get_all("gc", None, "recentObjectsHook")
-        .into_iter()
-        .flatten()
-    {
-        let output = ProcessCommand::new("sh")
-            .arg("-c")
-            .arg(hook)
-            .current_dir(common_git_dir.parent().unwrap_or(common_git_dir))
-            .output()?;
-        if !output.status.success() {
-            eprintln!("fatal: unable to enumerate additional recent objects");
-            return Err(GitError::Exit(128));
-        }
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let value = line.trim();
-            if value.len() == format.hex_len() {
-                roots.push(ObjectId::from_hex(format, value)?);
-            }
-        }
-    }
-    Ok(roots)
+    commands::hooks::run_recent_objects_hooks(
+        &config,
+        format,
+        common_git_dir.parent().unwrap_or(common_git_dir),
+    )
 }
 
 fn gc_prune_expired_loose(
@@ -6542,6 +6590,14 @@ fn cmd_multi_pack_index_write(
     cli_session: &crate::session::CliSession,
     args: &[String],
 ) -> Result<()> {
+    cmd_multi_pack_index_write_with_pack_names(cli_session, args, None)
+}
+
+fn cmd_multi_pack_index_write_with_pack_names(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+    selected_pack_names: Option<Vec<String>>,
+) -> Result<()> {
     let cwd = cli_session.cwd().to_path_buf();
     let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
@@ -6669,7 +6725,9 @@ fn cmd_multi_pack_index_write(
         }
     }
 
-    let mut pack_names = if stdin_packs {
+    let mut pack_names = if let Some(pack_names) = selected_pack_names {
+        pack_names
+    } else if stdin_packs {
         let mut input = String::new();
         io::stdin().read_to_string(&mut input)?;
         input

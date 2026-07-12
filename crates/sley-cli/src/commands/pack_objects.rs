@@ -294,7 +294,8 @@ pub(crate) fn cmd_pack_objects(
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    options.write_reverse_index = read_repo_config(&git_dir)?
+    let config = read_repo_config(&git_dir)?;
+    options.write_reverse_index = config
         .get_bool("pack", None, "writeReverseIndex")
         .unwrap_or(false);
     let database = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -316,6 +317,7 @@ pub(crate) fn cmd_pack_objects(
             &common_git_dir,
             &database,
             format,
+            &config,
             &options,
             progress,
             max_pack_size,
@@ -2329,8 +2331,29 @@ struct PackMembership {
 
 impl ObjectLocationScan {
     fn scan(common_git_dir: &Path, format: ObjectFormat) -> Result<Self> {
+        let environment_alternates = env::var_os("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .map(|value| env::split_paths(&value).collect::<Vec<_>>())
+            .unwrap_or_default();
+        Self::scan_with_environment_alternates(common_git_dir, format, &environment_alternates)
+    }
+
+    fn scan_with_environment_alternates(
+        common_git_dir: &Path,
+        format: ObjectFormat,
+        environment_alternates: &[PathBuf],
+    ) -> Result<Self> {
         let objects_dir = sley_odb::repository_objects_dir(common_git_dir);
         let mut object_dirs: Vec<(PathBuf, bool)> = vec![(objects_dir.clone(), true)];
+        // Environment alternates participate in the same locality policy as
+        // `objects/info/alternates`. In particular, `--local` must not copy an
+        // object merely because its alternate was injected for this process
+        // instead of recorded in the repository.
+        object_dirs.extend(
+            environment_alternates
+                .iter()
+                .cloned()
+                .map(|path| (path, false)),
+        );
         // info/alternates: one path per line, relative entries resolved
         // against the objects directory (upstream link_alt_odb_entry).
         if let Ok(alternates) = fs::read_to_string(objects_dir.join("info/alternates")) {
@@ -2570,6 +2593,7 @@ fn write_cruft_pack(
     common_git_dir: &Path,
     database: &FileObjectDatabase,
     format: ObjectFormat,
+    config: &sley_config::GitConfig,
     options: &PackObjectsOptions,
     progress: bool,
     max_pack_size: Option<u64>,
@@ -2616,6 +2640,10 @@ fn write_cruft_pack(
     // for a cruft pack (`.mtimes` present) where each object carries its own
     // recorded mtime.
     let mut mtimes: HashMap<ObjectId, u32> = HashMap::new();
+    let locations = options
+        .local
+        .then(|| ObjectLocationScan::scan(common_git_dir, format))
+        .transpose()?;
     // Object ids that live in a kept (fresh/unknown) pack: such a copy vetoes
     // adding the object to the cruft pack (want_object_in_pack's kept-pack
     // rule), unless a cruft pack being retained holds it — but on this suite
@@ -2699,6 +2727,12 @@ fn write_cruft_pack(
         if kept.contains(&oid) {
             return;
         }
+        if locations
+            .as_ref()
+            .is_some_and(|locations| !locations.wanted(&oid, options))
+        {
+            return;
+        }
         mtimes
             .entry(oid)
             .and_modify(|existing| {
@@ -2728,7 +2762,22 @@ fn write_cruft_pack(
     // Expiration: rescue older objects reachable from a recent one, then drop
     // the rest. Without an expiration, every candidate survives.
     if let Some(expiration) = options.cruft_expiration {
-        rescue_and_expire_cruft(database, format, &mut mtimes, expiration)?;
+        // Git invokes recent-object hooks from pack-objects only after it has
+        // found at least one cruft candidate. An empty cruft side is a no-op,
+        // even when a configured hook would fail.
+        let additional_recent = if mtimes.is_empty() {
+            Vec::new()
+        } else {
+            let hook_cwd = env::current_dir()?;
+            commands::hooks::run_recent_objects_hooks(config, format, &hook_cwd)?
+        };
+        rescue_and_expire_cruft(
+            database,
+            format,
+            &mut mtimes,
+            expiration,
+            &additional_recent,
+        )?;
     }
 
     let _ = (git_dir, progress);
@@ -2802,6 +2851,7 @@ fn rescue_and_expire_cruft(
     format: ObjectFormat,
     mtimes: &mut HashMap<ObjectId, u32>,
     expiration: u32,
+    additional_recent: &[ObjectId],
 ) -> Result<()> {
     // Recent objects anchor the rescue traversal.
     let recent: Vec<ObjectId> = mtimes
@@ -2814,7 +2864,8 @@ fn rescue_and_expire_cruft(
     // Every object reached (recent or older) survives; an older object reached
     // this way is rescued at the cutoff mtime.
     let mut keep: HashSet<ObjectId> = HashSet::new();
-    let mut pending: Vec<ObjectId> = recent.clone();
+    let mut pending: Vec<ObjectId> = recent;
+    pending.extend_from_slice(additional_recent);
     while let Some(oid) = pending.pop() {
         if !keep.insert(oid) {
             continue;
@@ -2861,4 +2912,103 @@ fn rescue_and_expire_cruft(
     }
     *mtimes = next;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_objects_dir(name: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!(
+            "sley-pack-objects-{name}-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).expect("create object directory");
+        path
+    }
+
+    #[test]
+    fn local_policy_rejects_objects_available_from_an_alternate() {
+        let loose = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("loose oid");
+        let packed = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "2222222222222222222222222222222222222222",
+        )
+        .expect("packed oid");
+        let locations = ObjectLocationScan {
+            nonlocal_loose: HashSet::from([loose]),
+            packs: vec![PackMembership {
+                oids: HashSet::from([packed]),
+                local: false,
+                keep: false,
+            }],
+        };
+        let local = PackObjectsOptions {
+            local: true,
+            ..PackObjectsOptions::default()
+        };
+        assert!(!locations.wanted(&loose, &local));
+        assert!(!locations.wanted(&packed, &local));
+
+        let nonlocal = PackObjectsOptions::default();
+        assert!(locations.wanted(&loose, &nonlocal));
+        assert!(locations.wanted(&packed, &nonlocal));
+    }
+
+    #[test]
+    fn location_scan_includes_environment_alternate_loose_objects() {
+        let git_dir = temp_objects_dir("environment-alternate-git-dir");
+        let local_objects = git_dir.join("objects");
+        fs::create_dir_all(&local_objects).expect("create local objects");
+        let alternate_objects = temp_objects_dir("environment-alternate-objects");
+        let alternate = FileObjectDatabase::new(alternate_objects.clone(), ObjectFormat::Sha1);
+        let oid = alternate
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"environment alternate\n".to_vec(),
+            ))
+            .expect("write alternate object");
+
+        let locations = ObjectLocationScan::scan_with_environment_alternates(
+            &git_dir,
+            ObjectFormat::Sha1,
+            std::slice::from_ref(&alternate_objects),
+        )
+        .expect("scan environment alternate");
+        let local = PackObjectsOptions {
+            local: true,
+            ..PackObjectsOptions::default()
+        };
+        assert!(!locations.wanted(&oid, &local));
+
+        fs::remove_dir_all(git_dir).ok();
+        fs::remove_dir_all(alternate_objects).ok();
+    }
+
+    #[test]
+    fn configured_recent_tip_rescues_an_expired_candidate() {
+        let objects_dir = temp_objects_dir("recent-tip");
+        let database = FileObjectDatabase::new(objects_dir.clone(), ObjectFormat::Sha1);
+        let rescued = database
+            .write_object(EncodedObject::new(ObjectType::Blob, b"rescued".to_vec()))
+            .expect("write rescued object");
+        let expired = database
+            .write_object(EncodedObject::new(ObjectType::Blob, b"expired".to_vec()))
+            .expect("write expired object");
+        let mut mtimes = HashMap::from([(rescued, 1), (expired, 1)]);
+
+        rescue_and_expire_cruft(&database, ObjectFormat::Sha1, &mut mtimes, 2, &[rescued])
+            .expect("rescue configured tip");
+
+        assert_eq!(mtimes, HashMap::from([(rescued, 1)]));
+        fs::remove_dir_all(objects_dir).ok();
+    }
 }

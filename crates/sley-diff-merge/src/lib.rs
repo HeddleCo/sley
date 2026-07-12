@@ -175,6 +175,65 @@ mod tests {
     }
 
     #[test]
+    fn conflicted_diff_keeps_absent_skip_worktree_entries_clean() {
+        let root = temp_root();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false)
+            .expect("test operation should succeed");
+        let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
+        let clean = write_blob(&mut db, b"clean\n");
+        let base = write_blob(&mut db, b"base\n");
+        let ours = write_blob(&mut db, b"ours\n");
+        let theirs = write_blob(&mut db, b"theirs\n");
+        let empty_tree = write_tree(&mut db, &[]);
+        write_index(
+            &layout.git_dir,
+            vec![
+                skip_worktree_entry(b"absent", clean),
+                staged_entry(b"conflict", base, 1),
+                staged_entry(b"conflict", ours, 2),
+                staged_entry(b"conflict", theirs, 3),
+            ],
+        );
+        fs::write(root.join("conflict"), b"ours\n=======\ntheirs\n")
+            .expect("write conflicted worktree file");
+
+        let changes = diff_name_status_index_worktree_with_options(
+            &root,
+            &layout.git_dir,
+            ObjectFormat::Sha1,
+            DiffNameStatusOptions::default(),
+        )
+        .expect("diff conflicted sparse index");
+
+        assert!(
+            changes
+                .iter()
+                .any(|entry| entry.status == NameStatus::Unmerged && entry.path == b"conflict"),
+            "conflict must remain visible: {changes:?}"
+        );
+        assert!(
+            changes
+                .iter()
+                .all(|entry| entry.path != b"absent" || entry.status != NameStatus::Deleted),
+            "absent skip-worktree leaf must remain clean: {changes:?}"
+        );
+        let cached = diff_name_status_tree_index_with_options(
+            &layout.git_dir,
+            ObjectFormat::Sha1,
+            &empty_tree,
+            DiffNameStatusOptions::default(),
+        )
+        .expect("cached diff of conflicted index");
+        assert!(
+            cached
+                .iter()
+                .any(|entry| entry.status == NameStatus::Unmerged && entry.path == b"conflict"),
+            "cached conflict must carry U status for diff-filter semantics: {cached:?}"
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
     fn index_worktree_diff_returns_staged_gitlinks() {
         let root = temp_root();
         let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false)
@@ -1242,6 +1301,25 @@ new mode 100755
         };
         entry.set_skip_worktree(true);
         entry
+    }
+
+    fn staged_entry(path: &[u8], oid: ObjectId, stage: u16) -> sley_index::IndexEntry {
+        sley_index::IndexEntry {
+            ctime_seconds: 0,
+            ctime_nanoseconds: 0,
+            mtime_seconds: 0,
+            mtime_nanoseconds: 0,
+            dev: 0,
+            ino: 0,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            oid,
+            flags: (path.len() as u16) | (stage << 12),
+            flags_extended: 0,
+            path: BString::from(path),
+        }
     }
 
     fn write_index(git_dir: &Path, mut entries: Vec<sley_index::IndexEntry>) {

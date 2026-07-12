@@ -234,6 +234,7 @@ pub(crate) fn cmd_worktree_add(
     write_worktree_linking_files(&common_git_dir, &admin_dir, &path, relative_paths)?;
     fs::write(admin_dir.join("commondir"), "../..\n")?;
     copy_worktree_config_for_new_worktree(&common_git_dir, &git_dir, &admin_dir)?;
+    copy_sparse_checkout_for_new_worktree(&git_dir, &admin_dir)?;
     let common_store = FileRefStore::new(&common_git_dir, format);
     let reftable_refs = common_store.uses_reftable()?;
     let alternate_refs = common_store.uses_alternate_ref_storage();
@@ -277,6 +278,13 @@ pub(crate) fn cmd_worktree_add(
         &add_head.oid,
         options.checkout,
     )?;
+    if options.checkout {
+        // `worktree add` inherits the invoking worktree's sparse definition.
+        // Build the target tree normally, then reconcile it through the shared
+        // sparse engine so skip-worktree bits, sparse-directory collapsing and
+        // materialized files all use the same semantics as sparse-checkout set.
+        sley_worktree::reapply_active_sparse_checkout(&path, &admin_dir, format)?;
+    }
     // The prepare line was already printed (before check_candidate_path); only
     // the post-checkout "HEAD is now at ..." reset line remains.
     if !options.quiet && options.checkout {
@@ -1825,6 +1833,24 @@ fn copy_worktree_config_for_new_worktree(
     Ok(())
 }
 
+/// Copy the invoking worktree's per-worktree sparse patterns into the newly
+/// allocated linked-worktree admin directory.  `extensions.worktreeConfig`
+/// already causes [`copy_worktree_config_for_new_worktree`] to carry the
+/// enabling `core.sparseCheckout` and `index.sparse` knobs; the pattern file is
+/// the other half of that per-worktree state.
+fn copy_sparse_checkout_for_new_worktree(source_git_dir: &Path, admin_dir: &Path) -> Result<()> {
+    let source = source_git_dir.join("info").join("sparse-checkout");
+    if !source.is_file() {
+        return Ok(());
+    }
+    let destination = admin_dir.join("info").join("sparse-checkout");
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, destination)?;
+    Ok(())
+}
+
 fn run_worktree_add_post_checkout_hook(
     admin_dir: &Path,
     worktree_path: &Path,
@@ -2154,12 +2180,18 @@ fn worktree_remove_has_local_changes(
     admin: &LinkedWorktreeAdmin,
     format: ObjectFormat,
 ) -> Result<bool> {
-    let index = read_repository_index(&admin.admin_dir, format)?.unwrap_or(Index {
+    let mut index = read_repository_index(&admin.admin_dir, format)?.unwrap_or(Index {
         version: 2,
         entries: Vec::new(),
         extensions: Vec::new(),
         checksum: None,
     });
+    // A collapsed sparse directory is still the complete set of tracked leaves
+    // for dirtiness purposes. Expand only this temporary view: removing a
+    // linked worktree must neither rewrite its index nor advertise a sparse
+    // expansion merely because it checked whether removal is safe.
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    sley_worktree::expand_sparse_index_view(&mut index, &db, format)?;
     let head = worktree_head_tree_entries(common_git_dir, &admin.admin_dir, format)?;
     let mut tracked = BTreeSet::new();
     for entry in &index.entries {
@@ -2169,6 +2201,9 @@ fn worktree_remove_has_local_changes(
             .is_none_or(|head_entry| head_entry.mode != entry.mode || head_entry.oid != entry.oid)
         {
             return Ok(true);
+        }
+        if entry.is_skip_worktree() {
+            continue;
         }
         let path = admin
             .path

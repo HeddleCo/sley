@@ -2834,11 +2834,13 @@ fn apply_one_patch(
     }
 
     match try_straight_apply(
+        git_dir,
         common_git_dir,
         worktree_root,
         format,
         &file_patches,
         apply_opts,
+        lazy_fetch,
     )? {
         Some(actions) => {
             apply_actions(git_dir, worktree_root, format, &actions)?;
@@ -3039,14 +3041,36 @@ enum ApplyFileAction {
 /// Compute the file actions for every hunk against the current worktree, or
 /// `None` if any hunk fails to apply (so the whole patch is atomic, like git).
 fn try_straight_apply(
+    git_dir: &Path,
     common_git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
     file_patches: &[sley_diff_merge::FilePatch],
     apply_opts: &AmApplyOpts,
+    lazy_fetch: bool,
 ) -> Result<Option<Vec<ApplyFileAction>>> {
     let mut actions = Vec::new();
     let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    // A sparse checkout deliberately omits skip-worktree files from disk. The
+    // straight-apply backend still has a semantic preimage for those paths in
+    // the index; treating a missing worktree file as empty makes an ordinary
+    // update reject and unnecessarily enters am's 3-way fallback. Expand a
+    // sparse index only in memory and retain just those omitted leaf entries as
+    // candidate preimages. A genuinely missing non-sparse file must still make
+    // the patch fail rather than being silently restored from the index.
+    let mut sparse_preimages = BTreeMap::new();
+    if let Some(mut index) = read_repository_index(git_dir, format)? {
+        if index.is_sparse() {
+            expand_am_sparse_index_view(&mut index, &db, format)?;
+        }
+        sparse_preimages.extend(
+            index
+                .entries
+                .into_iter()
+                .filter(|entry| index_entry_stage(entry) == 0 && entry.is_skip_worktree())
+                .map(|entry| (entry.path.as_bytes().to_vec(), (entry.mode, entry.oid))),
+        );
+    }
     for patch in file_patches {
         // git apply (`check_to_create` in apply.c) rejects a create patch when
         // the target already exists in the working tree — the whole patch fails
@@ -3059,11 +3083,15 @@ fn try_straight_apply(
         // still fails the create (→ conflict / `git am` aborts).
         if patch.is_new
             && let Some(target) = patch.new_path.as_deref().or(patch.old_path.as_deref())
-            && let Ok(rel) = std::str::from_utf8(target)
-            && let Ok(meta) = std::fs::symlink_metadata(worktree_root.join(rel))
-            && !(meta.is_dir() && patch.new_mode == Some(0o160000))
         {
-            return Ok(None);
+            let sparse_target_exists = sparse_preimages.contains_key(target);
+            let worktree_target_blocks = std::str::from_utf8(target)
+                .ok()
+                .and_then(|rel| std::fs::symlink_metadata(worktree_root.join(rel)).ok())
+                .is_some_and(|meta| !(meta.is_dir() && patch.new_mode == Some(0o160000)));
+            if sparse_target_exists || worktree_target_blocks {
+                return Ok(None);
+            }
         }
         let base = if patch.is_new {
             Vec::new()
@@ -3076,7 +3104,15 @@ fn try_straight_apply(
         } else if let Some(old) = patch.old_path.as_deref().or(patch.new_path.as_deref()) {
             let rel = std::str::from_utf8(old)
                 .map_err(|_| GitError::InvalidFormat("non-utf8 patch path".into()))?;
-            fs::read(worktree_root.join(rel)).unwrap_or_default()
+            match fs::read(worktree_root.join(rel)) {
+                Ok(content) => content,
+                Err(_) => match sparse_preimages.get(old) {
+                    Some((mode, oid)) if !sley_index::is_gitlink(*mode) => {
+                        merge_read_blob(&db, oid, lazy_fetch)?
+                    }
+                    _ => Vec::new(),
+                },
+            }
         } else {
             Vec::new()
         };
@@ -3170,6 +3206,25 @@ fn try_straight_apply(
         }
     }
     Ok(Some(actions))
+}
+
+/// Expand synthetic sparse-directory rows to their semantic leaf entries in
+/// memory. Apply/am operates on paths, while sparse-directory rows are only an
+/// index serialization optimization.
+fn expand_am_sparse_index_view(
+    index: &mut Index,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<()> {
+    if !index.is_sparse() {
+        return Ok(());
+    }
+    for entry in &mut index.entries {
+        if entry.mode == sley_index::SPARSE_DIR_MODE && entry.path.as_bytes().ends_with(b"/") {
+            entry.set_skip_worktree(true);
+        }
+    }
+    sley_worktree::expand_sparse_index_view(index, db, format).map(|_| ())
 }
 
 /// `git apply --whitespace=fix`: rewrite each *added* line to remove the
@@ -3585,6 +3640,16 @@ fn stage_and_commit(
         extensions: Vec::new(),
         checksum: None,
     });
+    let physical_sparse_index = index
+        .entries
+        .iter()
+        .any(sley_index::IndexEntry::is_sparse_dir)
+        .then(|| index.clone());
+    // Upserting `dir/file` beside a synthetic `dir/` sparse row creates two
+    // competing representations of the same subtree. Expand the snapshot
+    // before staging so the changed leaf replaces its real index entry and the
+    // commit tree contains each path exactly once.
+    expand_am_sparse_index_view(&mut index, &db, format)?;
 
     for action in actions {
         match action {
@@ -3613,12 +3678,16 @@ fn stage_and_commit(
     index
         .entries
         .sort_by(|left, right| left.path.cmp(&right.path));
+    if let Some(physical) = physical_sparse_index.as_ref() {
+        am_restore_unchanged_sparse_directories(&mut index, physical, &db, format)?;
+    }
     // We mutated entry OIDs above; the cache-tree extension carried over from
     // the parsed index is now stale. `write_tree_from_index` trusts a present
     // cache-tree by entry-count, so leaving a stale `TREE` here makes the
     // commit reuse the OLD root tree (wrong OID; modified-file content lost).
     // Invalidate it, matching every entry-mutating writer in sley-worktree.
     index.set_cache_tree(None)?;
+    index.upgrade_version_for_flags();
     fs::write(
         sley_worktree::repository_index_path(git_dir),
         index.write(format)?,
@@ -3633,6 +3702,53 @@ fn stage_and_commit(
         commit_opts,
         config,
     )
+}
+
+/// Put unchanged physical sparse-directory rows back after applying a patch to
+/// the semantic index view. This keeps an in-cone `am` from persisting every
+/// unrelated out-of-cone leaf while still leaving a genuinely changed sparse
+/// directory expanded for the normal sparse policy to reconcile later.
+fn am_restore_unchanged_sparse_directories(
+    index: &mut Index,
+    physical: &Index,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<()> {
+    let mut restored = false;
+    for sparse in physical
+        .entries
+        .iter()
+        .filter(|entry| entry.is_sparse_dir())
+    {
+        let prefix = sparse.path.as_bytes();
+        let expected = sley_diff_merge::flatten_tree(db, format, &sparse.oid)?;
+        let actual = index
+            .entries
+            .iter()
+            .filter(|entry| entry.path.as_bytes().starts_with(prefix))
+            .collect::<Vec<_>>();
+        if actual.len() != expected.len()
+            || actual.iter().any(|entry| {
+                entry.stage() != sley_index::Stage::Normal
+                    || expected.get(&entry.path.as_bytes()[prefix.len()..])
+                        != Some(&(entry.mode, entry.oid))
+            })
+        {
+            continue;
+        }
+        index
+            .entries
+            .retain(|entry| !entry.path.as_bytes().starts_with(prefix));
+        index.entries.push(sparse.clone());
+        restored = true;
+    }
+    if restored {
+        index
+            .entries
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        index.set_sparse_extension();
+    }
+    Ok(())
 }
 
 /// Insert or replace the stage-0 index entry for `path`.

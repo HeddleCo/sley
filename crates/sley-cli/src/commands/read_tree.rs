@@ -283,6 +283,14 @@ fn map_read_tree_transition_result<T>(
     match result {
         Ok(outcome) => Ok(outcome),
         Err(sley_worktree::ReadTreeTransitionError::InvalidPath(_)) => Err(GitError::Exit(128)),
+        Err(sley_worktree::ReadTreeTransitionError::BindOverlap { incoming, existing }) => {
+            eprintln!(
+                "error: Entry '{}' overlaps with '{}'.  Cannot bind.",
+                String::from_utf8_lossy(&incoming),
+                String::from_utf8_lossy(&existing)
+            );
+            Err(GitError::Exit(128))
+        }
         Err(sley_worktree::ReadTreeTransitionError::Engine(error)) => Err(error),
     }
 }
@@ -1081,7 +1089,7 @@ pub(crate) fn reset_index_and_worktree_to_commit(
     let config = read_repo_config(git_dir).unwrap_or_default();
     let tree = commands::merge_rebase::commit_tree_oid(&db, format, commit)?;
     let mut diagnostics = CliReadTreeDiagnostics;
-    let mut entries = map_read_tree_transition_result(sley_worktree::plan_read_tree_transition(
+    let entries = map_read_tree_transition_result(sley_worktree::plan_read_tree_transition(
         git_dir,
         format,
         &db,
@@ -1090,17 +1098,75 @@ pub(crate) fn reset_index_and_worktree_to_commit(
         &mut diagnostics,
     ))?
     .entries;
-    reset_worktree_to_entries(
-        worktree_root,
-        git_dir,
-        format,
-        &db,
-        &config,
-        None,
-        &mut entries,
-        recurse_submodules,
-    )?;
-    sley_worktree::persist_read_tree_entries(git_dir, format, entries)
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let previous_index = fs::read(&index_path).ok();
+    let target_paths = entries
+        .iter()
+        .map(|(path, _)| path.as_slice())
+        .collect::<BTreeSet<_>>();
+    if recurse_submodules
+        && let Some(index) = sley_worktree::read_repository_index(git_dir, format)?
+    {
+        for entry in index.entries.iter().filter(|entry| {
+            entry.stage() == sley_index::Stage::Normal
+                && sley_index::is_gitlink(entry.mode)
+                && !target_paths.contains(entry.path.as_bytes())
+        }) {
+            remove_submodule_worktree(worktree_root, git_dir, &entry.path)?;
+        }
+    }
+
+    // The shared hard-reset engine owns sparse pattern application and
+    // physical sparse-index shape preservation. The old read-tree overlay
+    // materialized every target leaf and relied on a porcelain reapply pass,
+    // which both expanded out-of-cone paths and collapsed partial sparse-index
+    // boundaries. Reset the superproject first, then recurse only into
+    // materialized target gitlinks.
+    sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, commit)?;
+    if !recurse_submodules {
+        return Ok(());
+    }
+    let persisted = sley_worktree::read_repository_index(git_dir, format)?
+        .map(|index| {
+            index
+                .entries
+                .into_iter()
+                .filter(|entry| entry.stage() == sley_index::Stage::Normal)
+                .map(|entry| (entry.path.as_bytes().to_vec(), entry))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    for (path, entry) in entries
+        .iter()
+        .filter(|(_, entry)| sley_index::is_gitlink(entry.mode))
+    {
+        if persisted
+            .get(path)
+            .is_some_and(sley_index::IndexEntry::is_skip_worktree)
+            || !gitlink_should_recurse(worktree_root, &config, path)
+        {
+            continue;
+        }
+        if let Err(error) =
+            checkout_submodule_to_commit(worktree_root, git_dir, format, path, &entry.oid)
+        {
+            // The superproject worktree has already moved, but a recursive
+            // submodule failure leaves its index at the pre-reset state. The
+            // reset caller refreshes that restored index against the rewritten
+            // worktree before propagating the failure, matching Git's partial
+            // failure contract.
+            match previous_index.as_ref() {
+                Some(bytes) => fs::write(&index_path, bytes)?,
+                None => match fs::remove_file(&index_path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err.into()),
+                },
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 /// Perform git's trivial fast-forward / two-way / three-way merge of the listed

@@ -1262,6 +1262,28 @@ pub fn move_index_and_worktree_path(
             checksum: None,
         }
     };
+    // A sparse-index directory row is only a compact representation of the
+    // tracked leaves below it. `git mv --sparse dir …` operates on those leaves
+    // individually so their destination cone membership can be recomputed.
+    // Expand the semantic view before source/destination classification; the
+    // resulting index is persisted only when the move itself succeeds.
+    //
+    // Older index readers may expose the `sdir` extension and 040000 `/` row
+    // before decoding its extended skip-worktree bit. Normalize that redundant
+    // representation at this engine boundary so the shared expansion primitive
+    // still recognizes the row. A fully decoded index already has the bit and
+    // this loop is a no-op.
+    if options.sparse && index.is_sparse() {
+        for entry in &mut index.entries {
+            if entry.mode == sley_index::SPARSE_DIR_MODE && entry.path.as_bytes().ends_with(b"/") {
+                entry.set_skip_worktree(true);
+            }
+        }
+    }
+    if options.sparse && index.entries.iter().any(IndexEntry::is_sparse_dir) {
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        crate::checkout::expand_sparse_index_view(&mut index, &db, format)?;
+    }
     let source_absolute = if source.is_absolute() {
         source.to_path_buf()
     } else {

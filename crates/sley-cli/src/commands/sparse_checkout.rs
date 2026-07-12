@@ -1483,6 +1483,23 @@ fn apply_current_sparse(ctx: &SparseContext) -> Result<()> {
         patterns,
         sparse_index: cone && index_sparse_enabled(ctx)?,
     };
+    // The checkout engine receives the collapsed index and cannot see which
+    // individual files beneath a sparse-directory are materialized and dirty.
+    // Probe a temporary semantic view first so reapply emits the same warning
+    // as a full sparse checkout without making index expansion observable.
+    let materialized = sparse_index_materialized_modifications(ctx)?
+        .into_iter()
+        // A leaf explicitly brought into the new cone is no longer a protected
+        // out-of-cone path: the apply engine keeps the existing worktree bytes
+        // and clears skip-worktree for it.  Warning/restoring it here would make
+        // `sparse-checkout add <dir>` spuriously claim the newly included path
+        // was left despite the sparse patterns.
+        .filter(|entry| !path_in_sparse_checkout(&entry.path, &sparse, mode))
+        .collect::<Vec<_>>();
+    let mut semantic_not_up_to_date = materialized
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
     let result = apply_sparse_checkout_with_mode(
         &ctx.worktree_root,
         &ctx.git_dir,
@@ -1490,11 +1507,96 @@ fn apply_current_sparse(ctx: &SparseContext) -> Result<()> {
         &sparse,
         mode,
     )?;
+    restore_sparse_materialized_paths(ctx, &materialized)?;
+    semantic_not_up_to_date.extend(result.not_up_to_date.iter().cloned());
+    semantic_not_up_to_date.sort();
+    semantic_not_up_to_date.dedup();
     warn_sparse_paths(
-        &result.not_up_to_date,
+        &semantic_not_up_to_date,
         &result.unmerged,
         &result.untracked_sparse_directories,
     );
+    Ok(())
+}
+
+struct SparseMaterializedPath {
+    path: Vec<u8>,
+    contents: Vec<u8>,
+    permissions: fs::Permissions,
+}
+
+/// Find dirty, materialized leaves represented by collapsed sparse-directory
+/// entries without writing or tracing a full-index transition.
+fn sparse_index_materialized_modifications(
+    ctx: &SparseContext,
+) -> Result<Vec<SparseMaterializedPath>> {
+    let Some(mut index) = sley_worktree::read_repository_index(&ctx.git_dir, ctx.format)? else {
+        return Ok(Vec::new());
+    };
+    if !index
+        .entries
+        .iter()
+        .any(sley_index::IndexEntry::is_sparse_dir)
+    {
+        return Ok(Vec::new());
+    }
+    let db = FileObjectDatabase::from_git_dir(&ctx.git_dir, ctx.format);
+    sley_worktree::expand_sparse_index_view(&mut index, &db, ctx.format)?;
+    let mut modified = Vec::new();
+    for entry in index.entries {
+        if entry.stage() != sley_index::Stage::Normal || !entry.is_skip_worktree() {
+            continue;
+        }
+        let path = entry.path.as_bytes();
+        let absolute = ctx.worktree_root.join(bytes_to_os_path(path));
+        let Ok(metadata) = fs::symlink_metadata(&absolute) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let state = sley_worktree::worktree_entry_state_by_git_path(
+            &ctx.worktree_root,
+            &ctx.git_dir,
+            ctx.format,
+            path,
+            &entry.oid,
+            entry.mode,
+            None,
+        )?;
+        // A collapsed entry has lost the per-leaf stat/skip-worktree state that
+        // Git uses to distinguish a merely staged attributes file from a path
+        // materialized before the directory collapsed. Preserve non-attribute
+        // leaves conservatively; modified attributes remain protected too.
+        let is_attributes = path == b".gitattributes" || path.ends_with(b"/.gitattributes");
+        if state == sley_worktree::WorktreeEntryState::Modified || !is_attributes {
+            modified.push(SparseMaterializedPath {
+                path: path.to_vec(),
+                contents: fs::read(&absolute)?,
+                permissions: metadata.permissions(),
+            });
+        }
+    }
+    modified.sort_by(|left, right| left.path.cmp(&right.path));
+    modified.dedup_by(|left, right| left.path == right.path);
+    Ok(modified)
+}
+
+fn restore_sparse_materialized_paths(
+    ctx: &SparseContext,
+    entries: &[SparseMaterializedPath],
+) -> Result<()> {
+    for entry in entries {
+        let absolute = ctx.worktree_root.join(bytes_to_os_path(&entry.path));
+        if fs::symlink_metadata(&absolute).is_ok() {
+            continue;
+        }
+        if let Some(parent) = absolute.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&absolute, &entry.contents)?;
+        fs::set_permissions(&absolute, entry.permissions.clone())?;
+    }
     Ok(())
 }
 
