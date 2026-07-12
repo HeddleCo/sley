@@ -605,8 +605,14 @@ fn maintenance_start_does_not_register_when_auto_scheduler_is_unavailable() {
         .output()
         .expect("run maintenance start");
     assert!(!out.status.success(), "unavailable scheduler succeeded");
+    // `maintenance start` with no explicit --scheduler is AUTO resolution; on
+    // Linux with neither systemd nor crontab available, upstream git dies with
+    // this exact message (git builtin/gc.c: "neither systemd timers nor crontab
+    // are available"). The "%s scheduler is not available" form is git's message
+    // for an EXPLICITLY-requested unavailable scheduler, not the AUTO path.
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("scheduler is not available"),
+        String::from_utf8_lossy(&out.stderr)
+            .contains("neither systemd timers nor crontab are available"),
         "unexpected stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
