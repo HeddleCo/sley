@@ -1885,6 +1885,7 @@ fn diff_direct_blob_pairs_match_upstream_git() {
         vec!["diff", "-R", old.as_str(), new.as_str()],
         vec!["diff", old_binary.as_str(), new_binary.as_str()],
         vec!["diff", old.as_str(), "new.txt"],
+        vec!["diff", "-R", old.as_str(), "new.txt"],
         vec!["diff", "new.txt", old.as_str()],
         vec!["diff", "-R", "new.txt", old.as_str()],
     ];

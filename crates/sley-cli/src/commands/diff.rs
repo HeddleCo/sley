@@ -1836,6 +1836,10 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         && let Some((mut left, mut right)) =
             diff_direct_blob_pair(&cwd, &git_dir, format, &db, &path_args)?
     {
+        if reverse && right.file {
+            eprintln!("fatal: unable to read {}", zero_oid(format)?);
+            return Err(GitError::Exit(128));
+        }
         if reverse {
             std::mem::swap(&mut left, &mut right);
         }

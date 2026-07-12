@@ -2992,16 +2992,11 @@ fn try_reject_apply(
             });
         }
 
-        let content_changed = result.content != base;
         if patch.is_delete && result.rejected.is_empty() {
             if let Some(old) = &patch.old_path {
                 actions.push(ApplyFileAction::Remove { path: old.clone() });
             }
-        } else if content_changed
-            || patch.is_new
-            || patch.is_rename
-            || patch.old_mode != patch.new_mode
-        {
+        } else {
             actions.push(ApplyFileAction::Write {
                 path: target,
                 mode: patch.new_mode.or(patch.old_mode).unwrap_or(0o100644),
@@ -3600,42 +3595,10 @@ fn apply_actions(
             } else {
                 Cow::Borrowed(content.as_slice())
             };
-            if am_worktree_action_already_materialized(
-                &worktree_root.join(
-                    std::str::from_utf8(path)
-                        .map_err(|err| GitError::InvalidPath(err.to_string()))?,
-                ),
-                &worktree_content,
-                *mode,
-            ) {
-                continue;
-            }
             merge_write_worktree_file(worktree_root, path, &worktree_content, *mode)?;
         }
     }
     Ok(())
-}
-
-fn am_worktree_action_already_materialized(path: &Path, content: &[u8], mode: u32) -> bool {
-    if mode & 0o170000 != 0o100000 {
-        return false;
-    }
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return false;
-    };
-    if !metadata.file_type().is_file() || fs::read(path).ok().as_deref() != Some(content) {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let actual_executable = metadata.permissions().mode() & 0o111 != 0;
-        let wanted_executable = mode & 0o111 != 0;
-        if actual_executable != wanted_executable {
-            return false;
-        }
-    }
-    true
 }
 
 /// Reconstruct a gitlink patch's preimage (`Subproject commit <old>\n`) from its

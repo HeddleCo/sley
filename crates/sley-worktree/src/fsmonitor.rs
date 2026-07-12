@@ -272,7 +272,14 @@ mod platform {
                 alias.display()
             ))),
             Ok(_) => {
-                let target = fs::read_link(&alias).map_err(|err| GitError::Io(err.to_string()))?;
+                let target = match fs::read_link(&alias) {
+                    Ok(target) => target,
+                    // The daemon removes its endpoint alias during shutdown.
+                    // Treat a removal between the metadata probe and readlink
+                    // like Git's IPC_STATE__PATH_NOT_FOUND, not an I/O error.
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(alias),
+                    Err(err) => return Err(GitError::Io(err.to_string())),
+                };
                 if target == git_dir {
                     Ok(alias)
                 } else {

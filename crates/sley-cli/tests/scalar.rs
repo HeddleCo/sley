@@ -316,11 +316,15 @@ fn scalar_registration_lifecycle_uses_native_config_and_registry() {
         &["fsmonitor--daemon", "status"],
         &environment_refs,
     );
-    assert!(
-        watching.status.success(),
-        "{}",
-        String::from_utf8_lossy(&watching.stderr)
+    let git_watching = run_configured(
+        Path::new(sley_testkit::oracle_git()),
+        &repository,
+        &["fsmonitor--daemon", "status"],
+        &environment_refs,
     );
+    assert_eq!(watching.status.code(), git_watching.status.code());
+    assert_eq!(watching.stdout, git_watching.stdout);
+    assert_eq!(watching.stderr, git_watching.stderr);
 
     let unregister = run_configured(
         scalar_bin(),
@@ -341,7 +345,15 @@ fn scalar_registration_lifecycle_uses_native_config_and_registry() {
         &["fsmonitor--daemon", "status"],
         &environment_refs,
     );
-    assert_eq!(stopped.status.code(), Some(1));
+    let git_stopped = run_configured(
+        Path::new(sley_testkit::oracle_git()),
+        &repository,
+        &["fsmonitor--daemon", "status"],
+        &environment_refs,
+    );
+    assert_eq!(stopped.status.code(), git_stopped.status.code());
+    assert_eq!(stopped.stdout, git_stopped.stdout);
+    assert_eq!(stopped.stderr, git_stopped.stderr);
     fs::remove_dir_all(root).ok();
 }
 

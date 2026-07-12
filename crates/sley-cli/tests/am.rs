@@ -767,8 +767,18 @@ fn am_reject_partially_applies_and_writes_reject_like_git() {
     let rs_target = root.join("rs");
     for target in [&git_target, &rs_target] {
         init_repo(target, "1\n2\n3\n4\n5\n6\n7\n");
+        filetime::set_file_mtime(
+            target.join("file.txt"),
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .expect("age rejected-patch fixture");
     }
 
+    // Refresh the fixture's cached stat data before applying, as Git's own
+    // tests do for racy-stat hygiene. The aged mtime keeps the subsequent
+    // byte-identical rewrite outside the index's racy-clean timestamp window.
+    let _ = git(&rs_target, &["update-index", "-q", "--refresh"]);
+    let _ = git(&git_target, &["update-index", "-q", "--refresh"]);
     let g = git(&git_target, &["am", "--reject", &patch]);
     let r = sley(&rs_target, &["am", "--reject", &patch]);
     assert!(
@@ -787,16 +797,16 @@ fn am_reject_partially_applies_and_writes_reject_like_git() {
         fs::read(git_target.join("file.txt.rej")).expect("Git reject file"),
         "reject-file bytes differ"
     );
-    // Both implementations may materialize a byte-identical result within the
-    // index timestamp's racy-clean window. Refresh cached stat data before the
-    // plumbing comparison so `diff-files` continues to assert real index versus
-    // worktree content/mode separation instead of transient timestamp metadata.
-    let _ = git(&rs_target, &["update-index", "-q", "--refresh"]);
-    let _ = git(&git_target, &["update-index", "-q", "--refresh"]);
+    let expected_dirty = "file.txt";
     assert_eq!(
         git_ok(&rs_target, &["diff-files", "--name-only"]),
+        expected_dirty,
+        "Sley must materialize the rejected patch result"
+    );
+    assert_eq!(
         git_ok(&git_target, &["diff-files", "--name-only"]),
-        "index/worktree separation differs"
+        expected_dirty,
+        "Git fixture must exercise byte-identical materialization"
     );
     assert_eq!(
         fs::read(rs_target.join(".git/rebase-apply/apply-opt")).expect("Sley apply-opt"),
