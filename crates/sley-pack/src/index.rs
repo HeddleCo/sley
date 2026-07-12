@@ -27,7 +27,7 @@ pub struct PackIndexedObject {
     pub offset: u64,
 }
 
-/// Streaming pack-receive counters emitted while [`index_pack_from_stream`]
+/// Streaming pack-receive counters emitted while `index_pack_from_stream`
 /// parses a pack off a reader. All fields are monotonically non-decreasing
 /// within one indexing pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -872,7 +872,7 @@ impl PackIndex {
         index_pack_from_reader_to_trailer(reader, format)
     }
 
-    /// [`write_v2_for_pack_reader_to_trailer`] that reports streaming pack
+    /// `write_v2_for_pack_reader_to_trailer` that reports streaming pack
     /// progress. `progress` is invoked on a throttled cadence with the pack byte
     /// offset, objects parsed so far, and the header-declared total, then once
     /// more at completion with `received_objects == total_objects`.
