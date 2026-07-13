@@ -11,7 +11,6 @@ license.workspace = true
 sley-core.workspace = true
 sley-odb.workspace = true
 sley-protocol.workspace = true
-sley-transport.workspace = true
 
 [dev-dependencies]
 sley-formats.workspace = true

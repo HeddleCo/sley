@@ -2,16 +2,15 @@
 // the only retained `expect`s would be documented compile-time invariants.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use sley_core::ObjectFormat;
-use sley_core::Result;
+use sley_core::{Cancel, CancelFlag, ObjectFormat, Result};
 use sley_odb::{FileObjectDatabase, RawPackInstallOptions, RawPackInstallResult, RawPackInstaller};
 use sley_protocol::{
-    PktLineFrame, ProtocolV2FetchResponseHeader, ProtocolV2FetchResponseSection,
-    ProtocolV2FetchShallowInfo, SideBandChannel, parse_sideband_packet, read_pkt_line_frame,
-    read_protocol_v2_fetch_response_header, read_upload_pack_raw_packfile_response_header,
+    ProtocolV2FetchResponseHeader, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
+    StreamingSidebandReader, read_protocol_v2_fetch_response_header,
+    read_upload_pack_raw_packfile_response_header,
     read_upload_pack_shallow_info_and_raw_packfile_response_header,
 };
-use std::io::{Cursor, ErrorKind, Read};
+use std::io::{Cursor, Read};
 
 fn raw_pack_install_options(
     promisor: bool,
@@ -21,6 +20,85 @@ fn raw_pack_install_options(
         promisor,
         max_input_size,
     }
+}
+
+/// Map sideband `Read` failures back to the GitError variants the buffered
+/// demux path used, so fetch/clone diagnostics stay parity-stable.
+fn map_sideband_stream_io_error(err: std::io::Error) -> sley_core::GitError {
+    let message = err.to_string();
+    if message.contains("sideband fatal:")
+        || message.contains("sideband stream")
+        || message.contains("side-band")
+        || message.contains("pkt-line")
+    {
+        // demux_sideband_packets / parse_sideband used InvalidFormat for these.
+        sley_core::GitError::InvalidFormat(message)
+    } else if err.kind() == std::io::ErrorKind::Interrupted && message.contains("cancelled") {
+        sley_core::GitError::Cancelled
+    } else {
+        sley_core::GitError::from(err)
+    }
+}
+
+fn map_sideband_install_error(err: sley_core::GitError) -> sley_core::GitError {
+    match err {
+        sley_core::GitError::Io(message)
+            if message.contains("sideband fatal:")
+                || message.contains("sideband stream")
+                || message.contains("side-band") =>
+        {
+            sley_core::GitError::InvalidFormat(message)
+        }
+        other => other,
+    }
+}
+
+/// Install a demuxed protocol-v2 packfile section via streaming sideband.
+///
+/// The v2 packfile section is pure sideband (no upload-pack ACK preamble), so
+/// we do **not** call [`StreamingSidebandReader::skip_upload_pack_acks`].
+fn install_protocol_v2_packfile_section_with_cancel<I, R, C>(
+    reader: &mut R,
+    destination: &I,
+    promisor: bool,
+    max_input_size: Option<u64>,
+    cancel: &CancelFlag<C>,
+) -> Result<RawPackInstallResult>
+where
+    I: RawPackInstaller,
+    R: Read,
+    C: Cancel,
+{
+    // Stream demux sideband channel-1 bytes as frames arrive so pack install
+    // can cancel mid-transfer without buffering the full response. Channel-2
+    // progress is ignored here (callers can wrap the installer for progress).
+    //
+    // Parity with the old ProtocolV2PackfileReader + buffer-then-install path:
+    // - after the pack trailer is complete the indexer stops reading, but the
+    //   wire may still carry trailing progress frames + flush — drain them;
+    // - sideband fatal/protocol errors surface as InvalidFormat (not bare Io).
+    let mut pack_reader = StreamingSidebandReader::new(reader, |_: &[u8]| {});
+    let result = destination.install_raw_pack_from_reader_with_progress_and_cancel(
+        &mut pack_reader,
+        raw_pack_install_options(promisor, max_input_size),
+        cancel,
+        |_| {},
+    );
+    let drain = pack_reader
+        .drain_to_end()
+        .map_err(map_sideband_stream_io_error);
+    let result = match (result, drain) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Ok(_), Err(drain_err)) => Err(drain_err),
+        (Err(install_err), _) => Err(map_sideband_install_error(install_err)),
+    }?;
+    Ok(if promisor {
+        RawPackInstallResult {
+            object_ids: result.object_ids,
+        }
+    } else {
+        result
+    })
 }
 
 pub fn install_upload_pack_raw_response_from_reader<I, R>(
@@ -33,11 +111,35 @@ where
     I: RawPackInstaller,
     R: Read,
 {
+    install_upload_pack_raw_response_from_reader_with_cancel(
+        format,
+        reader,
+        destination,
+        max_input_size,
+        &CancelFlag::never(),
+    )
+}
+
+/// Raw (non-sideband) upload-pack pack install with cooperative cancellation.
+pub fn install_upload_pack_raw_response_from_reader_with_cancel<I, R, C>(
+    format: ObjectFormat,
+    reader: &mut R,
+    destination: &I,
+    max_input_size: Option<u64>,
+    cancel: &CancelFlag<C>,
+) -> Result<RawPackInstallResult>
+where
+    I: RawPackInstaller,
+    R: Read,
+    C: Cancel,
+{
     let header = read_upload_pack_raw_packfile_response_header(format, reader)?;
     let mut pack_reader = Cursor::new(header.pack_prefix).chain(reader);
-    destination.install_raw_pack_from_reader_with_options(
+    destination.install_raw_pack_from_reader_with_progress_and_cancel(
         &mut pack_reader,
         raw_pack_install_options(false, max_input_size),
+        cancel,
+        |_| {},
     )
 }
 
@@ -50,11 +152,34 @@ pub fn install_upload_pack_raw_promisor_response_from_reader<R>(
 where
     R: Read,
 {
+    install_upload_pack_raw_promisor_response_from_reader_with_cancel(
+        format,
+        reader,
+        destination,
+        max_input_size,
+        &CancelFlag::never(),
+    )
+}
+
+/// Promisor raw upload-pack install with cooperative cancellation.
+pub fn install_upload_pack_raw_promisor_response_from_reader_with_cancel<R, C>(
+    format: ObjectFormat,
+    reader: &mut R,
+    destination: &FileObjectDatabase,
+    max_input_size: Option<u64>,
+    cancel: &CancelFlag<C>,
+) -> Result<RawPackInstallResult>
+where
+    R: Read,
+    C: Cancel,
+{
     let header = read_upload_pack_raw_packfile_response_header(format, reader)?;
     let mut pack_reader = Cursor::new(header.pack_prefix).chain(reader);
-    let result = destination.install_raw_pack_from_reader_with_options(
+    let result = destination.install_raw_pack_from_reader_with_progress_and_cancel(
         &mut pack_reader,
         raw_pack_install_options(true, max_input_size),
+        cancel,
+        |_| {},
     )?;
     Ok(RawPackInstallResult {
         object_ids: result.object_ids,
@@ -71,12 +196,36 @@ where
     I: RawPackInstaller,
     R: Read,
 {
+    install_upload_pack_shallow_raw_response_from_reader_with_cancel(
+        format,
+        reader,
+        destination,
+        max_input_size,
+        &CancelFlag::never(),
+    )
+}
+
+/// Shallow raw upload-pack install with cooperative cancellation.
+pub fn install_upload_pack_shallow_raw_response_from_reader_with_cancel<I, R, C>(
+    format: ObjectFormat,
+    reader: &mut R,
+    destination: &I,
+    max_input_size: Option<u64>,
+    cancel: &CancelFlag<C>,
+) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
+where
+    I: RawPackInstaller,
+    R: Read,
+    C: Cancel,
+{
     let (shallow, header) =
         read_upload_pack_shallow_info_and_raw_packfile_response_header(format, reader)?;
     let mut pack_reader = Cursor::new(header.pack_prefix).chain(reader);
-    let result = destination.install_raw_pack_from_reader_with_options(
+    let result = destination.install_raw_pack_from_reader_with_progress_and_cancel(
         &mut pack_reader,
         raw_pack_install_options(false, max_input_size),
+        cancel,
+        |_| {},
     )?;
     Ok((shallow, result))
 }
@@ -90,12 +239,35 @@ pub fn install_upload_pack_shallow_raw_promisor_response_from_reader<R>(
 where
     R: Read,
 {
+    install_upload_pack_shallow_raw_promisor_response_from_reader_with_cancel(
+        format,
+        reader,
+        destination,
+        max_input_size,
+        &CancelFlag::never(),
+    )
+}
+
+/// Shallow promisor raw upload-pack install with cooperative cancellation.
+pub fn install_upload_pack_shallow_raw_promisor_response_from_reader_with_cancel<R, C>(
+    format: ObjectFormat,
+    reader: &mut R,
+    destination: &FileObjectDatabase,
+    max_input_size: Option<u64>,
+    cancel: &CancelFlag<C>,
+) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
+where
+    R: Read,
+    C: Cancel,
+{
     let (shallow, header) =
         read_upload_pack_shallow_info_and_raw_packfile_response_header(format, reader)?;
     let mut pack_reader = Cursor::new(header.pack_prefix).chain(reader);
-    let result = destination.install_raw_pack_from_reader_with_options(
+    let result = destination.install_raw_pack_from_reader_with_progress_and_cancel(
         &mut pack_reader,
         raw_pack_install_options(true, max_input_size),
+        cancel,
+        |_| {},
     )?;
     Ok((
         shallow,
@@ -116,14 +288,44 @@ where
     I: RawPackInstaller,
     R: Read,
 {
+    install_protocol_v2_fetch_response_from_reader_with_cancel(
+        format,
+        reader,
+        sideband_all,
+        destination,
+        max_input_size,
+        &CancelFlag::never(),
+    )
+}
+
+/// Protocol v2 fetch response install with cooperative cancellation.
+///
+/// Demuxes the packfile section with [`StreamingSidebandReader`] (no ACK skip;
+/// v2 pack sections have no upload-pack ACK preamble) and threads `cancel` into
+/// the destination installer.
+pub fn install_protocol_v2_fetch_response_from_reader_with_cancel<I, R, C>(
+    format: ObjectFormat,
+    reader: &mut R,
+    sideband_all: bool,
+    destination: &I,
+    max_input_size: Option<u64>,
+    cancel: &CancelFlag<C>,
+) -> Result<(ProtocolV2FetchResponseHeader, Option<RawPackInstallResult>)>
+where
+    I: RawPackInstaller,
+    R: Read,
+    C: Cancel,
+{
     let header = read_protocol_v2_fetch_response_header(format, reader, sideband_all)?;
     if !header.has_packfile {
         return Ok((header, None));
     }
-    let mut pack_reader = ProtocolV2PackfileReader::new(reader);
-    let result = destination.install_raw_pack_from_reader_with_options(
-        &mut pack_reader,
-        raw_pack_install_options(false, max_input_size),
+    let result = install_protocol_v2_packfile_section_with_cancel(
+        reader,
+        destination,
+        false,
+        max_input_size,
+        cancel,
     )?;
     Ok((header, Some(result)))
 }
@@ -138,123 +340,41 @@ pub fn install_protocol_v2_fetch_promisor_response_from_reader<R>(
 where
     R: Read,
 {
+    install_protocol_v2_fetch_promisor_response_from_reader_with_cancel(
+        format,
+        reader,
+        sideband_all,
+        destination,
+        max_input_size,
+        &CancelFlag::never(),
+    )
+}
+
+/// Protocol v2 promisor fetch response install with cooperative cancellation.
+pub fn install_protocol_v2_fetch_promisor_response_from_reader_with_cancel<R, C>(
+    format: ObjectFormat,
+    reader: &mut R,
+    sideband_all: bool,
+    destination: &FileObjectDatabase,
+    max_input_size: Option<u64>,
+    cancel: &CancelFlag<C>,
+) -> Result<(ProtocolV2FetchResponseHeader, Option<RawPackInstallResult>)>
+where
+    R: Read,
+    C: Cancel,
+{
     let header = read_protocol_v2_fetch_response_header(format, reader, sideband_all)?;
     if !header.has_packfile {
         return Ok((header, None));
     }
-    let mut pack_reader = ProtocolV2PackfileReader::new(reader);
-    let result = destination.install_raw_pack_from_reader_with_options(
-        &mut pack_reader,
-        raw_pack_install_options(true, max_input_size),
+    let result = install_protocol_v2_packfile_section_with_cancel(
+        reader,
+        destination,
+        true,
+        max_input_size,
+        cancel,
     )?;
-    Ok((
-        header,
-        Some(RawPackInstallResult {
-            object_ids: result.object_ids,
-        }),
-    ))
-}
-
-struct ProtocolV2PackfileReader<'a, R> {
-    reader: &'a mut R,
-    pending: Vec<u8>,
-    pending_offset: usize,
-    done: bool,
-}
-
-impl<'a, R> ProtocolV2PackfileReader<'a, R> {
-    fn new(reader: &'a mut R) -> Self {
-        Self {
-            reader,
-            pending: Vec::new(),
-            pending_offset: 0,
-            done: false,
-        }
-    }
-
-    fn drain_pending(&mut self, buf: &mut [u8]) -> usize {
-        let available = self.pending.len().saturating_sub(self.pending_offset);
-        let to_copy = available.min(buf.len());
-        if to_copy == 0 {
-            if self.pending_offset >= self.pending.len() {
-                self.pending.clear();
-                self.pending_offset = 0;
-            }
-            return 0;
-        }
-        let end = self.pending_offset + to_copy;
-        buf[..to_copy].copy_from_slice(&self.pending[self.pending_offset..end]);
-        self.pending_offset = end;
-        if self.pending_offset == self.pending.len() {
-            self.pending.clear();
-            self.pending_offset = 0;
-        }
-        to_copy
-    }
-}
-
-impl<R> Read for ProtocolV2PackfileReader<'_, R>
-where
-    R: Read,
-{
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        let mut written = 0usize;
-        while written < buf.len() {
-            let copied = self.drain_pending(&mut buf[written..]);
-            if copied > 0 {
-                written += copied;
-                continue;
-            }
-            if self.done {
-                break;
-            }
-            let frame = read_pkt_line_frame(self.reader)
-                .map_err(git_error_to_io)?
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "protocol v2 packfile ended before flush",
-                    )
-                })?;
-            match frame {
-                PktLineFrame::Data(payload) => {
-                    let packet = parse_sideband_packet(&payload).map_err(git_error_to_io)?;
-                    match packet.channel {
-                        SideBandChannel::Data => {
-                            self.pending = packet.data;
-                            self.pending_offset = 0;
-                        }
-                        SideBandChannel::Progress => {}
-                        SideBandChannel::Fatal => {
-                            let message = String::from_utf8_lossy(&packet.data).into_owned();
-                            return Err(std::io::Error::new(
-                                ErrorKind::InvalidData,
-                                format!("sideband fatal: {message}"),
-                            ));
-                        }
-                    }
-                }
-                PktLineFrame::Flush => {
-                    self.done = true;
-                    break;
-                }
-                PktLineFrame::Delimiter | PktLineFrame::ResponseEnd => {
-                    return Err(std::io::Error::new(
-                        ErrorKind::InvalidData,
-                        "protocol v2 packfile section ended unexpectedly",
-                    ));
-                }
-            }
-        }
-        Ok(written)
-    }
-}
-
-fn git_error_to_io(err: sley_core::GitError) -> std::io::Error {
-    std::io::Error::new(ErrorKind::InvalidData, err.to_string())
+    Ok((header, Some(result)))
 }
 
 pub fn shallow_info_from_protocol_v2_fetch_header(
@@ -272,7 +392,7 @@ pub fn shallow_info_from_protocol_v2_fetch_header(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sley_core::ObjectFormat;
+    use sley_core::{AtomicCancel, CancelFlag, GitError, ObjectFormat};
     use sley_object::{EncodedObject, ObjectType};
     use sley_odb::{FileObjectDatabase, ObjectDatabase, ObjectReader};
     use sley_pack::PackFile;
@@ -620,6 +740,243 @@ mod tests {
                 .as_ref(),
             &object
         );
+    }
+
+    fn encode_chunked_v2_packfile(pack_bytes: &[u8], chunk_size: usize) -> Vec<u8> {
+        let mut sideband = vec![SideBandPacket {
+            channel: SideBandChannel::Progress,
+            data: b"counting objects\n".to_vec(),
+        }];
+        for chunk in pack_bytes.chunks(chunk_size.max(1)) {
+            sideband.push(SideBandPacket {
+                channel: SideBandChannel::Data,
+                data: chunk.to_vec(),
+            });
+        }
+        // Trailing progress after the pack data forces drain_to_end to consume
+        // remaining frames after the pack trailer is complete.
+        sideband.push(SideBandPacket {
+            channel: SideBandChannel::Progress,
+            data: b"done\n".to_vec(),
+        });
+        let sections = vec![ProtocolV2FetchResponseSection::Packfile(
+            sideband
+                .iter()
+                .map(|packet| encode_sideband_packet(packet).expect("sideband should encode"))
+                .collect(),
+        )];
+        let mut encoded = Vec::new();
+        write_protocol_v2_fetch_response(&mut encoded, &sections)
+            .expect("response should encode");
+        encoded
+    }
+
+    #[test]
+    fn protocol_v2_chunked_sideband_stream_installs_pack_without_buffering_response() {
+        let root = test_temp_root("sley-fetch-v2-chunked-stream-install");
+        let format = ObjectFormat::Sha1;
+        let object = EncodedObject::new(ObjectType::Blob, b"v2 chunked stream pack\n".to_vec());
+        let oid = object
+            .object_id(format)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format)
+            .expect("test operation should succeed");
+        // Chunk the pack across many sideband frames so install cannot rely on a
+        // single demuxed buffer.
+        let encoded = encode_chunked_v2_packfile(&pack.pack, 32);
+        let destination = FileObjectDatabase::new(root.join("objects"), format);
+        let mut reader = encoded.as_slice();
+
+        let (header, result) = install_protocol_v2_fetch_response_from_reader(
+            format,
+            &mut reader,
+            false,
+            &destination,
+            None,
+        )
+        .expect("test operation should succeed");
+        let result = result.expect("packfile should be installed");
+
+        assert!(header.has_packfile);
+        assert_eq!(result.object_ids, vec![oid]);
+        assert_pack_install(&root.join("objects"), &destination, &oid, &object);
+        // Full response consumed (trailing progress + flush drained).
+        assert!(reader.is_empty(), "stream should be fully drained");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn protocol_v2_sideband_cancel_mid_stream() {
+        let root = test_temp_root("sley-fetch-v2-sideband-cancel");
+        let format = ObjectFormat::Sha1;
+        let objects: Vec<EncodedObject> = (0..12)
+            .map(|i| {
+                EncodedObject::new(
+                    ObjectType::Blob,
+                    format!("v2 cancel fixture {i}\n").into_bytes(),
+                )
+            })
+            .collect();
+        let pack = PackFile::write_undeltified(&objects, format).expect("pack should encode");
+        let encoded = encode_chunked_v2_packfile(&pack.pack, 48);
+        let destination = FileObjectDatabase::new(root.join("objects"), format);
+
+        let source = AtomicCancel::new();
+        let mut reader = encoded.as_slice();
+        // Trip cancel from pack-indexer progress after the first object so the
+        // public with_cancel path observes mid-stream cooperative cancel.
+        struct CancelOnProgressInstaller<'a> {
+            inner: &'a FileObjectDatabase,
+            source: &'a AtomicCancel,
+            saw_object: std::cell::Cell<bool>,
+        }
+
+        impl RawPackInstaller for CancelOnProgressInstaller<'_> {
+            fn install_raw_pack_from_reader_with_options<R>(
+                &self,
+                reader: &mut R,
+                options: RawPackInstallOptions,
+            ) -> Result<RawPackInstallResult>
+            where
+                R: Read,
+            {
+                // Route through the trait impl so PackInstallResult is mapped to
+                // RawPackInstallResult (FileObjectDatabase inherent methods differ).
+                RawPackInstaller::install_raw_pack_from_reader_with_options(
+                    self.inner, reader, options,
+                )
+            }
+
+            fn install_raw_pack_from_reader_with_progress_and_cancel<R, F, C>(
+                &self,
+                reader: &mut R,
+                options: RawPackInstallOptions,
+                cancel: &CancelFlag<C>,
+                mut progress: F,
+            ) -> Result<RawPackInstallResult>
+            where
+                R: Read,
+                F: FnMut(sley_odb::PackStreamProgress),
+                C: Cancel,
+            {
+                RawPackInstaller::install_raw_pack_from_reader_with_progress_and_cancel(
+                    self.inner,
+                    reader,
+                    options,
+                    cancel,
+                    |p| {
+                        if p.received_objects >= 1 {
+                            self.saw_object.set(true);
+                            self.source.cancel();
+                        }
+                        progress(p);
+                    },
+                )
+            }
+        }
+
+        let installer = CancelOnProgressInstaller {
+            inner: &destination,
+            source: &source,
+            saw_object: std::cell::Cell::new(false),
+        };
+        let err = install_protocol_v2_fetch_response_from_reader_with_cancel(
+            format,
+            &mut reader,
+            false,
+            &installer,
+            None,
+            &CancelFlag::new(&source),
+        )
+        .expect_err("mid-stream cancel should fail");
+
+        assert!(
+            installer.saw_object.get(),
+            "progress should report at least one object before cancel"
+        );
+        assert_eq!(err, GitError::Cancelled);
+        let pack_dir = root.join("objects").join("pack");
+        let installed = fs::read_dir(&pack_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| {
+                        entry.path().extension().and_then(|ext| ext.to_str()) == Some("pack")
+                    })
+                    .count()
+            })
+            .unwrap_or_default();
+        assert_eq!(installed, 0, "cancelled install must not leave pack files");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn protocol_v2_sideband_fatal_maps_to_invalid_format() {
+        let root = test_temp_root("sley-fetch-v2-sideband-fatal");
+        let format = ObjectFormat::Sha1;
+        let sections = vec![ProtocolV2FetchResponseSection::Packfile(vec![
+            encode_sideband_packet(&SideBandPacket {
+                channel: SideBandChannel::Fatal,
+                data: b"server error\n".to_vec(),
+            })
+            .expect("test operation should succeed"),
+        ])];
+        let mut encoded = Vec::new();
+        write_protocol_v2_fetch_response(&mut encoded, &sections)
+            .expect("test operation should succeed");
+        let destination = FileObjectDatabase::new(root.join("objects"), format);
+        let mut reader = encoded.as_slice();
+
+        let err = install_protocol_v2_fetch_response_from_reader(
+            format,
+            &mut reader,
+            false,
+            &destination,
+            None,
+        )
+        .expect_err("sideband fatal should fail");
+
+        match err {
+            GitError::InvalidFormat(message) => {
+                assert!(
+                    message.contains("sideband fatal"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn raw_upload_pack_response_cancel_before_install() {
+        let root = test_temp_root("sley-fetch-raw-cancel");
+        let format = ObjectFormat::Sha1;
+        let object = EncodedObject::new(ObjectType::Blob, b"raw cancel fixture\n".to_vec());
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format)
+            .expect("test operation should succeed");
+        let response = UploadPackRawPackfileResponse {
+            acknowledgments: Vec::new(),
+            packfile: pack.pack,
+        };
+        let encoded =
+            encode_upload_pack_raw_packfile_response(&response).expect("response should encode");
+        let destination = FileObjectDatabase::new(root.join("objects"), format);
+        let mut reader = encoded.as_slice();
+        let source = AtomicCancel::new();
+        source.cancel();
+
+        let err = install_upload_pack_raw_response_from_reader_with_cancel(
+            format,
+            &mut reader,
+            &destination,
+            None,
+            &CancelFlag::new(&source),
+        )
+        .expect_err("pre-canceled install should fail");
+
+        assert_eq!(err, GitError::Cancelled);
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn test_temp_root(prefix: &str) -> std::path::PathBuf {

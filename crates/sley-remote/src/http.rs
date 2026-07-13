@@ -16,17 +16,18 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::install::{
-    ProgressInstaller, install_protocol_v2_fetch_promisor_response_from_reader,
-    install_protocol_v2_fetch_response_from_reader,
-    install_upload_pack_packfile_promisor_response_from_reader,
-    install_upload_pack_packfile_response_from_reader,
-    install_upload_pack_shallow_packfile_promisor_response_from_reader,
-    install_upload_pack_shallow_packfile_response_from_reader,
+    ProgressInstaller, install_protocol_v2_fetch_promisor_response_from_reader_with_cancel,
+    install_protocol_v2_fetch_response_from_reader_with_cancel,
+    install_upload_pack_packfile_promisor_response_from_reader_with_cancel,
+    install_upload_pack_packfile_response_from_reader_with_cancel,
+    install_upload_pack_shallow_packfile_promisor_response_from_reader_with_cancel,
+    install_upload_pack_shallow_packfile_response_from_reader_with_cancel,
     shallow_info_from_protocol_v2_fetch_header,
 };
 use sley_config::GitConfig;
 use sley_core::{
-    Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
+    Cancel, CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result,
+    UPSTREAM_GIT_COMPAT_VERSION,
 };
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
@@ -828,6 +829,7 @@ pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
     request: HttpFetchPackRequest<'_, C>,
     credentials: &mut dyn CredentialProvider,
     progress: &mut dyn ProgressSink,
+    cancel: &CancelFlag<impl Cancel>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if request.wants.is_empty() {
         return Ok(Vec::new());
@@ -867,18 +869,20 @@ pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
             request.post_buffer,
         )?;
         if request.promisor {
-            install_upload_pack_packfile_promisor_response_from_reader(
+            install_upload_pack_packfile_promisor_response_from_reader_with_cancel(
                 request.format,
                 &mut response.body,
                 &local_db,
                 request.max_input_size,
+                cancel,
             )?;
         } else {
-            install_upload_pack_packfile_response_from_reader(
+            install_upload_pack_packfile_response_from_reader_with_cancel(
                 request.format,
                 &mut response.body,
                 &ProgressInstaller::new(&local_db, progress),
                 request.max_input_size,
+                cancel,
             )?;
         }
         return Ok(Vec::new());
@@ -894,20 +898,24 @@ pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
         request.post_buffer,
     )?;
     let shallow_info = if request.promisor {
-        let (shallow_info, _) = install_upload_pack_shallow_packfile_promisor_response_from_reader(
-            request.format,
-            &mut response.body,
-            &local_db,
-            request.max_input_size,
-        )?;
+        let (shallow_info, _) =
+            install_upload_pack_shallow_packfile_promisor_response_from_reader_with_cancel(
+                request.format,
+                &mut response.body,
+                &local_db,
+                request.max_input_size,
+                cancel,
+            )?;
         shallow_info
     } else {
-        let (shallow_info, _) = install_upload_pack_shallow_packfile_response_from_reader(
-            request.format,
-            &mut response.body,
-            &ProgressInstaller::new(&local_db, progress),
-            request.max_input_size,
-        )?;
+        let (shallow_info, _) =
+            install_upload_pack_shallow_packfile_response_from_reader_with_cancel(
+                request.format,
+                &mut response.body,
+                &ProgressInstaller::new(&local_db, progress),
+                request.max_input_size,
+                cancel,
+            )?;
         shallow_info
     };
     Ok(shallow_info)
@@ -918,6 +926,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
     handshake: &TransportHandshake,
     credentials: &mut dyn CredentialProvider,
     progress: &mut dyn ProgressSink,
+    cancel: &CancelFlag<impl Cancel>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if request.wants.is_empty() {
         return Ok(Vec::new());
@@ -1001,20 +1010,22 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
         }
 
         let (header, _install) = if request.promisor {
-            install_protocol_v2_fetch_promisor_response_from_reader(
+            install_protocol_v2_fetch_promisor_response_from_reader_with_cancel(
                 request.format,
                 &mut response.body,
                 sideband_all,
                 &local_db,
                 request.max_input_size,
+                cancel,
             )?
         } else {
-            install_protocol_v2_fetch_response_from_reader(
+            install_protocol_v2_fetch_response_from_reader_with_cancel(
                 request.format,
                 &mut response.body,
                 sideband_all,
                 &ProgressInstaller::new(&local_db, progress),
                 request.max_input_size,
+                cancel,
             )?
         };
         return Ok(shallow_info_from_protocol_v2_fetch_header(&header));

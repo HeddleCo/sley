@@ -515,12 +515,36 @@ impl PackFile {
         object_ids: &[ObjectId],
         format: ObjectFormat,
         options: &PackWriteOptions,
-        mut read_object: F,
+        read_object: F,
         writer: &mut W,
     ) -> Result<PackWriteSummary>
     where
         W: Write,
         F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
+    {
+        Self::write_undeltified_from_source_to_writer_with_cancel(
+            object_ids,
+            format,
+            options,
+            read_object,
+            writer,
+            &CancelFlag::never(),
+        )
+    }
+
+    /// Undeltified pack write that polls `cancel` between compression windows.
+    pub fn write_undeltified_from_source_to_writer_with_cancel<W, F, C>(
+        object_ids: &[ObjectId],
+        format: ObjectFormat,
+        options: &PackWriteOptions,
+        mut read_object: F,
+        writer: &mut W,
+        cancel: &CancelFlag<C>,
+    ) -> Result<PackWriteSummary>
+    where
+        W: Write,
+        F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
+        C: Cancel,
     {
         let mut seen = HashSet::with_capacity(object_ids.len());
         for oid in object_ids {
@@ -543,6 +567,7 @@ impl PackFile {
 
         let mut index_entries = Vec::with_capacity(object_ids.len());
         for oid_window in object_ids.chunks(PACK_STREAM_COMPRESSION_WINDOW_OBJECTS) {
+            cancel.check()?;
             let mut objects = Vec::with_capacity(oid_window.len());
             for oid in oid_window {
                 objects.push(read_object(oid)?);
@@ -587,12 +612,37 @@ impl PackFile {
         object_ids: &[ObjectId],
         format: ObjectFormat,
         options: &PackWriteOptions,
-        mut read_object: F,
+        read_object: F,
         writer: &mut W,
     ) -> Result<PackWriteSummary>
     where
         W: Write,
         F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
+    {
+        Self::write_packed_from_source_to_writer_with_cancel(
+            object_ids,
+            format,
+            options,
+            read_object,
+            writer,
+            &CancelFlag::never(),
+        )
+    }
+
+    /// Streaming deltified pack write that polls `cancel` between compression
+    /// windows. Returns [`GitError::Cancelled`] when the flag trips.
+    pub fn write_packed_from_source_to_writer_with_cancel<W, F, C>(
+        object_ids: &[ObjectId],
+        format: ObjectFormat,
+        options: &PackWriteOptions,
+        mut read_object: F,
+        writer: &mut W,
+        cancel: &CancelFlag<C>,
+    ) -> Result<PackWriteSummary>
+    where
+        W: Write,
+        F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
+        C: Cancel,
     {
         if object_ids.len() > u32::MAX as usize {
             return Err(GitError::InvalidFormat("too many pack objects".into()));
@@ -630,6 +680,7 @@ impl PackFile {
         let mut base_horizon: VecDeque<StreamingDeltaBase> = VecDeque::new();
 
         for oid_window in object_ids.chunks(PACK_STREAM_COMPRESSION_WINDOW_OBJECTS) {
+            cancel.check()?;
             let mut objects = Vec::with_capacity(oid_window.len());
             for oid in oid_window {
                 objects.push(read_object(oid)?);

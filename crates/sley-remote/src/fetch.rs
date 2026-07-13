@@ -26,7 +26,9 @@ use sley_config::GitConfig;
 use sley_config::remotes::{
     remote_config_values, remote_exists, remote_names, rewrite_url_with_config,
 };
-use sley_core::{GitError, ObjectFormat, ObjectId, Result, redact_url_for_display};
+use sley_core::{
+    DynCancelFlag, GitError, ObjectFormat, ObjectId, Result, redact_url_for_display,
+};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, collect_reachable_object_ids_excluding,
     collect_reachable_object_ids_tolerating_promised_missing,
@@ -287,6 +289,9 @@ pub struct FetchServices<'a> {
     /// supplies a runner so `--atomic` fetches honor a hook that aborts the
     /// transaction, matching git's `store_updated_refs`.
     pub ref_hook: Option<&'a dyn sley_refs::ReferenceTransactionHook>,
+    /// Cooperative cancel for mid-transfer pack install. Use
+    /// [`sley_core::CancelFlag::never_dyn`] when cancel is not wired.
+    pub cancel: DynCancelFlag<'a>,
 }
 
 /// Fetch from a resolved `source` into the repository at `git_dir`.
@@ -568,12 +573,14 @@ fn fetch_impl(
                     handshake,
                     services.credentials,
                     services.progress,
+                    &services.cancel,
                 )?
             } else {
                 crate::http::install_fetch_pack_via_http_upload_pack(
                     pack_request,
                     services.credentials,
                     services.progress,
+                    &services.cancel,
                 )?
             };
             reject_shallow_clone_fetch(&options, &shallow_info)?;
@@ -659,6 +666,7 @@ fn fetch_impl(
                     max_input_size,
                 },
                 services.progress,
+                &services.cancel,
             )?;
             reject_shallow_clone_fetch(&options, &shallow_info)?;
             finalize_fetch(
@@ -752,6 +760,7 @@ fn fetch_impl(
                     max_input_size,
                 },
                 services.progress,
+                &services.cancel,
             )?;
             reject_shallow_clone_fetch(&options, &shallow_info)?;
             finalize_fetch(
@@ -1062,6 +1071,7 @@ fn fetch_impl(
                         want_refs,
                         haves: negotiation_haves.clone(),
                     },
+                    &services.cancel,
                 )?;
                 for wanted in ref_in_want.wanted_refs {
                     for update in &mut updates {
@@ -3134,6 +3144,7 @@ mod tests {
                 credentials: &mut credentials,
                 progress: &mut progress,
                 ref_hook: None,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect("fetch should succeed");
@@ -3206,6 +3217,7 @@ mod tests {
                 credentials: &mut credentials,
                 progress: &mut progress,
                 ref_hook: None,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect_err("divergent update must fail");
@@ -3232,6 +3244,7 @@ mod tests {
                 credentials: &mut credentials,
                 progress: &mut progress,
                 ref_hook: None,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect("forced fetch should update");
@@ -3325,6 +3338,7 @@ mod tests {
                 credentials: &mut credentials,
                 progress: &mut progress,
                 ref_hook: None,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect("fetch should succeed");
@@ -3453,6 +3467,7 @@ mod tests {
                 credentials: &mut credentials,
                 progress: &mut progress,
                 ref_hook: None,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
             Some(&client),
         )
@@ -3541,6 +3556,7 @@ mod tests {
                 credentials: &mut credentials,
                 progress: &mut progress,
                 ref_hook: None,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         );
         assert!(
@@ -3590,6 +3606,7 @@ mod tests {
                 credentials: &mut credentials,
                 progress: &mut progress,
                 ref_hook: None,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect("shallow fetch should succeed");
@@ -3640,6 +3657,7 @@ mod tests {
                 credentials: &mut credentials,
                 progress: &mut progress,
                 ref_hook: None,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect("pending shallow boundary should make quarantine connected");
@@ -3687,6 +3705,7 @@ mod tests {
                 credentials: &mut credentials,
                 progress: &mut progress,
                 ref_hook: None,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect("create depth-one destination");
@@ -3774,6 +3793,7 @@ mod tests {
                 credentials: &mut credentials,
                 progress: &mut progress,
                 ref_hook: None,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect("full fetch should succeed");
@@ -3796,6 +3816,7 @@ mod tests {
                 credentials: &mut credentials,
                 progress: &mut progress,
                 ref_hook: None,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect("relative deepen from a complete repository should be a full no-op");
@@ -3848,6 +3869,7 @@ mod tests {
                 credentials: &mut credentials,
                 progress: &mut progress,
                 ref_hook: None,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect("initial shallow fetch should succeed");
@@ -3870,6 +3892,7 @@ mod tests {
                 credentials: &mut credentials,
                 progress: &mut progress,
                 ref_hook: None,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect("same-depth shallow fetch should succeed");
@@ -3956,6 +3979,7 @@ mod tests {
                 credentials: &mut credentials,
                 progress: &mut progress,
                 ref_hook: None,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect_err("fetch should fail before finalizing refs");

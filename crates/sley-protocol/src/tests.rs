@@ -1,6 +1,7 @@
 use super::*;
 use crate::receive_pack::zero_object_id;
 use sley_core::{Capability, ObjectFormat, ObjectId};
+use std::io::Read;
 
 #[test]
 fn pkt_line_frame_encodes_data_and_control_frames() {
@@ -1157,6 +1158,308 @@ fn sideband_packets_reject_bad_channels_and_oversize_payloads() {
         }])
         .is_err()
     );
+}
+
+#[test]
+fn streaming_sideband_reader_round_trips_data_and_progress() {
+    let packets = vec![
+        SideBandPacket {
+            channel: SideBandChannel::Data,
+            data: b"PACK".to_vec(),
+        },
+        SideBandPacket {
+            channel: SideBandChannel::Progress,
+            data: b"counting objects\n".to_vec(),
+        },
+        SideBandPacket {
+            channel: SideBandChannel::Data,
+            data: b" bytes".to_vec(),
+        },
+        SideBandPacket {
+            channel: SideBandChannel::Progress,
+            data: b"done\n".to_vec(),
+        },
+    ];
+    let mut encoded = Vec::new();
+    write_sideband_stream(&mut encoded, &packets).expect("test operation should succeed");
+    encoded.extend_from_slice(b"tail");
+
+    let mut progress = Vec::new();
+    let mut data = Vec::new();
+    let rest = {
+        let mut reader = StreamingSidebandReader::new(encoded.as_slice(), |chunk: &[u8]| {
+            progress.push(chunk.to_vec());
+        });
+        reader
+            .read_to_end(&mut data)
+            .expect("test operation should succeed");
+        assert!(reader.is_finished());
+        reader.into_inner()
+    };
+    assert_eq!(data, b"PACK bytes");
+    assert_eq!(
+        progress,
+        vec![b"counting objects\n".to_vec(), b"done\n".to_vec()]
+    );
+    assert_eq!(rest, b"tail");
+}
+
+#[test]
+fn streaming_sideband_reader_supports_partial_reads() {
+    let packets = vec![
+        SideBandPacket {
+            channel: SideBandChannel::Data,
+            data: b"ABCDEFGH".to_vec(),
+        },
+        SideBandPacket {
+            channel: SideBandChannel::Data,
+            data: b"IJKLMNOP".to_vec(),
+        },
+    ];
+    let mut encoded = Vec::new();
+    write_sideband_stream(&mut encoded, &packets).expect("test operation should succeed");
+
+    let mut reader = StreamingSidebandReader::new(encoded.as_slice(), |_: &[u8]| {});
+    let mut got = Vec::new();
+    let mut buf = [0u8; 3];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .expect("test operation should succeed");
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(got, b"ABCDEFGHIJKLMNOP");
+    assert!(reader.is_finished());
+}
+
+#[test]
+fn streaming_sideband_reader_surfaces_fatal_channel() {
+    let packets = vec![
+        SideBandPacket {
+            channel: SideBandChannel::Data,
+            data: b"PA".to_vec(),
+        },
+        SideBandPacket {
+            channel: SideBandChannel::Fatal,
+            data: b"remote died\n".to_vec(),
+        },
+    ];
+    let mut encoded = Vec::new();
+    write_sideband_stream(&mut encoded, &packets).expect("test operation should succeed");
+
+    let mut reader = StreamingSidebandReader::new(encoded.as_slice(), |_: &[u8]| {});
+    let mut data = Vec::new();
+    let err = reader
+        .read_to_end(&mut data)
+        .expect_err("fatal sideband should fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains("sideband fatal"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(data, b"PA");
+}
+
+#[test]
+fn streaming_sideband_reader_skips_upload_pack_ack_preamble() {
+    let response = UploadPackPackfileResponse {
+        acknowledgments: vec![
+            UploadPackAcknowledgment::Nak,
+            UploadPackAcknowledgment::Ack {
+                oid: ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .expect("test operation should succeed"),
+                status: Some(UploadPackAckStatus::Common),
+            },
+        ],
+        sideband: vec![
+            SideBandPacket {
+                channel: SideBandChannel::Progress,
+                data: b"remote: packing\n".to_vec(),
+            },
+            SideBandPacket {
+                channel: SideBandChannel::Data,
+                data: b"PACKDATA".to_vec(),
+            },
+        ],
+    };
+    let mut encoded = Vec::new();
+    write_upload_pack_packfile_response(&mut encoded, &response)
+        .expect("test operation should succeed");
+
+    let mut progress = Vec::new();
+    let mut data = Vec::new();
+    {
+        let mut reader = StreamingSidebandReader::new(encoded.as_slice(), |chunk: &[u8]| {
+            progress.push(chunk.to_vec());
+        })
+        .skip_upload_pack_acks();
+        reader
+            .read_to_end(&mut data)
+            .expect("test operation should succeed");
+    }
+    assert_eq!(data, b"PACKDATA");
+    assert_eq!(progress, vec![b"remote: packing\n".to_vec()]);
+}
+
+#[test]
+fn streaming_sideband_reader_cancel_mid_stream_with_cancellable_read() {
+    use sley_core::{AtomicCancel, CancelFlag, CancellableRead, map_cancel_io};
+    use std::io::ErrorKind;
+
+    let mut packets = Vec::new();
+    for i in 0..32u8 {
+        packets.push(SideBandPacket {
+            channel: SideBandChannel::Data,
+            data: vec![i; 64],
+        });
+    }
+    let mut encoded = Vec::new();
+    write_sideband_stream(&mut encoded, &packets).expect("test operation should succeed");
+
+    let source = AtomicCancel::new();
+    let demux = StreamingSidebandReader::new(encoded.as_slice(), |_: &[u8]| {});
+    let mut reader = CancellableRead::new(demux, CancelFlag::new(&source));
+
+    let mut buf = [0u8; 16];
+    let first = reader
+        .read(&mut buf)
+        .expect("first read should succeed before cancel");
+    assert!(first > 0);
+    source.cancel();
+    let err = reader
+        .read(&mut buf)
+        .expect_err("cancelled read should fail");
+    assert_eq!(err.kind(), ErrorKind::Interrupted);
+    assert_eq!(map_cancel_io(err), sley_core::GitError::Cancelled);
+}
+
+/// Streaming demux must yield the same channel-1 bytes as the buffered
+/// parse→demux path used before cancel work — including interleaved progress
+/// frames and trailing progress after the last data frame (the pack-install
+/// early-stop case).
+#[test]
+fn streaming_sideband_matches_buffered_upload_pack_demux() {
+    let response = UploadPackPackfileResponse {
+        acknowledgments: vec![
+            UploadPackAcknowledgment::Nak,
+            UploadPackAcknowledgment::Ack {
+                oid: ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .expect("test oid"),
+                status: Some(UploadPackAckStatus::Common),
+            },
+        ],
+        sideband: vec![
+            SideBandPacket {
+                channel: SideBandChannel::Progress,
+                data: b"remote: counting\n".to_vec(),
+            },
+            SideBandPacket {
+                channel: SideBandChannel::Data,
+                data: b"PACK".to_vec(),
+            },
+            SideBandPacket {
+                channel: SideBandChannel::Data,
+                data: b"-BODY".to_vec(),
+            },
+            SideBandPacket {
+                channel: SideBandChannel::Progress,
+                data: b"remote: done\n".to_vec(),
+            },
+            SideBandPacket {
+                channel: SideBandChannel::Data,
+                data: b"-TAIL".to_vec(),
+            },
+            SideBandPacket {
+                channel: SideBandChannel::Progress,
+                data: b"remote: trailing after pack\n".to_vec(),
+            },
+        ],
+    };
+    let mut encoded = Vec::new();
+    write_upload_pack_packfile_response(&mut encoded, &response)
+        .expect("encode upload-pack response");
+
+    let buffered = demux_upload_pack_packfile_response(&response).expect("buffered demux");
+
+    // Full streaming pass must match buffered channel-1 bytes exactly.
+    let mut full = Vec::new();
+    let mut full_progress = Vec::new();
+    {
+        let mut reader = StreamingSidebandReader::new(encoded.as_slice(), |chunk: &[u8]| {
+            full_progress.push(chunk.to_vec());
+        })
+        .skip_upload_pack_acks();
+        reader
+            .read_to_end(&mut full)
+            .expect("full streaming demux");
+        assert!(reader.is_finished());
+    }
+    assert_eq!(full, buffered.data);
+    assert_eq!(full, b"PACK-BODY-TAIL");
+    assert_eq!(
+        full_progress,
+        vec![
+            b"remote: counting\n".to_vec(),
+            b"remote: done\n".to_vec(),
+            b"remote: trailing after pack\n".to_vec(),
+        ]
+    );
+
+    // Simulate pack install early-stop: read a prefix, then drain. Drain must
+    // leave the transport positioned after the sideband flush (parity with the
+    // old buffer-all path that always consumed the full response).
+    {
+        let mut reader = StreamingSidebandReader::new(encoded.as_slice(), |_: &[u8]| {})
+            .skip_upload_pack_acks();
+        let mut partial = [0u8; 6];
+        let n = reader.read(&mut partial).expect("partial read");
+        assert_eq!(&partial[..n], &b"PACK-B"[..n]);
+        reader.drain_to_end().expect("drain remaining sideband");
+        assert!(reader.is_finished());
+        assert_eq!(reader.read(&mut partial).expect("post-drain EOF"), 0);
+    }
+}
+
+#[test]
+fn streaming_sideband_drain_to_end_consumes_trailing_progress_and_flush() {
+    let packets = vec![
+        SideBandPacket {
+            channel: SideBandChannel::Data,
+            data: b"PACK".to_vec(),
+        },
+        SideBandPacket {
+            channel: SideBandChannel::Progress,
+            data: b"remote: trailing\n".to_vec(),
+        },
+    ];
+    let mut encoded = Vec::new();
+    write_sideband_stream(&mut encoded, &packets).expect("encode");
+    encoded.extend_from_slice(b"AFTER");
+
+    let mut progress = Vec::new();
+    let rest = {
+        let mut reader = StreamingSidebandReader::new(encoded.as_slice(), |chunk: &[u8]| {
+            progress.push(chunk.to_vec());
+        });
+        let mut buf = [0u8; 4];
+        assert_eq!(reader.read(&mut buf).expect("read pack"), 4);
+        assert_eq!(&buf, b"PACK");
+        // Pack install would stop here; drain must consume progress + flush.
+        reader.drain_to_end().expect("drain");
+        assert!(reader.is_finished());
+        reader.into_inner()
+    };
+    assert_eq!(progress, vec![b"remote: trailing\n".to_vec()]);
+    assert_eq!(rest, b"AFTER");
 }
 
 #[test]

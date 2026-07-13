@@ -1225,6 +1225,7 @@ fn rev_parse_error_message(err: &GitError) -> String {
         | GitError::Transaction(msg)
         | GitError::Cli(_, msg) => msg.clone(),
         GitError::Exit(code) => format!("exit {code}"),
+        GitError::Cancelled => "operation cancelled".to_string(),
     }
 }
 

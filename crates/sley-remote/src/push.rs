@@ -25,7 +25,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::proc_receive::ProcReceiveReport;
 use sley_config::GitConfig;
-use sley_core::{GitError, ObjectFormat, ObjectId, Result, redact_url_for_display};
+use sley_core::{
+    DynCancelFlag, GitError, ObjectFormat, ObjectId, Result, redact_url_for_display,
+};
 use sley_object::ObjectType;
 use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, build_and_install_reachable_pack,
@@ -47,8 +49,8 @@ use sley_protocol::{
 
 use crate::pack::push_pack_roots;
 #[cfg(feature = "http")]
-use crate::pack::write_receive_pack_body;
-use crate::pack::{PushPackRequest, write_push_packfile};
+use crate::pack::write_receive_pack_body_with_cancel;
+use crate::pack::{PushPackRequest, write_push_packfile_with_cancel};
 use crate::proc_receive::{
     ReceivePackCommandState, parse_proc_receive_refs, proc_receive_ref_matches,
 };
@@ -423,6 +425,9 @@ pub struct PushServices<'a> {
     pub credentials: &'a mut dyn CredentialProvider,
     /// Progress sink reserved for future push progress.
     pub progress: &'a mut dyn ProgressSink,
+    /// Cooperative cancel for mid-build pack generation. Use
+    /// [`sley_core::CancelFlag::never_dyn`] when cancel is not wired.
+    pub cancel: DynCancelFlag<'a>,
 }
 
 /// A push after ref negotiation and command planning, but before any ref update
@@ -751,6 +756,7 @@ pub fn execute_push_plan(
         } => execute_push_http(
             request,
             services.credentials,
+            &services.cancel,
             http_batch,
             plan.commands,
             remote_url,
@@ -758,8 +764,12 @@ pub fn execute_push_plan(
             advertisements,
             pack_objects,
         ),
-        PushExecution::Ssh(plan) => crate::ssh::execute_push_ssh_plan(request, plan),
-        PushExecution::Git(plan) => crate::git::execute_push_git_plan(request, plan),
+        PushExecution::Ssh(plan) => {
+            crate::ssh::execute_push_ssh_plan(request, plan, &services.cancel)
+        }
+        PushExecution::Git(plan) => {
+            crate::git::execute_push_git_plan(request, plan, &services.cancel)
+        }
         PushExecution::Local {
             remote_git_dir,
             remote_common_git_dir,
@@ -768,6 +778,7 @@ pub fn execute_push_plan(
             pack_objects,
         } => execute_push_local(
             request,
+            &services.cancel,
             plan.commands,
             remote_git_dir,
             remote_common_git_dir,
@@ -901,6 +912,7 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
 fn execute_push_http(
     request: PushRequest<'_>,
     credentials: &mut dyn CredentialProvider,
+    cancel: &DynCancelFlag<'_>,
     http_batch: crate::http::HttpOperationBatch,
     commands: Vec<ReceivePackCommand>,
     remote_url: RemoteUrl,
@@ -942,6 +954,7 @@ fn execute_push_http(
             &headers,
             &pack_request,
             post_buffer,
+            cancel,
         )
     })?;
     crate::http::http_check_status(&response, &url)?;
@@ -1019,14 +1032,16 @@ fn send_receive_pack_body(
     headers: &[(&str, &str)],
     pack_request: &PushPackRequest<'_>,
     post_buffer: usize,
+    cancel: &DynCancelFlag<'_>,
 ) -> Result<HttpResponse> {
+    let cancel = *cancel;
     std::thread::scope(|scope| {
         let (mut reader, writer) = std::io::pipe().map_err(|err| GitError::Io(err.to_string()))?;
         let generator = scope.spawn(move || -> Result<()> {
             // `writer` is dropped at the end of this closure, signalling EOF to
             // the reader even on the error path.
             let mut writer = writer;
-            write_receive_pack_body(pack_request, &mut writer)
+            write_receive_pack_body_with_cancel(pack_request, &mut writer, &cancel)
         });
 
         // Probe up to `post_buffer + 1` bytes to decide buffered vs chunked
@@ -1156,6 +1171,7 @@ fn plan_push_local(request: PushLocalRequest<'_>) -> Result<PushPlan> {
 
 fn execute_push_local(
     request: PushRequest<'_>,
+    cancel: &DynCancelFlag<'_>,
     commands: Vec<ReceivePackCommand>,
     remote_git_dir: PathBuf,
     remote_common_git_dir: PathBuf,
@@ -1187,6 +1203,7 @@ fn execute_push_local(
             quiet: request.options.quiet,
             remote_advertisements: &remote_refs,
             remote_stderr: None,
+            cancel: *cancel,
         })?
     } else {
         let receive_request = ReceivePackPushRequest {
@@ -1605,6 +1622,7 @@ pub fn push_local_with_report_and_objects(
                     quiet: request.quiet,
                     remote_advertisements: &remote_refs,
                     remote_stderr: request.remote_stderr,
+                    cancel: sley_core::CancelFlag::never_dyn(),
                 })?
             } else {
                 let receive_request = ReceivePackPushRequest {
@@ -2097,6 +2115,7 @@ struct LocalPushViaReceivePackRequest<'a> {
     quiet: bool,
     remote_advertisements: &'a [RefAdvertisement],
     remote_stderr: Option<&'a mut Vec<u8>>,
+    cancel: DynCancelFlag<'a>,
 }
 
 fn local_push_via_receive_pack_server(
@@ -2126,7 +2145,7 @@ fn local_push_via_receive_pack_server(
         pack_request.options.clone(),
     )?;
     let mut packfile = Vec::new();
-    write_push_packfile(&pack_request, &mut packfile)?;
+    write_push_packfile_with_cancel(&pack_request, &mut packfile, &request.cancel)?;
     let config = sley_config::read_repo_config(request.remote_git_dir, None).unwrap_or_default();
     let validation = sley_fsck::FsckPolicy::from_config(
         &config,
@@ -3144,9 +3163,10 @@ mod tests {
 
         // The canonical body the streaming and buffered paths must both deliver.
         let mut canonical = Vec::new();
-        write_receive_pack_body(&req, &mut canonical).expect("canonical body");
+        crate::pack::write_receive_pack_body(&req, &mut canonical).expect("canonical body");
         assert!(canonical.len() > 1, "body should be non-trivial");
 
+        let never = sley_core::CancelFlag::never_dyn();
         // A post_buffer larger than the body → buffered Content-Length send.
         let buffered_client = RecordingClient::default();
         send_receive_pack_body(
@@ -3156,6 +3176,7 @@ mod tests {
             &[],
             &req,
             usize::MAX,
+            &never,
         )
         .expect("buffered send");
         let (method, body) = buffered_client.take();
@@ -3173,6 +3194,7 @@ mod tests {
             &[],
             &req,
             8,
+            &never,
         )
         .expect("streamed send");
         let (method, body) = streamed_client.take();
@@ -3313,6 +3335,7 @@ mod tests {
             PushServices {
                 credentials: &mut credentials,
                 progress: &mut progress,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
     }
@@ -3353,6 +3376,7 @@ mod tests {
             PushServices {
                 credentials: &mut credentials,
                 progress: &mut progress,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect("push should succeed");
@@ -3765,6 +3789,7 @@ mod tests {
         let mut services = PushServices {
             credentials: &mut credentials,
             progress: &mut progress,
+            cancel: sley_core::CancelFlag::never_dyn(),
         };
         let plan = plan_push(request, &mut services).expect("push should plan");
 

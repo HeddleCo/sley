@@ -35,7 +35,7 @@
 use std::path::{Path, PathBuf};
 
 use sley_config::GitConfig;
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{DynCancelFlag, GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{InitOptions, RefStorageFormat, RepositoryBootstrap};
 use sley_object::{Commit, ObjectType, Tree};
 use sley_odb::{FileObjectDatabase, ObjectReader};
@@ -190,6 +190,9 @@ pub struct CloneServices<'a> {
     pub credentials: &'a mut dyn CredentialProvider,
     /// Progress sink for fetch progress/prune notices.
     pub progress: &'a mut dyn ProgressSink,
+    /// Cooperative cancel for mid-transfer pack install (passed into fetch).
+    /// Use [`sley_core::CancelFlag::never_dyn`] when cancel is not wired.
+    pub cancel: DynCancelFlag<'a>,
 }
 
 /// Clone the resolved `source` into a fresh repository at `destination`.
@@ -325,6 +328,7 @@ fn clone_impl(
         credentials: services.credentials,
         progress: services.progress,
         ref_hook: None,
+        cancel: services.cancel,
     };
     #[cfg(feature = "http")]
     let fetch_outcome =
@@ -433,6 +437,7 @@ fn clone_impl(
             &config,
             &fetch_outcome.accepted_promisor_remotes,
             services.credentials,
+            services.cancel,
             http_client,
         )?;
         #[cfg(not(feature = "http"))]
@@ -443,6 +448,7 @@ fn clone_impl(
             &config,
             &fetch_outcome.accepted_promisor_remotes,
             services.credentials,
+            services.cancel,
         )?;
     } else {
         let mut tx = store.transaction();
@@ -520,6 +526,7 @@ fn fetch_partial_clone_checkout_blobs(
     config: &GitConfig,
     accepted_promisors: &[sley_protocol::PromisorRemoteAdvertisement],
     credentials: &mut dyn CredentialProvider,
+    cancel: DynCancelFlag<'_>,
     #[cfg(feature = "http")] http_client: Option<&dyn HttpClient>,
 ) -> Result<()> {
     if request.options.filter.is_none() && !request.options.filter_auto {
@@ -580,6 +587,7 @@ fn fetch_partial_clone_checkout_blobs(
             commit_oid,
             remote,
             credentials,
+            cancel,
             http_client,
         ),
         // SSH/git:// partial clones are gated out by the CLI (the in-process
@@ -600,6 +608,7 @@ fn fetch_http_partial_clone_checkout_blobs(
     commit_oid: ObjectId,
     remote: &RemoteUrl,
     credentials: &mut dyn CredentialProvider,
+    cancel: DynCancelFlag<'_>,
     http_client: Option<&dyn HttpClient>,
 ) -> Result<()> {
     let local_db = FileObjectDatabase::from_git_dir(git_dir, request.format);
@@ -669,12 +678,14 @@ fn fetch_http_partial_clone_checkout_blobs(
             handshake,
             credentials,
             &mut progress,
+            &cancel,
         )?;
     } else {
         crate::http::install_fetch_pack_via_http_upload_pack(
             pack_request,
             credentials,
             &mut progress,
+            &cancel,
         )?;
     }
     Ok(())

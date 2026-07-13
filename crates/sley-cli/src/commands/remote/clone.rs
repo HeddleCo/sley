@@ -1234,6 +1234,8 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress_sink = StdoutProgress::default();
+    let interrupt = crate::interrupt_cancel::process_interrupt_cancel();
+    crate::interrupt_cancel::reset_process_interrupt_cancel(&interrupt);
     let outcome = sley_remote::clone(
         sley_remote::CloneRequest {
             destination: &checkout_destination,
@@ -1282,6 +1284,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
             },
             credentials: &mut credentials,
             progress: &mut progress_sink,
+            cancel: crate::interrupt_cancel::dyn_cancel_flag(&interrupt),
         },
     )?;
     let git_dir = outcome.git_dir;
@@ -2181,6 +2184,8 @@ fn clone_network_repository(
     let dest_pre_existed = options.destination.exists();
     let git_dir_override_pre_existed = options.git_dir_override.map(Path::exists);
     let clone_result = (|| -> Result<()> {
+        let interrupt = crate::interrupt_cancel::process_interrupt_cancel();
+        crate::interrupt_cancel::reset_process_interrupt_cancel(&interrupt);
         let outcome = sley_remote::clone(
             sley_remote::CloneRequest {
                 destination: options.destination,
@@ -2248,6 +2253,7 @@ fn clone_network_repository(
                 },
                 credentials: &mut credentials,
                 progress: &mut progress,
+                cancel: crate::interrupt_cancel::dyn_cancel_flag(&interrupt),
             },
         );
         let outcome = map_clone_missing_branch(outcome, branch_explicit, &checkout_branch, origin)?;

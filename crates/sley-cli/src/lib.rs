@@ -65,6 +65,7 @@ mod checkout_reset;
 mod cli_misc;
 mod command_synopsis;
 mod commands;
+mod interrupt_cancel;
 mod commit_identity;
 mod commit_message;
 mod diff_render;

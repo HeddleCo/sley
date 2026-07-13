@@ -3,7 +3,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use flate2::{Compress, Compression, FlushCompress, Status};
-use sley_core::{GitError, ObjectFormat, ObjectId, Result, StreamingDigest};
+use sley_core::{Cancel, CancelFlag, GitError, ObjectFormat, ObjectId, Result, StreamingDigest};
 use sley_formats::Bundle;
 use sley_object::{EncodedObject, ObjectType};
 use std::borrow::Borrow;
@@ -231,12 +231,131 @@ mod tests {
     use flate2::Compression;
     use flate2::read::ZlibDecoder;
     use flate2::write::ZlibEncoder;
+    use sley_core::AtomicCancel;
     use std::fs;
-    use std::io::Read;
-    use std::io::Write;
+    use std::io::{Cursor, Read, Write};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn multi_blob_pack(count: usize) -> Vec<u8> {
+        let objects = (0..count)
+            .map(|idx| {
+                EncodedObject::new(
+                    ObjectType::Blob,
+                    format!("stream cancel pack object {idx}\n").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        PackFile::write_undeltified(&objects, ObjectFormat::Sha1)
+            .expect("test operation should succeed")
+            .pack
+    }
+
+    #[test]
+    fn index_pack_stream_already_cancelled_returns_cancelled() {
+        let pack = multi_blob_pack(4);
+        let source = AtomicCancel::new();
+        source.cancel();
+        let mut reader = Cursor::new(pack.as_slice());
+        let err = PackIndex::write_v2_for_pack_reader_to_trailer_with_progress_and_cancel(
+            &mut reader,
+            ObjectFormat::Sha1,
+            &CancelFlag::new(&source),
+            |_| {},
+        )
+        .expect_err("pre-cancelled index should fail");
+        assert_eq!(err, GitError::Cancelled);
+    }
+
+    #[test]
+    fn index_pack_stream_cancel_mid_stream_returns_cancelled() {
+        let pack = multi_blob_pack(8);
+        let source = AtomicCancel::new();
+        let mut saw_object = false;
+        let mut reader = Cursor::new(pack.as_slice());
+        let err = PackIndex::write_v2_for_pack_reader_to_trailer_with_progress_and_cancel(
+            &mut reader,
+            ObjectFormat::Sha1,
+            &CancelFlag::new(&source),
+            |progress| {
+                if progress.received_objects >= 1 {
+                    saw_object = true;
+                    source.cancel();
+                }
+            },
+        )
+        .expect_err("mid-stream cancel should fail");
+        assert!(
+            saw_object,
+            "progress should have reported at least one object before cancel"
+        );
+        assert_eq!(err, GitError::Cancelled);
+    }
+
+    #[test]
+    fn index_pack_stream_with_progress_still_works_without_cancel() {
+        let pack = multi_blob_pack(3);
+        let mut samples = 0u32;
+        let mut reader = Cursor::new(pack.as_slice());
+        let build = PackIndex::write_v2_for_pack_reader_to_trailer_with_progress(
+            &mut reader,
+            ObjectFormat::Sha1,
+            |_| {
+                samples += 1;
+            },
+        )
+        .expect("uncancelled index should succeed");
+        assert_eq!(build.entries.len(), 3);
+        assert!(samples >= 2, "header + completion progress expected");
+    }
+
+    #[test]
+    fn write_packed_from_source_respects_cancel_between_windows() {
+        let format = ObjectFormat::Sha1;
+        // Two compression windows so cancel between windows is observable.
+        let count = PACK_STREAM_COMPRESSION_WINDOW_OBJECTS + 4;
+        let objects = (0..count)
+            .map(|idx| {
+                EncodedObject::new(
+                    ObjectType::Blob,
+                    format!("write-cancel object {idx}\n").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let object_ids = objects
+            .iter()
+            .map(|object| object.object_id(format).expect("oid"))
+            .collect::<Vec<_>>();
+        let object_map = object_ids
+            .iter()
+            .copied()
+            .zip(objects.into_iter().map(Arc::new))
+            .collect::<HashMap<_, _>>();
+
+        let source = AtomicCancel::new();
+        source.cancel();
+        let mut written = Vec::new();
+        let err = PackFile::write_packed_from_source_to_writer_with_cancel(
+            &object_ids,
+            format,
+            &PackWriteOptions::new().with_reorder(false),
+            |oid| {
+                object_map
+                    .get(oid)
+                    .cloned()
+                    .ok_or_else(|| GitError::not_found(format!("missing test object {oid}")))
+            },
+            &mut written,
+            &CancelFlag::new(&source),
+        )
+        .expect_err("pre-cancelled pack write should fail");
+        assert_eq!(err, GitError::Cancelled);
+        assert!(
+            written.is_empty() || written.len() < 32,
+            "should not have finished a full pack after cancel"
+        );
+    }
 
     fn delta_pack_options(prefer_ofs_delta: bool) -> PackWriteOptions {
         PackWriteOptions::new()

@@ -11,15 +11,17 @@ use std::path::Path;
 use sley_config::GitConfig;
 
 use crate::install::{
-    ProgressInstaller, install_protocol_v2_fetch_promisor_response_from_reader,
-    install_protocol_v2_fetch_response_from_reader,
-    install_upload_pack_raw_promisor_response_from_reader,
-    install_upload_pack_raw_response_from_reader,
-    install_upload_pack_shallow_raw_promisor_response_from_reader,
-    install_upload_pack_shallow_raw_response_from_reader,
+    ProgressInstaller, install_protocol_v2_fetch_promisor_response_from_reader_with_cancel,
+    install_protocol_v2_fetch_response_from_reader_with_cancel,
+    install_upload_pack_raw_promisor_response_from_reader_with_cancel,
+    install_upload_pack_raw_response_from_reader_with_cancel,
+    install_upload_pack_shallow_raw_promisor_response_from_reader_with_cancel,
+    install_upload_pack_shallow_raw_response_from_reader_with_cancel,
     shallow_info_from_protocol_v2_fetch_header,
 };
-use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{
+    Cancel, CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result,
+};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
     GitService, ProtocolV2CommandOptions, ProtocolV2FetchRequest, ProtocolV2FetchShallowInfo,
@@ -249,6 +251,7 @@ pub fn discover_git_upload_pack_advertisements(
 pub fn install_fetch_pack_via_git_upload_pack(
     request: GitFetchPackRequest<'_>,
     progress: &mut dyn ProgressSink,
+    cancel: &CancelFlag<impl Cancel>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if request.wants.is_empty() {
         return Ok(Vec::new());
@@ -263,7 +266,7 @@ pub fn install_fetch_pack_via_git_upload_pack(
         .map(Ok)
         .unwrap_or_else(|| crate::local::local_have_oids(request.git_dir, request.format))?;
     if request.protocol_v2 {
-        return git_protocol_v2_fetch_into_repository(&request, haves, &local_db, progress);
+        return git_protocol_v2_fetch_into_repository(&request, haves, &local_db, progress, cancel);
     }
 
     let upload_request = UploadPackRequest {
@@ -285,37 +288,43 @@ pub fn install_fetch_pack_via_git_upload_pack(
     let _ = stream.shutdown(Shutdown::Write);
     if request.deepen.is_some() {
         let shallow_info = if request.promisor {
-            let (shallow_info, _) = install_upload_pack_shallow_raw_promisor_response_from_reader(
-                request.format,
-                &mut stream,
-                &local_db,
-                request.max_input_size,
-            )?;
+            let (shallow_info, _) =
+                install_upload_pack_shallow_raw_promisor_response_from_reader_with_cancel(
+                    request.format,
+                    &mut stream,
+                    &local_db,
+                    request.max_input_size,
+                    cancel,
+                )?;
             shallow_info
         } else {
-            let (shallow_info, _) = install_upload_pack_shallow_raw_response_from_reader(
-                request.format,
-                &mut stream,
-                &ProgressInstaller::new(&local_db, progress),
-                request.max_input_size,
-            )?;
+            let (shallow_info, _) =
+                install_upload_pack_shallow_raw_response_from_reader_with_cancel(
+                    request.format,
+                    &mut stream,
+                    &ProgressInstaller::new(&local_db, progress),
+                    request.max_input_size,
+                    cancel,
+                )?;
             shallow_info
         };
         return Ok(shallow_info);
     }
     if request.promisor {
-        install_upload_pack_raw_promisor_response_from_reader(
+        install_upload_pack_raw_promisor_response_from_reader_with_cancel(
             request.format,
             &mut stream,
             &local_db,
             request.max_input_size,
+            cancel,
         )?;
     } else {
-        install_upload_pack_raw_response_from_reader(
+        install_upload_pack_raw_response_from_reader_with_cancel(
             request.format,
             &mut stream,
             &ProgressInstaller::new(&local_db, progress),
             request.max_input_size,
+            cancel,
         )?;
     }
     Ok(Vec::new())
@@ -427,6 +436,7 @@ pub(crate) fn plan_push_git_commands(request: GitPushCommandsRequest<'_>) -> Res
 pub(crate) fn execute_push_git_plan(
     request: PushRequest<'_>,
     mut plan: GitPushPlan,
+    cancel: &sley_core::DynCancelFlag<'_>,
 ) -> Result<PushOutcome> {
     if plan.commands.is_empty() {
         return Ok(PushOutcome::default());
@@ -437,7 +447,7 @@ pub(crate) fn execute_push_git_plan(
         .ok_or_else(|| GitError::Command("git:// receive-pack stream was not available".into()))?;
     let commands = plan.commands.clone();
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
-    crate::pack::write_receive_pack_body(
+    crate::pack::write_receive_pack_body_with_cancel(
         &crate::pack::PushPackRequest {
             local_db: &local_db,
             format: request.format,
@@ -455,6 +465,7 @@ pub(crate) fn execute_push_git_plan(
             thin: request.options.thin.wants_thin(),
         },
         &mut stream,
+        cancel,
     )?;
     stream.flush()?;
     let _ = stream.shutdown(Shutdown::Write);
@@ -620,6 +631,7 @@ fn git_protocol_v2_fetch_into_repository(
     haves: Vec<ObjectId>,
     local_db: &FileObjectDatabase,
     progress: &mut dyn ProgressSink,
+    cancel: &CancelFlag<impl Cancel>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     let mut stream = connect_git_service(
         request.remote,
@@ -647,20 +659,22 @@ fn git_protocol_v2_fetch_into_repository(
     stream.flush()?;
     let _ = stream.shutdown(Shutdown::Write);
     let (header, _install) = if request.promisor {
-        install_protocol_v2_fetch_promisor_response_from_reader(
+        install_protocol_v2_fetch_promisor_response_from_reader_with_cancel(
             request.format,
             &mut stream,
             v2_features.sideband_all,
             local_db,
             request.max_input_size,
+            cancel,
         )?
     } else {
-        install_protocol_v2_fetch_response_from_reader(
+        install_protocol_v2_fetch_response_from_reader_with_cancel(
             request.format,
             &mut stream,
             v2_features.sideband_all,
             &ProgressInstaller::new(local_db, progress),
             request.max_input_size,
+            cancel,
         )?
     };
     Ok(shallow_info_from_protocol_v2_fetch_header(&header))

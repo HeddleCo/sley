@@ -108,8 +108,9 @@ pub mod plumbing {
 // so the common path (`use sley::{Repository, ObjectId, ...}`) stays short.
 pub use sley_config::GitConfig;
 pub use sley_core::{
-    BString, FullName, GitError, GitTime, MissingObjectContext, MissingObjectKind, NotFoundKind,
-    ObjectFormat, ObjectId, Result, Signature,
+    AtomicCancel, BString, Cancel, CancelFlag, CancellableRead, DynCancelFlag, FullName, GitError,
+    GitTime, MissingObjectContext, MissingObjectKind, Never, NotFoundKind, ObjectFormat, ObjectId,
+    Result, Signature, StreamControl,
 };
 pub use sley_diff_merge::format as diff_format;
 pub use sley_diff_merge::{DiffNameStatusOptions, NameStatusEntry};
@@ -129,7 +130,7 @@ pub use sley_sequencer::TagCreate;
 pub use sley_worktree::{
     AtomicMetadataWriteOptions, AtomicMetadataWriteResult, IndexStatProbe, IndexStatProbeCache,
     ShortStatusEntry, ShortStatusOptions, ShortStatusRow, StatusIgnoredMode, StatusUntrackedMode,
-    StreamControl, SubmoduleStatus, WorktreeEntryState, write_metadata_file_atomic,
+    SubmoduleStatus, WorktreeEntryState, write_metadata_file_atomic,
 };
 
 pub use capabilities::RepositoryCapabilities;

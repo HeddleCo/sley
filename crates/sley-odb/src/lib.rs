@@ -28,6 +28,9 @@ pub use reachability::*;
 pub use registry::*;
 pub use repack::*;
 pub use sley_pack::PackStreamProgress;
+// Cancel types re-exported so callers of cancel-aware install (remote, fetch)
+// can name them without depending on `sley-pack` or reaching into `sley-core`.
+pub use sley_core::{AtomicCancel, Cancel, CancelFlag, CancellableRead, Never};
 
 static TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -122,7 +125,7 @@ pub(crate) fn unique_temp_path(parent: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sley_core::BString;
+    use sley_core::{BString, GitError};
     use sley_formats::Bundle;
     use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntry};
     use sley_pack::{MultiPackIndex, PackBitmapIndex, PackFile, PackIndex, PackWriteOptions};
@@ -1395,6 +1398,51 @@ mod tests {
             .map(|entries| entries.count())
             .unwrap_or_default();
         assert_eq!(pack_entries, 0);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_database_cancels_raw_pack_install_and_cleans_temp() {
+        let root = temp_root("sley-file-odb-install-raw-pack-cancel");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let object = EncodedObject::new(ObjectType::Blob, b"cancelled raw pack install\n".to_vec());
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let pack_dir = git_dir.join("objects").join("pack");
+        let source = AtomicCancel::new();
+        source.cancel();
+        let cancel = CancelFlag::new(&source);
+        let mut reader = pack.pack.as_slice();
+
+        let err = db
+            .install_raw_pack_from_reader_with_progress_and_cancel(
+                &mut reader,
+                RawPackInstallOptions::default(),
+                &cancel,
+                |_| {},
+            )
+            .expect_err("pre-set cancel should abort install");
+
+        assert!(
+            matches!(err, GitError::Cancelled),
+            "expected Cancelled, got {err:?}"
+        );
+        // Early cancel.check() should avoid creating a temp file; even if a
+        // staging file was opened, error cleanup must leave pack/ empty of
+        // tmp_obj_* and durable pack/idx files.
+        if pack_dir.exists() {
+            let leftovers = fs::read_dir(&pack_dir)
+                .expect("pack dir should be readable")
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>();
+            assert!(
+                leftovers.is_empty(),
+                "no leftover pack staging files after cancel: {leftovers:?}"
+            );
+        }
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 

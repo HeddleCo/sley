@@ -41,17 +41,29 @@ pub use admin::{
 };
 pub use install::{
     install_protocol_v2_fetch_promisor_response_from_reader,
+    install_protocol_v2_fetch_promisor_response_from_reader_with_cancel,
     install_protocol_v2_fetch_response_from_reader,
+    install_protocol_v2_fetch_response_from_reader_with_cancel,
     install_upload_pack_packfile_promisor_response_from_reader,
+    install_upload_pack_packfile_promisor_response_from_reader_with_cancel,
     install_upload_pack_packfile_response_from_reader,
+    install_upload_pack_packfile_response_from_reader_with_cancel,
     install_upload_pack_raw_promisor_response_from_reader,
+    install_upload_pack_raw_promisor_response_from_reader_with_cancel,
     install_upload_pack_raw_response_from_reader,
+    install_upload_pack_raw_response_from_reader_with_cancel,
     install_upload_pack_shallow_packfile_promisor_response_from_reader,
+    install_upload_pack_shallow_packfile_promisor_response_from_reader_with_cancel,
     install_upload_pack_shallow_packfile_response_from_reader,
+    install_upload_pack_shallow_packfile_response_from_reader_with_cancel,
     install_upload_pack_shallow_raw_promisor_response_from_reader,
+    install_upload_pack_shallow_raw_promisor_response_from_reader_with_cancel,
     install_upload_pack_shallow_raw_response_from_reader,
+    install_upload_pack_shallow_raw_response_from_reader_with_cancel,
     shallow_info_from_protocol_v2_fetch_header,
 };
+// Cancel primitives for embedders driving fetch/clone pack install.
+pub use sley_core::{AtomicCancel, Cancel, CancelFlag, CancellableRead, DynCancelFlag, Never};
 
 mod credentials;
 pub use credentials::{
@@ -582,6 +594,7 @@ mod tests {
                 credentials,
                 progress: &mut progress,
                 ref_hook: None,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect("live fetch should succeed");
@@ -637,6 +650,7 @@ mod tests {
             PushServices {
                 credentials,
                 progress: &mut progress,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect("live push should succeed");
@@ -805,6 +819,7 @@ mod tests {
                 configure_branch: &mut configure_branch,
                 credentials: &mut clone_credentials,
                 progress: &mut progress,
+                cancel: sley_core::CancelFlag::never_dyn(),
             },
         )
         .expect("live shallow HTTPS clone should succeed");

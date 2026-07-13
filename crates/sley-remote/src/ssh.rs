@@ -28,13 +28,15 @@ use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as Proce
 use std::thread::JoinHandle;
 
 use crate::install::{
-    ProgressInstaller, install_upload_pack_raw_promisor_response_from_reader,
-    install_upload_pack_raw_response_from_reader,
-    install_upload_pack_shallow_raw_promisor_response_from_reader,
-    install_upload_pack_shallow_raw_response_from_reader,
+    ProgressInstaller, install_upload_pack_raw_promisor_response_from_reader_with_cancel,
+    install_upload_pack_raw_response_from_reader_with_cancel,
+    install_upload_pack_shallow_raw_promisor_response_from_reader_with_cancel,
+    install_upload_pack_shallow_raw_response_from_reader_with_cancel,
 };
 use sley_config::GitConfig;
-use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{
+    Cancel, CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result,
+};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::write_pkt_line_payload;
 use sley_protocol::{
@@ -735,6 +737,7 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
 pub(crate) fn execute_push_ssh_plan(
     request: PushRequest<'_>,
     mut plan: SshPushPlan,
+    cancel: &sley_core::DynCancelFlag<'_>,
 ) -> Result<PushOutcome> {
     if plan.commands.is_empty() {
         return Ok(PushOutcome::default());
@@ -745,7 +748,7 @@ pub(crate) fn execute_push_ssh_plan(
         .ok_or_else(|| GitError::Command("ssh receive-pack stdin was not available".into()))?;
     let commands = plan.commands.clone();
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
-    crate::pack::write_receive_pack_body(
+    crate::pack::write_receive_pack_body_with_cancel(
         &crate::pack::PushPackRequest {
             local_db: &local_db,
             format: request.format,
@@ -763,6 +766,7 @@ pub(crate) fn execute_push_ssh_plan(
             thin: request.options.thin.wants_thin(),
         },
         &mut stdin,
+        cancel,
     )?;
     drop(stdin);
 
@@ -928,6 +932,7 @@ pub struct SshFetchPackRequest<'a> {
 pub fn install_fetch_pack_via_ssh_upload_pack(
     request: SshFetchPackRequest<'_>,
     progress: &mut dyn ProgressSink,
+    cancel: &CancelFlag<impl Cancel>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if request.wants.is_empty() {
         return Ok(Vec::new());
@@ -971,36 +976,42 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
 
     let shallow_info = if request.deepen.is_some() {
         if request.promisor {
-            let (shallow_info, _) = install_upload_pack_shallow_raw_promisor_response_from_reader(
-                request.format,
-                &mut stdout,
-                &local_db,
-                request.max_input_size,
-            )?;
+            let (shallow_info, _) =
+                install_upload_pack_shallow_raw_promisor_response_from_reader_with_cancel(
+                    request.format,
+                    &mut stdout,
+                    &local_db,
+                    request.max_input_size,
+                    cancel,
+                )?;
             shallow_info
         } else {
-            let (shallow_info, _) = install_upload_pack_shallow_raw_response_from_reader(
-                request.format,
-                &mut stdout,
-                &ProgressInstaller::new(&local_db, progress),
-                request.max_input_size,
-            )?;
+            let (shallow_info, _) =
+                install_upload_pack_shallow_raw_response_from_reader_with_cancel(
+                    request.format,
+                    &mut stdout,
+                    &ProgressInstaller::new(&local_db, progress),
+                    request.max_input_size,
+                    cancel,
+                )?;
             shallow_info
         }
     } else {
         if request.promisor {
-            install_upload_pack_raw_promisor_response_from_reader(
+            install_upload_pack_raw_promisor_response_from_reader_with_cancel(
                 request.format,
                 &mut stdout,
                 &local_db,
                 request.max_input_size,
+                cancel,
             )?;
         } else {
-            install_upload_pack_raw_response_from_reader(
+            install_upload_pack_raw_response_from_reader_with_cancel(
                 request.format,
                 &mut stdout,
                 &ProgressInstaller::new(&local_db, progress),
                 request.max_input_size,
+                cancel,
             )?;
         }
         Vec::new()

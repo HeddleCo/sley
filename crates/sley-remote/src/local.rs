@@ -17,7 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_config::GitConfig;
 use sley_core::{
-    Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
+    Cancel, CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result,
+    UPSTREAM_GIT_COMPAT_VERSION,
 };
 use sley_object::{Commit, ObjectType, Tag};
 use sley_odb::{
@@ -51,7 +52,7 @@ use sley_refs::{
     DeleteRef, FileRefStore, Ref, RefDeletePrecondition, RefPrecondition, RefTarget, ReflogEntry,
 };
 
-use crate::install::install_protocol_v2_fetch_response_from_reader;
+use crate::install::install_protocol_v2_fetch_response_from_reader_with_cancel;
 
 /// The all-zero object id for `format`, used for the synthetic
 /// `capabilities^{}` advertisement when a repository has no refs.
@@ -1832,6 +1833,7 @@ pub(crate) struct LocalProtocolV2FetchOutcome {
 /// relying on the earlier `ls-refs` snapshot.
 pub(crate) fn install_fetch_pack_via_local_protocol_v2(
     input: LocalProtocolV2FetchRequest<'_>,
+    cancel: &CancelFlag<impl Cancel>,
 ) -> Result<LocalProtocolV2FetchOutcome> {
     if input.wants.is_empty() && input.want_refs.is_empty() {
         return Ok(LocalProtocolV2FetchOutcome::default());
@@ -1886,12 +1888,13 @@ pub(crate) fn install_fetch_pack_via_local_protocol_v2(
     let mut response_bytes = Vec::new();
     write_protocol_v2_fetch_response(&mut response_bytes, &sections)?;
 
-    let (header, _) = install_protocol_v2_fetch_response_from_reader(
+    let (header, _) = install_protocol_v2_fetch_response_from_reader_with_cancel(
         input.format,
         &mut response_bytes.as_slice(),
         false,
         &destination_db,
         None,
+        cancel,
     )?;
     let mut outcome = LocalProtocolV2FetchOutcome::default();
     for section in header.sections {
@@ -3015,15 +3018,18 @@ mod tests {
         )
         .expect("test repository main ref");
 
-        let outcome = install_fetch_pack_via_local_protocol_v2(LocalProtocolV2FetchRequest {
-            git_dir: &client_git,
-            destination_git_dir: &client_git,
-            remote_git_dir: &remote_git,
-            format,
-            wants: Vec::new(),
-            want_refs: vec!["refs/heads/main".into()],
-            haves: Some(Vec::new()),
-        })
+        let outcome = install_fetch_pack_via_local_protocol_v2(
+            LocalProtocolV2FetchRequest {
+                git_dir: &client_git,
+                destination_git_dir: &client_git,
+                remote_git_dir: &remote_git,
+                format,
+                wants: Vec::new(),
+                want_refs: vec!["refs/heads/main".into()],
+                haves: Some(Vec::new()),
+            },
+            &CancelFlag::never(),
+        )
         .expect("protocol-v2 want-ref fetch");
 
         assert_eq!(outcome.wanted_refs.len(), 1);

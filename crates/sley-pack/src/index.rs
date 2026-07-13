@@ -885,7 +885,35 @@ impl PackIndex {
         R: Read,
         F: FnMut(PackStreamProgress),
     {
-        index_pack_from_reader_to_trailer_with_progress(reader, format, progress)
+        Self::write_v2_for_pack_reader_to_trailer_with_progress_and_cancel(
+            reader,
+            format,
+            &CancelFlag::never(),
+            progress,
+        )
+    }
+
+    /// Like [`Self::write_v2_for_pack_reader_to_trailer_with_progress`], but
+    /// polls `cancel` cooperatively between pack objects (and after progress
+    /// emission). Returns [`GitError::Cancelled`] when the flag trips.
+    ///
+    /// Progress callbacks remain side-effect only; cancellation is checked
+    /// independently and does not require the callback to return
+    /// [`sley_core::StreamControl`].
+    pub fn write_v2_for_pack_reader_to_trailer_with_progress_and_cancel<R, F, C>(
+        reader: &mut R,
+        format: ObjectFormat,
+        cancel: &CancelFlag<C>,
+        progress: F,
+    ) -> Result<PackStreamIndexBuild>
+    where
+        R: Read,
+        F: FnMut(PackStreamProgress),
+        C: Cancel,
+    {
+        index_pack_from_reader_to_trailer_with_progress_and_cancel(
+            reader, format, cancel, progress,
+        )
     }
 
     pub fn write_v2_for_pack_reader_with_len<R>(

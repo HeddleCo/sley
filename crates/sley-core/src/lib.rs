@@ -8,6 +8,13 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::OnceLock;
 
+mod cancel;
+
+pub use cancel::{
+    AtomicCancel, Cancel, CancelFlag, CancellableRead, DynCancelFlag, Never, StreamControl,
+    cancelled_io_error, is_cancelled_error, map_cancel_io,
+};
+
 pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.55.0";
 
 static ORIGINAL_CWD: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -1727,6 +1734,12 @@ pub enum GitError {
     Cli(CliExit, String),
     /// Legacy explicit exit code; the message (if any) was already printed by the command.
     Exit(i32),
+    /// Cooperative cancellation of a streaming or long-running operation.
+    ///
+    /// Raised when a [`CancelFlag`] trips mid-stream (pack index/install, pack
+    /// write, fetch demux, emit loops). Distinct from I/O failure so embedders
+    /// and the CLI can treat user-stop as non-corruption.
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, GitError>;
@@ -1745,6 +1758,7 @@ impl fmt::Display for GitError {
             Self::Command(msg) => write!(f, "command failed: {msg}"),
             Self::Cli(_, msg) => f.write_str(msg),
             Self::Exit(code) => write!(f, "exit {code}"),
+            Self::Cancelled => f.write_str("operation cancelled"),
         }
     }
 }
@@ -1841,6 +1855,9 @@ pub fn cli_exit_code(err: &GitError) -> i32 {
         // During migration, usage-style validation still returns `Command`; treat as
         // general failure until those call sites adopt `GitError::usage`.
         GitError::Command(_) => 1,
+        // User/library stop of a long-running stream: non-zero but not a usage
+        // or corruption failure. Matches common CLI "interrupted" convention.
+        GitError::Cancelled => 130,
         _ => 1,
     }
 }
@@ -2529,6 +2546,7 @@ mod tests {
         );
         assert_eq!(GitError::Command("bad value".into()).cli_exit_code(), 1);
         assert_eq!(GitError::not_found("missing ref").cli_exit_code(), 1);
+        assert_eq!(GitError::Cancelled.cli_exit_code(), 130);
     }
 
     #[test]
