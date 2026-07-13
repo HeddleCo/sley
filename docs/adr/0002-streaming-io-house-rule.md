@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-07-13
 - **Related:** [ADR 0001](0001-cli-layer-engines.md) (CLI-layer engines), pack install /
-  protocol sideband paths in `sley-protocol`, `sley-fetch`, `sley-remote`,
+  protocol sideband paths in `sley-protocol`, `sley-remote`,
   `sley-core::cancel`
 
 ## Context
@@ -138,7 +138,7 @@ Distinguish:
 | Concern | Location (indicative) |
 |---|---|
 | Sideband `Read` demux + `drain_to_end` | `crates/sley-protocol/src/sideband.rs` |
-| Streaming pack install + cancel | `crates/sley-fetch`, `crates/sley-remote/src/install.rs` |
+| Streaming pack install + cancel | `crates/sley-remote/src/install.rs` |
 | Cancel primitives | `crates/sley-core/src/cancel.rs` |
 | Facade `*_with_cancel` | `crates/sley/src/remote.rs` |
 | Engine investment roadmap | [`docs/ROADMAP_ENGINES.md`](../ROADMAP_ENGINES.md) |
@@ -147,6 +147,6 @@ Distinguish:
 
 Accepted after stream-cancelling work: protocol-v2 packfile section install via
 `StreamingSidebandReader`, post-install `drain_to_end`, and cooperative cancel
-mid-sideband (see `sley-fetch` / `sley-protocol` tests for chunked sideband and
+mid-sideband (see `sley-remote` / `sley-protocol` tests for chunked sideband and
 cancel cases). This ADR freezes the policy so future engines (transport,
 unpack-trees streaming checkout, format substrate) inherit the same I/O shape.

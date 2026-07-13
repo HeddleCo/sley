@@ -243,7 +243,7 @@ impl<R: Read> Read for CancellableRead<'_, R> {
 /// `Interrupted` — see that type's docs.
 #[inline]
 pub fn cancelled_io_error() -> io::Error {
-    io::Error::new(io::ErrorKind::Other, OperationCancelled)
+    io::Error::other(OperationCancelled)
 }
 
 /// `true` when `err` is a cooperative cancel from [`CancellableRead`].

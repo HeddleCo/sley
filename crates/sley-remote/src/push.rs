@@ -1041,7 +1041,6 @@ fn send_receive_pack_body(
     post_buffer: usize,
     cancel: CancelFlag<'_>,
 ) -> Result<HttpResponse> {
-    let cancel = cancel;
     std::thread::scope(|scope| {
         let (mut reader, writer) = std::io::pipe().map_err(|err| GitError::Io(err.to_string()))?;
         let generator = scope.spawn(move || -> Result<()> {
