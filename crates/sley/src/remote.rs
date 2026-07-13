@@ -12,7 +12,7 @@
 //!   [`Repository::push_actions_with_cancel`] — cooperative cancel of pack work
 //!
 //! Cancel primitives ([`AtomicCancel`], [`CancelFlag`], [`CancellableRead`],
-//! [`DynCancelFlag`], [`Never`]) are re-exported from `sley_remote` / `sley_core`
+//! [`DynCancelFlag`], `Never`) are re-exported from `sley_remote` / `sley_core`
 //! and also at the crate root of `sley`.
 
 use std::path::Path;
@@ -145,7 +145,7 @@ impl Repository {
     /// [`Self::fetch`] with cooperative cancellation of pack receive/index.
     ///
     /// Pass `CancelFlag::new(&atomic)` (or any `DynCancelFlag`) so a UI stop or
-    /// SIGINT handler can trip [`GitError::Cancelled`] mid-transfer without
+    /// SIGINT handler can trip [`sley_core::GitError::Cancelled`] mid-transfer without
     /// corrupting the object database.
     pub fn fetch_with_cancel(
         &self,
