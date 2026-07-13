@@ -529,6 +529,7 @@ fn scheme_for_clone_source(source: &CloneSource) -> &'static str {
 /// checkout blobs, so unreachable filtered blobs stay absent). The trees are
 /// already present locally (a blob filter keeps trees), so the wanted blob ids
 /// are computed by walking the local copy of the commit's tree.
+#[allow(clippy::too_many_arguments)]
 fn fetch_partial_clone_checkout_blobs(
     request: &CloneRequest<'_>,
     git_dir: &Path,
@@ -613,6 +614,7 @@ fn fetch_partial_clone_checkout_blobs(
 /// the exact blob ids via `want <oid>`, which the server permits under
 /// `uploadpack.allowanysha1inwant`). Installed as a `.promisor` pack.
 #[cfg(feature = "http")]
+#[allow(clippy::too_many_arguments)]
 fn fetch_http_partial_clone_checkout_blobs(
     request: &CloneRequest<'_>,
     git_dir: &Path,

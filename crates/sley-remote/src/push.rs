@@ -1175,6 +1175,7 @@ fn plan_push_local(request: PushLocalRequest<'_>) -> Result<PushPlan> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_push_local(
     request: PushRequest<'_>,
     cancel: CancelFlag<'_>,
