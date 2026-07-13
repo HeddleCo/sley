@@ -1,9 +1,7 @@
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use flate2::{Decompress, FlushDecompress};
-use sley_core::{
-    Cancel, CancelFlag, GitError, MissingObjectContext, ObjectFormat, ObjectId, Result,
-};
+use sley_core::{CancelFlag, GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, tree_entry_object_type};
 use sley_pack::{
     MultiPackIndex, PackBitmapIndex, PackBitmapWriter, PackFile, PackIndex, PackIndexEntry,
@@ -419,25 +417,24 @@ where
         starts,
         excluded,
         writer,
-        &CancelFlag::never(),
+        CancelFlag::never(),
     )
 }
 
 /// Like [`write_reachable_pack_to_writer`], polling `cancel` on the streaming
 /// path and once before a buffered known-ids write.
-pub fn write_reachable_pack_to_writer_with_cancel<R, I, W, C>(
+pub fn write_reachable_pack_to_writer_with_cancel<R, I, W>(
     reader: &R,
     format: ObjectFormat,
     starts: I,
     excluded: &HashSet<ObjectId>,
     writer: &mut W,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<Option<ReachablePackWriteSummary>>
 where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
     W: Write,
-    C: Cancel,
 {
     match collect_reachable_pack_objects_for_write(reader, format, starts, excluded)? {
         ReachablePackObjectsForWrite::Buffered(objects) => {
@@ -459,10 +456,8 @@ where
                 return Ok(None);
             }
             let object_ids = metadata.iter().map(|meta| meta.oid).collect::<Vec<_>>();
-            write_object_id_pack_to_writer_with_cancel(
-                reader, format, &object_ids, writer, cancel,
-            )
-            .map(Some)
+            write_object_id_pack_to_writer_with_cancel(reader, format, &object_ids, writer, cancel)
+                .map(Some)
         }
     }
 }
@@ -482,23 +477,22 @@ where
         format,
         object_ids,
         writer,
-        &CancelFlag::never(),
+        CancelFlag::never(),
     )
 }
 
 /// Streaming object-id pack write that polls `cancel` between compression
 /// windows via [`PackFile::write_packed_from_source_to_writer_with_cancel`].
-pub fn write_object_id_pack_to_writer_with_cancel<R, W, C>(
+pub fn write_object_id_pack_to_writer_with_cancel<R, W>(
     reader: &R,
     format: ObjectFormat,
     object_ids: &[ObjectId],
     writer: &mut W,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<ReachablePackWriteSummary>
 where
     R: ObjectReader,
     W: Write,
-    C: Cancel,
 {
     let summary = PackFile::write_packed_from_source_to_writer_with_cancel(
         object_ids,

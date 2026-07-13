@@ -17,8 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_config::GitConfig;
 use sley_core::{
-    Cancel, CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result,
-    UPSTREAM_GIT_COMPAT_VERSION,
+    CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
 };
 use sley_object::{Commit, ObjectType, Tag};
 use sley_odb::{
@@ -1819,6 +1818,9 @@ pub(crate) struct LocalProtocolV2FetchRequest<'a> {
     pub wants: Vec<ObjectId>,
     pub want_refs: Vec<String>,
     pub haves: Option<Vec<ObjectId>>,
+    /// Maximum raw pack bytes (`fetch.maxInputSize` / `transfer.maxSize`).
+    /// `None` means unlimited.
+    pub max_input_size: Option<u64>,
 }
 
 /// Structured result of an in-process protocol-v2 `want-ref` fetch.
@@ -1833,7 +1835,7 @@ pub(crate) struct LocalProtocolV2FetchOutcome {
 /// relying on the earlier `ls-refs` snapshot.
 pub(crate) fn install_fetch_pack_via_local_protocol_v2(
     input: LocalProtocolV2FetchRequest<'_>,
-    cancel: &CancelFlag<impl Cancel>,
+    cancel: CancelFlag<'_>,
 ) -> Result<LocalProtocolV2FetchOutcome> {
     if input.wants.is_empty() && input.want_refs.is_empty() {
         return Ok(LocalProtocolV2FetchOutcome::default());
@@ -1893,7 +1895,7 @@ pub(crate) fn install_fetch_pack_via_local_protocol_v2(
         &mut response_bytes.as_slice(),
         false,
         &destination_db,
-        None,
+        input.max_input_size,
         cancel,
     )?;
     let mut outcome = LocalProtocolV2FetchOutcome::default();
@@ -3027,8 +3029,9 @@ mod tests {
                 wants: Vec::new(),
                 want_refs: vec!["refs/heads/main".into()],
                 haves: Some(Vec::new()),
+                max_input_size: None,
             },
-            &CancelFlag::never(),
+            CancelFlag::never(),
         )
         .expect("protocol-v2 want-ref fetch");
 

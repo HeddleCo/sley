@@ -19,9 +19,7 @@ use crate::install::{
     install_upload_pack_shallow_raw_response_from_reader_with_cancel,
     shallow_info_from_protocol_v2_fetch_header,
 };
-use sley_core::{
-    Cancel, CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result,
-};
+use sley_core::{CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
     GitService, ProtocolV2CommandOptions, ProtocolV2FetchRequest, ProtocolV2FetchShallowInfo,
@@ -251,7 +249,7 @@ pub fn discover_git_upload_pack_advertisements(
 pub fn install_fetch_pack_via_git_upload_pack(
     request: GitFetchPackRequest<'_>,
     progress: &mut dyn ProgressSink,
-    cancel: &CancelFlag<impl Cancel>,
+    cancel: CancelFlag<'_>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if request.wants.is_empty() {
         return Ok(Vec::new());
@@ -436,7 +434,7 @@ pub(crate) fn plan_push_git_commands(request: GitPushCommandsRequest<'_>) -> Res
 pub(crate) fn execute_push_git_plan(
     request: PushRequest<'_>,
     mut plan: GitPushPlan,
-    cancel: &sley_core::DynCancelFlag<'_>,
+    cancel: CancelFlag<'_>,
 ) -> Result<PushOutcome> {
     if plan.commands.is_empty() {
         return Ok(PushOutcome::default());
@@ -631,7 +629,7 @@ fn git_protocol_v2_fetch_into_repository(
     haves: Vec<ObjectId>,
     local_db: &FileObjectDatabase,
     progress: &mut dyn ProgressSink,
-    cancel: &CancelFlag<impl Cancel>,
+    cancel: CancelFlag<'_>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     let mut stream = connect_git_service(
         request.remote,

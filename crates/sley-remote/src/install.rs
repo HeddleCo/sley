@@ -2,7 +2,7 @@
 // the only retained `expect`s would be documented compile-time invariants.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use sley_core::{Cancel, CancelFlag, ObjectFormat, Result};
+use sley_core::{CancelFlag, ObjectFormat, Result};
 use sley_odb::{
     FileObjectDatabase, PackStreamProgress, RawPackInstallOptions, RawPackInstallResult,
     RawPackInstaller,
@@ -52,34 +52,34 @@ where
         self.install_raw_pack_from_reader_with_progress_and_cancel(
             reader,
             options,
-            &CancelFlag::never(),
+            CancelFlag::never(),
             |_| {},
         )
     }
 
-    fn install_raw_pack_from_reader_with_progress_and_cancel<R, F, C>(
+    fn install_raw_pack_from_reader_with_progress_and_cancel<R, F>(
         &self,
         reader: &mut R,
         options: RawPackInstallOptions,
-        cancel: &CancelFlag<C>,
+        cancel: CancelFlag<'_>,
         _progress: F,
     ) -> Result<RawPackInstallResult>
     where
         R: Read,
         F: FnMut(PackStreamProgress),
-        C: Cancel,
     {
         // External progress F is ignored: ProgressInstaller owns the ProgressSink.
-        self.inner.install_raw_pack_from_reader_with_progress_and_cancel(
-            reader,
-            options,
-            cancel,
-            |progress| {
-                self.sink
-                    .borrow_mut()
-                    .transfer(transfer_from_pack(progress));
-            },
-        )
+        self.inner
+            .install_raw_pack_from_reader_with_progress_and_cancel(
+                reader,
+                options,
+                cancel,
+                |progress| {
+                    self.sink
+                        .borrow_mut()
+                        .transfer(transfer_from_pack(progress));
+                },
+            )
     }
 }
 
@@ -125,7 +125,7 @@ where
         reader,
         destination,
         max_input_size,
-        &CancelFlag::never(),
+        CancelFlag::never(),
     )
 }
 
@@ -166,21 +166,20 @@ where
         reader,
         destination,
         max_input_size,
-        &CancelFlag::never(),
+        CancelFlag::never(),
     )
 }
 
 /// Promisor sideband pack install with cooperative cancellation.
-pub fn install_upload_pack_packfile_promisor_response_from_reader_with_cancel<R, C>(
+pub fn install_upload_pack_packfile_promisor_response_from_reader_with_cancel<R>(
     format: ObjectFormat,
     reader: &mut R,
     destination: &FileObjectDatabase,
     max_input_size: Option<u64>,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<RawPackInstallResult>
 where
     R: Read,
-    C: Cancel,
 {
     install_upload_pack_sideband_response_from_reader_with_cancel(
         format,
@@ -209,7 +208,7 @@ where
         destination,
         promisor,
         max_input_size,
-        &CancelFlag::never(),
+        CancelFlag::never(),
     )
 }
 
@@ -220,17 +219,16 @@ where
 /// cancel source (`AtomicCancel`, etc.) so mid-transfer stop is observed
 /// between pack objects and between network reads when the installer wraps the
 /// stream in [`CancellableRead`](sley_core::CancellableRead).
-pub fn install_upload_pack_packfile_response_from_reader_with_cancel<I, R, C>(
+pub fn install_upload_pack_packfile_response_from_reader_with_cancel<I, R>(
     format: ObjectFormat,
     reader: &mut R,
     destination: &I,
     max_input_size: Option<u64>,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<RawPackInstallResult>
 where
     I: RawPackInstaller,
     R: Read,
-    C: Cancel,
 {
     install_upload_pack_sideband_response_from_reader_with_cancel(
         format,
@@ -243,17 +241,16 @@ where
 }
 
 /// Raw (non-sideband) upload-pack pack install with cooperative cancellation.
-pub fn install_upload_pack_raw_response_from_reader_with_cancel<I, R, C>(
+pub fn install_upload_pack_raw_response_from_reader_with_cancel<I, R>(
     format: ObjectFormat,
     reader: &mut R,
     destination: &I,
     max_input_size: Option<u64>,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<RawPackInstallResult>
 where
     I: RawPackInstaller,
     R: Read,
-    C: Cancel,
 {
     let header = read_upload_pack_raw_packfile_response_header(format, reader)?;
     let mut pack_reader = Cursor::new(header.pack_prefix).chain(reader);
@@ -265,18 +262,17 @@ where
     )
 }
 
-fn install_upload_pack_sideband_response_from_reader_with_cancel<I, R, C>(
+fn install_upload_pack_sideband_response_from_reader_with_cancel<I, R>(
     _format: ObjectFormat,
     reader: &mut R,
     destination: &I,
     promisor: bool,
     max_input_size: Option<u64>,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<RawPackInstallResult>
 where
     I: RawPackInstaller,
     R: Read,
-    C: Cancel,
 {
     // Stream demux sideband channel-1 bytes as frames arrive so pack install
     // can cancel mid-transfer without buffering the full response. Leading
@@ -296,13 +292,15 @@ where
         cancel,
         |_| {},
     );
-    let drain = pack_reader
-        .drain_to_end()
-        .map_err(map_sideband_stream_io_error);
-    let result = match (result, drain) {
-        (Ok(result), Ok(())) => Ok(result),
-        (Ok(_), Err(drain_err)) => Err(drain_err),
-        (Err(install_err), _) => Err(map_sideband_install_error(install_err)),
+    // B2: never drain on error/cancel — that would download the rest of the pack.
+    let result = match result {
+        Ok(result) => {
+            pack_reader
+                .drain_to_end()
+                .map_err(map_sideband_stream_io_error)?;
+            Ok(result)
+        }
+        Err(install_err) => Err(map_sideband_install_error(install_err)),
     }?;
     Ok(if promisor {
         RawPackInstallResult {
@@ -316,6 +314,9 @@ where
 /// Map sideband `Read` failures back to the GitError variants the buffered
 /// demux path used, so fetch/clone diagnostics stay parity-stable.
 fn map_sideband_stream_io_error(err: std::io::Error) -> sley_core::GitError {
+    if sley_core::is_cancelled_io(&err) {
+        return sley_core::GitError::Cancelled;
+    }
     let message = err.to_string();
     if message.contains("sideband fatal:")
         || message.contains("sideband stream")
@@ -324,8 +325,6 @@ fn map_sideband_stream_io_error(err: std::io::Error) -> sley_core::GitError {
     {
         // demux_sideband_packets / parse_sideband used InvalidFormat for these.
         sley_core::GitError::InvalidFormat(message)
-    } else if err.kind() == std::io::ErrorKind::Interrupted && message.contains("cancelled") {
-        sley_core::GitError::Cancelled
     } else {
         sley_core::GitError::from(err)
     }
@@ -358,21 +357,20 @@ where
         reader,
         destination,
         max_input_size,
-        &CancelFlag::never(),
+        CancelFlag::never(),
     )
 }
 
 /// Raw promisor pack install with cooperative cancellation.
-pub fn install_upload_pack_raw_promisor_response_from_reader_with_cancel<R, C>(
+pub fn install_upload_pack_raw_promisor_response_from_reader_with_cancel<R>(
     format: ObjectFormat,
     reader: &mut R,
     destination: &FileObjectDatabase,
     max_input_size: Option<u64>,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<RawPackInstallResult>
 where
     R: Read,
-    C: Cancel,
 {
     let header = read_upload_pack_raw_packfile_response_header(format, reader)?;
     let mut pack_reader = Cursor::new(header.pack_prefix).chain(reader);
@@ -402,22 +400,21 @@ where
         reader,
         destination,
         max_input_size,
-        &CancelFlag::never(),
+        CancelFlag::never(),
     )
 }
 
 /// Shallow raw pack install with cooperative cancellation.
-pub fn install_upload_pack_shallow_raw_response_from_reader_with_cancel<I, R, C>(
+pub fn install_upload_pack_shallow_raw_response_from_reader_with_cancel<I, R>(
     format: ObjectFormat,
     reader: &mut R,
     destination: &I,
     max_input_size: Option<u64>,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
 where
     I: RawPackInstaller,
     R: Read,
-    C: Cancel,
 {
     let (shallow, header) =
         read_upload_pack_shallow_info_and_raw_packfile_response_header(format, reader)?;
@@ -447,22 +444,21 @@ where
         reader,
         destination,
         max_input_size,
-        &CancelFlag::never(),
+        CancelFlag::never(),
     )
 }
 
 /// Shallow sideband pack install with cooperative cancellation.
-pub fn install_upload_pack_shallow_packfile_response_from_reader_with_cancel<I, R, C>(
+pub fn install_upload_pack_shallow_packfile_response_from_reader_with_cancel<I, R>(
     format: ObjectFormat,
     reader: &mut R,
     destination: &I,
     max_input_size: Option<u64>,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
 where
     I: RawPackInstaller,
     R: Read,
-    C: Cancel,
 {
     install_upload_pack_shallow_sideband_response_from_reader_with_cancel(
         format,
@@ -474,18 +470,17 @@ where
     )
 }
 
-fn install_upload_pack_shallow_sideband_response_from_reader_with_cancel<I, R, C>(
+fn install_upload_pack_shallow_sideband_response_from_reader_with_cancel<I, R>(
     format: ObjectFormat,
     reader: &mut R,
     destination: &I,
     promisor: bool,
     max_input_size: Option<u64>,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
 where
     I: RawPackInstaller,
     R: Read,
-    C: Cancel,
 {
     let shallow = read_upload_pack_shallow_info_section(format, reader)?;
     let result = install_upload_pack_sideband_response_from_reader_with_cancel(
@@ -513,21 +508,20 @@ where
         reader,
         destination,
         max_input_size,
-        &CancelFlag::never(),
+        CancelFlag::never(),
     )
 }
 
 /// Shallow raw promisor pack install with cooperative cancellation.
-pub fn install_upload_pack_shallow_raw_promisor_response_from_reader_with_cancel<R, C>(
+pub fn install_upload_pack_shallow_raw_promisor_response_from_reader_with_cancel<R>(
     format: ObjectFormat,
     reader: &mut R,
     destination: &FileObjectDatabase,
     max_input_size: Option<u64>,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
 where
     R: Read,
-    C: Cancel,
 {
     let (shallow, header) =
         read_upload_pack_shallow_info_and_raw_packfile_response_header(format, reader)?;
@@ -560,21 +554,20 @@ where
         reader,
         destination,
         max_input_size,
-        &CancelFlag::never(),
+        CancelFlag::never(),
     )
 }
 
 /// Shallow promisor sideband pack install with cooperative cancellation.
-pub fn install_upload_pack_shallow_packfile_promisor_response_from_reader_with_cancel<R, C>(
+pub fn install_upload_pack_shallow_packfile_promisor_response_from_reader_with_cancel<R>(
     format: ObjectFormat,
     reader: &mut R,
     destination: &FileObjectDatabase,
     max_input_size: Option<u64>,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
 where
     R: Read,
-    C: Cancel,
 {
     install_upload_pack_shallow_sideband_response_from_reader_with_cancel(
         format,
@@ -603,7 +596,7 @@ where
         sideband_all,
         destination,
         max_input_size,
-        &CancelFlag::never(),
+        CancelFlag::never(),
     )
 }
 
@@ -613,18 +606,17 @@ where
 /// pure sideband stream (no ACK skip — the `packfile` section marker was
 /// already read). Drains trailing progress frames after install so connection
 /// reuse matches the buffered path.
-pub fn install_protocol_v2_fetch_response_from_reader_with_cancel<I, R, C>(
+pub fn install_protocol_v2_fetch_response_from_reader_with_cancel<I, R>(
     format: ObjectFormat,
     reader: &mut R,
     sideband_all: bool,
     destination: &I,
     max_input_size: Option<u64>,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<(ProtocolV2FetchResponseHeader, Option<RawPackInstallResult>)>
 where
     I: RawPackInstaller,
     R: Read,
-    C: Cancel,
 {
     let header = read_protocol_v2_fetch_response_header(format, reader, sideband_all)?;
     if !header.has_packfile {
@@ -656,22 +648,21 @@ where
         sideband_all,
         destination,
         max_input_size,
-        &CancelFlag::never(),
+        CancelFlag::never(),
     )
 }
 
 /// Protocol v2 promisor pack install with cooperative cancellation.
-pub fn install_protocol_v2_fetch_promisor_response_from_reader_with_cancel<R, C>(
+pub fn install_protocol_v2_fetch_promisor_response_from_reader_with_cancel<R>(
     format: ObjectFormat,
     reader: &mut R,
     sideband_all: bool,
     destination: &FileObjectDatabase,
     max_input_size: Option<u64>,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<(ProtocolV2FetchResponseHeader, Option<RawPackInstallResult>)>
 where
     R: Read,
-    C: Cancel,
 {
     let header = read_protocol_v2_fetch_response_header(format, reader, sideband_all)?;
     if !header.has_packfile {
@@ -691,17 +682,16 @@ where
 ///
 /// The section header (`packfile\n`) has already been consumed; remaining
 /// frames are pure sideband until flush — do not skip upload-pack ACKs.
-fn install_protocol_v2_packfile_from_reader_with_cancel<I, R, C>(
+fn install_protocol_v2_packfile_from_reader_with_cancel<I, R>(
     reader: &mut R,
     destination: &I,
     promisor: bool,
     max_input_size: Option<u64>,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<RawPackInstallResult>
 where
     I: RawPackInstaller,
     R: Read,
-    C: Cancel,
 {
     let mut pack_reader = StreamingSidebandReader::new(reader, |_: &[u8]| {});
     let result = destination.install_raw_pack_from_reader_with_progress_and_cancel(
@@ -710,13 +700,15 @@ where
         cancel,
         |_| {},
     );
-    let drain = pack_reader
-        .drain_to_end()
-        .map_err(map_sideband_stream_io_error);
-    let result = match (result, drain) {
-        (Ok(result), Ok(())) => Ok(result),
-        (Ok(_), Err(drain_err)) => Err(drain_err),
-        (Err(install_err), _) => Err(map_sideband_install_error(install_err)),
+    // B2: never drain on error/cancel — that would download the rest of the pack.
+    let result = match result {
+        Ok(result) => {
+            pack_reader
+                .drain_to_end()
+                .map_err(map_sideband_stream_io_error)?;
+            Ok(result)
+        }
+        Err(install_err) => Err(map_sideband_install_error(install_err)),
     }?;
     Ok(if promisor {
         RawPackInstallResult {
@@ -743,10 +735,10 @@ pub fn shallow_info_from_protocol_v2_fetch_header(
 mod tests {
     use super::*;
     use sley_core::ObjectFormat;
+    use sley_core::{AtomicCancel, CancelFlag, GitError};
     use sley_object::{EncodedObject, ObjectType};
     use sley_odb::{FileObjectDatabase, ObjectDatabase, ObjectReader};
     use sley_pack::PackFile;
-    use sley_core::{AtomicCancel, CancelFlag, GitError};
     use sley_protocol::{
         SideBandChannel, SideBandPacket, StreamingSidebandReader, UploadPackAcknowledgment,
         UploadPackPackfileResponse, UploadPackRawPackfileResponse, encode_sideband_packet,
@@ -813,8 +805,10 @@ mod tests {
     fn sideband_upload_pack_response_stream_installs_pack_without_buffering_response() {
         let root = test_temp_root("sley-remote-install-upload-pack-sideband-stream-install");
         let format = ObjectFormat::Sha1;
-        let object =
-            EncodedObject::new(ObjectType::Blob, b"sideband streamed upload-pack\n".to_vec());
+        let object = EncodedObject::new(
+            ObjectType::Blob,
+            b"sideband streamed upload-pack\n".to_vec(),
+        );
         let oid = object
             .object_id(format)
             .expect("test operation should succeed");
@@ -863,7 +857,7 @@ mod tests {
             .install_raw_pack_from_reader_with_progress_and_cancel(
                 &mut pack_reader,
                 sley_odb::RawPackInstallOptions::default(),
-                &CancelFlag::new(&source),
+                CancelFlag::new(&source),
                 |progress| {
                     if progress.received_objects >= 1 {
                         saw_object = true;
@@ -897,8 +891,10 @@ mod tests {
     fn sideband_upload_pack_response_drains_trailing_progress() {
         let root = test_temp_root("sley-remote-install-upload-pack-sideband-drain");
         let format = ObjectFormat::Sha1;
-        let object =
-            EncodedObject::new(ObjectType::Blob, b"sideband drain trailing progress\n".to_vec());
+        let object = EncodedObject::new(
+            ObjectType::Blob,
+            b"sideband drain trailing progress\n".to_vec(),
+        );
         let oid = object
             .object_id(format)
             .expect("test operation should succeed");
@@ -1114,7 +1110,7 @@ mod tests {
                 false,
                 &installer,
                 None,
-                &CancelFlag::new(&source),
+                CancelFlag::new(&source),
             )
             .expect_err("mid-stream cancel should fail")
         };

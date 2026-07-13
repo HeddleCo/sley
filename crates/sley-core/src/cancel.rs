@@ -6,23 +6,26 @@
 //!
 //! # Design
 //!
-//! * [`Cancel`] — trait for a cancellation source.
-//! * [`CancelFlag<C>`] — monomorphized handle over any `C: Cancel`. Prefer this
-//!   over `dyn Cancel` on hot paths so `Never` checks optimize away.
-//! * [`Never`] — zero-cost default source that is never cancelled.
-//! * [`AtomicCancel`] — shared flag for cross-thread cancel (UI stop, SIGINT).
+//! * [`AtomicCancel`] — shared atomic flag (UI stop, SIGINT, deadlines).
+//! * [`CancelFlag`] — cheap `Copy` handle: `Option<&AtomicCancel>` (no cancel
+//!   when `None`). Prefer this over generic monomorphization; every transfer
+//!   seam already type-erases to one shape.
 //! * [`StreamControl`] — continue/stop for callback-style event streams.
-//! * [`CancellableRead`] — `Read` adapter that fails with
-//!   [`std::io::ErrorKind::Interrupted`] when the flag trips between reads.
+//! * [`CancellableRead`] — `Read` adapter that fails with a **dedicated**
+//!   [`OperationCancelled`] payload (not [`io::ErrorKind::Interrupted`]).
+//!   Using `Interrupted` is wrong: `read_exact` and sley's pkt-line readers
+//!   treat it as EINTR and retry, spinning at 100% CPU after Ctrl-C.
 //!
-//! Type erasure is still available when needed: `CancelFlag<&dyn Cancel>` or
-//! `CancelFlag<Arc<dyn Cancel + Send + Sync>>` via the blanket [`Cancel`] impls
-//! for references and `Arc`.
+//! Pair with transport teardown ([`kill_child_if_cancelled`]) when a thread may
+//! be blocked in a kernel `read` on a pipe or socket.
 
 use crate::{GitError, Result};
+use std::error::Error as StdError;
+use std::fmt;
 use std::io::{self, Read};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::Child;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Cooperative continue/stop control for callback-style event streams
 /// (status rows, revwalk commits, untracked paths, …).
@@ -51,36 +54,12 @@ impl StreamControl {
     }
 }
 
-/// A cooperative cancellation source.
-///
-/// Implementations must be cheap to poll. Hot paths call [`Cancel::is_cancelled`]
-/// frequently; monomorphization over concrete types keeps the never-cancel case
-/// essentially free.
-pub trait Cancel {
-    /// `true` once cancellation has been requested.
-    fn is_cancelled(&self) -> bool;
-}
-
-/// Zero-cost cancellation source that is never cancelled.
-///
-/// This is the default type parameter of [`CancelFlag`]. Use
-/// [`CancelFlag::never`] at call sites that do not support cancel.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Never;
-
-impl Cancel for Never {
-    #[inline(always)]
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
-
 /// Shared atomic cancellation flag.
 ///
 /// Safe to share across threads via [`Arc`] or bare references. Setting the
 /// flag does not interrupt a thread blocked in kernel I/O; pair with
-/// [`CancellableRead`] for poll-between-reads, or close the underlying
-/// transport for preemptive wake-up.
+/// [`CancellableRead`] for poll-between-reads, and [`kill_child_if_cancelled`]
+/// (or closing the HTTP body) for preemptive wake-up.
 #[derive(Debug, Default)]
 pub struct AtomicCancel {
     cancelled: AtomicBool,
@@ -95,8 +74,7 @@ impl AtomicCancel {
         }
     }
 
-    /// Request cancellation. Subsequent [`Cancel::is_cancelled`] polls return
-    /// `true`. Idempotent.
+    /// Request cancellation. Subsequent polls return `true`. Idempotent.
     #[inline]
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
@@ -115,116 +93,51 @@ impl AtomicCancel {
     }
 }
 
-impl Cancel for AtomicCancel {
-    #[inline]
-    fn is_cancelled(&self) -> bool {
-        AtomicCancel::is_cancelled(self)
-    }
-}
-
-impl Cancel for AtomicBool {
-    #[inline]
-    fn is_cancelled(&self) -> bool {
-        self.load(Ordering::Acquire)
-    }
-}
-
-impl<C: Cancel + ?Sized> Cancel for &C {
-    #[inline]
-    fn is_cancelled(&self) -> bool {
-        (**self).is_cancelled()
-    }
-}
-
-impl<C: Cancel + ?Sized> Cancel for Arc<C> {
-    #[inline]
-    fn is_cancelled(&self) -> bool {
-        (**self).is_cancelled()
-    }
-}
-
-/// Monomorphized cancellation handle.
+/// Cheap cooperative cancel handle for long-running I/O.
 ///
-/// Prefer a concrete `C` (especially [`Never`]) on hot paths. Use
-/// `CancelFlag<&dyn Cancel>` only at type-erased boundaries (trait objects,
-/// heterogeneous storage).
+/// `None` means never cancel (the common default). `Some` borrows an
+/// [`AtomicCancel`] owned by the CLI interrupt handler, UI, or embedder.
+///
+/// This is intentionally non-generic: every transfer path already needs a
+/// single type-erased shape for service structs (`FetchServices`, etc.).
 #[derive(Debug, Clone, Copy, Default)]
-pub struct CancelFlag<C: Cancel = Never> {
-    source: C,
+pub struct CancelFlag<'a> {
+    source: Option<&'a AtomicCancel>,
 }
 
-impl CancelFlag<Never> {
+impl CancelFlag<'static> {
     /// A flag that never reports cancellation.
     #[inline]
     pub const fn never() -> Self {
-        Self { source: Never }
-    }
-
-    /// Type-erased never-cancel handle for long-lived service structs that
-    /// cannot monomorphize over a concrete `C: Cancel` (e.g. `FetchServices`).
-    ///
-    /// Prefer [`CancelFlag::never`] on hot paths so monomorphization can
-    /// eliminate the poll entirely.
-    #[inline]
-    pub fn never_dyn() -> CancelFlag<&'static (dyn Cancel + Send + Sync)> {
-        static NEVER: Never = Never;
-        CancelFlag {
-            source: &NEVER as &'static (dyn Cancel + Send + Sync),
-        }
+        Self { source: None }
     }
 }
 
-/// Type-erased cancel handle for orchestration seams (fetch/clone/push
-/// services) that store one cancel source for many monomorphized install paths.
-///
-/// Requires `Send + Sync` so the flag can be shared into scoped pack-generator
-/// threads (e.g. HTTP push body streaming).
-pub type DynCancelFlag<'a> = CancelFlag<&'a (dyn Cancel + Send + Sync)>;
-
-impl<C: Cancel> CancelFlag<C> {
-    /// Wrap a cancellation source.
+impl<'a> CancelFlag<'a> {
+    /// Wrap a shared atomic cancel source.
     #[inline]
-    pub const fn new(source: C) -> Self {
-        Self { source }
-    }
-
-    /// Borrow the inner source as a nested flag (for passing down without
-    /// cloning owned sources like [`Arc`]).
-    #[inline]
-    pub fn as_ref(&self) -> CancelFlag<&C> {
-        CancelFlag {
-            source: &self.source,
+    pub const fn new(source: &'a AtomicCancel) -> Self {
+        Self {
+            source: Some(source),
         }
     }
 
-    /// Access the underlying source.
+    /// Alias for [`CancelFlag::never`] used by older call sites.
     #[inline]
-    pub fn source(&self) -> &C {
-        &self.source
-    }
-
-    /// Unwrap the underlying source.
-    #[inline]
-    pub fn into_source(self) -> C {
-        self.source
+    pub const fn never_dyn() -> CancelFlag<'static> {
+        CancelFlag::never()
     }
 
     /// Whether cancellation has been requested.
     #[inline]
-    fn is_cancelled_inner(&self) -> bool {
-        self.source.is_cancelled()
-    }
-
-    /// Whether cancellation has been requested.
-    #[inline]
-    pub fn is_cancelled(&self) -> bool {
-        self.is_cancelled_inner()
+    pub fn is_cancelled(self) -> bool {
+        self.source.is_some_and(AtomicCancel::is_cancelled)
     }
 
     /// Return [`GitError::Cancelled`] when the flag is set; otherwise `Ok(())`.
     #[inline]
-    pub fn check(&self) -> Result<()> {
-        if self.is_cancelled_inner() {
+    pub fn check(self) -> Result<()> {
+        if self.is_cancelled() {
             Err(GitError::Cancelled)
         } else {
             Ok(())
@@ -232,40 +145,61 @@ impl<C: Cancel> CancelFlag<C> {
     }
 
     /// Map the flag into a [`StreamControl`] value for emit-style loops.
-    ///
-    /// Cancelled → [`StreamControl::Stop`]; otherwise [`StreamControl::Continue`].
     #[inline]
-    pub fn control(&self) -> StreamControl {
-        if self.is_cancelled_inner() {
+    pub fn control(self) -> StreamControl {
+        if self.is_cancelled() {
             StreamControl::Stop
         } else {
             StreamControl::Continue
         }
     }
-}
 
-impl<C: Cancel> Cancel for CancelFlag<C> {
+    /// Borrowed view with a possibly shorter lifetime (no-op for `Copy`).
     #[inline]
-    fn is_cancelled(&self) -> bool {
-        self.is_cancelled_inner()
+    pub fn as_ref(self) -> CancelFlag<'a> {
+        self
+    }
+
+    /// Underlying atomic, if any.
+    #[inline]
+    pub fn source(self) -> Option<&'a AtomicCancel> {
+        self.source
     }
 }
 
-/// `Read` adapter that polls a [`CancelFlag`] before each underlying read.
+/// Historical name for the type-erased cancel handle; now identical to
+/// [`CancelFlag`].
+pub type DynCancelFlag<'a> = CancelFlag<'a>;
+
+/// Marker error stored inside [`io::Error`] when a cooperative cancel fires.
 ///
-/// When cancelled, returns `Err` with [`io::ErrorKind::Interrupted`]. Callers
-/// that map I/O errors through [`GitError`] should treat Interrupted as
-/// [`GitError::Cancelled`] (see [`map_cancel_io`]).
-#[derive(Debug)]
-pub struct CancellableRead<R, C: Cancel = Never> {
-    inner: R,
-    cancel: CancelFlag<C>,
+/// **Must not** use [`io::ErrorKind::Interrupted`]: `Read::read_exact` and
+/// sley's pkt-line readers treat that as EINTR and retry forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationCancelled;
+
+impl fmt::Display for OperationCancelled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("operation cancelled")
+    }
 }
 
-impl<R, C: Cancel> CancellableRead<R, C> {
+impl StdError for OperationCancelled {}
+
+/// `Read` adapter that polls a [`CancelFlag`] before each underlying read.
+///
+/// When cancelled, returns `Err` wrapping [`OperationCancelled`] with kind
+/// [`io::ErrorKind::Other`] (never `Interrupted`).
+#[derive(Debug)]
+pub struct CancellableRead<'a, R> {
+    inner: R,
+    cancel: CancelFlag<'a>,
+}
+
+impl<'a, R> CancellableRead<'a, R> {
     /// Wrap `inner`, polling `cancel` before every read.
     #[inline]
-    pub fn new(inner: R, cancel: CancelFlag<C>) -> Self {
+    pub fn new(inner: R, cancel: CancelFlag<'a>) -> Self {
         Self { inner, cancel }
     }
 
@@ -289,12 +223,12 @@ impl<R, C: Cancel> CancellableRead<R, C> {
 
     /// The cancel flag driving this adapter.
     #[inline]
-    pub fn cancel(&self) -> CancelFlag<&C> {
-        self.cancel.as_ref()
+    pub fn cancel(&self) -> CancelFlag<'a> {
+        self.cancel
     }
 }
 
-impl<R: Read, C: Cancel> Read for CancellableRead<R, C> {
+impl<R: Read> Read for CancellableRead<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.cancel.is_cancelled() {
             return Err(cancelled_io_error());
@@ -303,24 +237,27 @@ impl<R: Read, C: Cancel> Read for CancellableRead<R, C> {
     }
 }
 
-/// Build the standard I/O error used by [`CancellableRead`] on cancel.
+/// Build the I/O error used by [`CancellableRead`] on cancel.
+///
+/// Kind is **`Other`**, payload is [`OperationCancelled`]. Do not use
+/// `Interrupted` — see that type's docs.
 #[inline]
 pub fn cancelled_io_error() -> io::Error {
-    io::Error::new(io::ErrorKind::Interrupted, "operation cancelled")
+    io::Error::new(io::ErrorKind::Other, OperationCancelled)
+}
+
+/// `true` when `err` is a cooperative cancel from [`CancellableRead`].
+#[inline]
+pub fn is_cancelled_io(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<OperationCancelled>().is_some())
 }
 
 /// Map a cancel-flavored I/O error to [`GitError::Cancelled`]; pass other
 /// errors through [`GitError::from`].
 #[inline]
 pub fn map_cancel_io(err: io::Error) -> GitError {
-    if err.kind() == io::ErrorKind::Interrupted
-        && err
-            .get_ref()
-            .map(|inner| inner.to_string() == "operation cancelled")
-            .unwrap_or(false)
-    {
-        GitError::Cancelled
-    } else if err.kind() == io::ErrorKind::Interrupted && err.to_string().contains("cancelled") {
+    if is_cancelled_io(&err) {
         GitError::Cancelled
     } else {
         GitError::from(err)
@@ -333,10 +270,24 @@ pub fn is_cancelled_error(err: &GitError) -> bool {
     matches!(err, GitError::Cancelled)
 }
 
+/// Kill an OS child if cancel was requested (best-effort preemptive wake).
+#[inline]
+pub fn kill_child_if_cancelled(child: &mut Child, cancel: CancelFlag<'_>) {
+    if cancel.is_cancelled() {
+        let _ = child.kill();
+    }
+}
+
+/// Compatibility: treat a bare atomic reference as a cancel poll source.
+#[inline]
+pub fn cancel_flag_from_arc(source: &Arc<AtomicCancel>) -> CancelFlag<'_> {
+    CancelFlag::new(source.as_ref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
 
     #[test]
     fn never_flag_is_never_cancelled() {
@@ -360,27 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn arc_atomic_cancel_shares_state() {
-        let source = Arc::new(AtomicCancel::new());
-        let flag_a = CancelFlag::new(Arc::clone(&source));
-        let flag_b = CancelFlag::new(Arc::clone(&source));
-        source.cancel();
-        assert!(flag_a.is_cancelled());
-        assert!(flag_b.is_cancelled());
-    }
-
-    #[test]
-    fn dyn_cancel_type_erasure_works() {
-        let source = AtomicCancel::new();
-        let erased: &dyn Cancel = &source;
-        let flag = CancelFlag::new(erased);
-        assert!(!flag.is_cancelled());
-        source.cancel();
-        assert!(flag.is_cancelled());
-    }
-
-    #[test]
-    fn cancellable_read_fails_when_flag_set() {
+    fn cancellable_read_fails_with_operation_cancelled_not_interrupted() {
         let source = AtomicCancel::new();
         let data = b"hello world";
         let mut reader = CancellableRead::new(Cursor::new(&data[..]), CancelFlag::new(&source));
@@ -388,31 +319,58 @@ mod tests {
         assert_eq!(reader.read(&mut buf).expect("read"), 5);
         source.cancel();
         let err = reader.read(&mut buf).expect_err("cancelled");
-        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::Interrupted,
+            "Interrupted is retried by read_exact / pkt-line"
+        );
+        assert!(is_cancelled_io(&err));
         assert_eq!(map_cancel_io(err), GitError::Cancelled);
     }
 
     #[test]
-    fn cancel_flag_as_ref_preserves_state() {
+    fn read_exact_does_not_spin_on_cancel() {
         let source = AtomicCancel::new();
-        let owned = CancelFlag::new(&source);
-        let borrowed = owned.as_ref();
         source.cancel();
-        assert!(borrowed.is_cancelled());
+        let mut reader = CancellableRead::new(Cursor::new(&b"abcd"[..]), CancelFlag::new(&source));
+        let mut buf = [0u8; 4];
+        // Would spin forever if cancel used ErrorKind::Interrupted.
+        let err = reader.read_exact(&mut buf).expect_err("cancelled");
+        assert!(is_cancelled_io(&err));
     }
 
     #[test]
-    fn never_dyn_is_never_cancelled_and_accepts_atomic() {
-        let dyn_never = CancelFlag::never_dyn();
-        assert!(!dyn_never.is_cancelled());
-        assert!(dyn_never.check().is_ok());
+    fn never_dyn_alias_matches_never() {
+        assert!(!CancelFlag::never().is_cancelled());
+    }
 
+    #[test]
+    fn kill_child_if_cancelled_is_noop_when_not_cancelled() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
         let source = AtomicCancel::new();
-        let dyn_flag: DynCancelFlag<'_> =
-            CancelFlag::new(&source as &(dyn Cancel + Send + Sync));
-        assert!(!dyn_flag.is_cancelled());
+        kill_child_if_cancelled(&mut child, CancelFlag::new(&source));
+        assert!(child.try_wait().expect("try_wait").is_none());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn kill_child_if_cancelled_kills_when_flag_set() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let source = AtomicCancel::new();
         source.cancel();
-        assert!(dyn_flag.is_cancelled());
-        assert_eq!(dyn_flag.check(), Err(GitError::Cancelled));
+        kill_child_if_cancelled(&mut child, CancelFlag::new(&source));
+        let status = child.wait().expect("wait after kill");
+        assert!(!status.success());
     }
 }

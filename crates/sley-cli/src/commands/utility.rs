@@ -3,7 +3,9 @@
 use sley::plumbing::{sley_config, sley_core, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
+use crate::commands::cli_options::cli_usage_error;
 use crate::*;
+use sley_options::{OptFlags, OptValue, OptionSpec, parse_options};
 
 /// Minimal native `imap-send` front end for the empty-message contract. The
 /// full IMAP transport is deliberately not delegated to an installed Git
@@ -29,17 +31,31 @@ pub(crate) fn cmd_imap_send(args: &[String]) -> Result<()> {
 }
 
 pub(crate) fn cmd_version(args: &[String]) -> Result<()> {
-    // `git version` ignores positional arguments and prints the version line; the
-    // only flag it acts on is `--build-options`, which appends a block of build
-    // facts. Upstream's test harness (t/test-lib.sh) parses that block for the
-    // active hash (`default-hash:`) and integer widths (`sizeof-*`), so the line
-    // shapes must match git's exactly.
-    let build_options = args.iter().any(|arg| arg == "--build-options");
+    // Pilot migration onto `sley-options` (ADR 0001): one-option table for
+    // `--build-options`. Positionals are ignored (git does too); unknown options
+    // exit 129 with a usage block. Build-options line shapes must stay byte-
+    // identical for t/test-lib.sh (`default-hash:`, `sizeof-*`, etc.).
+    let parsed =
+        parse_options(args, version_option_specs(), VERSION_USAGE).map_err(cli_usage_error)?;
+    let build_options = parsed.last_bool("build-options", false);
     println!("git version {}", sley_core::UPSTREAM_GIT_COMPAT_VERSION);
     if build_options {
         print_version_build_options();
     }
     Ok(())
+}
+
+const VERSION_USAGE: &[&str] = &["git version [--build-options]"];
+
+fn version_option_specs() -> &'static [OptionSpec<'static>] {
+    static SPECS: &[OptionSpec<'static>] = &[OptionSpec {
+        short: None,
+        long: Some("build-options"),
+        value: OptValue::Bool,
+        flags: OptFlags::NONE,
+        help: "also print build details",
+    }];
+    SPECS
 }
 
 pub(crate) fn cmd_bugreport(

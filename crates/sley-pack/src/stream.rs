@@ -25,16 +25,15 @@ where
     index_pack_from_stream(PackReadStream::new(reader, format, None)?, format)
 }
 
-pub(crate) fn index_pack_from_reader_to_trailer_with_progress_and_cancel<R, F, C>(
+pub(crate) fn index_pack_from_reader_to_trailer_with_progress_and_cancel<R, F>(
     reader: &mut R,
     format: ObjectFormat,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
     progress: F,
 ) -> Result<PackStreamIndexBuild>
 where
     R: Read,
     F: FnMut(PackStreamProgress),
-    C: Cancel,
 {
     index_pack_from_stream_with_progress(
         PackReadStream::new(reader, format, None)?,
@@ -51,23 +50,22 @@ pub(crate) fn index_pack_from_stream<R>(
 where
     R: Read,
 {
-    index_pack_from_stream_with_progress(stream, format, &CancelFlag::never(), |_| {})
+    index_pack_from_stream_with_progress(stream, format, CancelFlag::never(), |_| {})
 }
 
 /// Approximate cadence for progress emission: report at least every this many
 /// pack bytes, matching how git paces "Receiving objects" (no per-object churn).
 pub(crate) const PROGRESS_BYTE_STEP: u64 = 256 * 1024;
 
-pub(crate) fn index_pack_from_stream_with_progress<R, F, C>(
+pub(crate) fn index_pack_from_stream_with_progress<R, F>(
     mut stream: PackReadStream<'_, R>,
     format: ObjectFormat,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
     mut progress: F,
 ) -> Result<PackStreamIndexBuild>
 where
     R: Read,
     F: FnMut(PackStreamProgress),
-    C: Cancel,
 {
     let mut header = [0u8; 12];
     stream.read_pack_bytes(&mut header)?;

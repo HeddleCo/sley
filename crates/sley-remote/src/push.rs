@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::proc_receive::ProcReceiveReport;
 use sley_config::GitConfig;
 use sley_core::{
-    DynCancelFlag, GitError, ObjectFormat, ObjectId, Result, redact_url_for_display,
+    CancelFlag, DynCancelFlag, GitError, ObjectFormat, ObjectId, Result, redact_url_for_display,
 };
 use sley_object::ObjectType;
 use sley_odb::{
@@ -43,7 +43,7 @@ use sley_protocol::{
     ReceivePackCommandStatusV2Options, ReceivePackFeatures, ReceivePackPushRequest,
     ReceivePackPushRequestHeader, ReceivePackPushRequestOptions, ReceivePackReportStatus,
     ReceivePackReportStatusV2, ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement,
-    RefSpec, parse_refspec, plan_push_commands, read_and_demux_sideband_stream,
+    RefSpec, StreamingSidebandReader, parse_refspec, plan_push_commands,
     read_receive_pack_report_status, read_receive_pack_report_status_v2,
 };
 
@@ -430,6 +430,13 @@ pub struct PushServices<'a> {
     pub cancel: DynCancelFlag<'a>,
 }
 
+impl<'a> PushServices<'a> {
+    /// Borrow progress + cancel as a single [`crate::OperationContext`].
+    pub fn context(&mut self) -> crate::OperationContext<'_> {
+        crate::OperationContext::new(self.progress, self.cancel)
+    }
+}
+
 /// A push after ref negotiation and command planning, but before any ref update
 /// is sent or applied.
 pub struct PushPlan {
@@ -740,10 +747,11 @@ pub fn execute_push_plan(
     plan: PushPlan,
 ) -> Result<PushOutcome> {
     let _ = (request.config, request.remote);
-    let _ = &mut services.progress;
     if plan.commands.is_empty() {
         return Ok(PushOutcome::default());
     }
+    // Bundle progress+cancel for the transfer phase (pack build / report demux).
+    let ctx = crate::OperationContext::new(services.progress, services.cancel);
     match plan.execution {
         PushExecution::Noop => Ok(PushOutcome::default()),
         #[cfg(feature = "http")]
@@ -756,7 +764,8 @@ pub fn execute_push_plan(
         } => execute_push_http(
             request,
             services.credentials,
-            &services.cancel,
+            ctx.progress,
+            ctx.cancel,
             http_batch,
             plan.commands,
             remote_url,
@@ -764,12 +773,8 @@ pub fn execute_push_plan(
             advertisements,
             pack_objects,
         ),
-        PushExecution::Ssh(plan) => {
-            crate::ssh::execute_push_ssh_plan(request, plan, &services.cancel)
-        }
-        PushExecution::Git(plan) => {
-            crate::git::execute_push_git_plan(request, plan, &services.cancel)
-        }
+        PushExecution::Ssh(plan) => crate::ssh::execute_push_ssh_plan(request, plan, ctx.cancel),
+        PushExecution::Git(plan) => crate::git::execute_push_git_plan(request, plan, ctx.cancel),
         PushExecution::Local {
             remote_git_dir,
             remote_common_git_dir,
@@ -778,7 +783,7 @@ pub fn execute_push_plan(
             pack_objects,
         } => execute_push_local(
             request,
-            &services.cancel,
+            ctx.cancel,
             plan.commands,
             remote_git_dir,
             remote_common_git_dir,
@@ -912,7 +917,8 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
 fn execute_push_http(
     request: PushRequest<'_>,
     credentials: &mut dyn CredentialProvider,
-    cancel: &DynCancelFlag<'_>,
+    progress: &mut dyn ProgressSink,
+    cancel: CancelFlag<'_>,
     http_batch: crate::http::HttpOperationBatch,
     commands: Vec<ReceivePackCommand>,
     remote_url: RemoteUrl,
@@ -920,6 +926,7 @@ fn execute_push_http(
     advertisements: Vec<RefAdvertisement>,
     pack_objects: Vec<ObjectId>,
 ) -> Result<PushOutcome> {
+    let _ = progress;
     let client = http_batch.client();
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
     let pack_request = PushPackRequest {
@@ -1032,16 +1039,16 @@ fn send_receive_pack_body(
     headers: &[(&str, &str)],
     pack_request: &PushPackRequest<'_>,
     post_buffer: usize,
-    cancel: &DynCancelFlag<'_>,
+    cancel: CancelFlag<'_>,
 ) -> Result<HttpResponse> {
-    let cancel = *cancel;
+    let cancel = cancel;
     std::thread::scope(|scope| {
         let (mut reader, writer) = std::io::pipe().map_err(|err| GitError::Io(err.to_string()))?;
         let generator = scope.spawn(move || -> Result<()> {
             // `writer` is dropped at the end of this closure, signalling EOF to
             // the reader even on the error path.
             let mut writer = writer;
-            write_receive_pack_body_with_cancel(pack_request, &mut writer, &cancel)
+            write_receive_pack_body_with_cancel(pack_request, &mut writer, cancel)
         });
 
         // Probe up to `post_buffer + 1` bytes to decide buffered vs chunked
@@ -1171,7 +1178,7 @@ fn plan_push_local(request: PushLocalRequest<'_>) -> Result<PushPlan> {
 
 fn execute_push_local(
     request: PushRequest<'_>,
-    cancel: &DynCancelFlag<'_>,
+    cancel: CancelFlag<'_>,
     commands: Vec<ReceivePackCommand>,
     remote_git_dir: PathBuf,
     remote_common_git_dir: PathBuf,
@@ -1203,7 +1210,7 @@ fn execute_push_local(
             quiet: request.options.quiet,
             remote_advertisements: &remote_refs,
             remote_stderr: None,
-            cancel: *cancel,
+            cancel,
         })?
     } else {
         let receive_request = ReceivePackPushRequest {
@@ -1622,7 +1629,7 @@ pub fn push_local_with_report_and_objects(
                     quiet: request.quiet,
                     remote_advertisements: &remote_refs,
                     remote_stderr: request.remote_stderr,
-                    cancel: sley_core::CancelFlag::never_dyn(),
+                    cancel: sley_core::CancelFlag::never(),
                 })?
             } else {
                 let receive_request = ReceivePackPushRequest {
@@ -2145,7 +2152,7 @@ fn local_push_via_receive_pack_server(
         pack_request.options.clone(),
     )?;
     let mut packfile = Vec::new();
-    write_push_packfile_with_cancel(&pack_request, &mut packfile, &request.cancel)?;
+    write_push_packfile_with_cancel(&pack_request, &mut packfile, request.cancel)?;
     let config = sley_config::read_repo_config(request.remote_git_dir, None).unwrap_or_default();
     let validation = sley_fsck::FsckPolicy::from_config(
         &config,
@@ -2636,6 +2643,12 @@ pub fn read_receive_pack_push_report(
     read_receive_pack_push_report_with_progress(format, reader, use_report_v2, use_sideband, None)
 }
 
+/// Read a receive-pack report, streaming sideband demux when negotiated.
+///
+/// Channel-1 (data) bytes are accumulated into a small report-status buffer
+/// while channel-2 (progress) frames are delivered live into `remote_progress`
+/// (or printed to stderr when that buffer is `None`). This avoids buffering the
+/// entire sideband response before the first progress line is visible.
 pub fn read_receive_pack_push_report_with_progress(
     format: ObjectFormat,
     reader: &mut impl Read,
@@ -2644,18 +2657,25 @@ pub fn read_receive_pack_push_report_with_progress(
     mut remote_progress: Option<&mut Vec<u8>>,
 ) -> Result<ReceivePackPushReport> {
     if use_sideband {
-        let demuxed = read_and_demux_sideband_stream(reader)?;
-        for line in demuxed.progress {
-            if let Some(buf) = remote_progress.as_mut() {
-                buf.extend_from_slice(&line);
-                if !line.ends_with(b"\n") {
-                    buf.push(b'\n');
+        // Stream demux: progress callbacks fire as frames arrive; only channel-1
+        // report-status text is retained (report-status is small).
+        let mut data = Vec::new();
+        {
+            let mut sideband = StreamingSidebandReader::new(reader, |progress_line: &[u8]| {
+                if let Some(buf) = remote_progress.as_mut() {
+                    buf.extend_from_slice(progress_line);
+                    if !progress_line.ends_with(b"\n") {
+                        buf.push(b'\n');
+                    }
+                } else {
+                    eprint!("{}", String::from_utf8_lossy(progress_line));
                 }
-            } else {
-                eprint!("{}", String::from_utf8_lossy(&line));
-            }
+            });
+            sideband
+                .read_to_end(&mut data)
+                .map_err(map_push_sideband_stream_io_error)?;
         }
-        let mut payload = demuxed.data.as_slice();
+        let mut payload = data.as_slice();
         if use_report_v2 {
             Ok(ReceivePackPushReport::V2(
                 read_receive_pack_report_status_v2(format, &mut payload)?,
@@ -2673,6 +2693,23 @@ pub fn read_receive_pack_push_report_with_progress(
         Ok(ReceivePackPushReport::V1(read_receive_pack_report_status(
             reader,
         )?))
+    }
+}
+
+/// Map sideband `Read` failures back to the [`GitError`] variants the buffered
+/// demux path used, so push report diagnostics stay parity-stable.
+fn map_push_sideband_stream_io_error(err: std::io::Error) -> GitError {
+    let message = err.to_string();
+    if message.contains("sideband fatal:")
+        || message.contains("sideband stream")
+        || message.contains("side-band")
+        || message.contains("pkt-line")
+    {
+        GitError::InvalidFormat(message)
+    } else if sley_core::is_cancelled_io(&err) {
+        GitError::Cancelled
+    } else {
+        GitError::from(err)
     }
 }
 
@@ -2951,7 +2988,10 @@ mod tests {
     use sley_formats::RepositoryLayout;
     use sley_object::{BString, Commit, EncodedObject, ObjectType, Tree, TreeEntry};
     use sley_odb::{FileObjectDatabase, ObjectReplacements, ObjectWriter};
-    use sley_protocol::{ReceivePackCommandStatus, ReceivePackUnpackStatus};
+    use sley_protocol::{
+        ReceivePackCommandStatus, ReceivePackUnpackStatus, SideBandChannel, SideBandPacket,
+        write_receive_pack_report_status, write_sideband_stream,
+    };
     use sley_refs::{RefTarget, RefUpdate};
 
     use crate::{NoCredentials, SilentProgress};
@@ -3166,7 +3206,7 @@ mod tests {
         crate::pack::write_receive_pack_body(&req, &mut canonical).expect("canonical body");
         assert!(canonical.len() > 1, "body should be non-trivial");
 
-        let never = sley_core::CancelFlag::never_dyn();
+        let never = sley_core::CancelFlag::never();
         // A post_buffer larger than the body → buffered Content-Length send.
         let buffered_client = RecordingClient::default();
         send_receive_pack_body(
@@ -3176,7 +3216,7 @@ mod tests {
             &[],
             &req,
             usize::MAX,
-            &never,
+            never,
         )
         .expect("buffered send");
         let (method, body) = buffered_client.take();
@@ -3194,7 +3234,7 @@ mod tests {
             &[],
             &req,
             8,
-            &never,
+            never,
         )
         .expect("streamed send");
         let (method, body) = streamed_client.take();
@@ -3335,7 +3375,7 @@ mod tests {
             PushServices {
                 credentials: &mut credentials,
                 progress: &mut progress,
-                cancel: sley_core::CancelFlag::never_dyn(),
+                cancel: sley_core::CancelFlag::never(),
             },
         )
     }
@@ -3376,7 +3416,7 @@ mod tests {
             PushServices {
                 credentials: &mut credentials,
                 progress: &mut progress,
-                cancel: sley_core::CancelFlag::never_dyn(),
+                cancel: sley_core::CancelFlag::never(),
             },
         )
         .expect("push should succeed");
@@ -3740,6 +3780,85 @@ mod tests {
     }
 
     #[test]
+    fn sideband_report_status_streams_data_and_progress() {
+        // Match receive_pack_server::write_report_sideband: channel-1 carries the
+        // full report-status pkt-line stream (including its flush); channel-2
+        // progress is interleaved and must surface without buffering the whole
+        // response first.
+        let report = ReceivePackReportStatus {
+            unpack: ReceivePackUnpackStatus::Ok,
+            commands: vec![ReceivePackCommandStatus::Ok {
+                name: "refs/heads/main".into(),
+            }],
+        };
+        let mut report_bytes = Vec::new();
+        write_receive_pack_report_status(&mut report_bytes, &report)
+            .expect("report-status should encode");
+
+        let packets = vec![
+            SideBandPacket {
+                channel: SideBandChannel::Progress,
+                data: b"remote: Counting objects: 3, done.\n".to_vec(),
+            },
+            SideBandPacket {
+                channel: SideBandChannel::Data,
+                data: report_bytes,
+            },
+            SideBandPacket {
+                channel: SideBandChannel::Progress,
+                data: b"remote: Total 3 (delta 0)\n".to_vec(),
+            },
+        ];
+        let mut encoded = Vec::new();
+        write_sideband_stream(&mut encoded, &packets).expect("sideband stream should encode");
+
+        let mut remote_progress = Vec::new();
+        let mut input = encoded.as_slice();
+        let parsed = read_receive_pack_push_report_with_progress(
+            ObjectFormat::Sha1,
+            &mut input,
+            false,
+            true,
+            Some(&mut remote_progress),
+        )
+        .expect("streaming sideband report should parse");
+
+        match parsed {
+            ReceivePackPushReport::V1(status) => {
+                assert!(matches!(status.unpack, ReceivePackUnpackStatus::Ok));
+                assert!(matches!(
+                    status.commands.as_slice(),
+                    [ReceivePackCommandStatus::Ok { name }] if name == "refs/heads/main"
+                ));
+            }
+            ReceivePackPushReport::V2(_) => panic!("expected v1 report"),
+        }
+        let progress_text = String::from_utf8_lossy(&remote_progress);
+        assert!(
+            progress_text.contains("Counting objects"),
+            "progress should be delivered live into remote_progress: {progress_text}"
+        );
+        assert!(
+            progress_text.contains("Total 3"),
+            "trailing progress should also be captured: {progress_text}"
+        );
+    }
+
+    #[test]
+    fn operation_context_check_cancel_and_never() {
+        use sley_core::AtomicCancel;
+        let mut progress = SilentProgress;
+        let ctx = crate::OperationContext::never(&mut progress);
+        assert!(ctx.check_cancel().is_ok());
+
+        let cancel = AtomicCancel::new();
+        cancel.cancel();
+        let mut progress = SilentProgress;
+        let ctx = crate::OperationContext::new(&mut progress, sley_core::CancelFlag::new(&cancel));
+        assert!(matches!(ctx.check_cancel(), Err(GitError::Cancelled)));
+    }
+
+    #[test]
     fn report_status_rejection_is_an_error() {
         let report = ReceivePackReportStatus {
             unpack: ReceivePackUnpackStatus::Ok,
@@ -3789,7 +3908,7 @@ mod tests {
         let mut services = PushServices {
             credentials: &mut credentials,
             progress: &mut progress,
-            cancel: sley_core::CancelFlag::never_dyn(),
+            cancel: sley_core::CancelFlag::never(),
         };
         let plan = plan_push(request, &mut services).expect("push should plan");
 

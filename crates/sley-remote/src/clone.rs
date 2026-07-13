@@ -195,6 +195,13 @@ pub struct CloneServices<'a> {
     pub cancel: DynCancelFlag<'a>,
 }
 
+impl<'a> CloneServices<'a> {
+    /// Borrow progress + cancel as a single [`crate::OperationContext`].
+    pub fn context(&mut self) -> crate::OperationContext<'_> {
+        crate::OperationContext::new(self.progress, self.cancel)
+    }
+}
+
 /// Clone the resolved `source` into a fresh repository at `destination`.
 ///
 /// Performs the transport-shaped core the CLI's `clone_http_repository` and the
@@ -324,11 +331,14 @@ fn clone_impl(
         options: &fetch_options,
         validation: None,
     };
+    // Hand progress+cancel into fetch as an OperationContext-shaped pair so
+    // cancel mid-pack still reaches the install path through FetchServices.
+    let ctx = crate::OperationContext::new(services.progress, services.cancel);
     let fetch_services = crate::fetch::FetchServices {
         credentials: services.credentials,
-        progress: services.progress,
+        progress: ctx.progress,
         ref_hook: None,
-        cancel: services.cancel,
+        cancel: ctx.cancel,
     };
     #[cfg(feature = "http")]
     let fetch_outcome =
@@ -585,6 +595,7 @@ fn fetch_partial_clone_checkout_blobs(
             request,
             git_dir,
             commit_oid,
+            config,
             remote,
             credentials,
             cancel,
@@ -606,6 +617,7 @@ fn fetch_http_partial_clone_checkout_blobs(
     request: &CloneRequest<'_>,
     git_dir: &Path,
     commit_oid: ObjectId,
+    config: &GitConfig,
     remote: &RemoteUrl,
     credentials: &mut dyn CredentialProvider,
     cancel: DynCancelFlag<'_>,
@@ -646,6 +658,9 @@ fn fetch_http_partial_clone_checkout_blobs(
         None,
     )?;
     let git_protocol = crate::http::http_git_protocol_header_value(None)?;
+    // Honor the same pack-size policy as the primary fetch path
+    // (`fetch.maxInputSize` / `transfer.maxSize`); unset remains unlimited.
+    let max_input_size = crate::fetch::fetch_max_input_size(config);
     let pack_request = crate::http::HttpFetchPackRequest {
         client,
         git_dir,
@@ -656,13 +671,13 @@ fn fetch_http_partial_clone_checkout_blobs(
         shallow: Vec::new(),
         deepen: None,
         promisor: true,
-        max_input_size: None,
+        max_input_size,
         filter: None,
         deepen_since: None,
         deepen_not: Vec::new(),
         deepen_relative: false,
         git_protocol: git_protocol.as_deref(),
-        post_buffer: crate::http::http_post_buffer(None),
+        post_buffer: crate::http::http_post_buffer(Some(config)),
         // The client already has the checkout commit and its trees; advertising
         // them as haves would make the server omit the (filtered-out) blobs we
         // are explicitly requesting, so suppress haves for this top-up fetch.
@@ -678,14 +693,14 @@ fn fetch_http_partial_clone_checkout_blobs(
             handshake,
             credentials,
             &mut progress,
-            &cancel,
+            cancel,
         )?;
     } else {
         crate::http::install_fetch_pack_via_http_upload_pack(
             pack_request,
             credentials,
             &mut progress,
-            &cancel,
+            cancel,
         )?;
     }
     Ok(())

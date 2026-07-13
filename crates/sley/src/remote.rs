@@ -3,6 +3,17 @@
 //! This module re-exports [`sley_remote`] and adds [`RemoteContext`], which binds a
 //! [`Repository`] to a remote name and resolves fetch/push URLs and transport
 //! sources using the repository's effective configuration.
+//!
+//! Prefer the thin facade entry points:
+//!
+//! * [`clone_repository`] — destination clone (re-export of [`sley_remote::clone`])
+//! * [`OperationContext`] — progress + cancel bundle for transfer helpers
+//! * [`Repository::fetch_with_cancel`] / [`Repository::push_with_cancel`] /
+//!   [`Repository::push_actions_with_cancel`] — cooperative cancel of pack work
+//!
+//! Cancel primitives ([`AtomicCancel`], [`CancelFlag`], [`CancellableRead`],
+//! [`DynCancelFlag`], [`Never`]) are re-exported from `sley_remote` / `sley_core`
+//! and also at the crate root of `sley`.
 
 use std::path::Path;
 
@@ -14,6 +25,22 @@ use crate::{Repository, Result};
 
 /// Stable semver for the integration-facing API surface (crate version tracks this).
 pub const INTEGRATION_API_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Clone a resolved remote into a fresh repository.
+///
+/// Thin free-function entry point for embedders: identical to
+/// [`sley_remote::clone`]. Callers fully resolve [`CloneRequest`] (destination,
+/// format, [`CloneSource`]) and inject configure/credentials/progress/cancel
+/// via [`CloneServices`].
+///
+/// For repository-bound fetch/push after open, use [`Repository::fetch`] /
+/// [`Repository::push`] (and their `*_with_cancel` variants).
+pub fn clone_repository(
+    request: CloneRequest<'_>,
+    services: CloneServices<'_>,
+) -> Result<CloneOutcome> {
+    clone(request, services)
+}
 
 /// A repository-bound remote: resolves URLs and transport sources from config.
 #[derive(Debug, Clone)]
@@ -111,7 +138,7 @@ impl Repository {
             options,
             credentials,
             progress,
-            sley_core::CancelFlag::never_dyn(),
+            sley_core::CancelFlag::never(),
         )
     }
 
@@ -168,7 +195,7 @@ impl Repository {
             options,
             credentials,
             progress,
-            sley_core::CancelFlag::never_dyn(),
+            sley_core::CancelFlag::never(),
         )
     }
 
@@ -220,7 +247,7 @@ impl Repository {
             plan,
             credentials,
             progress,
-            sley_core::CancelFlag::never_dyn(),
+            sley_core::CancelFlag::never(),
         )
     }
 

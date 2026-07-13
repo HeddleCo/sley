@@ -528,23 +528,22 @@ impl PackFile {
             options,
             read_object,
             writer,
-            &CancelFlag::never(),
+            CancelFlag::never(),
         )
     }
 
     /// Undeltified pack write that polls `cancel` between compression windows.
-    pub fn write_undeltified_from_source_to_writer_with_cancel<W, F, C>(
+    pub fn write_undeltified_from_source_to_writer_with_cancel<W, F>(
         object_ids: &[ObjectId],
         format: ObjectFormat,
         options: &PackWriteOptions,
         mut read_object: F,
         writer: &mut W,
-        cancel: &CancelFlag<C>,
+        cancel: CancelFlag<'_>,
     ) -> Result<PackWriteSummary>
     where
         W: Write,
         F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
-        C: Cancel,
     {
         let mut seen = HashSet::with_capacity(object_ids.len());
         for oid in object_ids {
@@ -625,24 +624,23 @@ impl PackFile {
             options,
             read_object,
             writer,
-            &CancelFlag::never(),
+            CancelFlag::never(),
         )
     }
 
     /// Streaming deltified pack write that polls `cancel` between compression
     /// windows. Returns [`GitError::Cancelled`] when the flag trips.
-    pub fn write_packed_from_source_to_writer_with_cancel<W, F, C>(
+    pub fn write_packed_from_source_to_writer_with_cancel<W, F>(
         object_ids: &[ObjectId],
         format: ObjectFormat,
         options: &PackWriteOptions,
         mut read_object: F,
         writer: &mut W,
-        cancel: &CancelFlag<C>,
+        cancel: CancelFlag<'_>,
     ) -> Result<PackWriteSummary>
     where
         W: Write,
         F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
-        C: Cancel,
     {
         if object_ids.len() > u32::MAX as usize {
             return Err(GitError::InvalidFormat("too many pack objects".into()));

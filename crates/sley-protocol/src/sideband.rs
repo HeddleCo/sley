@@ -439,12 +439,12 @@ fn sideband_git_error_to_io(err: GitError) -> io::Error {
     match err {
         GitError::Io(message) => {
             if message.contains("cancelled") {
-                io::Error::new(ErrorKind::Interrupted, message)
+                sley_core::cancelled_io_error()
             } else {
                 io::Error::other(message)
             }
         }
-        GitError::Cancelled => io::Error::new(ErrorKind::Interrupted, "operation cancelled"),
+        GitError::Cancelled => sley_core::cancelled_io_error(),
         other => io::Error::new(ErrorKind::InvalidData, other.to_string()),
     }
 }

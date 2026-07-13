@@ -11,8 +11,9 @@ use std::sync::OnceLock;
 mod cancel;
 
 pub use cancel::{
-    AtomicCancel, Cancel, CancelFlag, CancellableRead, DynCancelFlag, Never, StreamControl,
-    cancelled_io_error, is_cancelled_error, map_cancel_io,
+    AtomicCancel, CancelFlag, CancellableRead, DynCancelFlag, OperationCancelled, StreamControl,
+    cancel_flag_from_arc, cancelled_io_error, is_cancelled_error, is_cancelled_io,
+    kill_child_if_cancelled, map_cancel_io,
 };
 
 pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.55.0";

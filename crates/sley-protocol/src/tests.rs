@@ -1335,7 +1335,12 @@ fn streaming_sideband_reader_cancel_mid_stream_with_cancellable_read() {
     let err = reader
         .read(&mut buf)
         .expect_err("cancelled read should fail");
-    assert_eq!(err.kind(), ErrorKind::Interrupted);
+    assert_ne!(
+        err.kind(),
+        ErrorKind::Interrupted,
+        "cancel must not use Interrupted (read_exact retries it)"
+    );
+    assert!(sley_core::is_cancelled_io(&err));
     assert_eq!(map_cancel_io(err), sley_core::GitError::Cancelled);
 }
 
@@ -1398,9 +1403,7 @@ fn streaming_sideband_matches_buffered_upload_pack_demux() {
             full_progress.push(chunk.to_vec());
         })
         .skip_upload_pack_acks();
-        reader
-            .read_to_end(&mut full)
-            .expect("full streaming demux");
+        reader.read_to_end(&mut full).expect("full streaming demux");
         assert!(reader.is_finished());
     }
     assert_eq!(full, buffered.data);
@@ -1418,8 +1421,8 @@ fn streaming_sideband_matches_buffered_upload_pack_demux() {
     // leave the transport positioned after the sideband flush (parity with the
     // old buffer-all path that always consumed the full response).
     {
-        let mut reader = StreamingSidebandReader::new(encoded.as_slice(), |_: &[u8]| {})
-            .skip_upload_pack_acks();
+        let mut reader =
+            StreamingSidebandReader::new(encoded.as_slice(), |_: &[u8]| {}).skip_upload_pack_acks();
         let mut partial = [0u8; 6];
         let n = reader.read(&mut partial).expect("partial read");
         assert_eq!(&partial[..n], &b"PACK-B"[..n]);

@@ -26,8 +26,7 @@ use crate::install::{
 };
 use sley_config::GitConfig;
 use sley_core::{
-    Cancel, CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result,
-    UPSTREAM_GIT_COMPAT_VERSION,
+    CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
 };
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
@@ -829,7 +828,7 @@ pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
     request: HttpFetchPackRequest<'_, C>,
     credentials: &mut dyn CredentialProvider,
     progress: &mut dyn ProgressSink,
-    cancel: &CancelFlag<impl Cancel>,
+    cancel: CancelFlag<'_>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if request.wants.is_empty() {
         return Ok(Vec::new());
@@ -926,7 +925,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
     handshake: &TransportHandshake,
     credentials: &mut dyn CredentialProvider,
     progress: &mut dyn ProgressSink,
-    cancel: &CancelFlag<impl Cancel>,
+    cancel: CancelFlag<'_>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if request.wants.is_empty() {
         return Ok(Vec::new());
@@ -964,6 +963,8 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
     fetch.done = all_haves.is_empty();
 
     loop {
+        // M0: poll cancel between negotiation rounds (not only during pack I/O).
+        cancel.check()?;
         let sent_done = fetch.done;
         let wait_for_done = fetch.wait_for_done;
         let mut response = http_protocol_v2_fetch_post(

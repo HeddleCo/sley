@@ -30,7 +30,7 @@ pub use repack::*;
 pub use sley_pack::PackStreamProgress;
 // Cancel types re-exported so callers of cancel-aware install (remote, fetch)
 // can name them without depending on `sley-pack` or reaching into `sley-core`.
-pub use sley_core::{AtomicCancel, Cancel, CancelFlag, CancellableRead, Never};
+pub use sley_core::{AtomicCancel, CancelFlag, CancellableRead};
 
 static TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1420,7 +1420,7 @@ mod tests {
             .install_raw_pack_from_reader_with_progress_and_cancel(
                 &mut reader,
                 RawPackInstallOptions::default(),
-                &cancel,
+                cancel,
                 |_| {},
             )
             .expect_err("pre-set cancel should abort install");

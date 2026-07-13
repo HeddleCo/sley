@@ -15,11 +15,16 @@
 //! * [`Repository::init_mirror`] — bare mirror defaults (`+refs/*:refs/*`,
 //!   `mirror = true` on `origin`).
 //! * [`Repository::copy_reachable_from`] — pack-based object transfer.
+//! * [`clone_repository`] — thin free-function clone of a resolved remote
+//!   (re-export of [`sley_remote::clone`]).
 //! * [`Repository::remote`] / [`remote::RemoteContext`] — URL rewriting and
 //!   [`sley_remote`] fetch/push/clone/ls-remote orchestration (HTTP v2 fetch,
 //!   SSH, bundle fetch, thin-pack push). Porcelain paths on the facade
 //!   ([`Repository::push`], and future commit/checkout helpers) invoke git
 //!   hooks via [`hooks`] when a hook is configured.
+//! * Cancel — cooperative stream cancellation for pack receive/generate:
+//!   [`AtomicCancel`], [`CancelFlag`], [`CancellableRead`], [`OperationContext`],
+//!   plus `Repository::{fetch,push,push_actions}_with_cancel`.
 //! * [`hooks`] — traditional and config-defined hook discovery/execution.
 //! * [`OpenOptions::respect_environment`] / [`Repository::open_from_environment`]
 //!   — honor `GIT_DIR`, `GIT_WORK_TREE`, and related discovery env vars.
@@ -62,6 +67,18 @@ mod tags;
 
 #[cfg(feature = "remote")]
 pub mod remote;
+
+/// Clone a resolved remote into a fresh repository (feature `remote`).
+///
+/// See [`remote::clone_repository`].
+#[cfg(feature = "remote")]
+pub use remote::clone_repository;
+
+/// Progress + cancel bundle for long-running transfer orchestration (feature `remote`).
+///
+/// See [`remote::OperationContext`].
+#[cfg(feature = "remote")]
+pub use remote::OperationContext;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -108,9 +125,9 @@ pub mod plumbing {
 // so the common path (`use sley::{Repository, ObjectId, ...}`) stays short.
 pub use sley_config::GitConfig;
 pub use sley_core::{
-    AtomicCancel, BString, Cancel, CancelFlag, CancellableRead, DynCancelFlag, FullName, GitError,
-    GitTime, MissingObjectContext, MissingObjectKind, Never, NotFoundKind, ObjectFormat, ObjectId,
-    Result, Signature, StreamControl,
+    AtomicCancel, BString, CancelFlag, CancellableRead, DynCancelFlag, FullName, GitError, GitTime,
+    MissingObjectContext, MissingObjectKind, NotFoundKind, ObjectFormat, ObjectId, Result,
+    Signature, StreamControl,
 };
 pub use sley_diff_merge::format as diff_format;
 pub use sley_diff_merge::{DiffNameStatusOptions, NameStatusEntry};

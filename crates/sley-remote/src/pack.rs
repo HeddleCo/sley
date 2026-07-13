@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
-use sley_core::{Cancel, CancelFlag, ObjectFormat, ObjectId, Result};
+use sley_core::{CancelFlag, ObjectFormat, ObjectId, Result};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, collect_reachable_object_ids,
     write_object_id_pack_to_writer_with_cancel, write_reachable_pack_to_writer_with_cancel,
@@ -80,18 +80,17 @@ pub fn write_push_packfile<W>(req: &PushPackRequest<'_>, writer: &mut W) -> Resu
 where
     W: Write,
 {
-    write_push_packfile_with_cancel(req, writer, &CancelFlag::never())
+    write_push_packfile_with_cancel(req, writer, CancelFlag::never())
 }
 
 /// Like [`write_push_packfile`], polling `cancel` while generating the pack.
-pub fn write_push_packfile_with_cancel<W, C>(
+pub fn write_push_packfile_with_cancel<W>(
     req: &PushPackRequest<'_>,
     writer: &mut W,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<()>
 where
     W: Write,
-    C: Cancel,
 {
     let remote_excluded_tips =
         remote_advertisement_tips_known_to_local(req.local_db, req.remote_advertisements)?;
@@ -149,16 +148,15 @@ pub(crate) fn push_pack_roots(
         .collect()
 }
 
-fn write_thin_push_packfile_with_cancel<W, C>(
+fn write_thin_push_packfile_with_cancel<W>(
     req: &PushPackRequest<'_>,
     starts: Vec<sley_core::ObjectId>,
     remote_excluded: &HashSet<sley_core::ObjectId>,
     writer: &mut W,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<()>
 where
     W: Write,
-    C: Cancel,
 {
     let reachable = collect_reachable_object_ids(req.local_db, req.format, starts)?;
     let mut to_send = reachable
@@ -226,18 +224,17 @@ pub fn write_receive_pack_body<W>(req: &PushPackRequest<'_>, writer: &mut W) -> 
 where
     W: Write,
 {
-    write_receive_pack_body_with_cancel(req, writer, &CancelFlag::never())
+    write_receive_pack_body_with_cancel(req, writer, CancelFlag::never())
 }
 
 /// Like [`write_receive_pack_body`], threading `cancel` into pack generation.
-pub fn write_receive_pack_body_with_cancel<W, C>(
+pub fn write_receive_pack_body_with_cancel<W>(
     req: &PushPackRequest<'_>,
     writer: &mut W,
-    cancel: &CancelFlag<C>,
+    cancel: CancelFlag<'_>,
 ) -> Result<()>
 where
     W: Write,
-    C: Cancel,
 {
     let header = build_receive_pack_push_request_header(
         req.features,
@@ -512,7 +509,7 @@ mod tests {
         let source = AtomicCancel::new();
         source.cancel();
         let mut written = Vec::new();
-        let err = write_push_packfile_with_cancel(&req, &mut written, &CancelFlag::new(&source))
+        let err = write_push_packfile_with_cancel(&req, &mut written, CancelFlag::new(&source))
             .expect_err("pre-cancelled push pack write should fail");
         assert_eq!(err, GitError::Cancelled);
 

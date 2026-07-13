@@ -3,7 +3,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use flate2::{Compress, Compression, FlushCompress, Status};
-use sley_core::{Cancel, CancelFlag, GitError, ObjectFormat, ObjectId, Result, StreamingDigest};
+use sley_core::{CancelFlag, GitError, ObjectFormat, ObjectId, Result, StreamingDigest};
 use sley_formats::Bundle;
 use sley_object::{EncodedObject, ObjectType};
 use std::borrow::Borrow;
@@ -261,7 +261,7 @@ mod tests {
         let err = PackIndex::write_v2_for_pack_reader_to_trailer_with_progress_and_cancel(
             &mut reader,
             ObjectFormat::Sha1,
-            &CancelFlag::new(&source),
+            CancelFlag::new(&source),
             |_| {},
         )
         .expect_err("pre-cancelled index should fail");
@@ -277,7 +277,7 @@ mod tests {
         let err = PackIndex::write_v2_for_pack_reader_to_trailer_with_progress_and_cancel(
             &mut reader,
             ObjectFormat::Sha1,
-            &CancelFlag::new(&source),
+            CancelFlag::new(&source),
             |progress| {
                 if progress.received_objects >= 1 {
                     saw_object = true;
@@ -347,7 +347,7 @@ mod tests {
                     .ok_or_else(|| GitError::not_found(format!("missing test object {oid}")))
             },
             &mut written,
-            &CancelFlag::new(&source),
+            CancelFlag::new(&source),
         )
         .expect_err("pre-cancelled pack write should fail");
         assert_eq!(err, GitError::Cancelled);

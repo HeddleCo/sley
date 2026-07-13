@@ -63,7 +63,9 @@ pub use install::{
     shallow_info_from_protocol_v2_fetch_header,
 };
 // Cancel primitives for embedders driving fetch/clone pack install.
-pub use sley_core::{AtomicCancel, Cancel, CancelFlag, CancellableRead, DynCancelFlag, Never};
+pub use sley_core::{
+    AtomicCancel, CancelFlag, CancellableRead, DynCancelFlag, kill_child_if_cancelled,
+};
 
 mod credentials;
 pub use credentials::{
@@ -199,7 +201,7 @@ pub use fetch::{
     FetchOptions, FetchOutcome, FetchRepositoryPlan, FetchRequest, FetchServices, FetchSource,
     PruneRefsInput, PrunedRef, RemoteHelperFetchRequest, append_reachable_auto_follow_tags,
     apply_configured_fetch_prune_option, apply_configured_partial_clone_filter,
-    apply_configured_remote_tag_option, fetch, fetch_head_source_description,
+    apply_configured_remote_tag_option, fetch, fetch_head_source_description, fetch_max_input_size,
     fetch_refspec_excludes, fetch_refspecs_for_source, finalize_remote_helper_fetch,
     mark_tag_refspec_updates_not_for_merge, order_bundle_fetch_all_tags_updates,
     plan_fetch_repository, prune_refs_from_advertisements, retain_missing_auto_follow_tags,
@@ -376,6 +378,39 @@ pub trait ProgressSink {
 pub struct SilentProgress;
 
 impl ProgressSink for SilentProgress {}
+
+/// Bundles progress + cancel for long-running transfer orchestration.
+///
+/// Service structs ([`FetchServices`], [`CloneServices`], [`PushServices`]) still
+/// expose `progress` and `cancel` as separate fields for backward compatibility.
+/// Call [`FetchServices::context`] (or the clone/push equivalents) when a helper
+/// needs both seams together.
+pub struct OperationContext<'a> {
+    /// Where human-facing progress and summary lines go.
+    pub progress: &'a mut dyn ProgressSink,
+    /// Cooperative cancel for mid-transfer work.
+    pub cancel: DynCancelFlag<'a>,
+}
+
+impl<'a> OperationContext<'a> {
+    /// Bundle an existing progress sink with a cancel flag.
+    pub fn new(progress: &'a mut dyn ProgressSink, cancel: DynCancelFlag<'a>) -> Self {
+        Self { progress, cancel }
+    }
+
+    /// Bundle progress with a cancel flag that never trips.
+    pub fn never(progress: &'a mut dyn ProgressSink) -> Self {
+        Self {
+            progress,
+            cancel: CancelFlag::never(),
+        }
+    }
+
+    /// Return [`GitError::Cancelled`] when cancellation has been requested.
+    pub fn check_cancel(&self) -> Result<()> {
+        self.cancel.check()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -594,7 +629,7 @@ mod tests {
                 credentials,
                 progress: &mut progress,
                 ref_hook: None,
-                cancel: sley_core::CancelFlag::never_dyn(),
+                cancel: sley_core::CancelFlag::never(),
             },
         )
         .expect("live fetch should succeed");
@@ -650,7 +685,7 @@ mod tests {
             PushServices {
                 credentials,
                 progress: &mut progress,
-                cancel: sley_core::CancelFlag::never_dyn(),
+                cancel: sley_core::CancelFlag::never(),
             },
         )
         .expect("live push should succeed");
@@ -819,7 +854,7 @@ mod tests {
                 configure_branch: &mut configure_branch,
                 credentials: &mut clone_credentials,
                 progress: &mut progress,
-                cancel: sley_core::CancelFlag::never_dyn(),
+                cancel: sley_core::CancelFlag::never(),
             },
         )
         .expect("live shallow HTTPS clone should succeed");

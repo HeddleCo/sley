@@ -1,6 +1,6 @@
 use sley_core::{
-    Cancel, CancelFlag, CancellableRead, GitError, MissingObjectContext, ObjectFormat, ObjectId,
-    Result, is_cancelled_error,
+    CancelFlag, CancellableRead, GitError, MissingObjectContext, ObjectFormat, ObjectId, Result,
+    is_cancelled_error,
 };
 use sley_formats::{Bundle, BundleReference};
 use sley_object::{EncodedObject, ObjectType};
@@ -347,7 +347,7 @@ pub trait RawPackInstaller {
         self.install_raw_pack_from_reader_with_progress_and_cancel(
             reader,
             options,
-            &CancelFlag::never(),
+            CancelFlag::never(),
             progress,
         )
     }
@@ -358,17 +358,16 @@ pub trait RawPackInstaller {
     /// install, and wraps `reader` in [`CancellableRead`] so a trip mid-stream
     /// surfaces as [`GitError::Cancelled`]. [`FileObjectDatabase`] overrides this
     /// to also thread cancel into the pack indexer.
-    fn install_raw_pack_from_reader_with_progress_and_cancel<R, F, C>(
+    fn install_raw_pack_from_reader_with_progress_and_cancel<R, F>(
         &self,
         reader: &mut R,
         options: RawPackInstallOptions,
-        cancel: &CancelFlag<C>,
+        cancel: CancelFlag<'_>,
         _progress: F,
     ) -> Result<RawPackInstallResult>
     where
         R: Read,
         F: FnMut(PackStreamProgress),
-        C: Cancel,
     {
         cancel.check()?;
         let mut cancellable = CancellableRead::new(reader, cancel.as_ref());
@@ -423,17 +422,16 @@ impl RawPackInstaller for FileObjectDatabase {
         })
     }
 
-    fn install_raw_pack_from_reader_with_progress_and_cancel<R, F, C>(
+    fn install_raw_pack_from_reader_with_progress_and_cancel<R, F>(
         &self,
         reader: &mut R,
         options: RawPackInstallOptions,
-        cancel: &CancelFlag<C>,
+        cancel: CancelFlag<'_>,
         progress: F,
     ) -> Result<RawPackInstallResult>
     where
         R: Read,
         F: FnMut(PackStreamProgress),
-        C: Cancel,
     {
         let result = FileObjectDatabase::install_raw_pack_from_reader_with_progress_and_cancel(
             self, reader, options, cancel, progress,
@@ -1148,7 +1146,7 @@ impl FileObjectDatabase {
         self.install_raw_pack_from_reader_with_progress_and_cancel(
             reader,
             options,
-            &CancelFlag::never(),
+            CancelFlag::never(),
             progress,
         )
     }
@@ -1159,17 +1157,16 @@ impl FileObjectDatabase {
     /// inbound reader in [`CancellableRead`] so a trip mid-read also aborts.
     /// On any failure — including [`GitError::Cancelled`] — the temporary pack
     /// staging file under `objects/pack` is removed.
-    pub fn install_raw_pack_from_reader_with_progress_and_cancel<R, F, C>(
+    pub fn install_raw_pack_from_reader_with_progress_and_cancel<R, F>(
         &self,
         reader: &mut R,
         options: RawPackInstallOptions,
-        cancel: &CancelFlag<C>,
+        cancel: CancelFlag<'_>,
         progress: F,
     ) -> Result<PackInstallResult>
     where
         R: Read,
         F: FnMut(PackStreamProgress),
-        C: Cancel,
     {
         // Fail before creating a temp file when cancel is already set.
         cancel.check()?;
