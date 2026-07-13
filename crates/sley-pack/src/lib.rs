@@ -32,7 +32,7 @@ mod write;
 pub(crate) use delta::*;
 pub use index::*;
 pub use read::*;
-pub(crate) use stream::*;
+pub use stream::*;
 pub use write::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

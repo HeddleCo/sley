@@ -847,13 +847,7 @@ impl PackIndex {
     where
         R: Read + Seek,
     {
-        let start = reader.stream_position()?;
-        let end = reader.seek(SeekFrom::End(0))?;
-        let pack_len = end
-            .checked_sub(start)
-            .ok_or_else(|| GitError::InvalidFormat("pack stream position overflow".into()))?;
-        reader.seek(SeekFrom::Start(start))?;
-        index_pack_from_reader(reader, format, pack_len)
+        index_pack_from_reader(reader, format)
     }
 
     /// Validate and index a pack from the reader's current position, stopping
@@ -885,12 +879,7 @@ impl PackIndex {
         R: Read,
         F: FnMut(PackStreamProgress),
     {
-        Self::write_v2_for_pack_reader_to_trailer_with_progress_and_cancel(
-            reader,
-            format,
-            CancelFlag::never(),
-            progress,
-        )
+        index_pack_from_reader_to_trailer_with_progress(reader, format, progress)
     }
 
     /// Like [`Self::write_v2_for_pack_reader_to_trailer_with_progress`], but
@@ -921,7 +910,7 @@ impl PackIndex {
     where
         R: Read,
     {
-        index_pack_from_reader(reader, format, pack_len)
+        index_pack_from_reader_with_len(reader, format, pack_len)
     }
 
     /// Validate and index a pack from a filesystem path without loading the
