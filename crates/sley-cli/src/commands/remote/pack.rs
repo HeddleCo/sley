@@ -2244,9 +2244,12 @@ fn run_push(
         refspecs,
         options: &remote_options,
     };
+    let interrupt = crate::interrupt_cancel::process_interrupt_cancel();
+    crate::interrupt_cancel::reset_process_interrupt_cancel(&interrupt);
     let mut services = sley_remote::PushServices {
         credentials: &mut credentials,
         progress: &mut progress,
+        cancel: crate::interrupt_cancel::dyn_cancel_flag(&interrupt),
     };
     let plan = match sley_remote::plan_push(request, &mut services) {
         Err(GitError::InvalidFormat(message)) if message.contains("push-options") => {

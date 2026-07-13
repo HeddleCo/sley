@@ -3,6 +3,17 @@
 //! This module re-exports [`sley_remote`] and adds [`RemoteContext`], which binds a
 //! [`Repository`] to a remote name and resolves fetch/push URLs and transport
 //! sources using the repository's effective configuration.
+//!
+//! Prefer the thin facade entry points:
+//!
+//! * [`clone_repository`] — destination clone (re-export of [`sley_remote::clone`])
+//! * [`OperationContext`] — progress + cancel bundle for transfer helpers
+//! * [`Repository::fetch_with_cancel`] / [`Repository::push_with_cancel`] /
+//!   [`Repository::push_actions_with_cancel`] — cooperative cancel of pack work
+//!
+//! Cancel primitives ([`AtomicCancel`], [`CancelFlag`], [`CancellableRead`],
+//! [`DynCancelFlag`], `Never`) are re-exported from `sley_remote` / `sley_core`
+//! and also at the crate root of `sley`.
 
 use std::path::Path;
 
@@ -14,6 +25,22 @@ use crate::{Repository, Result};
 
 /// Stable semver for the integration-facing API surface (crate version tracks this).
 pub const INTEGRATION_API_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Clone a resolved remote into a fresh repository.
+///
+/// Thin free-function entry point for embedders: identical to
+/// [`sley_remote::clone`]. Callers fully resolve [`CloneRequest`] (destination,
+/// format, [`CloneSource`]) and inject configure/credentials/progress/cancel
+/// via [`CloneServices`].
+///
+/// For repository-bound fetch/push after open, use [`Repository::fetch`] /
+/// [`Repository::push`] (and their `*_with_cancel` variants).
+pub fn clone_repository(
+    request: CloneRequest<'_>,
+    services: CloneServices<'_>,
+) -> Result<CloneOutcome> {
+    clone(request, services)
+}
 
 /// A repository-bound remote: resolves URLs and transport sources from config.
 #[derive(Debug, Clone)]
@@ -105,6 +132,30 @@ impl Repository {
         credentials: &mut dyn CredentialProvider,
         progress: &mut dyn ProgressSink,
     ) -> Result<FetchOutcome> {
+        self.fetch_with_cancel(
+            remote,
+            refspecs,
+            options,
+            credentials,
+            progress,
+            sley_core::CancelFlag::never(),
+        )
+    }
+
+    /// [`Self::fetch`] with cooperative cancellation of pack receive/index.
+    ///
+    /// Pass `CancelFlag::new(&atomic)` (or any `DynCancelFlag`) so a UI stop or
+    /// SIGINT handler can trip [`sley_core::GitError::Cancelled`] mid-transfer without
+    /// corrupting the object database.
+    pub fn fetch_with_cancel(
+        &self,
+        remote: impl Into<String>,
+        refspecs: &[String],
+        options: FetchOptions,
+        credentials: &mut dyn CredentialProvider,
+        progress: &mut dyn ProgressSink,
+        cancel: sley_core::DynCancelFlag<'_>,
+    ) -> Result<FetchOutcome> {
         let ctx = self.remote(remote)?;
         let source = ctx.fetch_source(self)?;
         let outcome = fetch(
@@ -122,6 +173,7 @@ impl Repository {
                 credentials,
                 progress,
                 ref_hook: None,
+                cancel,
             },
         )?;
         self.refresh_objects();
@@ -136,6 +188,30 @@ impl Repository {
         options: PushOptions,
         credentials: &mut dyn CredentialProvider,
         progress: &mut dyn ProgressSink,
+    ) -> Result<PushOutcome> {
+        self.push_with_cancel(
+            remote,
+            refspecs,
+            options,
+            credentials,
+            progress,
+            sley_core::CancelFlag::never(),
+        )
+    }
+
+    /// [`Self::push`] with cooperative cancellation of pack generation.
+    ///
+    /// Pass `CancelFlag::new(&atomic)` (or any `DynCancelFlag`) so a UI stop or
+    /// SIGINT handler can trip [`sley_core::GitError::Cancelled`] while building
+    /// the push packfile.
+    pub fn push_with_cancel(
+        &self,
+        remote: impl Into<String>,
+        refspecs: &[String],
+        options: PushOptions,
+        credentials: &mut dyn CredentialProvider,
+        progress: &mut dyn ProgressSink,
+        cancel: sley_core::DynCancelFlag<'_>,
     ) -> Result<PushOutcome> {
         let ctx = self.remote(remote)?;
         let destination = ctx.push_destination(self)?;
@@ -153,6 +229,7 @@ impl Repository {
             PushServices {
                 credentials,
                 progress,
+                cancel,
             },
         )
     }
@@ -164,6 +241,24 @@ impl Repository {
         plan: PushActionPlan,
         credentials: &mut dyn CredentialProvider,
         progress: &mut dyn ProgressSink,
+    ) -> Result<PushOutcome> {
+        self.push_actions_with_cancel(
+            remote,
+            plan,
+            credentials,
+            progress,
+            sley_core::CancelFlag::never(),
+        )
+    }
+
+    /// [`Self::push_actions`] with cooperative cancellation of pack generation.
+    pub fn push_actions_with_cancel(
+        &self,
+        remote: impl Into<String>,
+        plan: PushActionPlan,
+        credentials: &mut dyn CredentialProvider,
+        progress: &mut dyn ProgressSink,
+        cancel: sley_core::DynCancelFlag<'_>,
     ) -> Result<PushOutcome> {
         let ctx = self.remote(remote)?;
         let destination = ctx.push_destination(self)?;
@@ -180,6 +275,7 @@ impl Repository {
             PushServices {
                 credentials,
                 progress,
+                cancel,
             },
         )
     }

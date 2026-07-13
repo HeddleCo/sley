@@ -73,6 +73,7 @@ mod dispatch;
 mod for_each_ref_helpers;
 mod global_options;
 mod init_config;
+mod interrupt_cancel;
 mod log_cli;
 mod ls_files_pathspec;
 mod ownership;

@@ -2113,6 +2113,8 @@ pub(super) fn run_fetch(
         trace_protocol_v2_ls_refs_request(server_options);
     }
     let ref_hook = crate::commands::refs::ReferenceTransactionHookRunner::new(git_dir);
+    let interrupt = crate::interrupt_cancel::process_interrupt_cancel();
+    crate::interrupt_cancel::reset_process_interrupt_cancel(&interrupt);
     let outcome = sley_remote::fetch(
         sley_remote::FetchRequest {
             git_dir,
@@ -2128,6 +2130,7 @@ pub(super) fn run_fetch(
             credentials: &mut credentials,
             progress: &mut progress,
             ref_hook: Some(&ref_hook),
+            cancel: crate::interrupt_cancel::dyn_cancel_flag(&interrupt),
         },
     )?;
     maybe_set_remote_head_on_fetch(

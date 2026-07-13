@@ -294,18 +294,11 @@ pub struct ShortStatusRow<'a> {
     pub submodule: Option<SubmoduleStatus>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum StreamControl {
-    #[default]
-    Continue,
-    Stop,
-}
-
-impl StreamControl {
-    pub(crate) fn is_stop(self) -> bool {
-        matches!(self, Self::Stop)
-    }
-}
+/// Cooperative continue/stop for callback-style event streams.
+///
+/// Defined in [`sley_core`] and re-exported here so existing `sley_worktree::StreamControl`
+/// paths keep working with a single type identity.
+pub use sley_core::StreamControl;
 
 /// Submodule-specific change detail for a status entry, mirroring upstream's
 /// `wt_status_change_data` trio: `new_submodule_commits` plus the

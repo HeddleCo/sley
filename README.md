@@ -114,8 +114,20 @@ Linux certification commands.
 | Storage | `sley-odb`, `sley-pack`, `sley-index`, `sley-refs`, `sley-mmap` |
 | History / worktree | `sley-rev`, `sley-worktree`, `sley-diff-merge`, `sley-unpack-trees` |
 | Network | `sley-protocol`, `sley-remote`, `sley-transport` |
+| CLI options / registry | `sley-options` |
 | Facade / CLI | `sley`, `sley-cli` |
 | Parity / performance | `sley-testkit`, `sley-bench` |
+
+## Architecture
+
+Behavior lives in typed engine crates; the `sley::Repository` facade is the
+embedder entry point; `sley-cli` is a thin argv/setup/dispatch shell. Prefer
+table-driven CLI options (`sley-options`) and shared engines over per-command
+handlers ([ADR 0001](docs/adr/0001-cli-layer-engines.md)). Large payloads stream
+as pull `Read`/`Write` with cooperative cancel and sideband demux as a `Read`
+adapter ([ADR 0002](docs/adr/0002-streaming-io-house-rule.md)). Clustered
+upstream/parity work by engine is tracked in
+[`docs/ROADMAP_ENGINES.md`](docs/ROADMAP_ENGINES.md).
 
 ## Documentation
 
@@ -125,6 +137,9 @@ Linux certification commands.
 | [`GOAL.md`](GOAL.md) | Long-term product goal |
 | [`GIT_PARITY_CHECKLIST.md`](GIT_PARITY_CHECKLIST.md) | Phase checklist and release gates |
 | [`TRACKER.md`](TRACKER.md) | Living engineering tracker |
+| [`docs/ROADMAP_ENGINES.md`](docs/ROADMAP_ENGINES.md) | Engine-clustered parity roadmap |
+| [`docs/adr/0001-cli-layer-engines.md`](docs/adr/0001-cli-layer-engines.md) | CLI engines over per-command handlers |
+| [`docs/adr/0002-streaming-io-house-rule.md`](docs/adr/0002-streaming-io-house-rule.md) | Streaming I/O and cancel house rule |
 | [`crates/sley-testkit/UPSTREAM_TIMINGS.md`](crates/sley-testkit/UPSTREAM_TIMINGS.md) | Exact-work timing protocol and evidence |
 | [`docs/adr/`](docs/adr/) | Architecture decisions |
 

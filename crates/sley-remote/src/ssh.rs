@@ -25,16 +25,22 @@ use std::env;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::install::{
-    ProgressInstaller, install_upload_pack_raw_promisor_response_from_reader,
-    install_upload_pack_raw_response_from_reader,
-    install_upload_pack_shallow_raw_promisor_response_from_reader,
-    install_upload_pack_shallow_raw_response_from_reader,
+    ProgressInstaller, install_upload_pack_raw_promisor_response_from_reader_with_cancel,
+    install_upload_pack_raw_response_from_reader_with_cancel,
+    install_upload_pack_shallow_raw_promisor_response_from_reader_with_cancel,
+    install_upload_pack_shallow_raw_response_from_reader_with_cancel,
 };
 use sley_config::GitConfig;
-use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{
+    CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result, is_cancelled_error,
+    kill_child_if_cancelled,
+};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::write_pkt_line_payload;
 use sley_protocol::{
@@ -165,6 +171,47 @@ impl StderrDrain {
     fn finish(self) -> Vec<u8> {
         self.handle.join().unwrap_or_default()
     }
+}
+
+/// Run `body` while a scoped watcher kills `child` if `cancel` trips.
+///
+/// Cooperative [`CancelFlag`] / pack-install [`CancellableRead`] alone cannot
+/// interrupt a kernel `read` blocked on the SSH stdout pipe. The watcher polls
+/// cancel and kills the child so the pipe closes and the blocked read wakes
+/// (EOF / error), allowing the install path to surface [`GitError::Cancelled`].
+fn with_ssh_child_cancel_watch<T>(
+    child: &Arc<Mutex<Child>>,
+    cancel: CancelFlag<'_>,
+    body: impl FnOnce() -> T,
+) -> T {
+    let stop = AtomicBool::new(false);
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    std::thread::scope(|scope| {
+        let watch_child = Arc::clone(child);
+        let watch_cancel = cancel;
+        let watch_stop = &stop;
+        scope.spawn(move || {
+            while !watch_stop.load(Ordering::Relaxed) {
+                if watch_cancel.is_cancelled() {
+                    if let Ok(mut guard) = watch_child.lock() {
+                        let _ = guard.kill();
+                    }
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        // Ensure the watcher always observes stop, even if `body` panics.
+        let _stop_guard = StopOnDrop(&stop);
+        body()
+        // Scope joins the watcher before returning.
+    })
 }
 
 struct ExtGitRequest {
@@ -735,6 +782,7 @@ pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Res
 pub(crate) fn execute_push_ssh_plan(
     request: PushRequest<'_>,
     mut plan: SshPushPlan,
+    cancel: CancelFlag<'_>,
 ) -> Result<PushOutcome> {
     if plan.commands.is_empty() {
         return Ok(PushOutcome::default());
@@ -745,7 +793,7 @@ pub(crate) fn execute_push_ssh_plan(
         .ok_or_else(|| GitError::Command("ssh receive-pack stdin was not available".into()))?;
     let commands = plan.commands.clone();
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
-    crate::pack::write_receive_pack_body(
+    let write_result = crate::pack::write_receive_pack_body_with_cancel(
         &crate::pack::PushPackRequest {
             local_db: &local_db,
             format: request.format,
@@ -763,7 +811,20 @@ pub(crate) fn execute_push_ssh_plan(
             thin: request.options.thin.wants_thin(),
         },
         &mut stdin,
-    )?;
+        cancel,
+    );
+    // Tear down the ssh child on cancel so a blocked remote does not linger.
+    kill_child_if_cancelled(&mut plan.child, cancel);
+    if cancel.is_cancelled() || write_result.as_ref().err().is_some_and(is_cancelled_error) {
+        drop(stdin);
+        let _ = plan.child.wait();
+        let _ = plan.stderr_drain.finish();
+        return match write_result {
+            Err(err) if is_cancelled_error(&err) => Err(err),
+            _ => Err(GitError::Cancelled),
+        };
+    }
+    write_result?;
     drop(stdin);
 
     let report = if plan.features.report_status || plan.features.report_status_v2 {
@@ -928,6 +989,7 @@ pub struct SshFetchPackRequest<'a> {
 pub fn install_fetch_pack_via_ssh_upload_pack(
     request: SshFetchPackRequest<'_>,
     progress: &mut dyn ProgressSink,
+    cancel: CancelFlag<'_>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if request.wants.is_empty() {
         return Ok(Vec::new());
@@ -951,7 +1013,7 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
         .clone()
         .map(Ok)
         .unwrap_or_else(|| crate::local::local_have_oids(request.git_dir, request.format))?;
-    let (mut child, stdin, mut stdout, stderr_drain) = spawn_service_process(
+    let (child, stdin, mut stdout, stderr_drain) = spawn_service_process(
         request.remote,
         GitService::UploadPack,
         true,
@@ -969,43 +1031,76 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
     )?;
     drop(stdin);
 
-    let shallow_info = if request.deepen.is_some() {
-        if request.promisor {
-            let (shallow_info, _) = install_upload_pack_shallow_raw_promisor_response_from_reader(
+    // Share the child with a cancel watcher so a mid-transfer cancel can kill
+    // the ssh process and wake a blocked stdout read (CancellableRead alone only
+    // polls between successful user-space reads).
+    let child = Arc::new(Mutex::new(child));
+    let install_result = with_ssh_child_cancel_watch(&child, cancel, || {
+        if request.deepen.is_some() {
+            if request.promisor {
+                install_upload_pack_shallow_raw_promisor_response_from_reader_with_cancel(
+                    request.format,
+                    &mut stdout,
+                    &local_db,
+                    request.max_input_size,
+                    cancel,
+                )
+                .map(|(shallow_info, _)| shallow_info)
+            } else {
+                install_upload_pack_shallow_raw_response_from_reader_with_cancel(
+                    request.format,
+                    &mut stdout,
+                    &ProgressInstaller::new(&local_db, progress),
+                    request.max_input_size,
+                    cancel,
+                )
+                .map(|(shallow_info, _)| shallow_info)
+            }
+        } else if request.promisor {
+            install_upload_pack_raw_promisor_response_from_reader_with_cancel(
                 request.format,
                 &mut stdout,
                 &local_db,
                 request.max_input_size,
-            )?;
-            shallow_info
+                cancel,
+            )
+            .map(|_| Vec::new())
         } else {
-            let (shallow_info, _) = install_upload_pack_shallow_raw_response_from_reader(
+            install_upload_pack_raw_response_from_reader_with_cancel(
                 request.format,
                 &mut stdout,
                 &ProgressInstaller::new(&local_db, progress),
                 request.max_input_size,
-            )?;
-            shallow_info
+                cancel,
+            )
+            .map(|_| Vec::new())
         }
-    } else {
-        if request.promisor {
-            install_upload_pack_raw_promisor_response_from_reader(
-                request.format,
-                &mut stdout,
-                &local_db,
-                request.max_input_size,
-            )?;
-        } else {
-            install_upload_pack_raw_response_from_reader(
-                request.format,
-                &mut stdout,
-                &ProgressInstaller::new(&local_db, progress),
-                request.max_input_size,
-            )?;
-        }
-        Vec::new()
-    };
+    });
+
+    let mut child = child
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Always attempt kill when cancel is set so a stuck child does not linger
+    // after cooperative install returned Cancelled (or the watcher already
+    // tore the process down).
+    kill_child_if_cancelled(&mut child, cancel);
+    if cancel.is_cancelled()
+        || install_result
+            .as_ref()
+            .err()
+            .is_some_and(is_cancelled_error)
+    {
+        let _ = child.wait();
+        drop(child);
+        let _ = stderr_drain.finish();
+        return match install_result {
+            Err(err) if is_cancelled_error(&err) => Err(err),
+            _ => Err(GitError::Cancelled),
+        };
+    }
+
     let status = child.wait()?;
+    drop(child);
     let stderr = stderr_drain.finish();
     if !status.success() {
         return Err(GitError::Command(format!(
@@ -1014,7 +1109,7 @@ pub fn install_fetch_pack_via_ssh_upload_pack(
             ssh_command_failure_message("ssh upload-pack", &stderr, status)
         )));
     }
-    Ok(shallow_info)
+    install_result
 }
 
 fn all_wants_present(db: &FileObjectDatabase, wants: &[ObjectId]) -> Result<bool> {

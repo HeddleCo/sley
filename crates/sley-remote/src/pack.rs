@@ -7,10 +7,10 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
-use sley_core::{ObjectFormat, ObjectId, Result};
+use sley_core::{CancelFlag, ObjectFormat, ObjectId, Result};
 use sley_odb::{
-    FileObjectDatabase, ObjectReader, collect_reachable_object_ids, write_object_id_pack_to_writer,
-    write_reachable_pack_to_writer,
+    FileObjectDatabase, ObjectReader, collect_reachable_object_ids,
+    write_object_id_pack_to_writer_with_cancel, write_reachable_pack_to_writer_with_cancel,
 };
 use sley_pack::{PackFile, PackInput, PackWriteOptions};
 use sley_protocol::{
@@ -80,6 +80,18 @@ pub fn write_push_packfile<W>(req: &PushPackRequest<'_>, writer: &mut W) -> Resu
 where
     W: Write,
 {
+    write_push_packfile_with_cancel(req, writer, CancelFlag::never())
+}
+
+/// Like [`write_push_packfile`], polling `cancel` while generating the pack.
+pub fn write_push_packfile_with_cancel<W>(
+    req: &PushPackRequest<'_>,
+    writer: &mut W,
+    cancel: CancelFlag<'_>,
+) -> Result<()>
+where
+    W: Write,
+{
     let remote_excluded_tips =
         remote_advertisement_tips_known_to_local(req.local_db, req.remote_advertisements)?;
     let remote_excluded =
@@ -90,14 +102,15 @@ where
     }
 
     if req.thin && !req.features.no_thin {
-        write_thin_push_packfile(req, starts, &remote_excluded, writer)
+        write_thin_push_packfile_with_cancel(req, starts, &remote_excluded, writer, cancel)
     } else {
-        if write_reachable_pack_to_writer(
+        if write_reachable_pack_to_writer_with_cancel(
             req.local_db,
             req.format,
             starts,
             &remote_excluded,
             writer,
+            cancel,
         )?
         .is_none()
         {
@@ -135,11 +148,12 @@ pub(crate) fn push_pack_roots(
         .collect()
 }
 
-fn write_thin_push_packfile<W>(
+fn write_thin_push_packfile_with_cancel<W>(
     req: &PushPackRequest<'_>,
     starts: Vec<sley_core::ObjectId>,
     remote_excluded: &HashSet<sley_core::ObjectId>,
     writer: &mut W,
+    cancel: CancelFlag<'_>,
 ) -> Result<()>
 where
     W: Write,
@@ -154,10 +168,17 @@ where
         return write_empty_packfile(req.format, writer);
     }
     if to_send.len() >= THIN_PUSH_STREAMING_MIN_OBJECTS {
-        write_object_id_pack_to_writer(req.local_db, req.format, &to_send, writer)?;
+        write_object_id_pack_to_writer_with_cancel(
+            req.local_db,
+            req.format,
+            &to_send,
+            writer,
+            cancel,
+        )?;
         return Ok(());
     }
 
+    cancel.check()?;
     let mut remote_base_oids = remote_excluded.iter().copied().collect::<Vec<_>>();
     remote_base_oids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
 
@@ -203,13 +224,25 @@ pub fn write_receive_pack_body<W>(req: &PushPackRequest<'_>, writer: &mut W) -> 
 where
     W: Write,
 {
+    write_receive_pack_body_with_cancel(req, writer, CancelFlag::never())
+}
+
+/// Like [`write_receive_pack_body`], threading `cancel` into pack generation.
+pub fn write_receive_pack_body_with_cancel<W>(
+    req: &PushPackRequest<'_>,
+    writer: &mut W,
+    cancel: CancelFlag<'_>,
+) -> Result<()>
+where
+    W: Write,
+{
     let header = build_receive_pack_push_request_header(
         req.features,
         req.commands.to_vec(),
         req.options.clone(),
     )?;
     write_receive_pack_push_request_header(writer, &header)?;
-    write_push_packfile(req, writer)
+    write_push_packfile_with_cancel(req, writer, cancel)
 }
 
 #[cfg(test)]
@@ -217,7 +250,7 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use sley_core::ObjectId;
+    use sley_core::{AtomicCancel, CancelFlag, GitError, ObjectId};
     use sley_object::{EncodedObject, ObjectType};
     use sley_odb::{FileObjectDatabase, ObjectWriter};
     use sley_protocol::{
@@ -449,6 +482,36 @@ mod tests {
         ))
         .expect("full pack");
         assert_eq!(thin_pack, full_pack);
+
+        let _ = fs::remove_dir_all(git_dir);
+    }
+
+    #[test]
+    fn write_push_packfile_pre_cancelled_returns_cancelled() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+
+        let base_oid = write_blob(&mut db, b"cancel base\n");
+        let new_oid = write_blob(&mut db, b"cancel new payload\n");
+        let commands = [push_command(&base_oid, &new_oid)];
+        let remote_advertisements = [advertisement(&base_oid, "refs/heads/main")];
+        let features = default_features();
+        let req = pack_request(
+            &db,
+            format,
+            &commands,
+            &remote_advertisements,
+            &features,
+            false,
+        );
+
+        let source = AtomicCancel::new();
+        source.cancel();
+        let mut written = Vec::new();
+        let err = write_push_packfile_with_cancel(&req, &mut written, CancelFlag::new(&source))
+            .expect_err("pre-cancelled push pack write should fail");
+        assert_eq!(err, GitError::Cancelled);
 
         let _ = fs::remove_dir_all(git_dir);
     }

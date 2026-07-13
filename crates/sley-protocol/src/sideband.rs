@@ -1,9 +1,10 @@
 use sley_core::{GitError, Result};
-use std::io::{Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 
 use crate::pktline::{
     PKT_LINE_MAX_PAYLOAD_LEN, PktLineFrame, line_from_str, parse_protocol_v2_line_text,
-    pkt_line_header, read_pkt_line_frames_until_flush, write_pkt_line_payload,
+    pkt_line_header, read_pkt_line_frame, read_pkt_line_frames_until_flush, trim_trailing_lf,
+    write_pkt_line_payload,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +199,254 @@ pub fn demux_sideband_stream(frames: &[PktLineFrame]) -> Result<SideBandDemux> {
 pub fn read_and_demux_sideband_stream(reader: &mut impl Read) -> Result<SideBandDemux> {
     let packets = read_sideband_stream(reader)?;
     demux_sideband_packets(&packets)
+}
+
+/// Streaming demultiplexer for side-band / side-band-64k pkt-line streams.
+///
+/// Implements [`Read`] over the sideband data channel (channel 1). Progress
+/// (channel 2) is delivered via `on_progress`. Fatal (channel 3) and malformed
+/// frames surface as `std::io::Error`. The stream ends at the terminating flush
+/// pkt-line; subsequent reads return `Ok(0)` once any leftover data-channel
+/// bytes have been drained.
+///
+/// Pair with [`CancellableRead`](sley_core::CancellableRead) as an *outer*
+/// wrapper so pack install can observe cooperative cancel between reads without
+/// buffering the full demuxed pack.
+pub struct StreamingSidebandReader<R, F = fn(&[u8])> {
+    reader: R,
+    pending: Vec<u8>,
+    pending_offset: usize,
+    finished: bool,
+    /// When set, leading upload-pack `ACK`/`NAK` pkt-lines (before the first
+    /// sideband packet) are skipped — matching
+    /// [`parse_upload_pack_packfile_response`](crate::parse_upload_pack_packfile_response).
+    skip_upload_pack_acks: bool,
+    /// Fatal / protocol error deferred until after any already-drained data
+    /// bytes have been returned to the caller.
+    pending_error: Option<io::Error>,
+    on_progress: F,
+}
+
+impl<R, F> StreamingSidebandReader<R, F> {
+    /// Create a reader that demuxes a pure sideband stream (no ACK preamble).
+    pub fn new(reader: R, on_progress: F) -> Self {
+        Self {
+            reader,
+            pending: Vec::new(),
+            pending_offset: 0,
+            finished: false,
+            skip_upload_pack_acks: false,
+            pending_error: None,
+            on_progress,
+        }
+    }
+
+    /// Skip leading upload-pack `ACK`/`NAK` pkt-lines before the first sideband
+    /// frame. Used for smart-HTTP upload-pack packfile responses.
+    pub fn skip_upload_pack_acks(mut self) -> Self {
+        self.skip_upload_pack_acks = true;
+        self
+    }
+
+    /// Borrow the underlying reader.
+    pub fn get_ref(&self) -> &R {
+        &self.reader
+    }
+
+    /// Mutably borrow the underlying reader.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.reader
+    }
+
+    /// Unwrap the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+
+    /// Whether the terminating flush pkt-line has been observed.
+    ///
+    /// Pending data-channel bytes may still remain; subsequent reads return
+    /// `Ok(0)` only after those bytes are drained.
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Consume remaining sideband frames through the terminating flush.
+    ///
+    /// Pack install may stop reading once the pack trailer is complete while
+    /// the wire still has trailing progress frames and the flush pkt-line.
+    /// The buffered demux path always consumed the full response; call this
+    /// after a successful (or failed) pack install so connection reuse and
+    /// protocol state match that behavior.
+    pub fn drain_to_end(&mut self) -> io::Result<()>
+    where
+        R: Read,
+        F: FnMut(&[u8]),
+    {
+        let mut buf = [0u8; 8 * 1024];
+        loop {
+            match self.read(&mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(_) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn drain_pending(&mut self, buf: &mut [u8]) -> usize {
+        let available = self.pending.len().saturating_sub(self.pending_offset);
+        let to_copy = available.min(buf.len());
+        if to_copy == 0 {
+            if self.pending_offset >= self.pending.len() {
+                self.pending.clear();
+                self.pending_offset = 0;
+            }
+            return 0;
+        }
+        let end = self.pending_offset + to_copy;
+        buf[..to_copy].copy_from_slice(&self.pending[self.pending_offset..end]);
+        self.pending_offset = end;
+        if self.pending_offset == self.pending.len() {
+            self.pending.clear();
+            self.pending_offset = 0;
+        }
+        to_copy
+    }
+}
+
+impl<R: Read, F: FnMut(&[u8])> Read for StreamingSidebandReader<R, F> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if let Some(err) = self.pending_error.take() {
+            return Err(err);
+        }
+        let mut written = 0usize;
+        while written < buf.len() {
+            let copied = self.drain_pending(&mut buf[written..]);
+            if copied > 0 {
+                written += copied;
+                continue;
+            }
+            if self.finished {
+                break;
+            }
+            if let Some(err) = self.pending_error.take() {
+                if written > 0 {
+                    self.pending_error = Some(err);
+                    break;
+                }
+                return Err(err);
+            }
+            let frame = match read_pkt_line_frame(&mut self.reader) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    let err = io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "sideband stream ended before flush",
+                    );
+                    if written > 0 {
+                        self.pending_error = Some(err);
+                        break;
+                    }
+                    return Err(err);
+                }
+                Err(err) => {
+                    let err = sideband_git_error_to_io(err);
+                    if written > 0 {
+                        self.pending_error = Some(err);
+                        break;
+                    }
+                    return Err(err);
+                }
+            };
+            match frame {
+                PktLineFrame::Data(payload) => {
+                    if self.skip_upload_pack_acks && is_upload_pack_ack_or_nak_payload(&payload) {
+                        continue;
+                    }
+                    // Once any non-ACK frame is seen, further ACK-shaped lines
+                    // (if any) must be treated as sideband.
+                    self.skip_upload_pack_acks = false;
+                    let packet = match parse_sideband_packet(&payload) {
+                        Ok(packet) => packet,
+                        Err(err) => {
+                            let err = sideband_git_error_to_io(err);
+                            if written > 0 {
+                                self.pending_error = Some(err);
+                                break;
+                            }
+                            return Err(err);
+                        }
+                    };
+                    match packet.channel {
+                        SideBandChannel::Data => {
+                            if packet.data.is_empty() {
+                                continue;
+                            }
+                            self.pending = packet.data;
+                            self.pending_offset = 0;
+                        }
+                        SideBandChannel::Progress => {
+                            (self.on_progress)(&packet.data);
+                        }
+                        SideBandChannel::Fatal => {
+                            let message = String::from_utf8_lossy(&packet.data).into_owned();
+                            let err = io::Error::new(
+                                ErrorKind::InvalidData,
+                                format!("sideband fatal: {message}"),
+                            );
+                            if written > 0 {
+                                self.pending_error = Some(err);
+                                break;
+                            }
+                            return Err(err);
+                        }
+                    }
+                }
+                PktLineFrame::Flush => {
+                    self.finished = true;
+                    break;
+                }
+                PktLineFrame::Delimiter | PktLineFrame::ResponseEnd => {
+                    let err = io::Error::new(
+                        ErrorKind::InvalidData,
+                        "sideband stream contains a non-flush control packet",
+                    );
+                    if written > 0 {
+                        self.pending_error = Some(err);
+                        break;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Ok(written)
+    }
+}
+
+/// Detect upload-pack acknowledgment pkt-lines that may precede sideband data.
+///
+/// Matches the preamble rule in
+/// [`parse_upload_pack_packfile_response`](crate::parse_upload_pack_packfile_response):
+/// `NAK` (with optional trailing LF) or any payload starting with `ACK `.
+fn is_upload_pack_ack_or_nak_payload(payload: &[u8]) -> bool {
+    trim_trailing_lf(payload) == b"NAK" || payload.starts_with(b"ACK ")
+}
+
+fn sideband_git_error_to_io(err: GitError) -> io::Error {
+    match err {
+        GitError::Io(message) => {
+            if message.contains("cancelled") {
+                sley_core::cancelled_io_error()
+            } else {
+                io::Error::other(message)
+            }
+        }
+        GitError::Cancelled => sley_core::cancelled_io_error(),
+        other => io::Error::new(ErrorKind::InvalidData, other.to_string()),
+    }
 }
 
 pub fn parse_upload_archive_request(frames: &[PktLineFrame]) -> Result<UploadArchiveRequest> {

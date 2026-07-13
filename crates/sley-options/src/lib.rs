@@ -1,3 +1,23 @@
+//! Byte-faithful port of Git's `parse-options` for sley CLI surfaces.
+//!
+//! # Pilot (ADR 0001 epic A)
+//!
+//! Prefer declarative tables over hand-rolled `while let Some(arg)` loops:
+//!
+//! * [`OptionSpec`] + [`OptValue`] — per-option type, metavar, and help
+//! * [`OptFlags`] — `NONEG`, `OPTARG`, `NODASH`, `HIDDEN` (Git's `PARSE_OPT_*`)
+//! * [`parse_options`] — long/short parsing, `--no-` negation, abbreviation,
+//!   short bundling, `=value`, `--`, usage / `-h` / `--help`, exit **129**
+//! * [`CommandRegistry`] / [`CommandSpec`] — sorted command metadata for help
+//!   and completion (see `sley-cli` help)
+//!
+//! **Pilot migrations:** pack/refs/ls-remote/name-rev option tables, plus
+//! `git version` (`--build-options`). New commands should add a static
+//! `&[OptionSpec]` and call [`parse_options`] rather than private parsers.
+//!
+//! Shared value validators that still live outside typed `OptValue` live in
+//! [`validators`].
+
 pub mod validators;
 
 use std::fmt;

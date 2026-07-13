@@ -272,6 +272,8 @@ pub struct RemoteHelperFetchServices<'a> {
     pub progress: &'a mut dyn ProgressSink,
     /// Optional reference-transaction hook runner.
     pub ref_hook: Option<&'a dyn sley_refs::ReferenceTransactionHook>,
+    /// Cooperative cancel for pack receive during helper finalization.
+    pub cancel: sley_core::DynCancelFlag<'a>,
 }
 
 /// Controls for the protocol-affecting portion of a remote-helper push.
@@ -775,6 +777,7 @@ pub fn fetch_via_discovered_remote_helper(
             credentials: services.credentials,
             progress: services.progress,
             ref_hook: services.ref_hook,
+            cancel: services.cancel,
         },
     )
 }

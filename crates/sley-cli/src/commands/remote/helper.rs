@@ -52,6 +52,7 @@ pub(crate) fn fetch_with_remote_helper(
             credentials: &mut credentials,
             progress: &mut progress,
             ref_hook: Some(&ref_hook),
+            cancel: sley_core::CancelFlag::never(),
         },
     )
     .map(Some)
@@ -106,6 +107,7 @@ pub(crate) fn fetch_with_discovered_remote_helper(
             credentials: &mut credentials,
             progress: &mut progress,
             ref_hook: Some(&ref_hook),
+            cancel: sley_core::CancelFlag::never(),
         },
     )
     .map_err(render_remote_helper_error)
