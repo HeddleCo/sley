@@ -19,6 +19,7 @@ sley-notes.workspace = true
 sley-odb.workspace = true
 sley-pack.workspace = true
 sley-pretty.workspace = true
+sley-protocol.workspace = true
 sley-refs.workspace = true
 sley-rev.workspace = true
 sley-sequencer.workspace = true

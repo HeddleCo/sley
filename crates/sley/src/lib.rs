@@ -25,6 +25,8 @@
 //! * Cancel — cooperative stream cancellation for pack receive/generate:
 //!   [`AtomicCancel`], [`CancelFlag`], [`CancellableRead`], [`OperationContext`],
 //!   plus `Repository::{fetch,push,push_actions}_with_cancel`.
+//! * [`pack`] / [`protocol`] — repository-free streaming pack indexing and
+//!   upload-pack sideband demultiplexing for custom storage pipelines.
 //! * [`hooks`] — traditional and config-defined hook discovery/execution.
 //! * [`OpenOptions::respect_environment`] / [`Repository::open_from_environment`]
 //!   — honor `GIT_DIR`, `GIT_WORK_TREE`, and related discovery env vars.
@@ -96,6 +98,24 @@ pub mod notes {
     pub use sley_notes::*;
 }
 
+/// Streaming pack indexing primitives for embedders ([`sley_pack`]).
+pub mod pack {
+    pub use sley_pack::{
+        PackIndexEntry, PackIndexedObject, PackReadStream, PackStreamIndexBuild,
+        PackStreamProgress, PackWrite, index_pack_from_reader, index_pack_from_reader_to_trailer,
+        index_pack_from_reader_to_trailer_with_progress, index_pack_from_stream,
+        index_pack_from_stream_with_progress,
+    };
+}
+
+/// Streaming Git protocol primitives for embedders ([`sley_protocol`]).
+pub mod protocol {
+    pub use sley_protocol::{
+        PktLineFrame, SideBandChannel, SideBandPacket, StreamingSidebandReader,
+        encode_sideband_packet, parse_sideband_packet, write_sideband_packet,
+    };
+}
+
 /// Re-exports of the underlying plumbing crates for callers that need direct
 /// access to the engine. Everything reachable through [`Repository`] is built
 /// from these, and they remain available for the operations the facade does not
@@ -113,6 +133,7 @@ pub mod plumbing {
     pub use sley_odb;
     pub use sley_pack;
     pub use sley_pretty;
+    pub use sley_protocol;
     pub use sley_refs;
     #[cfg(feature = "remote")]
     pub use sley_remote;

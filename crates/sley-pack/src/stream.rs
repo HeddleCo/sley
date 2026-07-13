@@ -4,7 +4,27 @@
 //! (no function body changed); all items are re-exported from `lib.rs`.
 use super::*;
 
-pub(crate) fn index_pack_from_reader<R>(
+/// Validate and index a seekable pack stream without writing into a repository.
+///
+/// The reader is consumed from its current position through EOF and left at EOF
+/// on success. Embedders can use the returned bytes as the pack's v2 `.idx`.
+pub fn index_pack_from_reader<R>(
+    reader: &mut R,
+    format: ObjectFormat,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read + Seek,
+{
+    let start = reader.stream_position()?;
+    let end = reader.seek(SeekFrom::End(0))?;
+    let pack_len = end
+        .checked_sub(start)
+        .ok_or_else(|| GitError::InvalidFormat("pack stream position overflow".into()))?;
+    reader.seek(SeekFrom::Start(start))?;
+    index_pack_from_reader_with_len(reader, format, pack_len)
+}
+
+pub(crate) fn index_pack_from_reader_with_len<R>(
     reader: &mut R,
     format: ObjectFormat,
     pack_len: u64,
@@ -15,7 +35,11 @@ where
     index_pack_from_stream(PackReadStream::new(reader, format, Some(pack_len))?, format)
 }
 
-pub(crate) fn index_pack_from_reader_to_trailer<R>(
+/// Validate and index one pack from a stream, stopping after its trailer.
+///
+/// This variant supports non-seekable upload-pack streams whose length is not
+/// known in advance and returns the v2 `.idx` without installing the pack.
+pub fn index_pack_from_reader_to_trailer<R>(
     reader: &mut R,
     format: ObjectFormat,
 ) -> Result<PackStreamIndexBuild>
@@ -23,6 +47,27 @@ where
     R: Read,
 {
     index_pack_from_stream(PackReadStream::new(reader, format, None)?, format)
+}
+
+/// Index one non-seekable pack through its trailer and report receive progress.
+///
+/// Embedders can use this while streaming upload-pack data to surface byte and
+/// object counters without writing the pack into a repository.
+pub fn index_pack_from_reader_to_trailer_with_progress<R, F>(
+    reader: &mut R,
+    format: ObjectFormat,
+    progress: F,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+    F: FnMut(PackStreamProgress),
+{
+    index_pack_from_reader_to_trailer_with_progress_and_cancel(
+        reader,
+        format,
+        CancelFlag::never(),
+        progress,
+    )
 }
 
 pub(crate) fn index_pack_from_reader_to_trailer_with_progress_and_cancel<R, F>(
@@ -35,7 +80,7 @@ where
     R: Read,
     F: FnMut(PackStreamProgress),
 {
-    index_pack_from_stream_with_progress(
+    index_pack_from_stream_with_progress_and_cancel(
         PackReadStream::new(reader, format, None)?,
         format,
         cancel,
@@ -43,21 +88,41 @@ where
     )
 }
 
-pub(crate) fn index_pack_from_stream<R>(
+/// Index a prepared [`PackReadStream`] without progress callbacks.
+///
+/// This lower-level entry point lets embedders select bounded or trailer-based
+/// streaming before producing the pack's v2 `.idx` bytes.
+pub fn index_pack_from_stream<R>(
     stream: PackReadStream<'_, R>,
     format: ObjectFormat,
 ) -> Result<PackStreamIndexBuild>
 where
     R: Read,
 {
-    index_pack_from_stream_with_progress(stream, format, CancelFlag::never(), |_| {})
+    index_pack_from_stream_with_progress(stream, format, |_| {})
 }
 
 /// Approximate cadence for progress emission: report at least every this many
 /// pack bytes, matching how git paces "Receiving objects" (no per-object churn).
 pub(crate) const PROGRESS_BYTE_STEP: u64 = 256 * 1024;
 
-pub(crate) fn index_pack_from_stream_with_progress<R, F>(
+/// Index a prepared [`PackReadStream`] and report receive progress.
+///
+/// The callback receives monotonic byte and object counters while the v2
+/// `.idx` is produced entirely in memory.
+pub fn index_pack_from_stream_with_progress<R, F>(
+    stream: PackReadStream<'_, R>,
+    format: ObjectFormat,
+    progress: F,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+    F: FnMut(PackStreamProgress),
+{
+    index_pack_from_stream_with_progress_and_cancel(stream, format, CancelFlag::never(), progress)
+}
+
+pub(crate) fn index_pack_from_stream_with_progress_and_cancel<R, F>(
     mut stream: PackReadStream<'_, R>,
     format: ObjectFormat,
     cancel: CancelFlag<'_>,
@@ -219,7 +284,11 @@ pub(crate) fn pack_object_kind_to_object_type(kind: PackObjectKind) -> Result<Ob
     }
 }
 
-pub(crate) struct PackReadStream<'a, R> {
+/// A pack-byte reader configured for a known length or trailer-delimited input.
+///
+/// Construct this when using [`index_pack_from_stream`] directly; pass a pack
+/// length for bounded seekable input or `None` to stop at the pack trailer.
+pub struct PackReadStream<'a, R> {
     reader: &'a mut R,
     position: u64,
     pack_len: Option<u64>,
@@ -233,11 +302,8 @@ impl<'a, R> PackReadStream<'a, R>
 where
     R: Read,
 {
-    pub(crate) fn new(
-        reader: &'a mut R,
-        format: ObjectFormat,
-        pack_len: Option<u64>,
-    ) -> Result<Self> {
+    /// Wrap `reader` at its current position for streaming pack indexing.
+    pub fn new(reader: &'a mut R, format: ObjectFormat, pack_len: Option<u64>) -> Result<Self> {
         let trailer_len = format.raw_len() as u64;
         let trailer_position = pack_len
             .map(|pack_len| {
