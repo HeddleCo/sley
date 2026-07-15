@@ -1048,6 +1048,28 @@ where
 }
 
 pub(crate) fn apply_pack_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
+    let result_size = decoded_delta_result_size(delta)?;
+    let result_size_hint = usize::try_from(result_size).unwrap_or(usize::MAX);
+    let reserve = inflate::bounded_inflate_reserve(result_size_hint, delta.len());
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(reserve)
+        .map_err(|error| GitError::InvalidObject(format!("delta allocation failed: {error}")))?;
+    apply_pack_delta_into(base, delta, &mut result, CancelFlag::never())?;
+    Ok(result)
+}
+
+pub(crate) fn apply_pack_delta_into(
+    base: &[u8],
+    delta: &[u8],
+    result: &mut Vec<u8>,
+    cancel: CancelFlag<'_>,
+) -> Result<()> {
+    if !result.is_empty() {
+        return Err(GitError::InvalidObject(
+            "delta output buffer must be empty".into(),
+        ));
+    }
     let mut cursor = 0usize;
     let base_size = read_delta_varint(delta, &mut cursor)?;
     if base_size != base.len() as u64 {
@@ -1057,20 +1079,12 @@ pub(crate) fn apply_pack_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
         )));
     }
     let result_size = read_delta_varint(delta, &mut cursor)?;
-    // `result_size` is an attacker-controlled delta varint from a network pack
-    // (install_raw_pack -> sley-fetch). On 64-bit a naive `result_size as usize`
-    // (or `.min(usize::MAX)`, a no-op there) lets a tiny delta declare
-    // `u64::MAX`/1 TiB and drive `with_capacity` to abort the process before the
-    // size-mismatch check below can fire. Route the up-front reservation through
-    // the sley#2 bound so the speculative allocation is capped; `result.extend`
-    // still grows the buffer organically and the post-decode length check
-    // (`result.len() != result_size`) rejects the lie cleanly.
+    // `result_size` is an attacker-controlled delta varint from a network pack.
+    // The caller reserves fallibly, and each command below also grows fallibly;
+    // the declared result size bounds logical output before either extension.
     let result_size_hint = usize::try_from(result_size).unwrap_or(usize::MAX);
-    let mut result = Vec::with_capacity(inflate::bounded_inflate_reserve(
-        result_size_hint,
-        delta.len(),
-    ));
     while cursor < delta.len() {
+        cancel.check()?;
         let command = delta[cursor];
         cursor += 1;
         if command & 0x80 != 0 {
@@ -1098,6 +1112,9 @@ pub(crate) fn apply_pack_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
                     "delta instructions exceed declared result size".into(),
                 ));
             }
+            result.try_reserve_exact(slice.len()).map_err(|error| {
+                GitError::InvalidObject(format!("delta output allocation failed: {error}"))
+            })?;
             result.extend_from_slice(slice);
         } else if command != 0 {
             let len = usize::from(command);
@@ -1114,6 +1131,9 @@ pub(crate) fn apply_pack_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
                     "delta instructions exceed declared result size".into(),
                 ));
             }
+            result.try_reserve_exact(slice.len()).map_err(|error| {
+                GitError::InvalidObject(format!("delta output allocation failed: {error}"))
+            })?;
             result.extend_from_slice(slice);
             cursor = end;
         } else {
@@ -1128,7 +1148,7 @@ pub(crate) fn apply_pack_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
             result.len()
         )));
     }
-    Ok(result)
+    Ok(())
 }
 
 pub(crate) fn decoded_delta_result_size(delta: &[u8]) -> Result<u64> {

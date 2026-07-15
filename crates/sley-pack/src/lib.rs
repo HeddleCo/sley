@@ -589,6 +589,23 @@ mod tests {
     }
 
     #[test]
+    fn bounded_delta_application_polls_cancel_between_commands() {
+        let base = vec![b'x'; 4096];
+        let mut result = base.clone();
+        result.extend_from_slice(b"changed");
+        let delta = DeltaIndex::new(&base).delta(&result).expect("delta");
+        let mut out = Vec::with_capacity(result.len());
+        let source = AtomicCancel::new();
+        source.cancel();
+
+        assert_eq!(
+            apply_pack_delta_into(&base, &delta, &mut out, CancelFlag::new(&source)),
+            Err(GitError::Cancelled)
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
     fn rejects_bundle_pack_payload_with_wrong_object_format() {
         let pack = single_object_pack(ObjectFormat::Sha1, ObjectType::Blob, b"bundle\n");
         let oid = sley_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"bundle\n")
