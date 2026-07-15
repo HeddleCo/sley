@@ -86,8 +86,13 @@ jobs:
           echo "${ORACLE_GIT_TAG#v}" > version
           make -j"$(nproc)" prefix=/tmp/git-prefix USE_LIBPCRE2=1 NO_TCLTK=YesPlease install 2>&1 | tail -20
 
-      - name: Build sley
-        run: cargo build -p sley-cli --bin sley --release --features git-compat-i18n
+      - name: Build native Sley binaries
+        run: cargo build -p sley-cli --bins --release --features git-compat-i18n
+
+      - name: Verify native Sley binaries
+        run: |
+          test -x target/release/sley
+          test -x target/release/scalar
 
       - name: Validate curated manifest
         env:
@@ -150,6 +155,7 @@ jobs:
           SLEY_UPSTREAM_WAVES: "8"
           SLEY_TEST_TARGET: sley
           SLEY_BIN: ${{ github.workspace }}/target/release/sley
+          SLEY_SCALAR_BIN: ${{ github.workspace }}/target/release/scalar
           SLEY_REPORT: crates/sley-testkit/upstream-report.txt
           SLEY_SUMMARY: crates/sley-testkit/upstream-report-summary.csv
           SLEY_HISTORY: crates/sley-testkit/upstream-history.csv
