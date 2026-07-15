@@ -95,14 +95,58 @@ fn open_chain(
     (decoder, bases, locations)
 }
 
+#[derive(Clone, Copy)]
+enum ChainExpectation {
+    Success,
+    DepthLimit { attempted: usize },
+}
+
+fn assert_chain_on_stack(
+    chain: Arc<MultiPackChain>,
+    target_depth: usize,
+    max_depth: usize,
+    stack_size: usize,
+    expectation: ChainExpectation,
+) {
+    std::thread::Builder::new()
+        .stack_size(stack_size)
+        .spawn(move || {
+            let (mut decoder, bases, locations) =
+                open_chain(&chain, limits(max_depth, 64 * 1024, 8 * 1024));
+            match expectation {
+                ChainExpectation::Success => {
+                    let decoded = decoder
+                        .read_object_at_location(locations[target_depth], &bases)
+                        .expect("cold cross-pack chain");
+                    assert_eq!(decoded.object(), &chain.objects[target_depth]);
+                    assert_eq!(decoded.stats().delta_depth(), target_depth);
+                }
+                ChainExpectation::DepthLimit { attempted } => assert!(matches!(
+                    decoder.read_object_at_location(locations[target_depth], &bases),
+                    Err(PackReadError::Limit(limit))
+                        if limit.kind == PackLimitKind::DeltaDepth
+                            && limit.attempted == attempted
+                )),
+            }
+        })
+        .expect("bounded-stack thread")
+        .join()
+        .expect("decoder stack use must not depend on chain depth");
+}
+
 #[test]
 fn immutable_resolved_base_is_identity_bound_and_counted_without_copying() {
     let chain = multi_pack_chain(0, 24 * 1024, ObjectFormat::Sha1);
-    let (mut base_decoder, empty, base_locations) = open_chain(&chain, limits(8, 128 * 1024, 0));
+    let (mut base_decoder, empty, base_locations) =
+        open_chain(&chain, limits(8, 128 * 1024, 24 * 1024));
     let base_outcome = base_decoder
         .read_object_at_location(base_locations[0], &empty)
         .expect("base outcome");
+    assert_eq!(base_decoder.cached_bytes(), chain.objects[0].body.len());
     let resolved = base_outcome.resolved_base();
+    assert!(std::ptr::eq(base_outcome.object(), resolved.object()));
+    assert_eq!(resolved.object_id(), chain.oids[0]);
+    assert_eq!(resolved.delta_depth(), 0);
 
     let base = chain.objects[0].clone();
     let base_oid = chain.oids[0];
@@ -115,18 +159,7 @@ fn immutable_resolved_base_is_identity_bound_and_counted_without_copying() {
     )
     .expect("thin");
     let mut bases = RefDeltaBases::new();
-    bases
-        .insert_resolved(base_oid, resolved.clone())
-        .expect("matching identity");
-    assert!(
-        bases
-            .insert_resolved(
-                target.object_id(ObjectFormat::Sha1).expect("target id"),
-                resolved
-            )
-            .is_err(),
-        "safe code cannot bind one resolved object to another identity"
-    );
+    assert_eq!(bases.insert_resolved(resolved), base_oid);
 
     let mut generous = BoundedPackDecoder::new(
         thin.pack.clone(),
@@ -163,32 +196,118 @@ fn immutable_resolved_base_is_identity_bound_and_counted_without_copying() {
 }
 
 #[test]
+fn ref_location_identity_mismatch_is_rejected_before_delta_application() {
+    let base = EncodedObject::new(ObjectType::Blob, vec![b'a'; 8192]);
+    let mut target = base.clone();
+    target.body[0] = b'b';
+    let base_oid = base.object_id(ObjectFormat::Sha1).expect("base id");
+    let thin = PackFile::write_thin(
+        std::slice::from_ref(&target),
+        ObjectFormat::Sha1,
+        HashMap::from([(base_oid, base)]),
+    )
+    .expect("thin");
+    let unrelated = EncodedObject::new(ObjectType::Blob, vec![b'z'; 8192]);
+    let unrelated_pack =
+        PackFile::write_undeltified(std::slice::from_ref(&unrelated), ObjectFormat::Sha1)
+            .expect("unrelated pack");
+
+    let mut decoder =
+        BoundedPackDecoder::new(thin.pack, ObjectFormat::Sha1, limits(8, 64 * 1024, 0))
+            .expect("decoder");
+    let unrelated_source = decoder
+        .add_source(unrelated_pack.pack, ObjectFormat::Sha1)
+        .expect("source");
+    let mut bases = RefDeltaBases::new();
+    bases.insert_location(
+        base_oid,
+        PackObjectLocation::new(unrelated_source, unrelated_pack.entries[0].offset),
+    );
+    assert!(matches!(
+        decoder.read_object_at(thin.entries[0].offset, &bases),
+        Err(PackReadError::Pack(GitError::InvalidObject(message)))
+            if message.contains("identity mismatch")
+    ));
+    assert_eq!(decoder.cached_objects(), 0);
+}
+
+#[test]
+fn cold_and_warm_multi_pack_chains_share_exact_materialization_budget() {
+    let chain = multi_pack_chain(1, 24 * 1024, ObjectFormat::Sha1);
+    let generous = limits(8, 128 * 1024, 24 * 1024);
+
+    let (mut cold_measure, bases, locations) = open_chain(&chain, generous);
+    let cold_peak = cold_measure
+        .read_object_at_location(locations[1], &bases)
+        .expect("measure cold")
+        .stats()
+        .peak_materialized_bytes();
+    assert!(cold_peak >= chain.objects[0].body.len() * 2);
+
+    let (mut warm_measure, bases, locations) = open_chain(&chain, generous);
+    warm_measure
+        .read_object_at_location(locations[0], &bases)
+        .expect("warm base");
+    let warm_peak = warm_measure
+        .read_object_at_location(locations[1], &bases)
+        .expect("measure warm")
+        .stats()
+        .peak_materialized_bytes();
+    assert!(warm_peak >= chain.objects[0].body.len() * 2);
+
+    for (peak, warm_base) in [(cold_peak, false), (warm_peak, true)] {
+        let (mut exact, bases, locations) = open_chain(&chain, limits(8, peak, 24 * 1024));
+        if warm_base {
+            exact
+                .read_object_at_location(locations[0], &bases)
+                .expect("warm exact base");
+        }
+        exact
+            .read_object_at_location(locations[1], &bases)
+            .expect("exact multi-pack budget passes");
+
+        let (mut under, bases, locations) = open_chain(&chain, limits(8, peak - 1, 24 * 1024));
+        if warm_base {
+            under
+                .read_object_at_location(locations[0], &bases)
+                .expect("warm under-limit base");
+        }
+        assert!(matches!(
+            under.read_object_at_location(locations[1], &bases),
+            Err(PackReadError::Limit(limit))
+                if limit.kind == PackLimitKind::MaterializedBytes
+        ));
+    }
+}
+
+#[test]
+fn successful_decode_stack_baseline_is_independent_of_chain_depth() {
+    // A depth-zero diagnostic overflows a 64 KiB debug-test thread before any
+    // chain traversal, so 128 KiB is the fixed successful-decode baseline. Use
+    // that identical stack for shallow and very deep chains to catch retention
+    // that grows with attacker-controlled depth.
+    for depth in [0, 1, 16, 192] {
+        assert_chain_on_stack(
+            Arc::new(multi_pack_chain(depth, 4096, ObjectFormat::Sha1)),
+            depth,
+            depth,
+            128 * 1024,
+            ChainExpectation::Success,
+        );
+    }
+}
+
+#[test]
 fn cold_multi_pack_chain_is_iterative_and_enforces_cumulative_depth() {
     const DEPTH: usize = 192;
-    let chain = multi_pack_chain(DEPTH, 4096, ObjectFormat::Sha1);
-    std::thread::Builder::new()
-        .stack_size(64 * 1024)
-        .spawn(move || {
-            let (mut decoder, bases, locations) =
-                open_chain(&chain, limits(DEPTH, 64 * 1024, 8 * 1024));
-            let decoded = decoder
-                .read_object_at_location(locations[DEPTH], &bases)
-                .expect("deep cold cross-pack chain");
-            assert_eq!(decoded.object(), &chain.objects[DEPTH]);
-            assert_eq!(decoded.stats().delta_depth(), DEPTH);
-
-            let (mut over, bases, locations) =
-                open_chain(&chain, limits(DEPTH - 1, 64 * 1024, 8 * 1024));
-            assert!(matches!(
-                over.read_object_at_location(locations[DEPTH], &bases),
-                Err(PackReadError::Limit(limit))
-                    if limit.kind == PackLimitKind::DeltaDepth
-                        && limit.attempted == DEPTH
-            ));
-        })
-        .expect("small-stack thread")
-        .join()
-        .expect("iterative decoder must not overflow");
+    let chain = Arc::new(multi_pack_chain(DEPTH, 4096, ObjectFormat::Sha1));
+    assert_chain_on_stack(
+        chain,
+        DEPTH,
+        DEPTH - 1,
+        128 * 1024,
+        ChainExpectation::DepthLimit { attempted: DEPTH },
+    );
 }
 
 #[derive(Clone)]
@@ -272,6 +391,37 @@ fn cancelled_deep_multi_pack_read_does_not_poison_cache() {
 }
 
 #[test]
+fn cancellation_with_many_tiny_cache_entries_preserves_cache_state() {
+    let objects: Vec<_> = (0u8..=199)
+        .map(|byte| EncodedObject::new(ObjectType::Blob, vec![byte]))
+        .collect();
+    let written = PackFile::write_undeltified(&objects, ObjectFormat::Sha1).expect("pack");
+    let mut decoder =
+        BoundedPackDecoder::new(written.pack, ObjectFormat::Sha1, limits(0, 512, 200))
+            .expect("decoder");
+    for entry in &written.entries {
+        decoder
+            .read_object_at(entry.offset, &RefDeltaBases::new())
+            .expect("warm tiny entry");
+    }
+    assert_eq!(decoder.cached_objects(), 200);
+    assert_eq!(decoder.cached_bytes(), 200);
+
+    let cancel = AtomicCancel::new();
+    cancel.cancel();
+    assert!(matches!(
+        decoder.read_object_at_with_cancel(
+            written.entries[199].offset,
+            &RefDeltaBases::new(),
+            CancelFlag::new(&cancel),
+        ),
+        Err(PackReadError::Pack(GitError::Cancelled))
+    ));
+    assert_eq!(decoder.cached_objects(), 200);
+    assert_eq!(decoder.cached_bytes(), 200);
+}
+
+#[test]
 fn exact_compressed_stats_exclude_prefixes_and_zlib_read_ahead() {
     for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
         for prefer_ofs_delta in [true, false] {
@@ -291,6 +441,12 @@ fn exact_compressed_stats_exclude_prefixes_and_zlib_read_ahead() {
             )
             .expect("pack");
             assert_eq!(written.delta_count, 1);
+            let parsed = PackFile::parse(&written.pack, format).expect("parse fixture");
+            let expected: u64 = parsed
+                .entries
+                .iter()
+                .map(|entry| entry.entry.compressed_size)
+                .sum();
             let trailer_len = format.raw_len();
             let trailer = written.pack.split_off(written.pack.len() - trailer_len);
             written.pack.extend_from_slice(&[0xa5; 257]);
@@ -309,11 +465,6 @@ fn exact_compressed_stats_exclude_prefixes_and_zlib_read_ahead() {
             let decoded = decoder
                 .read_object_at(written.entries[1].offset, &bases)
                 .expect("delta target");
-            let expected: u64 = written
-                .entries
-                .iter()
-                .map(|entry| entry.compressed_size)
-                .sum();
             assert_eq!(decoded.stats().compressed_bytes_read(), expected);
             assert!(decoded.stats().source_bytes_read() > expected);
         }

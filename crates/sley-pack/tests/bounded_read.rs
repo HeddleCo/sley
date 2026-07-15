@@ -1,8 +1,8 @@
 use sley_core::{AtomicCancel, CancelFlag, GitError, ObjectFormat, ObjectId};
 use sley_object::{EncodedObject, ObjectType};
 use sley_pack::{
-    BoundedPackDecoder, PackDeltaDepth, PackFile, PackLimitKind, PackReadError, PackReadLimits,
-    PackReadSource, PackWriteOptions, RefDeltaBase, SlicePackSource,
+    BoundedPackDecoder, PackFile, PackLimitKind, PackObjectLocation, PackReadError, PackReadLimits,
+    PackReadSource, PackWriteOptions, RefDeltaBases, SlicePackSource,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -23,15 +23,17 @@ fn bounded_targeted_read_matches_existing_decoder_and_reports_usage() {
         BoundedPackDecoder::new(source, ObjectFormat::Sha1, limits).expect("open decoder");
 
     let decoded = decoder
-        .read_object_at(written.entries[0].offset, |_| Ok(None), |_, _, _| Ok(()))
+        .read_object_at(written.entries[0].offset, &RefDeltaBases::new())
         .expect("decode targeted object");
 
-    assert_eq!(*decoded.object, expected);
-    assert!(decoded.stats.source_bytes_read > 0);
-    assert_eq!(decoded.stats.cached_bytes, decoded.object.body.len());
-    assert!(decoded.stats.peak_materialized_bytes >= decoded.object.body.len());
-    assert!(decoded.stats.peak_materialized_bytes <= limits.max_materialized_bytes);
-    assert!(decoded.stats.cached_bytes <= limits.max_cached_bytes);
+    assert_eq!(decoded.object(), &expected);
+    assert_eq!(decoded.object_id(), written.entries[0].oid);
+    assert!(decoded.stats().source_bytes_read() > 0);
+    assert!(decoded.stats().compressed_bytes_read() > 0);
+    assert_eq!(decoded.stats().cached_bytes(), decoded.object().body.len());
+    assert!(decoded.stats().peak_materialized_bytes() >= decoded.object().body.len());
+    assert!(decoded.stats().peak_materialized_bytes() <= limits.max_materialized_bytes);
+    assert!(decoded.stats().cached_bytes() <= limits.max_cached_bytes);
 }
 
 fn similar_objects(count: usize, body_len: usize) -> Vec<EncodedObject> {
@@ -79,22 +81,25 @@ fn bounded_decoder_matches_existing_decoder_for_ofs_and_in_pack_ref_deltas() {
             let mut decoder =
                 BoundedPackDecoder::new(SlicePackSource::new(&written.pack), format, limits)
                     .expect("open decoder");
+            let mut bases = RefDeltaBases::new();
+            for (oid, offset) in &offsets {
+                bases.insert_location(
+                    *oid,
+                    PackObjectLocation::new(decoder.primary_source(), *offset),
+                );
+            }
 
             let mut delta_reads = 0;
             // Reverse order makes the first read traverse the complete chain before
             // any possible base has been warmed in the cache.
             for expected in parsed.entries.iter().rev() {
                 let decoded = decoder
-                    .read_object_at(
-                        expected.entry.offset,
-                        |oid| Ok(offsets.get(oid).copied().map(RefDeltaBase::InPack)),
-                        |_, _, _| Ok(()),
-                    )
+                    .read_object_at(expected.entry.offset, &bases)
                     .expect("decode object");
-                assert_eq!(*decoded.object, expected.object);
-                delta_reads += usize::from(decoded.stats.delta_depth > 0);
-                assert!(decoded.stats.peak_materialized_bytes <= limits.max_materialized_bytes);
-                assert!(decoded.stats.cached_bytes <= limits.max_cached_bytes);
+                assert_eq!(decoded.object(), &expected.object);
+                delta_reads += usize::from(decoded.stats().delta_depth() > 0);
+                assert!(decoded.stats().peak_materialized_bytes() <= limits.max_materialized_bytes);
+                assert!(decoded.stats().cached_bytes() <= limits.max_cached_bytes);
             }
             assert!(
                 delta_reads > 5,
@@ -131,17 +136,17 @@ fn exact_depth_boundary_is_identical_cold_and_warm() {
     let over_limit = written.entries[9].offset;
 
     let cold = decoder
-        .read_object_at(at_limit, |_| Ok(None), |_, _, _| Ok(()))
+        .read_object_at(at_limit, &RefDeltaBases::new())
         .expect("exact depth must pass");
-    assert_eq!(cold.stats.delta_depth, 8);
+    assert_eq!(cold.stats().delta_depth(), 8);
     let warm = decoder
-        .read_object_at(at_limit, |_| Ok(None), |_, _, _| Ok(()))
+        .read_object_at(at_limit, &RefDeltaBases::new())
         .expect("warm exact depth must pass");
-    assert_eq!(warm.stats.delta_depth, cold.stats.delta_depth);
+    assert_eq!(warm.stats().delta_depth(), cold.stats().delta_depth());
 
     for error in [
         decoder
-            .read_object_at(over_limit, |_| Ok(None), |_, _, _| Ok(()))
+            .read_object_at(over_limit, &RefDeltaBases::new())
             .expect_err("warm base must not hide full depth"),
         BoundedPackDecoder::new(
             SlicePackSource::new(&written.pack),
@@ -149,7 +154,7 @@ fn exact_depth_boundary_is_identical_cold_and_warm() {
             limits,
         )
         .expect("open cold decoder")
-        .read_object_at(over_limit, |_| Ok(None), |_, _, _| Ok(()))
+        .read_object_at(over_limit, &RefDeltaBases::new())
         .expect_err("cold over-limit depth must fail"),
     ] {
         assert!(matches!(
@@ -170,14 +175,14 @@ fn exact_depth_boundary_is_identical_cold_and_warm() {
     )
     .expect("zero-depth decoder");
     assert_eq!(
-        zero.read_object_at(written.entries[0].offset, |_| Ok(None), |_, _, _| Ok(()))
+        zero.read_object_at(written.entries[0].offset, &RefDeltaBases::new())
             .expect("undeltified base passes")
-            .stats
-            .delta_depth,
+            .stats()
+            .delta_depth(),
         0
     );
     assert!(matches!(
-        zero.read_object_at(written.entries[1].offset, |_| Ok(None), |_, _, _| Ok(())),
+        zero.read_object_at(written.entries[1].offset, &RefDeltaBases::new()),
         Err(PackReadError::Limit(limit)) if limit.attempted == 1
     ));
 }
@@ -202,30 +207,22 @@ fn bounded_decoder_preserves_external_ref_delta_resolution() {
         generous_limits(),
     )
     .expect("open decoder");
+    let mut bases = RefDeltaBases::new();
+    assert_eq!(
+        bases
+            .insert_loose(Arc::new(base), ObjectFormat::Sha1)
+            .expect("loose base"),
+        base_oid
+    );
 
     let decoded = decoder
-        .read_object_at(
-            written.entries[0].offset,
-            |oid| {
-                Ok((*oid == base_oid).then_some(RefDeltaBase::External {
-                    object_type: base.object_type,
-                    size: base.body.len(),
-                    delta_depth: PackDeltaDepth::undeltified(),
-                }))
-            },
-            |oid, out, _| {
-                assert_eq!(*oid, base_oid);
-                assert_eq!(out.len(), base.body.len());
-                out.copy_from_slice(&base.body);
-                Ok(())
-            },
-        )
+        .read_object_at(written.entries[0].offset, &bases)
         .expect("decode thin object");
-    assert_eq!(*decoded.object, target);
+    assert_eq!(decoded.object(), &target);
 }
 
 #[test]
-fn external_depth_witness_is_counted_cold_warm_and_for_same_pack_refs() {
+fn resolved_base_depth_is_counted_cold_warm_and_for_same_pack_refs() {
     let objects = similar_objects(4, 8 * 1024);
     let written = PackFile::write_packed_with_options(
         &objects,
@@ -248,17 +245,23 @@ fn external_depth_witness_is_counted_cold_warm_and_for_same_pack_refs() {
         generous_limits(),
     )
     .expect("base decoder");
+    let mut in_pack = RefDeltaBases::new();
+    for (oid, offset) in &offsets {
+        in_pack.insert_location(
+            *oid,
+            PackObjectLocation::new(base_decoder.primary_source(), *offset),
+        );
+    }
     let materialized_base = base_decoder
-        .read_object_at(
-            written.entries[2].offset,
-            |oid| Ok(offsets.get(oid).copied().map(RefDeltaBase::InPack)),
-            |_, _, _| Ok(()),
-        )
+        .read_object_at(written.entries[2].offset, &in_pack)
         .expect("materialize depth-two base");
-    assert_eq!(materialized_base.stats.delta_depth, 2);
+    assert_eq!(materialized_base.stats().delta_depth(), 2);
     let base_oid = written.entries[2].oid;
-    let base_object = Arc::clone(&materialized_base.object);
-    let witness = materialized_base.depth_witness();
+    let resolved = materialized_base.resolved_base();
+    assert_eq!(resolved.object_id(), base_oid);
+    assert_eq!(resolved.delta_depth(), 2);
+    let mut resolved_bases = RefDeltaBases::new();
+    assert_eq!(resolved_bases.insert_resolved(resolved), base_oid);
 
     let exact_limits = PackReadLimits {
         max_delta_depth: 3,
@@ -271,29 +274,13 @@ fn external_depth_witness_is_counted_cold_warm_and_for_same_pack_refs() {
     )
     .expect("exact decoder");
     let decode = |decoder: &mut BoundedPackDecoder<SlicePackSource<'_>>| {
-        decoder.read_object_at(
-            written.entries[3].offset,
-            |oid| {
-                assert_eq!(*oid, base_oid, "fixture must reference immediate base");
-                Ok(Some(RefDeltaBase::External {
-                    object_type: base_object.object_type,
-                    size: base_object.body.len(),
-                    delta_depth: witness,
-                }))
-            },
-            |oid, out, _| {
-                assert_eq!(*oid, base_oid);
-                out.copy_from_slice(&base_object.body);
-                Ok(())
-            },
-        )
+        decoder.read_object_at(written.entries[3].offset, &resolved_bases)
     };
     let cold = decode(&mut exact).expect("external N plus local link at limit");
-    assert_eq!(cold.stats.delta_depth, 3);
+    assert_eq!(cold.stats().delta_depth(), 3);
     let warm = decode(&mut exact).expect("warm result retains external depth");
-    assert_eq!(warm.stats.delta_depth, cold.stats.delta_depth);
+    assert_eq!(warm.stats().delta_depth(), cold.stats().delta_depth());
 
-    let over_fill_called = std::cell::Cell::new(false);
     let mut over = BoundedPackDecoder::new(
         SlicePackSource::new(&written.pack),
         ObjectFormat::Sha1,
@@ -304,23 +291,8 @@ fn external_depth_witness_is_counted_cold_warm_and_for_same_pack_refs() {
     )
     .expect("over-limit decoder");
     let error = over
-        .read_object_at(
-            written.entries[3].offset,
-            |oid| {
-                assert_eq!(*oid, base_oid);
-                Ok(Some(RefDeltaBase::External {
-                    object_type: base_object.object_type,
-                    size: base_object.body.len(),
-                    delta_depth: witness,
-                }))
-            },
-            |_, _, _| {
-                over_fill_called.set(true);
-                Ok(())
-            },
-        )
+        .read_object_at(written.entries[3].offset, &resolved_bases)
         .expect_err("same-pack REF cannot reset external base depth");
-    assert!(!over_fill_called.get());
     assert!(matches!(
         error,
         PackReadError::Limit(limit)
@@ -329,7 +301,7 @@ fn external_depth_witness_is_counted_cold_warm_and_for_same_pack_refs() {
 }
 
 #[test]
-fn external_base_budget_rejects_before_fill_is_called() {
+fn external_base_budget_rejects_before_delta_materialization() {
     let base = EncodedObject::new(ObjectType::Blob, vec![b'a'; 32 * 1024]);
     let mut target = base.clone();
     target.body[0] = b'b';
@@ -337,7 +309,7 @@ fn external_base_budget_rejects_before_fill_is_called() {
     let written = PackFile::write_thin(
         std::slice::from_ref(&target),
         ObjectFormat::Sha1,
-        HashMap::from([(base_oid, base)]),
+        HashMap::from([(base_oid, base.clone())]),
     )
     .expect("thin pack");
     let limits = PackReadLimits {
@@ -351,24 +323,16 @@ fn external_base_budget_rejects_before_fill_is_called() {
         limits,
     )
     .expect("decoder");
-    let fill_called = std::cell::Cell::new(false);
+    let mut bases = RefDeltaBases::new();
+    assert_eq!(
+        bases
+            .insert_loose(Arc::new(base), ObjectFormat::Sha1)
+            .expect("loose base"),
+        base_oid
+    );
     let error = decoder
-        .read_object_at(
-            written.entries[0].offset,
-            |_| {
-                Ok(Some(RefDeltaBase::External {
-                    object_type: ObjectType::Blob,
-                    size: 32 * 1024,
-                    delta_depth: PackDeltaDepth::undeltified(),
-                }))
-            },
-            |_, _, _| {
-                fill_called.set(true);
-                Ok(())
-            },
-        )
-        .expect_err("external base must be rejected before fill");
-    assert!(!fill_called.get());
+        .read_object_at(written.entries[0].offset, &bases)
+        .expect_err("external base must be rejected before delta materialization");
     assert!(matches!(
         error,
         PackReadError::Limit(limit) if limit.kind == PackLimitKind::MaterializedBytes
@@ -408,7 +372,7 @@ fn deep_ofs_chain_on_small_stack_returns_typed_depth_limit() {
             )
             .expect("open decoder");
             decoder
-                .read_object_at(target_offset, |_| Ok(None), |_, _, _| Ok(()))
+                .read_object_at(target_offset, &RefDeltaBases::new())
                 .expect_err("depth limit must reject chain")
         })
         .expect("spawn small-stack thread")
@@ -443,7 +407,7 @@ fn declared_body_over_materialized_budget_is_rejected_before_inflate() {
     .expect("open decoder");
 
     let error = decoder
-        .read_object_at(written.entries[0].offset, |_| Ok(None), |_, _, _| Ok(()))
+        .read_object_at(written.entries[0].offset, &RefDeltaBases::new())
         .expect_err("body budget must reject object");
     match error {
         PackReadError::Limit(limit) => {
@@ -473,10 +437,10 @@ fn logical_materialized_byte_boundary_is_checked_before_allocation() {
     )
     .expect("exact decoder");
     let decoded = exact
-        .read_object_at(written.entries[0].offset, |_| Ok(None), |_, _, _| Ok(()))
+        .read_object_at(written.entries[0].offset, &RefDeltaBases::new())
         .expect("logical size exactly at limit");
-    assert_eq!(decoded.stats.peak_materialized_bytes, size);
-    assert_eq!(decoded.stats.cached_bytes, size);
+    assert_eq!(decoded.stats().peak_materialized_bytes(), size);
+    assert_eq!(decoded.stats().cached_bytes(), size);
 
     let mut under = BoundedPackDecoder::new(
         SlicePackSource::new(&written.pack),
@@ -488,11 +452,7 @@ fn logical_materialized_byte_boundary_is_checked_before_allocation() {
     )
     .expect("under-limit decoder");
     assert!(matches!(
-        under.read_object_at(
-            written.entries[0].offset,
-            |_| Ok(None),
-            |_, _, _| Ok(()),
-        ),
+        under.read_object_at(written.entries[0].offset, &RefDeltaBases::new()),
         Err(PackReadError::Limit(limit))
             if limit.kind == PackLimitKind::MaterializedBytes
                 && limit.limit == size - 1
@@ -520,11 +480,11 @@ fn cache_is_byte_bounded_evicts_and_can_be_cleared() {
 
     for entry in &written.entries {
         let decoded = decoder
-            .read_object_at(entry.offset, |_| Ok(None), |_, _, _| Ok(()))
+            .read_object_at(entry.offset, &RefDeltaBases::new())
             .expect("decode object");
-        evictions += decoded.stats.cache_evictions;
-        assert!(decoded.stats.cached_bytes <= limits.max_cached_bytes);
-        assert!(decoded.stats.peak_materialized_bytes <= limits.max_materialized_bytes);
+        evictions += decoded.stats().cache_evictions();
+        assert!(decoded.stats().cached_bytes() <= limits.max_cached_bytes);
+        assert!(decoded.stats().peak_materialized_bytes() <= limits.max_materialized_bytes);
     }
     assert!(evictions > 0, "cache must evict by byte weight");
     assert_eq!(decoder.cached_objects(), 1);
@@ -549,9 +509,9 @@ fn file_source_decodes_positionally_without_whole_pack_residency() {
         BoundedPackDecoder::new(file, ObjectFormat::Sha1, generous_limits()).expect("open decoder");
 
     let decoded = decoder
-        .read_object_at(written.entries[0].offset, |_| Ok(None), |_, _, _| Ok(()))
+        .read_object_at(written.entries[0].offset, &RefDeltaBases::new())
         .expect("decode file-backed object");
-    assert_eq!(*decoded.object, object);
+    assert_eq!(decoded.object(), &object);
     drop(decoder);
     fs::remove_file(path).expect("remove fixture file");
 }
@@ -571,7 +531,7 @@ fn malformed_and_truncated_sources_return_pack_errors() {
     )
     .expect("open truncated source");
     assert!(matches!(
-        decoder.read_object_at(entry_offset as u64, |_| Ok(None), |_, _, _| Ok(())),
+        decoder.read_object_at(entry_offset as u64, &RefDeltaBases::new()),
         Err(PackReadError::Pack(GitError::InvalidObject(_)))
             | Err(PackReadError::Pack(GitError::InvalidFormat(_)))
     ));
@@ -585,7 +545,7 @@ fn malformed_and_truncated_sources_return_pack_errors() {
     )
     .expect("open malformed source");
     assert!(matches!(
-        decoder.read_object_at(entry_offset as u64, |_| Ok(None), |_, _, _| Ok(())),
+        decoder.read_object_at(entry_offset as u64, &RefDeltaBases::new()),
         Err(PackReadError::Pack(GitError::InvalidFormat(_)))
     ));
 }
@@ -636,20 +596,21 @@ fn source_byte_stats_count_every_prefix_and_inflate_read_once() {
     .expect("decoder");
 
     let decoded = decoder
-        .read_object_at(written.entries[5].offset, |_| Ok(None), |_, _, _| Ok(()))
+        .read_object_at(written.entries[5].offset, &RefDeltaBases::new())
         .expect("decode deep target");
-    assert_eq!(decoded.stats.delta_depth, 5);
-    assert_eq!(decoded.stats.source_bytes_read, returned.get());
+    assert_eq!(decoded.stats().delta_depth(), 5);
+    assert_eq!(decoded.stats().source_bytes_read(), returned.get());
     assert!(
-        decoded.stats.source_bytes_read >= 64 * (decoded.stats.delta_depth as u64 + 1),
+        decoded.stats().source_bytes_read() >= 64 * (decoded.stats().delta_depth() as u64 + 1),
         "every planned entry prefix must be included"
     );
 
     let before_warm = returned.get();
     let warm = decoder
-        .read_object_at(written.entries[5].offset, |_| Ok(None), |_, _, _| Ok(()))
+        .read_object_at(written.entries[5].offset, &RefDeltaBases::new())
         .expect("warm cache hit");
-    assert_eq!(warm.stats.source_bytes_read, 0);
+    assert_eq!(warm.stats().source_bytes_read(), 0);
+    assert_eq!(warm.stats().compressed_bytes_read(), 0);
     assert_eq!(returned.get(), before_warm);
 }
 
@@ -711,8 +672,7 @@ fn cancel_aware_targeted_read_polls_before_and_between_source_reads() {
     assert!(matches!(
         decoder.read_object_at_with_cancel(
             written.entries[0].offset,
-            |_| Ok(None),
-            |_, _, _| Ok(()),
+            &RefDeltaBases::new(),
             CancelFlag::new(&already),
         ),
         Err(PackReadError::Pack(GitError::Cancelled))
@@ -729,8 +689,7 @@ fn cancel_aware_targeted_read_polls_before_and_between_source_reads() {
     assert!(matches!(
         decoder.read_object_at_with_cancel(
             written.entries[0].offset,
-            |_| Ok(None),
-            |_, _, _| Ok(()),
+            &RefDeltaBases::new(),
             CancelFlag::new(&mid),
         ),
         Err(PackReadError::Pack(GitError::Cancelled))
@@ -738,7 +697,7 @@ fn cancel_aware_targeted_read_polls_before_and_between_source_reads() {
 }
 
 #[test]
-fn cancellation_wins_over_source_resolver_and_fill_errors_before_allocation() {
+fn cancellation_wins_over_source_errors_and_prevents_resolved_base_work() {
     let object = EncodedObject::new(ObjectType::Blob, vec![b'q'; 4096]);
     let written = PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha1)
         .expect("pack");
@@ -755,8 +714,7 @@ fn cancellation_wins_over_source_resolver_and_fill_errors_before_allocation() {
     assert!(matches!(
         source_decoder.read_object_at_with_cancel(
             written.entries[0].offset,
-            |_| Ok(None),
-            |_, _, _| Ok(()),
+            &RefDeltaBases::new(),
             CancelFlag::new(&source_cancel),
         ),
         Err(PackReadError::Pack(GitError::Cancelled))
@@ -773,79 +731,28 @@ fn cancellation_wins_over_source_resolver_and_fill_errors_before_allocation() {
     )
     .expect("thin pack");
 
-    let resolver_error_cancel = AtomicCancel::new();
-    let mut resolver_error_decoder = BoundedPackDecoder::new(
-        SlicePackSource::new(&thin.pack),
-        ObjectFormat::Sha1,
-        generous_limits(),
-    )
-    .expect("resolver error decoder");
-    assert!(matches!(
-        resolver_error_decoder.read_object_at_with_cancel(
-            thin.entries[0].offset,
-            |_| {
-                resolver_error_cancel.cancel();
-                Err(GitError::InvalidObject("resolver failure".into()))
-            },
-            |_, _, _| Ok(()),
-            CancelFlag::new(&resolver_error_cancel),
-        ),
-        Err(PackReadError::Pack(GitError::Cancelled))
-    ));
-
     let before_allocation_cancel = AtomicCancel::new();
-    let fill_called = std::cell::Cell::new(false);
+    before_allocation_cancel.cancel();
     let mut before_allocation_decoder = BoundedPackDecoder::new(
         SlicePackSource::new(&thin.pack),
         ObjectFormat::Sha1,
         generous_limits(),
     )
     .expect("before allocation decoder");
+    let mut bases = RefDeltaBases::new();
+    assert_eq!(
+        bases
+            .insert_loose(Arc::new(base), ObjectFormat::Sha1)
+            .expect("loose base"),
+        base_oid
+    );
     assert!(matches!(
         before_allocation_decoder.read_object_at_with_cancel(
             thin.entries[0].offset,
-            |_| {
-                before_allocation_cancel.cancel();
-                Ok(Some(RefDeltaBase::External {
-                    object_type: base.object_type,
-                    size: base.body.len(),
-                    delta_depth: PackDeltaDepth::undeltified(),
-                }))
-            },
-            |_, _, _| {
-                fill_called.set(true);
-                Ok(())
-            },
+            &bases,
             CancelFlag::new(&before_allocation_cancel),
         ),
         Err(PackReadError::Pack(GitError::Cancelled))
     ));
-    assert!(!fill_called.get());
     assert_eq!(before_allocation_decoder.cached_bytes(), 0);
-
-    let fill_error_cancel = AtomicCancel::new();
-    let mut fill_error_decoder = BoundedPackDecoder::new(
-        SlicePackSource::new(&thin.pack),
-        ObjectFormat::Sha1,
-        generous_limits(),
-    )
-    .expect("fill error decoder");
-    assert!(matches!(
-        fill_error_decoder.read_object_at_with_cancel(
-            thin.entries[0].offset,
-            |_| {
-                Ok(Some(RefDeltaBase::External {
-                    object_type: base.object_type,
-                    size: base.body.len(),
-                    delta_depth: PackDeltaDepth::undeltified(),
-                }))
-            },
-            |_, _, _| {
-                fill_error_cancel.cancel();
-                Err(GitError::InvalidObject("fill failure".into()))
-            },
-            CancelFlag::new(&fill_error_cancel),
-        ),
-        Err(PackReadError::Pack(GitError::Cancelled))
-    ));
 }
