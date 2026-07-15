@@ -22,6 +22,7 @@ use std::sync::Arc;
 // the crate-root scope in via `use super::*` and is re-exported below so every
 // `sley_pack::X` path (public API and intra-crate) resolves unchanged.
 // This is a pure code move: no function body was altered.
+mod bounded_read;
 mod delta;
 mod index;
 pub mod inflate;
@@ -29,6 +30,7 @@ mod read;
 mod stream;
 mod write;
 
+pub use bounded_read::*;
 pub(crate) use delta::*;
 pub use index::*;
 pub use read::*;
@@ -584,6 +586,49 @@ mod tests {
             assert_eq!(parsed.entries[0].object.body, base);
             assert_eq!(parsed.entries[1].object.body, result);
         }
+    }
+
+    #[test]
+    fn bounded_delta_application_polls_cancel_between_commands() {
+        let base = vec![b'x'; 4096];
+        let mut result = base.clone();
+        result.extend_from_slice(b"changed");
+        let delta = DeltaIndex::new(&base).delta(&result).expect("delta");
+        let plan = plan_pack_delta(&base, &delta).expect("plan");
+        let mut out = Vec::with_capacity(result.len());
+        let source = AtomicCancel::new();
+        source.cancel();
+
+        assert_eq!(
+            apply_pack_delta_exact(&base, &delta, plan, &mut out, CancelFlag::new(&source)),
+            Err(GitError::Cancelled)
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn legacy_delta_preserves_final_size_mismatch_and_copy_heavy_growth() {
+        let base = b"x";
+        let overproducing = vec![1, 1, 2, b'x', b'y'];
+        assert_eq!(
+            apply_pack_delta(base, &overproducing),
+            Err(GitError::InvalidObject(
+                "delta result size mismatch: expected 1, got 2".into()
+            ))
+        );
+
+        let copies = 4096usize;
+        let mut copy_heavy = Vec::new();
+        write_delta_varint(&mut copy_heavy, base.len() as u64);
+        write_delta_varint(&mut copy_heavy, copies as u64);
+        for _ in 0..copies {
+            // Copy one byte from base offset zero.
+            copy_heavy.extend_from_slice(&[0x91, 0, 1]);
+        }
+        assert_eq!(
+            apply_pack_delta(base, &copy_heavy).expect("copy-heavy legacy delta"),
+            vec![b'x'; copies]
+        );
     }
 
     #[test]

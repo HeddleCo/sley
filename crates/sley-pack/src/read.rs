@@ -1048,29 +1048,101 @@ where
 }
 
 pub(crate) fn apply_pack_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
-    let mut cursor = 0usize;
-    let base_size = read_delta_varint(delta, &mut cursor)?;
+    let plan = plan_pack_delta(base, delta)?;
+    let result_size = plan.result_size;
+    let result_size_hint = usize::try_from(result_size).unwrap_or(usize::MAX);
+    // Preserve the legacy decoder's bounded speculative reservation followed by
+    // geometric Vec growth. Its malformed-input bytes, errors, and complexity
+    // are part of the Git-parity surface.
+    let mut result = Vec::with_capacity(inflate::bounded_inflate_reserve(
+        result_size_hint,
+        delta.len(),
+    ));
+    walk_pack_delta(base, delta, plan, CancelFlag::never(), |slice| {
+        result.extend_from_slice(slice);
+        Ok(())
+    })?;
+    if result.len() as u64 != result_size {
+        return Err(GitError::InvalidObject(format!(
+            "delta result size mismatch: expected {result_size}, got {}",
+            result.len()
+        )));
+    }
+    Ok(result)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PackDeltaPlan {
+    instructions_offset: usize,
+    pub(crate) result_size: u64,
+}
+
+pub(crate) fn plan_pack_delta(base: &[u8], delta: &[u8]) -> Result<PackDeltaPlan> {
+    let mut instructions_offset = 0usize;
+    let base_size = read_delta_varint(delta, &mut instructions_offset)?;
     if base_size != base.len() as u64 {
         return Err(GitError::InvalidObject(format!(
             "delta base size mismatch: expected {base_size}, got {}",
             base.len()
         )));
     }
-    let result_size = read_delta_varint(delta, &mut cursor)?;
-    // `result_size` is an attacker-controlled delta varint from a network pack
-    // (install_raw_pack -> sley-fetch). On 64-bit a naive `result_size as usize`
-    // (or `.min(usize::MAX)`, a no-op there) lets a tiny delta declare
-    // `u64::MAX`/1 TiB and drive `with_capacity` to abort the process before the
-    // size-mismatch check below can fire. Route the up-front reservation through
-    // the sley#2 bound so the speculative allocation is capped; `result.extend`
-    // still grows the buffer organically and the post-decode length check
-    // (`result.len() != result_size`) rejects the lie cleanly.
-    let result_size_hint = usize::try_from(result_size).unwrap_or(usize::MAX);
-    let mut result = Vec::with_capacity(inflate::bounded_inflate_reserve(
-        result_size_hint,
-        delta.len(),
-    ));
+    let result_size = read_delta_varint(delta, &mut instructions_offset)?;
+    Ok(PackDeltaPlan {
+        instructions_offset,
+        result_size,
+    })
+}
+
+pub(crate) fn apply_pack_delta_exact(
+    base: &[u8],
+    delta: &[u8],
+    plan: PackDeltaPlan,
+    result: &mut Vec<u8>,
+    cancel: CancelFlag<'_>,
+) -> Result<()> {
+    if !result.is_empty() || u64::try_from(result.capacity()).unwrap_or(u64::MAX) < plan.result_size
+    {
+        return Err(GitError::InvalidObject(
+            "delta output buffer is not empty and preallocated to the declared result size".into(),
+        ));
+    }
+    walk_pack_delta(base, delta, plan, cancel, |slice| {
+        let end = result
+            .len()
+            .checked_add(slice.len())
+            .ok_or_else(|| GitError::InvalidObject("delta output range overflow".into()))?;
+        if u64::try_from(end).unwrap_or(u64::MAX) > plan.result_size {
+            return Err(GitError::InvalidObject(
+                "delta instructions exceed declared result size".into(),
+            ));
+        }
+        result.extend_from_slice(slice);
+        Ok(())
+    })?;
+    cancel.check()?;
+    if result.len() as u64 != plan.result_size {
+        return Err(GitError::InvalidObject(format!(
+            "delta result size mismatch: expected {}, got {}",
+            plan.result_size,
+            result.len()
+        )));
+    }
+    Ok(())
+}
+
+fn walk_pack_delta<F>(
+    base: &[u8],
+    delta: &[u8],
+    plan: PackDeltaPlan,
+    cancel: CancelFlag<'_>,
+    mut emit: F,
+) -> Result<()>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
+    let mut cursor = plan.instructions_offset;
     while cursor < delta.len() {
+        cancel.check()?;
         let command = delta[cursor];
         cursor += 1;
         if command & 0x80 != 0 {
@@ -1093,7 +1165,7 @@ pub(crate) fn apply_pack_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
                     "delta copy range exceeds base object".into(),
                 ));
             };
-            result.extend_from_slice(slice);
+            emit(slice)?;
         } else if command != 0 {
             let len = usize::from(command);
             let end = cursor
@@ -1104,7 +1176,7 @@ pub(crate) fn apply_pack_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
                     "delta insert range exceeds delta data".into(),
                 ));
             };
-            result.extend_from_slice(slice);
+            emit(slice)?;
             cursor = end;
         } else {
             return Err(GitError::InvalidObject(
@@ -1112,13 +1184,8 @@ pub(crate) fn apply_pack_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
             ));
         }
     }
-    if result.len() as u64 != result_size {
-        return Err(GitError::InvalidObject(format!(
-            "delta result size mismatch: expected {result_size}, got {}",
-            result.len()
-        )));
-    }
-    Ok(result)
+    cancel.check()?;
+    Ok(())
 }
 
 pub(crate) fn decoded_delta_result_size(delta: &[u8]) -> Result<u64> {
@@ -1126,6 +1193,7 @@ pub(crate) fn decoded_delta_result_size(delta: &[u8]) -> Result<u64> {
     let _ = read_delta_varint(delta, &mut cursor)?;
     read_delta_varint(delta, &mut cursor)
 }
+
 pub(crate) fn read_delta_varint(delta: &[u8], cursor: &mut usize) -> Result<u64> {
     let mut value = 0u64;
     let mut shift = 0u32;
