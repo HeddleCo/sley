@@ -1000,13 +1000,9 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
                     attempted: usize::MAX,
                 })
             })?;
-            let mut resolved = self.allocate_body(
-                result_size,
-                base_bytes.saturating_add(delta.len()),
-                pinned_cache,
-                cancel,
-                &mut stats,
-            )?;
+            let active_bytes = self.checked_materialized_add(base_bytes, delta.len())?;
+            let mut resolved =
+                self.allocate_body(result_size, active_bytes, pinned_cache, cancel, &mut stats)?;
             apply_pack_delta_exact(&object.body, &delta, plan, &mut resolved, cancel)?;
             object = Arc::new(EncodedObject::new(object.object_type, resolved));
             object_oid = None;
@@ -1049,6 +1045,19 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
             }));
         }
         Ok(())
+    }
+
+    fn checked_materialized_add(
+        &self,
+        left: usize,
+        right: usize,
+    ) -> std::result::Result<usize, PackReadError> {
+        left.checked_add(right)
+            .ok_or(PackReadError::Limit(PackLimitError {
+                kind: PackLimitKind::MaterializedBytes,
+                limit: self.limits.max_materialized_bytes,
+                attempted: usize::MAX,
+            }))
     }
 
     fn read_entry_plan(
@@ -1179,7 +1188,7 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
             input_start = input_start.saturating_add(consumed);
             stats.compressed_bytes_read =
                 stats.compressed_bytes_read.saturating_add(consumed as u64);
-            let attempted = body.len().saturating_add(produced);
+            let attempted = self.checked_materialized_add(body.len(), produced)?;
             if attempted > expected {
                 return Err(GitError::InvalidObject(format!(
                     "pack object declared {} bytes, decoded more than {}",
@@ -1215,7 +1224,7 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
         stats: &mut PackReadStats,
     ) -> std::result::Result<(), PackReadError> {
         cancel.check()?;
-        let working = active_bytes.saturating_add(additional_bytes);
+        let working = self.checked_materialized_add(active_bytes, additional_bytes)?;
         if working > self.limits.max_materialized_bytes {
             return Err(PackReadError::Limit(PackLimitError {
                 kind: PackLimitKind::MaterializedBytes,
@@ -1223,13 +1232,15 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
                 attempted: working,
             }));
         }
-        while self.cache.used.saturating_add(working) > self.limits.max_materialized_bytes {
+        while self.checked_materialized_add(self.cache.used, working)?
+            > self.limits.max_materialized_bytes
+        {
             cancel.check()?;
             if !self.cache.evict_one_except(pinned_cache, cancel)? {
                 break;
             }
         }
-        let total = self.cache.used.saturating_add(working);
+        let total = self.checked_materialized_add(self.cache.used, working)?;
         if total > self.limits.max_materialized_bytes {
             return Err(PackReadError::Limit(PackLimitError {
                 kind: PackLimitKind::MaterializedBytes,
@@ -1523,7 +1534,7 @@ mod tests {
             cache: ByteCache::new(0),
         };
         let mut stats = PackReadStats::start(0);
-        let requested = (isize::MAX as usize).saturating_add(1);
+        let requested = (isize::MAX as usize) + 1;
         let error = decoder
             .allocate_body(requested, 0, None, CancelFlag::never(), &mut stats)
             .expect_err("Vec capacity overflow must be an allocation error");
@@ -1535,6 +1546,57 @@ mod tests {
                 active: 0,
                 cached: 0,
             }) if actual == requested
+        ));
+    }
+
+    #[test]
+    fn active_plus_requested_overflow_is_a_limit_without_allocating() {
+        let mut decoder: BoundedPackDecoder<Vec<u8>> = BoundedPackDecoder {
+            sources: Vec::new(),
+            limits: PackReadLimits {
+                max_delta_depth: 0,
+                max_materialized_bytes: usize::MAX,
+                max_cached_bytes: 0,
+            },
+            cache: ByteCache::new(0),
+        };
+        let mut stats = PackReadStats::start(0);
+        let error = decoder
+            .allocate_body(1, usize::MAX, None, CancelFlag::never(), &mut stats)
+            .expect_err("overflowing active plus requested bytes must be a limit");
+        assert!(matches!(
+            error,
+            PackReadError::Limit(PackLimitError {
+                kind: PackLimitKind::MaterializedBytes,
+                limit: usize::MAX,
+                attempted: usize::MAX,
+            })
+        ));
+    }
+
+    #[test]
+    fn cached_plus_working_overflow_is_a_limit_before_body_allocation() {
+        let mut decoder: BoundedPackDecoder<Vec<u8>> = BoundedPackDecoder {
+            sources: Vec::new(),
+            limits: PackReadLimits {
+                max_delta_depth: 0,
+                max_materialized_bytes: usize::MAX,
+                max_cached_bytes: usize::MAX,
+            },
+            cache: ByteCache::new(usize::MAX),
+        };
+        insert_cached(&mut decoder.cache, 1, 1);
+        let mut stats = PackReadStats::start(decoder.cache.used);
+        let error = decoder
+            .ensure_materialized(usize::MAX, 0, None, CancelFlag::never(), &mut stats)
+            .expect_err("overflowing cached plus working bytes must be a limit");
+        assert!(matches!(
+            error,
+            PackReadError::Limit(PackLimitError {
+                kind: PackLimitKind::MaterializedBytes,
+                limit: usize::MAX,
+                attempted: usize::MAX,
+            })
         ));
     }
 }
