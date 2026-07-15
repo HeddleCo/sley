@@ -488,7 +488,18 @@ fn cache_is_byte_bounded_evicts_and_can_be_cleared() {
     }
     assert!(evictions > 0, "cache must evict by byte weight");
     assert_eq!(decoder.cached_objects(), 1);
-    decoder.clear_cache();
+    let cancel = AtomicCancel::new();
+    cancel.cancel();
+    let cached_before_cancel = decoder.cached_bytes();
+    assert!(matches!(
+        decoder.clear_cache(CancelFlag::new(&cancel)),
+        Err(PackReadError::Pack(GitError::Cancelled))
+    ));
+    assert_eq!(decoder.cached_bytes(), cached_before_cancel);
+    assert_eq!(decoder.cached_objects(), 1);
+    decoder
+        .clear_cache(CancelFlag::never())
+        .expect("clear cache");
     assert_eq!(decoder.cached_bytes(), 0);
     assert_eq!(decoder.cached_objects(), 0);
 }

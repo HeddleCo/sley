@@ -140,10 +140,26 @@ pub struct PackLimitError {
     pub attempted: usize,
 }
 
+/// A body allocation failed after every configured decoder limit had passed.
+///
+/// This is deliberately distinct from [`PackReadError::Limit`]: allocator
+/// availability is an environmental resource failure, not a deterministic
+/// rejection by [`PackReadLimits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackAllocationError {
+    /// Logical body bytes requested from the allocator.
+    pub requested: usize,
+    /// Other active logical body/delta bytes at the allocation point.
+    pub active: usize,
+    /// Logical body bytes retained in the decoder cache at the allocation point.
+    pub cached: usize,
+}
+
 /// Error returned by bounded targeted decoding.
 #[derive(Debug)]
 pub enum PackReadError {
     Limit(PackLimitError),
+    Allocation(PackAllocationError),
     Source(io::Error),
     Pack(GitError),
 }
@@ -156,6 +172,11 @@ impl fmt::Display for PackReadError {
                 "pack {:?} limit exceeded: limit {}, attempted {}",
                 error.kind, error.limit, error.attempted
             ),
+            Self::Allocation(error) => write!(
+                formatter,
+                "pack body allocation failed: requested {}, active {}, cached {}",
+                error.requested, error.active, error.cached
+            ),
             Self::Source(error) => write!(formatter, "pack source read failed: {error}"),
             Self::Pack(error) => error.fmt(formatter),
         }
@@ -167,7 +188,7 @@ impl std::error::Error for PackReadError {
         match self {
             Self::Source(error) => Some(error),
             Self::Pack(error) => Some(error),
-            Self::Limit(_) => None,
+            Self::Limit(_) | Self::Allocation(_) => None,
         }
     }
 }
@@ -293,20 +314,38 @@ impl RefDeltaBases {
     ) -> Result<ObjectId> {
         let oid = cancellable_object_id(&object, format, cancel)?;
         cancel.check()?;
-        self.entries.insert(
+        let resolved = RefDeltaBase::Resolved(ResolvedPackObject {
+            object,
             oid,
-            RefDeltaBase::Resolved(ResolvedPackObject {
-                object,
-                oid,
-                depth: 0,
-                origin: None,
-            }),
-        );
-        if let Err(error) = cancel.check() {
-            self.entries.remove(&oid);
+            depth: 0,
+            origin: None,
+        });
+        self.replace_transactionally(oid, resolved, || cancel.check())?;
+        Ok(oid)
+    }
+
+    fn replace_transactionally<F>(
+        &mut self,
+        oid: ObjectId,
+        replacement: RefDeltaBase,
+        post_insert: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        let previous = self.entries.insert(oid, replacement);
+        if let Err(error) = post_insert() {
+            match previous {
+                Some(previous) => {
+                    self.entries.insert(oid, previous);
+                }
+                None => {
+                    self.entries.remove(&oid);
+                }
+            }
             return Err(error);
         }
-        Ok(oid)
+        Ok(())
     }
 
     pub fn insert_resolved(&mut self, resolved: ResolvedPackObject) -> ObjectId {
@@ -444,7 +483,8 @@ struct CachedObject {
     oid: ObjectId,
     bytes: usize,
     depth: usize,
-    last_used: u64,
+    less_recent: Option<PackObjectLocation>,
+    more_recent: Option<PackObjectLocation>,
 }
 
 #[derive(Debug)]
@@ -452,7 +492,8 @@ struct ByteCache {
     budget: usize,
     used: usize,
     entries: HashMap<PackObjectLocation, CachedObject>,
-    clock: u64,
+    least_recent: Option<PackObjectLocation>,
+    most_recent: Option<PackObjectLocation>,
     evictions: u64,
 }
 
@@ -462,14 +503,10 @@ impl ByteCache {
             budget,
             used: 0,
             entries: HashMap::new(),
-            clock: 0,
+            least_recent: None,
+            most_recent: None,
             evictions: 0,
         }
-    }
-
-    fn next_tick(&mut self) -> u64 {
-        self.clock = self.clock.saturating_add(1);
-        self.clock
     }
 
     fn get(
@@ -478,13 +515,12 @@ impl ByteCache {
         cancel: CancelFlag<'_>,
     ) -> Result<Option<(Arc<EncodedObject>, ObjectId, usize)>> {
         cancel.check()?;
-        let tick = self.next_tick();
-        let Some(entry) = self.entries.get_mut(&location) else {
+        let Some(entry) = self.entries.get(&location) else {
             cancel.check()?;
             return Ok(None);
         };
-        entry.last_used = tick;
         let found = (Arc::clone(&entry.object), entry.oid, entry.depth);
+        self.touch(location);
         cancel.check()?;
         Ok(Some(found))
     }
@@ -516,17 +552,25 @@ impl ByteCache {
             cancel.check()?;
             return Ok(());
         }
-        if let Some(previous) = self.entries.remove(&location) {
-            self.used = self.used.saturating_sub(previous.bytes);
-        }
-        while self.used.saturating_add(bytes) > self.budget {
+        let previous_bytes = self
+            .entries
+            .get(&location)
+            .map_or(0, |previous| previous.bytes);
+        while self
+            .used
+            .checked_sub(previous_bytes)
+            .and_then(|retained| retained.checked_add(bytes))
+            .is_none_or(|projected| projected > self.budget)
+        {
             cancel.check()?;
-            if !self.evict_one_except(None, cancel)? {
+            if !self.evict_one_except(Some(location), cancel)? {
                 return Ok(());
             }
         }
         cancel.check()?;
-        let tick = self.next_tick();
+        if self.entries.contains_key(&location) {
+            self.remove_entry(location);
+        }
         self.used += bytes;
         self.entries.insert(
             location,
@@ -535,15 +579,11 @@ impl ByteCache {
                 oid,
                 bytes,
                 depth,
-                last_used: tick,
+                less_recent: None,
+                more_recent: None,
             },
         );
-        if let Err(error) = cancel.check() {
-            if let Some(inserted) = self.entries.remove(&location) {
-                self.used = self.used.saturating_sub(inserted.bytes);
-            }
-            return Err(error);
-        }
+        self.link_as_most_recent(location);
         Ok(())
     }
 
@@ -552,47 +592,117 @@ impl ByteCache {
         pinned: Option<PackObjectLocation>,
         cancel: CancelFlag<'_>,
     ) -> Result<bool> {
-        let location = self.oldest_except_with(pinned, || cancel.check())?;
-        cancel.check()?;
-        let Some(location) = location else {
-            return Ok(false);
-        };
-        if let Some(cached) = self.entries.remove(&location) {
-            self.used = self.used.saturating_sub(cached.bytes);
-            self.evictions += 1;
-        }
-        cancel.check()?;
-        Ok(true)
+        self.evict_one_except_with(pinned, || cancel.check())
     }
 
-    fn oldest_except_with<F>(
-        &self,
+    fn evict_one_except_with<F>(
+        &mut self,
         pinned: Option<PackObjectLocation>,
         mut poll: F,
-    ) -> Result<Option<PackObjectLocation>>
+    ) -> Result<bool>
     where
         F: FnMut() -> Result<()>,
     {
         poll()?;
-        let mut oldest = None;
-        for (index, (location, cached)) in self.entries.iter().enumerate() {
-            if index % 64 == 0 {
+        let location = match self.least_recent {
+            Some(location) if Some(location) != pinned => Some(location),
+            Some(location) => self
+                .entries
+                .get(&location)
+                .and_then(|cached| cached.more_recent),
+            None => None,
+        };
+        let Some(location) = location else {
+            poll()?;
+            return Ok(false);
+        };
+        self.remove_entry(location);
+        self.evictions += 1;
+        poll()?;
+        Ok(true)
+    }
+
+    fn clear(&mut self, cancel: CancelFlag<'_>) -> Result<()> {
+        self.clear_with(|| cancel.check())
+    }
+
+    fn clear_with<F>(&mut self, mut poll: F) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        poll()?;
+        let mut removed = 0usize;
+        while let Some(location) = self.least_recent {
+            self.remove_entry(location);
+            removed += 1;
+            if removed.is_multiple_of(64) {
                 poll()?;
-            }
-            if Some(*location) == pinned {
-                continue;
-            }
-            if oldest.is_none_or(|(_, tick)| cached.last_used < tick) {
-                oldest = Some((*location, cached.last_used));
             }
         }
         poll()?;
-        Ok(oldest.map(|(location, _)| location))
+        Ok(())
     }
 
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.used = 0;
+    fn touch(&mut self, location: PackObjectLocation) {
+        if self.most_recent == Some(location) {
+            return;
+        }
+        self.unlink(location);
+        self.link_as_most_recent(location);
+    }
+
+    fn remove_entry(&mut self, location: PackObjectLocation) -> Option<CachedObject> {
+        self.unlink(location);
+        let cached = self.entries.remove(&location)?;
+        debug_assert!(self.used >= cached.bytes);
+        self.used -= cached.bytes;
+        Some(cached)
+    }
+
+    fn unlink(&mut self, location: PackObjectLocation) {
+        let Some((less_recent, more_recent)) = self
+            .entries
+            .get(&location)
+            .map(|cached| (cached.less_recent, cached.more_recent))
+        else {
+            return;
+        };
+        if let Some(less_recent) = less_recent {
+            if let Some(cached) = self.entries.get_mut(&less_recent) {
+                cached.more_recent = more_recent;
+            }
+        } else {
+            self.least_recent = more_recent;
+        }
+        if let Some(more_recent) = more_recent {
+            if let Some(cached) = self.entries.get_mut(&more_recent) {
+                cached.less_recent = less_recent;
+            }
+        } else {
+            self.most_recent = less_recent;
+        }
+        if let Some(cached) = self.entries.get_mut(&location) {
+            cached.less_recent = None;
+            cached.more_recent = None;
+        }
+    }
+
+    fn link_as_most_recent(&mut self, location: PackObjectLocation) {
+        let previous = self.most_recent;
+        if let Some(cached) = self.entries.get_mut(&location) {
+            cached.less_recent = previous;
+            cached.more_recent = None;
+        } else {
+            return;
+        }
+        if let Some(previous) = previous {
+            if let Some(cached) = self.entries.get_mut(&previous) {
+                cached.more_recent = Some(location);
+            }
+        } else {
+            self.least_recent = Some(location);
+        }
+        self.most_recent = Some(location);
     }
 }
 
@@ -684,9 +794,15 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
         self.cache.entries.len()
     }
 
-    /// Drop all decoded objects retained between targeted reads.
-    pub fn clear_cache(&mut self) {
-        self.cache.clear();
+    /// Drop decoded objects retained between targeted reads, polling between
+    /// bounded batches. Cancellation may leave a valid partially-cleared cache;
+    /// its byte accounting and LRU order remain exact for the retained entries.
+    pub fn clear_cache(
+        &mut self,
+        cancel: CancelFlag<'_>,
+    ) -> std::result::Result<(), PackReadError> {
+        self.cache.clear(cancel)?;
+        Ok(())
     }
 
     /// Decode an entry in the primary source without loading a complete pack.
@@ -724,8 +840,7 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
 
     /// Cancel-aware form of [`Self::read_object_at_location`]. The flag is
     /// polled during chain planning, positional reads, inflate, object-ID
-    /// hashing, every delta command, cache scans, and before/after cache
-    /// insertion and eviction.
+    /// hashing, every delta command, and between cache maintenance operations.
     pub fn read_object_at_location_with_cancel(
         &mut self,
         location: PackObjectLocation,
@@ -1141,10 +1256,10 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
         let allocation = body.try_reserve_exact(requested);
         cancel.check()?;
         allocation.map_err(|_| {
-            PackReadError::Limit(PackLimitError {
-                kind: PackLimitKind::MaterializedBytes,
-                limit: self.limits.max_materialized_bytes,
-                attempted: active_bytes.saturating_add(requested),
+            PackReadError::Allocation(PackAllocationError {
+                requested,
+                active: active_bytes,
+                cached: self.cache.used,
             })
         })?;
         Ok(body)
@@ -1242,40 +1357,184 @@ fn object_type_for_entry(kind: PackObjectKind) -> Result<ObjectType> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sley_core::AtomicCancel;
+
+    fn test_oid() -> ObjectId {
+        ObjectId::from_raw(ObjectFormat::Sha1, &[0; 20]).expect("object id")
+    }
+
+    fn location(offset: u64) -> PackObjectLocation {
+        PackObjectLocation::new(PackSourceId(0), offset)
+    }
+
+    fn insert_cached(cache: &mut ByteCache, offset: u64, bytes: usize) {
+        cache
+            .insert(
+                location(offset),
+                Arc::new(EncodedObject::new(
+                    ObjectType::Blob,
+                    vec![offset as u8; bytes],
+                )),
+                test_oid(),
+                0,
+                CancelFlag::never(),
+            )
+            .expect("cache insert");
+    }
 
     #[test]
-    fn cache_eviction_scan_polls_between_bounded_entry_batches() {
-        let oid = ObjectId::from_raw(ObjectFormat::Sha1, &[0; 20]).expect("object id");
-        let object = Arc::new(EncodedObject::new(ObjectType::Blob, vec![0]));
+    fn cache_eviction_is_constant_work_and_preserves_lru_accounting() {
         let mut cache = ByteCache::new(512);
         for offset in 0..256 {
-            cache.entries.insert(
-                PackObjectLocation::new(PackSourceId(0), offset),
-                CachedObject {
-                    object: Arc::clone(&object),
-                    oid,
-                    bytes: 1,
-                    depth: 0,
-                    last_used: offset,
-                },
-            );
+            insert_cached(&mut cache, offset, 1);
         }
-        cache.used = cache.entries.len();
+        cache
+            .get(location(0), CancelFlag::never())
+            .expect("cache get")
+            .expect("cached entry");
+        assert_eq!(cache.least_recent, Some(location(1)));
+        assert_eq!(cache.most_recent, Some(location(0)));
 
-        let cancel = AtomicCancel::new();
+        let mut polls = 0;
+        assert!(
+            cache
+                .evict_one_except_with(None, || {
+                    polls += 1;
+                    Ok(())
+                })
+                .expect("eviction")
+        );
+        assert_eq!(polls, 2, "eviction work must not grow with cache size");
+        assert!(!cache.entries.contains_key(&location(1)));
+        assert_eq!(cache.least_recent, Some(location(2)));
+        assert_eq!(cache.most_recent, Some(location(0)));
+        assert_eq!(cache.entries.len(), 255);
+        assert_eq!(cache.used, 255);
+        assert_eq!(cache.evictions, 1);
+    }
+
+    #[test]
+    fn cache_replacement_and_pinned_eviction_keep_exact_order_and_bytes() {
+        let mut cache = ByteCache::new(8);
+        insert_cached(&mut cache, 1, 1);
+        insert_cached(&mut cache, 2, 2);
+        insert_cached(&mut cache, 3, 3);
+        assert_eq!(cache.used, 6);
+
+        // Replacing the least-recent entry pins it during capacity eviction.
+        insert_cached(&mut cache, 1, 5);
+        assert_eq!(cache.used, 8);
+        assert!(!cache.entries.contains_key(&location(2)));
+        assert!(cache.entries.contains_key(&location(3)));
+        assert!(cache.entries.contains_key(&location(1)));
+        assert_eq!(cache.least_recent, Some(location(3)));
+        assert_eq!(cache.most_recent, Some(location(1)));
+        assert_eq!(cache.evictions, 1);
+    }
+
+    #[test]
+    fn cancelled_clear_leaves_exact_partially_cleared_lru_state() {
+        let mut cache = ByteCache::new(256);
+        for offset in 0..256 {
+            insert_cached(&mut cache, offset, 1);
+        }
         let mut polls = 0;
         let error = cache
-            .oldest_except_with(None, || {
+            .clear_with(|| {
                 polls += 1;
                 if polls == 3 {
-                    cancel.cancel();
+                    return Err(GitError::Cancelled);
                 }
-                CancelFlag::new(&cancel).check()
+                Ok(())
             })
-            .expect_err("scan must observe cancellation before visiting every entry");
+            .expect_err("clear must observe cancellation between batches");
         assert!(matches!(error, GitError::Cancelled));
-        assert_eq!(cache.entries.len(), 256);
-        assert_eq!(cache.evictions, 0);
+        assert_eq!(cache.entries.len(), 128);
+        assert_eq!(cache.used, 128);
+        assert_eq!(cache.least_recent, Some(location(128)));
+        assert_eq!(cache.most_recent, Some(location(255)));
+        assert_eq!(
+            cache.entries[&location(128)].less_recent,
+            None,
+            "remaining head must be detached from removed entries"
+        );
+
+        cache.clear_with(|| Ok(())).expect("finish clear");
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.used, 0);
+        assert_eq!(cache.least_recent, None);
+        assert_eq!(cache.most_recent, None);
+    }
+
+    #[test]
+    fn cancelled_loose_replacement_restores_location_and_resolved_bases() {
+        let oid = test_oid();
+        let prior_location = location(41);
+        let replacement = || {
+            RefDeltaBase::Resolved(ResolvedPackObject {
+                object: Arc::new(EncodedObject::new(ObjectType::Blob, vec![9])),
+                oid,
+                depth: 0,
+                origin: None,
+            })
+        };
+
+        let mut bases = RefDeltaBases::new();
+        bases.insert_location(oid, prior_location);
+        assert!(matches!(
+            bases.replace_transactionally(oid, replacement(), || Err(GitError::Cancelled)),
+            Err(GitError::Cancelled)
+        ));
+        assert!(matches!(
+            bases.get(&oid),
+            Some(RefDeltaBase::Location(location)) if *location == prior_location
+        ));
+
+        let prior_object = Arc::new(EncodedObject::new(ObjectType::Blob, vec![7]));
+        bases.entries.insert(
+            oid,
+            RefDeltaBase::Resolved(ResolvedPackObject {
+                object: Arc::clone(&prior_object),
+                oid,
+                depth: 7,
+                origin: Some(prior_location),
+            }),
+        );
+        assert!(matches!(
+            bases.replace_transactionally(oid, replacement(), || Err(GitError::Cancelled)),
+            Err(GitError::Cancelled)
+        ));
+        let Some(RefDeltaBase::Resolved(restored)) = bases.get(&oid) else {
+            panic!("resolved base must be restored");
+        };
+        assert!(Arc::ptr_eq(&restored.object, &prior_object));
+        assert_eq!(restored.depth, 7);
+        assert_eq!(restored.origin, Some(prior_location));
+    }
+
+    #[test]
+    fn allocator_failure_below_limit_is_not_reported_as_limit_rejection() {
+        let mut decoder: BoundedPackDecoder<Vec<u8>> = BoundedPackDecoder {
+            sources: Vec::new(),
+            limits: PackReadLimits {
+                max_delta_depth: 0,
+                max_materialized_bytes: usize::MAX,
+                max_cached_bytes: 0,
+            },
+            cache: ByteCache::new(0),
+        };
+        let mut stats = PackReadStats::start(0);
+        let requested = (isize::MAX as usize).saturating_add(1);
+        let error = decoder
+            .allocate_body(requested, 0, None, CancelFlag::never(), &mut stats)
+            .expect_err("Vec capacity overflow must be an allocation error");
+        assert!(requested < decoder.limits.max_materialized_bytes);
+        assert!(matches!(
+            error,
+            PackReadError::Allocation(PackAllocationError {
+                requested: actual,
+                active: 0,
+                cached: 0,
+            }) if actual == requested
+        ));
     }
 }
