@@ -22,6 +22,7 @@ use std::sync::Arc;
 // the crate-root scope in via `use super::*` and is re-exported below so every
 // `sley_pack::X` path (public API and intra-crate) resolves unchanged.
 // This is a pure code move: no function body was altered.
+mod bounded_read;
 mod delta;
 mod index;
 pub mod inflate;
@@ -29,6 +30,7 @@ mod read;
 mod stream;
 mod write;
 
+pub use bounded_read::*;
 pub(crate) use delta::*;
 pub use index::*;
 pub use read::*;

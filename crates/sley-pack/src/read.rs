@@ -1093,6 +1093,11 @@ pub(crate) fn apply_pack_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
                     "delta copy range exceeds base object".into(),
                 ));
             };
+            if result.len().saturating_add(slice.len()) > result_size_hint {
+                return Err(GitError::InvalidObject(
+                    "delta instructions exceed declared result size".into(),
+                ));
+            }
             result.extend_from_slice(slice);
         } else if command != 0 {
             let len = usize::from(command);
@@ -1104,6 +1109,11 @@ pub(crate) fn apply_pack_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
                     "delta insert range exceeds delta data".into(),
                 ));
             };
+            if result.len().saturating_add(slice.len()) > result_size_hint {
+                return Err(GitError::InvalidObject(
+                    "delta instructions exceed declared result size".into(),
+                ));
+            }
             result.extend_from_slice(slice);
             cursor = end;
         } else {
