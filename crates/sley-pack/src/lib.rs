@@ -594,15 +594,41 @@ mod tests {
         let mut result = base.clone();
         result.extend_from_slice(b"changed");
         let delta = DeltaIndex::new(&base).delta(&result).expect("delta");
+        let plan = plan_pack_delta(&base, &delta).expect("plan");
         let mut out = Vec::with_capacity(result.len());
         let source = AtomicCancel::new();
         source.cancel();
 
         assert_eq!(
-            apply_pack_delta_into(&base, &delta, &mut out, CancelFlag::new(&source)),
+            apply_pack_delta_exact(&base, &delta, plan, &mut out, CancelFlag::new(&source)),
             Err(GitError::Cancelled)
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn legacy_delta_preserves_final_size_mismatch_and_copy_heavy_growth() {
+        let base = b"x";
+        let overproducing = vec![1, 1, 2, b'x', b'y'];
+        assert_eq!(
+            apply_pack_delta(base, &overproducing),
+            Err(GitError::InvalidObject(
+                "delta result size mismatch: expected 1, got 2".into()
+            ))
+        );
+
+        let copies = 4096usize;
+        let mut copy_heavy = Vec::new();
+        write_delta_varint(&mut copy_heavy, base.len() as u64);
+        write_delta_varint(&mut copy_heavy, copies as u64);
+        for _ in 0..copies {
+            // Copy one byte from base offset zero.
+            copy_heavy.extend_from_slice(&[0x91, 0, 1]);
+        }
+        assert_eq!(
+            apply_pack_delta(base, &copy_heavy).expect("copy-heavy legacy delta"),
+            vec![b'x'; copies]
+        );
     }
 
     #[test]

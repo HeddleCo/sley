@@ -85,12 +85,14 @@ impl PackReadSource for std::fs::File {
 pub struct PackReadLimits {
     /// Maximum number of delta entries between a target and its base.
     pub max_delta_depth: usize,
-    /// Maximum decoded object and delta allocation capacity owned or actively
-    /// used by the decoder at one time. Fixed-size I/O scratch buffers are not
-    /// included. Returned objects cease to count after the call unless cached.
+    /// Maximum logical decoded object and delta bytes owned or actively used by
+    /// the decoder at one time. The bound is checked before allocation. Allocator
+    /// slack/capacity, collection metadata, and fixed-size I/O scratch buffers
+    /// are not included, so this is deliberately not an RSS or heap-usage bound.
+    /// Returned objects cease to count after the call unless cached.
     pub max_materialized_bytes: usize,
-    /// Maximum decoded body allocation capacity retained between calls. The
-    /// effective cache ceiling is also capped by `max_materialized_bytes`.
+    /// Maximum logical decoded body bytes retained between calls. The effective
+    /// cache ceiling is also capped by `max_materialized_bytes`.
     pub max_cached_bytes: usize,
 }
 
@@ -163,6 +165,27 @@ impl From<GitError> for PackReadError {
     }
 }
 
+/// Opaque evidence of the structural depth already resolved for a materialized
+/// pack object.
+///
+/// Pack-derived witnesses come from [`PackReadOutcome::depth_witness`]. Use
+/// [`Self::undeltified`] only for a base known to come from loose/non-delta
+/// storage; treating a pack-derived delta as undeltified violates the decoder's
+/// depth contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackDeltaDepth(usize);
+
+impl PackDeltaDepth {
+    /// Evidence for an object known to be stored without a delta base.
+    pub const fn undeltified() -> Self {
+        Self(0)
+    }
+
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
 /// Resolution supplied for a ref-delta base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefDeltaBase {
@@ -171,22 +194,26 @@ pub enum RefDeltaBase {
     InPack(u64),
     /// The base lives outside this pack. The decoder checks and allocates this
     /// declared body size before asking the caller to fill its bounded slice.
+    /// `delta_depth` must describe the materialized base's own structural chain;
+    /// it is added to the local chain before the depth limit is enforced.
     External {
         object_type: ObjectType,
         size: usize,
+        delta_depth: PackDeltaDepth,
     },
 }
 
 /// Usage measured for one targeted read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PackReadStats {
-    /// Source bytes fetched while inflating zlib members. This counts positional
-    /// read chunks, including any unread tail in the chunk containing StreamEnd.
-    pub compressed_bytes_read: u64,
-    /// Highest simultaneous decoded body/delta allocation capacity during this
+    /// Total bytes returned by [`PackReadSource`] during this call, including
+    /// entry prefixes and compressed read chunks. Bytes are counted once at the
+    /// decoder's single positional-read chokepoint.
+    pub source_bytes_read: u64,
+    /// Highest simultaneous logical decoded body/delta byte total during this
     /// call, including decoder cache contents.
     pub peak_materialized_bytes: usize,
-    /// Decoded body allocation capacity retained after this call.
+    /// Logical decoded body bytes retained after this call.
     pub cached_bytes: usize,
     pub cached_objects: usize,
     pub cache_evictions: u64,
@@ -199,6 +226,14 @@ pub struct PackReadStats {
 pub struct PackReadOutcome {
     pub object: Arc<EncodedObject>,
     pub stats: PackReadStats,
+}
+
+impl PackReadOutcome {
+    /// Produce opaque depth evidence for using this decoded object as a
+    /// materialized external REF base in another bounded decoder.
+    pub const fn depth_witness(&self) -> PackDeltaDepth {
+        PackDeltaDepth(self.stats.delta_depth)
+    }
 }
 
 #[derive(Debug)]
@@ -242,8 +277,8 @@ impl ByteCache {
     }
 
     fn insert(&mut self, offset: u64, object: Arc<EncodedObject>, depth: usize) {
-        let bytes = object.body.capacity();
-        // Zero-capacity bodies would otherwise permit unbounded cache metadata
+        let bytes = object.body.len();
+        // Zero-length bodies would otherwise permit unbounded cache metadata
         // under a byte-only budget without retaining any useful body storage.
         if bytes == 0 || bytes > self.budget || self.budget == 0 {
             return;
@@ -323,7 +358,7 @@ struct EntryPlan {
 /// so call-stack use is constant with respect to attacker-controlled depth.
 /// The internal cache is scoped to this decoder/source pair. The source's
 /// length and contents, including an open [`std::fs::File`], must remain stable
-/// for the decoder's lifetime. Cache accounting is by owned body capacity, not
+/// for the decoder's lifetime. Cache accounting is by logical body bytes, not
 /// entry count, and [`Self::clear_cache`] releases every decoder-held object.
 pub struct BoundedPackDecoder<S> {
     source: S,
@@ -373,9 +408,11 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
     /// Decode the entry at `offset` without loading the whole pack.
     ///
     /// `resolve_ref_base` returns an in-pack offset, size/type metadata for an
-    /// external base, or `None`. For an external base, the decoder enforces the
-    /// remaining allocation budget first, then passes an exact-length bounded
-    /// slice to `fill_external_base`; the callback must fill it completely.
+    /// external base, or `None`. An external base must carry depth evidence from
+    /// its bounded resolution (or explicit undeltified storage). The decoder
+    /// enforces total depth and the remaining materialization budget first, then
+    /// passes an exact-length bounded slice to `fill_external_base`; the callback
+    /// must fill it completely.
     pub fn read_object_at<F, G>(
         &mut self,
         offset: u64,
@@ -441,7 +478,7 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
                 base_object = Some((object, Some(current_offset), cached_depth));
                 break;
             }
-            let entry = self.read_entry_plan(current_offset, cancel)?;
+            let entry = self.read_entry_plan(current_offset, cancel, &mut stats)?;
             cancel.check()?;
             match entry.base.clone() {
                 None => {
@@ -454,38 +491,55 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
                     deltas.push(entry);
                     match base {
                         DeltaBase::Offset(base_offset) => current_offset = base_offset,
-                        DeltaBase::Ref(base_oid) => match resolve_ref_base(&base_oid)? {
-                            Some(RefDeltaBase::InPack(base_offset)) => {
-                                current_offset = base_offset;
+                        DeltaBase::Ref(base_oid) => {
+                            cancel.check()?;
+                            let resolution = resolve_ref_base(&base_oid);
+                            cancel.check()?;
+                            match resolution? {
+                                Some(RefDeltaBase::InPack(base_offset)) => {
+                                    current_offset = base_offset;
+                                }
+                                Some(RefDeltaBase::External {
+                                    object_type,
+                                    size,
+                                    delta_depth,
+                                }) => {
+                                    let full_depth = deltas.len().saturating_add(delta_depth.get());
+                                    self.enforce_depth(full_depth)?;
+                                    external_base =
+                                        Some((base_oid, object_type, size, delta_depth.get()));
+                                    break;
+                                }
+                                None => {
+                                    return Err(GitError::not_found(format!(
+                                        "ref-delta base object {base_oid}"
+                                    ))
+                                    .into());
+                                }
                             }
-                            Some(RefDeltaBase::External { object_type, size }) => {
-                                external_base = Some((base_oid, object_type, size));
-                                break;
-                            }
-                            None => {
-                                return Err(GitError::not_found(format!(
-                                    "ref-delta base object {base_oid}"
-                                ))
-                                .into());
-                            }
-                        },
+                        }
                     }
                 }
             }
         }
 
         let cached_base_depth = base_object.as_ref().map_or(0, |(_, _, depth)| *depth);
-        stats.delta_depth = deltas.len().saturating_add(cached_base_depth);
+        let external_base_depth = external_base.as_ref().map_or(0, |(_, _, _, depth)| *depth);
+        stats.delta_depth = deltas
+            .len()
+            .saturating_add(cached_base_depth)
+            .saturating_add(external_base_depth);
         self.enforce_depth(stats.delta_depth)?;
         let (mut object, mut pinned_cache) = match (base_object, base_entry, external_base) {
             (Some((object, pinned, _)), None, None) => (object, pinned),
-            (None, None, Some((oid, object_type, size))) => {
+            (None, None, Some((oid, object_type, size, _))) => {
                 cancel.check()?;
-                let mut body = self.allocate_body(size, 0, None, &mut stats)?;
-                body.resize(size, 0);
+                let mut body = self.allocate_body(size, 0, None, cancel, &mut stats)?;
+                Self::initialize_body(&mut body, size, cancel)?;
                 cancel.check()?;
-                fill_external_base(&oid, &mut body, cancel)?;
+                let fill_result = fill_external_base(&oid, &mut body, cancel);
                 cancel.check()?;
+                fill_result?;
                 (Arc::new(EncodedObject::new(object_type, body)), None)
             }
             (None, Some(entry), None) => {
@@ -505,11 +559,12 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
             let base_bytes = if pinned_cache.is_some() {
                 0
             } else {
-                object.body.capacity()
+                object.body.len()
             };
             let delta =
                 self.inflate_entry(delta_entry, base_bytes, pinned_cache, cancel, &mut stats)?;
-            let result_size_u64 = decoded_delta_result_size(&delta)?;
+            let plan = plan_pack_delta(&object.body, &delta)?;
+            let result_size_u64 = plan.result_size;
             let result_size = usize::try_from(result_size_u64).map_err(|_| {
                 PackReadError::Limit(PackLimitError {
                     kind: PackLimitKind::MaterializedBytes,
@@ -519,15 +574,17 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
             })?;
             let mut resolved = self.allocate_body(
                 result_size,
-                base_bytes.saturating_add(delta.capacity()),
+                base_bytes.saturating_add(delta.len()),
                 pinned_cache,
+                cancel,
                 &mut stats,
             )?;
-            apply_pack_delta_into(&object.body, &delta, &mut resolved, cancel)?;
+            apply_pack_delta_exact(&object.body, &delta, plan, &mut resolved, cancel)?;
             object = Arc::new(EncodedObject::new(object.object_type, resolved));
             pinned_cache = None;
         }
 
+        cancel.check()?;
         self.cache
             .insert(offset, Arc::clone(&object), stats.delta_depth);
         self.finish_stats(&mut stats, evictions_before);
@@ -556,6 +613,7 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
         &self,
         offset: u64,
         cancel: CancelFlag<'_>,
+        stats: &mut PackReadStats,
     ) -> std::result::Result<EntryPlan, PackReadError> {
         if offset >= self.trailer_offset {
             return Err(GitError::InvalidFormat("pack object offset out of range".into()).into());
@@ -564,7 +622,7 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
             usize::try_from((self.trailer_offset - offset).min(ENTRY_PREFIX_BYTES as u64))
                 .unwrap_or(ENTRY_PREFIX_BYTES);
         let mut prefix = [0u8; ENTRY_PREFIX_BYTES];
-        self.read_exact_at(offset, &mut prefix[..available], cancel)?;
+        self.read_exact_at(offset, &mut prefix[..available], cancel, stats)?;
         let bytes = &prefix[..available];
         let mut cursor = 0usize;
         let header = parse_entry_header(bytes, &mut cursor)?;
@@ -613,7 +671,7 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
                 attempted: usize::MAX,
             })
         })?;
-        let mut body = self.allocate_body(expected, active_bytes, pinned_cache, stats)?;
+        let mut body = self.allocate_body(expected, active_bytes, pinned_cache, cancel, stats)?;
 
         let mut decompressor = Decompress::new(true);
         let mut input = [0u8; INFLATE_CHUNK_BYTES];
@@ -632,22 +690,14 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
                     (self.trailer_offset - source_offset).min(INFLATE_CHUNK_BYTES as u64),
                 )
                 .unwrap_or(INFLATE_CHUNK_BYTES);
-                cancel.check()?;
-                let read = self.source.read_at(source_offset, &mut input[..wanted])?;
-                if read > wanted {
-                    return Err(GitError::InvalidFormat(
-                        "pack source returned more bytes than requested".into(),
-                    )
-                    .into());
-                }
+                let read =
+                    self.read_source_at(source_offset, &mut input[..wanted], cancel, stats)?;
                 if read == 0 {
                     return Err(GitError::InvalidObject("truncated zlib stream".into()).into());
                 }
                 source_offset = source_offset
                     .checked_add(read as u64)
                     .ok_or_else(|| GitError::InvalidFormat("pack source offset overflow".into()))?;
-                stats.compressed_bytes_read =
-                    stats.compressed_bytes_read.saturating_add(read as u64);
                 input_start = 0;
                 input_end = read;
             }
@@ -700,8 +750,10 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
         active_bytes: usize,
         additional_bytes: usize,
         pinned_cache: Option<u64>,
+        cancel: CancelFlag<'_>,
         stats: &mut PackReadStats,
     ) -> std::result::Result<(), PackReadError> {
+        cancel.check()?;
         let working = active_bytes.saturating_add(additional_bytes);
         if working > self.limits.max_materialized_bytes {
             return Err(PackReadError::Limit(PackLimitError {
@@ -711,6 +763,7 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
             }));
         }
         while self.cache.used.saturating_add(working) > self.limits.max_materialized_bytes {
+            cancel.check()?;
             if !self.cache.evict_one_except(pinned_cache) {
                 break;
             }
@@ -732,19 +785,58 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
         requested: usize,
         active_bytes: usize,
         pinned_cache: Option<u64>,
+        cancel: CancelFlag<'_>,
         stats: &mut PackReadStats,
     ) -> std::result::Result<Vec<u8>, PackReadError> {
-        self.ensure_materialized(active_bytes, requested, pinned_cache, stats)?;
+        cancel.check()?;
+        self.ensure_materialized(active_bytes, requested, pinned_cache, cancel, stats)?;
+        cancel.check()?;
         let mut body = Vec::new();
-        body.try_reserve_exact(requested).map_err(|_| {
+        let allocation = body.try_reserve_exact(requested);
+        cancel.check()?;
+        allocation.map_err(|_| {
             PackReadError::Limit(PackLimitError {
                 kind: PackLimitKind::MaterializedBytes,
                 limit: self.limits.max_materialized_bytes,
                 attempted: active_bytes.saturating_add(requested),
             })
         })?;
-        self.ensure_materialized(active_bytes, body.capacity(), pinned_cache, stats)?;
         Ok(body)
+    }
+
+    fn read_source_at(
+        &self,
+        offset: u64,
+        buf: &mut [u8],
+        cancel: CancelFlag<'_>,
+        stats: &mut PackReadStats,
+    ) -> std::result::Result<usize, PackReadError> {
+        cancel.check()?;
+        let read_result = self.source.read_at(offset, buf);
+        cancel.check()?;
+        let read = read_result?;
+        if read > buf.len() {
+            return Err(GitError::InvalidFormat(
+                "pack source returned more bytes than requested".into(),
+            )
+            .into());
+        }
+        stats.source_bytes_read = stats.source_bytes_read.saturating_add(read as u64);
+        Ok(read)
+    }
+
+    fn initialize_body(
+        body: &mut Vec<u8>,
+        size: usize,
+        cancel: CancelFlag<'_>,
+    ) -> std::result::Result<(), PackReadError> {
+        while body.len() < size {
+            cancel.check()?;
+            let end = body.len().saturating_add(INFLATE_CHUNK_BYTES).min(size);
+            body.resize(end, 0);
+        }
+        cancel.check()?;
+        Ok(())
     }
 
     fn read_exact_at(
@@ -752,16 +844,10 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
         mut offset: u64,
         mut buf: &mut [u8],
         cancel: CancelFlag<'_>,
+        stats: &mut PackReadStats,
     ) -> std::result::Result<(), PackReadError> {
         while !buf.is_empty() {
-            cancel.check()?;
-            let read = self.source.read_at(offset, buf)?;
-            if read > buf.len() {
-                return Err(GitError::InvalidFormat(
-                    "pack source returned more bytes than requested".into(),
-                )
-                .into());
-            }
+            let read = self.read_source_at(offset, buf, cancel, stats)?;
             if read == 0 {
                 return Err(GitError::InvalidFormat("truncated pack entry header".into()).into());
             }
