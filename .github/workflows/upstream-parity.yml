@@ -55,11 +55,15 @@ jobs:
 
       # Build deps for git from source (matches the local build:
       # libcurl4-openssl-dev libexpat1-dev libpcre2-dev gettext).
+      # gnupg + openssh-client are required by the upstream signing t-files
+      # (t7612/t5573/t9305/t5534/t7528/t5813 etc.); without them the whole
+      # signing cluster drops below floor and reddens the parity gate even
+      # though the sley engine is unchanged.
       - name: Install git build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libcurl4-openssl-dev libexpat1-dev libpcre2-dev gettext
+            libcurl4-openssl-dev libexpat1-dev libpcre2-dev gettext gnupg openssh-client
 
       # Cache the built git source tree, keyed on the version tag. A cache hit
       # skips the ~minutes-long clone+make.
