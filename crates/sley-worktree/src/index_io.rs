@@ -849,24 +849,52 @@ pub(crate) fn head_tree_entries(
     format: ObjectFormat,
     db: &FileObjectDatabase,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
+    tree_entries_for_status_reference(git_dir, format, db, "HEAD")
+}
+
+/// Flatten the tree of a status reference into tracked path entries.
+///
+/// Supports `"HEAD"` and `"HEAD^1"` / `"HEAD^"` (first parent of HEAD). An
+/// unresolvable reference (e.g. root commit has no parent) yields an empty map,
+/// matching git's `s->is_initial` empty-tree comparison for amend of a root
+/// commit.
+pub(crate) fn tree_entries_for_status_reference(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    reference: &str,
+) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
     let refs = FileRefStore::new(git_dir, format);
     let Some(head) = refs.read_ref("HEAD")? else {
         return Ok(BTreeMap::new());
     };
-    let commit_oid = match head {
+    let head_oid = match head {
         RefTarget::Direct(oid) => Some(oid),
         RefTarget::Symbolic(name) => match refs.read_ref(&name)? {
             Some(RefTarget::Direct(oid)) => Some(oid),
             _ => None,
         },
     };
-    let Some(commit_oid) = commit_oid.filter(|oid| !oid.is_null()) else {
+    let Some(head_oid) = head_oid.filter(|oid| !oid.is_null()) else {
         return Ok(BTreeMap::new());
     };
-    let object = read_expected_object(db, &commit_oid, ObjectType::Commit)?;
+    let object = read_expected_object(db, &head_oid, ObjectType::Commit)?;
     let commit = Commit::parse_ref(format, &object.body)?;
+    let tree_oid = if reference == "HEAD" {
+        commit.tree
+    } else if reference == "HEAD^1" || reference == "HEAD^" {
+        // First parent; missing parent → empty map (initial/root amend).
+        let Some(parent) = commit.parents.first() else {
+            return Ok(BTreeMap::new());
+        };
+        let parent_obj = read_expected_object(db, parent, ObjectType::Commit)?;
+        let parent_commit = Commit::parse_ref(format, &parent_obj.body)?;
+        parent_commit.tree
+    } else {
+        return Ok(BTreeMap::new());
+    };
     let mut entries = BTreeMap::new();
-    collect_tree_entries(db, format, &commit.tree, &mut entries)?;
+    collect_tree_entries(db, format, &tree_oid, &mut entries)?;
     Ok(entries)
 }
 

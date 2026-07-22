@@ -6,8 +6,9 @@ use sley::plumbing::{sley_diff_merge, sley_object, sley_worktree};
 // descendant-privacy; see commands::stash for the rationale.
 use super::status::{
     StatusLongDisplay, SubmoduleIgnoreResolver, apply_submodule_ignore, build_status_long_sink,
-    commit_comment_string, print_status_long, resolve_status_rename_config, status_comment_prefix,
-    status_entries_have_index_changes, status_submodule_summary,
+    commit_comment_string, print_status_long, resolve_commit_comment_char,
+    resolve_status_rename_config, status_comment_prefix, status_entries_have_index_changes,
+    status_submodule_summary,
 };
 use crate::*;
 
@@ -1120,7 +1121,7 @@ pub(crate) fn cmd_commit(
         && !in_revert
         && !git_dir.join("SQUASH_MSG").is_file()
         && template_file.is_some();
-    let message = reused_commit
+    let mut message = reused_commit
         .as_ref()
         .map(|commit| {
             if let Some(squash_message) = &squash_message {
@@ -1226,18 +1227,6 @@ pub(crate) fn cmd_commit(
         &message,
         &trailers,
     ));
-    let mut message = if signoff {
-        commands::replay::append_signoff_before_comments(
-            message,
-            &commit_signoff_from_env(&identity_config)?,
-        )
-    } else {
-        message
-    };
-    if !trailers.is_empty() {
-        message =
-            commit_message_with_trailers(repo_config.as_ref(), &message, &trailers).into_owned();
-    }
     // Editor flow: a commit without an explicit message source launches the
     // editor over COMMIT_EDITMSG (the in-merge / rebase conclude paths keep
     // their historical no-editor behavior).
@@ -1315,7 +1304,28 @@ pub(crate) fn cmd_commit(
             .and_then(|c| c.get("commit", None, "cleanup").map(str::to_string))
     });
     let cleanup_mode = resolve_commit_cleanup_mode(cleanup_config.as_deref(), use_editor);
-    let comment_char = commit_comment_string(&git_dir);
+    // git's prepare_to_commit: stripspace (when not verbatim) BEFORE signoff so
+    // an empty `commit -s` keeps the two leading blank lines append_signoff
+    // inserts for the title/body (t7502 "places sob on third line...").
+    if cleanup_mode != CommitCleanupMode::Verbatim {
+        message = commit_stripspace_message(&message, None);
+    }
+    let mut message = if signoff {
+        commands::replay::append_signoff_before_comments(
+            message,
+            &commit_signoff_from_env(&identity_config)?,
+        )
+    } else {
+        message
+    };
+    if !trailers.is_empty() {
+        message =
+            commit_message_with_trailers(repo_config.as_ref(), &message, &trailers).into_owned();
+    }
+    // core.commentChar=auto: pick an unused candidate from the user message
+    // (git's adjust_comment_line_char), after stripspace+signoff and before the
+    // status block is appended.
+    let comment_char = resolve_commit_comment_char(&git_dir, &message)?;
     let editmsg = git_dir.join("COMMIT_EDITMSG");
     // When an editor will run, git appends a commented status block (the
     // template) to COMMIT_EDITMSG unless `--no-status`/`commit.status=false`.
@@ -1326,11 +1336,10 @@ pub(crate) fn cmd_commit(
             .and_then(|c| c.get_bool("commit", None, "status"))
             .unwrap_or(true)
     });
-    let mut template = if cleanup_mode == CommitCleanupMode::Verbatim {
-        message.clone()
-    } else {
-        commit_stripspace_message(&message, None)
-    };
+    // Message is already stripspace'd (unless verbatim) and signed off — write
+    // it as-is. A second stripspace would eat the leading blanks append_signoff
+    // placed for an empty buffer.
+    let mut template = message.clone();
     if use_editor && include_status_resolved {
         // `author_date_is_interesting()` = `--date` given or author reused from
         // another commit (`-C`/`-c`/amend); env GIT_AUTHOR_DATE alone does not
@@ -2470,6 +2479,7 @@ fn cmd_commit_long_status_preview(
             include_ignored: false,
             ignored_mode: sley_worktree::StatusIgnoredMode::Traditional,
             untracked_mode,
+            reference: if amend { Some("HEAD^1") } else { None },
         },
     )?;
     let committable = status_entries_have_index_changes(&entries);
@@ -2719,13 +2729,13 @@ fn read_fixup_commit_message(
     match fixup {
         CommitFixup::Plain(_) => {
             let mut message = b"fixup! ".to_vec();
-            message.extend_from_slice(subject);
+            message.extend_from_slice(&subject);
             message.push(b'\n');
             Ok(message)
         }
         CommitFixup::Amend { .. } => {
             let mut amend = b"amend! ".to_vec();
-            amend.extend_from_slice(subject);
+            amend.extend_from_slice(&subject);
             amend.extend_from_slice(b"\n\n");
             let body = if commit.message.starts_with(b"amend! ") {
                 commit_message_body(&commit.message)
@@ -2749,7 +2759,7 @@ fn read_squash_commit_message(
     let message = commit_message_for_commit_encoding(&commit, output_encoding);
     let subject = commit_subject_bytes(&message);
     let mut squash = b"squash! ".to_vec();
-    squash.extend_from_slice(subject);
+    squash.extend_from_slice(&subject);
     squash.push(b'\n');
     Ok(squash)
 }
@@ -3486,6 +3496,9 @@ fn render_commit_template_status(
             include_ignored: false,
             ignored_mode: sley_worktree::StatusIgnoredMode::Traditional,
             untracked_mode,
+            // git's run_status for amend sets s->reference = "HEAD^1" so the
+            // template's "Changes to be committed" is the parent→index diff.
+            reference: if amend { Some("HEAD^1") } else { None },
         },
     )?;
     let ignore_resolver = SubmoduleIgnoreResolver::load(git_dir, &config, None)?;

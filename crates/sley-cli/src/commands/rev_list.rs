@@ -1843,7 +1843,7 @@ fn write_rev_list_short(
     writeln!(stdout)?;
     stdout.write_all(b"    ")?;
     let message = commit_message_for_commit_encoding(&record.commit, output_encoding);
-    stdout.write_all(commit_subject_bytes(&message))?;
+    stdout.write_all(&commit_subject_bytes(&message))?;
     stdout.write_all(b"\n")?;
     writeln!(stdout)?;
     Ok(())

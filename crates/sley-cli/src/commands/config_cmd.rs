@@ -762,7 +762,33 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
     } else if let Some(spec) = blob {
         ConfigSource::Blob(spec)
     } else {
-        ConfigSource::Repository(repo_git_dir?)
+        match repo_git_dir {
+            Ok(git_dir) => ConfigSource::Repository(git_dir),
+            Err(err) => {
+                // git's `check_write` / `show_editor`: writing the default
+                // (repository) config outside a repo dies with this exact
+                // message — not the generic "not a git repository" discovery
+                // error. Reads still fall through to the discovery error so
+                // non-write paths keep their existing diagnostic.
+                let is_write = matches!(
+                    action,
+                    ConfigAction::Set
+                        | ConfigAction::SetAll
+                        | ConfigAction::Add
+                        | ConfigAction::ReplaceAll
+                        | ConfigAction::Unset
+                        | ConfigAction::UnsetAll
+                        | ConfigAction::RenameSection
+                        | ConfigAction::RemoveSection
+                        | ConfigAction::Edit
+                );
+                if is_write {
+                    eprintln!("fatal: not in a git directory");
+                    return Err(GitError::Exit(128));
+                }
+                return Err(err);
+            }
+        }
     };
 
     if action == ConfigAction::Edit {

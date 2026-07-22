@@ -95,7 +95,7 @@ pub(crate) fn print_reset_hard_head(
         "HEAD is now at {} ",
         format_log_abbrev_oid(commit_oid)
     )?;
-    stdout.write_all(subject)?;
+    stdout.write_all(&subject)?;
     writeln!(stdout)?;
     Ok(())
 }

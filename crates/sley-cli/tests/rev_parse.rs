@@ -1089,3 +1089,88 @@ fn rev_parse_short_and_ref_flags_terminate_and_match_git() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// t1504-ceiling-dirs: a leading empty `GIT_CEILING_DIRECTORIES` entry disables
+/// realpath resolution so a ceiling named via a symlink (`top` → `sub`) does
+/// not hide the real path when discovering from `sub/dir`.
+#[test]
+fn rev_parse_show_prefix_ceiling_symlink_no_resolve_matches_upstream_git() {
+    let root = unique_temp_dir("rev-parse-ceiling-no-resolve");
+    fs::create_dir_all(&root).expect("create temp root");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        let sub_dir = root.join("sub").join("dir");
+        fs::create_dir_all(&sub_dir).expect("create sub/dir");
+        let top = root.join("top");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("sub", &top).expect("symlink top -> sub");
+        #[cfg(not(unix))]
+        {
+            let _ = top;
+            return;
+        }
+
+        let top_s = top.to_string_lossy().into_owned();
+        let top_slash = format!("{top_s}/");
+        let resolved_ceiling = root.join("sub").to_string_lossy().into_owned();
+
+        // With realpath: ceiling at the symlink target blocks discovery.
+        for (label, ceiling) in [
+            ("resolved_symlink_target", resolved_ceiling.as_str()),
+            ("resolved_via_symlink_name", top_s.as_str()),
+            ("resolved_via_symlink_name_slash", top_slash.as_str()),
+        ] {
+            let envs = [("GIT_CEILING_DIRECTORIES", ceiling)];
+            let expected = run_status_with_env(
+                sley_testkit::oracle_git(),
+                &sub_dir,
+                &["rev-parse", "--show-prefix"],
+                &envs,
+            );
+            let actual = run_status_with_env(
+                sley_testkit::sley_bin!(),
+                &sub_dir,
+                &["rev-parse", "--show-prefix"],
+                &envs,
+            );
+            assert_eq!(
+                actual, expected,
+                "sley result differed for resolved ceiling {label}={ceiling}"
+            );
+        }
+
+        // Leading empty entry (`:path`) disables resolve — discovery succeeds.
+        for (label, ceiling) in [
+            ("no_resolve", format!(":{top_s}")),
+            ("no_resolve_slash", format!(":{top_slash}")),
+        ] {
+            let envs = [("GIT_CEILING_DIRECTORIES", ceiling.as_str())];
+            let expected = run_status_with_env(
+                sley_testkit::oracle_git(),
+                &sub_dir,
+                &["rev-parse", "--show-prefix"],
+                &envs,
+            );
+            let actual = run_status_with_env(
+                sley_testkit::sley_bin!(),
+                &sub_dir,
+                &["rev-parse", "--show-prefix"],
+                &envs,
+            );
+            assert_eq!(
+                actual, expected,
+                "sley result differed for no-resolve ceiling {label}={ceiling}"
+            );
+            assert_eq!(
+                expected.0, 0,
+                "oracle should succeed for no-resolve {label}"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&expected.1),
+                "sub/dir/\n",
+                "oracle show-prefix for no-resolve {label}"
+            );
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}

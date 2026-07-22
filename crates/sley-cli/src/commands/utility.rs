@@ -518,6 +518,11 @@ fn var_editor(
     cli_session: &crate::session::CliSession,
     specific_key: Option<&str>,
 ) -> Result<String> {
+    // Matches git's `git_editor()` / `git_sequence_editor()` (editor.c): env and
+    // config cascade, then VISUAL (when the terminal is not dumb), then EDITOR,
+    // then DEFAULT_EDITOR ("vi"). A dumb terminal with nothing else set yields
+    // NULL (git var exits 1) — t7005 "determine default editor" / "dumb should
+    // error out when falling back on vi".
     if let Some(key) = specific_key {
         if let Ok(value) = env::var("GIT_SEQUENCE_EDITOR") {
             return Ok(value);
@@ -532,16 +537,22 @@ fn var_editor(
     if let Some(value) = var_effective_config_value(cli_session, "core.editor") {
         return Ok(value);
     }
-    if let Ok(value) = env::var("VISUAL")
-        && !value.is_empty()
-        && env::var("TERM").is_ok_and(|term| term != "dumb")
-    {
-        return Ok(value);
+    let terminal_is_dumb = match env::var("TERM") {
+        Ok(term) => term == "dumb",
+        Err(_) => true,
+    };
+    if !terminal_is_dumb {
+        if let Ok(value) = env::var("VISUAL") {
+            return Ok(value);
+        }
     }
     if let Ok(value) = env::var("EDITOR") {
         return Ok(value);
     }
-    Err(GitError::Exit(1))
+    if terminal_is_dumb {
+        return Err(GitError::Exit(1));
+    }
+    Ok("vi".into())
 }
 
 fn var_pager(cli_session: &crate::session::CliSession) -> String {
@@ -1523,7 +1534,10 @@ fn stripspace_usage<T>() -> Result<T> {
     Err(GitError::Exit(129))
 }
 
-pub(crate) fn cmd_check_ref_format(args: &[String]) -> Result<()> {
+pub(crate) fn cmd_check_ref_format(
+    cli_session: &crate::session::CliSession,
+    args: &[String],
+) -> Result<()> {
     let mut allow_onelevel = false;
     let mut branch = false;
     let mut normalize = false;
@@ -1550,8 +1564,13 @@ pub(crate) fn cmd_check_ref_format(args: &[String]) -> Result<()> {
         name = normalize_check_ref_format_name(&name);
     }
     if branch {
-        if check_branch_format_name(&name).is_ok() {
-            println!("{name}");
+        // git's check_branch_ref: when a repository is present, interpret
+        // branch-name sugar (`@{-N}`, …) via the HEAD reflog, then validate the
+        // expanded name as `refs/heads/<name>` and print the short form.
+        // Outside a repository the literal argument is checked instead (t1402).
+        let expanded = expand_check_ref_format_branch_name(cli_session, &name);
+        if check_branch_format_name(&expanded).is_ok() {
+            println!("{expanded}");
             return Ok(());
         }
         eprintln!("fatal: '{name}' is not a valid branch name");
@@ -1565,6 +1584,44 @@ pub(crate) fn cmd_check_ref_format(args: &[String]) -> Result<()> {
     } else {
         Err(GitError::Exit(1))
     }
+}
+
+/// Expand `--branch` sugar the way git's `copy_branchname` /
+/// `repo_interpret_branch_name` does when a repository is available.
+fn expand_check_ref_format_branch_name(
+    cli_session: &crate::session::CliSession,
+    name: &str,
+) -> String {
+    let Ok(git_dir) = cli_session.git_dir() else {
+        return name.to_string();
+    };
+    let Ok(format) = repository_object_format(&git_dir) else {
+        return name.to_string();
+    };
+    if let Some(inner) = name
+        .strip_prefix("@{-")
+        .and_then(|rest| rest.strip_suffix('}'))
+    {
+        if inner.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(n) = inner.parse::<usize>() {
+                if n > 0 {
+                    if let Ok(Some(from)) =
+                        sley_rev::nth_prior_checkout_branch_name(&git_dir, format, n)
+                    {
+                        // Reflog "from" is already the short name or an oid; strip
+                        // a heads/ prefix if a full ref was recorded.
+                        return from
+                            .strip_prefix("refs/heads/")
+                            .unwrap_or(&from)
+                            .to_string();
+                    }
+                }
+            }
+        }
+        // Malformed / unresolvable `@{-N}` stays as the literal (then fails format).
+        return name.to_string();
+    }
+    name.to_string()
 }
 
 fn check_ref_format_usage<T>() -> Result<T> {

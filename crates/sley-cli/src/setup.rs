@@ -97,12 +97,18 @@ fn discover(cli_session: &session::CliSession, cwd: &Path) -> Option<Discovered>
     let one_filesystem = !git_env_bool("GIT_DISCOVERY_ACROSS_FILESYSTEM");
     let start_device = if one_filesystem { device_of(cwd) } else { None };
 
-    let ceilings = ceiling_directories();
+    let ceilings = crate::discovery::discovery_ceiling_directories();
 
     for dir in cwd.ancestors() {
         // GIT_CEILING_DIRECTORIES: stop before entering a listed *proper*
         // ancestor; the starting directory itself is always examined.
-        if dir != cwd && ceilings.iter().any(|ceiling| paths_same_dir(ceiling, dir)) {
+        // Empty entries in the env list disable realpath for subsequent ceilings
+        // (git's canonicalize_ceiling_entry / t1504 no_resolve cases).
+        if dir != cwd
+            && ceilings
+                .iter()
+                .any(|ceiling| ceiling.matches_discovery_candidate(dir))
+        {
             return None;
         }
 
@@ -568,36 +574,12 @@ fn common_dir_for(git_dir_text: &str, gitdir_dir: &Path) -> String {
     git_dir_text.to_string()
 }
 
-/// `GIT_CEILING_DIRECTORIES`, colon-separated absolute paths; empty entries
-/// ignored.
-fn ceiling_directories() -> Vec<PathBuf> {
-    match env::var("GIT_CEILING_DIRECTORIES") {
-        Ok(value) if !value.is_empty() => value
-            .split(':')
-            .filter(|entry| !entry.is_empty())
-            .map(PathBuf::from)
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
 /// A `GIT_*` boolean env var with a configurable default when unset, matching
 /// git's `git_env_bool`.
 fn git_env_bool_default(name: &str, default: bool) -> bool {
     match env::var(name) {
         Ok(value) => !matches!(value.as_str(), "" | "0" | "false" | "no" | "off"),
         Err(_) => default,
-    }
-}
-
-/// Whether two paths name the same directory (canonicalize-tolerant).
-fn paths_same_dir(left: &Path, right: &Path) -> bool {
-    if left == right {
-        return true;
-    }
-    match (fs::canonicalize(left), fs::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
     }
 }
 

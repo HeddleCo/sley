@@ -645,12 +645,15 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
     let local_store = FileRefStore::new(git_dir, format);
     let mut local_refs = crate::push::local_push_source_refs(&local_store, format)?;
     crate::push::add_revision_push_sources(git_dir, format, refspecs, &mut local_refs);
+    let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let command_forces = crate::push::plan_push_command_forces(
         format,
         &local_refs,
         &advertisement_set.refs,
         refspecs,
         force,
+        &local_db,
+        crate::push::advice_push_unqualified_ref_name(None),
     )?;
     let commands = command_forces
         .iter()
@@ -671,7 +674,6 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
         });
     }
 
-    let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     crate::push::reject_non_fast_forward_pushes(
         common_git_dir,
         &local_db,

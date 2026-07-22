@@ -894,18 +894,18 @@ fn emit_plain_oneline_limited_commit(
     out.push(b' ');
     let (message, encoding) = commit_object_message_and_optional_encoding(&object.body);
     if encoding_is_none(output_encoding) {
-        out.extend_from_slice(commit_subject_bytes(message));
+        out.extend_from_slice(&commit_subject_bytes(message));
         return Ok(());
     }
     if encoding.is_none() && output_encoding_is_utf8 {
-        out.extend_from_slice(commit_subject_bytes(message));
+        out.extend_from_slice(&commit_subject_bytes(message));
         return Ok(());
     }
     let utf8_message = match encoding {
         Some(encoding) => log_reencode_message(message, encoding.as_ref(), "UTF-8"),
         None => std::borrow::Cow::Borrowed(message),
     };
-    out.extend_from_slice(commit_subject_bytes(&utf8_message));
+    out.extend_from_slice(&commit_subject_bytes(&utf8_message));
     if !output_encoding_is_utf8 {
         let reencoded = log_reencode_message(out, "UTF-8", output_encoding).into_owned();
         out.clear();
