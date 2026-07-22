@@ -859,3 +859,91 @@ fn init_reinit_ignores_default_hash_env_like_upstream_git() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+/// `GIT_OBJECT_DIRECTORY` during `git init` must place `info/` and `pack/` in the
+/// external object store and must *not* create `$GIT_DIR/objects/pack`.
+///
+/// Mirrors upstream t0001-init.sh #103 ("init honors GIT_OBJECT_DIRECTORY").
+#[test]
+fn init_honors_git_object_directory() {
+    let root = unique_temp_dir("init-git-object-directory");
+    fs::create_dir_all(&root).expect("create temp root");
+
+    for (name, program) in [
+        ("git", sley_testkit::oracle_git()),
+        ("sley", sley_testkit::sley_bin!()),
+    ] {
+        let case_root = root.join(name);
+        let custom_odb = case_root.join("custom-odb");
+        let repo = case_root.join("init-objdir");
+        fs::create_dir_all(&custom_odb).expect("create custom odb");
+
+        let object_dir = custom_odb.to_str().expect("utf8 object dir");
+        let repo_arg = repo.to_str().expect("utf8 repo path");
+        let (code, _stdout, stderr) = run_status_env(
+            program,
+            &case_root,
+            &["init", "-q", "-b", "main", repo_arg],
+            &[("GIT_OBJECT_DIRECTORY", object_dir)],
+        );
+        assert_eq!(
+            code,
+            0,
+            "{name} init failed\nstderr:\n{}",
+            String::from_utf8_lossy(&stderr)
+        );
+
+        assert!(
+            !repo.join(".git/objects/pack").exists(),
+            "{name}: default objects/pack must be missing under GIT_OBJECT_DIRECTORY"
+        );
+        assert!(
+            custom_odb.join("pack").is_dir(),
+            "{name}: custom-odb/pack must exist"
+        );
+        assert!(
+            custom_odb.join("info").is_dir(),
+            "{name}: custom-odb/info must exist"
+        );
+    }
+
+    // Relative GIT_OBJECT_DIRECTORY: git chdirs into the directory argument first,
+    // so the relative path is resolved against the new worktree, not the original cwd.
+    let rel_root = root.join("relative");
+    fs::create_dir_all(&rel_root).expect("create relative case root");
+    for (name, program) in [
+        ("git", sley_testkit::oracle_git()),
+        ("sley", sley_testkit::sley_bin!()),
+    ] {
+        let case_root = rel_root.join(name);
+        fs::create_dir_all(&case_root).expect("create case root");
+        let (code, _stdout, stderr) = run_status_env(
+            program,
+            &case_root,
+            &["init", "-q", "-b", "main", "init-objdir"],
+            &[("GIT_OBJECT_DIRECTORY", "custom-odb")],
+        );
+        assert_eq!(
+            code,
+            0,
+            "{name} relative init failed\nstderr:\n{}",
+            String::from_utf8_lossy(&stderr)
+        );
+
+        let worktree = case_root.join("init-objdir");
+        assert!(
+            !worktree.join(".git/objects/pack").exists(),
+            "{name}: relative: default objects/pack must be missing"
+        );
+        assert!(
+            worktree.join("custom-odb/pack").is_dir(),
+            "{name}: relative custom-odb/pack must live under the init target"
+        );
+        assert!(
+            !case_root.join("custom-odb/pack").exists(),
+            "{name}: relative custom-odb must not be resolved against the original cwd"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}

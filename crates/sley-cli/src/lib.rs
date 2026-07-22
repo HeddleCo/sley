@@ -194,7 +194,8 @@ pub(crate) use commands::merge_rebase::{
     read_merge_message_from_file, rebase_in_progress, three_way_merge_trees,
 };
 pub(crate) use commands::remote::{
-    read_repo_config, remote_exists, remote_names, repo_current_branch_name, write_repo_config,
+    read_repo_config, read_repo_config_on_disk, remote_exists, remote_names,
+    repo_current_branch_name, write_repo_config,
 };
 pub(crate) use commands::status::cmd_status;
 use commands::tag::tag_stripspace_message;

@@ -1326,3 +1326,237 @@ fn for_each_ref_name_only_format_skips_missing_object() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+/// t6300 / t1461 "sort by custom date format": `--sort=creatordate:format:...`
+/// orders by the *rendered* date string, not the raw timestamp. The fixture
+/// dates reverse under the two keys, so a Number-vs-Text mix-up is visible.
+#[test]
+fn for_each_ref_sort_by_custom_date_format_matches_git() {
+    let root = unique_temp_dir("for-each-ref-custom-date-sort");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("file"), b"file\n").expect("write fixture");
+        git(&root, &["add", "file"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+                "-q",
+            ],
+        );
+        // Same instants as t/for-each-ref-tests.sh "set up custom date sorting".
+        for (i, when) in [1707341660u64, 945129922, 1622806011, 1169484241]
+            .into_iter()
+            .enumerate()
+        {
+            let name = format!("custom-dates-{}", i + 1);
+            let date = format!("@{when} +0000");
+            let status = Command::new(sley_testkit::oracle_git())
+                .current_dir(&root)
+                .env("GIT_COMMITTER_DATE", &date)
+                .env("GIT_COMMITTER_EMAIL", "user@example.com")
+                .env("GIT_COMMITTER_NAME", "user")
+                .args(["tag", "-m", &format!("tag {when}"), &name])
+                .status()
+                .expect("run git tag");
+            assert!(status.success(), "git tag {name} failed");
+        }
+
+        let expected_unix = "945129922 refs/tags/custom-dates-2\n\
+1169484241 refs/tags/custom-dates-4\n\
+1622806011 refs/tags/custom-dates-3\n\
+1707341660 refs/tags/custom-dates-1\n";
+        let expected_fmt = "00:05:22 refs/tags/custom-dates-2\n\
+11:26:51 refs/tags/custom-dates-3\n\
+16:44:01 refs/tags/custom-dates-4\n\
+21:34:20 refs/tags/custom-dates-1\n";
+
+        for cmd in ["for-each-ref", "refs"] {
+            let (args_unix, args_fmt): (Vec<&str>, Vec<&str>) = if cmd == "for-each-ref" {
+                (
+                    vec![
+                        "for-each-ref",
+                        "--format=%(creatordate:unix) %(refname)",
+                        "--sort=creatordate",
+                        "refs/tags/custom-dates-*",
+                    ],
+                    vec![
+                        "for-each-ref",
+                        "--format=%(creatordate:format:%H:%M:%S) %(refname)",
+                        "--sort=creatordate:format:%H:%M:%S",
+                        "refs/tags/custom-dates-*",
+                    ],
+                )
+            } else {
+                (
+                    vec![
+                        "refs",
+                        "list",
+                        "--format=%(creatordate:unix) %(refname)",
+                        "--sort=creatordate",
+                        "refs/tags/custom-dates-*",
+                    ],
+                    vec![
+                        "refs",
+                        "list",
+                        "--format=%(creatordate:format:%H:%M:%S) %(refname)",
+                        "--sort=creatordate:format:%H:%M:%S",
+                        "refs/tags/custom-dates-*",
+                    ],
+                )
+            };
+            let git_unix = String::from_utf8_lossy(&git(&root, &args_unix)).into_owned();
+            let sley_unix = String::from_utf8_lossy(&sley(&root, &args_unix)).into_owned();
+            assert_eq!(git_unix, expected_unix, "oracle unix order ({cmd})");
+            assert_eq!(sley_unix, expected_unix, "sley unix order ({cmd})");
+
+            let git_fmt = String::from_utf8_lossy(&git(&root, &args_fmt)).into_owned();
+            let sley_fmt = String::from_utf8_lossy(&sley(&root, &args_fmt)).into_owned();
+            assert_eq!(git_fmt, expected_fmt, "oracle format order ({cmd})");
+            assert_eq!(sley_fmt, expected_fmt, "sley format order ({cmd})");
+            assert_ne!(
+                expected_unix.lines().map(|l| l.split_once(' ').unwrap().1).collect::<Vec<_>>(),
+                expected_fmt.lines().map(|l| l.split_once(' ').unwrap().1).collect::<Vec<_>>(),
+                "fixture must distinguish timestamp vs format sort"
+            );
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t6300 / t1461 "is-base atom with non-commits": peeling a broken tag (type
+/// claims blob, object is commit) while computing `%(is-base:…)` must emit the
+/// two standard errors and still mark the tip's base.
+#[test]
+fn for_each_ref_is_base_with_non_commits_matches_git() {
+    let root = unique_temp_dir("for-each-ref-is-base-non-commits");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("file"), b"file\n").expect("write fixture");
+        git(&root, &["add", "file"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+                "-q",
+            ],
+        );
+        // Broken tag fixture from "reports broken tags" in for-each-ref-tests.sh.
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "tag",
+                "-m",
+                "good tag",
+                "broken-tag-good",
+                "HEAD",
+            ],
+        );
+        let good = git(&root, &["cat-file", "tag", "broken-tag-good"]);
+        let bad_body = String::from_utf8_lossy(&good).replacen("commit", "blob", 1);
+        fs::write(root.join("bad-tag"), bad_body.as_bytes()).expect("write bad tag body");
+        let bad_oid = String::from_utf8_lossy(&git(
+            &root,
+            &["hash-object", "-w", "-t", "tag", "bad-tag"],
+        ))
+        .trim()
+        .to_string();
+        git(&root, &["update-ref", "refs/tags/broken-tag-bad", &bad_oid]);
+
+        // Nested tags (immediate predecessor of the is-base test in the suite).
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "tag",
+                "-am",
+                "Normal tag",
+                "nested/base",
+                "HEAD",
+            ],
+        );
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "tag",
+                "-am",
+                "Nested tag",
+                "nested/nest1",
+                "refs/tags/nested/base",
+            ],
+        );
+
+        for args in [
+            vec!["for-each-ref", "--format=%(is-base:HEAD) %(refname)"],
+            vec!["refs", "list", "--format=%(is-base:HEAD) %(refname)"],
+        ] {
+            let expected = git_raw(&root, &args);
+            let actual = sley_raw(&root, &args);
+            assert!(
+                expected.status.success() && actual.status.success(),
+                "is-base must exit 0; git={:?} sley={:?}",
+                expected.status.code(),
+                actual.status.code()
+            );
+            assert_eq!(
+                actual.stdout, expected.stdout,
+                "is-base stdout mismatch for {args:?}\ngit:\n{}\nsley:\n{}",
+                String::from_utf8_lossy(&expected.stdout),
+                String::from_utf8_lossy(&actual.stdout)
+            );
+            assert_eq!(
+                actual.stderr, expected.stderr,
+                "is-base stderr mismatch for {args:?}\ngit:\n{}\nsley:\n{}",
+                String::from_utf8_lossy(&expected.stderr),
+                String::from_utf8_lossy(&actual.stderr)
+            );
+            let out = String::from_utf8_lossy(&actual.stdout);
+            let err = String::from_utf8_lossy(&actual.stderr);
+            assert!(
+                out.lines().any(|l| l.contains("(HEAD) refs/heads/main")),
+                "missing (HEAD) base mark: {out}"
+            );
+            let err_lines: Vec<_> = err.lines().filter(|l| !l.is_empty()).collect();
+            assert_eq!(
+                err_lines.len(),
+                2,
+                "expected exactly 2 error lines, got {}: {err}",
+                err_lines.len()
+            );
+            assert!(
+                err.contains("is a commit, not a blob"),
+                "missing type mismatch error: {err}"
+            );
+            assert!(
+                err.contains("bad tag pointer to"),
+                "missing bad tag pointer error: {err}"
+            );
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}

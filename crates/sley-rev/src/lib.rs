@@ -1707,7 +1707,13 @@ fn resolve_upstream_ref(
         .ok_or_else(|| GitError::not_found(format!("no upstream remote for branch '{branch}'")))?;
 
     let refname = if remote == "." {
-        merge.to_string()
+        // Match git's set_merge for remote `.`: expand short merge names
+        // (e.g. `main`) to `refs/heads/<name>` when not already fully qualified.
+        if merge.starts_with("refs/") {
+            merge.to_string()
+        } else {
+            format!("refs/heads/{merge}")
+        }
     } else {
         format!("refs/remotes/{remote}/{short}")
     };
@@ -1803,7 +1809,12 @@ fn branch_get_upstream_refname(
             GitError::not_found(format!("no upstream configured for branch '{branch}'"))
         })?;
     if remote == "." {
-        return Ok(merge.to_string());
+        // Match git's set_merge for remote `.`: short merge names expand to heads.
+        return Ok(if merge.starts_with("refs/") {
+            merge.to_string()
+        } else {
+            format!("refs/heads/{merge}")
+        });
     }
     tracking_for_push_dest(config, remote, merge)
 }
