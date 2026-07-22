@@ -64,7 +64,7 @@ fn resolve_git_dir_by_walk(start: impl AsRef<Path>) -> Result<PathBuf> {
         if candidate != start.as_ref()
             && ceilings
                 .iter()
-                .any(|ceiling| paths_refer_to_same_dir(ceiling, candidate))
+                .any(|ceiling| ceiling.matches_discovery_candidate(candidate))
         {
             break;
         }
@@ -206,14 +206,89 @@ fn os_string_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
     std::ffi::OsString::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
-fn discovery_ceiling_directories() -> Vec<PathBuf> {
-    match env::var("GIT_CEILING_DIRECTORIES") {
-        Ok(value) if !value.is_empty() => value
-            .split(':')
-            .filter(|entry| !entry.is_empty())
-            .map(PathBuf::from)
-            .collect(),
-        _ => Vec::new(),
+/// One entry from `GIT_CEILING_DIRECTORIES` after git's
+/// `canonicalize_ceiling_entry` processing.
+///
+/// An empty list entry (e.g. leading `:`) turns off realpath resolution for all
+/// subsequent entries — they must match discovery candidates by string equality
+/// only so a ceiling pointed at a symlink name does not also hide the symlink
+/// target (t1504 `subdir_ceil_at_top_no_resolve`).
+#[derive(Debug, Clone)]
+pub(crate) struct CeilingDirectory {
+    path: PathBuf,
+    /// When true the path was realpath'd and may also match a candidate via
+    /// canonicalize. When false, only string equality (after trailing-slash
+    /// strip) is used.
+    resolved: bool,
+}
+
+impl CeilingDirectory {
+    pub(crate) fn matches_discovery_candidate(&self, candidate: &Path) -> bool {
+        let ceiling = strip_trailing_slashes(&self.path);
+        let candidate_raw = strip_trailing_slashes(candidate);
+        if ceiling.as_os_str() == candidate_raw.as_os_str() {
+            return true;
+        }
+        if !self.resolved {
+            return false;
+        }
+        match fs::canonicalize(candidate) {
+            Ok(canonical) => {
+                strip_trailing_slashes(&canonical).as_os_str() == ceiling.as_os_str()
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Parse `GIT_CEILING_DIRECTORIES` the way git's `canonicalize_ceiling_entry`
+/// does: absolute paths only; empty entries disable realpath for later entries;
+/// failed realpaths are dropped.
+pub(crate) fn discovery_ceiling_directories() -> Vec<CeilingDirectory> {
+    let Ok(value) = env::var("GIT_CEILING_DIRECTORIES") else {
+        return Vec::new();
+    };
+    if value.is_empty() {
+        return Vec::new();
+    }
+    let mut empty_entry_found = false;
+    let mut out = Vec::new();
+    for entry in value.split(':') {
+        if entry.is_empty() {
+            empty_entry_found = true;
+            continue;
+        }
+        let path = Path::new(entry);
+        if !path.is_absolute() {
+            continue;
+        }
+        if empty_entry_found {
+            out.push(CeilingDirectory {
+                path: strip_trailing_slashes(path),
+                resolved: false,
+            });
+            continue;
+        }
+        match fs::canonicalize(path) {
+            Ok(canonical) => out.push(CeilingDirectory {
+                path: strip_trailing_slashes(&canonical),
+                resolved: true,
+            }),
+            Err(_) => {
+                // Unusable ceiling (git's real_pathdup failure) — discard.
+            }
+        }
+    }
+    out
+}
+
+fn strip_trailing_slashes(path: &Path) -> PathBuf {
+    let raw = path.as_os_str().to_string_lossy();
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.is_empty() {
+        PathBuf::from(std::path::MAIN_SEPARATOR.to_string())
+    } else {
+        PathBuf::from(trimmed)
     }
 }
 

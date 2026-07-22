@@ -2297,3 +2297,363 @@ fn commit_identity_falls_back_to_global_gitconfig_like_upstream_git() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// t7502 #43/#44: `--cleanup=whitespace` / `commit.cleanup=whitespace` keep
+/// comment lines that the editor-default strip mode would drop. The assertion
+/// uses `log --pretty=format:%s%b` so multi-line title paragraphs fold with a
+/// space (git's `format_subject`).
+#[test]
+fn commit_cleanup_whitespace_option_and_config_preserve_comments() {
+    let root = unique_temp_dir("commit-cleanup-whitespace");
+    let result = std::panic::catch_unwind(|| {
+        let editor = root.join("add-content-and-comment");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(
+            &editor,
+            b"#!/bin/sh\necho \"commit message\" >> \"$1\"\necho \"# comment\" >> \"$1\"\n",
+        )
+        .expect("write editor");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&editor).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&editor, perms).unwrap();
+        }
+
+        for (name, extra_env, args) in [
+            (
+                "option",
+                Vec::<(&str, String)>::new(),
+                vec!["commit", "--cleanup=whitespace", "--no-status"],
+            ),
+            (
+                "config",
+                vec![],
+                vec!["-c", "commit.cleanup=whitespace", "commit", "--no-status"],
+            ),
+        ] {
+            let expected_root = root.join(format!("{name}-expected"));
+            let actual_root = root.join(format!("{name}-actual"));
+            fs::create_dir_all(&expected_root).expect("mkdir");
+            fs::create_dir_all(&actual_root).expect("mkdir");
+            prepare_commit_repo(&expected_root);
+            prepare_commit_repo(&actual_root);
+
+            let editor_s = editor.to_string_lossy().into_owned();
+            for (program, repo) in [
+                (sley_testkit::oracle_git(), expected_root.as_path()),
+                (sley_testkit::sley_bin!(), actual_root.as_path()),
+            ] {
+                let mut cmd = Command::new(program);
+                cmd.current_dir(repo)
+                    .args(&args)
+                    .env("GIT_AUTHOR_NAME", "Example User")
+                    .env("GIT_AUTHOR_EMAIL", "example@example.invalid")
+                    .env("GIT_AUTHOR_DATE", "@0 +0000")
+                    .env("GIT_COMMITTER_NAME", "Example User")
+                    .env("GIT_COMMITTER_EMAIL", "example@example.invalid")
+                    .env("GIT_COMMITTER_DATE", "@0 +0000")
+                    .env("GIT_EDITOR", &editor_s)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_SYSTEM", "/dev/null");
+                for (k, v) in &extra_env {
+                    cmd.env(k, v);
+                }
+                let out = cmd.output().expect("run commit");
+                assert!(
+                    out.status.success(),
+                    "{program} {args:?} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+
+            let msg = |program: &str, repo: &Path| {
+                let out = Command::new(program)
+                    .current_dir(repo)
+                    .args(["log", "--pretty=format:%s%b", "-1"])
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                    .output()
+                    .expect("log");
+                assert!(out.status.success());
+                out.stdout
+            };
+            // Use sley's log for sley repo and oracle log for oracle repo so
+            // format:%s folding is exercised on both sides.
+            let expected_msg = msg(sley_testkit::oracle_git(), &expected_root);
+            let actual_msg = msg(sley_testkit::sley_bin!(), &actual_root);
+            assert_eq!(
+                actual_msg, expected_msg,
+                "cleanup whitespace {name}: message mismatch"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&actual_msg).as_ref(),
+                "commit message # comment",
+                "cleanup whitespace {name}: unexpected subject"
+            );
+        }
+    });
+    let _ = fs::remove_dir_all(&root);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// t7502 #60: empty `commit -s` leaves two blank lines before the SOB in
+/// COMMIT_EDITMSG so the editor has room for a title + body.
+#[test]
+fn commit_signoff_empty_message_places_sob_on_third_line() {
+    let root = unique_temp_dir("commit-signoff-empty");
+    let result = std::panic::catch_unwind(|| {
+        fs::create_dir_all(&root).expect("mkdir");
+        prepare_commit_repo(&root);
+        // Need an initial commit so allow-empty is not root-only special-cased.
+        let init = run_output_with_identity(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["commit", "-m", "initial"],
+        );
+        assert!(init.status.success());
+
+        let out = run_output_with_identity(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["commit", "-s", "--allow-empty", "--allow-empty-message"],
+        );
+        assert!(
+            out.status.success(),
+            "sley empty signoff failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let editmsg = fs::read(root.join(".git/COMMIT_EDITMSG")).expect("read EDITMSG");
+        // Strip comment lines like the upstream test's sed.
+        let mut stripped = Vec::new();
+        for line in editmsg.split_inclusive(|&b| b == b'\n') {
+            if line.first() == Some(&b'#') {
+                continue;
+            }
+            stripped.extend_from_slice(line);
+        }
+        let expect = b"\n\nSigned-off-by: Example User <example@example.invalid>\n\n";
+        assert_eq!(
+            stripped.as_slice(),
+            expect.as_slice(),
+            "COMMIT_EDITMSG SOB placement mismatch:\nactual: {:?}\nexpect: {:?}",
+            String::from_utf8_lossy(&stripped),
+            String::from_utf8_lossy(expect)
+        );
+
+        // Oracle parity on the committed object.
+        let oracle_root = root.join("oracle");
+        fs::create_dir_all(&oracle_root).unwrap();
+        prepare_commit_repo(&oracle_root);
+        run_output_with_identity(
+            sley_testkit::oracle_git(),
+            &oracle_root,
+            &["commit", "-m", "initial"],
+        );
+        let o = run_output_with_identity(
+            sley_testkit::oracle_git(),
+            &oracle_root,
+            &["commit", "-s", "--allow-empty", "--allow-empty-message"],
+        );
+        assert!(o.status.success());
+        // Compare just the signoff line of the commit object (empty body + SOB).
+        let sley_msg = cat_head(sley_testkit::oracle_git(), &root);
+        let git_msg = cat_head(sley_testkit::oracle_git(), &oracle_root);
+        fn body(raw: &[u8]) -> &[u8] {
+            let i = raw.windows(2).position(|w| w == b"\n\n").unwrap();
+            &raw[i + 2..]
+        }
+        assert_eq!(
+            body(&sley_msg),
+            body(&git_msg),
+            "committed message body mismatch for empty signoff"
+        );
+    });
+    let _ = fs::remove_dir_all(&root);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// t7502 #80/#81: `core.commentChar=auto` picks an unused candidate and dies
+/// when every candidate is already used as a line start.
+#[test]
+fn commit_commentchar_auto_switch_and_exhausted() {
+    let root = unique_temp_dir("commit-commentchar-auto");
+    let result = std::panic::catch_unwind(|| {
+        fs::create_dir_all(&root).expect("mkdir");
+        // Hermetic HOME so advice paths shorten to ~/...
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        prepare_commit_repo(&repo);
+        // Parent commit then #foo so amend has a parent (Changes to be committed).
+        let out = Command::new(sley_testkit::sley_bin!())
+            .current_dir(&repo)
+            .args(["commit", "-m", "parent"])
+            .env("GIT_AUTHOR_NAME", "Example User")
+            .env("GIT_AUTHOR_EMAIL", "example@example.invalid")
+            .env("GIT_AUTHOR_DATE", "@0 +0000")
+            .env("GIT_COMMITTER_NAME", "Example User")
+            .env("GIT_COMMITTER_EMAIL", "example@example.invalid")
+            .env("GIT_COMMITTER_DATE", "@0 +0000")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        fs::write(repo.join("foo"), b"foo\n").unwrap();
+        run_success(sley_testkit::sley_bin!(), &repo, &["add", "foo"]);
+        let out = Command::new(sley_testkit::sley_bin!())
+            .current_dir(&repo)
+            .args(["commit", "-m", "#foo"])
+            .env("GIT_AUTHOR_NAME", "Example User")
+            .env("GIT_AUTHOR_EMAIL", "example@example.invalid")
+            .env("GIT_AUTHOR_DATE", "@0 +0000")
+            .env("GIT_COMMITTER_NAME", "Example User")
+            .env("GIT_COMMITTER_EMAIL", "example@example.invalid")
+            .env("GIT_COMMITTER_DATE", "@0 +0000")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let include = repo.join("config-include");
+        fs::write(
+            &include,
+            b"[core]\n\tcommentString=:\n\tcommentString=%\n\tcommentChar=auto\n",
+        )
+        .unwrap();
+        run_success(
+            sley_testkit::sley_bin!(),
+            &repo,
+            &[
+                "config",
+                "include.path",
+                &include.to_string_lossy(),
+            ],
+        );
+        run_success(
+            sley_testkit::sley_bin!(),
+            &repo,
+            &["config", "core.commentChar", "!"],
+        );
+
+        let editor = repo.join(".git/FAKE_EDITOR");
+        fs::write(
+            &editor,
+            b"#!/bin/sh\ncp \"$1\" \"$1.cap\"\nmv \"$1\" \"$1.orig\"\n(echo message; cat \"$1.orig\") >\"$1\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&editor).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&editor, perms).unwrap();
+        }
+
+        let out = Command::new(sley_testkit::sley_bin!())
+            .current_dir(&repo)
+            .args(["commit", "--amend"])
+            .env("GIT_AUTHOR_NAME", "Example User")
+            .env("GIT_AUTHOR_EMAIL", "example@example.invalid")
+            .env("GIT_AUTHOR_DATE", "@0 +0000")
+            .env("GIT_COMMITTER_NAME", "Example User")
+            .env("GIT_COMMITTER_EMAIL", "example@example.invalid")
+            .env("GIT_COMMITTER_DATE", "@0 +0000")
+            .env("GIT_EDITOR", &editor)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "auto switch amend failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("core.commentChar=auto") && stderr.contains("deprecated"),
+            "missing deprecation warning: {stderr}"
+        );
+        let cap = fs::read_to_string(repo.join(".git/COMMIT_EDITMSG.cap")).expect("cap");
+        assert!(
+            cap.lines().any(|l| l.starts_with("; Changes to be committed:")),
+            "expected '; Changes to be committed:' in template, got:\n{cap}"
+        );
+
+        // #81: exhaust candidates then auto must fail.
+        let text = "# 1\n; 2\n@ 3\n! 4\n$ 5\n% 6\n^ 7\n& 8\n| 9\n: 10\n";
+        fs::write(repo.join("text"), text.as_bytes()).unwrap();
+        // Clear auto config so -F text can succeed (mirrors test_config cleanup).
+        run_success(
+            sley_testkit::sley_bin!(),
+            &repo,
+            &["config", "--unset", "include.path"],
+        );
+        run_success(
+            sley_testkit::sley_bin!(),
+            &repo,
+            &["config", "--unset", "core.commentChar"],
+        );
+        let out = Command::new(sley_testkit::sley_bin!())
+            .current_dir(&repo)
+            .args(["commit", "--amend", "-F", "text"])
+            .env("GIT_AUTHOR_NAME", "Example User")
+            .env("GIT_AUTHOR_EMAIL", "example@example.invalid")
+            .env("GIT_AUTHOR_DATE", "@0 +0000")
+            .env("GIT_COMMITTER_NAME", "Example User")
+            .env("GIT_COMMITTER_EMAIL", "example@example.invalid")
+            .env("GIT_COMMITTER_DATE", "@0 +0000")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "amend -F text failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let out = Command::new(sley_testkit::sley_bin!())
+            .current_dir(&repo)
+            .args(["-c", "core.commentChar=auto", "commit", "--amend"])
+            .env("GIT_AUTHOR_NAME", "Example User")
+            .env("GIT_AUTHOR_EMAIL", "example@example.invalid")
+            .env("GIT_AUTHOR_DATE", "@0 +0000")
+            .env("GIT_COMMITTER_NAME", "Example User")
+            .env("GIT_COMMITTER_EMAIL", "example@example.invalid")
+            .env("GIT_COMMITTER_DATE", "@0 +0000")
+            .env("GIT_EDITOR", &editor)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "expected auto out-of-options to fail"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("unable to select a comment character"),
+            "missing out-of-options fatal: {stderr}"
+        );
+    });
+    let _ = fs::remove_dir_all(&root);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

@@ -907,7 +907,7 @@ fn show_commit(
             print_log_decorations(oid, decorations);
             let display_message = commit_message_for_commit_encoding(commit, &output_encoding);
             stdout.write_all(b" ")?;
-            stdout.write_all(commit_subject_bytes(&display_message))?;
+            stdout.write_all(&commit_subject_bytes(&display_message))?;
             stdout.write_all(b"\n")?;
         }
         ShowCommitFormat::FullOneline => {
@@ -919,7 +919,7 @@ fn show_commit(
             print_log_decorations(oid, decorations);
             let display_message = commit_message_for_commit_encoding(commit, &output_encoding);
             stdout.write_all(b" ")?;
-            stdout.write_all(commit_subject_bytes(&display_message))?;
+            stdout.write_all(&commit_subject_bytes(&display_message))?;
             stdout.write_all(b"\n")?;
         }
         ShowCommitFormat::Custom { compiled, .. } => {

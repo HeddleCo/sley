@@ -1996,3 +1996,38 @@ fn config_injection_matches_upstream_git() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+/// t1308 #38: writing the default (repository) config outside any repository
+/// dies with `fatal: not in a git directory` — git's `check_write` message,
+/// not the generic discovery "not a git repository".
+#[test]
+fn config_set_without_repo_matches_upstream_git() {
+    let root = unique_temp_dir("config-set-no-repo");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream dir");
+    fs::create_dir_all(&rust).expect("create rust dir");
+    {
+        assert_status_stdout_stderr_match(&upstream, &rust, &["config", "a.b", "c"]);
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t1308 #37: bare alias key without a value reports missing-value + line
+/// number + config path. Exercised via the alias dispatch path (`git br`).
+#[test]
+fn config_malformed_alias_missing_value_line_errors_match_upstream_git() {
+    let root = unique_temp_dir("config-malformed-alias");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream dir");
+    fs::create_dir_all(&rust).expect("create rust dir");
+    {
+        for dir in [&upstream, &rust] {
+            git(dir, &["init", "-q"]);
+            fs::write(dir.join(".git/config"), "[alias]\n\tbr\n").expect("write config");
+        }
+        assert_status_stdout_stderr_match(&upstream, &rust, &["br"]);
+    }
+    let _ = fs::remove_dir_all(&root);
+}

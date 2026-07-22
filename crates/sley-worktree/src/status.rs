@@ -440,7 +440,11 @@ where
 {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
-    if !options.include_ignored
+    let custom_reference = options
+        .reference
+        .filter(|reference| *reference != "HEAD");
+    if custom_reference.is_none()
+        && !options.include_ignored
         && let Some(()) = stream_short_status_borrowed_head_matches_index_if_possible(
             worktree_root,
             git_dir,
@@ -482,7 +486,13 @@ pub fn collect_short_status_with_database(
 ) -> Result<Vec<ShortStatusEntry>> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
-    if !options.include_ignored
+    // A non-HEAD reference (e.g. amend's HEAD^1) must not use the
+    // head-matches-index fast path — the index matches HEAD, not the parent.
+    let custom_reference = options
+        .reference
+        .filter(|reference| *reference != "HEAD");
+    if custom_reference.is_none()
+        && !options.include_ignored
         && let Some(entries) = short_status_borrowed_head_matches_index_if_possible(
             worktree_root,
             git_dir,
@@ -500,6 +510,9 @@ pub fn collect_short_status_with_database(
     // second path-sorted copy of every tracked entry.
     let (mut parsed_index, mut stat_cache, mut head_matches_index) =
         read_index_with_stat_cache(git_dir, format, db)?;
+    if custom_reference.is_some() {
+        head_matches_index = false;
+    }
     let sparse_checkout_active = sparse_checkout_active_for_status(git_dir, &parsed_index);
     if sparse_checkout_active && parsed_index.entries.iter().any(IndexEntry::is_sparse_dir) {
         expand_sparse_index(&mut parsed_index, db, format)?;
@@ -560,7 +573,10 @@ pub fn collect_short_status_with_database(
     let head = if head_matches_index {
         None
     } else {
-        Some(head_tree_entries(git_dir, format, db)?)
+        let reference = options.reference.unwrap_or("HEAD");
+        Some(tree_entries_for_status_reference(
+            git_dir, format, db, reference,
+        )?)
     };
     let known_tracked_paths = index.keys().cloned().collect::<BTreeSet<_>>();
     let tracked_paths = if options.untracked_mode == StatusUntrackedMode::None {

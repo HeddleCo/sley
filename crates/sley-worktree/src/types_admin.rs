@@ -354,6 +354,7 @@ pub fn submodule_dirt(sub_root: &Path) -> u8 {
             include_ignored: false,
             ignored_mode: StatusIgnoredMode::Traditional,
             untracked_mode: StatusUntrackedMode::Normal,
+            reference: None,
         },
         |entry| {
             if let Some(submodule) = entry.submodule {
@@ -425,6 +426,10 @@ pub struct ShortStatusOptions {
     pub include_ignored: bool,
     pub ignored_mode: StatusIgnoredMode,
     pub untracked_mode: StatusUntrackedMode,
+    /// When set, compare the index against this revision's tree instead of HEAD
+    /// (git's `s->reference`; `commit --amend` uses `"HEAD^1"` so the template
+    /// shows the diff from the parent to the would-be new commit).
+    pub reference: Option<&'static str>,
 }
 
 /// The worktree state of one tracked path relative to an expected index/tree

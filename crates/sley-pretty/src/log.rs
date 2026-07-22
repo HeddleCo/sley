@@ -302,40 +302,81 @@ pub fn format_log_parent_oids(
 }
 
 pub fn commit_subject(message: &[u8]) -> String {
-    String::from_utf8_lossy(message)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string()
+    String::from_utf8_lossy(&commit_subject_bytes(message)).into_owned()
 }
 
 /// Raw-bytes subject: the title paragraph with internal newlines folded to
 /// single spaces (git's `format_subject`), preserving non-UTF-8/control bytes.
-pub fn commit_subject_bytes(message: &[u8]) -> &[u8] {
-    // git skips leading blank lines, then takes lines until a blank line,
-    // joining with spaces. The upstream corpus only uses single-line subjects,
-    // so we return the first non-empty line slice directly.
-    let mut start = 0;
-    while start < message.len() && (message[start] == b'\n' || message[start] == b'\r') {
-        start += 1;
+///
+/// git's `parse_commit_message` + `format_subject`: skip leading blank lines,
+/// then join consecutive non-blank lines with a single space until the first
+/// blank line (end of the title paragraph).
+pub fn commit_subject_bytes(message: &[u8]) -> Vec<u8> {
+    let after_leading = skip_blank_lines(message);
+    let mut out = Vec::new();
+    let mut rest = after_leading;
+    while !rest.is_empty() {
+        let (line, next) = split_one_line(rest);
+        let trimmed_len = line_content_len(line);
+        if trimmed_len == 0 {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(b' ');
+        }
+        out.extend_from_slice(&line[..trimmed_len]);
+        rest = next;
     }
-    let end = message[start..]
-        .iter()
-        .position(|&b| b == b'\n')
-        .map(|off| start + off)
-        .unwrap_or(message.len());
-    &message[start..end]
+    out
 }
 
+/// Body after the title paragraph (git's `body_off`): skip leading blanks, the
+/// subject paragraph, then any blank lines that separate subject from body.
 pub fn commit_body(message: &[u8]) -> &[u8] {
-    let Some(first_newline) = message.iter().position(|byte| *byte == b'\n') else {
-        return &[];
-    };
-    let mut body = &message[first_newline + 1..];
-    if body.first().copied() == Some(b'\n') {
-        body = &body[1..];
+    let after_leading = skip_blank_lines(message);
+    let mut rest = after_leading;
+    while !rest.is_empty() {
+        let (line, next) = split_one_line(rest);
+        if line_content_len(line) == 0 {
+            break;
+        }
+        rest = next;
     }
-    body
+    skip_blank_lines(rest)
+}
+
+/// Advance past consecutive blank lines (git's `skip_blank_lines`).
+fn skip_blank_lines(message: &[u8]) -> &[u8] {
+    let mut rest = message;
+    while !rest.is_empty() {
+        let (line, next) = split_one_line(rest);
+        if line_content_len(line) != 0 {
+            break;
+        }
+        rest = next;
+    }
+    rest
+}
+
+/// One line including its trailing `\n` when present, plus the remainder.
+fn split_one_line(message: &[u8]) -> (&[u8], &[u8]) {
+    match message.iter().position(|&b| b == b'\n') {
+        Some(idx) => (&message[..=idx], &message[idx + 1..]),
+        None => (message, &[]),
+    }
+}
+
+/// Content length of a line with trailing whitespace (and optional `\n`) stripped
+/// for blank-line detection (git's `is_blank_line`).
+fn line_content_len(line: &[u8]) -> usize {
+    let mut end = line.len();
+    while end > 0 {
+        match line[end - 1] {
+            b' ' | b'\t' | b'\r' | b'\n' => end -= 1,
+            _ => break,
+        }
+    }
+    end
 }
 
 pub fn commit_message_lines(message: &[u8]) -> Vec<&[u8]> {
@@ -594,7 +635,7 @@ pub fn emit_log_one_token(
             }
             FormatToken::Marker => out.push(marker as u8),
             FormatToken::Subject => {
-                out.extend_from_slice(commit_subject_bytes(message));
+                out.extend_from_slice(&commit_subject_bytes(message));
             }
             FormatToken::SanitizedSubject => {
                 write!(out, "{}", log_sanitized_subject(message))?;
@@ -1236,7 +1277,7 @@ pub fn emit_compiled_log_format_metadata_inner(
                 out.extend_from_slice(git_color_spec_to_ansi(spec, color).as_bytes());
             }
             FormatToken::Subject if let Some(message) = message => {
-                out.extend_from_slice(commit_subject_bytes(message));
+                out.extend_from_slice(&commit_subject_bytes(message));
             }
             FormatToken::SanitizedSubject if let Some(message) = message => {
                 write!(out, "{}", log_sanitized_subject(message))?;
