@@ -565,6 +565,7 @@ pub fn plan_push(request: PushRequest<'_>, services: &mut PushServices<'_>) -> R
             git_dir: request.git_dir,
             common_git_dir: request.common_git_dir,
             format: request.format,
+            config: request.config,
             remote: request.remote,
             remote_git_dir,
             remote_common_git_dir,
@@ -853,14 +854,16 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
     let local_store = FileRefStore::new(git_dir, format);
     let mut local_refs = local_push_source_refs(&local_store, format)?;
     add_revision_push_sources(git_dir, format, refspecs, &mut local_refs);
+    let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let command_forces = plan_push_command_forces(
         format,
         &local_refs,
         &advertisement_set.refs,
         refspecs,
         options.force,
+        &local_db,
+        advice_push_unqualified_ref_name(Some(config)),
     )?;
-    let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let mut accepted = Vec::new();
     let mut preflight_rejections = Vec::new();
     for (command, force) in command_forces {
@@ -1099,6 +1102,7 @@ struct PushLocalRequest<'a> {
     git_dir: &'a Path,
     common_git_dir: &'a Path,
     format: ObjectFormat,
+    config: &'a GitConfig,
     remote: &'a str,
     remote_git_dir: &'a Path,
     remote_common_git_dir: &'a Path,
@@ -1111,6 +1115,7 @@ fn plan_push_local(request: PushLocalRequest<'_>) -> Result<PushPlan> {
         git_dir,
         common_git_dir,
         format,
+        config,
         remote,
         remote_git_dir,
         remote_common_git_dir,
@@ -1131,9 +1136,16 @@ fn plan_push_local(request: PushLocalRequest<'_>) -> Result<PushPlan> {
     let mut local_refs = local_push_source_refs(&local_store, format)?;
     add_revision_push_sources(git_dir, format, refspecs, &mut local_refs);
     let remote_refs = crate::local::local_fetch_advertisements(remote_git_dir, format)?;
-    let command_forces =
-        plan_push_command_forces(format, &local_refs, &remote_refs, refspecs, options.force)?;
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let command_forces = plan_push_command_forces(
+        format,
+        &local_refs,
+        &remote_refs,
+        refspecs,
+        options.force,
+        &local_db,
+        advice_push_unqualified_ref_name(Some(config)),
+    )?;
     reject_non_fast_forward_pushes(common_git_dir, &local_db, format, &command_forces)?;
     let commands = commands_from_forces(&command_forces);
     let execution = if commands.is_empty() {
@@ -1455,7 +1467,7 @@ pub fn push_local_with_report(
 /// the bytes written under an object id.
 pub fn push_local_with_report_and_objects(
     request: PushReportRequest<'_>,
-    _config: &GitConfig,
+    config: &GitConfig,
     objects: &FileObjectDatabase,
 ) -> Result<PushStatusReport> {
     let format = request.format;
@@ -1483,6 +1495,8 @@ pub fn push_local_with_report_and_objects(
         &remote_refs,
         request.refspecs,
         request.force,
+        objects,
+        advice_push_unqualified_ref_name(Some(config)),
     )?;
     let source_db = objects;
     // Pack construction and installation are storage operations. Keep their
@@ -2207,17 +2221,29 @@ pub fn run_local_push_post_hooks(
 /// forced (the global `force` flag or the refspec's own `+`). Each refspec is
 /// normalized then planned independently so per-refspec force is preserved,
 /// matching the CLI.
+///
+/// `objects` is used only when an unqualified destination cannot be guessed
+/// (git's `show_push_unqualified_ref_name_error`): the source object's type
+/// drives the optional `advice.pushUnqualifiedRefName` "Did you mean" hints.
 pub(crate) fn plan_push_command_forces(
     format: ObjectFormat,
     local_refs: &[PushSourceRef],
     remote_refs: &[RefAdvertisement],
     refspecs: &[String],
     force: bool,
+    objects: &impl ObjectReader,
+    advice_unqualified_ref_name: bool,
 ) -> Result<Vec<(ReceivePackCommand, bool)>> {
     let parsed_refspecs = refspecs
         .iter()
         .map(|refspec| {
-            let normalized = normalize_push_refspec_for_sources(refspec, local_refs, remote_refs)?;
+            let normalized = normalize_push_refspec_for_sources(
+                refspec,
+                local_refs,
+                remote_refs,
+                objects,
+                advice_unqualified_ref_name,
+            )?;
             parse_refspec(&normalized)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2254,10 +2280,18 @@ fn plan_push_command_sources(
     remote_refs: &[RefAdvertisement],
     refspecs: &[String],
     force: bool,
+    objects: &impl ObjectReader,
+    advice_unqualified_ref_name: bool,
 ) -> Result<Vec<PlannedPushCommand>> {
     let mut planned = Vec::new();
     for refspec in refspecs {
-        let normalized = normalize_push_refspec_for_sources(refspec, local_refs, remote_refs)?;
+        let normalized = normalize_push_refspec_for_sources(
+            refspec,
+            local_refs,
+            remote_refs,
+            objects,
+            advice_unqualified_ref_name,
+        )?;
         let parsed = parse_refspec(&normalized)?;
         let commands = plan_push_commands(
             format,
@@ -2344,16 +2378,29 @@ fn normalize_push_refspec_for_sources(
     refspec: &str,
     local_refs: &[PushSourceRef],
     remote_refs: &[RefAdvertisement],
+    objects: &impl ObjectReader,
+    advice_unqualified_ref_name: bool,
 ) -> Result<String> {
     let (force, refspec) = refspec
         .strip_prefix('+')
         .map_or((false, refspec), |refspec| (true, refspec));
     let normalized = if let Some((src, dst)) = refspec.split_once(':') {
+        // Keep the caller-facing source spelling for error/advice text (git's
+        // `matched_src->name` is the refspec LHS, not a rewritten form).
+        let src_display = src.to_string();
         let (src, src_kind) = normalize_push_source_refname(src, local_refs);
         let dst = if src.is_empty() {
             normalize_push_delete_destination_refname(dst, remote_refs)?
         } else {
-            normalize_push_destination_refname(dst, src_kind, remote_refs)?
+            normalize_push_destination_refname(
+                dst,
+                &src_display,
+                src_kind,
+                remote_refs,
+                local_refs,
+                objects,
+                advice_unqualified_ref_name,
+            )?
         };
         if !src.is_empty() && !dst.contains('*') && push_destination_is_onelevel_under_refs(&dst) {
             return Err(GitError::Command(format!(
@@ -2460,13 +2507,16 @@ fn count_refspec_match_dst<'a>(pattern: &str, remote_refs: &'a [RefAdvertisement
 enum PushSourceKind {
     Branch,
     Tag,
-    /// A source ref that resolves but is neither under `refs/heads/` nor
-    /// `refs/tags/` (e.g. `HEAD`, a fully-qualified `refs/...` name). git's
-    /// `guess_ref` still guesses `refs/heads/<dst>` for these.
+    /// A source that resolves under neither `refs/heads/` nor `refs/tags/` after
+    /// following the source name the way git's `guess_ref` does — e.g. attached
+    /// `HEAD` (which follows to a branch and is treated as heads), or a
+    /// fully-qualified `refs/heads/*` / short branch name. Only heads/tags can
+    /// drive an unqualified destination guess.
     Other,
-    /// A source that is NOT a ref at all (a raw object id or a rev-expression
-    /// like `main^`). git's `guess_ref` resolves nothing for these, so an
-    /// unqualified destination cannot be guessed and the push is rejected.
+    /// A source for which git's `guess_ref` returns NULL: a raw object id /
+    /// rev-expression, or a ref outside `refs/{heads,tags}/` (remote-tracking
+    /// refs, notes, trees, …). An unqualified destination is rejected with
+    /// `show_push_unqualified_ref_name_error`.
     Unqualifiable,
 }
 
@@ -2474,10 +2524,22 @@ fn normalize_push_source_refname(
     name: &str,
     local_refs: &[PushSourceRef],
 ) -> (String, PushSourceKind) {
-    // `@` is git's documented alias for `HEAD`; like `HEAD` it resolves to a
-    // branch, so `guess_ref` can still qualify an unqualified destination.
-    if name.is_empty() || name == "HEAD" || name == "@" || name.starts_with("refs/") {
+    // `@` is git's documented alias for `HEAD`; like attached `HEAD` it resolves
+    // to a branch, so `guess_ref` can still qualify an unqualified destination.
+    if name.is_empty() || name == "HEAD" || name == "@" {
         return (name.to_string(), PushSourceKind::Other);
+    }
+    // git's `guess_ref` only succeeds when the *resolved* peer name is under
+    // `refs/heads/` or `refs/tags/`. Fully-qualified names outside those
+    // namespaces (e.g. `refs/remotes/…`) must not be guessed as heads.
+    if name.starts_with("refs/heads/") {
+        return (name.to_string(), PushSourceKind::Branch);
+    }
+    if name.starts_with("refs/tags/") {
+        return (name.to_string(), PushSourceKind::Tag);
+    }
+    if name.starts_with("refs/") {
+        return (name.to_string(), PushSourceKind::Unqualifiable);
     }
     let branch = format!("refs/heads/{name}");
     let tag = format!("refs/tags/{name}");
@@ -2515,8 +2577,12 @@ fn normalize_push_delete_destination_refname(
 
 fn normalize_push_destination_refname(
     name: &str,
+    src_name: &str,
     src_kind: PushSourceKind,
     remote_refs: &[RefAdvertisement],
+    local_refs: &[PushSourceRef],
+    objects: &impl ObjectReader,
+    advice_unqualified_ref_name: bool,
 ) -> Result<String> {
     if name.is_empty() || name == "HEAD" || name.starts_with("refs/") {
         return Ok(name.to_string());
@@ -2534,14 +2600,110 @@ fn normalize_push_destination_refname(
         DstMatch::None => match src_kind {
             PushSourceKind::Tag => Ok(format!("refs/tags/{name}")),
             PushSourceKind::Branch | PushSourceKind::Other => Ok(format!("refs/heads/{name}")),
-            // git's `guess_ref` returns NULL for a non-ref source, so the
-            // unqualified destination is unresolvable (the "destination is not a
-            // full refname … you must fully qualify the ref" error).
-            PushSourceKind::Unqualifiable => Err(GitError::Command(format!(
-                "the destination you provided is not a full refname (i.e., starting with \"refs/\"); unable to guess the destination for {name}"
-            ))),
+            // git's `guess_ref` returned NULL — emit the multi-line unqualified
+            // destination error (and optional type-based advice).
+            PushSourceKind::Unqualifiable => Err(push_unqualified_dst_error(
+                name,
+                src_name,
+                local_refs,
+                objects,
+                advice_unqualified_ref_name,
+            )),
         },
     }
+}
+
+/// git's `show_push_unqualified_ref_name_error` (+ optional
+/// `advice.pushUnqualifiedRefName` hints). Returned as [`GitError::InvalidFormat`]
+/// so the CLI entrypoint prints the `error:` / `hint:` lines without a `sley:`
+/// prefix.
+fn push_unqualified_dst_error(
+    dst: &str,
+    src: &str,
+    local_refs: &[PushSourceRef],
+    objects: &impl ObjectReader,
+    advice: bool,
+) -> GitError {
+    let mut message = format!(
+        "error: The destination you provided is not a full refname (i.e.,\n\
+         starting with \"refs/\"). We tried to guess what you meant by:\n\
+         \n\
+         - Looking for a ref that matches '{dst}' on the remote side.\n\
+         - Checking if the <src> being pushed ('{src}')\n\
+           is a ref in \"refs/{{heads,tags}}/\". If so we add a corresponding\n\
+           refs/{{heads,tags}}/ prefix on the remote side.\n\
+         \n\
+         Neither worked, so we gave up. You must fully qualify the ref."
+    );
+    if advice {
+        let object_type = source_object_type_for_push(local_refs, src, objects);
+        message.push('\n');
+        message.push_str(&push_unqualified_dst_advice(src, dst, object_type));
+    }
+    GitError::InvalidFormat(message)
+}
+
+fn source_object_type_for_push(
+    local_refs: &[PushSourceRef],
+    src_name: &str,
+    objects: &impl ObjectReader,
+) -> Option<ObjectType> {
+    // Prefer an exact name match (the refspec LHS as given / after heads-tags
+    // expansion). Fall back to any local ref with the same spelling.
+    let oid = local_refs
+        .iter()
+        .find(|reference| reference.name == src_name)
+        .map(|reference| reference.oid)?;
+    objects
+        .read_object(&oid)
+        .ok()
+        .map(|object| object.object_type)
+}
+
+fn push_unqualified_dst_advice(src: &str, dst: &str, object_type: Option<ObjectType>) -> String {
+    match object_type {
+        Some(ObjectType::Commit) => format!(
+            "hint: The <src> part of the refspec is a commit object.\n\
+             hint: Did you mean to create a new branch by pushing to\n\
+             hint: '{src}:refs/heads/{dst}'?"
+        ),
+        Some(ObjectType::Tag) => format!(
+            "hint: The <src> part of the refspec is a tag object.\n\
+             hint: Did you mean to create a new tag by pushing to\n\
+             hint: '{src}:refs/tags/{dst}'?"
+        ),
+        Some(ObjectType::Tree) => format!(
+            "hint: The <src> part of the refspec is a tree object.\n\
+             hint: Did you mean to tag a new tree by pushing to\n\
+             hint: '{src}:refs/tags/{dst}'?"
+        ),
+        Some(ObjectType::Blob) => format!(
+            "hint: The <src> part of the refspec is a blob object.\n\
+             hint: Did you mean to tag a new blob by pushing to\n\
+             hint: '{src}:refs/tags/{dst}'?"
+        ),
+        None => format!(
+            "hint: The <src> part of the refspec ('{src}') is an object ID that doesn't exist."
+        ),
+    }
+}
+
+/// Whether `advice.pushUnqualifiedRefName` is enabled (default true), honouring
+/// `GIT_ADVICE=0` as a global off-switch the way git's `advice_enabled` does.
+pub(crate) fn advice_push_unqualified_ref_name(config: Option<&GitConfig>) -> bool {
+    if let Ok(value) = std::env::var("GIT_ADVICE") {
+        let off = value.is_empty()
+            || value.eq_ignore_ascii_case("0")
+            || value.eq_ignore_ascii_case("false")
+            || value.eq_ignore_ascii_case("no")
+            || value.eq_ignore_ascii_case("off");
+        if off {
+            return false;
+        }
+    }
+    config
+        .and_then(|cfg| cfg.get_bool("advice", None, "pushUnqualifiedRefName"))
+        .unwrap_or(true)
 }
 
 fn push_destination_is_onelevel_under_refs(name: &str) -> bool {
@@ -3044,6 +3206,122 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].name, format!("{original}^"));
         assert_eq!(sources[0].oid, replacement_parent);
+    }
+
+    #[test]
+    fn unqualified_dst_from_oid_src_emits_dwim_error_and_advice() {
+        let git_dir = temp_repo("unqualified-dst-oid");
+        let commit = write_commit(&git_dir, Vec::new(), "tip");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let local_refs = vec![PushSourceRef {
+            name: commit.to_string(),
+            oid: commit,
+        }];
+        let err = normalize_push_refspec_for_sources(
+            &format!("{commit}:dst"),
+            &local_refs,
+            &[],
+            &db,
+            true,
+        )
+        .expect_err("oid:dst must fail to guess destination");
+        let message = err.to_string();
+        // InvalidFormat Display prefixes "invalid format: "; the payload itself
+        // already starts with "error:".
+        assert!(
+            message.contains("error: The destination you provided is not a full refname"),
+            "missing multi-line DWIM error:\n{message}"
+        );
+        assert!(
+            message.contains("hint: Did you mean to create a new branch by pushing to"),
+            "missing commit advice:\n{message}"
+        );
+        assert!(
+            message.contains(&format!("hint: '{commit}:refs/heads/dst'?")),
+            "missing suggested refspec:\n{message}"
+        );
+
+        let err = normalize_push_refspec_for_sources(
+            &format!("{commit}:dst"),
+            &local_refs,
+            &[],
+            &db,
+            false,
+        )
+        .expect_err("oid:dst must still fail with advice off");
+        let message = err.to_string();
+        assert!(
+            message.contains("error: The destination you provided is not a full refname"),
+            "missing multi-line DWIM error with advice off:\n{message}"
+        );
+        assert!(
+            !message.contains("hint: Did you mean"),
+            "advice should be suppressed:\n{message}"
+        );
+    }
+
+    #[test]
+    fn unqualified_dst_from_remote_tracking_src_is_unqualifiable() {
+        let git_dir = temp_repo("unqualified-dst-remote");
+        let commit = write_commit(&git_dir, Vec::new(), "tip");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let local_refs = vec![PushSourceRef {
+            name: "refs/remotes/two/another".into(),
+            oid: commit,
+        }];
+        let err = normalize_push_refspec_for_sources(
+            "refs/remotes/two/another:dst",
+            &local_refs,
+            &[],
+            &db,
+            true,
+        )
+        .expect_err("remote-tracking src must not DWIM to refs/heads/dst");
+        let message = err.to_string();
+        assert!(
+            message.contains("error: The destination you provided is not a full refname"),
+            "missing multi-line DWIM error:\n{message}"
+        );
+        assert!(
+            message.contains("refs/remotes/two/another"),
+            "error should name the remote-tracking source:\n{message}"
+        );
+        // Qualified destinations still work for the same source.
+        let ok = normalize_push_refspec_for_sources(
+            "refs/remotes/two/another:refs/heads/dst",
+            &local_refs,
+            &[],
+            &db,
+            true,
+        )
+        .expect("qualified dst must succeed");
+        assert_eq!(ok, "refs/remotes/two/another:refs/heads/dst");
+    }
+
+    #[test]
+    fn unqualified_dst_from_branch_src_guesses_heads() {
+        let git_dir = temp_repo("unqualified-dst-branch");
+        let commit = write_commit(&git_dir, Vec::new(), "tip");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let local_refs = vec![
+            PushSourceRef {
+                name: "refs/heads/main".into(),
+                oid: commit,
+            },
+            PushSourceRef {
+                name: "main".into(),
+                oid: commit,
+            },
+        ];
+        let ok = normalize_push_refspec_for_sources(
+            "main:dst",
+            &local_refs,
+            &[],
+            &db,
+            true,
+        )
+        .expect("branch src should guess refs/heads/dst");
+        assert_eq!(ok, "refs/heads/main:refs/heads/dst");
     }
 
     /// Records the last send and which `HttpClient` method delivered it, so the

@@ -535,23 +535,87 @@ fn pull_rebase_fork_point(
     let Some(orig_head) = orig_head else {
         return Ok(None);
     };
-    if remote == "." {
-        return Ok(None);
-    }
-    let Some(remote_ref) = refspecs.first().or_else(|| merge_srcs.first()) else {
-        return Ok(None);
-    };
-    let remote_ref = if remote_ref.starts_with("refs/") {
-        remote_ref.to_string()
+    // Mirror git's `get_rebase_fork_point` / `get_tracking_branch`: for the
+    // local remote `.` the "tracking" ref is `refs/heads/<src>` directly; for a
+    // named remote it is the mapped remote-tracking ref from `remote.<name>.fetch`.
+    let tracking_ref = if let Some(remote_ref) = refspecs.first().or_else(|| merge_srcs.first()) {
+        let remote_ref = if remote_ref.starts_with("refs/") {
+            remote_ref.to_string()
+        } else if remote_ref == "HEAD" {
+            "HEAD".to_string()
+        } else {
+            format!("refs/heads/{remote_ref}")
+        };
+        if remote == "." {
+            // git `get_tracking_branch(".", refspec)` → `refs/heads/<src>` (or
+            // NULL for unqualified/non-heads sources). Skip non-heads the same
+            // way: only heads/HEAD participate in fork-point for local pulls.
+            if remote_ref == "HEAD" {
+                Some("HEAD".to_string())
+            } else if let Some(name) = remote_ref
+                .strip_prefix("refs/heads/")
+                .or_else(|| remote_ref.strip_prefix("heads/"))
+            {
+                Some(format!("refs/heads/{name}"))
+            } else if !remote_ref.starts_with("refs/")
+                && !remote_ref.starts_with("tags/")
+                && !remote_ref.starts_with("remotes/")
+            {
+                Some(format!("refs/heads/{remote_ref}"))
+            } else {
+                None
+            }
+        } else {
+            pull_remote_tracking_ref(config, remote, &remote_ref)
+        }
+    } else if remote == "." {
+        None
     } else {
-        format!("refs/heads/{remote_ref}")
+        // No explicit refspec: use the current branch's configured upstream
+        // tracking ref (`branch.<name>.merge` mapped through the remote).
+        None
     };
-    let Some(tracking_ref) = pull_remote_tracking_ref(config, remote, &remote_ref) else {
+    let Some(tracking_ref) = tracking_ref.or_else(|| {
+        // Default-remote path: `get_upstream_branch(repo)` when no refspec.
+        if !refspecs.is_empty() || !merge_srcs.is_empty() {
+            return None;
+        }
+        pull_upstream_tracking_ref(config, git_dir, format, remote)
+    }) else {
         return Ok(None);
     };
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     merge_base_fork_point(git_dir, format, &db, &tracking_ref, &orig_head)
+}
+
+/// `branch.<current>.merge` mapped through `remote.<remote>.fetch`, or
+/// `refs/remotes/<remote>/<short>` as a fallback — the ref `merge-base
+/// --fork-point` should walk before fetch moves it.
+fn pull_upstream_tracking_ref(
+    config: &GitConfig,
+    git_dir: &Path,
+    format: ObjectFormat,
+    remote: &str,
+) -> Option<String> {
+    let store = FileRefStore::new(git_dir, format);
+    let current = store.current_branch().ok().flatten()?;
+    let branch_remote = config.get("branch", Some(&current), "remote")?;
+    if branch_remote != remote {
+        return None;
+    }
+    let merge = config.get("branch", Some(&current), "merge")?;
+    let remote_ref = if merge.starts_with("refs/") {
+        merge.to_string()
+    } else {
+        format!("refs/heads/{merge}")
+    };
+    pull_remote_tracking_ref(config, remote, &remote_ref).or_else(|| {
+        let short = remote_ref
+            .strip_prefix("refs/heads/")
+            .unwrap_or(remote_ref.as_str());
+        Some(format!("refs/remotes/{remote}/{short}"))
+    })
 }
 
 fn pull_remote_tracking_ref(config: &GitConfig, remote: &str, remote_ref: &str) -> Option<String> {
@@ -569,6 +633,64 @@ fn pull_remote_tracking_ref(config: &GitConfig, remote: &str, remote_ref: &str) 
         }
     }
     None
+}
+
+/// git's `get_rebase_newbase_and_upstream`: `newbase` is always the merge head;
+/// `upstream` is the pre-fetch fork-point unless that fork-point is the octopus
+/// merge base of (HEAD, merge_head, fork_point) — in which case it is discarded
+/// and `upstream` falls back to the merge head. That discard is what lets
+/// `pull --rebase` see already-upstreamed patches (t5520 #77/#79) instead of
+/// replaying every commit since the old remote tip.
+fn pull_rebase_newbase_and_upstream(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    curr_head: &ObjectId,
+    merge_head: &ObjectId,
+    fork_point: Option<ObjectId>,
+) -> Result<(ObjectId, ObjectId)> {
+    let newbase = *merge_head;
+    let Some(fp) = fork_point else {
+        return Ok((newbase, *merge_head));
+    };
+    if pull_octopus_merge_base_equals(git_dir, format, db, curr_head, merge_head, &fp)? {
+        return Ok((newbase, *merge_head));
+    }
+    Ok((newbase, fp))
+}
+
+/// True when the reduced octopus merge base of the three commits equals
+/// `fork_point` (git `get_octopus_merge_base` + `oideq`).
+fn pull_octopus_merge_base_equals(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    curr_head: &ObjectId,
+    merge_head: &ObjectId,
+    fork_point: &ObjectId,
+) -> Result<bool> {
+    let depths = [
+        sley_rev::ancestor_depths(git_dir, format, db, curr_head)?,
+        sley_rev::ancestor_depths(git_dir, format, db, merge_head)?,
+        sley_rev::ancestor_depths(git_dir, format, db, fork_point)?,
+    ];
+    let mut common: Vec<ObjectId> = depths[0]
+        .keys()
+        .filter(|oid| depths[1].contains_key(*oid) && depths[2].contains_key(*oid))
+        .cloned()
+        .collect();
+    if common.is_empty() {
+        return Ok(false);
+    }
+    // `reduce_heads`: drop a candidate that is a strict ancestor of another.
+    let candidates = common.clone();
+    common.retain(|cand| {
+        !candidates.iter().any(|other| {
+            other != cand
+                && sley_rev::is_ancestor(git_dir, format, db, cand, other).unwrap_or(false)
+        })
+    });
+    Ok(common.first().is_some_and(|base| base == fork_point))
 }
 
 fn pull_fetch(
@@ -1121,60 +1243,70 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
     }
     let theirs_oid = merge_oids[0];
     let ours_commit = sley_rev::peel_to_commit(&db, format, &ours_oid)?;
+    // git's `already_up_to_date`: ours is a descendant of every merge head.
+    // Used only to decide "divergent" for the pull.rebase-unspecified die and
+    // (for the *merge* path) the early "Already up to date." return. The rebase
+    // path must NOT short-circuit here: `pull --rebase=interactive` still opens
+    // the sequence editor when HEAD is strictly ahead of the upstream
+    // (t5520 #61/#62), and a non-interactive rebase still runs cherry-pick
+    // detection against the new tip.
     let already_up_to_date = merge_oids.iter().all(|theirs_commit| {
         *theirs_commit == ours_commit
             || sley_rev::ancestor_depths(&git_dir, format, &db, &ours_commit)
                 .is_ok_and(|ours_depths| ours_depths.contains_key(theirs_commit))
     });
-    if already_up_to_date {
-        if verbosity >= 0 {
-            println!("Already up to date.");
-        }
-        // git's pull still runs `git submodule update` after an up-to-date merge,
-        // so a `--recurse-submodules` pull re-syncs a submodule worktree that an
-        // earlier `--no-recurse-submodules` pull advanced the gitlink for without
-        // checking out.
-        pull_update_submodules_after_merge(cli_session, update_recurse_submodules, verbosity)?;
-        return Ok(());
-    }
+    // git's `get_can_ff`: merge head is a descendant of ours (including equal).
     let fast_forward = if merge_oids.len() == 1 {
         sley_rev::ancestor_depths(&git_dir, format, &db, &theirs_oid)?.contains_key(&ours_commit)
     } else {
         false
     };
+    let divergent = !fast_forward && !already_up_to_date;
     let mut effective_rebase = effective_rebase;
     if opt_ff == Some(PullFastForward::Only) {
-        if !fast_forward {
+        if divergent {
             eprintln!("fatal: Not possible to fast-forward, aborting.");
             return Err(GitError::Exit(128));
         }
         effective_rebase = PullRebase::False;
     }
-    if opt_ff.is_none() && rebase_unspecified && !fast_forward {
+    if opt_ff.is_none() && rebase_unspecified && divergent {
         ensure_pull_can_merge(&config)?;
     }
-    if fast_forward {
-        hydrate_pull_target_blobs(&git_dir, &db, format, &theirs_oid, cli_session.lazy_fetch())?;
-        let mut merge_args = Vec::new();
-        if effective_rebase.enabled() {
-            merge_args.push("--ff-only".to_string());
-        } else if let Some(ff) = opt_ff {
-            merge_args.push(ff.as_merge_arg().to_string());
-        }
-        if update_recurse_submodules {
-            merge_args.push("--recurse-submodules".to_string());
-        }
-        merge_args.extend(merge_passthrough.iter().cloned());
-        push_autostash_arg(&mut merge_args, effective_autostash);
-        if verbosity < 0 {
-            merge_args.push("--quiet".to_string());
-        }
-        merge_args.push("FETCH_HEAD".to_string());
-        cmd_merge(cli_session, &merge_args)?;
-        pull_update_submodules_after_merge(cli_session, update_recurse_submodules, verbosity)?;
-        return Ok(());
-    }
+    // Rebase path: can_ff → merge --ff-only (bypass rebase); otherwise always
+    // invoke rebase with git's `--onto <newbase> <upstream>` form.
     if effective_rebase.enabled() {
+        if fast_forward {
+            hydrate_pull_target_blobs(
+                &git_dir,
+                &db,
+                format,
+                &theirs_oid,
+                cli_session.lazy_fetch(),
+            )?;
+            let mut merge_args = Vec::new();
+            merge_args.push("--ff-only".to_string());
+            if update_recurse_submodules {
+                merge_args.push("--recurse-submodules".to_string());
+            }
+            merge_args.extend(merge_passthrough.iter().cloned());
+            push_autostash_arg(&mut merge_args, effective_autostash);
+            if verbosity < 0 {
+                merge_args.push("--quiet".to_string());
+            }
+            merge_args.push("FETCH_HEAD".to_string());
+            cmd_merge(cli_session, &merge_args)?;
+            pull_update_submodules_after_merge(cli_session, update_recurse_submodules, verbosity)?;
+            return Ok(());
+        }
+        let (newbase, upstream) = pull_rebase_newbase_and_upstream(
+            &git_dir,
+            format,
+            &db,
+            &ours_commit,
+            &theirs_oid,
+            rebase_fork_point,
+        )?;
         let mut rebase_args = Vec::new();
         if let Some(arg) = effective_rebase.rebase_arg() {
             rebase_args.push(arg.to_string());
@@ -1189,14 +1321,43 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
         if update_recurse_submodules {
             rebase_args.push("--recurse-submodules".to_string());
         }
-        if let Some(fork_point) = rebase_fork_point {
-            rebase_args.push("--onto".to_string());
-            rebase_args.push("FETCH_HEAD".to_string());
-            rebase_args.push(fork_point.to_hex());
-        } else {
-            rebase_args.push("FETCH_HEAD".to_string());
-        }
+        // Always `--onto <newbase> <upstream>` like git's `run_rebase` (OIDs).
+        // When the fork-point was discarded, both resolve to the merge head so
+        // cherry-pick detection runs against the full upstream tip.
+        rebase_args.push("--onto".to_string());
+        rebase_args.push(newbase.to_hex());
+        rebase_args.push(upstream.to_hex());
         return commands::rebase::cmd_rebase(cli_session, &rebase_args);
+    }
+    if already_up_to_date {
+        if verbosity >= 0 {
+            println!("Already up to date.");
+        }
+        // git's pull still runs `git submodule update` after an up-to-date merge,
+        // so a `--recurse-submodules` pull re-syncs a submodule worktree that an
+        // earlier `--no-recurse-submodules` pull advanced the gitlink for without
+        // checking out.
+        pull_update_submodules_after_merge(cli_session, update_recurse_submodules, verbosity)?;
+        return Ok(());
+    }
+    if fast_forward {
+        hydrate_pull_target_blobs(&git_dir, &db, format, &theirs_oid, cli_session.lazy_fetch())?;
+        let mut merge_args = Vec::new();
+        if let Some(ff) = opt_ff {
+            merge_args.push(ff.as_merge_arg().to_string());
+        }
+        if update_recurse_submodules {
+            merge_args.push("--recurse-submodules".to_string());
+        }
+        merge_args.extend(merge_passthrough.iter().cloned());
+        push_autostash_arg(&mut merge_args, effective_autostash);
+        if verbosity < 0 {
+            merge_args.push("--quiet".to_string());
+        }
+        merge_args.push("FETCH_HEAD".to_string());
+        cmd_merge(cli_session, &merge_args)?;
+        pull_update_submodules_after_merge(cli_session, update_recurse_submodules, verbosity)?;
+        return Ok(());
     }
     let mut merge_args = Vec::new();
     if let Some(ff) = opt_ff {

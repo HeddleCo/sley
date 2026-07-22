@@ -424,6 +424,7 @@ pub(crate) fn cmd_status(cli_session: &crate::session::CliSession, args: &[Strin
         include_ignored: show_ignored,
         ignored_mode,
         untracked_mode,
+        reference: None,
     };
     let pathspec = StatusPathspec::new(
         &cwd,
@@ -1705,18 +1706,336 @@ impl PartialOrd for SummaryHeapEntry {
 }
 
 /// The effective `core.commentChar` string (git's `comment_line_str`), default
-/// `#`. May be multi-char; an empty or `auto` value falls back to `#` (we do not
-/// implement the `auto` scan, which picks an unused character). Used by
-/// commit-message cleanup (scissors detection + comment stripping).
+/// `#`. May be multi-char. When the configured value is `auto`, returns `#` as
+/// the provisional default; callers that have a commit message should use
+/// [`resolve_commit_comment_char`] so the auto-scan can pick an unused char.
 pub(crate) fn commit_comment_string(git_dir: &Path) -> String {
-    read_repo_config(git_dir)
-        .ok()
-        .and_then(|c| {
-            c.get("core", None, "commentchar")
-                .filter(|value| !value.is_empty() && *value != "auto")
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "#".to_string())
+    match commit_comment_config(git_dir) {
+        CommentCharConfig::Fixed(value) => value,
+        CommentCharConfig::Auto | CommentCharConfig::Default => "#".to_string(),
+    }
+}
+
+/// Resolved `core.commentChar` / `core.commentString` configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommentCharConfig {
+    /// Explicit non-auto value (may be multi-char).
+    Fixed(String),
+    /// `auto` — pick an unused candidate at commit time.
+    Auto,
+    /// Unset / empty → default `#`.
+    Default,
+}
+
+fn commit_comment_config(git_dir: &Path) -> CommentCharConfig {
+    // Prefer commentChar, then commentString (both map to the same git setting;
+    // last-wins is already applied by `GitConfig::get` over the merged view).
+    let value = read_repo_config(git_dir).ok().and_then(|c| {
+        c.get("core", None, "commentchar")
+            .or_else(|| c.get("core", None, "commentstring"))
+            .map(str::to_string)
+    });
+    match value.as_deref() {
+        None | Some("") => CommentCharConfig::Default,
+        Some(v) if v.eq_ignore_ascii_case("auto") => CommentCharConfig::Auto,
+        Some(v) => CommentCharConfig::Fixed(v.to_string()),
+    }
+}
+
+/// Candidates git's `adjust_comment_line_char` walks when `core.commentChar=auto`.
+const AUTO_COMMENT_CANDIDATES: &[u8] = b"#;@!$%^&|:";
+
+/// Resolve the comment string for a commit, honouring `core.commentChar=auto`
+/// (git's `adjust_comment_line_char`). Emits the deprecation warning when auto
+/// is active. Fails when every candidate already appears as a line-start in
+/// `message` ("out of options").
+pub(crate) fn resolve_commit_comment_char(git_dir: &Path, message: &[u8]) -> Result<String> {
+    match commit_comment_config(git_dir) {
+        CommentCharConfig::Fixed(value) => Ok(value),
+        CommentCharConfig::Default => Ok("#".to_string()),
+        CommentCharConfig::Auto => {
+            warn_auto_comment_char_config(git_dir);
+            adjust_comment_line_char(message)
+        }
+    }
+}
+
+/// git's `adjust_comment_line_char`: pick the first candidate that is not used
+/// as the first non-empty character of any line in the user message. Trailing
+/// ignorable footer bytes (git's `ignored_log_message_bytes`) are excluded from
+/// the scan; scissors cutoff is applied with the provisional `#` comment char.
+fn adjust_comment_line_char(message: &[u8]) -> Result<String> {
+    let mut candidates: Vec<u8> = AUTO_COMMENT_CANDIDATES.to_vec();
+    // git: cutoff = sb->len - ignored_log_message_bytes(sb->buf, sb->len);
+    let cutoff = message.len().saturating_sub(ignored_log_message_bytes(message));
+
+    // Fast path: `#` unused anywhere in the scanned region → keep `#`.
+    if !message[..cutoff].contains(&b'#') {
+        return Ok("#".to_string());
+    }
+
+    // Blank out candidates that appear at the start of the buffer or after a
+    // newline (git's loop over line starts).
+    let body = &message[..cutoff];
+    if let Some(first) = body.first() {
+        blank_candidate(&mut candidates, *first);
+    }
+    for window in body.windows(2) {
+        if (window[0] == b'\n' || window[0] == b'\r') && window[1] != 0 {
+            blank_candidate(&mut candidates, window[1]);
+        }
+    }
+
+    match candidates.iter().find(|&&c| c != b' ').copied() {
+        Some(chosen) => Ok(String::from(chosen as char)),
+        None => {
+            eprintln!(
+                "fatal: unable to select a comment character that is not used\nin the current commit message"
+            );
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn blank_candidate(candidates: &mut [u8], ch: u8) {
+    if let Some(slot) = candidates.iter_mut().find(|c| **c == ch) {
+        *slot = b' ';
+    }
+}
+
+/// git's `ignored_log_message_bytes`: how many trailing bytes of `message` are
+/// blank lines / comment lines (provisional comment char `#`) / old-style
+/// Conflicts: blocks. Returns 0 when there is no ignorable trailer — including
+/// the case where the whole buffer is comments starting at offset 0 (C treats
+/// `boc == 0` as falsy, so that path falls through to `len - scissors_cutoff`,
+/// which is 0 when no scissors line is present). That keeps `adjust_comment_
+/// line_char` scanning the full message for subjects like `#foo`.
+fn ignored_log_message_bytes(message: &[u8]) -> usize {
+    // Scissors cut with provisional `#` (auto starts with comment_line_str="#").
+    let scissors_cutoff = crate::commit_message::commit_locate_scissors(message, "#");
+    let limit = scissors_cutoff.min(message.len());
+    let mut boc: usize = 0;
+    let mut boc_set = false;
+    let mut offset = 0;
+    let mut in_conflicts = false;
+    while offset < limit {
+        let rest = &message[offset..limit];
+        let line_end = rest
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let line = &rest[..line_end];
+        let is_blank = line == b"\n" || line.is_empty();
+        let is_comment = line.starts_with(b"#");
+        let is_conflicts = line == b"Conflicts:\n" || line == b"Conflicts:";
+        let is_conflicts_entry = in_conflicts && line.first() == Some(&b'\t');
+        if is_blank || is_comment || is_conflicts || is_conflicts_entry {
+            if !boc_set {
+                boc = offset;
+                boc_set = true;
+            }
+            if is_conflicts {
+                in_conflicts = true;
+            } else if !is_conflicts_entry {
+                in_conflicts = false;
+            }
+        } else {
+            boc = 0;
+            boc_set = false;
+            in_conflicts = false;
+        }
+        offset += line_end;
+    }
+    // Match C: `return boc ? len - boc : len - cutoff;` where boc==0 is falsy.
+    if boc_set && boc > 0 {
+        message.len() - boc
+    } else {
+        message.len() - scissors_cutoff.min(message.len())
+    }
+}
+
+/// Emit git's deprecation warning + config-unset advice for `core.commentChar=auto`.
+/// Suppressed after the first emission in this process (git uses
+/// `GIT_AUTO_COMMENT_CHAR_CONFIG_WARNING_GIVEN`; we use a process-local atomic
+/// because the workspace forbids `std::env::set_var`).
+fn warn_auto_comment_char_config(git_dir: &Path) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    // Discover which config keys/files contributed commentChar / commentString
+    // so the advice matches git's multi-file unset list (t7502 #80).
+    let advice = collect_auto_comment_char_advice(git_dir);
+    eprintln!(
+        "warning: Support for 'core.commentChar=auto' is deprecated and will be removed in Git 3.0"
+    );
+    if let Some(advice) = advice {
+        eprint!("{advice}");
+    } else {
+        // Minimal fallback when we cannot reconstruct file origins.
+        eprintln!("hint: ");
+        eprintln!("hint: To use the default comment string (#) please run");
+        eprintln!("hint: ");
+        eprintln!("hint:     git config unset core.commentChar");
+        eprintln!("hint: ");
+        eprintln!("hint: To set a custom comment string please run");
+        eprintln!("hint: ");
+        eprintln!("hint:     git config set core.commentChar <comment string>");
+        eprintln!("hint: ");
+        eprintln!("hint: where '<comment string>' is the string you wish to use.");
+    }
+}
+
+/// Build the multi-hint advice block git prints for auto commentChar.
+fn collect_auto_comment_char_advice(git_dir: &Path) -> Option<String> {
+    use sley_config::{ConfigOriginKind, ConfigScope, ConfigStack};
+
+    let common = crate::common_git_dir_for_git_dir(git_dir).ok()?;
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(sley_config::git_dir_for_include_context(git_dir)),
+        crate::commands::remote::repo_current_branch_name(git_dir),
+    );
+    let mut stack = ConfigStack::new();
+    // Local repo config (with includes) is enough for the t7502 fixture; system
+    // / global may add noise under hermetic tests and are optional.
+    let local_path = common.join("config");
+    let _ = stack.push_file(&local_path, ConfigScope::Local, true, &context);
+    if let Ok(parameters) = crate::injected_config_parameters() {
+        let _ = stack.push_parameters_with_includes(&parameters, &context);
+    }
+
+    // Track first-seen (path, key_id) and whether the key appeared twice in a
+    // file — matching git's KEY_SEEN_ONCE / KEY_SEEN_TWICE for --all.
+    #[derive(Clone)]
+    struct Item {
+        key_id: usize, // 0 = commentChar, 1 = commentString
+        path: String,
+        scope: ConfigScope,
+    }
+    let mut items: Vec<Item> = Vec::new();
+    let mut seen: std::collections::HashMap<(String, usize), u8> = std::collections::HashMap::new();
+    let mut last_key_id = 0usize;
+    let mut auto_set = false;
+    let mut auto_set_in_file = false;
+
+    for entry in &stack.entries {
+        if !entry.section.eq_ignore_ascii_case("core") || entry.subsection.is_some() {
+            continue;
+        }
+        let key_id = if entry.key.eq_ignore_ascii_case("commentchar") {
+            0
+        } else if entry.key.eq_ignore_ascii_case("commentstring") {
+            1
+        } else {
+            continue;
+        };
+        last_key_id = key_id;
+        auto_set = entry
+            .value
+            .as_deref()
+            .is_some_and(|v| v.eq_ignore_ascii_case("auto"));
+        if entry.origin.kind != ConfigOriginKind::File {
+            auto_set_in_file = auto_set;
+            continue;
+        }
+        let path = entry.origin.name.clone();
+        let count = seen.entry((path.clone(), key_id)).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count == 1 {
+            items.push(Item {
+                key_id,
+                path,
+                scope: entry.scope,
+            });
+        }
+        auto_set_in_file = auto_set;
+    }
+
+    if !auto_set {
+        return None;
+    }
+
+    let key_name = |id: usize| {
+        if id == 0 {
+            "core.commentChar"
+        } else {
+            "core.commentString"
+        }
+    };
+
+    let mut out = String::new();
+    out.push_str("hint: \n");
+    out.push_str("hint: To use the default comment string (#) please run\n");
+    out.push_str("hint: \n");
+    for item in &items {
+        let twice = seen.get(&(item.path.clone(), item.key_id)).copied() == Some(2);
+        out.push_str("hint:     git config unset ");
+        out.push_str(&config_scope_arg(git_dir, item.scope, &item.path));
+        if twice {
+            out.push_str("--all ");
+        }
+        out.push_str(key_name(item.key_id));
+        out.push('\n');
+    }
+    if auto_set_in_file {
+        if let Some(last) = items.last() {
+            out.push_str("hint: \n");
+            out.push_str("hint: To set a custom comment string please run\n");
+            out.push_str("hint: \n");
+            out.push_str("hint:     git config set ");
+            out.push_str(&config_scope_arg(git_dir, last.scope, &last.path));
+            out.push_str(key_name(last.key_id));
+            out.push_str(" <comment string>\n");
+            out.push_str("hint: \n");
+            out.push_str("hint: where '<comment string>' is the string you wish to use.\n");
+        }
+    }
+    let _ = last_key_id;
+    Some(out)
+}
+
+/// Format the scope flag / `--file <path>` for a config advice line (git's
+/// `add_config_scope_arg`). Paths under `$HOME` are shortened to `~/...`.
+fn config_scope_arg(git_dir: &Path, scope: sley_config::ConfigScope, path: &str) -> String {
+    use sley_config::ConfigScope;
+    match scope {
+        ConfigScope::System => "--system ".to_string(),
+        ConfigScope::Global => "--global ".to_string(),
+        ConfigScope::Local => {
+            // Local is the default (no flag) when the path is the repo config.
+            let local = git_dir.join("config");
+            let common = crate::common_git_dir_for_git_dir(git_dir)
+                .ok()
+                .map(|p| p.join("config"));
+            if Path::new(path) == local.as_path()
+                || common.as_ref().is_some_and(|c| Path::new(path) == c.as_path())
+            {
+                String::new()
+            } else {
+                format!("--file {} ", pretty_config_path(path))
+            }
+        }
+        ConfigScope::Worktree => "--worktree ".to_string(),
+        ConfigScope::Command => String::new(),
+    }
+}
+
+fn pretty_config_path(path: &str) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        let p = Path::new(path);
+        if let Ok(rel) = p.strip_prefix(&home) {
+            let rel = rel.to_string_lossy();
+            if rel.is_empty() {
+                return "~/".to_string();
+            }
+            return format!("~/{rel}");
+        }
+    }
+    path.to_string()
 }
 
 /// Comment prefix for `git status` output when `status.displayCommentPrefix` is

@@ -1401,3 +1401,286 @@ fn remote_add_config_options_match_upstream_git() {
     }
     let _ = fs::remove_dir_all(&root);
 }
+
+/// t5505 #120 — unqualified `<dst>` with a raw object-id `<src>` must fail with
+/// git's multi-line DWIM error and type-based `advice.pushUnqualifiedRefName`
+/// "Did you mean" hints (and suppress the hints when the advice is disabled).
+#[test]
+fn push_unqualified_dst_refspec_dwim_and_advice_match_upstream_git() {
+    let root = unique_temp_dir("push-unqualified-dst-dwim");
+    fs::create_dir_all(&root).expect("create temp root");
+
+    // Build one seed repo, then give expected/actual each their own bare origin.
+    let seed = root.join("seed");
+    fs::create_dir_all(&seed).expect("create seed");
+    git(&seed, &["init", "-q", "-b", "main"]);
+    fs::write(seed.join("file"), "content\n").expect("write file");
+    git(&seed, &["add", "file"]);
+    git(
+        &seed,
+        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"],
+    );
+
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    for (repo, remote_name) in [(&expected, "origin-e.git"), (&actual, "origin-a.git")] {
+        let remote = root.join(remote_name);
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().expect("utf8"),
+                remote.to_str().expect("utf8"),
+            ],
+        );
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                remote.to_str().expect("utf8"),
+                repo.to_str().expect("utf8"),
+            ],
+        );
+        git(
+            repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "tag",
+                "-a",
+                "-m",
+                "Some tag",
+                "some-tag",
+                "main",
+            ],
+        );
+    }
+
+    for (label, peels) in [
+        ("commit", "some-tag^{commit}"),
+        ("tag", "some-tag^{tag}"),
+        ("tree", "some-tag^{tree}"),
+        ("blob", "some-tag:file"),
+    ] {
+        let oid = String::from_utf8(git(&expected, &["rev-parse", peels]))
+            .expect("utf8 oid")
+            .trim()
+            .to_string();
+        let refspec = format!("{oid}:dst");
+
+        let expected_out = run_output(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["push", "origin", &refspec],
+        );
+        let actual_out = run_output(
+            sley_testkit::sley_bin!(),
+            &actual,
+            &["push", "origin", &refspec],
+        );
+        assert_eq!(
+            actual_out.status.code(),
+            expected_out.status.code(),
+            "{label}: status differed"
+        );
+        let expected_err = String::from_utf8_lossy(&expected_out.stderr);
+        let actual_err = String::from_utf8_lossy(&actual_out.stderr);
+        assert!(
+            actual_err.contains("error: The destination you"),
+            "{label}: missing DWIM error in sley stderr:\n{actual_err}"
+        );
+        assert!(
+            expected_err.contains("error: The destination you"),
+            "{label}: oracle should emit DWIM error"
+        );
+        assert!(
+            actual_err.contains("hint: Did you mean"),
+            "{label}: missing advice hint in sley stderr:\n{actual_err}"
+        );
+        assert!(
+            expected_err.contains("hint: Did you mean"),
+            "{label}: oracle should emit advice"
+        );
+
+        let expected_off = run_output(
+            sley_testkit::oracle_git(),
+            &expected,
+            &[
+                "-c",
+                "advice.pushUnqualifiedRefName=false",
+                "push",
+                "origin",
+                &refspec,
+            ],
+        );
+        let actual_off = run_output(
+            sley_testkit::sley_bin!(),
+            &actual,
+            &[
+                "-c",
+                "advice.pushUnqualifiedRefName=false",
+                "push",
+                "origin",
+                &refspec,
+            ],
+        );
+        assert_eq!(
+            actual_off.status.code(),
+            expected_off.status.code(),
+            "{label} advice=false: status differed"
+        );
+        let actual_off_err = String::from_utf8_lossy(&actual_off.stderr);
+        assert!(
+            actual_off_err.contains("error: The destination you"),
+            "{label} advice=false: missing DWIM error:\n{actual_off_err}"
+        );
+        assert!(
+            !actual_off_err.contains("hint: Did you mean"),
+            "{label} advice=false: advice should be suppressed:\n{actual_off_err}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t5505 #121 — pushing a remote-tracking / non-heads-tags source with an
+/// unqualified destination must fail the same DWIM error (git's `guess_ref`
+/// only qualifies from `refs/{heads,tags}/`).
+#[test]
+fn push_remote_tracking_src_unqualified_dst_dwim_match_upstream_git() {
+    let root = unique_temp_dir("push-remote-src-unqualified-dst");
+    fs::create_dir_all(&root).expect("create temp root");
+
+    let seed = root.join("seed");
+    fs::create_dir_all(&seed).expect("create seed");
+    git(&seed, &["init", "-q", "-b", "main"]);
+    fs::write(seed.join("file"), "content\n").expect("write file");
+    git(&seed, &["add", "file"]);
+    git(
+        &seed,
+        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"],
+    );
+    git(
+        &seed,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "tag",
+            "-a",
+            "-m",
+            "Some tag",
+            "my-tag",
+            "main",
+        ],
+    );
+
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    let mut remote_dirs = Vec::new();
+    for (repo, remote_name) in [(&expected, "origin-e.git"), (&actual, "origin-a.git")] {
+        let remote = root.join(remote_name);
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().expect("utf8"),
+                remote.to_str().expect("utf8"),
+            ],
+        );
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                remote.to_str().expect("utf8"),
+                repo.to_str().expect("utf8"),
+            ],
+        );
+        // Stage remote-tracking mirrors the way t5505 fetches them from `two`.
+        let head = String::from_utf8(git(repo, &["rev-parse", "HEAD"]))
+            .expect("utf8")
+            .trim()
+            .to_string();
+        let tag = String::from_utf8(git(repo, &["rev-parse", "my-tag"]))
+            .expect("utf8")
+            .trim()
+            .to_string();
+        let tree = String::from_utf8(git(repo, &["rev-parse", "HEAD^{tree}"]))
+            .expect("utf8")
+            .trim()
+            .to_string();
+        let blob = String::from_utf8(git(repo, &["rev-parse", "HEAD:file"]))
+            .expect("utf8")
+            .trim()
+            .to_string();
+        for (name, oid) in [
+            ("refs/remotes/two/another", head.as_str()),
+            ("refs/remotes/tags-from-two/my-tag", tag.as_str()),
+            ("refs/remotes/trees-from-two/my-head-tree", tree.as_str()),
+            ("refs/remotes/blobs-from-two/my-file-blob", blob.as_str()),
+        ] {
+            git(repo, &["update-ref", name, oid]);
+        }
+        remote_dirs.push(remote);
+    }
+
+    for (src, dst) in [
+        ("refs/remotes/two/another", "dst"),
+        ("refs/remotes/tags-from-two/my-tag", "dst-tag"),
+        ("refs/remotes/trees-from-two/my-head-tree", "dst-tree"),
+        ("refs/remotes/blobs-from-two/my-file-blob", "dst-blob"),
+    ] {
+        let refspec = format!("{src}:{dst}");
+        let expected_out = run_output(
+            sley_testkit::oracle_git(),
+            &expected,
+            &["push", "origin", &refspec],
+        );
+        let actual_out = run_output(
+            sley_testkit::sley_bin!(),
+            &actual,
+            &["push", "origin", &refspec],
+        );
+        assert_eq!(
+            actual_out.status.code(),
+            expected_out.status.code(),
+            "{refspec}: status differed\noracle stderr:\n{}\nsley stderr:\n{}",
+            String::from_utf8_lossy(&expected_out.stderr),
+            String::from_utf8_lossy(&actual_out.stderr),
+        );
+        let actual_err = String::from_utf8_lossy(&actual_out.stderr);
+        let expected_err = String::from_utf8_lossy(&expected_out.stderr);
+        assert!(
+            expected_err.contains("error: The destination you"),
+            "{refspec}: oracle missing DWIM error:\n{expected_err}"
+        );
+        assert!(
+            actual_err.contains("error: The destination you"),
+            "{refspec}: sley missing DWIM error:\n{actual_err}"
+        );
+        // Must not have silently created the destination (the old bug).
+        for remote in &remote_dirs {
+            let remote_has = run_output(
+                sley_testkit::oracle_git(),
+                remote,
+                &["show-ref", "--verify", &format!("refs/heads/{dst}")],
+            );
+            assert!(
+                !remote_has.status.success(),
+                "{refspec}: destination should not have been created on {}",
+                remote.display()
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
