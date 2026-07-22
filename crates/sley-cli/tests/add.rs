@@ -1431,3 +1431,472 @@ fn add_pathspec_file_nul_requires_pathspec_from_file_like_upstream_git() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+/// t3700 #24: `git add --refresh -- <path>` re-stats the index entry after
+/// `read-tree` zeroed the cached stat so `diff-index` is clean again.
+#[test]
+fn add_refresh_restores_stat_cache_like_upstream_git() {
+    let root = unique_temp_dir("add-refresh");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    {
+        for repo in [&upstream, &rust] {
+            git(repo, &["init", "-q", "-b", "main"]);
+            fs::write(repo.join("foo"), b"").expect("write foo");
+            git(repo, &["add", "foo"]);
+            run_with_identity(repo, &["commit", "-a", "-m", "commit all", "-q"]);
+            git(repo, &["read-tree", "HEAD"]);
+            let dirty = git(repo, &["diff-index", "HEAD", "--", "foo"]);
+            assert!(
+                !dirty.is_empty(),
+                "read-tree should leave foo stat-dirty in {}",
+                repo.display()
+            );
+        }
+
+        let args = ["add", "--refresh", "--", "foo"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+        assert_same_output(actual, expected, &args);
+
+        assert_eq!(
+            git(&rust, &["diff-index", "HEAD", "--", "foo"]),
+            git(&upstream, &["diff-index", "HEAD", "--", "foo"]),
+            "diff-index after add --refresh differed"
+        );
+        assert!(
+            git(&rust, &["diff-index", "HEAD", "--", "foo"]).is_empty(),
+            "add --refresh should clear stat dirtiness"
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t3700 #25: pathspec-limited `--refresh` only re-stats matching entries.
+#[test]
+fn add_refresh_with_pathspec_only_touches_matches_like_upstream_git() {
+    let root = unique_temp_dir("add-refresh-pathspec");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    {
+        for repo in [&upstream, &rust] {
+            git(repo, &["init", "-q", "-b", "main"]);
+            run_with_identity(repo, &["commit", "--allow-empty", "-m", "init", "-q"]);
+            fs::write(repo.join("foo"), b"\n").expect("write foo");
+            fs::write(repo.join("bar"), b"\n").expect("write bar");
+            fs::write(repo.join("baz"), b"\n").expect("write baz");
+            git(repo, &["add", "foo", "bar", "baz"]);
+            let oid = String::from_utf8(git(repo, &["rev-parse", ":foo"]))
+                .expect("oid utf8")
+                .trim()
+                .to_string();
+            git(repo, &["rm", "-f", "foo"]);
+            let info = format!("100644 {oid} 3\tfoo\n");
+            let mut child = Command::new(sley_testkit::oracle_git())
+                .current_dir(repo)
+                .args(["update-index", "--index-info"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn update-index");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(info.as_bytes())
+                .expect("write index-info");
+            assert!(child.wait().expect("wait").success(), "update-index");
+            // Age mtimes so both bar and baz look dirty.
+            let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_880_000);
+            let _ = filetime_set(repo.join("bar"), old);
+            let _ = filetime_set(repo.join("baz"), old);
+        }
+
+        let args = ["add", "--refresh", "bar"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+        assert_same_output(actual, expected, &args);
+
+        assert_eq!(
+            git(&rust, &["diff-files", "--name-only"]),
+            git(&upstream, &["diff-files", "--name-only"]),
+            "diff-files after pathspec refresh differed"
+        );
+        let dirty_bytes = git(&rust, &["diff-files", "--name-only"]);
+        let dirty = String::from_utf8_lossy(&dirty_bytes);
+        assert!(
+            !dirty.lines().any(|line| line == "bar"),
+            "bar should be refreshed clean, got:\n{dirty}"
+        );
+        assert!(
+            dirty.lines().any(|line| line == "baz"),
+            "baz must remain dirty when only bar is refreshed, got:\n{dirty}"
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Best-effort mtime set without an extra crate dependency.
+fn filetime_set(path: PathBuf, when: std::time::SystemTime) -> std::io::Result<()> {
+    use std::process::Command as SysCommand;
+    let secs = when
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // touch -t expects [[CC]YY]MMDDhhmm[.SS]; use epoch via perl for portability.
+    let status = SysCommand::new("perl")
+        .arg("-e")
+        .arg(format!(
+            "utime {secs}, {secs}, $ARGV[0] or die $!",
+        ))
+        .arg(&path)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("perl utime failed"))
+    }
+}
+
+/// t3700 #26: unmatched magic pathspec under `--refresh` is fatal.
+#[test]
+fn add_refresh_unmatched_pathspec_errors_like_upstream_git() {
+    let root = unique_temp_dir("add-refresh-nomatch");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    {
+        for repo in [&upstream, &rust] {
+            git(repo, &["init", "-q", "-b", "main"]);
+            run_with_identity(repo, &["commit", "--allow-empty", "-m", "init", "-q"]);
+        }
+
+        let args = ["add", "--refresh", ":(icase)nonexistent"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+        assert_same_output(actual, expected, &args);
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t3700 #28/#29: `--ignore-errors` / `add.ignore-errors` stage readable peers.
+#[test]
+fn add_ignore_errors_stages_readable_peers_like_upstream_git() {
+    let root = unique_temp_dir("add-ignore-errors");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    {
+        for repo in [&upstream, &rust] {
+            git(repo, &["init", "-q", "-b", "main"]);
+            run_with_identity(repo, &["commit", "--allow-empty", "-m", "init", "-q"]);
+            fs::write(repo.join("foo1"), b"one\n").expect("write foo1");
+            fs::write(repo.join("foo2"), b"two\n").expect("write foo2");
+            let mut perms = fs::metadata(repo.join("foo2"))
+                .expect("meta")
+                .permissions();
+            perms.set_mode(0o000);
+            fs::set_permissions(repo.join("foo2"), perms).expect("chmod 0 foo2");
+        }
+
+        let args = ["add", "--verbose", "--ignore-errors", "foo1", "foo2"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            git(&rust, &["ls-files"]),
+            git(&upstream, &["ls-files"]),
+            "ls-files after --ignore-errors differed"
+        );
+
+        // Restore perms and re-test config form on fresh unreadable foo2.
+        for repo in [&upstream, &rust] {
+            let mut perms = fs::metadata(repo.join("foo2"))
+                .expect("meta")
+                .permissions();
+            perms.set_mode(0o644);
+            fs::set_permissions(repo.join("foo2"), perms).expect("chmod restore");
+            git(repo, &["reset", "-q"]);
+            // Drop staged foo1 from the previous step.
+            let _ = run_output(sley_testkit::oracle_git(), repo, &["rm", "-f", "--cached", "foo1"]);
+            fs::write(repo.join("foo1"), b"one\n").expect("rewrite foo1");
+            fs::write(repo.join("foo2"), b"two\n").expect("rewrite foo2");
+            let mut perms = fs::metadata(repo.join("foo2"))
+                .expect("meta")
+                .permissions();
+            perms.set_mode(0o000);
+            fs::set_permissions(repo.join("foo2"), perms).expect("chmod 0 foo2");
+            git(repo, &["config", "add.ignore-errors", "1"]);
+        }
+
+        let args = ["add", "--verbose", "foo1", "foo2"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            git(&rust, &["ls-files"]),
+            git(&upstream, &["ls-files"]),
+            "ls-files after add.ignore-errors config differed"
+        );
+
+        for repo in [&upstream, &rust] {
+            let mut perms = fs::metadata(repo.join("foo2"))
+                .expect("meta")
+                .permissions();
+            perms.set_mode(0o644);
+            let _ = fs::set_permissions(repo.join("foo2"), perms);
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t3700 #39: `--dry-run` of a dirty tracked file prints `add '…'` and stages nothing.
+#[test]
+fn add_dry_run_of_changed_tracked_file_like_upstream_git() {
+    let root = unique_temp_dir("add-dry-run-changed");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    {
+        for repo in [&upstream, &rust] {
+            git(repo, &["init", "-q", "-b", "main"]);
+            fs::write(repo.join("track-this"), b"track\n").expect("write");
+            git(repo, &["add", "track-this"]);
+            run_with_identity(repo, &["commit", "-m", "t", "-q"]);
+            fs::write(repo.join("track-this"), b"track\nnew\n").expect("modify");
+        }
+
+        let args = ["add", "--dry-run", "track-this"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            git(&rust, &["diff", "--cached", "--name-status"]),
+            git(&upstream, &["diff", "--cached", "--name-status"]),
+            "dry-run must not stage"
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t3700 #43: `--dry-run --ignore-missing` of an ignored missing path reports
+/// the ignore advice while still listing the addable path on stdout.
+#[test]
+fn add_dry_run_ignore_missing_ignored_path_output_like_upstream_git() {
+    let root = unique_temp_dir("add-dry-run-ignore-missing-output");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    {
+        for repo in [&upstream, &rust] {
+            git(repo, &["init", "-q", "-b", "main"]);
+            fs::write(repo.join("track-this"), b"track\n").expect("write");
+            git(repo, &["add", "track-this"]);
+            run_with_identity(repo, &["commit", "-m", "t", "-q"]);
+            fs::write(repo.join("track-this"), b"track\nnew\n").expect("modify");
+            fs::write(repo.join(".gitignore"), b"ignored-file\n").expect("gitignore");
+        }
+
+        let args = [
+            "add",
+            "--dry-run",
+            "--ignore-missing",
+            "track-this",
+            "ignored-file",
+        ];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+        assert_same_output(actual, expected, &args);
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t3700 #58: on a case-insensitive FS, absolute pathspecs with folded case
+/// under the worktree still stage the file.
+#[test]
+fn add_case_insensitive_absolute_path_like_upstream_git() {
+    let root = unique_temp_dir("add-case-insensitive");
+    // Detect case-insensitivity the same way git's CASE_INSENSITIVE_FS does.
+    let probe = root.join("CaseProbe");
+    fs::create_dir_all(&root).expect("root");
+    fs::write(&probe, b"x").expect("probe");
+    if !root.join("caseprobe").exists() {
+        let _ = fs::remove_dir_all(&root);
+        return;
+    }
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    {
+        for repo in [&upstream, &rust] {
+            git(repo, &["init", "-q", "-b", "main"]);
+            run_with_identity(repo, &["commit", "--allow-empty", "-m", "init", "-q"]);
+            fs::write(repo.join("BLUB"), b"").expect("write BLUB");
+        }
+
+        // Match t3700: `path="$(pwd)/BLUB"; downcased="$(echo "$path" | tr A-Z a-z)"`.
+        // Use the worktree's own absolute path (not a foreign canonicalize) so
+        // intermediate components are folded the same way git's shell test does.
+        let downcased_up = {
+            let path = format!("{}/BLUB", upstream.display());
+            path.chars().map(|c| c.to_ascii_lowercase()).collect::<String>()
+        };
+        let downcased_rs = {
+            let path = format!("{}/BLUB", rust.display());
+            path.chars().map(|c| c.to_ascii_lowercase()).collect::<String>()
+        };
+
+        // t3700 only requires the command to succeed (exit 0). Oracle git 2.55
+        // on macOS may accept the pathspec without staging when intermediate
+        // absolute components are case-folded; sley stages via FS resolve.
+        // Match the suite: both must not fail.
+        let expected = run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["add", &downcased_up],
+        );
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &["add", &downcased_rs]);
+        assert_eq!(
+            actual.status.code(),
+            expected.status.code(),
+            "status differed for case-insensitive absolute add\n\
+             git stderr:\n{}\nsley stderr:\n{}",
+            String::from_utf8_lossy(&expected.stderr),
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        assert!(
+            actual.status.success(),
+            "sley must accept case-folded absolute pathspecs on CI filesystems"
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t2200 #7: `add -u` with an untracked pathspec errors and stages nothing.
+#[test]
+fn add_update_errors_on_untracked_pathspec_like_upstream_git() {
+    let root = unique_temp_dir("add-update-untracked-pathspec");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    {
+        for repo in [&upstream, &rust] {
+            git(repo, &["init", "-q", "-b", "main"]);
+            fs::write(repo.join("top"), b"base\n").expect("write top");
+            git(repo, &["add", "top"]);
+            run_with_identity(repo, &["commit", "-m", "base", "-q"]);
+            fs::write(repo.join("baz"), b"content\n").expect("write untracked baz");
+            fs::write(repo.join("top"), b"base\ncontent\n").expect("modify top");
+        }
+
+        let args = ["add", "-u", "baz", "top"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            git(&rust, &["diff", "--cached", "--name-only"]),
+            git(&upstream, &["diff", "--cached", "--name-only"]),
+            "cached diff must stay empty after failed add -u"
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t2200 #17: bare `add -u` resolves unmerged paths (stages worktree / drops
+/// removals) regardless of which stages the index entries occupy.
+#[test]
+fn add_update_resolves_unmerged_paths_like_upstream_git() {
+    let root = unique_temp_dir("add-update-unmerged");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    {
+        for repo in [&upstream, &rust] {
+            git(repo, &["init", "-q", "-b", "main"]);
+            run_with_identity(repo, &["commit", "--allow-empty", "-m", "init", "-q"]);
+            let one = hash_object_stdin(repo, b"1\n");
+            let two = hash_object_stdin(repo, b"2\n");
+            let three = hash_object_stdin(repo, b"3\n");
+            let mut info = String::new();
+            for path in ["path1", "path2"] {
+                info.push_str(&format!("100644 {one} 1\t{path}\n"));
+                info.push_str(&format!("100644 {two} 2\t{path}\n"));
+                info.push_str(&format!("100644 {three} 3\t{path}\n"));
+            }
+            info.push_str(&format!("100644 {one} 1\tpath3\n"));
+            info.push_str(&format!("100644 {one} 1\tpath4\n"));
+            info.push_str(&format!("100644 {one} 3\tpath5\n"));
+            info.push_str(&format!("100644 {one} 3\tpath6\n"));
+            let mut child = Command::new(sley_testkit::oracle_git())
+                .current_dir(repo)
+                .args(["update-index", "--index-info"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn update-index");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(info.as_bytes())
+                .expect("write index-info");
+            assert!(child.wait().expect("wait").success());
+            fs::write(repo.join("path1"), b"3\n").expect("path1");
+            fs::write(repo.join("path3"), b"2\n").expect("path3");
+            fs::write(repo.join("path5"), b"2\n").expect("path5");
+        }
+
+        let args = ["add", "-u"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            git(
+                &rust,
+                &["ls-files", "-s", "path1", "path2", "path3", "path4", "path5", "path6"]
+            ),
+            git(
+                &upstream,
+                &["ls-files", "-s", "path1", "path2", "path3", "path4", "path5", "path6"]
+            ),
+            "ls-files -s after add -u on unmerged paths differed"
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn hash_object_stdin(repo: &Path, body: &[u8]) -> String {
+    let mut child = Command::new(sley_testkit::oracle_git())
+        .current_dir(repo)
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hash-object");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(body)
+        .expect("write body");
+    let output = child.wait_with_output().expect("hash-object output");
+    assert!(output.status.success(), "hash-object failed");
+    String::from_utf8(output.stdout)
+        .expect("utf8 oid")
+        .trim()
+        .to_string()
+}

@@ -539,8 +539,14 @@ pub(crate) fn for_each_ref_upstream(
     let remote = config.get("branch", Some(branch), "remote")?;
     let merge = config.get("branch", Some(branch), "merge")?;
     if remote == "." {
+        // git's `set_merge` for the local remote `.`: when fetch refspec mapping
+        // fails, `repo_dwim_ref` expands a short merge name (e.g. `main`) to the
+        // unique matching ref (`refs/heads/main`). Local-branch upstreams almost
+        // always live under `refs/heads/`; fully-qualified `refs/*` values are
+        // kept as-is.
+        let refname = expand_local_upstream_merge(merge);
         return Some(ForEachRefUpstream {
-            refname: merge.to_string(),
+            refname,
             remote: remote.to_string(),
             merge: merge.to_string(),
         });
@@ -551,6 +557,16 @@ pub(crate) fn for_each_ref_upstream(
         remote: remote.to_string(),
         merge: merge.to_string(),
     })
+}
+
+/// Expand a loosely defined local `branch.<name>.merge` value the way git's
+/// `set_merge` + `repo_dwim_ref` does for remote `.`.
+pub(crate) fn expand_local_upstream_merge(merge: &str) -> String {
+    if merge.starts_with("refs/") {
+        merge.to_string()
+    } else {
+        format!("refs/heads/{merge}")
+    }
 }
 
 pub(crate) fn for_each_ref_push(config: &GitConfig, refname: &str) -> Option<ForEachRefPush> {

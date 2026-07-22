@@ -186,16 +186,6 @@ pub(crate) fn cmd_init(
     }
 
     let cwd = cli_session.cwd().to_path_buf();
-    let object_dir = env::var_os("GIT_OBJECT_DIRECTORY")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(|path| {
-            if path.is_absolute() {
-                path
-            } else {
-                cwd.join(path)
-            }
-        });
     let init_config_git_dir = init_config_git_dir_for_lookup(
         cli_session,
         &cwd,
@@ -390,6 +380,25 @@ pub(crate) fn cmd_init(
         &cwd,
         init_config_git_dir.as_deref(),
     )?;
+
+    // `GIT_OBJECT_DIRECTORY` (init-db.c → setup.c `create_object_directory`) places
+    // the object store outside `$GIT_DIR/objects`. Git chdirs into a directory
+    // argument first, so a *relative* value is resolved against that target; with
+    // no directory argument it stays relative to the original cwd. Absolute values
+    // are used as-is. Only `info/` and `pack/` are created at this path — the
+    // default `$GIT_DIR/objects` tree is never materialised (t0001 #103).
+    let object_dir = env::var_os("GIT_OBJECT_DIRECTORY")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else if path_given {
+                worktree.join(path)
+            } else {
+                cwd.join(path)
+            }
+        });
 
     let layout = RepositoryBootstrap::init(InitOptions {
         worktree,

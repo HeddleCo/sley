@@ -157,7 +157,9 @@ pub(super) fn set_branch_upstream(
     branch: &str,
     upstream: &str,
 ) -> Result<()> {
-    let mut config = read_repo_config(git_dir)?;
+    // Effective config for resolution (sees `-c`); on-disk for the write-back so
+    // command-line injections are never persisted (git keeps `-c` process-local).
+    let effective = read_repo_config(git_dir)?;
     let format = repository_object_format(git_dir)?;
     if branch_upstream_is_non_ref(git_dir, format, replace_objects, upstream)? {
         eprintln!(
@@ -165,7 +167,8 @@ pub(super) fn set_branch_upstream(
         );
         return Err(GitError::Exit(128));
     }
-    let Some(upstream) = resolve_branch_upstream(git_dir, format, store, &config, upstream)? else {
+    let Some(upstream) = resolve_branch_upstream(git_dir, format, store, &effective, upstream)?
+    else {
         eprintln!("fatal: the requested upstream branch '{upstream}' does not exist");
         eprintln!("hint:");
         eprintln!("hint: If you are planning on basing your work on an upstream");
@@ -185,6 +188,7 @@ pub(super) fn set_branch_upstream(
         eprintln!("warning: not setting branch '{branch}' as its own upstream");
         return Ok(());
     }
+    let mut config = read_repo_config_on_disk(git_dir)?;
     set_config_value(
         &mut config,
         "branch",
@@ -331,7 +335,7 @@ pub(super) fn branch_tracking_ref_candidate(upstream: &str) -> String {
 }
 
 pub(super) fn unset_branch_upstream(git_dir: &Path, branch: &str) -> Result<()> {
-    let mut config = read_repo_config(git_dir)?;
+    let mut config = read_repo_config_on_disk(git_dir)?;
     let Some(section_idx) = config.sections.iter().rposition(|section| {
         section.name == "branch" && section.subsection.as_deref() == Some(branch)
     }) else {
