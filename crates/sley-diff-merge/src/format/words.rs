@@ -385,7 +385,10 @@ impl WordDiffBuffers {
                 has_newline: true,
             })
             .collect();
-        let ops = crate::myers_diff_lines(&minus_lines, &plus_lines);
+        // git's word-diff runs the full xdiff pipeline (including
+        // `xdl_cleanup_records`), not bare Myers. The prepared variant
+        // pre-discards one-sided tokens so SES ties match git (bibtex).
+        let ops = crate::myers_diff_lines_prepared(&minus_lines, &plus_lines);
 
         // Walk the edit script as (minus_first, minus_len, plus_first,
         // plus_len) changes, mirroring fn_out_diff_words_aux.

@@ -1566,10 +1566,75 @@ mod tests {
                 local: false,
             }
         );
+        // Bare `creatordate:format:...` (no peel/desc flags) is the atom used by
+        // t6300/t1461 "sort by custom date format".
+        let plain = parse_for_each_ref_date_sort("creatordate:format:%H:%M:%S")
+            .expect("valid date sort")
+            .expect("recognized date atom");
+        assert!(!plain.peeled);
+        assert!(!plain.descending);
+        assert_eq!(plain.role, ForEachRefAtomIdentityRole::Creator);
+        assert_eq!(
+            plain.mode,
+            DateMode::Strftime {
+                template: "%H:%M:%S".to_string(),
+                local: false,
+            }
+        );
         assert!(
             parse_for_each_ref_date_sort("refname")
                 .expect("non-date sort is not an error")
                 .is_none()
+        );
+    }
+
+    /// Git sorts bare date atoms by raw timestamp, but once a `format:` (or
+    /// other) modifier is present the *rendered* string is compared bytewise.
+    /// The t6300 fixture dates reverse order under those two keys; pin that.
+    #[test]
+    fn custom_date_format_sort_keys_differ_from_raw_timestamps() {
+        // Same instants as t/for-each-ref-tests.sh "set up custom date sorting".
+        let idents = [
+            b"user <user@example.com> 1707341660 +0000".as_slice(), // 21:34:20
+            b"user <user@example.com> 945129922 +0000".as_slice(),  // 00:05:22
+            b"user <user@example.com> 1622806011 +0000".as_slice(), // 11:26:51
+            b"user <user@example.com> 1169484241 +0000".as_slice(), // 16:44:01
+        ];
+        let mode = DateMode::Strftime {
+            template: "%H:%M:%S".to_string(),
+            local: false,
+        };
+        let mut by_format: Vec<_> = idents
+            .iter()
+            .map(|ident| for_each_ref_identity_date(ident, &mode).expect("date"))
+            .collect();
+        let mut by_unix: Vec<_> = idents
+            .iter()
+            .map(|ident| for_each_ref_identity_timestamp(ident).expect("ts"))
+            .collect();
+        by_format.sort();
+        by_unix.sort();
+        assert_eq!(
+            by_format,
+            vec![
+                "00:05:22".to_string(),
+                "11:26:51".to_string(),
+                "16:44:01".to_string(),
+                "21:34:20".to_string(),
+            ]
+        );
+        assert_eq!(by_unix, vec![945129922, 1169484241, 1622806011, 1707341660]);
+        // Timestamp order of the *labels* is not the same as time-of-day order.
+        let labels_by_unix: Vec<_> = by_unix
+            .iter()
+            .map(|ts| {
+                let ident = format!("user <user@example.com> {ts} +0000");
+                for_each_ref_identity_date(ident.as_bytes(), &mode).expect("date")
+            })
+            .collect();
+        assert_ne!(
+            labels_by_unix, by_format,
+            "format:%H:%M:%S order must not collapse to creatordate order"
         );
     }
 

@@ -135,6 +135,162 @@ fn checkout_existing_branch_recovers_from_null_direct_head() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// t2024 #13: `git -c checkout.defaultRemote=… checkout <branch>` must not
+/// persist `checkout.defaultRemote` into `.git/config`. A leaked value would
+/// make a later multi-remote DWIM checkout pick one remote silently instead of
+/// failing with the ambiguity message.
+#[test]
+fn checkout_dash_c_default_remote_does_not_persist_into_repo_config() {
+    // Temp dir name must not contain the substring "defaultremote" — remote
+    // URLs embed the absolute path and would false-positive the assertion.
+    let root = unique_temp_dir("checkout-c-no-persist");
+    let repo = root.join("repo");
+    let remote_a = root.join("remote_a");
+    let remote_b = root.join("remote_b");
+    fs::create_dir_all(&repo).expect("create repo");
+    fs::create_dir_all(&remote_a).expect("create remote_a");
+    fs::create_dir_all(&remote_b).expect("create remote_b");
+
+    prepare_repo(&repo);
+    for (remote, body) in [(&remote_a, b"from-a\n" as &[u8]), (&remote_b, b"from-b\n")] {
+        git(remote, &["init", "-q", "-b", "main"]);
+        fs::write(remote.join("hello.txt"), b"base\n").expect("write base file");
+        git(remote, &["add", "hello.txt"]);
+        run_with_identity(remote, &["commit", "-m", "base", "-q"]);
+        git(remote, &["checkout", "-q", "-b", "shared"]);
+        fs::write(remote.join("hello.txt"), body).expect("write shared branch file");
+        git(remote, &["add", "hello.txt"]);
+        run_with_identity(remote, &["commit", "-m", "shared", "-q"]);
+    }
+
+    git(&repo, &["remote", "add", "repo_a", remote_a.to_str().unwrap()]);
+    git(&repo, &["remote", "add", "repo_b", remote_b.to_str().unwrap()]);
+    git(&repo, &["fetch", "--all", "-q"]);
+
+    // First DWIM with an explicit defaultRemote via `-c` should succeed and set
+    // tracking — but must leave no checkout.defaultRemote on disk.
+    let out = run_output(
+        sley_testkit::sley_bin!(),
+        &repo,
+        &[
+            "-c",
+            "checkout.defaultRemote=repo_a",
+            "checkout",
+            "shared",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "sley -c checkout.defaultRemote checkout shared failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let config = fs::read_to_string(repo.join(".git/config")).expect("read config");
+    assert!(
+        !config
+            .lines()
+            .any(|line| line.to_ascii_lowercase().contains("defaultremote")),
+        "command-line checkout.defaultRemote was persisted into .git/config:\n{config}"
+    );
+
+    // Drop the local branch so the next DWIM is ambiguous across remotes again.
+    git(&repo, &["checkout", "-q", "main"]);
+    git(&repo, &["branch", "-D", "shared"]);
+
+    let ambiguous = run_output(sley_testkit::sley_bin!(), &repo, &["checkout", "shared"]);
+    assert_eq!(
+        ambiguous.status.code(),
+        Some(128),
+        "ambiguous multi-remote DWIM should exit 128, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        ambiguous.status.code(),
+        String::from_utf8_lossy(&ambiguous.stdout),
+        String::from_utf8_lossy(&ambiguous.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&ambiguous.stderr);
+    assert!(
+        stderr.contains("matched multiple") && stderr.contains("remote tracking branches"),
+        "expected multi-remote ambiguity message, got:\n{stderr}"
+    );
+    assert!(
+        !repo.join(".git/refs/heads/shared").exists(),
+        "ambiguous DWIM must not create the local branch"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t2024 #20: when `branch.<name>.remote=.` and `branch.<name>.merge` is a short
+/// name (`main`) rather than `refs/heads/main`, checkout must report tracking
+/// status identically to the fully-qualified form ("behind … by N commits").
+#[test]
+fn checkout_loosely_defined_local_base_branch_reported_like_strict() {
+    let root = unique_temp_dir("checkout-loose-local-base");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream");
+    fs::create_dir_all(&rust).expect("create rust");
+    for repo in [&upstream, &rust] {
+        prepare_repo(repo);
+        git(repo, &["branch", "strict"]);
+        git(repo, &["branch", "loose"]);
+        run_with_identity(repo, &["commit", "--allow-empty", "-m", "a bit more", "-q"]);
+        git(repo, &["config", "branch.strict.remote", "."]);
+        git(repo, &["config", "branch.loose.remote", "."]);
+        git(repo, &["config", "branch.strict.merge", "refs/heads/main"]);
+        git(repo, &["config", "branch.loose.merge", "main"]);
+    }
+
+    fn combined(out: &Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
+    let git_strict = run_output(sley_testkit::oracle_git(), &upstream, &["checkout", "strict"]);
+    let git_loose = {
+        git(&upstream, &["checkout", "-q", "main"]);
+        run_output(sley_testkit::oracle_git(), &upstream, &["checkout", "loose"])
+    };
+    assert!(git_strict.status.success() && git_loose.status.success());
+    let git_expect = combined(&git_strict).replace("strict", "BRANCHNAME");
+    let git_actual = combined(&git_loose).replace("loose", "BRANCHNAME");
+    assert_eq!(
+        git_expect, git_actual,
+        "oracle git strict vs loose tracking report differed"
+    );
+
+    let sley_strict = run_output(sley_testkit::sley_bin!(), &rust, &["checkout", "strict"]);
+    let sley_loose = {
+        git(&rust, &["checkout", "-q", "main"]);
+        run_output(sley_testkit::sley_bin!(), &rust, &["checkout", "loose"])
+    };
+    assert_same_output(sley_strict, git_strict, &["checkout", "strict"]);
+    assert_same_output(sley_loose, git_loose, &["checkout", "loose"]);
+
+    // And sley's own strict/loose reports must match after name normalization.
+    let sley_strict2 = {
+        git(&rust, &["checkout", "-q", "main"]);
+        run_output(sley_testkit::sley_bin!(), &rust, &["checkout", "strict"])
+    };
+    let sley_loose2 = {
+        git(&rust, &["checkout", "-q", "main"]);
+        run_output(sley_testkit::sley_bin!(), &rust, &["checkout", "loose"])
+    };
+    let sley_expect = combined(&sley_strict2).replace("strict", "BRANCHNAME");
+    let sley_actual = combined(&sley_loose2).replace("loose", "BRANCHNAME");
+    assert_eq!(
+        sley_expect, sley_actual,
+        "sley strict vs loose tracking report differed:\nexpect:\n{sley_expect}\nactual:\n{sley_actual}"
+    );
+    assert!(
+        sley_actual.contains("behind") && sley_actual.contains("BRANCHNAME"),
+        "expected behind-tracking report, got:\n{sley_actual}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn checkout_branch_creation_and_quiet_match_upstream_git() {
     let root = unique_temp_dir("checkout-branch-create");

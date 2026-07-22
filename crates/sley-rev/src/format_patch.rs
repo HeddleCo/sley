@@ -501,7 +501,12 @@ fn resolve_upstream_base(
         .get("branch", Some(&branch), "remote")
         .unwrap_or(".");
     let revision = if remote == "." {
-        merge.to_string()
+        // git set_merge for remote `.`: expand short merge names to heads.
+        if merge.starts_with("refs/") {
+            merge.to_string()
+        } else {
+            format!("refs/heads/{merge}")
+        }
     } else {
         let short = merge.strip_prefix("refs/heads/").unwrap_or(merge);
         format!("refs/remotes/{remote}/{short}")

@@ -2673,18 +2673,29 @@ pub(crate) fn cmd_update_index(
             sley_worktree::disable_untracked_cache(&git_dir, format)?;
         }
     }
+    // Track whether `--refresh` reported dirty entries so we can still process
+    // trailing path arguments (git runs `refresh_index` during option parse,
+    // then `update_one` for each remaining path) and combine the exit status.
+    let mut refresh_had_errors = false;
     if refresh {
-        sley_worktree::refresh_index_paths_with_options(
+        // git's `update-index --refresh` always refreshes the whole index
+        // (`refresh_index(..., pathspec=NULL, ...)`); trailing path arguments are
+        // processed as ordinary path updates, not as a refresh pathspec.
+        match sley_worktree::refresh_index_paths_with_options(
             &worktree_root,
             git_dir.clone(),
             format,
-            &resolved_paths,
+            &[],
             refresh_quiet,
             refresh_ignore_missing,
             refresh_ignore_submodules,
             refresh_unmerged,
             really_refresh,
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(GitError::Exit(1)) => refresh_had_errors = true,
+            Err(err) => return Err(err),
+        }
         // Unmerged entries make the refresh fail (`<path>: needs merge`).
         let index_path = sley_worktree::repository_index_path(&git_dir);
         if !refresh_unmerged && index_path.exists() {
@@ -2702,10 +2713,11 @@ pub(crate) fn cmd_update_index(
                         println!("{path}: needs merge");
                     }
                 }
-                return Err(GitError::Exit(1));
+                refresh_had_errors = true;
             }
         }
-    } else if again {
+    }
+    if !refresh && again {
         if let Some(skip_worktree) = skip_worktree {
             sley_worktree::set_index_skip_worktree_again(
                 &worktree_root,
@@ -2731,9 +2743,9 @@ pub(crate) fn cmd_update_index(
                 },
             )?;
         }
-    } else if let Some(index_version) = index_version {
+    } else if !refresh && let Some(index_version) = index_version {
         sley_worktree::set_index_version(git_dir.clone(), format, index_version, verbose)?;
-    } else if let Some(fsmonitor_valid) = fsmonitor_valid {
+    } else if !refresh && let Some(fsmonitor_valid) = fsmonitor_valid {
         sley_worktree::set_index_fsmonitor_valid_paths(
             &worktree_root,
             git_dir.clone(),
@@ -2741,7 +2753,7 @@ pub(crate) fn cmd_update_index(
             &resolved_paths,
             fsmonitor_valid,
         )?;
-    } else if let Some(skip_worktree) = skip_worktree {
+    } else if !refresh && let Some(skip_worktree) = skip_worktree {
         sley_worktree::set_index_skip_worktree_paths(
             &worktree_root,
             git_dir.clone(),
@@ -2749,7 +2761,7 @@ pub(crate) fn cmd_update_index(
             &resolved_paths,
             skip_worktree,
         )?;
-    } else if let Some(assume_unchanged) = assume_unchanged {
+    } else if !refresh && let Some(assume_unchanged) = assume_unchanged {
         sley_worktree::set_index_assume_unchanged_paths(
             &worktree_root,
             git_dir.clone(),
@@ -2757,7 +2769,17 @@ pub(crate) fn cmd_update_index(
             &resolved_paths,
             assume_unchanged,
         )?;
-    } else if !ordered_paths.is_empty() {
+    } else if !ordered_paths.is_empty()
+        && (refresh
+            || (again == false
+                && index_version.is_none()
+                && fsmonitor_valid.is_none()
+                && skip_worktree.is_none()
+                && assume_unchanged.is_none()))
+    {
+        // Including the `refresh` arm: git refreshes first, then `update_one`
+        // for each trailing path (so `--really-refresh keep.txt` both re-stats
+        // the whole index and stages the new contents of keep.txt).
         let config = read_repo_config(&git_dir)?;
         sley_worktree::update_index_ordered_paths_filtered(
             &worktree_root,
@@ -2780,6 +2802,9 @@ pub(crate) fn cmd_update_index(
             &config,
             verbose,
         )?;
+    }
+    if refresh_had_errors {
+        return Err(GitError::Exit(1));
     }
     if !cacheinfo.is_empty() {
         let cacheinfo = cacheinfo

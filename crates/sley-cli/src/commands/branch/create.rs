@@ -183,7 +183,8 @@ pub(super) fn branch_edit_description(
         }
     };
 
-    let mut config = read_repo_config(git_dir)?;
+    // On-disk only so command-line `-c` values are not rewritten into the file.
+    let mut config = read_repo_config_on_disk(git_dir)?;
     let existing = config
         .get("branch", Some(&branch), "description")
         .unwrap_or("");
@@ -404,8 +405,13 @@ pub(super) fn install_tracking_config(
     resolved: &ResolvedBranchUpstream,
     quiet: bool,
 ) -> Result<()> {
-    let mut config = read_repo_config(git_dir)?;
-    let rebasing = should_setup_rebase(&config, resolved.remote != ".")?;
+    // Read-modify-write must use the on-disk repo config only. `read_repo_config`
+    // layers command-line `-c` / `GIT_CONFIG_*` injections; writing those back
+    // would persist process-local settings (e.g. `git -c checkout.defaultRemote=…`
+    // leaking into `.git/config` and breaking later multi-remote DWIM).
+    let effective = read_repo_config(git_dir)?;
+    let mut config = read_repo_config_on_disk(git_dir)?;
+    let rebasing = should_setup_rebase(&effective, resolved.remote != ".")?;
     set_config_value(
         &mut config,
         "branch",
@@ -474,7 +480,9 @@ pub(super) fn branch_create_inherit_upstream(
     start: Option<&String>,
     quiet: bool,
 ) -> Result<()> {
-    let config = read_repo_config(git_dir)?;
+    // On-disk only: never persist command-line `-c` injections (see
+    // `install_tracking_config`).
+    let config = read_repo_config_on_disk(git_dir)?;
     let source = branch_create_inherit_source(store, start)?;
     let Some(remote) = config
         .get("branch", Some(&source.name), "remote")

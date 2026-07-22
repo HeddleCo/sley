@@ -38,7 +38,8 @@ pub(super) fn copy_branch_config(git_dir: &Path, old_branch: &str, new_branch: &
     if copy_branch_config_raw(git_dir, old_branch, new_branch)? {
         return Ok(());
     }
-    let mut config = read_repo_config(git_dir)?;
+    // On-disk only: do not persist command-line `-c` injections into the file.
+    let mut config = read_repo_config_on_disk(git_dir)?;
     let mut copied = false;
     let mut sections = Vec::with_capacity(config.sections.len());
     for section in config.sections {
@@ -184,7 +185,8 @@ pub(super) fn branch_config_display_path(git_dir: &Path) -> String {
     }
 }
 pub(super) fn remove_branch_config(git_dir: &Path, branch: &str) -> Result<()> {
-    let mut config = read_repo_config(git_dir)?;
+    // On-disk only: do not persist command-line `-c` injections into the file.
+    let mut config = read_repo_config_on_disk(git_dir)?;
     let before = config.sections.len();
     config.sections.retain(|section| {
         !(section.name == "branch" && section.subsection.as_deref() == Some(branch))

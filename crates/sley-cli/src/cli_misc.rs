@@ -47,14 +47,37 @@ pub(crate) fn resolve_add_update_actions(
             } else {
                 cwd.join(&path)
             };
-            let matched = absolute.exists();
-            (path, absolute, matched)
+            let exists = absolute.exists();
+            (path, absolute, exists)
         })
         .collect::<Vec<_>>();
+    // `git add -u` pathspecs must match *tracked* paths (dir.c
+    // `report_path_error` → "known to git"). Mere worktree presence of an
+    // untracked file must not count as a match (t2200 "error out when passing
+    // untracked path"). `git add -A` may match untracked/existing paths, so
+    // existence is enough there.
     let mut matched = pathspecs
         .iter()
-        .map(|(_, _, matched)| *matched)
+        .map(|(_, _, exists)| include_untracked && *exists)
         .collect::<Vec<_>>();
+    if !include_untracked && !pathspecs.is_empty() {
+        // Mark pathspecs that hit any index entry (including clean / unmerged).
+        // Status alone misses clean tracked paths, which `-u` still treats as
+        // matched no-ops.
+        if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
+            for entry in &index.entries {
+                let path = worktree_root.join(
+                    std::str::from_utf8(entry.path.as_bytes())
+                        .map_err(|err| GitError::InvalidPath(err.to_string()))?,
+                );
+                for (idx, (_, pathspec, _)) in pathspecs.iter().enumerate() {
+                    if !matched[idx] && add_path_matches(&path, pathspec) {
+                        matched[idx] = true;
+                    }
+                }
+            }
+        }
+    }
     let status = if include_untracked {
         collect_short_status(worktree_root, git_dir, format)?
     } else {
@@ -107,10 +130,18 @@ pub(crate) fn resolve_add_update_actions(
     }
     for ((display, _, _), matched) in pathspecs.iter().zip(matched) {
         if !matched && !ignore_missing {
-            eprintln!(
-                "fatal: pathspec '{}' did not match any files",
-                display.to_string_lossy()
-            );
+            if include_untracked {
+                eprintln!(
+                    "fatal: pathspec '{}' did not match any files",
+                    display.to_string_lossy()
+                );
+            } else {
+                // git's `report_path_error` wording for `add -u` pathspecs.
+                eprintln!(
+                    "error: pathspec '{}' did not match any file(s) known to git",
+                    display.to_string_lossy()
+                );
+            }
             return Err(GitError::Exit(128));
         }
     }
