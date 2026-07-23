@@ -42,6 +42,7 @@ pub(crate) fn read_effective_repo_config(git_dir: &Path, cwd: &Path) -> Result<G
         cwd,
     )?;
     sley_config::remotes::augment_with_legacy_remote_files(&mut config, git_dir);
+    sley_core::activate_precompose_unicode(config.get_bool("core", None, "precomposeunicode"));
     Ok(config)
 }
 

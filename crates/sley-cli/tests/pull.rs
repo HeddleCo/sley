@@ -211,3 +211,170 @@ fn pull_three_way_clean_matches_upstream_git() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+/// t5521-pull-options: non-quiet `pull --no-rebase` / `--rebase` / `-v` into an
+/// unborn branch must print fetch status on stderr (the `From …` / `* branch …`
+/// → `FETCH_HEAD` lines) and keep stdout empty. Quiet and last-flag-wins
+/// `-v -q` must silence stderr.
+#[test]
+fn pull_options_verbosity_stderr_matches_t5521() {
+    let root = unique_temp_dir("pull-options-verbosity");
+    let parent = root.join("parent");
+    fs::create_dir_all(&parent).expect("create parent");
+    git(&parent, &["init", "-q", "-b", "main"]);
+    prepare_identity(&parent);
+    fs::write(parent.join("file"), b"one\n").expect("write file");
+    git(&parent, &["add", "file"]);
+    git_with_identity(&parent, &["commit", "-m", "one", "-q"]);
+    let parent_arg = parent.to_str().expect("parent path utf8");
+
+    let cases: &[(&str, &[&str], bool)] = &[
+        ("no-rebase", &["pull", "--no-rebase", parent_arg], true),
+        ("rebase", &["pull", "--rebase", parent_arg], true),
+        ("v-no-rebase", &["pull", "-v", "--no-rebase", parent_arg], true),
+        ("v-rebase", &["pull", "-v", "--rebase", parent_arg], true),
+        ("q-no-rebase", &["pull", "-q", "--no-rebase", parent_arg], false),
+        ("q-v-no-rebase", &["pull", "-q", "-v", "--no-rebase", parent_arg], true),
+        ("v-q-no-rebase", &["pull", "-v", "-q", "--no-rebase", parent_arg], false),
+    ];
+    for (label, args, expect_stderr) in cases {
+        let cloned = root.join(format!("cloned-{label}"));
+        fs::create_dir_all(&cloned).expect("create clone dir");
+        git(&cloned, &["init", "-q", "-b", "main"]);
+        prepare_identity(&cloned);
+        let output = run_output_with_identity(sley_testkit::sley_bin!(), &cloned, args);
+        assert!(
+            output.status.success(),
+            "pull {label} failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "pull {label}: expected empty stdout, got:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        if *expect_stderr {
+            assert!(
+                !output.stderr.is_empty(),
+                "pull {label}: expected non-empty stderr (fetch status)"
+            );
+            let err = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                err.contains("From ") || err.contains("FETCH_HEAD"),
+                "pull {label}: stderr should look like fetch status, got:\n{err}"
+            );
+        } else {
+            assert!(
+                output.stderr.is_empty(),
+                "pull {label}: expected empty stderr under quiet, got:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t5521-pull-options #12: `pull --no-rebase --all --force` must force a
+/// non-fast-forward update of a local tracking branch (fetch-side `--force`,
+/// not `--force-rebase`).
+#[test]
+fn pull_force_allows_non_fast_forward_tracking_update() {
+    let root = unique_temp_dir("pull-options-force");
+    let parent = root.join("parent");
+    let cloned = root.join("cloned");
+    fs::create_dir_all(&parent).expect("create parent");
+    fs::create_dir_all(&cloned).expect("create clone");
+    git(&parent, &["init", "-q", "-b", "main"]);
+    prepare_identity(&parent);
+    fs::write(parent.join("file"), b"one\n").expect("write file");
+    git(&parent, &["add", "file"]);
+    git_with_identity(&parent, &["commit", "-m", "one", "-q"]);
+
+    git(&cloned, &["init", "-q", "-b", "main"]);
+    prepare_identity(&cloned);
+    let parent_arg = parent.to_str().expect("parent path utf8");
+    // Append remotes (do not clobber user.identity written by prepare_identity).
+    let config = format!(
+        r#"
+[remote "one"]
+	url = {parent_arg}
+	fetch = refs/heads/main:refs/heads/mirror
+[remote "two"]
+	url = {parent_arg}
+	fetch = refs/heads/main:refs/heads/origin
+[branch "main"]
+	remote = two
+	merge = refs/heads/main
+"#
+    );
+    {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(cloned.join(".git/config"))
+            .expect("open config");
+        f.write_all(config.as_bytes()).expect("append config");
+    }
+    // Seed via remote "two" so origin tracks parent's main.
+    let seed = run_output_with_identity(
+        sley_testkit::sley_bin!(),
+        &cloned,
+        &["pull", "two"],
+    );
+    assert!(
+        seed.status.success(),
+        "seed pull two failed: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    fs::write(cloned.join("A"), b"A\n").expect("write A");
+    git(&cloned, &["add", "A"]);
+    git_with_identity(&cloned, &["commit", "-m", "A", "-q"]);
+    git(&cloned, &["branch", "-f", "origin"]);
+
+    // Without --force this must reject (non-fast-forward origin).
+    let rejected = run_output_with_identity(
+        sley_testkit::sley_bin!(),
+        &cloned,
+        &["pull", "--no-rebase", "--all"],
+    );
+    assert!(
+        !rejected.status.success(),
+        "expected non-force pull to reject non-ff tracking update"
+    );
+    let reject_err = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        reject_err.contains("rejected") || reject_err.contains("non-fast-forward"),
+        "expected non-ff rejection, got:\n{reject_err}"
+    );
+
+    let forced = run_output_with_identity(
+        sley_testkit::sley_bin!(),
+        &cloned,
+        &["pull", "--no-rebase", "--all", "--force"],
+    );
+    assert!(
+        forced.status.success(),
+        "pull --force should allow non-ff tracking update: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        forced.status.code(),
+        String::from_utf8_lossy(&forced.stdout),
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    // origin must now match parent's main (forced back), not the local commit A.
+    let origin = run_output(
+        sley_testkit::sley_bin!(),
+        &cloned,
+        &["rev-parse", "origin"],
+    );
+    let parent_main = run_output(
+        sley_testkit::sley_bin!(),
+        &parent,
+        &["rev-parse", "main"],
+    );
+    assert_eq!(
+        origin.stdout, parent_main.stdout,
+        "origin should be forced back to parent main"
+    );
+    let _ = fs::remove_dir_all(&root);
+}

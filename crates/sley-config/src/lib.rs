@@ -467,6 +467,9 @@ pub fn read_repo_config(git_dir: &Path, parameters_env: Option<&str>) -> Result<
     // defined by a config `[remote "<name>"].url`. Synthesize the equivalent
     // `[remote]` sections so every remote-aware command sees a uniform view.
     remotes::augment_with_legacy_remote_files(&mut config, git_dir);
+    // Activate NFD→NFC path conversion for this thread when the effective
+    // repository config enables it (git's cached `precomposed_unicode`).
+    sley_core::activate_precompose_unicode(config.get_bool("core", None, "precomposeunicode"));
     Ok(config)
 }
 

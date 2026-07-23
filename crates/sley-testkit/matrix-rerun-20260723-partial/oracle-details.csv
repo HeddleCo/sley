@@ -1,0 +1,9 @@
+target,script,result,exit_code,pass,fail,todo,skip,total_cells,plan_total,abort,timeout,missing_cells,extra_cells
+oracle,t3701-add-interactive.sh,PASS,0,128,0,0,2,130,130,0,0,0,0
+oracle,t5319-multi-pack-index.sh,PASS,0,97,0,0,1,98,98,0,0,0,0
+oracle,t3700-add.sh,PASS,0,58,0,0,0,58,58,0,0,0,0
+oracle,t5900-repo-selection.sh,PASS,0,8,0,0,0,8,8,0,0,0,0
+oracle,t2105-update-index-gitfile.sh,PASS,0,4,0,0,0,4,4,0,0,0,0
+oracle,t6133-pathspec-rev-dwim.sh,PASS,0,6,0,0,0,6,6,0,0,0,0
+oracle,t6301-for-each-ref-errors.sh,PASS,0,6,0,0,0,6,6,0,0,0,0
+oracle,t3430-rebase-merges.sh,PASS,0,34,0,0,0,34,34,0,0,0,0

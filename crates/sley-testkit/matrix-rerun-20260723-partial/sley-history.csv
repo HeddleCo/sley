@@ -1,0 +1,9 @@
+label,script,command,result,ok,notok,total
+partial-sley-cb43e92d,t3701-add-interactive.sh,t3701-add-interactive.sh,PASS,130,0,130
+partial-sley-cb43e92d,t5319-multi-pack-index.sh,t5319-multi-pack-index.sh,PASS,98,0,98
+partial-sley-cb43e92d,t3700-add.sh,t3700-add.sh,PASS,58,0,58
+partial-sley-cb43e92d,t5900-repo-selection.sh,t5900-repo-selection.sh,PASS,8,0,8
+partial-sley-cb43e92d,t2105-update-index-gitfile.sh,t2105-update-index-gitfile.sh,PASS,4,0,4
+partial-sley-cb43e92d,t6133-pathspec-rev-dwim.sh,t6133-pathspec-rev-dwim.sh,PASS,6,0,6
+partial-sley-cb43e92d,t6301-for-each-ref-errors.sh,t6301-for-each-ref-errors.sh,PASS,6,0,6
+partial-sley-cb43e92d,t3430-rebase-merges.sh,t3430-rebase-merges.sh,PASS,34,0,34

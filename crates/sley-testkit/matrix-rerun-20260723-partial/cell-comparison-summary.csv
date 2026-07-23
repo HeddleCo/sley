@@ -1,0 +1,9 @@
+script,oracle_result,sley_result,oracle_cells,sley_cells,cell_vector,correctness,unexpected_sley_skips,missing_sley_cells,extra_sley_cells,performance_eligible,performance_comparison
+t2105-update-index-gitfile.sh,PASS,PASS,4,4,EXACT,PASS,0,0,0,eligible,COMPARABLE
+t3430-rebase-merges.sh,PASS,PASS,34,34,EXACT,PASS,0,0,0,eligible,COMPARABLE
+t3700-add.sh,PASS,PASS,58,58,EXACT,PASS,0,0,0,eligible,COMPARABLE
+t3701-add-interactive.sh,PASS,PASS,130,130,EXACT,PASS,0,0,0,eligible,COMPARABLE
+t5319-multi-pack-index.sh,PASS,PASS,98,98,EXACT,PASS,0,0,0,eligible,COMPARABLE
+t5900-repo-selection.sh,PASS,PASS,8,8,EXACT,PASS,0,0,0,eligible,COMPARABLE
+t6133-pathspec-rev-dwim.sh,PASS,PASS,6,6,EXACT,PASS,0,0,0,eligible,COMPARABLE
+t6301-for-each-ref-errors.sh,PASS,PASS,6,6,EXACT,PASS,0,0,0,eligible,COMPARABLE

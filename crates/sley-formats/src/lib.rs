@@ -3230,6 +3230,12 @@ impl RepositoryBootstrap {
             )?;
         }
 
+        // Fresh inits probe filesystem traits that git records in the local
+        // config (setup.c `create_default_files`). Reinit leaves existing values.
+        if !reinitialized {
+            probe_and_record_filesystem_traits(&git_dir, &config_path)?;
+        }
+
         // A command-line/reinit sharing mode overrides a template value and is
         // persisted even when the repository config already existed.
         if let Some(shared) = options.shared_repository.as_deref() {
@@ -3260,6 +3266,90 @@ impl RepositoryBootstrap {
             ref_storage,
             reinitialized,
         })
+    }
+}
+
+/// Probe filesystem case-folding and Unicode composition, writing
+/// `core.ignorecase` / `core.precomposeunicode` like git's `create_default_files`.
+///
+/// `core.precomposeunicode` is only written when no earlier config layer
+/// (system/global) already chose a value — matching
+/// `probe_utf8_pathname_composition`'s respect for a global override.
+fn probe_and_record_filesystem_traits(git_dir: &Path, config_path: &Path) -> Result<()> {
+    let mut config = GitConfig::read(config_path)?;
+
+    // Case-insensitive FS: `config` is visible as `CoNfIg` (setup.c).
+    let case_probe = git_dir.join("CoNfIg");
+    if case_probe.exists() {
+        upsert_core_bool(&mut config, "ignorecase", true);
+    }
+
+    // Unicode composition probe: create NFC ä under $GIT_DIR; if the NFD form
+    // resolves to the same entry the FS folds normalization and Git should
+    // precompose paths (compat/precompose_utf8.c `probe_utf8_pathname_composition`).
+    let precompose_already_set = {
+        let context = sley_config::ConfigIncludeContext::new(
+            Some(sley_config::git_dir_for_include_context(git_dir)),
+            None,
+        );
+        sley_config::load_pre_dispatch_config(None, &context)
+            .ok()
+            .and_then(|cfg| cfg.get_bool("core", None, "precomposeunicode"))
+            .is_some()
+    };
+    if !precompose_already_set {
+        let nfc_name = "\u{00E4}"; // ä NFC = c3 a4
+        let nfd_name = "a\u{0308}"; // a + combining diaeresis
+        let nfc_path = git_dir.join(nfc_name);
+        let nfd_path = git_dir.join(nfd_name);
+        // O_CREAT|O_EXCL: only probe when we can create the file.
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&nfc_path)
+        {
+            Ok(_) => {
+                let needs_precompose = nfd_path.exists();
+                upsert_core_bool(&mut config, "precomposeunicode", needs_precompose);
+                // Unlink the NFC spelling (APFS may only expose NFD; try both).
+                let _ = fs::remove_file(&nfc_path);
+                let _ = fs::remove_file(&nfd_path);
+            }
+            Err(_) => {
+                // Probe failed (permissions, race); leave unset like git when
+                // open() fails.
+            }
+        }
+    }
+
+    fs::write(config_path, config.to_canonical_bytes())?;
+    Ok(())
+}
+
+fn upsert_core_bool(config: &mut GitConfig, key: &str, value: bool) {
+    let text = if value { "true" } else { "false" };
+    let section = config.sections.iter_mut().rev().find(|section| {
+        section.name.eq_ignore_ascii_case("core") && section.subsection.is_none()
+    });
+    if let Some(section) = section {
+        if let Some(entry) = section
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.key.eq_ignore_ascii_case(key))
+        {
+            entry.value = Some(text.into());
+        } else {
+            section
+                .entries
+                .push(ConfigEntry::new(key, Some(text.into())));
+        }
+    } else {
+        config.sections.push(ConfigSection::new(
+            "core",
+            None,
+            vec![ConfigEntry::new(key, Some(text.into()))],
+        ));
     }
 }
 
@@ -5125,6 +5215,72 @@ mod tests {
 
         let config = GitConfig::read(layout.git_dir.join("config")).expect("read config");
         assert_eq!(config.get("core", None, "sharedRepository"), Some("1"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `create_default_files` probes case-folding and Unicode composition and
+    /// records the results in the local config (t3910 "detect if nfd needed").
+    #[test]
+    fn repository_bootstrap_probes_ignorecase_and_precomposeunicode() {
+        let root = unique_temp_dir("init-fs-probe");
+        let repo = root.join("repo");
+        let layout = RepositoryBootstrap::init(InitOptions {
+            git_dir_override: None,
+            core_worktree: None,
+            object_dir: None,
+            worktree: repo,
+            object_format: ObjectFormat::Sha1,
+            object_format_explicit: false,
+            bare: false,
+            initial_branch: "main".into(),
+            template_dir: None,
+            copy_template_config: false,
+            separate_git_dir: None,
+            shared_repository: None,
+            ref_storage: RefStorageFormat::Files,
+            ref_storage_explicit: false,
+        })
+        .expect("init should succeed");
+
+        let config = GitConfig::read(layout.git_dir.join("config")).expect("read config");
+        // On APFS (macOS default), both probes succeed; on a case-sensitive
+        // non-folding FS they stay unset/false. Assert the keys are only set
+        // when the probe can observe the property.
+        let case_probe = layout.git_dir.join("CoNfIg");
+        if case_probe.exists() {
+            assert_eq!(
+                config.get("core", None, "ignorecase"),
+                Some("true"),
+                "case-insensitive FS should record core.ignorecase=true"
+            );
+        }
+        // Re-run the composition probe against the live FS to know the expected
+        // value without hard-coding platform assumptions.
+        let nfc = layout.git_dir.join("\u{00E4}");
+        let nfd = layout.git_dir.join("a\u{0308}");
+        let expected_precompose = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&nfc)
+        {
+            Ok(_) => {
+                let needs = nfd.exists();
+                let _ = fs::remove_file(&nfc);
+                let _ = fs::remove_file(&nfd);
+                Some(if needs { "true" } else { "false" })
+            }
+            Err(_) => None,
+        };
+        if let Some(expected) = expected_precompose {
+            assert_eq!(
+                config.get("core", None, "precomposeunicode"),
+                Some(expected),
+                "core.precomposeunicode must match the FS composition probe"
+            );
+        }
+        // Probe files must not be left behind in $GIT_DIR.
+        assert!(!layout.git_dir.join("\u{00E4}").exists());
+        assert!(!layout.git_dir.join("a\u{0308}").exists());
         let _ = fs::remove_dir_all(&root);
     }
 
