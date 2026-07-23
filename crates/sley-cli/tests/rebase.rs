@@ -323,3 +323,73 @@ fn checkout_can_leave_gitlink_branch_with_dirty_populated_submodule() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn rebase_interactive_reads_sequence_editor_from_common_config_in_worktree() {
+    // t3430: `test_config -C wt sequence.editor ...` must be honoured when
+    // rebasing inside a linked worktree (config lives in the common gitdir).
+    let root = unique_temp_dir("rebase-wt-sequence-editor");
+    fs::create_dir_all(&root).expect("create temp");
+    {
+        git_with_identity(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("f"), b"f\n").expect("write");
+        git_with_identity(&root, &["add", "f"]);
+        git_with_identity(&root, &["commit", "-m", "c1", "-q"]);
+        git_with_identity(&root, &["worktree", "add", "wt", "-q"]);
+        let editor = root.join("replace-editor.sh");
+        fs::write(
+            &editor,
+            "#!/bin/sh\nmv \"$1\" \"$(git rev-parse --git-path ORIGINAL-TODO)\"\ncp script-from-scratch \"$1\"\n",
+        )
+        .expect("write editor");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&editor).expect("meta").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&editor, perms).expect("chmod");
+        }
+        let wt = root.join("wt");
+        fs::write(
+            wt.join("script-from-scratch"),
+            "label xyz\nexec true\n",
+        )
+        .expect("write todo script");
+        // Config goes to the common gitdir (same as `git -C wt config`).
+        git_with_identity(
+            &wt,
+            &[
+                "config",
+                "sequence.editor",
+                editor.to_str().expect("utf8"),
+            ],
+        );
+        // Clear env override so only config is consulted.
+        let output = Command::new(sley_testkit::sley_bin!())
+            .current_dir(&wt)
+            .args(["rebase", "-i", "HEAD"])
+            .env_remove("GIT_SEQUENCE_EDITOR")
+            .env("GIT_EDITOR", "false")
+            .env("GIT_AUTHOR_NAME", "Example User")
+            .env("GIT_AUTHOR_EMAIL", "example@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Example User")
+            .env("GIT_COMMITTER_EMAIL", "example@example.invalid")
+            .output()
+            .expect("run rebase");
+        assert!(
+            output.status.success(),
+            "rebase -i failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Editor should have saved ORIGINAL-TODO under the worktree admin dir.
+        let original = root.join(".git/worktrees/wt/ORIGINAL-TODO");
+        assert!(
+            original.is_file(),
+            "sequence.editor was not launched (missing {})\nstderr:\n{}",
+            original.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}

@@ -282,6 +282,13 @@ pub(crate) fn preferred_index_mode_for_untrusted_worktree(
 }
 
 pub(crate) fn file_mode_with_trust(metadata: &fs::Metadata, trust_filemode: bool) -> u32 {
+    // core.filemode only governs the executable bit on regular files. A real
+    // symlink must still stage as 120000 (t3700 "filemode=0 should not get
+    // confused by symlink"); collapsing it to 100644 would treat the link
+    // target bytes as a regular blob.
+    if metadata.file_type().is_symlink() {
+        return 0o120000;
+    }
     if trust_filemode {
         file_mode(metadata)
     } else {

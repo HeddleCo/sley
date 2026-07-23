@@ -1419,6 +1419,7 @@ dependencies = [
 name = "sley-rev"
 version = "0.5.0"
 dependencies = [
+ "regex",
  "sley-config",
  "sley-core",
  "sley-diff-merge",

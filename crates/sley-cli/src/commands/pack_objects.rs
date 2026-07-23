@@ -28,7 +28,6 @@ use crate::*;
 use sley::PackWriteOptions;
 use sley::plumbing::sley_pack::{PackInput, PackReverseIndex, pack_order_index_positions};
 
-#[derive(Default)]
 struct PackObjectsOptions {
     base_name: Option<String>,
     stdout_mode: bool,
@@ -56,6 +55,12 @@ struct PackObjectsOptions {
     /// undeltified. sley's writer chooses deltas internally, so this forces the
     /// no-delta path that emits `Total N (delta 0)`.
     no_delta: bool,
+    /// Prefer OFS_DELTA over REF_DELTA. Defaults to true (matching
+    /// [`sley_pack::PackWriteOptions`] and `repack.useDeltaBaseOffset`): our
+    /// sliding-window planner produces slightly larger ref-delta packs than
+    /// git's, which flips midx batch selection on t5319. OFS encoding closes
+    /// that gap and matches what `multi-pack-index repack` / `git repack` pass
+    /// to pack-objects. `--no-delta-base-offset` still forces REF_DELTA.
     delta_base_offset: bool,
     stdin_packs: bool,
     /// `--stdin-packs=follow`: in addition to the standard "objects in the
@@ -80,6 +85,42 @@ struct PackObjectsOptions {
     object_filter: PackObjectFilter,
     filter_print_omitted: bool,
     missing_action: PackObjectsMissingAction,
+}
+
+impl Default for PackObjectsOptions {
+    fn default() -> Self {
+        Self {
+            base_name: None,
+            stdout_mode: false,
+            revs: false,
+            all: false,
+            local: false,
+            honor_pack_keep: false,
+            incremental: false,
+            unpacked: false,
+            use_bitmap_index: None,
+            progress: None,
+            index_version: None,
+            cruft: false,
+            cruft_expiration: None,
+            no_delta: false,
+            // See field docs: prefer OFS_DELTA unless the user opts out.
+            delta_base_offset: true,
+            stdin_packs: false,
+            stdin_packs_follow: false,
+            exclude_promisor_objects: false,
+            path_walk: false,
+            sparse: None,
+            thin: false,
+            write_reverse_index: false,
+            write_bitmap_index: false,
+            name_hash_version: None,
+            max_pack_size: None,
+            object_filter: PackObjectFilter::default(),
+            filter_print_omitted: false,
+            missing_action: PackObjectsMissingAction::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

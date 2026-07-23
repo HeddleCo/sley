@@ -207,7 +207,9 @@ fn repository_object_replacements(
     format: ObjectFormat,
 ) -> Result<sley_odb::ObjectReplacements> {
     let mut replacements = Vec::new();
-    for reference in refs.list_refs()? {
+    // Prefer the replace namespace only so opening an object database does not
+    // emit "ignoring broken ref" warnings for unrelated refs (t6301).
+    for reference in refs.list_refs_with_prefix("refs/replace/")? {
         let Some(source) = reference.name.strip_prefix("refs/replace/") else {
             continue;
         };

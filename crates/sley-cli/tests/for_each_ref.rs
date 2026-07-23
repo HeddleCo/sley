@@ -1566,3 +1566,57 @@ fn for_each_ref_is_base_with_non_commits_matches_git() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn for_each_ref_broken_ref_warns_once() {
+    let root = unique_temp_dir("for-each-ref-broken");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("file"), b"file\n").expect("write fixture");
+        git(&root, &["add", "file"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+                "-q",
+            ],
+        );
+        // Empty loose ref body is REF_ISBROKEN (t6301).
+        fs::write(root.join(".git/refs/heads/bogus"), b"").expect("write broken ref");
+        let actual = sley_raw(&root, &["for-each-ref"]);
+        let expected = git_raw(&root, &["for-each-ref"]);
+        assert_eq!(
+            actual.status.code(),
+            expected.status.code(),
+            "status mismatch\nsley stderr:\n{}\ngit stderr:\n{}",
+            String::from_utf8_lossy(&actual.stderr),
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        assert_eq!(
+            actual.stdout, expected.stdout,
+            "stdout mismatch\nsley:\n{}\ngit:\n{}",
+            String::from_utf8_lossy(&actual.stdout),
+            String::from_utf8_lossy(&expected.stdout)
+        );
+        assert_eq!(
+            actual.stderr, expected.stderr,
+            "stderr mismatch (double warn?)\nsley:\n{}\ngit:\n{}",
+            String::from_utf8_lossy(&actual.stderr),
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let err = String::from_utf8_lossy(&actual.stderr);
+        assert_eq!(
+            err.matches("warning: ignoring broken ref refs/heads/bogus").count(),
+            1,
+            "expected exactly one broken-ref warning, got:\n{err}"
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
