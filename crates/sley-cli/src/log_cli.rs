@@ -795,9 +795,13 @@ pub(crate) fn compile_log_message_grep_matcher(
     if patterns.is_empty() {
         return Ok(None);
     }
+    let pattern_bytes: Vec<Vec<u8>> = patterns
+        .iter()
+        .map(|pattern| crate::argv_bytes_from_string(pattern))
+        .collect();
     sley_grep::GrepMatcher::compile_with_error_context(
         sley_grep::GrepCompileConfig {
-            patterns,
+            patterns: &pattern_bytes,
             kind,
             ignore_case,
             word: false,

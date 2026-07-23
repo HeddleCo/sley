@@ -1272,6 +1272,9 @@ dependencies = [
 [[package]]
 name = "sley-i18n"
 version = "0.5.0"
+dependencies = [
+ "encoding_rs",
+]
 
 [[package]]
 name = "sley-index"

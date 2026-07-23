@@ -410,11 +410,50 @@ pub fn git_dir_for_include_context(git_dir: &Path) -> PathBuf {
     if git_dir.is_absolute() {
         git_dir.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(git_dir))
-            .unwrap_or_else(|_| git_dir.to_path_buf())
+        absolute_path_preferring_pwd(git_dir)
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(git_dir))
+                    .unwrap_or_else(|_| git_dir.to_path_buf())
+            })
     }
 }
+fn absolute_path_preferring_pwd(path: &Path) -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let base = pwd_alias_of_cwd(&cwd).unwrap_or(cwd);
+    Some(base.join(path))
+}
+
+fn pwd_alias_of_cwd(cwd: &Path) -> Option<PathBuf> {
+    let pwd = PathBuf::from(std::env::var_os("PWD")?);
+    if pwd == *cwd {
+        return None;
+    }
+    if !same_dir_identity(cwd, &pwd) {
+        return None;
+    }
+    Some(pwd)
+}
+
+fn same_dir_identity(a: &Path, b: &Path) -> bool {
+    let Ok(a_meta) = fs::metadata(a) else {
+        return false;
+    };
+    let Ok(b_meta) = fs::metadata(b) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a_meta.dev() == b_meta.dev() && a_meta.ino() == b_meta.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a_meta, b_meta);
+        fs::canonicalize(a).ok() == fs::canonicalize(b).ok()
+    }
+}
+
 
 /// Read a config file from disk and resolve its `include`/`includeIf` directives.
 ///
