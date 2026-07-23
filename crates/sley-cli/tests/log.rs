@@ -1555,6 +1555,104 @@ fn log_grep_filter_matches_upstream_git() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// t4210-log-i18n.sh: `log --grep` searches in the log output encoding.
+/// Patterns and re-encoded messages are raw bytes (latin1 é is 0xE9); do not
+/// private-use-sentinel the haystack while patterns stay raw argv bytes.
+#[cfg(unix)]
+#[test]
+fn log_grep_searches_in_log_output_encoding() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let utf8_e = b"\xC3\xA9";
+    let latin1_e = b"\xE9";
+    let root = unique_temp_dir("log-grep-i18n");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        let mut utf8_msg = b"utf8\n\nt".to_vec();
+        utf8_msg.extend_from_slice(utf8_e);
+        utf8_msg.extend_from_slice(b"st\n");
+        fs::write(root.join("msg"), &utf8_msg).expect("write utf8 msg");
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "i18n.commitEncoding=utf8",
+                "commit",
+                "--allow-empty",
+                "-F",
+                "msg",
+                "-q",
+            ],
+        );
+        let mut latin1_msg = b"latin1\n\nt".to_vec();
+        latin1_msg.extend_from_slice(latin1_e);
+        latin1_msg.extend_from_slice(b"st\n");
+        fs::write(root.join("msg"), &latin1_msg).expect("write latin1 msg");
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "i18n.commitEncoding=ISO-8859-1",
+                "commit",
+                "--allow-empty",
+                "-F",
+                "msg",
+                "-q",
+            ],
+        );
+
+        let cases: &[(&[&str], &[u8])] = &[
+            (&["log", "--encoding=utf8", "--format=%s", "--grep"], utf8_e),
+            (
+                &["log", "--encoding=ISO-8859-1", "--format=%s", "--grep"],
+                latin1_e,
+            ),
+            (
+                &["log", "--encoding=utf8", "--format=%s", "--grep"],
+                latin1_e,
+            ),
+            (
+                &["log", "--encoding=ISO-8859-1", "--format=%s", "--grep"],
+                utf8_e,
+            ),
+        ];
+        for (prefix, needle) in cases {
+            let mut sley_cmd = Command::new(sley_testkit::sley_bin!());
+            sley_cmd.current_dir(&root).args(*prefix).arg(OsStr::from_bytes(needle));
+            let mut git_cmd = Command::new(sley_testkit::oracle_git());
+            git_cmd.current_dir(&root).args(*prefix).arg(OsStr::from_bytes(needle));
+            let actual = sley_cmd.output().expect("run sley");
+            let expected = git_cmd.output().expect("run git");
+            assert_eq!(
+                actual.status.code(),
+                expected.status.code(),
+                "status for prefix={prefix:?} needle={needle:02x?}"
+            );
+            assert_eq!(
+                actual.stdout, expected.stdout,
+                "stdout for prefix={prefix:?} needle={needle:02x?}\nsley={:?}\ngit={:?}",
+                String::from_utf8_lossy(&actual.stdout),
+                String::from_utf8_lossy(&expected.stdout)
+            );
+            assert_eq!(
+                actual.stderr, expected.stderr,
+                "stderr for prefix={prefix:?} needle={needle:02x?}"
+            );
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn log_custom_format_placeholders_match_upstream_git() {
     let root = unique_temp_dir("log-custom-format");

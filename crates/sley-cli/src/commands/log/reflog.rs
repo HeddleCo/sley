@@ -509,16 +509,16 @@ pub(super) fn log_grep_matcher_matches(
     let Some(filter) = filter else {
         return true;
     };
+    // Git greps in the log output encoding (`repo_logmsg_reencode` then
+    // `grep_buffer`). Patterns arrive as raw argv bytes (sentinel-encoded
+    // through `String` then restored via `argv_bytes_from_string`), so the
+    // haystack must stay the re-encoded raw message — not a private-use
+    // sentinel rewrite, which would never match latin1 needles (t4210).
     let message = commit_message_for_commit_encoding(&record.commit, output_encoding);
-    let search_message = if encoding_is_utf8(output_encoding) {
-        Cow::Borrowed(message.as_ref())
-    } else {
-        Cow::Owned(argv_string_from_bytes(message.as_ref()).into_bytes())
-    };
     let matched = if all_match {
-        filter.matches_all(&search_message)
+        filter.matches_all(message.as_ref())
     } else {
-        filter.matches_any(&search_message)
+        filter.matches_any(message.as_ref())
     };
     matched != invert
 }
