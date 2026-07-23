@@ -436,7 +436,12 @@ impl Ctx {
         // from the per-worktree admin dir silently drops `sequence.editor` and
         // friends (t3430 `refs/rewritten/* is worktree-local` uses
         // `test_config -C wt sequence.editor ...`).
-        let config = read_repo_config(&common_git_dir)?;
+        //
+        // Use the full effective cascade (system + global + local) so settings
+        // like `user.useConfigOnly` from `~/.gitconfig` refuse non-ff rebases
+        // that would invent a committer identity (t7517).
+        let config =
+            commands::remote::read_effective_repo_config(&common_git_dir, cli_session.cwd())?;
         let refs = repository.references();
         let common_refs = FileRefStore::new(&common_git_dir, format);
         let reflog_action = env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "rebase".to_string());

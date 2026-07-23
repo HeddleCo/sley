@@ -2804,8 +2804,18 @@ pub(crate) fn materialize_tree_entry(
 
 pub(crate) fn materialize_gitlink_dir(worktree_root: &Path, dir_path: &Path) -> Result<()> {
     prepare_blob_parent_dirs(worktree_root, dir_path)?;
-    if fs::symlink_metadata(dir_path).is_ok_and(|metadata| !metadata.is_dir()) {
-        remove_existing_worktree_path(dir_path)?;
+    // git's `validate_submodule_path` / entry.c: never replace a symlink with a
+    // gitlink directory. Doing so would destroy the link and let a later
+    // --recurse-submodules pass migrate the linked repo's .git into
+    // $GIT_DIR/modules (t7423). Leave the symlink in place so the recursive
+    // submodule path can refuse with the proper error.
+    if let Ok(metadata) = fs::symlink_metadata(dir_path) {
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        if !metadata.is_dir() {
+            remove_existing_worktree_path(dir_path)?;
+        }
     }
     fs::create_dir_all(dir_path)?;
     Ok(())

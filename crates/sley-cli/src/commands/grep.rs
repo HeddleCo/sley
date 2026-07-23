@@ -21,6 +21,15 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
 
+/// Decode patterns from the CLI argv sentinel form back to raw bytes so
+/// ISO-8859-1 (and other non-UTF-8) needles match the on-disk content.
+fn grep_pattern_bytes(patterns: &[String]) -> Vec<Vec<u8>> {
+    patterns
+        .iter()
+        .map(|pattern| crate::argv_bytes_from_string(pattern))
+        .collect()
+}
+
 /// Parsed command-line options for `git grep`.
 struct GrepOptions {
     patterns: Vec<String>,
@@ -640,8 +649,9 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
         return Err(GitError::Exit(128));
     }
 
+    let pattern_bytes = grep_pattern_bytes(&opts.patterns);
     let matcher = GrepMatcher::compile(GrepCompileConfig {
-        patterns: &opts.patterns,
+        patterns: &pattern_bytes,
         kind: opts.kind,
         ignore_case: opts.ignore_case,
         word: opts.word,
@@ -1177,8 +1187,9 @@ fn grep_no_index(
         pathspec_args,
         effective_pathspec_flags(cli_session),
     )?;
+    let pattern_bytes = grep_pattern_bytes(&opts.patterns);
     let matcher = GrepMatcher::compile(GrepCompileConfig {
-        patterns: &opts.patterns,
+        patterns: &pattern_bytes,
         kind: opts.kind,
         ignore_case: opts.ignore_case,
         word: opts.word,

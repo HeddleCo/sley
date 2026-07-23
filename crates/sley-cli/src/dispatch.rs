@@ -241,6 +241,12 @@ fn run_external_or_unknown(
     command: &str,
     args: &[String],
 ) -> Result<()> {
+    // `git-http-fetch` is a separate executable built from http-fetch.c in
+    // upstream. Emit the parent `_run_dashed_` / child `http-fetch` def_param
+    // pair even though sley does not ship a full implementation.
+    if command == "http-fetch" {
+        return run_dashed_http_fetch_stub(cli_session, &args[1..]);
+    }
     if commands::help::is_reserved_git_core_helper(command) {
         eprintln!(
             "fatal: 'git-{command}' is a Git core helper without a native Sley implementation"
@@ -280,12 +286,52 @@ fn run_external_or_unknown(
     commands::help::unknown_command(command, 1)
 }
 
+/// Emit the two-layer trace2 events git produces when `git remote-http` spawns
+/// the `remote-curl` dashed helper, then run sley's in-process stub.
+fn run_dashed_remote_curl(
+    cli_session: &session::CliSession,
+    command: &str,
+    args: &[String],
+) -> Result<()> {
+    let mut child_argv = Vec::with_capacity(args.len() + 1);
+    child_argv.push(format!("git-{command}"));
+    child_argv.extend(args.iter().cloned());
+    let hierarchy = trace2_dashed_hierarchy(0);
+    sley_core::trace2::cmd_name("_run_dashed_", Some(&hierarchy));
+    sley_core::trace2::child_start("dashed", &child_argv);
+    let child_hierarchy = format!("{hierarchy}/remote-curl");
+    sley_core::trace2::cmd_name_at_depth(1, "remote-curl", Some(&child_hierarchy));
+    crate::trace2_emit_def_params_at_depth(cli_session, 1);
+    commands::remote::cmd_remote_http(args)
+}
+
+/// Emit the two-layer trace2 events git produces when `git http-fetch` spawns
+/// the dashed `git-http-fetch` helper. Full dumb-HTTP fetch is not implemented;
+/// after the oracle-matching events, fail with the reserved-helper diagnostic.
+fn run_dashed_http_fetch_stub(
+    cli_session: &session::CliSession,
+    args: &[String],
+) -> Result<()> {
+    let mut child_argv = Vec::with_capacity(args.len() + 1);
+    child_argv.push("git-http-fetch".to_string());
+    child_argv.extend(args.iter().cloned());
+    let hierarchy = trace2_dashed_hierarchy(0);
+    sley_core::trace2::cmd_name("_run_dashed_", Some(&hierarchy));
+    sley_core::trace2::child_start("dashed", &child_argv);
+    let child_hierarchy = format!("{hierarchy}/http-fetch");
+    sley_core::trace2::cmd_name_at_depth(1, "http-fetch", Some(&child_hierarchy));
+    crate::trace2_emit_def_params_at_depth(cli_session, 1);
+    eprintln!("fatal: 'git-http-fetch' is a Git core helper without a native Sley implementation");
+    Err(GitError::Exit(128))
+}
+
 fn trace2_external_child_metadata(cli_session: &session::CliSession, command: &str) {
     let child_name = match command {
         "remote-http" | "remote-https" | "remote-ftp" | "remote-ftps" => "remote-curl",
         other => other,
     };
-    sley_core::trace2::cmd_name_at_depth(1, child_name, None);
+    let hierarchy = format!("{}/{}", trace2_dashed_hierarchy(0), child_name);
+    sley_core::trace2::cmd_name_at_depth(1, child_name, Some(&hierarchy));
     crate::trace2_emit_def_params_at_depth(cli_session, 1);
 }
 
@@ -345,6 +391,16 @@ fn dispatch_command(
     // are prefixed `packet: %12s` with this value (e.g. `ls-remote`, `clone`,
     // `fetch`, `upload-pack`).
     set_packet_trace_identity(command);
+    // Upstream builds `remote-http` / `remote-https` / `remote-ftp` / `remote-ftps`
+    // from remote-curl.c as dashed externals. Even though sley implements
+    // `remote-http` in-process, emit the parent `_run_dashed_` + child
+    // `remote-curl` def_param layers so t0211 oracle greps match.
+    if matches!(
+        command,
+        "remote-http" | "remote-https" | "remote-ftp" | "remote-ftps"
+    ) {
+        return run_dashed_remote_curl(cli_session, command, &args[1..]);
+    }
     let trace2_command_name = match command {
         "--exec-path" | "--html-path" | "--man-path" | "--info-path" => "_query_",
         value if value.starts_with("--list-cmds=") => "_query_",
@@ -459,7 +515,7 @@ fn dispatch_command(
         "receive-pack" => commands::remote::cmd_receive_pack(cli_session, &args[1..]),
         "upload-pack" => commands::remote::cmd_upload_pack(cli_session, &args[1..]),
         "http-backend" => commands::remote::cmd_http_backend(cli_session, &args[1..]),
-        "remote-http" => commands::remote::cmd_remote_http(&args[1..]),
+        // `remote-http` / remote-curl family handled above as dashed helpers.
         "daemon" => commands::daemon::cmd_daemon(&args[1..]),
         "write-tree" => commands::trees::cmd_write_tree(cli_session, &args[1..]),
         "worktree" => commands::worktree::cmd_worktree(cli_session, &args[1..]),

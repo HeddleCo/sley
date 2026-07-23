@@ -76,6 +76,7 @@ fn write_merge_result_diffstat(
     new_tree: &ObjectId,
     mode: MergeDiffstat,
     lazy_fetch: bool,
+    config: &GitConfig,
 ) -> Result<()> {
     if mode == MergeDiffstat::Off {
         return Ok(());
@@ -89,6 +90,9 @@ fn write_merge_result_diffstat(
     )?;
     let compact = mode == MergeDiffstat::Compact;
     let stat_entries = collect_diff_stat_entries(&entries, db, None, false, lazy_fetch)?;
+    // Pass effective config so `diff.statGraphWidth` / `diff.statNameWidth`
+    // (and COLUMNS) are honoured — git's merge --stat uses the same width
+    // cascade as `git diff --stat` (t4052).
     write_diff_stat_materialized(
         stdout,
         &stat_entries,
@@ -98,7 +102,7 @@ fn write_merge_result_diffstat(
             color: false,
             quote_path_fully: true,
         },
-        None,
+        Some(config),
     )?;
     // The default `--stat` mode appends a `DIFF_FORMAT_SUMMARY` block (the
     // ` create mode`/` delete mode`/` rename`/` mode change` lines). The
@@ -641,6 +645,7 @@ fn merge_octopus(
                 &new_tree,
                 merge_diffstat_mode(options, &context.config),
                 context.lazy_fetch,
+                &context.config,
             )?;
             stdout.flush()?;
         }
@@ -740,6 +745,7 @@ fn merge_octopus(
             &merged_tree,
             merge_diffstat_mode(options, &context.config),
             context.lazy_fetch,
+            &context.config,
         )?;
         stdout.flush()?;
     }
@@ -3359,6 +3365,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
                 &other_tree,
                 merge_diffstat_mode(&options, &context.config),
                 context.lazy_fetch,
+                &context.config,
             )?;
             stdout.flush()?;
         }
@@ -3431,6 +3438,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
                 &other_tree,
                 merge_diffstat_mode(&options, &context.config),
                 context.lazy_fetch,
+                &context.config,
             )?;
             stdout.flush()?;
         }
@@ -3656,6 +3664,7 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
                 &merged_tree,
                 merge_diffstat_mode(&options, &context.config),
                 context.lazy_fetch,
+                &context.config,
             )?;
             stdout.flush()?;
         }

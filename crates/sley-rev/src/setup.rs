@@ -80,6 +80,8 @@ pub struct RevisionSetupContext<'a, R> {
     pub format: ObjectFormat,
     pub reader: &'a R,
     pub config: Option<&'a GitConfig>,
+    /// When true, treat every positional as a revision only.
+    pub assume_dashdash: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,7 +211,8 @@ where
         // When an explicit `--` is present, every positional before it is a
         // revision, even if it happens to carry pathspec magic. This decision
         // must be known before parsing the earlier tokens.
-        let has_pathspec_separator = args.iter().any(|arg| arg == "--");
+        let has_pathspec_separator =
+            self.ctx.assume_dashdash || args.iter().any(|arg| arg == "--");
         let mut iter = args.iter().peekable();
         while let Some(arg) = iter.next() {
             if positional_only {
@@ -921,14 +924,24 @@ fn positional_matches_worktree_path<R>(
 }
 
 fn path_exists<R>(ctx: &RevisionSetupContext<'_, R>, value: &str) -> bool {
-    // git's `verify_non_filename` / `check_filename` only probe the work tree.
-    // In a bare repository there is no work tree, so files that happen to live
-    // in the git directory itself (`HEAD`, `FETCH_HEAD`, `config`, …) must not
-    // make a successfully resolved revision look "ambiguous" (t5900: `git log
-    // FETCH_HEAD` from a bare fetch destination).
+    // git's `verify_non_filename` (setup.c):
+    //   if (!is_inside_work_tree(repo) || is_inside_git_dir(repo))
+    //       return;
+    // Bare repos have no work tree, so git-dir-resident names (`HEAD`,
+    // `FETCH_HEAD`, `config`, …) never compete with revisions (t5900 bare
+    // `FETCH_HEAD`). The same skip applies when cwd is *inside* the git
+    // directory of a non-bare repo — `.git/HEAD` must not make `git show HEAD`
+    // ambiguous (t1020 #12), including when that path is reached through a
+    // symlink to the worktree (t1020 #15).
     let Some(worktree_root) = ctx.worktree_root else {
         return false;
     };
+    if cwd_is_inside_dir(ctx.cwd, ctx.git_dir) {
+        return false;
+    }
+    if !cwd_is_inside_dir(ctx.cwd, worktree_root) {
+        return false;
+    }
     let path = PathBuf::from(value);
     let candidate = if path.is_absolute() {
         path
@@ -943,6 +956,24 @@ fn path_exists<R>(ctx: &RevisionSetupContext<'_, R>, value: &str) -> bool {
     // Also accept a worktree-rooted spelling when cwd is elsewhere (absolute
     // pathspecs and top-level names from outside the tree).
     worktree_root.join(value).exists()
+}
+
+/// Whether `cwd` is `dir` or a subdirectory of it, after realpath resolution.
+/// Mirrors git's `is_inside_dir` used by `is_inside_git_dir` / `is_inside_work_tree`.
+fn cwd_is_inside_dir(cwd: &Path, dir: &Path) -> bool {
+    let Ok(cwd) = fs::canonicalize(cwd) else {
+        return false;
+    };
+    let dir = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        // Relative git_dir (e.g. "." when setup found a bare dir at cwd).
+        cwd.join(dir)
+    };
+    let Ok(dir) = fs::canonicalize(&dir) else {
+        return false;
+    };
+    cwd == dir || cwd.starts_with(&dir)
 }
 
 fn parse_max_count(value: &str) -> Result<usize> {

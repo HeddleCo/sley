@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -29,6 +30,26 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
         .args(args)
         .output()
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+}
+
+fn run_with_input(program: &str, cwd: &Path, args: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("failed to spawn {program} {args:?}: {err}"));
+    child
+        .stdin
+        .take()
+        .expect("interactive stdin")
+        .write_all(input)
+        .expect("write interactive input");
+    child
+        .wait_with_output()
+        .unwrap_or_else(|err| panic!("failed to wait for {program} {args:?}: {err}"))
 }
 
 fn run_with_identity(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -431,6 +452,123 @@ fn switch_branch_creation_and_force_create_match_upstream_git() {
         let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"main\n");
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t2016: `checkout -p HEAD` / `@` with no staged changes — rejecting
+/// "Apply them to the worktree anyway?" must leave index and worktree
+/// untouched. Post-apply `update-index --refresh -- <path>` must not re-stage
+/// the dirty worktree (matrix regression: 19→17).
+#[test]
+fn checkout_patch_head_no_staged_abort_preserves_state() {
+    let root = unique_temp_dir("checkout-patch-head-abort");
+    fs::create_dir_all(&root).expect("create root");
+    {
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        git(&repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("dir")).expect("mkdir dir");
+        fs::write(repo.join("dir/foo"), b"parent\n").expect("write parent");
+        fs::write(repo.join("bar"), b"dummy\n").expect("write bar");
+        git(&repo, &["add", "bar", "dir/foo"]);
+        run_with_identity(&repo, &["commit", "-m", "initial", "-q"]);
+        fs::write(repo.join("dir/foo"), b"head\n").expect("write head");
+        git(&repo, &["add", "dir/foo"]);
+        run_with_identity(&repo, &["commit", "-m", "second", "-q"]);
+
+        for treeish in ["HEAD", "@"] {
+            // NO staged: index matches HEAD, worktree dirty
+            fs::write(repo.join("dir/foo"), b"head\n").expect("index=head");
+            git(&repo, &["add", "dir/foo"]);
+            fs::write(repo.join("dir/foo"), b"work\n").expect("worktree=work");
+            fs::write(repo.join("bar"), b"bar_index\n").expect("bar index");
+            git(&repo, &["add", "bar"]);
+            fs::write(repo.join("bar"), b"bar_work\n").expect("bar work");
+
+            let args = ["checkout", "-p", treeish];
+            // n=skip bar, y=select dir/foo, n=refuse worktree-only apply
+            let output = run_with_input(
+                sley_testkit::sley_bin!(),
+                &repo,
+                &args,
+                b"n\ny\nn\n",
+            );
+            assert!(
+                output.status.success(),
+                "checkout -p {treeish} abort failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("Discard"),
+                "expected Discard prompt for checkout -p {treeish}, got:\n{stdout}"
+            );
+            assert_eq!(
+                fs::read(repo.join("dir/foo")).expect("read worktree"),
+                b"work\n",
+                "abort must leave worktree dirty for {treeish}"
+            );
+            assert_eq!(
+                git(&repo, &["show", ":dir/foo"]),
+                b"head\n",
+                "abort must not re-stage dirty worktree into index for {treeish}"
+            );
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t2016 apply half: accept worktree-only apply when index does not take the hunk.
+#[test]
+fn checkout_patch_head_no_staged_apply_worktree_only() {
+    let root = unique_temp_dir("checkout-patch-head-apply");
+    fs::create_dir_all(&root).expect("create root");
+    {
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        git(&repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("dir")).expect("mkdir dir");
+        fs::write(repo.join("dir/foo"), b"parent\n").expect("write parent");
+        fs::write(repo.join("bar"), b"dummy\n").expect("write bar");
+        git(&repo, &["add", "bar", "dir/foo"]);
+        run_with_identity(&repo, &["commit", "-m", "initial", "-q"]);
+        fs::write(repo.join("dir/foo"), b"head\n").expect("write head");
+        git(&repo, &["add", "dir/foo"]);
+        run_with_identity(&repo, &["commit", "-m", "second", "-q"]);
+
+        fs::write(repo.join("dir/foo"), b"head\n").expect("index=head");
+        git(&repo, &["add", "dir/foo"]);
+        fs::write(repo.join("dir/foo"), b"work\n").expect("worktree=work");
+        fs::write(repo.join("bar"), b"bar_index\n").expect("bar index");
+        git(&repo, &["add", "bar"]);
+        fs::write(repo.join("bar"), b"bar_work\n").expect("bar work");
+
+        let output = run_with_input(
+            sley_testkit::sley_bin!(),
+            &repo,
+            &["checkout", "-p", "HEAD"],
+            b"n\ny\ny\n",
+        );
+        assert!(
+            output.status.success(),
+            "checkout -p HEAD apply failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("Discard"),
+            "expected Discard prompt"
+        );
+        assert_eq!(
+            fs::read(repo.join("dir/foo")).expect("read worktree"),
+            b"head\n",
+            "accepting worktree-only apply restores worktree to HEAD"
+        );
+        assert_eq!(
+            git(&repo, &["show", ":dir/foo"]),
+            b"head\n",
+            "index already matched HEAD and must stay that way"
+        );
     };
     let _ = fs::remove_dir_all(&root);
 }
