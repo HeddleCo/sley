@@ -6957,7 +6957,8 @@ mod tests {
                 format: ObjectFormat::Sha1,
                 reader: &db,
                 config: None,
-            },
+                        assume_dashdash: false,
+        },
         )
         .expect("setup should parse parent shorthand range");
         assert_eq!(
@@ -8657,7 +8658,8 @@ mod tests {
                 format: ObjectFormat::Sha1,
                 reader: &fixture.db,
                 config: None,
-            },
+                        assume_dashdash: false,
+        },
         )
     }
 
@@ -9683,3 +9685,28 @@ mod tests {
         assert!((nowish - now).abs() <= 2, "nowish={nowish} now={now}");
     }
 }
+
+#[test]
+    fn setup_revisions_skips_path_ambiguity_inside_git_dir() {
+        let fixture = setup_revisions_fixture();
+        // Ensure the git-dir-resident `HEAD` file exists (it always does).
+        assert!(fixture.git_dir.join("HEAD").is_file());
+        let args = ["HEAD".to_string()];
+        let setup = setup_revisions(
+            &args,
+            &RevisionSetupContext {
+                git_dir: &fixture.git_dir,
+                // CLI open may still attach the parent worktree when cwd is
+                // inside `.git`; the probe itself must refuse the ambiguity.
+                worktree_root: Some(&fixture.worktree),
+                cwd: &fixture.git_dir,
+                format: ObjectFormat::Sha1,
+                reader: &fixture.db,
+                config: None,
+                        assume_dashdash: false,
+        },
+        )
+        .expect("HEAD inside git dir must not be path-ambiguous");
+        assert_eq!(setup.options.positives[0].oid, fixture.tip);
+        assert!(setup.pathspecs.is_empty());
+    }

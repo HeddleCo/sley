@@ -252,6 +252,7 @@ pub fn plan_format_patch_series(
             format: request.format,
             reader: request.objects,
             config: Some(request.config),
+                    assume_dashdash: false,
         },
     )?;
     if let Some(argument) = setup.leftovers.first() {

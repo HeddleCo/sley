@@ -491,6 +491,7 @@ pub(crate) fn cmd_show(cli_session: &crate::session::CliSession, args: &[String]
             format,
             reader: db,
             config: Some(config),
+                    assume_dashdash: false,
         },
     )?;
     show_profile_mark(

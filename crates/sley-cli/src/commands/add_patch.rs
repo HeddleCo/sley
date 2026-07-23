@@ -2317,82 +2317,30 @@ fn gitlink_selected_oid<'a>(
     fallback.filter(|oid| oid.len() >= 40)
 }
 
-/// After staging hunks, refresh the index stat cache so `git diff-files` stays
-/// clean for paths whose worktree now matches the freshly-staged blob (t3701
-/// "index is refreshed after applying patch").
+/// After applying selected hunks, refresh the index stat cache so
+/// `git diff-files` stays clean for paths whose worktree now matches the index
+/// (t3701 "index is refreshed after applying patch").
 ///
-/// Important: entries staged via `update-index --cacheinfo` carry zeroed stat
-/// fields. A blanket `update-index --refresh` on such an entry re-hashes the
-/// worktree and **replaces** the carefully-selected staged blob whenever the
-/// worktree still has unstaged hunks (selective `add -p`). Only refresh paths
-/// whose worktree content already matches the index blob.
-fn refresh_index(paths: &[String]) {
-    let matching: Vec<&str> = paths
-        .iter()
-        .map(String::as_str)
-        .filter(|path| worktree_matches_index(path))
-        .collect();
-    if matching.is_empty() {
-        return;
-    }
+/// Must be invoked as `update-index -q --refresh` with **no path arguments**.
+/// Upstream `update-index` treats `--refresh` as an immediate whole-index
+/// refresh callback; any trailing paths are then processed as ordinary
+/// `update_one` stages from the worktree. Spawning
+/// `update-index --refresh -- <paths>` therefore re-stages those paths and
+/// clobbers selective / index-preserving patch modes:
+/// - `add -p` / `commit --interactive` partial stage (t3701, t0090 #10)
+/// - `restore -p --source=*` worktree-only (t2071 #6–#9, #13)
+/// - `checkout -p HEAD/@` when the hunk does not apply to the index (t2016 #5, #8)
+///
+/// `-q` must precede `--refresh` (git option-order: quiet is only armed if seen
+/// before the refresh callback fires).
+fn refresh_index(_paths: &[String]) {
     let mut command = Command::new(self_bin());
     command
-        .args(["update-index", "--refresh", "-q", "--"])
-        .args(&matching)
+        .args(["update-index", "-q", "--refresh"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let _ = command.status();
-}
-
-/// True when the worktree file's contents **and mode** match the stage-0 index
-/// entry for `path` (so a stat-only refresh is safe and desirable).
-///
-/// Content-only equality is not enough: after staging a content hunk while
-/// leaving a mode-change unstaged (t3701 #30), the worktree is still `+x`
-/// while the index is `100644`. Refreshing would re-hash the worktree and
-/// clobber the deliberately-kept index mode.
-fn worktree_matches_index(path: &str) -> bool {
-    let stage = match run_capture(&["ls-files", "--stage", "--", path], None) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(_) => return false,
-    };
-    let mut fields = stage.split_whitespace();
-    let index_mode = match fields.next() {
-        Some(mode) => mode,
-        None => return false,
-    };
-    let index_oid = match fields.next() {
-        Some(oid) => oid.to_string(),
-        None => return false,
-    };
-
-    // Worktree mode: git records regular files as 100644/100755.
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    #[cfg(unix)]
-    let worktree_mode = {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = meta.permissions().mode();
-        if mode & 0o111 != 0 {
-            "100755"
-        } else {
-            "100644"
-        }
-    };
-    #[cfg(not(unix))]
-    let worktree_mode = "100644";
-    if index_mode != worktree_mode {
-        return false;
-    }
-
-    let worktree_oid = match run_capture(&["hash-object", "--", path], None) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).trim().to_string(),
-        Err(_) => return false,
-    };
-    !index_oid.is_empty() && index_oid == worktree_oid
 }
 
 /// Apply the selected hunks to the index base text, line by line.
