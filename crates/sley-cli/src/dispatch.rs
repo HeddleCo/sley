@@ -379,7 +379,8 @@ fn dispatch_command(
             value.strip_prefix("--list-cmds=").unwrap_or_default(),
         ),
         "init" => commands::plumbing::cmd_init(cli_session, &args[1..], global_config),
-        "add" => commands::plumbing::cmd_add(cli_session, &args[1..]),
+        // git.c: `{ "stage", cmd_add, ... }` — `git stage` is a synonym for `git add`.
+        "add" | "stage" => commands::plumbing::cmd_add(cli_session, &args[1..]),
         "archive" => commands::plumbing::cmd_archive(cli_session, &args[1..]),
         "branch" => commands::branch::cmd_branch(cli_session, &args[1..]),
         "bundle" => commands::plumbing::cmd_bundle(cli_session, &args[1..]),

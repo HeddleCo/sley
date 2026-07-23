@@ -275,7 +275,8 @@ static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     CommandSpec::new("show-index", BUILTIN),
     CommandSpec::new("show-ref", BUILTIN),
     CommandSpec::new("sparse-checkout", BUILTIN_MAIN),
-    CommandSpec::new("stage", GIT_BUILTIN_RESERVED),
+    // git.c: `{ "stage", cmd_add, ... }` — synonym for `add`, not a reserved helper.
+    CommandSpec::new("stage", BUILTIN),
     CommandSpec::new("stash", BUILTIN_MAIN),
     CommandSpec::new("status", BUILTIN_MAIN),
     CommandSpec::new("stripspace", BUILTIN),

@@ -2204,6 +2204,31 @@ mod tests {
                 path: "/org/repo.git".into(),
             }
         );
+        // Deprecated scheme aliases parse as native SSH (t5813 git+ssh:// path).
+        assert_eq!(
+            parse_remote_url("git+ssh://git@example.com/org/repo.git")
+                .expect("test operation should succeed"),
+            RemoteUrl {
+                transport: RemoteTransport::Ssh,
+                user: Some("git".into()),
+                password: None,
+                host: Some("example.com".into()),
+                port: None,
+                path: "/org/repo.git".into(),
+            }
+        );
+        assert_eq!(
+            parse_remote_url("ssh+git://git@example.com/org/repo.git")
+                .expect("test operation should succeed"),
+            RemoteUrl {
+                transport: RemoteTransport::Ssh,
+                user: Some("git".into()),
+                password: None,
+                host: Some("example.com".into()),
+                port: None,
+                path: "/org/repo.git".into(),
+            }
+        );
         assert_eq!(
             parse_remote_url("ssh://git@example.com/org/repo%20space/it%27s%2Fnested.git")
                 .expect("test operation should succeed"),

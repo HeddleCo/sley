@@ -1,0 +1,77 @@
+===== ORACLE partial 2026-07-23T02:38:15Z =====
+oracle git: /tmp/git-prefix/bin/git
+oracle exec path: /tmp/git-prefix/libexec/git-core
+
+Running upstream scripts against oracle...
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t3701-add-interactive.sh     PASS       130     0  1..130
+t5319-multi-pack-index.sh    PASS        98     0  1..98
+t3700-add.sh                 PASS        58     0  1..58
+t5900-repo-selection.sh      PASS         8     0  1..8
+t2105-update-index-gitfile.sh PASS         4     0  1..4
+t6133-pathspec-rev-dwim.sh   PASS         6     0  1..6
+t6301-for-each-ref-errors.sh PASS         6     0  1..6
+t3430-rebase-merges.sh       PASS        34     0  1..34
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+t3701-add-interactive.sh PASS            130      0    130  100%
+t5319-multi-pack-index.sh PASS             98      0     98  100%
+t3700-add.sh   PASS             58      0     58  100%
+t5900-repo-selection.sh PASS              8      0      8  100%
+t2105-update-index-gitfile.sh PASS              4      0      4  100%
+t6133-pathspec-rev-dwim.sh PASS              6      0      6  100%
+t6301-for-each-ref-errors.sh PASS              6      0      6  100%
+t3430-rebase-merges.sh PASS             34      0     34  100%
+
+TAP CELL SUMMARY: pass=341 fail=0 todo=0 skip=3.
+SUMMARY: 8 script(s): 8 passed, 0 skipped, 0 failed, 0 aborted, 0 timed out.
+
+Full report written to: /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/oracle-report.txt
+Machine-readable summary: /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/oracle-summary.csv
+Pass-rate history (appended): /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/oracle-history.csv
+Per-script timings: /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/oracle-timings.csv
+Exact TAP cells: /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/oracle-cells.csv
+Per-script classifications: /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/oracle-details.csv
+Run identity metadata: /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/oracle-summary-metadata.tsv
+===== SLEY partial 2026-07-23T02:38:56Z =====
+sley binary: /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/target/release/sley
+
+Running upstream scripts against sley...
+
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t3701-add-interactive.sh     PASS       130     0  1..130
+t5319-multi-pack-index.sh    PASS        98     0  1..98
+t3700-add.sh                 PASS        58     0  1..58
+t5900-repo-selection.sh      PASS         8     0  1..8
+t2105-update-index-gitfile.sh PASS         4     0  1..4
+t6133-pathspec-rev-dwim.sh   PASS         6     0  1..6
+t6301-for-each-ref-errors.sh PASS         6     0  1..6
+t3430-rebase-merges.sh       PASS        34     0  1..34
+Oracle/Sley cell comparison: /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/cell-comparison.csv
+Oracle/Sley comparison summary: /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/cell-comparison-summary.csv
+
+PER-COMMAND PASS RATE (assertions):
+COMMAND        RESULT           OK   FAIL  TOTAL  PASS%
+t3701-add-interactive.sh PASS            130      0    130  100%
+t5319-multi-pack-index.sh PASS             98      0     98  100%
+t3700-add.sh   PASS             58      0     58  100%
+t5900-repo-selection.sh PASS              8      0      8  100%
+t2105-update-index-gitfile.sh PASS              4      0      4  100%
+t6133-pathspec-rev-dwim.sh PASS              6      0      6  100%
+t6301-for-each-ref-errors.sh PASS              6      0      6  100%
+t3430-rebase-merges.sh PASS             34      0     34  100%
+
+TAP CELL SUMMARY: pass=341 fail=0 todo=0 skip=3.
+SUMMARY: 8 script(s): 8 passed, 0 skipped, 0 failed, 0 aborted, 0 timed out.
+
+Full report written to: /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/sley-report.txt
+Machine-readable summary: /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/sley-summary.csv
+Pass-rate history (appended): /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/sley-history.csv
+Per-script timings: /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/sley-timings.csv
+Exact TAP cells: /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/sley-cells.csv
+Per-script classifications: /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/sley-details.csv
+Run identity metadata: /Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/matrix-rerun-20260723-partial/sley-summary-metadata.tsv

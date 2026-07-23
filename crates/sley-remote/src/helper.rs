@@ -89,9 +89,23 @@ pub fn resolve_remote_helper(config: &GitConfig, remote: &str) -> Option<RemoteH
 }
 
 fn native_helper_name(name: &str) -> bool {
+    // `git+ssh` / `ssh+git` are deprecated aliases for the built-in SSH transport
+    // (transport.c in upstream Git). They must not fall through to remote-helper
+    // discovery as `git-remote-git+ssh`.
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "file" | "local" | "ssh" | "git" | "ext" | "fd" | "http" | "https" | "ftp" | "ftps"
+        "file"
+            | "local"
+            | "ssh"
+            | "git"
+            | "git+ssh"
+            | "ssh+git"
+            | "ext"
+            | "fd"
+            | "http"
+            | "https"
+            | "ftp"
+            | "ftps"
     )
 }
 
@@ -1275,6 +1289,10 @@ mod tests {
             })
         );
         assert!(resolve_remote_helper(&empty, "https://example.com/repo").is_none());
+        assert!(resolve_remote_helper(&empty, "ssh://example.com/repo").is_none());
+        // Deprecated SSH scheme aliases are native, not git-remote-git+ssh helpers.
+        assert!(resolve_remote_helper(&empty, "git+ssh://example.com/repo").is_none());
+        assert!(resolve_remote_helper(&empty, "ssh+git://example.com/repo").is_none());
         assert!(resolve_remote_helper(&empty, "fd::3").is_none());
 
         let config = GitConfig {

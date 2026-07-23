@@ -2171,9 +2171,14 @@ fn print_fetch_status(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut rows = Vec::new();
     for update in &outcome.ref_updates {
-        let dst = match update.dst.as_deref() {
-            Some(dst) => dst,
-            None if dry_run && write_fetch_head => "FETCH_HEAD",
+        // git's store_updated_refs: FETCH_HEAD-only updates (no local dst) are
+        // still displayed when write_fetch_head is set, and also under --dry-run
+        // (which would have written FETCH_HEAD). Previously we only showed the
+        // dry-run case, so `git pull ../parent` / `git fetch ../parent` printed
+        // nothing to stderr and broke t5521's `test -s err` cells.
+        let (dst, fetch_head_only) = match update.dst.as_deref() {
+            Some(dst) => (dst, false),
+            None if write_fetch_head || dry_run => ("FETCH_HEAD", true),
             None => continue,
         };
         let old = update
@@ -2192,6 +2197,10 @@ fn print_fetch_status(
                 unique_abbrev(&old, &db),
                 unique_abbrev(&update.oid, &db)
             ),
+            None if fetch_head_only => {
+                // git display_info: code='*', summary="branch" → " * branch"
+                "* branch".to_string()
+            }
             None if update
                 .dst
                 .as_deref()

@@ -10,6 +10,14 @@ use std::sync::OnceLock;
 
 pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.55.0";
 
+pub mod precompose;
+pub use precompose::{
+    activate_precompose_unicode, has_non_ascii, has_non_ascii_bytes, precompose_argv_if_needed,
+    precompose_bytes_if_needed, precompose_os_str_bytes_if_needed, precompose_owned_string_if_needed,
+    precompose_path_if_needed, precompose_string_if_needed, precompose_unicode_enabled,
+    set_precompose_unicode,
+};
+
 static ORIGINAL_CWD: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 pub fn set_original_cwd(path: Option<PathBuf>) {

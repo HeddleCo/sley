@@ -1990,15 +1990,9 @@ fn untracked_cache_dir_has_observed_content(dir: &UntrackedCacheDir) -> bool {
 }
 
 pub(crate) fn component_name_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        name.as_bytes().to_vec()
-    }
-    #[cfg(not(unix))]
-    {
-        name.to_string_lossy().as_bytes().to_vec()
-    }
+    // Match git's precompose_utf8_readdir: NFD directory entries become NFC when
+    // core.precomposeunicode is true.
+    sley_core::precompose_os_str_bytes_if_needed(name).into_owned()
 }
 
 pub(crate) fn per_directory_ignore_oid(

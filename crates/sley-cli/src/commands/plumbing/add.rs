@@ -2380,6 +2380,8 @@ pub(super) fn add_git_path_bytes(path: &Path) -> Result<Vec<u8>> {
             path.display()
         )));
     }
+    // NFD→NFC when core.precomposeunicode is set (git precompose_argv_prefix).
+    let path = sley_core::precompose_path_if_needed(path);
     Ok(path
         .components()
         .filter_map(|component| match component {
