@@ -1900,3 +1900,206 @@ fn hash_object_stdin(repo: &Path, body: &[u8]) -> String {
         .trim()
         .to_string()
 }
+
+fn run_with_input(program: &str, cwd: &Path, args: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"));
+    child
+        .stdin
+        .take()
+        .expect("interactive stdin")
+        .write_all(input)
+        .expect("write interactive input");
+    child
+        .wait_with_output()
+        .expect("interactive command output")
+}
+
+fn write_lines(path: &Path, lines: &[&str]) {
+    let mut body = lines.join("\n");
+    body.push('\n');
+    fs::write(path, body).expect("write lines");
+}
+
+fn prepare_add_patch_repo(root: &Path) {
+    git(root, &["init", "-q", "-b", "main"]);
+    run_with_identity(root, &["commit", "--allow-empty", "-m", "init", "-q"]);
+}
+
+/// t3701 #80 cluster: selecting only a later hunk must not re-hash the dirty
+/// worktree back into the index after staging (post-apply refresh clobber).
+#[test]
+fn add_patch_selective_hunk_does_not_clobber_with_worktree_refresh() {
+    let root = unique_temp_dir("add-patch-selective-hunk");
+    let rust = root.join("rust");
+    fs::create_dir_all(&rust).expect("create repo");
+    prepare_add_patch_repo(&rust);
+
+    write_lines(&rust.join("a"), &["a"; 11]);
+    let sley = sley_testkit::sley_bin!();
+    run(sley, &rust, &["add", "a"]);
+    run_with_identity(&rust, &["commit", "-m", "base", "-q"]);
+
+    // Two well-separated hunks: skip the first, take the second.
+    write_lines(
+        &rust.join("a"),
+        &[
+            "c", "b", "a", "a", "a", "a", "a", "a", "a", "b", "a", "a", "a", "a",
+        ],
+    );
+    let out = run_with_input(sley, &rust, &["add", "-p"], b"n\ny\n");
+    assert!(
+        out.status.success(),
+        "add -p failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let staged = run(sley, &rust, &["cat-file", "blob", ":a"]);
+    let expected = b"a\na\na\na\na\na\na\nb\na\na\na\na\n";
+    assert_eq!(
+        staged, expected,
+        "selective second-hunk stage was clobbered by worktree refresh\nstaged:\n{}\nexpected:\n{}",
+        String::from_utf8_lossy(&staged),
+        String::from_utf8_lossy(expected)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// t3701 #30/#31: mode-change pseudo-hunk is independent of content hunks.
+#[test]
+fn add_patch_mode_change_independent_of_content_hunk() {
+    let root = unique_temp_dir("add-patch-mode-hunk");
+    let rust = root.join("rust");
+    fs::create_dir_all(&rust).expect("create repo");
+    prepare_add_patch_repo(&rust);
+
+    let sley = sley_testkit::sley_bin!();
+    fs::write(rust.join("file"), b"content\n").expect("write file");
+    run(sley, &rust, &["add", "file"]);
+    run_with_identity(&rust, &["commit", "-m", "base", "-q"]);
+
+    // Content + mode change; take mode only.
+    {
+        let mut body = fs::read(rust.join("file")).expect("read");
+        body.extend_from_slice(b"content\n");
+        fs::write(rust.join("file"), body).expect("append");
+        make_executable(&rust.join("file"));
+        let out = run_with_input(sley, &rust, &["add", "-p"], b"y\nn\n");
+        assert!(out.status.success(), "add -p mode-only failed");
+        let stage_bytes = run(sley, &rust, &["ls-files", "--stage", "file"]);
+        let stage = String::from_utf8_lossy(&stage_bytes);
+        assert!(
+            stage.starts_with("100755 "),
+            "mode-only stage should be 100755, got {stage}"
+        );
+        let blob = run(sley, &rust, &["cat-file", "blob", ":file"]);
+        assert_eq!(blob, b"content\n", "mode-only must keep original blob");
+        let unstaged_bytes = run(sley, &rust, &["diff", "file"]);
+        let unstaged = String::from_utf8_lossy(&unstaged_bytes);
+        assert!(
+            unstaged.contains("+content"),
+            "content hunk must remain unstaged: {unstaged}"
+        );
+    }
+
+    // Reset and take content only (not mode).
+    run(sley, &rust, &["reset", "--hard", "-q"]);
+    {
+        let mut body = fs::read(rust.join("file")).expect("read");
+        body.extend_from_slice(b"content\n");
+        fs::write(rust.join("file"), body).expect("append");
+        make_executable(&rust.join("file"));
+        let out = run_with_input(sley, &rust, &["add", "-p"], b"n\ny\n");
+        assert!(out.status.success(), "add -p content-only failed");
+        let stage_bytes = run(sley, &rust, &["ls-files", "--stage", "file"]);
+        let stage = String::from_utf8_lossy(&stage_bytes);
+        assert!(
+            stage.starts_with("100644 "),
+            "content-only stage should keep 100644, got {stage}"
+        );
+        let blob = run(sley, &rust, &["cat-file", "blob", ":file"]);
+        assert_eq!(blob, b"content\ncontent\n", "content hunk should be staged");
+        let unstaged_bytes = run(sley, &rust, &["diff", "file"]);
+        let unstaged = String::from_utf8_lossy(&unstaged_bytes);
+        assert!(
+            unstaged.contains("new mode") || unstaged.contains("100755"),
+            "mode change must remain unstaged: {unstaged}"
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+/// t3701 #57: fully accepting a patch still refreshes stat so diff-files is clean.
+#[test]
+fn add_patch_full_stage_refreshes_index_stat() {
+    let root = unique_temp_dir("add-patch-full-refresh");
+    let rust = root.join("rust");
+    fs::create_dir_all(&rust).expect("create repo");
+    prepare_add_patch_repo(&rust);
+
+    let sley = sley_testkit::sley_bin!();
+    fs::write(rust.join("test"), b"content\n").expect("write");
+    let out = run_with_input(sley, &rust, &["add", "-p"], b"y\n");
+    assert!(out.status.success(), "add -p full stage failed");
+    let diff_files = run_output(sley, &rust, &["diff-files", "--exit-code"]);
+    assert!(
+        diff_files.status.success(),
+        "diff-files should be clean after full add -p (stat refresh): {}",
+        String::from_utf8_lossy(&diff_files.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// t3701 #130: --no-auto-advance selective staging across multiple files.
+#[test]
+fn add_patch_no_auto_advance_selective_multi_file() {
+    let root = unique_temp_dir("add-patch-no-advance");
+    let rust = root.join("rust");
+    fs::create_dir_all(&rust).expect("create repo");
+    prepare_add_patch_repo(&rust);
+
+    let sley = sley_testkit::sley_bin!();
+    for name in ["a.file", "b.file", "c.file"] {
+        write_lines(&rust.join(name), &["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
+    }
+    run(sley, &rust, &["add", "-A"]);
+    run_with_identity(&rust, &["commit", "-m", "initial", "-q"]);
+
+    write_lines(
+        &rust.join("a.file"),
+        &["1", "A2", "3", "4", "A5", "6", "7", "8", "9"],
+    );
+    write_lines(
+        &rust.join("b.file"),
+        &["1", "2", "B3", "4", "5", "6", "7", "B8", "9"],
+    );
+    write_lines(
+        &rust.join("c.file"),
+        &["C1", "2", "3", "4", "5", "C6", "7", "8", "9"],
+    );
+
+    // Per t3701 #130: split each file, take first/skip second or similar pattern.
+    let input = b"s\ny\nn\n>\ns\nn\ny\n>\ns\ny\ny\nq\n";
+    let out = run_with_input(sley, &rust, &["add", "-p", "--no-auto-advance"], input);
+    assert!(
+        out.status.success(),
+        "add -p --no-auto-advance failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cached_bytes = run(sley, &rust, &["diff", "--cached"]);
+    let cached = String::from_utf8_lossy(&cached_bytes);
+    assert!(cached.contains("+A2"), "expected +A2 staged:\n{cached}");
+    assert!(!cached.contains("+A5"), "expected +A5 unstaged:\n{cached}");
+    assert!(cached.contains("+B8"), "expected +B8 staged:\n{cached}");
+    assert!(!cached.contains("+B3"), "expected +B3 unstaged:\n{cached}");
+    assert!(cached.contains("+C1"), "expected +C1 staged:\n{cached}");
+    assert!(cached.contains("+C6"), "expected +C6 staged:\n{cached}");
+    let _ = fs::remove_dir_all(root);
+}

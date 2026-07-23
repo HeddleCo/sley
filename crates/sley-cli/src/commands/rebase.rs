@@ -431,7 +431,12 @@ impl Ctx {
         let common_git_dir = repository.common_dir().to_path_buf();
         let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
         let format = repository.object_format();
-        let config = read_repo_config(&git_dir)?;
+        // Linked worktrees keep rebase state under `$GIT_DIR/worktrees/<id>/`
+        // while repository config lives in the common gitdir. Reading config
+        // from the per-worktree admin dir silently drops `sequence.editor` and
+        // friends (t3430 `refs/rewritten/* is worktree-local` uses
+        // `test_config -C wt sequence.editor ...`).
+        let config = read_repo_config(&common_git_dir)?;
         let refs = repository.references();
         let common_refs = FileRefStore::new(&common_git_dir, format);
         let reflog_action = env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "rebase".to_string());
