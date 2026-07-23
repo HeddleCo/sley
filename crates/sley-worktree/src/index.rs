@@ -1627,9 +1627,12 @@ pub(crate) fn update_index_paths_impl(
             trust_filemode,
         );
         if is_symlink {
+            // A real worktree symlink is always staged as 120000, even when
+            // core.filemode=false. Preferred-mode reuse only preserves the
+            // executable bit (or a 120000 entry under core.symlinks=false);
+            // it must not paper over a file→symlink type change.
             entry.mode = 0o120000;
-        }
-        if let Some(mode) = preferred_index_mode_for_untrusted_worktree(
+        } else if let Some(mode) = preferred_index_mode_for_untrusted_worktree(
             &index.entries[existing_range.clone()],
             trust_filemode,
             trust_symlinks,

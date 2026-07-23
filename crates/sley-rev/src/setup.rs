@@ -921,17 +921,28 @@ fn positional_matches_worktree_path<R>(
 }
 
 fn path_exists<R>(ctx: &RevisionSetupContext<'_, R>, value: &str) -> bool {
+    // git's `verify_non_filename` / `check_filename` only probe the work tree.
+    // In a bare repository there is no work tree, so files that happen to live
+    // in the git directory itself (`HEAD`, `FETCH_HEAD`, `config`, …) must not
+    // make a successfully resolved revision look "ambiguous" (t5900: `git log
+    // FETCH_HEAD` from a bare fetch destination).
+    let Some(worktree_root) = ctx.worktree_root else {
+        return false;
+    };
     let path = PathBuf::from(value);
     let candidate = if path.is_absolute() {
         path
     } else {
+        // Relative names are resolved from the invocation cwd (which may be a
+        // subdirectory of the worktree), matching git's prefix-aware probe.
         ctx.cwd.join(path)
     };
-    candidate.exists()
-        || ctx
-            .worktree_root
-            .map(|root| root.join(value).exists())
-            .unwrap_or(false)
+    if candidate.exists() {
+        return true;
+    }
+    // Also accept a worktree-rooted spelling when cwd is elsewhere (absolute
+    // pathspecs and top-level names from outside the tree).
+    worktree_root.join(value).exists()
 }
 
 fn parse_max_count(value: &str) -> Result<usize> {

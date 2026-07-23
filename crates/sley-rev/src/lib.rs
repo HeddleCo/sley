@@ -1334,7 +1334,13 @@ fn object_id_is_null(oid: &ObjectId) -> bool {
 }
 
 fn parse_reflog_selector_date(value: &str) -> Option<i64> {
-    if value == "now" {
+    // git's approxidate treats the word "now" (even surrounded by noise such as
+    // `now [or thereabouts]`, t6133) as the current time.
+    if value == "now"
+        || value
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|token| token == "now")
+    {
         return std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
@@ -6097,13 +6103,14 @@ fn repository_index_path(git_dir: &Path) -> PathBuf {
 // Commit-message search (`:/text` and `<rev>^{/text}`)
 // ---------------------------------------------------------------------------
 //
-// Matching is a plain substring test against the raw commit message; this crate
-// has no regex dependency, so `:/text` and `^{/text}` find commits whose
-// message *contains* `text` rather than matching it as a POSIX regular
-// expression. An empty pattern matches the most recent candidate, mirroring
-// git's "return the youngest commit" behavior for `:/`.
+// git treats the pattern as a POSIX extended regular expression over the raw
+// commit message (t6133 `HEAD^{/b.*}`). An empty pattern matches the most
+// recent candidate, mirroring git's "return the youngest commit" behavior for
+// `:/`. When the pattern is not a valid regex (or is free of metacharacters),
+// matching falls back to a literal substring probe so existing plain-text
+// patterns keep working on non-UTF-8 messages.
 
-/// `:/text` — newest commit (across all refs) whose message contains `text`.
+/// `:/text` — newest commit (across all refs) whose message matches `text`.
 ///
 /// "Newest" is approximated by committer timestamp, falling back to the order
 /// commits are discovered when timestamps are unavailable, which matches git's
@@ -6117,6 +6124,7 @@ fn search_commit_message_all<R: ObjectReader>(
     reader: &R,
     text: &str,
 ) -> Result<ObjectId> {
+    let matcher = CommitMessageMatcher::new(text);
     let starts = all_ref_commit_starts(git_dir, format, reader)?;
     let mut graph = CommitGraphContext::load(git_dir, format);
     let mut seen = HashSet::new();
@@ -6135,7 +6143,7 @@ fn search_commit_message_all<R: ObjectReader>(
         }
         let commit = Commit::parse_ref(format, &object.body)?;
         pending.extend(commit.parents.iter().cloned());
-        if commit_message_contains(commit.message, text) {
+        if matcher.matches(commit.message) {
             let when = graph
                 .commit_time(&oid)?
                 .or_else(|| commit_committer_time(commit.committer))
@@ -6153,7 +6161,7 @@ fn search_commit_message_all<R: ObjectReader>(
 }
 
 /// `<rev>^{/text}` — first commit reachable from `base` along the first-parent
-/// chain whose message contains `text`.
+/// chain whose message matches `text`.
 fn search_commit_message_first_parent<R: ObjectReader>(
     git_dir: &Path,
     reader: &R,
@@ -6161,6 +6169,7 @@ fn search_commit_message_first_parent<R: ObjectReader>(
     base: &ObjectId,
     text: &str,
 ) -> Result<ObjectId> {
+    let matcher = CommitMessageMatcher::new(text);
     let start = peel_to_commit(reader, format, base)?;
     // Commit *messages* are not stored in the commit-graph, so each candidate's
     // body is still read; the graph is only consulted to follow the first-parent
@@ -6180,7 +6189,7 @@ fn search_commit_message_first_parent<R: ObjectReader>(
             )));
         }
         let commit = Commit::parse_ref(format, &object.body)?;
-        if commit_message_contains(commit.message, text) {
+        if matcher.matches(commit.message) {
             return Ok(oid);
         }
         current = if reader.is_shallow_graft(&oid) {
@@ -6197,14 +6206,37 @@ fn search_commit_message_first_parent<R: ObjectReader>(
     )))
 }
 
-fn commit_message_contains(message: &[u8], text: &str) -> bool {
-    if text.is_empty() {
-        return true;
+/// Pattern used by `:/text` / `<rev>^{/text}` commit-message search.
+enum CommitMessageMatcher {
+    Empty,
+    Regex(regex::bytes::Regex),
+    Literal(Vec<u8>),
+}
+
+impl CommitMessageMatcher {
+    fn new(text: &str) -> Self {
+        if text.is_empty() {
+            return Self::Empty;
+        }
+        // git compiles the pattern as a POSIX ERE. The Rust `regex` crate is
+        // close enough for the metacharacters t6133 exercises (`*`, `.`, …);
+        // invalid patterns fall back to a literal substring so plain messages
+        // with accidental metacharacters still match when possible.
+        match regex::bytes::Regex::new(text) {
+            Ok(re) => Self::Regex(re),
+            Err(_) => Self::Literal(text.as_bytes().to_vec()),
+        }
     }
-    // Search the raw bytes so non-UTF-8 messages still match where possible.
-    message
-        .windows(text.len())
-        .any(|window| window == text.as_bytes())
+
+    fn matches(&self, message: &[u8]) -> bool {
+        match self {
+            Self::Empty => true,
+            Self::Regex(re) => re.is_match(message),
+            Self::Literal(bytes) => message
+                .windows(bytes.len())
+                .any(|window| window == bytes.as_slice()),
+        }
+    }
 }
 
 /// Best-effort committer timestamp (seconds since epoch) from a commit's
@@ -7689,6 +7721,17 @@ mod tests {
                 &format!("{third}^{{/widget bug}}"),
             )
             .expect("test operation should succeed"),
+            second
+        );
+        // Metacharacters are true regex (t6133 `HEAD^{/b.*}`), not literal text.
+        assert_eq!(
+            resolve_revision_with_reader(
+                &git_dir,
+                ObjectFormat::Sha1,
+                &db,
+                &format!("{third}^{{/w.*get}}"),
+            )
+            .expect("regex peel should match"),
             second
         );
         // No match is an error.
@@ -9633,5 +9676,10 @@ mod tests {
             parse_reflog_selector_date("2001-09-17")
         );
         assert_eq!(parse_reflog_selector_date("utter.bogosity"), None);
+        // t6133: `HEAD@{now [or thereabouts]}` resolves as "now".
+        let nowish = parse_reflog_selector_date("now [or thereabouts]")
+            .expect("now with noise should parse");
+        let now = parse_reflog_selector_date("now").expect("now should parse");
+        assert!((nowish - now).abs() <= 2, "nowish={nowish} now={now}");
     }
 }

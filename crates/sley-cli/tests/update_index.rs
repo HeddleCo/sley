@@ -2221,3 +2221,147 @@ fn update_index_adds_sha256_index_entries() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+/// t3700 #8/#10: with `core.filemode=0`, replacing a tracked regular file with
+/// a symlink must stage mode 120000 (the link target blob), not keep 100644
+/// from the previous index entry. core.filemode only ignores the executable
+/// bit; it must not suppress real type changes.
+#[cfg(unix)]
+#[test]
+fn update_index_filemode_false_does_not_confuse_symlink_type_change() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let root = unique_temp_dir("update-index-filemode0-symlink");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo dir");
+    fs::create_dir_all(&actual).expect("create actual repo dir");
+    {
+        for repo in [&expected, &actual] {
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["init", "-q", "-b", "main"],
+            );
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &["config", "core.filemode", "false"],
+            );
+            fs::write(repo.join("xfoo"), b"foo\n").expect("write regular file");
+            let mut perms = fs::metadata(repo.join("xfoo"))
+                .expect("stat xfoo")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(repo.join("xfoo"), perms).expect("chmod +x");
+        }
+
+        // Stage as a regular file first (exec bit ignored → 100644).
+        let add_args = ["update-index", "--add", "xfoo"];
+        let expected_add = run(sley_testkit::oracle_git(), &expected, &add_args);
+        let actual_add = run(sley_testkit::sley_bin!(), &actual, &add_args);
+        assert_same_output(actual_add, expected_add, &add_args);
+        assert_index_matches_for_label(&expected, &actual, "after regular add");
+
+        // Replace with a symlink and re-stage (t3700 test_ln_s_add path).
+        for repo in [&expected, &actual] {
+            fs::remove_file(repo.join("xfoo")).expect("remove regular file");
+            symlink("foo", repo.join("xfoo")).expect("create symlink");
+        }
+        let expected_link = run(sley_testkit::oracle_git(), &expected, &add_args);
+        let actual_link = run(sley_testkit::sley_bin!(), &actual, &add_args);
+        assert_same_output(actual_link, expected_link, &add_args);
+        assert_index_matches_for_label(&expected, &actual, "after symlink replace");
+
+        let stage = String::from_utf8(run_success(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["ls-files", "--stage", "xfoo"],
+        ))
+        .expect("ls-files utf8");
+        assert!(
+            stage.starts_with("120000 "),
+            "expected mode 120000 after file→symlink with core.filemode=0, got: {stage}"
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn update_index_adds_gitlink_via_gitfile() {
+    // t2105: submodule whose .git is a gitdir: pointer (absolute or relative).
+    let root = unique_temp_dir("update-index-gitfile");
+    fs::create_dir_all(&root).expect("create temp");
+    {
+        run_success(sley_testkit::sley_bin!(), &root, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["config", "user.email", "t@t.invalid"],
+        );
+        run_success(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["config", "user.name", "t"],
+        );
+        fs::write(root.join("root.txt"), b"root\n").expect("write root");
+        run_success(sley_testkit::sley_bin!(), &root, &["add", "root.txt"]);
+        run_success(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["commit", "-m", "root", "-q"],
+        );
+
+        let sub = root.join("sub1");
+        fs::create_dir_all(&sub).expect("mkdir sub1");
+        run_success(sley_testkit::sley_bin!(), &sub, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::sley_bin!(),
+            &sub,
+            &["config", "user.email", "t@t.invalid"],
+        );
+        run_success(
+            sley_testkit::sley_bin!(),
+            &sub,
+            &["config", "user.name", "t"],
+        );
+        // Move .git to .real and leave a gitfile (absolute form).
+        let real = sub.join(".real");
+        fs::rename(sub.join(".git"), &real).expect("mv .git .real");
+        fs::write(
+            sub.join(".git"),
+            format!("gitdir: {}\n", real.display()),
+        )
+        .expect("write gitfile");
+        fs::write(sub.join("f"), b"x\n").expect("write sub file");
+        // add/commit must resolve the gitfile worktree (not treat as bare).
+        run_success(sley_testkit::sley_bin!(), &sub, &["add", "f"]);
+        run_success(
+            sley_testkit::sley_bin!(),
+            &sub,
+            &["commit", "-m", "first", "-q"],
+        );
+        let out = run(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["update-index", "--add", "--", "sub1"],
+        );
+        assert!(
+            out.status.success(),
+            "update-index --add sub1 failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stage = run_success(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["ls-files", "--stage", "sub1"],
+        );
+        let stage = String::from_utf8_lossy(&stage);
+        assert!(
+            stage.starts_with("160000 "),
+            "expected gitlink mode 160000, got: {stage}"
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
