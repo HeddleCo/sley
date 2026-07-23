@@ -406,22 +406,68 @@ impl ConfigIncludeContext {
 /// symlinks. Git compares both this spelling and the realpath, so callers
 /// should preserve `$GIT_DIR`/discovery text here and let the matcher add the
 /// canonical alternate.
+///
+/// When `$PWD` is a same-inode alias of the process cwd (typical after
+/// `cd` through a symlink), prefer that spelling so patterns like
+/// `gitdir:bar/` match a worktree entered via `bar -> foo` (t1305).
 pub fn git_dir_for_include_context(git_dir: &Path) -> PathBuf {
     if git_dir.is_absolute() {
-        git_dir.to_path_buf()
+        // Discovery usually hands us `getcwd()/.git` (physical). Re-spell
+        // under `$PWD` when that is a symlink alias, matching git's second
+        // `include_by_gitdir` attempt via `strbuf_add_absolute_path(".git")`.
+        path_with_pwd_prefix(git_dir).unwrap_or_else(|| git_dir.to_path_buf())
     } else {
-        absolute_path_preferring_pwd(git_dir)
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(git_dir))
-                    .unwrap_or_else(|_| git_dir.to_path_buf())
-            })
+        absolute_path_preferring_pwd(git_dir).unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(git_dir))
+                .unwrap_or_else(|_| git_dir.to_path_buf())
+        })
     }
 }
+
 fn absolute_path_preferring_pwd(path: &Path) -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let base = pwd_alias_of_cwd(&cwd).unwrap_or(cwd);
     Some(base.join(path))
+}
+
+/// Rewrite `path` so a prefix equal to the physical cwd is expressed via
+/// `$PWD`, when `$PWD` is a same-inode symlink alias of cwd.
+///
+/// Mirrors git's `strbuf_add_absolute_path` PWD preference, extended to
+/// absolute discovery paths that already used `getcwd()` (which never keeps
+/// symlink components).
+fn path_with_pwd_prefix(path: &Path) -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let pwd = pwd_alias_of_cwd(&cwd)?;
+    path_with_logical_cwd_prefix(path, &cwd, &pwd)
+}
+
+/// Core of [`path_with_pwd_prefix`], with the logical cwd supplied explicitly
+/// so unit tests can exercise symlink re-spelling without mutating process env
+/// (the workspace forbids `set_var`).
+fn path_with_logical_cwd_prefix(path: &Path, cwd: &Path, logical_cwd: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        if let Ok(rest) = path.strip_prefix(cwd) {
+            return Some(logical_cwd.join(rest));
+        }
+        // macOS: getcwd may be `/private/tmp/...` while `$PWD` is `/tmp/...`.
+        if let Ok(cwd_canon) = fs::canonicalize(cwd) {
+            if cwd_canon != cwd
+                && let Ok(rest) = path.strip_prefix(&cwd_canon)
+            {
+                return Some(logical_cwd.join(rest));
+            }
+            if let Ok(path_canon) = fs::canonicalize(path)
+                && let Ok(rest) = path_canon.strip_prefix(&cwd_canon)
+            {
+                return Some(logical_cwd.join(rest));
+            }
+        }
+        None
+    } else {
+        Some(logical_cwd.join(path))
+    }
 }
 
 fn pwd_alias_of_cwd(cwd: &Path) -> Option<PathBuf> {
@@ -1406,13 +1452,30 @@ fn normalize_path_for_match(path: &Path) -> String {
 
 /// Git matches both the textual `$GIT_DIR` path and its realpath so symlinked
 /// worktrees can use either spelling in `includeIf.gitdir`.
+///
+/// A third spelling is tried when `$PWD` is a same-inode alias of cwd: rewrite
+/// the physical-cwd prefix of `git_dir` to `$PWD`. That is how git's second
+/// `include_by_gitdir` attempt reaches `$PWD/.git` for a relative default
+/// gitdir after `cd` through a symlink (t1305 "gitdir matching symlink").
 fn gitdir_match_targets(git_dir: &Path) -> Vec<String> {
-    let mut targets = vec![normalize_path_for_match(git_dir)];
-    if let Ok(realpath) = fs::canonicalize(git_dir) {
-        let realpath = normalize_path_for_match(&realpath);
-        if !targets.iter().any(|target| target == &realpath) {
-            targets.push(realpath);
+    let mut targets = Vec::new();
+    let mut push = |path: PathBuf| {
+        let normalized = normalize_path_for_match(&path);
+        if !targets.iter().any(|target| target == &normalized) {
+            targets.push(normalized);
         }
+    };
+    push(git_dir.to_path_buf());
+    if let Some(pwd_spelling) = path_with_pwd_prefix(git_dir) {
+        push(pwd_spelling);
+    } else if !git_dir.is_absolute() {
+        // No usable `$PWD` alias: still absolutize against getcwd.
+        if let Ok(cwd) = std::env::current_dir() {
+            push(cwd.join(git_dir));
+        }
+    }
+    if let Ok(realpath) = fs::canonicalize(git_dir) {
+        push(realpath);
     }
     targets
 }
@@ -3834,6 +3897,88 @@ mod tests {
         let ctx = ConfigIncludeContext::new(Some(PathBuf::from("/some/path/repo/.git")), None);
         let config = load_config_with_includes(&main, &ctx).expect("test operation should succeed");
         assert_eq!(config.get("user", None, "name"), Some("ci"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// t1305 "conditional include, gitdir matching symlink" (+ icase): after
+    /// `cd` through a worktree symlink, `$PWD` keeps the link spelling while
+    /// `getcwd`/discovery yield the physical path. Patterns that name the
+    /// link component must still match.
+    ///
+    /// Process env is not mutated (workspace forbids `set_var`); the PWD
+    /// re-spell helper is exercised directly, then matching uses that path.
+    #[test]
+    #[cfg(unix)]
+    fn config_include_if_gitdir_matches_symlink_pwd_spelling() {
+        let dir = unique_include_dir("inc-gitdir-symlink");
+        let physical = dir.join("foo");
+        fs::create_dir_all(physical.join(".git")).expect("mkdir physical repo");
+        let link = dir.join("bar");
+        std::os::unix::fs::symlink(&physical, &link).expect("symlink bar -> foo");
+
+        let main = physical.join(".git/config");
+        fs::write(
+            &main,
+            "[includeIf \"gitdir:bar/\"]\n\tpath = bar7.cfg\n\
+             [includeIf \"gitdir/i:BAR/\"]\n\tpath = bar8.cfg\n",
+        )
+        .expect("write config");
+        fs::write(
+            physical.join(".git/bar7.cfg"),
+            "[test]\n\tseven = 7\n",
+        )
+        .expect("write bar7");
+        fs::write(
+            physical.join(".git/bar8.cfg"),
+            "[test]\n\teight = 8\n",
+        )
+        .expect("write bar8");
+
+        let discovered = physical.join(".git");
+        // Discovery path is physical; logical `$PWD` names the symlink.
+        let logical = path_with_logical_cwd_prefix(&discovered, &physical, &link)
+            .expect("re-spell physical gitdir under symlink $PWD");
+        assert!(
+            logical.to_string_lossy().contains("bar"),
+            "logical gitdir should keep the symlink component: {}",
+            logical.display()
+        );
+
+        let ctx = ConfigIncludeContext::new(Some(logical), None);
+        let config = load_config_with_includes(&main, &ctx).expect("load includes");
+        assert_eq!(
+            config.get("test", None, "seven"),
+            Some("7"),
+            "gitdir:bar/ must match via $PWD symlink spelling"
+        );
+        assert_eq!(
+            config.get("test", None, "eight"),
+            Some("8"),
+            "gitdir/i:BAR/ must match via $PWD symlink spelling"
+        );
+
+        // Realpath-only context still works for patterns that name the
+        // physical component (`foo/`), and does not spuriously match `bar/`
+        // without a PWD rewrite available in this process.
+        let physical_ctx = ConfigIncludeContext::new(Some(discovered.clone()), None);
+        let config =
+            load_config_with_includes(&main, &physical_ctx).expect("load includes physical");
+        // No `$PWD` rewrite in-process here; physical path alone must not
+        // invent a `bar/` component. Realpath + textual still load nothing
+        // for these patterns.
+        assert_eq!(config.get("test", None, "seven"), None);
+        assert_eq!(config.get("test", None, "eight"), None);
+
+        // Unanchored physical-name pattern still matches the discovered path.
+        fs::write(
+            &main,
+            "[includeIf \"gitdir:foo/\"]\n\tpath = bar7.cfg\n",
+        )
+        .expect("rewrite config");
+        let config =
+            load_config_with_includes(&main, &physical_ctx).expect("load physical-name include");
+        assert_eq!(config.get("test", None, "seven"), Some("7"));
+
         fs::remove_dir_all(&dir).ok();
     }
 
