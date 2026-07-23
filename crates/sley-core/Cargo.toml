@@ -8,6 +8,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# NFD→NFC path precomposition for `core.precomposeunicode` (macOS HFS+/APFS).
+# License Unicode-3.0 is allowed in deny.toml.
+unicode-normalization = "0.1"
 # Only pulled in under `fast-sha1`; the default build stays dependency-free and
 # pure-Rust. RustCrypto's sha1 dispatches to ARMv8-SHA1 / x86 SHA-NI at runtime
 # and produces byte-identical digests, so OIDs are unchanged.

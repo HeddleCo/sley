@@ -867,7 +867,10 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
     let mut verbosity = 0i32;
     let mut rebase_flag = None::<PullRebase>;
     let mut autostash_flag = None::<bool>;
-    let mut force_rebase = false;
+    // git's OPT__FORCE on pull: a *fetch* option ("force overwrite of local
+    // branch"), not `--force-rebase`. Wave2 incorrectly treated `-f/--force` as
+    // rebase-only and left FetchOptions.force hard-coded false (t5521 #12).
+    let mut force = false;
     let mut verify_signatures = None::<bool>;
     let mut dry_run = false;
     let mut no_write_fetch_head = false;
@@ -898,7 +901,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
             "--no-rebase" => rebase_flag = Some(PullRebase::False),
             "--autostash" => autostash_flag = Some(true),
             "--no-autostash" => autostash_flag = Some(false),
-            "-f" | "--force" => force_rebase = true,
+            "-f" | "--force" => force = true,
             "--verify-signatures" => {
                 verify_signatures = Some(true);
                 merge_passthrough.push(arg.clone());
@@ -1061,7 +1064,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
         prune: false,
         prune_tags: false,
         dry_run,
-        force: false,
+        force,
         append: false,
         write_fetch_head: !dry_run,
         tag_option_explicit: tags.is_some(),
@@ -1314,9 +1317,6 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
         push_autostash_arg(&mut rebase_args, effective_autostash);
         if verbosity < 0 {
             rebase_args.push("--quiet".to_string());
-        }
-        if force_rebase {
-            rebase_args.push("--force-rebase".to_string());
         }
         if update_recurse_submodules {
             rebase_args.push("--recurse-submodules".to_string());
