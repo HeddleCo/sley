@@ -2987,6 +2987,16 @@ pub(crate) fn reset_merge_in(
     };
     index.upgrade_version_for_flags();
     fs::write(&index_path, index.write(format)?)?;
+    // Apply removals before materializations. A directory→gitlink transition
+    // has flattened deletes under `path/` plus a gitlink at `path`; writing the
+    // gitlink directory first and then pruning its children via
+    // `merge_remove_worktree_file` → `merge_prune_empty_dirs` would rmdir the
+    // newly-required empty submodule placeholder (t7112 reset --merge
+    // "replace directory with submodule"). Deletions first leave the parent
+    // gone/empty, then the gitlink write recreates the empty directory.
+    for path in &deletions {
+        crate::commands::merge_rebase::merge_remove_worktree_file(worktree_root, path)?;
+    }
     for (path, (mode, oid)) in &updates {
         let content = if sley_index::is_gitlink(*mode) {
             Vec::new()
@@ -3000,8 +3010,27 @@ pub(crate) fn reset_merge_in(
             *mode,
         )?;
     }
-    for path in &deletions {
-        crate::commands::merge_rebase::merge_remove_worktree_file(worktree_root, path)?;
+    // Belt-and-suspenders: every target gitlink must exist as a directory
+    // placeholder even when no CE_UPDATE was planned (identical oid carried
+    // through) or when a deletion pruned a parent that the target still records
+    // as a submodule path.
+    for (path, (mode, _)) in &target_map {
+        if !sley_index::is_gitlink(*mode) {
+            continue;
+        }
+        let Ok(rel) = std::str::from_utf8(path) else {
+            continue;
+        };
+        let full = worktree_root.join(rel);
+        if full.is_dir() {
+            continue;
+        }
+        crate::commands::merge_rebase::merge_write_worktree_file(
+            worktree_root,
+            path,
+            &[],
+            *mode,
+        )?;
     }
     sley_worktree::refresh_index_paths_with_options(
         worktree_root,

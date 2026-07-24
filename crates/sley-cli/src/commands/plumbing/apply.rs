@@ -2050,8 +2050,15 @@ fn read_patch_base(
         }
         return Ok(blob);
     }
-    let Some(blob) =
-        read_worktree_patch_blob_bytes(worktree_base, filter_worktree_root, git_dir, config, old)?
+    let keep_crlf = patch_crlf_in_old(patch);
+    let Some(blob) = read_worktree_patch_blob_bytes_with_eol(
+        worktree_base,
+        filter_worktree_root,
+        git_dir,
+        config,
+        old,
+        keep_crlf,
+    )?
     else {
         eprintln!(
             "error: {}: No such file or directory",
@@ -2141,12 +2148,44 @@ fn worktree_umask_complement(dir: &Path) -> u32 {
 
 /// Read the blob-form bytes of a worktree path (the symlink target for a
 /// symlink, the file bytes otherwise), or `None` when the path does not exist.
+/// True when any preimage (context/delete) line in the patch ends with CR —
+/// git's `crlf_in_old`. When set, preimage loading must use
+/// `CONV_EOL_KEEP_CRLF` so worktree CRLF is not stripped under `text=auto`.
+fn patch_crlf_in_old(patch: &sley_diff_merge::FilePatch) -> bool {
+    patch.hunks.iter().any(|hunk| {
+        hunk.lines.iter().any(|line| match line {
+            sley_diff_merge::HunkLine::Context(bytes) | sley_diff_merge::HunkLine::Delete(bytes) => {
+                bytes.last() == Some(&b'\r')
+            }
+            sley_diff_merge::HunkLine::Insert(_) => false,
+        })
+    })
+}
+
 fn read_worktree_patch_blob_bytes(
     worktree_base: &Path,
     filter_worktree_root: &Path,
     git_dir: &Path,
     config: &GitConfig,
     path: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    read_worktree_patch_blob_bytes_with_eol(
+        worktree_base,
+        filter_worktree_root,
+        git_dir,
+        config,
+        path,
+        false,
+    )
+}
+
+fn read_worktree_patch_blob_bytes_with_eol(
+    worktree_base: &Path,
+    filter_worktree_root: &Path,
+    git_dir: &Path,
+    config: &GitConfig,
+    path: &[u8],
+    keep_crlf: bool,
 ) -> Result<Option<Vec<u8>>> {
     let rel = std::str::from_utf8(path)
         .map_err(|_| GitError::InvalidFormat("non-utf8 patch path".into()))?;
@@ -2178,13 +2217,23 @@ fn read_worktree_patch_blob_bytes(
         return Ok(None);
     }
     let body = fs::read(full)?;
-    Ok(Some(sley_worktree::apply_clean_filter(
-        filter_worktree_root,
-        git_dir,
-        config,
-        path,
-        &body,
-    )?))
+    if keep_crlf {
+        Ok(Some(sley_worktree::apply_clean_filter_keep_crlf(
+            filter_worktree_root,
+            git_dir,
+            config,
+            path,
+            &body,
+        )?))
+    } else {
+        Ok(Some(sley_worktree::apply_clean_filter(
+            filter_worktree_root,
+            git_dir,
+            config,
+            path,
+            &body,
+        )?))
+    }
 }
 
 /// Outcome of applying a binary file patch.

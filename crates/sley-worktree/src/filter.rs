@@ -1568,6 +1568,33 @@ pub fn apply_clean_filter(
     apply_clean_filter_with_attributes(config, &checks, path, content)
 }
 
+/// Like [`apply_clean_filter`] but with git's `CONV_EOL_KEEP_CRLF`: clean driver
+/// and ident still run, but CRLF→LF conversion is suppressed. Used by
+/// `git apply` when the patch's preimage context already contains CRLF
+/// (`crlf_in_old`), so worktree content is matched byte-for-byte against the
+/// patch lines rather than renormalized under `text=auto`.
+pub fn apply_clean_filter_keep_crlf(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    config: &GitConfig,
+    path: &[u8],
+    content: &[u8],
+) -> Result<Vec<u8>> {
+    let _ = git_dir.as_ref();
+    let checks = filter_attribute_checks(worktree_root.as_ref(), path)?;
+    Ok(apply_clean_filter_cow_inner(
+        config,
+        &checks,
+        path,
+        content,
+        ConvFlags::Off,
+        SafeCrlfIndexBlob::None,
+        false,
+        true, // keep_crlf
+    )?
+    .into_owned())
+}
+
 /// A reusable handle that captures the worktree's `.gitattributes` chain once so
 /// repeated clean-filter calls (e.g. `hash-object --stdin-paths` hashing many
 /// paths in one process) don't re-walk the worktree and re-read every
@@ -1602,6 +1629,31 @@ impl WorktreeAttributes {
             .matcher
             .attributes_for_path(path, &filter_attribute_names(), false);
         apply_clean_filter_with_attributes(config, &checks, path, content)
+    }
+
+    /// Clean conversion that honours git's `has_crlf_in_index` safeguard for
+    /// `text=auto` / `core.autocrlf`: when `index_blob` already contains CRLF,
+    /// the worktree CRLF is left unconverted so a diff against that blob
+    /// keeps matching line endings on both sides.
+    pub fn apply_clean_filter_respecting_index(
+        &self,
+        config: &GitConfig,
+        path: &[u8],
+        content: &[u8],
+        index_blob: SafeCrlfIndexBlob<'_>,
+    ) -> Result<Vec<u8>> {
+        let checks = self
+            .matcher
+            .attributes_for_path(path, &filter_attribute_names(), false);
+        Ok(apply_clean_filter_with_attributes_cow_safecrlf(
+            config,
+            &checks,
+            path,
+            content,
+            ConvFlags::Off,
+            index_blob,
+        )?
+        .into_owned())
     }
 }
 
@@ -1791,13 +1843,25 @@ pub fn apply_clean_filter_with_attributes_cow_safecrlf<'a>(
 ) -> Result<Cow<'a, [u8]>> {
     // Non-object-writing callers (diff/status comparison): an encoding failure
     // is reported but not fatal.
-    apply_clean_filter_cow_inner(config, attributes, path, content, flags, index_blob, false)
+    apply_clean_filter_cow_inner(
+        config,
+        attributes,
+        path,
+        content,
+        flags,
+        index_blob,
+        false,
+        false,
+    )
 }
 
 /// Clean conversion core. `write_object` is set on the paths that hash content
 /// into the object database (add / hash-object): there, an invalid
 /// `working-tree-encoding` (bad BOM, undecodable bytes) is fatal, mirroring
 /// convert.c's `CONV_WRITE_OBJECT` die.
+///
+/// `keep_crlf` mirrors convert.c `CONV_EOL_KEEP_CRLF`: when true the EOL pass is
+/// skipped entirely (drivers/ident still run).
 pub(crate) fn apply_clean_filter_cow_inner<'a>(
     config: &GitConfig,
     attributes: &[AttributeCheck],
@@ -1806,6 +1870,7 @@ pub(crate) fn apply_clean_filter_cow_inner<'a>(
     flags: ConvFlags,
     index_blob: SafeCrlfIndexBlob<'_>,
     write_object: bool,
+    keep_crlf: bool,
 ) -> Result<Cow<'a, [u8]>> {
     let plan = ContentFilterPlan::resolve(config, attributes);
     check_wt_encoding_valid(&plan.encoding)?;
@@ -1826,10 +1891,13 @@ pub(crate) fn apply_clean_filter_cow_inner<'a>(
         let old_stats = gather_convert_stats(&data);
         plan.check_safe_crlf_stats(&old_stats, index_has_crlf, flags, path)?;
     }
-    // convert.c's CONV_EOL_RENORMALIZE flag bypasses this safeguard by not
-    // consulting the current index blob. Callers express that as
-    // `SafeCrlfIndexBlob::None`.
-    if plan.convert_eol(&data) && !(plan.text == TextDecision::Auto && index_has_crlf) {
+    // convert.c's CONV_EOL_KEEP_CRLF skips crlf_to_git entirely. CONV_EOL_RENORMALIZE
+    // bypasses the index-CRLF safeguard by not consulting the current index blob;
+    // callers express that as `SafeCrlfIndexBlob::None`.
+    if !keep_crlf
+        && plan.convert_eol(&data)
+        && !(plan.text == TextDecision::Auto && index_has_crlf)
+    {
         data = convert_crlf_to_lf_cow(data);
     }
     if plan.ident {

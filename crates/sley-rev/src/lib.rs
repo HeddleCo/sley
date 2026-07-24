@@ -6819,12 +6819,24 @@ pub fn merge_bases<R: ObjectReader>(
             }
         }
     }
+    // Deterministic equal-date order, then stable date sort newest-first —
+    // matching git's `commit_list_sort_by_date` / `compare_commits_by_commit_date`.
+    // Callers that fold virtual ancestors (merge) reverse this list so the fold
+    // sees oldest first (builtin/merge.c try_merge_strategy).
     let mut bases: Vec<ObjectId> = candidates
         .into_iter()
         .filter(|candidate| !dominated.contains(candidate))
         .collect();
     bases.sort_by_key(|oid| oid.to_hex());
-    Ok(bases)
+    let mut dated: Vec<(i64, ObjectId)> = Vec::with_capacity(bases.len());
+    for oid in bases {
+        let time = graph.commit_time(&oid)?.map(Ok).unwrap_or_else(|| {
+            commit_metadata_from_object(reader, format, &oid).map(|(_, t)| t)
+        })?;
+        dated.push((time, oid));
+    }
+    dated.sort_by(|a, b| b.0.cmp(&a.0));
+    Ok(dated.into_iter().map(|(_, oid)| oid).collect())
 }
 
 /// BFS the ancestry of `start`, recording the shortest distance to each commit.

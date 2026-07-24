@@ -447,6 +447,7 @@ fn dispatch_command(
         "pack-objects" => commands::pack_objects::cmd_pack_objects(cli_session, &args[1..]),
         "cat-file" => commands::cat_file::cmd_cat_file(cli_session, &args[1..]),
         "checkout" => commands::checkout::cmd_checkout(cli_session, &args[1..]),
+        "backfill" => commands::backfill::cmd_backfill(cli_session, &args[1..]),
         "check-attr" => commands::attrs::cmd_check_attr(cli_session, &args[1..]),
         "check-ignore" => commands::attrs::cmd_check_ignore(cli_session, &args[1..]),
         "check-mailmap" => commands::utility::cmd_check_mailmap(cli_session, &args[1..]),

@@ -2676,6 +2676,47 @@ fn env_count_parameters() -> std::result::Result<Vec<ConfigParameter>, ConfigPar
     Ok(out)
 }
 
+/// Process-local accumulation of command-line `-c` / `--config-env` fragments.
+/// Stands in for git's mutation of the process `GIT_CONFIG_PARAMETERS` env var
+/// (forbidden here via the workspace ban on `env::set_var`).
+static CMDLINE_CONFIG_PARAMETERS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Append a `key[=value]` pair to the process-local command-line config fragment
+/// in sq-quoted new-style form, mirroring git's `git_config_push_split_parameter`.
+pub fn push_cmdline_config_parameter(key: &str, value: Option<&str>) {
+    if let Ok(mut fragment) = CMDLINE_CONFIG_PARAMETERS.lock() {
+        if !fragment.is_empty() {
+            fragment.push(' ');
+        }
+        fragment.push_str(&sq_quote(key));
+        fragment.push('=');
+        if let Some(value) = value {
+            fragment.push_str(&sq_quote(value));
+        }
+    }
+}
+
+/// The effective `GIT_CONFIG_PARAMETERS` string: the inherited env value (if any)
+/// followed by the command-line `-c`/`--config-env` fragment, space-separated.
+/// Used both for in-process reads and for exporting to child processes (ext::
+/// remotes, shell aliases) so they inherit the parent's overrides.
+pub fn effective_config_parameters_env() -> Option<String> {
+    let inherited = std::env::var("GIT_CONFIG_PARAMETERS")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let fragment = CMDLINE_CONFIG_PARAMETERS
+        .lock()
+        .ok()
+        .map(|f| f.clone())
+        .filter(|s| !s.is_empty());
+    match (inherited, fragment) {
+        (Some(inherited), Some(fragment)) => Some(format!("{inherited} {fragment}")),
+        (Some(inherited), None) => Some(inherited),
+        (None, Some(fragment)) => Some(fragment),
+        (None, None) => None,
+    }
+}
+
 /// Build the full ordered config-injection parameter stream: `GIT_CONFIG_COUNT`
 /// pairs (read from the process environment) first, then the supplied
 /// `GIT_CONFIG_PARAMETERS` value (`parameters_env`), into which the caller has
@@ -2683,15 +2724,22 @@ fn env_count_parameters() -> std::result::Result<Vec<ConfigParameter>, ConfigPar
 /// lowest-to-highest precedence and is layered on top of the config files by the
 /// caller.
 ///
-/// `parameters_env` is passed explicitly rather than read here because the CLI
-/// cannot mutate the process env (the workspace forbids `unsafe`/`set_var`), so
-/// it reconstructs the effective `GIT_CONFIG_PARAMETERS` (inherited env plus the
-/// command-line fragment) itself.
+/// When `parameters_env` is `None`, the process-local command-line fragment is
+/// combined with any inherited `GIT_CONFIG_PARAMETERS` automatically.
 pub fn injected_config_parameters(
     parameters_env: Option<&str>,
 ) -> std::result::Result<Vec<ConfigParameter>, ConfigParameterError> {
     let mut out = env_count_parameters()?;
-    if let Some(env) = parameters_env.filter(|env| !env.is_empty()) {
+    let owned;
+    let env = match parameters_env {
+        Some(env) if !env.is_empty() => Some(env),
+        Some(_) => None,
+        None => {
+            owned = effective_config_parameters_env();
+            owned.as_deref()
+        }
+    };
+    if let Some(env) = env.filter(|env| !env.is_empty()) {
         out.extend(parse_config_env_list(env)?);
     }
     Ok(out)

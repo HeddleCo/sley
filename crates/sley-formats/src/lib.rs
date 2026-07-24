@@ -3042,7 +3042,8 @@ impl RepositoryBootstrap {
                 if existing != new_separate {
                     if existing.exists() && !new_separate.exists() {
                         if let Some(parent) = new_separate.parent() {
-                            create_shared_dir(parent, options.shared_repository.as_deref())?;
+                            // Leading dirs outside the repository follow umask.
+                            fs::create_dir_all(parent)?;
                         }
                         fs::rename(&existing, &new_separate)?;
                         // git's `separate_git_dir()` calls
@@ -3061,7 +3062,8 @@ impl RepositoryBootstrap {
         } else if let Some(separate_git_dir) = options.separate_git_dir.clone() {
             write_git_link = true;
             if let Some(parent) = separate_git_dir.parent() {
-                create_shared_dir(parent, options.shared_repository.as_deref())?;
+                // Leading dirs outside the repository follow umask.
+                fs::create_dir_all(parent)?;
             }
             // Move the *resolved* git directory (`git_link`), which is `.git` itself
             // when it is a real directory or its symlink target when `.git` is a
@@ -3119,6 +3121,16 @@ impl RepositoryBootstrap {
             .map(|backend| backend.path.clone())
             .unwrap_or_else(|| git_dir.clone());
 
+        // Leading directories of the repository path honor umask only.
+        // git's init-db temporarily sets sharedRepository=0 for
+        // safe_create_leading_directories, then mkdir()s the final directory
+        // and applies shared mode only to the repository itself (t0001
+        // "init creates a new deep directory (umask vs. shared)").
+        if let Some(parent) = git_dir.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
         create_shared_dir(&git_dir, options.shared_repository.as_deref())?;
         let object_dir = options
             .object_dir

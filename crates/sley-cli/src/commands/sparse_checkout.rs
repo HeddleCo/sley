@@ -1500,6 +1500,10 @@ fn apply_current_sparse(ctx: &SparseContext) -> Result<()> {
         .iter()
         .map(|entry| entry.path.clone())
         .collect::<Vec<_>>();
+    // Expanding the cone may require blobs that a partial clone never
+    // downloaded. Prefetch them from configured promisor remotes before the
+    // materialize loop (t5620 sparse-checkout set d during backfill --sparse).
+    prefetch_sparse_cone_blobs(ctx, &sparse, mode)?;
     let result = apply_sparse_checkout_with_mode(
         &ctx.worktree_root,
         &ctx.git_dir,
@@ -1516,6 +1520,77 @@ fn apply_current_sparse(ctx: &SparseContext) -> Result<()> {
         &result.unmerged,
         &result.untracked_sparse_directories,
     );
+    Ok(())
+}
+
+/// Prefetch missing index blobs that the new sparse cone will materialize.
+fn prefetch_sparse_cone_blobs(
+    ctx: &SparseContext,
+    sparse: &SparseCheckout,
+    mode: SparseCheckoutMode,
+) -> Result<()> {
+    let Some(index) = sley_worktree::read_repository_index(&ctx.git_dir, ctx.format)? else {
+        return Ok(());
+    };
+    let db = FileObjectDatabase::from_git_dir(&ctx.git_dir, ctx.format)
+        .with_promisor_remote_present(true);
+    let mut wants = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry in &index.entries {
+        if entry.stage() != sley_index::Stage::Normal {
+            continue;
+        }
+        if entry.is_sparse_dir() || sley_index::is_gitlink(entry.mode) {
+            continue;
+        }
+        if !path_in_sparse_checkout(entry.path.as_bytes(), sparse, mode) {
+            continue;
+        }
+        if !seen.insert(entry.oid) {
+            continue;
+        }
+        if !db.contains(&entry.oid).unwrap_or(false) {
+            wants.push(entry.oid);
+        }
+    }
+    if wants.is_empty() {
+        return Ok(());
+    }
+    let config = crate::commands::remote::read_repo_config_on_disk(&ctx.git_dir).unwrap_or_default();
+    let remotes = crate::promisor_remote_names(&config);
+    for remote_name in &remotes {
+        if wants.is_empty() {
+            break;
+        }
+        let Some(url) = config.get("remote", Some(remote_name), "url") else {
+            continue;
+        };
+        let Ok(remote_git_dir) = sley_remote::resolve_local_remote_git_dir(
+            sley_remote::RemoteResolutionContext {
+                cwd: &ctx.worktree_root,
+                local_git_dir: Some(&ctx.git_dir),
+                config: Some(&config),
+            },
+            url,
+        ) else {
+            continue;
+        };
+        let _ = sley_remote::install_fetch_pack_via_local_upload_pack(
+            &ctx.git_dir,
+            &remote_git_dir,
+            ctx.format,
+            wants.clone(),
+            None,
+            true,
+            false,
+            None,
+            None,
+            false,
+            None,
+        );
+        db.refresh_read_cache();
+        wants.retain(|oid| !db.contains(oid).unwrap_or(false));
+    }
     Ok(())
 }
 

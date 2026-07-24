@@ -1670,9 +1670,38 @@ fn resolve_add_regular_actions(
         if !path_matches {
             continue;
         }
-        let path = worktree_path_from_git_path(worktree_root, &path)?;
-        if seen.insert(path.clone()) {
-            actions.push(AddAction::Add(path));
+        let abs = worktree_path_from_git_path(worktree_root, &path)?;
+        // git's fix_unmerged_status (read-cache.c): unmerged + missing worktree
+        // becomes DELETED when removals are allowed (add -u/-A), but MODIFIED
+        // when ADD_CACHE_IGNORE_REMOVAL is set (plain/explicit add, --no-all).
+        // The MODIFIED arm then lstat()s and dies with "unable to stat".
+        let missing = match fs::symlink_metadata(&abs) {
+            Ok(_) => false,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                true
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if missing {
+            if options.ignore_removal {
+                let display = abs
+                    .strip_prefix(worktree_root)
+                    .unwrap_or(&abs)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                eprintln!("fatal: unable to stat '{display}': No such file or directory");
+                return Err(GitError::Exit(128));
+            }
+            if seen.insert(abs.clone()) {
+                actions.push(AddAction::Remove(abs));
+            }
+        } else if seen.insert(abs.clone()) {
+            actions.push(AddAction::Add(abs));
         }
     }
     let mut collect_status_action = |entry: sley_worktree::ShortStatusRow<'_>| {

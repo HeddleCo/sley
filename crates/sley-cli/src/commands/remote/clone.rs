@@ -1231,6 +1231,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
         ssh_options: None,
         upload_pack_command: None,
         reject_shallow: reject_shallow_config.unwrap_or(false),
+            sparse: false,
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress_sink = StdoutProgress::default();
@@ -1568,6 +1569,7 @@ fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Resu
         atomic: false,
         negotiation_restrict: None,
         negotiation_include: None,
+        negotiate_only: false,
     };
     let outcome = super::helper::fetch_with_discovered_remote_helper(
         options.context,
@@ -1785,6 +1787,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
             atomic: false,
             negotiation_restrict: None,
             negotiation_include: None,
+            negotiate_only: false,
         },
     )?;
     if let Some(branch) = head_branch {
@@ -2165,6 +2168,7 @@ fn clone_network_repository(
             .then_some(options.upload_pack_command)
             .flatten(),
         reject_shallow: options.reject_shallow,
+            sparse: false,
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress::new(options.quiet);
@@ -2411,6 +2415,7 @@ fn clone_bare_network_repository(
             atomic: false,
             negotiation_restrict: None,
             negotiation_include: None,
+            negotiate_only: false,
         },
         &[],
     )
@@ -2899,6 +2904,7 @@ fn clone_bare_or_mirror_local_repository(
             atomic: false,
             negotiation_restrict: None,
             negotiation_include: None,
+            negotiate_only: false,
         },
     );
     env::set_current_dir(previous_cwd)?;
@@ -4006,19 +4012,32 @@ fn remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Result<Str
 
 fn clone_remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Result<Option<String>> {
     let remote_store = FileRefStore::new_without_reference_backend_env(remote_git_dir, format);
-    let Some(RefTarget::Symbolic(target)) = remote_store.read_ref("HEAD")? else {
+    // When GIT_NAMESPACE / `--namespace` is active, the remote's default branch
+    // is the namespaced HEAD (e.g. `refs/namespaces/ns/HEAD` →
+    // `refs/namespaces/ns/refs/heads/two`), advertised to clients as
+    // `HEAD → refs/heads/two`. Read the namespaced form and strip before use.
+    let head_name = sley_core::expand_namespace("HEAD");
+    let Some(RefTarget::Symbolic(target)) = remote_store.read_ref(&head_name)? else {
         return Ok(None);
     };
-    let Some(branch) = target.strip_prefix("refs/heads/") else {
+    let logical_target = sley_core::strip_namespace(&target).unwrap_or(target.as_str());
+    let Some(branch) = logical_target.strip_prefix("refs/heads/") else {
         return Ok(None);
     };
+    // Existence check uses the physical (namespaced) target.
     if remote_store.read_ref(&target)?.is_some() {
         return Ok(Some(branch.to_string()));
     }
+    let namespace = sley_core::get_git_namespace();
+    let heads_prefix = if namespace.is_empty() {
+        "refs/heads/".to_string()
+    } else {
+        format!("{namespace}refs/heads/")
+    };
     if remote_store
         .list_refs()?
         .into_iter()
-        .any(|reference| reference.name.starts_with("refs/heads/"))
+        .any(|reference| reference.name.starts_with(&heads_prefix))
     {
         return Ok(None);
     }

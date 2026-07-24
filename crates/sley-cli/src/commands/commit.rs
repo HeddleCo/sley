@@ -1221,7 +1221,9 @@ pub(crate) fn cmd_commit(
         commit_stage_tracked_changes(cli_session, &git_dir, format)?;
     }
     // Emptiness is judged before the signoff trailer is added (git aborts
-    // `commit -m "" -s`).
+    // `commit -m "" -s`). Cleanup mode is resolved just below; for the
+    // pre-signoff check we only need a whitespace-only verdict (verbatim is
+    // re-checked after cleanup via `commit_message_is_empty_for_cleanup`).
     let empty_before_signoff = commit_message_is_empty(&commit_message_with_trailers(
         repo_config.as_ref(),
         &message,
@@ -1424,7 +1426,10 @@ pub(crate) fn cmd_commit(
     }
     message = fs::read(&editmsg)?;
     message = commit_cleanup_message(message, cleanup_mode, &comment_char, verbose > 0);
-    if (in_cherry_pick || in_revert) && !allow_empty_message && commit_message_is_empty(&message) {
+    if (in_cherry_pick || in_revert)
+        && !allow_empty_message
+        && commit_message_is_empty_for_cleanup(&message, cleanup_mode)
+    {
         let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
@@ -1478,13 +1483,20 @@ pub(crate) fn cmd_commit(
             cli_session.lazy_fetch(),
         );
     }
-    if !allow_empty_message && empty_before_signoff && !use_editor {
+    // git's message_is_empty with CLEANUP_NONE (verbatim) treats any non-zero
+    // buffer as non-empty, so a bare newline from `-m "$LF" --cleanup=verbatim`
+    // is allowed (t6006). The pre-signoff emptiness flag alone is insufficient.
+    if !allow_empty_message
+        && empty_before_signoff
+        && !use_editor
+        && cleanup_mode != CommitCleanupMode::Verbatim
+    {
         let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
     }
     if !allow_empty_message
-        && (commit_message_is_empty(&message)
+        && (commit_message_is_empty_for_cleanup(&message, cleanup_mode)
             || (template_message_source
                 && cleanup_mode_strips_comments(cleanup_mode)
                 && commit_message_lacks_non_trailer_content(&message)))
@@ -2668,8 +2680,21 @@ fn read_porcelain_commit_message_file(path: &str) -> Result<Vec<u8>> {
     Ok(message)
 }
 
+/// Match git's `message_is_empty` (sequencer.c): with `cleanup=verbatim`
+/// (`COMMIT_MSG_CLEANUP_NONE`), any non-zero-length buffer is non-empty — even
+/// if it is only whitespace/newlines. Other cleanup modes treat an all-
+/// whitespace (and signed-off-by-only) message as empty.
 fn commit_message_is_empty(message: &[u8]) -> bool {
     message.iter().all(u8::is_ascii_whitespace)
+}
+
+/// Like [`commit_message_is_empty`] but respects cleanup mode the way git does
+/// in `message_is_empty(sb, cleanup_mode)`.
+fn commit_message_is_empty_for_cleanup(message: &[u8], cleanup_mode: CommitCleanupMode) -> bool {
+    if cleanup_mode == CommitCleanupMode::Verbatim && !message.is_empty() {
+        return false;
+    }
+    commit_message_is_empty(message)
 }
 
 fn commit_message_lacks_non_trailer_content(message: &[u8]) -> bool {

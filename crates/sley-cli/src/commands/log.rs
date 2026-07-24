@@ -847,10 +847,46 @@ fn log_source_labels_for_selected(
     labels
 }
 
-fn log_unborn_head_branch(git_dir: &Path) -> Option<String> {
-    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let target = head.trim().strip_prefix("ref: ")?;
-    target.strip_prefix("refs/heads/").map(str::to_string)
+/// Classification of a failed default-HEAD revision resolution for `git log`.
+enum MissingDefaultHead {
+    /// HEAD is missing, not a symref, or points at a broken/invalid ref body.
+    Broken,
+    /// HEAD is a clean symref to an unborn `refs/heads/*` branch.
+    Unborn(String),
+    /// Failure is not about the default HEAD tip (e.g. unrelated parse error).
+    Other,
+}
+
+/// Port of git's `diagnose_missing_default` (revision.c): decide between the
+/// "appears to be broken" and "does not have any commits yet" messages.
+fn diagnose_missing_default_head(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+) -> MissingDefaultHead {
+    let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) else {
+        return MissingDefaultHead::Broken;
+    };
+    let head = head.trim();
+    let Some(target) = head.strip_prefix("ref: ") else {
+        // Direct or empty HEAD is not a clean branch symref → broken.
+        return MissingDefaultHead::Broken;
+    };
+    let target = target.trim();
+    let store = sley_refs::FileRefStore::new(git_dir.to_path_buf(), format);
+    match store.read_ref(target) {
+        // Target ref absent: unborn only for refs/heads/* (git's skip_prefix).
+        Ok(None) => match target.strip_prefix("refs/heads/") {
+            Some(branch) if !branch.is_empty() => {
+                MissingDefaultHead::Unborn(branch.to_string())
+            }
+            _ => MissingDefaultHead::Broken,
+        },
+        // Target ref exists with a valid oid (object may still be missing) —
+        // not the unborn/broken diagnosis path; let the original error stand.
+        Ok(Some(_)) => MissingDefaultHead::Other,
+        // Invalid loose-ref body (short/garbage hash) → REF_ISBROKEN.
+        Err(_) => MissingDefaultHead::Broken,
+    }
 }
 
 fn log_pathspec_magic(value: &str) -> Option<(&str, &str)> {
@@ -2417,13 +2453,23 @@ fn cmd_log_impl(
             return Err(GitError::Exit(128));
         }
         Err(err) if inserted_default_head => {
-            if repository.resolve_revision("HEAD").is_err()
-                && let Some(branch) = log_unborn_head_branch(&git_dir)
-            {
-                eprintln!("fatal: your current branch '{branch}' does not have any commits yet");
-                return Err(GitError::Exit(128));
+            // Match git's diagnose_missing_default (revision.c): a missing
+            // default tip is "unborn" only when HEAD is a clean symref to
+            // refs/heads/* whose target does not exist. A direct/broken HEAD
+            // or a target ref with invalid contents is "broken".
+            match diagnose_missing_default_head(&git_dir, format) {
+                MissingDefaultHead::Broken => {
+                    eprintln!("fatal: your current branch appears to be broken");
+                    return Err(GitError::Exit(128));
+                }
+                MissingDefaultHead::Unborn(branch) => {
+                    eprintln!(
+                        "fatal: your current branch '{branch}' does not have any commits yet"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                MissingDefaultHead::Other => return Err(err),
             }
-            return Err(err);
         }
         Err(err) => {
             if matches!(
@@ -2431,6 +2477,9 @@ fn cmd_log_impl(
                 Err(GitError::NotFound(
                     sley::NotFoundKind::BrokenReference { .. }
                 ))
+            ) || matches!(
+                diagnose_missing_default_head(&git_dir, format),
+                MissingDefaultHead::Broken
             ) {
                 eprintln!("fatal: your current branch appears to be broken");
                 return Err(GitError::Exit(128));
@@ -2638,6 +2687,7 @@ fn cmd_log_impl(
         };
         let repo_abbrev = repository_abbrev_from_config(&git_dir, format, &config)?;
         Some(LogDiffContext {
+            git_dir: &git_dir,
             db: &db,
             lazy_fetch,
             format,
@@ -2825,6 +2875,8 @@ fn cmd_log_impl(
             format,
             &reflog_revisions,
             ReflogWalkOptions {
+                abbrev_len,
+                date_explicit,
                 max_count,
                 skip,
                 output: &output,

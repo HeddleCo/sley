@@ -87,8 +87,14 @@ fn resolve_for_each_ref_target(
 pub fn upload_pack_features(git_dir: &Path, format: ObjectFormat) -> Result<UploadPackFeatures> {
     let store = FileRefStore::new(git_dir, format);
     let mut symrefs = Vec::new();
-    if let Some(RefTarget::Symbolic(target)) = store.read_ref("HEAD")? {
-        symrefs.push(format!("HEAD:{target}"));
+    let head_name = sley_core::expand_namespace("HEAD");
+    if let Some(RefTarget::Symbolic(target)) = store.read_ref(&head_name)? {
+        // Advertise the logical (namespace-stripped) target so clients see the
+        // same names they will later request.
+        let logical_target = sley_core::strip_namespace(&target)
+            .unwrap_or(target.as_str())
+            .to_string();
+        symrefs.push(format!("HEAD:{logical_target}"));
     }
     Ok(UploadPackFeatures {
         object_format: Some(format),
@@ -613,36 +619,121 @@ fn canonical_receive_pack_update_commands(
 
 /// The ref advertisements a local repository would send to a fetching client:
 /// `HEAD` (if resolvable) followed by every ref, each resolved to its object id.
+///
+/// When `GIT_NAMESPACE` / `--namespace` is active, only refs under the
+/// namespace are advertised (with the namespace prefix stripped). Hidden refs
+/// (`transfer.hideRefs` / `uploadpack.hideRefs`) are omitted using git's
+/// stripped-vs-full matching rules.
 pub fn local_fetch_advertisements(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<Vec<RefAdvertisement>> {
     let store = FileRefStore::new_without_reference_backend_env(git_dir, format);
+    let namespace = sley_core::get_git_namespace();
+    let hidden = transfer_upload_hidden_ref_patterns(git_dir);
     let mut advertisements = Vec::new();
-    if let Some(target) = store.read_ref("HEAD")? {
+
+    let head_name = if namespace.is_empty() {
+        "HEAD".to_string()
+    } else {
+        format!("{namespace}HEAD")
+    };
+    if let Some(target) = store.read_ref(&head_name)? {
         let reference = Ref {
-            name: "HEAD".to_string(),
+            name: head_name.clone(),
             target,
         };
         if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? {
-            advertisements.push(RefAdvertisement {
-                oid,
-                name: reference.name,
-                capabilities: Vec::new(),
-            });
+            let logical = if namespace.is_empty() {
+                "HEAD".to_string()
+            } else {
+                "HEAD".to_string()
+            };
+            if !sley_core::ref_is_hidden(Some(logical.as_str()), &head_name, &hidden) {
+                advertisements.push(RefAdvertisement {
+                    oid,
+                    name: logical,
+                    capabilities: Vec::new(),
+                });
+            }
         }
     }
     for reference in store.list_refs()? {
+        let physical = reference.name.clone();
+        let logical = if namespace.is_empty() {
+            Some(physical.as_str())
+        } else {
+            physical.strip_prefix(namespace.as_str())
+        };
+        let Some(logical) = logical else {
+            continue;
+        };
+        // Namespaced HEAD lives under `refs/namespaces/.../HEAD` and would
+        // otherwise appear twice (once from the special HEAD read above).
+        if logical == "HEAD" {
+            continue;
+        }
+        if sley_core::ref_is_hidden(Some(logical), &physical, &hidden) {
+            continue;
+        }
         let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? else {
             continue;
         };
         advertisements.push(RefAdvertisement {
             oid,
-            name: reference.name,
+            name: logical.to_string(),
             capabilities: Vec::new(),
         });
     }
     Ok(advertisements)
+}
+
+/// Collect `transfer.hideRefs` + `uploadpack.hideRefs` patterns for the
+/// upload-pack / ls-remote advertisement path.
+fn transfer_upload_hidden_ref_patterns(git_dir: &Path) -> Vec<String> {
+    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    let mut out = Vec::new();
+    for section in &config.sections {
+        if section.subsection.is_some() {
+            continue;
+        }
+        if !section.name.eq_ignore_ascii_case("transfer")
+            && !section.name.eq_ignore_ascii_case("uploadpack")
+        {
+            continue;
+        }
+        for entry in &section.entries {
+            if entry.key.eq_ignore_ascii_case("hiderefs")
+                && let Some(value) = entry.value.as_deref()
+            {
+                out.push(sley_core::trim_hidden_ref_pattern(value));
+            }
+        }
+    }
+    out
+}
+
+/// Collect `transfer.hideRefs` + `receive.hideRefs` patterns for receive-pack.
+pub(crate) fn transfer_receive_hidden_ref_patterns(config: &GitConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    for section in &config.sections {
+        if section.subsection.is_some() {
+            continue;
+        }
+        if !section.name.eq_ignore_ascii_case("transfer")
+            && !section.name.eq_ignore_ascii_case("receive")
+        {
+            continue;
+        }
+        for entry in &section.entries {
+            if entry.key.eq_ignore_ascii_case("hiderefs")
+                && let Some(value) = entry.value.as_deref()
+            {
+                out.push(sley_core::trim_hidden_ref_pattern(value));
+            }
+        }
+    }
+    out
 }
 
 /// The object ids the local repository can offer as `have`s during negotiation.
@@ -2197,10 +2288,18 @@ fn upload_pack_v2_capabilities(
 
 /// Resolve the symref target of `HEAD` (e.g. `refs/heads/main`) for the
 /// `symrefs`/symref-target ls-refs attribute, following one level of symbolic
-/// indirection. Returns `None` for a detached or missing `HEAD`.
+/// indirection. Returns `None` for a detached or missing `HEAD`. When a
+/// namespace is active the on-disk namespaced HEAD is read and the target is
+/// returned in its logical (stripped) form.
 fn head_symref_target(store: &FileRefStore) -> Result<Option<String>> {
-    match store.read_ref("HEAD")? {
-        Some(RefTarget::Symbolic(name)) => Ok(Some(name)),
+    let head_name = sley_core::expand_namespace("HEAD");
+    match store.read_ref(&head_name)? {
+        Some(RefTarget::Symbolic(name)) => {
+            let logical = sley_core::strip_namespace(&name)
+                .unwrap_or(name.as_str())
+                .to_string();
+            Ok(Some(logical))
+        }
         _ => Ok(None),
     }
 }
@@ -2216,34 +2315,64 @@ fn local_ls_refs_v2_records(
 ) -> Result<Vec<ProtocolV2LsRefsRecord>> {
     let store = FileRefStore::new(git_dir, format);
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let namespace = sley_core::get_git_namespace();
+    let hidden = transfer_upload_hidden_ref_patterns(git_dir);
     let head_symref = head_symref_target(&store)?;
 
     // Build the (name -> oid, symref) list in git's advertisement order: HEAD
     // first (when present), then the sorted ref list from `for-each-ref`.
+    // Names are always the logical (namespace-stripped) form clients expect.
     let mut entries: Vec<(String, ObjectId, Option<String>)> = Vec::new();
-    if let Some(target) = store.read_ref("HEAD")? {
+    let head_physical = if namespace.is_empty() {
+        "HEAD".to_string()
+    } else {
+        format!("{namespace}HEAD")
+    };
+    if let Some(target) = store.read_ref(&head_physical)? {
         let reference = Ref {
-            name: "HEAD".to_string(),
+            name: head_physical.clone(),
             target,
         };
-        if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? {
-            entries.push(("HEAD".to_string(), oid, head_symref.clone()));
-        } else if request.unborn && lsrefs_unborn_config(config) != LsRefsUnbornConfig::Ignore {
-            // An unborn HEAD (points at a not-yet-created branch) is reported as
-            // an `unborn` record carrying its symref-target.
-            entries.push((
-                "HEAD".to_string(),
-                ObjectId::null(format),
-                head_symref.clone(),
-            ));
+        if !sley_core::ref_is_hidden(Some("HEAD"), &head_physical, &hidden) {
+            if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? {
+                entries.push(("HEAD".to_string(), oid, head_symref.clone()));
+            } else if request.unborn && lsrefs_unborn_config(config) != LsRefsUnbornConfig::Ignore {
+                // An unborn HEAD (points at a not-yet-created branch) is reported as
+                // an `unborn` record carrying its symref-target.
+                entries.push((
+                    "HEAD".to_string(),
+                    ObjectId::null(format),
+                    head_symref.clone(),
+                ));
+            }
         }
     }
     for reference in store.list_refs()? {
-        let name = reference.name.clone();
+        let physical = reference.name.clone();
+        let logical = if namespace.is_empty() {
+            Some(physical.as_str())
+        } else {
+            physical.strip_prefix(namespace.as_str())
+        };
+        let Some(logical) = logical else {
+            continue;
+        };
+        // Namespaced HEAD is under `refs/namespaces/.../HEAD`; skip the duplicate.
+        if logical == "HEAD" {
+            continue;
+        }
+        if sley_core::ref_is_hidden(Some(logical), &physical, &hidden) {
+            continue;
+        }
         let Some((oid, symref)) = resolve_for_each_ref_target(&store, &reference)? else {
             continue;
         };
-        entries.push((name, oid, symref));
+        let logical_symref = symref.map(|s| {
+            sley_core::strip_namespace(&s)
+                .unwrap_or(s.as_str())
+                .to_string()
+        });
+        entries.push((logical.to_string(), oid, logical_symref));
     }
 
     let matches_prefix = |name: &str| -> bool {
@@ -3742,4 +3871,59 @@ mod tests {
             .write(),
         )
     }
+}
+
+pub fn negotiate_only_local(
+    local_git_dir: &Path,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    tip_oids: &[ObjectId],
+) -> Result<Vec<ObjectId>> {
+    let local_db = FileObjectDatabase::from_git_dir(local_git_dir, format);
+    let mut seen = HashSet::new();
+    let mut haves = Vec::new();
+    // Walk each tip's commit ancestry so a tip that only exists locally still
+    // reveals common ancestors the remote can ACK (fetch-pack negotiator).
+    for tip in tip_oids {
+        let mut stack = vec![*tip];
+        while let Some(oid) = stack.pop() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            haves.push(oid);
+            let Ok(object) = local_db.read_object(&oid) else {
+                continue;
+            };
+            if object.object_type != ObjectType::Commit {
+                continue;
+            }
+            if let Ok(commit) = Commit::parse_ref(format, &object.body) {
+                for parent in commit.parents {
+                    if !seen.contains(&parent) {
+                        stack.push(parent);
+                    }
+                }
+            }
+        }
+    }
+    let request = ProtocolV2FetchRequest {
+        haves,
+        wait_for_done: true,
+        done: false,
+        thin_pack: true,
+        ofs_delta: true,
+        ..ProtocolV2FetchRequest::default()
+    };
+    let sections = local_fetch_v2_sections(remote_git_dir, format, &request)?;
+    let mut acked = Vec::new();
+    for section in sections {
+        if let ProtocolV2FetchResponseSection::Acknowledgments(acks) = section {
+            for ack in acks {
+                if let ProtocolV2FetchAcknowledgment::Ack(oid) = ack {
+                    acked.push(oid);
+                }
+            }
+        }
+    }
+    Ok(acked)
 }

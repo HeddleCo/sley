@@ -610,27 +610,24 @@ pub(crate) fn cmd_checkout(
         }
     }
 
-    // `-f`: discard local index/worktree changes (including conflict stages)
-    // before switching, so the clean-tree checkout below succeeds — git's
-    // force semantics. Untracked files are preserved.
+    // `-f`: discard local *superproject* index/worktree changes (including
+    // conflict stages) before switching so a subsequent clean rebuild succeeds.
+    //
+    // git's `merge_working_tree` with `discard_changes` resets straight to the
+    // *target* tree (builtin/checkout.c); it never force-resets to the HEAD
+    // being left. A recursive reset to the current HEAD is actively wrong when
+    // that HEAD records an invalid/missing gitlink (t2013 "from invalid commit"):
+    // `submodule_move_head` would try to check out the bad oid and abort the
+    // whole switch. Keep this pre-pass superproject-only; recursive submodule
+    // updates belong to the target transition below.
     if force {
         if let Ok(Some(head_oid)) = resolve_ref_peeled(store, "HEAD") {
-            if recurse_submodules {
-                commands::read_tree::reset_index_and_worktree_to_commit(
-                    &worktree_root,
-                    &git_dir,
-                    format,
-                    &head_oid,
-                    true,
-                )?;
-            } else {
-                sley_worktree::reset_index_and_worktree_to_commit(
-                    &worktree_root,
-                    &git_dir,
-                    format,
-                    &head_oid,
-                )?;
-            }
+            sley_worktree::reset_index_and_worktree_to_commit(
+                &worktree_root,
+                &git_dir,
+                format,
+                &head_oid,
+            )?;
         } else {
             // Unborn HEAD: discard the staged state entirely.
             let index_path = sley_worktree::repository_index_path(&git_dir);
@@ -1134,15 +1131,28 @@ pub(crate) fn cmd_checkout(
     // Creating a branch at the commit already checked out does not need a
     // two-way unpack. Avoiding that index rebuild is observable: Git preserves
     // optional extensions such as UNTR across `checkout -b new HEAD`.
-    } else if recurse_submodules
-        || (branch_update_rollback.is_some() && !force && branch_target != Some(checkout_old_head))
+    //
+    // For every worktree-updating branch switch, prefer the shared two-way
+    // unpack-trees engine (git's `merge_working_tree`). The older "clean rebuild"
+    // path (`checkout_branch_filtered`) only looks at status dirtiness and misses
+    // untracked files that status treats as inside a submodule, and therefore
+    // silently clobbers them when a gitlink appears or when a submodule is
+    // replaced by ordinary paths (t2013 replace-submodule-with-directory /
+    // untracked-file-with-same-name). Same-HEAD create-branch stays above.
+    } else if branch_target != Some(checkout_old_head)
+        || recurse_submodules
+        || force
+        || branch_update_rollback.is_some()
     {
         let from = checkout_reflog_from.clone();
         let target = branch_target.ok_or_else(|| GitError::reference_not_found("branch"))?;
-        if let Err(err) = checkout_twoway_dirty(&context, Some(&target), recurse_submodules, force)
-        {
-            checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
-            return Err(err);
+        if branch_target != Some(checkout_old_head) || recurse_submodules || force {
+            if let Err(err) =
+                checkout_twoway_dirty(&context, Some(&target), recurse_submodules, force)
+            {
+                checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+                return Err(err);
+            }
         }
         if let Err(err) =
             switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from, &config)
@@ -1151,6 +1161,8 @@ pub(crate) fn cmd_checkout(
             return Err(err);
         }
     } else {
+        // Same-HEAD, no force, no recurse: preserve index extensions (UNTR) via
+        // the lightweight path — `checkout -b new` at the current tip.
         match sley_worktree::checkout_branch_filtered(
             &worktree_root,
             git_dir.clone(),

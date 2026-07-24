@@ -1526,8 +1526,15 @@ impl UreqHttpClient {
         // `http_status_as_error(false)` makes ureq deliver 4xx/5xx as a normal
         // response (carrying status + body) rather than an error, which is what
         // smart-HTTP callers need (e.g. inspecting 401 to prompt for creds).
+        //
+        // `max_redirects(0)` disables automatic redirect following so we can
+        // re-check `GIT_ALLOW_PROTOCOL` / protocol.<scheme>.allow against each
+        // Location (mirroring curl's CURLOPT_PROTOCOLS from git's http.c). A
+        // redirect to ftp:// with GIT_ALLOW_PROTOCOL=http:https must fail with
+        // an "ftp … disabled" message (t5812).
         let mut builder = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .max_redirects(0)
             .user_agent(HTTP_USER_AGENT);
         if let Some(tls_config) = ureq_tls_config() {
             builder = builder.tls_config(tls_config);
@@ -1580,15 +1587,7 @@ impl Default for UreqHttpClient {
 #[cfg(feature = "http-client")]
 impl HttpClient for UreqHttpClient {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
-        trace_curl_request("GET", url, headers, false);
-        let mut request = self.agent.get(url);
-        for (name, value) in headers {
-            request = request.header(*name, *value);
-        }
-        let response = request
-            .call()
-            .map_err(|err| http_transport_error(url, &err))?;
-        Ok(http_response_from_ureq(response))
+        self.request_with_redirects("GET", url, headers, None)
     }
 
     fn post(
@@ -1598,15 +1597,12 @@ impl HttpClient for UreqHttpClient {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<HttpResponse> {
-        trace_curl_request("POST", url, headers, false);
-        let mut request = self.agent.post(url).header("Content-Type", content_type);
-        for (name, value) in headers {
-            request = request.header(*name, *value);
-        }
-        let response = request
-            .send(body)
-            .map_err(|err| http_transport_error(url, &err))?;
-        Ok(http_response_from_ureq(response))
+        // Only the initial request carries a body; redirect hops are GETs
+        // (git/curl drop the body on 302/303-style hops for upload).
+        let mut headers_with_ct: Vec<(&str, &str)> = Vec::with_capacity(headers.len() + 1);
+        headers_with_ct.push(("Content-Type", content_type));
+        headers_with_ct.extend_from_slice(headers);
+        self.request_with_redirects("POST", url, &headers_with_ct, Some(body))
     }
 
     fn post_reader(
@@ -1616,6 +1612,8 @@ impl HttpClient for UreqHttpClient {
         headers: &[(&str, &str)],
         body: &mut dyn std::io::Read,
     ) -> Result<HttpResponse> {
+        // Streaming posts cannot rewind for multi-hop redirect body replay;
+        // follow redirects only after the first response (body already sent).
         trace_curl_request("POST", url, headers, true);
         let mut request = self.agent.post(url).header("Content-Type", content_type);
         for (name, value) in headers {
@@ -1623,10 +1621,269 @@ impl HttpClient for UreqHttpClient {
         }
         // `SendBody::from_reader` carries no known length, so ureq sends the
         // request with `Transfer-Encoding: chunked` and pulls bytes on demand.
+        // Initial POST is from_user; check before dial.
+        check_http_layer_scheme_allowed(url, true)?;
         let response = request
             .send(ureq::SendBody::from_reader(body))
             .map_err(|err| http_transport_error(url, &err))?;
-        Ok(http_response_from_ureq(response))
+        let (status, content_type_hdr, location, body_reader) =
+            http_response_parts_from_ureq(response);
+        if (300..400).contains(&status) {
+            let next = resolve_redirect_url(url, location.as_deref())?;
+            // Subsequent hops are GETs without a body (body already consumed)
+            // and are not from-user (CURLOPT_REDIR_PROTOCOLS).
+            check_http_layer_scheme_allowed(&next, false)?;
+            return self.request_with_redirects_from_user("GET", &next, headers, None, false);
+        }
+        Ok(HttpResponse {
+            status,
+            content_type: content_type_hdr,
+            body: body_reader,
+        })
+    }
+}
+
+#[cfg(feature = "http-client")]
+impl UreqHttpClient {
+    /// Issue `method` against `url`, following redirects while enforcing the
+    /// transport-protocol allow list (GIT_ALLOW_PROTOCOL / protocol.*.allow).
+    fn request_with_redirects(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse> {
+        // Initial request is from_user (CURLOPT_PROTOCOLS).
+        self.request_with_redirects_from_user(method, url, headers, body, true)
+    }
+
+    fn request_with_redirects_from_user(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        initial_from_user: bool,
+    ) -> Result<HttpResponse> {
+        const MAX_REDIRECTS: usize = 20;
+        let mut current = url.to_string();
+        let mut method = method.to_string();
+        let mut body = body.map(|b| b.to_vec());
+        // Initial request: from_user=true (CURLOPT_PROTOCOLS). Redirect hops:
+        // from_user=false (CURLOPT_REDIR_PROTOCOLS). That is how
+        // protocol.http.allow=user blocks smart-redir-perm (t5812).
+        let mut from_user = initial_from_user;
+        for _ in 0..=MAX_REDIRECTS {
+            check_http_layer_scheme_allowed(&current, from_user)?;
+            let chunked = false;
+            trace_curl_request(&method, &current, headers, chunked);
+            let response = match method.as_str() {
+                "GET" => {
+                    let mut request = self.agent.get(&current);
+                    for (name, value) in headers {
+                        // Content-Type on GET is harmless but skip if present.
+                        if name.eq_ignore_ascii_case("Content-Type") {
+                            continue;
+                        }
+                        request = request.header(*name, *value);
+                    }
+                    request
+                        .call()
+                        .map_err(|err| http_transport_error(&current, &err))?
+                }
+                "POST" => {
+                    let mut request = self.agent.post(&current);
+                    for (name, value) in headers {
+                        request = request.header(*name, *value);
+                    }
+                    let payload = body.as_deref().unwrap_or(b"");
+                    request
+                        .send(payload)
+                        .map_err(|err| http_transport_error(&current, &err))?
+                }
+                other => {
+                    return Err(GitError::Io(format!(
+                        "HTTP request to {current} failed: unsupported method {other}"
+                    )));
+                }
+            };
+            let (status, content_type, location, body_reader) =
+                http_response_parts_from_ureq(response);
+            if (300..400).contains(&status) {
+                let next = resolve_redirect_url(&current, location.as_deref())?;
+                // 303 and (for POST) 302 become GET without body, matching curl.
+                if method == "POST" && (status == 302 || status == 303) {
+                    method = "GET".to_string();
+                    body = None;
+                }
+                current = next;
+                from_user = false;
+                continue;
+            }
+            return Ok(HttpResponse {
+                status,
+                content_type,
+                body: body_reader,
+            });
+        }
+        Err(GitError::Io(format!(
+            "HTTP request to {url} failed: too many redirects"
+        )))
+    }
+}
+
+/// Split a ureq response into status / content-type / Location / body reader.
+#[cfg(feature = "http-client")]
+fn http_response_parts_from_ureq(
+    response: ureq::http::Response<ureq::Body>,
+) -> (
+    u16,
+    Option<String>,
+    Option<String>,
+    Box<dyn std::io::Read + Send>,
+) {
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(ureq::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let location = response
+        .headers()
+        .get(ureq::http::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let body = response.into_body().into_reader();
+    (status, content_type, location, Box::new(body))
+}
+
+/// Resolve a (possibly relative) Location header against the request URL.
+#[cfg(feature = "http-client")]
+fn resolve_redirect_url(current: &str, location: Option<&str>) -> Result<String> {
+    let Some(location) = location.filter(|value| !value.is_empty()) else {
+        return Err(GitError::Io(format!(
+            "HTTP request to {current} failed: redirect with no Location"
+        )));
+    };
+    if location.contains("://") {
+        return Ok(location.to_string());
+    }
+    // Relative redirect: join against the current URL's origin + directory.
+    if let Some(scheme_end) = current.find("://") {
+        let after_scheme = &current[scheme_end + 3..];
+        if location.starts_with('/') {
+            let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+            return Ok(format!(
+                "{}{}",
+                &current[..scheme_end + 3 + host_end],
+                location
+            ));
+        }
+        if let Some(slash) = current.rfind('/') {
+            return Ok(format!("{}{location}", &current[..=slash]));
+        }
+    }
+    Ok(location.to_string())
+}
+
+/// Enforce GIT_ALLOW_PROTOCOL / protocol.<scheme>.allow for a URL the HTTP
+/// layer is about to dial.
+///
+/// `from_user` mirrors curl's dual allow-lists: the initial request uses
+/// `from_user=true` (CURLOPT_PROTOCOLS); redirect hops use `from_user=false`
+/// (CURLOPT_REDIR_PROTOCOLS). Error text mirrors curl's
+/// `Protocol "ftp" not supported or disabled in libcurl` so t5812's
+/// `ftp.*disabled` grep matches.
+#[cfg(feature = "http-client")]
+fn check_http_layer_scheme_allowed(url: &str, from_user: bool) -> Result<()> {
+    let scheme = url
+        .split_once("://")
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+        .unwrap_or_default();
+    if scheme.is_empty() {
+        return Ok(());
+    }
+    if http_layer_scheme_allowed(&scheme, from_user) {
+        return Ok(());
+    }
+    Err(GitError::Io(format!(
+        "Protocol \"{scheme}\" not supported or disabled in libcurl"
+    )))
+}
+
+#[cfg(feature = "http-client")]
+#[derive(Clone, Copy)]
+enum HttpProtocolAllow {
+    Never,
+    UserOnly,
+    Always,
+}
+
+/// Mirror of git's `get_curl_allowed_protocols` + `is_transport_allowed` for the
+/// schemes curl's HTTP layer can dial (http/https/ftp/ftps).
+#[cfg(feature = "http-client")]
+fn http_layer_scheme_allowed(scheme: &str, from_user: bool) -> bool {
+    if let Ok(allow) = std::env::var("GIT_ALLOW_PROTOCOL") {
+        return allow
+            .split(':')
+            .any(|entry| entry.eq_ignore_ascii_case(scheme));
+    }
+    match http_layer_protocol_policy(scheme) {
+        HttpProtocolAllow::Always => true,
+        HttpProtocolAllow::Never => false,
+        HttpProtocolAllow::UserOnly => from_user,
+    }
+}
+
+/// Resolve protocol.<scheme>.allow / protocol.allow, including `-c` values
+/// folded into `GIT_CONFIG_PARAMETERS`.
+#[cfg(feature = "http-client")]
+fn http_layer_protocol_policy(scheme: &str) -> HttpProtocolAllow {
+    if let Some(policy) = http_layer_protocol_policy_from_config(scheme) {
+        return policy;
+    }
+    match scheme {
+        "http" | "https" | "git" | "ssh" => HttpProtocolAllow::Always,
+        "ext" => HttpProtocolAllow::Never,
+        // ftp/ftps and unknown schemes default to user-only.
+        _ => HttpProtocolAllow::UserOnly,
+    }
+}
+
+#[cfg(feature = "http-client")]
+fn http_layer_protocol_policy_from_config(scheme: &str) -> Option<HttpProtocolAllow> {
+    let context = sley_config::ConfigIncludeContext::new(None, None);
+    let mut config = sley_config::load_pre_dispatch_config(None, &context).ok()?;
+    // `None` folds in the process-global `-c`/`--config-env` fragment so
+    // `git -c protocol.http.allow=user clone …` is visible here.
+    if let Ok(parameters) = sley_config::injected_config_parameters(None) {
+        let _ = sley_config::append_injected_config_sections_with_includes(
+            &mut config,
+            &parameters,
+            &context,
+            std::path::Path::new("."),
+        );
+    }
+    if let Some(value) = config.get("protocol", Some(scheme), "allow") {
+        return parse_http_protocol_allow(value);
+    }
+    if let Some(value) = config.get("protocol", None, "allow") {
+        return parse_http_protocol_allow(value);
+    }
+    None
+}
+
+#[cfg(feature = "http-client")]
+fn parse_http_protocol_allow(value: &str) -> Option<HttpProtocolAllow> {
+    if value.eq_ignore_ascii_case("always") {
+        Some(HttpProtocolAllow::Always)
+    } else if value.eq_ignore_ascii_case("never") {
+        Some(HttpProtocolAllow::Never)
+    } else if value.eq_ignore_ascii_case("user") {
+        Some(HttpProtocolAllow::UserOnly)
+    } else {
+        None
     }
 }
 
@@ -1680,18 +1937,13 @@ fn curl_trace_sink() -> Option<Box<dyn Write>> {
 /// Convert a successful ureq response into an [`HttpResponse`] that streams its
 /// body from the connection (the body is never buffered into memory here).
 #[cfg(feature = "http-client")]
+#[allow(dead_code)] // retained for unit tests / alternate call sites
 fn http_response_from_ureq(response: ureq::http::Response<ureq::Body>) -> HttpResponse {
-    let status = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get(ureq::http::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_string());
-    let body = response.into_body().into_reader();
+    let (status, content_type, _location, body) = http_response_parts_from_ureq(response);
     HttpResponse {
         status,
         content_type,
-        body: Box::new(body),
+        body,
     }
 }
 

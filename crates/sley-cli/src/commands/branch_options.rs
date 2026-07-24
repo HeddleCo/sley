@@ -1085,17 +1085,24 @@ pub(super) fn setup_branch_create_options(args: &[String]) -> Result<Option<Bran
         }
     }
 
+    let positionals = branch_positionals(&parsed);
+    // Also treat bare `git branch <name> [<start>]` as create (no create-only
+    // flag) so `git -c submodule.recurse=true branch branch-a` reaches the
+    // recursive path (t3207). Listing (`git branch`) has empty positionals and
+    // still falls through.
     Ok(
-        (saw_create_option || saw_separator).then_some(BranchCreateOptions {
-            force,
-            quiet,
-            track,
-            recurse_submodules,
-            legacy_set_upstream,
-            edit_description,
-            create_reflog,
-            positionals: branch_positionals(&parsed),
-        }),
+        (saw_create_option || saw_separator || !positionals.is_empty()).then_some(
+            BranchCreateOptions {
+                force,
+                quiet,
+                track,
+                recurse_submodules,
+                legacy_set_upstream,
+                edit_description,
+                create_reflog,
+                positionals,
+            },
+        ),
     )
 }
 

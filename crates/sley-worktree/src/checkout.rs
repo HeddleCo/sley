@@ -1330,7 +1330,9 @@ pub(crate) fn materialize_tree_entry_with_optional_smudge(
 /// have their skip-worktree bit cleared, while out-of-cone paths are left out
 /// of the worktree, get their skip-worktree bit set, and have any stale file
 /// removed.
-pub(crate) fn checkout_commit_to_index_and_worktree_sparse(
+/// Sparse-aware checkout of a commit: only materializes in-cone paths; out-of-cone
+/// index entries get skip-worktree and no worktree file (blobs may be absent).
+pub fn checkout_commit_to_index_and_worktree_sparse(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -3265,7 +3267,7 @@ pub fn path_in_sparse_checkout(
     SparseMatcher::new(sparse, mode).includes_file(path)
 }
 
-pub(crate) fn active_sparse_checkout(
+pub fn active_sparse_checkout(
     git_dir: &Path,
 ) -> Result<Option<(SparseCheckout, SparseCheckoutMode)>> {
     let worktree_config = GitConfig::read(git_dir.join("config.worktree")).unwrap_or_default();

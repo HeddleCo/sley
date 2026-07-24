@@ -26,7 +26,17 @@ impl BranchCommandContext {
     pub(super) fn open(session: &crate::session::CliSession) -> crate::Result<Self> {
         let repository = session.open_repository()?;
         let refs = repository.references();
-        let config = repository.config_snapshot()?;
+        // Layer `-c` / `--config-env` overrides on top of the file stack so
+        // `git -c submodule.propagateBranches=false branch --recurse-submodules`
+        // (t3207) and `git -c submodule.recurse=true branch` are honoured.
+        // `config_snapshot` deliberately omits command-line parameters.
+        let worktree = repository
+            .workdir()
+            .unwrap_or_else(|| session.cwd().to_path_buf());
+        let config = crate::commands::remote::read_effective_repo_config(
+            repository.git_dir(),
+            &worktree,
+        )?;
         Ok(Self {
             repository,
             refs,

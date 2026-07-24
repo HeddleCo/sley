@@ -234,7 +234,14 @@ pub(crate) fn cmd_describe(
     }
 
     if commits.is_empty() {
-        let dirty_suffix = describe_dirty_suffix(repo.worktree_root()?, git_dir, format, &options)?;
+        // Only resolve a worktree when --dirty/--broken need it. Bare repos
+        // (and `git --git-dir=… describe` from outside a worktree) have no
+        // worktree; requiring one would reject a valid bare describe.
+        let dirty_suffix = if options.dirty.is_some() || options.broken.is_some() {
+            describe_dirty_suffix(repo.worktree_root()?, git_dir, format, &options)?
+        } else {
+            None
+        };
         let head = resolve_describe_commit(&repo, "HEAD")?;
         describe_one(
             git_dir,
