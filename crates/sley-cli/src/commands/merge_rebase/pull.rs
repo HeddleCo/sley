@@ -1089,6 +1089,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
         atomic: false,
         negotiation_restrict: None,
         negotiation_include: None,
+        negotiate_only: false,
     };
     let fetch_recurse_submodules = resolve_fetch_recurse_submodules(
         &config,

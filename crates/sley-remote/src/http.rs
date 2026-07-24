@@ -28,7 +28,7 @@ use sley_config::GitConfig;
 use sley_core::{
     CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
 };
-use sley_odb::FileObjectDatabase;
+use sley_odb::{FileObjectDatabase, ObjectReader};
 use sley_protocol::{
     GitService, ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchAcknowledgment,
     ProtocolV2FetchRequest, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
@@ -955,6 +955,94 @@ pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
         shallow_info
     };
     Ok(shallow_info)
+}
+
+/// Protocol-v2 `--negotiate-only` over smart HTTP.
+///
+/// Discovers the upload-pack advertisement, requires the `wait-for-done` fetch
+/// feature, POSTs a `fetch` command with only haves, and returns the ACKed
+/// common object ids. Emits the same warnings as upstream transport.c when the
+/// server is not v2 or lacks `wait-for-done`.
+pub fn negotiate_only_http<C: HttpClient + ?Sized>(
+    client: &C,
+    remote: &RemoteUrl,
+    format: ObjectFormat,
+    tip_oids: &[ObjectId],
+    git_dir: &Path,
+    credentials: &mut dyn CredentialProvider,
+    config: Option<&GitConfig>,
+) -> Result<Vec<ObjectId>> {
+    let discovery = http_discover_upload_pack(client, remote, credentials, config)?;
+    let Some(handshake) = discovery.advertisements.handshake.as_ref() else {
+        eprintln!("warning: --negotiate-only requires protocol v2");
+        return Err(GitError::Exit(1));
+    };
+    if handshake.protocol != ProtocolVersion::V2 {
+        eprintln!("warning: --negotiate-only requires protocol v2");
+        return Err(GitError::Exit(1));
+    }
+    let features =
+        parse_protocol_v2_fetch_features(&handshake.capabilities)?.unwrap_or_default();
+    if !features.wait_for_done {
+        eprintln!("warning: server does not support wait-for-done");
+        return Err(GitError::Exit(1));
+    }
+    let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut seen = std::collections::HashSet::new();
+    let mut haves = Vec::new();
+    for tip in tip_oids {
+        let mut stack = vec![*tip];
+        while let Some(oid) = stack.pop() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            haves.push(oid);
+            let Ok(object) = local_db.read_object(&oid) else {
+                continue;
+            };
+            if object.object_type != sley_object::ObjectType::Commit {
+                continue;
+            }
+            if let Ok(commit) = sley_object::Commit::parse_ref(format, &object.body) {
+                for parent in commit.parents {
+                    if !seen.contains(&parent) {
+                        stack.push(parent);
+                    }
+                }
+            }
+        }
+    }
+    let fetch = ProtocolV2FetchRequest {
+        haves,
+        wait_for_done: true,
+        done: false,
+        thin_pack: true,
+        ofs_delta: true,
+        include_tag: false,
+        ..ProtocolV2FetchRequest::default()
+    };
+    let git_protocol = http_git_protocol_header_value(config)?;
+    let mut response = http_protocol_v2_fetch_post(
+        client,
+        remote,
+        format,
+        handshake,
+        fetch,
+        credentials,
+        HttpRpcOptions {
+            git_protocol: git_protocol.as_deref(),
+            post_buffer: 1_048_576,
+        },
+    )?;
+    let negotiation =
+        read_protocol_v2_fetch_negotiation_response(format, &mut response.body, false, true)?;
+    let mut acked = Vec::new();
+    for ack in negotiation.acknowledgments {
+        if let ProtocolV2FetchAcknowledgment::Ack(oid) = ack {
+            acked.push(oid);
+        }
+    }
+    Ok(acked)
 }
 
 pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(

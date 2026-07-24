@@ -2347,10 +2347,25 @@ pub(crate) fn diff_entry_new_content(
             Ok(_) => {
                 let content = fs::read(path)?;
                 return match worktree_clean {
-                    Some(clean) => clean
-                        .attributes
-                        .apply_clean_filter(clean.config, &entry.path, &content)
-                        .map(Some),
+                    Some(clean) => {
+                        // Honour has_crlf_in_index so text=auto does not strip
+                        // CRLF when the recorded (old/index) blob already has
+                        // CRLF — otherwise unstaged diffs show mixed endings
+                        // (`-a\r` / `+b`) and break apply round-trips (t4124).
+                        let index_blob = match entry.old_oid {
+                            Some(oid) => sley_worktree::SafeCrlfIndexBlob::Lookup { odb: db, oid },
+                            None => sley_worktree::SafeCrlfIndexBlob::None,
+                        };
+                        clean
+                            .attributes
+                            .apply_clean_filter_respecting_index(
+                                clean.config,
+                                &entry.path,
+                                &content,
+                                index_blob,
+                            )
+                            .map(Some)
+                    }
                     None => Ok(Some(content)),
                 };
             }
@@ -2513,6 +2528,11 @@ fn prefetch_local_promisor_object(
         // remaining promisor remotes).
         db.refresh_read_cache();
         if db.contains(oid).unwrap_or(false) {
+            // git's promisor_remote_get_direct records fetch_count for the
+            // batch; single-object lazy paths (log -p, diff, cat-file) need
+            // the same event so tests like t5620 #22 can observe on-demand
+            // fetches via GIT_TRACE2_EVENT.
+            sley_core::trace2::data("promisor", "fetch_count", 1u64);
             return Ok(true);
         }
     }

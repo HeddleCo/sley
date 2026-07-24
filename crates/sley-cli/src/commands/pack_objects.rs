@@ -76,6 +76,10 @@ struct PackObjectsOptions {
     path_walk: bool,
     sparse: Option<bool>,
     thin: bool,
+    /// `--include-tag`: after selecting objects, also pack any tag object that
+    /// points at a selected object (upload-pack requests this when the client
+    /// sent `include-tag`).
+    include_tag: bool,
     /// Effective `pack.writeReverseIndex` policy. Unlike repack, pack-objects
     /// defaults this setting to false when it is not configured.
     write_reverse_index: bool,
@@ -112,6 +116,7 @@ impl Default for PackObjectsOptions {
             path_walk: false,
             sparse: None,
             thin: false,
+            include_tag: false,
             write_reverse_index: false,
             write_bitmap_index: false,
             name_hash_version: None,
@@ -290,6 +295,10 @@ pub(crate) fn cmd_pack_objects(
             // recomputes its own deltas (so reuse toggles are moot), only ever
             // writes non-empty packs unless there is nothing to write, and the
             // reflog/index inclusion knobs only matter alongside `--revs`.
+            //
+            // `--shallow` / `--uri-protocol=*` are emitted by upload-pack's
+            // pack-objects child; shallow boundaries and packfile URIs are
+            // negotiated outside pack-objects on the sley server path.
             "--no-reuse-delta"
             | "--no-reuse-object"
             | "--non-empty"
@@ -297,7 +306,11 @@ pub(crate) fn cmd_pack_objects(
             | "--reflog"
             | "--indexed-objects"
             | "--delta-islands"
+            | "--shallow"
                 if !saw_dashdash => {}
+            "--include-tag" if !saw_dashdash => options.include_tag = true,
+            "--no-include-tag" if !saw_dashdash => options.include_tag = false,
+            value if !saw_dashdash && value.starts_with("--uri-protocol=") => {}
             "--progress" | "--all-progress" | "--all-progress-implied" if !saw_dashdash => {
                 options.progress = Some(true)
             }
@@ -1221,6 +1234,48 @@ type TraversalPackObjects = (
     Vec<VerbatimPackReuse>,
 );
 
+/// Add annotated tag objects that point at already-selected pack contents.
+///
+/// Mirrors `add_ref_tag` in builtin/pack-objects.c: for each `refs/tags/*`
+/// tip that peels to an object already in `want_set`, include the tag object
+/// itself so clients that requested `include-tag` receive the tag.
+fn include_tags_for_packed_objects(
+    git_dir: &Path,
+    database: &FileObjectDatabase,
+    format: ObjectFormat,
+    want_oids: &mut Vec<ObjectId>,
+    want_objects: &mut Vec<Arc<EncodedObject>>,
+    want_set: &mut HashSet<ObjectId>,
+) -> Result<()> {
+    let store = FileRefStore::new(git_dir, format);
+    let tags = store.list_refs_with_prefix("refs/tags/")?;
+    for reference in tags {
+        let tag_oid = match reference.target {
+            RefTarget::Direct(oid) => oid,
+            RefTarget::Symbolic(_) => continue,
+        };
+        if want_set.contains(&tag_oid) {
+            continue;
+        }
+        let Ok(object) = database.read_object(&tag_oid) else {
+            continue;
+        };
+        if object.object_type != ObjectType::Tag {
+            continue;
+        }
+        let Ok(peeled) = sley_rev::peel_tags(database, format, &tag_oid) else {
+            continue;
+        };
+        if !want_set.contains(&peeled) {
+            continue;
+        }
+        want_set.insert(tag_oid);
+        want_oids.push(tag_oid);
+        want_objects.push(object);
+    }
+    Ok(())
+}
+
 /// Enumerate the want set for the traversal mode and decide on pack reuse.
 /// Returns the objects to encode fresh (oids + bodies) and the optional
 /// verbatim reuse (whose objects are excluded from the fresh list).
@@ -1250,6 +1305,10 @@ fn collect_traversal_objects(
         let stdin = io::stdin();
         let mut input = stdin.lock();
         let mut line = String::new();
+        // Mirrors revision.c `read_revisions_from_stdin` + `--not`: a toggle that
+        // marks subsequent positive revs uninteresting (haves). upload-pack feeds
+        // wants, then `--not`, then haves on the pack-objects --revs pipe.
+        let mut not_toggle = false;
         loop {
             line.clear();
             if input.read_line(&mut line)? == 0 {
@@ -1260,6 +1319,43 @@ fn collect_traversal_objects(
             // read_revisions_from_stdin: `if (!sb.len) break;`).
             if rev.is_empty() {
                 break;
+            }
+            // `--` ends the revision list (pathspecs may follow; pack-objects
+            // ignores pathspecs for object selection).
+            if rev == "--" {
+                break;
+            }
+            if rev == "--end-of-options" {
+                continue;
+            }
+            // Pseudo-options accepted on --revs stdin (handle_revision_pseudo_opt).
+            if rev == "--not" {
+                not_toggle = !not_toggle;
+                continue;
+            }
+            if rev == "--all" {
+                let store = FileRefStore::new(git_dir, format);
+                for reference in store.list_refs()? {
+                    if let RefTarget::Direct(oid) = reference.target {
+                        if not_toggle {
+                            haves.push(oid);
+                        } else {
+                            wants.push(oid);
+                        }
+                    }
+                }
+                if let Ok(head) = resolve_revision(git_dir, format, "HEAD", replace_objects) {
+                    if not_toggle {
+                        haves.push(head);
+                    } else {
+                        wants.push(head);
+                    }
+                }
+                continue;
+            }
+            if rev.starts_with('-') {
+                eprintln!("fatal: invalid option '{rev}' in --stdin mode");
+                return Err(GitError::Exit(128));
             }
             if let Some(range) = sley_rev::parse_revision_range(rev) {
                 match range {
@@ -1280,6 +1376,8 @@ fn collect_traversal_objects(
                                 return Err(GitError::Exit(128));
                             }
                         };
+                        // A..B is always (have start, want end); --not does not
+                        // invert range endpoints the way a bare rev is flipped.
                         haves.push(start_oid);
                         wants.push(end_oid);
                     }
@@ -1290,10 +1388,12 @@ fn collect_traversal_objects(
                 }
                 continue;
             }
-            let (negative, rev) = match rev.strip_prefix('^') {
+            let (caret_negative, rev) = match rev.strip_prefix('^') {
                 Some(rest) => (true, rest),
                 None => (false, rev),
             };
+            // `^oid` XOR the --not toggle (revision.c handle_revision_arg).
+            let negative = caret_negative ^ not_toggle;
             let oid = match resolve_revision(git_dir, format, rev, replace_objects) {
                 Ok(oid) => oid,
                 Err(_) => {
@@ -1349,6 +1449,19 @@ fn collect_traversal_objects(
         for oid in omitted {
             eprintln!("~{oid}");
         }
+    }
+
+    // `--include-tag`: pack any tag object whose peeled target is already in
+    // the want set (builtin/pack-objects.c `add_ref_tag`).
+    if options.include_tag {
+        include_tags_for_packed_objects(
+            git_dir,
+            database,
+            format,
+            &mut want_oids,
+            &mut want_objects,
+            &mut want_set,
+        )?;
     }
 
     // want_object_in_pack's veto rules over every on-disk copy.

@@ -1856,9 +1856,10 @@ fn receive_ref_is_hidden(
         overrides
             .iter()
             .filter(|(key, _)| key.eq_ignore_ascii_case("hiderefs"))
-            .map(|(_, value)| trim_hidden_ref_pattern(value)),
+            .map(|(_, value)| sley_core::trim_hidden_ref_pattern(value)),
     );
-    ref_is_hidden_by_patterns(refname, &hide_refs)
+    let full = sley_core::expand_namespace(refname);
+    sley_core::ref_is_hidden(Some(refname), &full, &hide_refs)
 }
 
 fn hidden_ref_values(config: &GitConfig, section: &str, subsection: Option<&str>) -> Vec<String> {
@@ -1866,35 +1867,8 @@ fn hidden_ref_values(config: &GitConfig, section: &str, subsection: Option<&str>
         .get_all(section, subsection, "hiderefs")
         .into_iter()
         .flatten()
-        .map(trim_hidden_ref_pattern)
+        .map(sley_core::trim_hidden_ref_pattern)
         .collect()
-}
-
-fn trim_hidden_ref_pattern(value: &str) -> String {
-    value.trim_end_matches('/').to_string()
-}
-
-fn ref_is_hidden_by_patterns(refname: &str, patterns: &[String]) -> bool {
-    for pattern in patterns.iter().rev() {
-        let mut pattern = pattern.as_str();
-        let negated = pattern.strip_prefix('!').is_some();
-        if negated {
-            pattern = &pattern[1..];
-        }
-        if let Some(rest) = pattern.strip_prefix('^') {
-            pattern = rest;
-        }
-        if hidden_ref_pattern_matches(refname, pattern) {
-            return !negated;
-        }
-    }
-    false
-}
-
-fn hidden_ref_pattern_matches(refname: &str, pattern: &str) -> bool {
-    refname
-        .strip_prefix(pattern)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 fn lease_expectation_mismatch(request: &PushReportRequest<'_>, plan: &PlannedPushCommand) -> bool {
@@ -2039,7 +2013,7 @@ fn receive_denies_current_branch_delete(
 
 /// Whether `old` is an ancestor of `new` (a fast-forward). A walk from `new`;
 /// `old` reachable ⇒ fast-forward.
-pub(crate) fn is_fast_forward(
+pub fn is_fast_forward(
     common_git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,

@@ -778,10 +778,21 @@ fn diff_entry_old_content_for_diff(
         let content = fs::read(path)?;
         let attr_path = entry.old_path.as_deref().unwrap_or(&entry.path);
         return match worktree_clean {
-            Some(clean) => clean
-                .attributes
-                .apply_clean_filter(clean.config, attr_path, &content)
-                .map(Some),
+            Some(clean) => {
+                let index_blob = match entry.old_oid {
+                    Some(oid) => sley_worktree::SafeCrlfIndexBlob::Lookup { odb: db, oid },
+                    None => sley_worktree::SafeCrlfIndexBlob::None,
+                };
+                clean
+                    .attributes
+                    .apply_clean_filter_respecting_index(
+                        clean.config,
+                        attr_path,
+                        &content,
+                        index_blob,
+                    )
+                    .map(Some)
+            }
             None => Ok(Some(content)),
         };
     }

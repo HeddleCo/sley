@@ -6396,8 +6396,19 @@ fn prune_repack_shallow_file(
     format: ObjectFormat,
     roots: &[ObjectId],
 ) -> Result<()> {
+    // Filter repacks intentionally leave large blobs absent from the local ODB
+    // (`--filter-to`). Only a present `shallow` file needs a reachability walk,
+    // and even then missing objects must be tolerated so filtered-out blobs do
+    // not abort an otherwise successful repack.
+    if !git_dir.join("shallow").exists() {
+        return Ok(());
+    }
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let reachable = collect_reachable_object_ids(&db, format, roots.iter().copied())?;
+    let reachable = sley_odb::collect_reachable_object_ids_tolerating_missing(
+        &db,
+        format,
+        roots.iter().copied(),
+    )?;
     prune_shallow_file(git_dir, format, &reachable, false, false)
 }
 
@@ -6962,6 +6973,11 @@ fn incremental_midx_base_chain(
 ) -> Result<Vec<String>> {
     match base_checksum {
         None => Ok(chain.to_vec()),
+        // Empty `--base=` (e.g. broken `$(nth_line …)` in t5334) is treated as
+        // "no base override" — matching Git 2.55.0, which never threads
+        // `incremental_base` into `write_midx_file` on the non-stdin path and
+        // therefore silently ignores the option.
+        Some("") => Ok(chain.to_vec()),
         Some("none") => Ok(Vec::new()),
         Some(base) => {
             let Some(index) = chain.iter().position(|checksum| checksum == base) else {

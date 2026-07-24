@@ -518,16 +518,36 @@ pub(crate) fn three_way_merge_trees_styled_with_strategy_options(
     Ok((results, conflicts))
 }
 
-/// Delegates to [`sley_diff_merge::virtual_ancestor_entry_map`].
+/// Delegates to [`sley_diff_merge::virtual_ancestor_entry_map_with_style`].
+///
+/// `style` is the effective `merge.conflictStyle` so nested virtual-ancestor
+/// markers (t6416 nested conflicts) match git's recursive merge.
 pub(crate) fn virtual_ancestor_entry_map(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     bases: &[ObjectId],
     git_dir: &Path,
+    style: sley_diff_merge::ConflictStyle,
 ) -> Result<MergeTreeMap> {
-    sley_diff_merge::virtual_ancestor_entry_map(db, format, bases, |left, right| {
-        merge_bases(git_dir, db, format, left, right)
-    })
+    sley_diff_merge::virtual_ancestor_entry_map_with_style(
+        db,
+        format,
+        bases,
+        style,
+        |left, right| merge_bases(git_dir, db, format, left, right),
+    )
+}
+
+/// Resolve `merge.conflictStyle` the way `git merge` does.
+pub(crate) fn merge_conflict_style_from_config(config: &GitConfig) -> sley_diff_merge::ConflictStyle {
+    config
+        .get("merge", None, "conflictstyle")
+        .map(|value| match value {
+            "diff3" => sley_diff_merge::ConflictStyle::Diff3,
+            "zdiff3" => sley_diff_merge::ConflictStyle::ZDiff3,
+            _ => sley_diff_merge::ConflictStyle::Merge,
+        })
+        .unwrap_or(sley_diff_merge::ConflictStyle::Merge)
 }
 
 /// Like [`three_way_merge_trees`] but with an explicit `-Xours`/`-Xtheirs`

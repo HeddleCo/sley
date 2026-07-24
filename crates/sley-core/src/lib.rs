@@ -18,6 +18,12 @@ pub use cancel::{
 
 pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.55.0";
 
+pub mod namespace;
+pub use namespace::{
+    clear_git_namespace_override, expand_namespace, get_git_namespace, namespace_active,
+    ref_is_hidden, set_git_namespace_override, strip_namespace, trim_hidden_ref_pattern,
+};
+
 pub mod precompose;
 pub use precompose::{
     activate_precompose_unicode, has_non_ascii, has_non_ascii_bytes, precompose_argv_if_needed,

@@ -2833,6 +2833,15 @@ struct RenameMergedLeaf {
     auto_merged: bool,
 }
 
+/// Paths used to qualify conflict-marker labels for a rename content merge
+/// (`HEAD:m` / `merged common ancestors:b` / `R2^0:b`). When all three are
+/// identical, bare labels are used (merge-ort's `pathnames[0]==[1]==[2]` arm).
+struct RenameMergePaths<'a> {
+    base_path: &'a [u8],
+    ours_path: &'a [u8],
+    theirs_path: &'a [u8],
+}
+
 fn rename_merged_leaf(
     db: &FileObjectDatabase,
     base: Option<(u32, ObjectId)>,
@@ -2840,6 +2849,7 @@ fn rename_merged_leaf(
     theirs: Option<(u32, ObjectId)>,
     path: &[u8],
     options: &MergeTreesOptions<'_>,
+    rename_paths: Option<RenameMergePaths<'_>>,
 ) -> Result<RenameMergedLeaf> {
     match (ours, theirs) {
         (None, None) => Ok(RenameMergedLeaf {
@@ -2886,18 +2896,41 @@ fn rename_merged_leaf(
                 None => Vec::new(),
             };
             let favor = merge_favor_for_path(options, path);
+            // merge-ort rename-collision content merges use
+            // `extra_marker_size = 1 + 2*call_depth` (here call_depth=0 → +1)
+            // and path-qualify labels when the three pathnames differ.
+            let (ours_label, theirs_label, base_label, marker_size) = match rename_paths {
+                Some(rp)
+                    if rp.base_path != rp.ours_path
+                        || rp.ours_path != rp.theirs_path
+                        || rp.base_path != rp.theirs_path =>
+                {
+                    (
+                        qualify_label(options.ours_label, rp.ours_path),
+                        qualify_label(options.theirs_label, rp.theirs_path),
+                        qualify_label(options.ancestor_label, rp.base_path),
+                        merge_marker_size_for_path(options, path).saturating_add(1),
+                    )
+                }
+                Some(_) | None => (
+                    options.ours_label.to_string(),
+                    options.theirs_label.to_string(),
+                    options.ancestor_label.to_string(),
+                    merge_marker_size_for_path(options, path).saturating_add(1),
+                ),
+            };
             let result = merge_blobs(
                 &base_bytes,
                 &merge_blob_bytes(db, &ours_oid)?,
                 &merge_blob_bytes(db, &theirs_oid)?,
                 &MergeBlobOptions {
-                    ours_label: options.ours_label,
-                    theirs_label: options.theirs_label,
-                    base_label: options.ancestor_label,
+                    ours_label: &ours_label,
+                    theirs_label: &theirs_label,
+                    base_label: &base_label,
                     style: options.style,
                     favor,
                     ws_ignore: options.ws_ignore,
-                    marker_size: merge_marker_size_for_path(options, path),
+                    marker_size,
                 },
             );
             let (mode, _) = merge_file_modes(base.map(|(mode, _)| mode), ours_mode, theirs_mode);
@@ -2941,6 +2974,11 @@ fn apply_rename_two_to_one_and_add_conflicts(
             theirs_map.get(&conflict.ours_source).copied(),
             dest,
             options,
+            Some(RenameMergePaths {
+                base_path: &conflict.ours_source,
+                ours_path: dest,
+                theirs_path: &conflict.ours_source,
+            }),
         )?;
         let theirs_merged = rename_merged_leaf(
             db,
@@ -2949,6 +2987,11 @@ fn apply_rename_two_to_one_and_add_conflicts(
             theirs_map.get(dest).copied(),
             dest,
             options,
+            Some(RenameMergePaths {
+                base_path: &conflict.theirs_source,
+                ours_path: &conflict.theirs_source,
+                theirs_path: dest,
+            }),
         )?;
         if ours_merged.auto_merged {
             info_messages.push(MergeInfoMessage::AutoMerge {
@@ -2984,6 +3027,7 @@ fn apply_rename_two_to_one_and_add_conflicts(
             options,
             paths,
             leaves,
+            false,
         )?;
         consumed_sources.push(conflict.ours_source.clone());
         consumed_sources.push(conflict.theirs_source.clone());
@@ -2999,6 +3043,11 @@ fn apply_rename_two_to_one_and_add_conflicts(
                     theirs_map.get(&add.source).copied(),
                     dest,
                     options,
+                    Some(RenameMergePaths {
+                        base_path: &add.source,
+                        ours_path: dest,
+                        theirs_path: &add.source,
+                    }),
                 )?;
                 if merged.auto_merged {
                     info_messages.push(MergeInfoMessage::AutoMerge {
@@ -3015,6 +3064,11 @@ fn apply_rename_two_to_one_and_add_conflicts(
                     theirs_map.get(dest).copied(),
                     dest,
                     options,
+                    Some(RenameMergePaths {
+                        base_path: &add.source,
+                        ours_path: &add.source,
+                        theirs_path: dest,
+                    }),
                 )?;
                 if merged.auto_merged {
                     info_messages.push(MergeInfoMessage::AutoMerge {
@@ -3077,6 +3131,7 @@ fn apply_rename_two_to_one_and_add_conflicts(
             options,
             paths,
             leaves,
+            false,
         )?;
         consumed_sources.push(add.source.clone());
     }
@@ -3156,6 +3211,11 @@ fn replace_distinct_type_rename_add(
 /// 2to1 or rename/add): stage 2 = `ours_leaf`, stage 3 = `theirs_leaf`, no
 /// common ancestor, worktree = their two-way merge. Replaces any existing slot
 /// (the path-keyed core's add/add result) for the destination.
+///
+/// When `swap_worktree_sides` is true, the worktree two-way merge feeds
+/// `theirs` as the "ours" side and vice versa (labels still Temporary/HEAD
+/// names). Used for rename/add so virtual-ancestor marker blobs match merge-ort
+/// (t6416); index stages stay unswapped.
 #[allow(clippy::too_many_arguments)]
 fn write_two_sided_dest_conflict(
     db: &FileObjectDatabase,
@@ -3166,6 +3226,7 @@ fn write_two_sided_dest_conflict(
     options: &MergeTreesOptions<'_>,
     paths: &mut Vec<MergedPath>,
     leaves: &mut MergeEntryMap,
+    swap_worktree_sides: bool,
 ) -> Result<()> {
     let ours_bytes = match ours_leaf {
         Some((mode, oid)) => Some((mode, merge_worktree_bytes(db, mode, &oid)?)),
@@ -3178,10 +3239,15 @@ fn write_two_sided_dest_conflict(
     let (worktree_mode, worktree_content, result_leaf) = match (&ours_bytes, &theirs_bytes) {
         (Some((ours_mode, ours_content)), Some((theirs_mode, theirs_content))) => {
             let favor = merge_favor_for_path(options, dest);
+            let (left, right) = if swap_worktree_sides {
+                (theirs_content.as_slice(), ours_content.as_slice())
+            } else {
+                (ours_content.as_slice(), theirs_content.as_slice())
+            };
             let merged = merge_blobs(
                 &[],
-                ours_content,
-                theirs_content,
+                left,
+                right,
                 &MergeBlobOptions {
                     ours_label: options.ours_label,
                     theirs_label: options.theirs_label,
@@ -3319,6 +3385,7 @@ fn apply_rename_rename_one_to_two_conflicts(
                 options,
                 paths,
                 leaves,
+                false,
             )?;
             continue;
         }
@@ -3352,7 +3419,7 @@ fn rename_one_to_two_source_leaf(
     options: &MergeTreesOptions<'_>,
 ) -> Result<RenameMergedLeaf> {
     let (Some((ours_mode, ours_oid)), Some((theirs_mode, theirs_oid))) = (ours, theirs) else {
-        return rename_merged_leaf(db, base, ours, theirs, old_path, options);
+        return rename_merged_leaf(db, base, ours, theirs, old_path, options, None);
     };
     if (ours_mode, ours_oid) == (theirs_mode, theirs_oid) {
         return Ok(RenameMergedLeaf {
@@ -3426,6 +3493,9 @@ fn entry_map_as_tracked(map: &MergeEntryMap) -> BTreeMap<Vec<u8>, TrackedEntry> 
         .collect()
 }
 
+/// Default conflict-marker width used by git (`DEFAULT_CONFLICT_MARKER_SIZE`).
+const DEFAULT_CONFLICT_MARKER_SIZE: usize = 7;
+
 /// Build the flattened entry map of the *virtual ancestor* for a 3-way merge,
 /// recursively merging the merge bases together (merge-recursive's criss-cross
 /// construction). Conflicts in the virtual merge are folded into the tree rather
@@ -3434,54 +3504,162 @@ fn entry_map_as_tracked(map: &MergeEntryMap) -> BTreeMap<Vec<u8>, TrackedEntry> 
 /// `merge_bases` supplies the pairwise merge-base list for two commits (typically
 /// `sley_rev::merge_bases` at the call site; kept injectable to avoid a
 /// `sley-diff-merge` ↔ `sley-rev` dependency cycle).
+///
+/// Uses [`ConflictStyle::Merge`] markers. Prefer
+/// [`virtual_ancestor_entry_map_with_style`] when the outer merge honours
+/// `merge.conflictStyle`.
 pub fn virtual_ancestor_entry_map(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     bases: &[ObjectId],
     merge_bases: impl Fn(&ObjectId, &ObjectId) -> Result<Vec<ObjectId>>,
 ) -> Result<MergeEntryMap> {
+    virtual_ancestor_entry_map_with_style(db, format, bases, ConflictStyle::Merge, merge_bases)
+}
+
+/// Like [`virtual_ancestor_entry_map`], but textual conflicts inside the virtual
+/// merge use `style` (so nested `merge.conflictStyle=diff3` markers match git).
+pub fn virtual_ancestor_entry_map_with_style(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    bases: &[ObjectId],
+    style: ConflictStyle,
+    merge_bases: impl Fn(&ObjectId, &ObjectId) -> Result<Vec<ObjectId>>,
+) -> Result<MergeEntryMap> {
+    if bases.is_empty() {
+        return Err(GitError::Command(
+            "virtual ancestor needs at least one base".into(),
+        ));
+    }
+    // try_merge_strategy reverses the `repo_get_merge_bases` list (newest-first
+    // after date sort) before `merge_ort_recursive`, so the fold sees oldest
+    // first. Mirror that here. Recursive recompute paths reverse separately in
+    // `merge_two_as_virtual_ancestor`.
+    let mut ordered = bases.to_vec();
+    ordered.reverse();
+    // call_depth starts at 0 for the outer fold of the top-level merge bases;
+    // each recursive base-merge increments it (mirroring merge-ort).
+    fold_virtual_merge_bases(db, format, &ordered, style, 0, &merge_bases)
+}
+
+/// Fold `bases` into a single entry map by pairwise recursive merges, mirroring
+/// merge-ort's `merge_ort_internal` base-folding loop.
+///
+/// The input `bases` order is preserved as git's top-level `repo_get_merge_bases`
+/// list (not reversed). Only when `merge_ort_internal` recomputes bases with a
+/// NULL list does git reverse; that path is the recursive sub-base fold, and we
+/// reverse there (see [`merge_two_as_virtual_ancestor`]).
+fn fold_virtual_merge_bases(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    bases: &[ObjectId],
+    style: ConflictStyle,
+    call_depth: usize,
+    merge_bases: &impl Fn(&ObjectId, &ObjectId) -> Result<Vec<ObjectId>>,
+) -> Result<MergeEntryMap> {
     let first = bases
         .first()
         .ok_or_else(|| GitError::Command("virtual ancestor needs at least one base".into()))?;
     let acc_tree = commit_tree_oid(db, format, first)?;
     let mut acc_map = flatten_tree(db, format, &acc_tree)?;
-    let mut acc_commits = vec![*first];
+    // Representative commit for subsequent `merge_bases` lookups. Git creates a
+    // virtual commit with both parents; we keep the latest real base, which is
+    // exact for the common two-base criss-cross case.
+    let mut acc_commit = *first;
 
     for base in &bases[1..] {
         let other_tree = commit_tree_oid(db, format, base)?;
         let other_map = flatten_tree(db, format, &other_tree)?;
-        let sub_bases = merge_bases(&acc_commits[0], base)?;
-        let sub_base_map = match sub_bases.first() {
-            Some(sb) => {
-                let sb_tree = commit_tree_oid(db, format, sb)?;
-                flatten_tree(db, format, &sb_tree)?
-            }
-            None => MergeEntryMap::new(),
-        };
-        let merge = merge_entry_maps(
+        acc_map = merge_two_as_virtual_ancestor(
             db,
             format,
-            &sub_base_map,
+            &acc_commit,
             &acc_map,
+            base,
             &other_map,
-            &MergeTreesOptions {
-                ours_label: "Temporary merge branch 1",
-                theirs_label: "Temporary merge branch 2",
-                detect_renames: true,
-                rename_threshold: DEFAULT_RENAME_THRESHOLD,
-                ..Default::default()
-            },
+            style,
+            call_depth + 1,
+            merge_bases,
         )?;
-        let mut next = MergeEntryMap::new();
-        for entry in merge.paths {
-            if let Some(leaf) = fold_virtual_ancestor_path(db, &entry)? {
-                next.insert(entry.path, leaf);
-            }
-        }
-        acc_map = next;
-        acc_commits = vec![*base];
+        acc_commit = *base;
     }
     Ok(acc_map)
+}
+
+/// Merge two sides into a virtual-ancestor entry map at `call_depth`, mirroring
+/// one `merge_ort_internal(opt, NULL, prev, next)` step: recompute their merge
+/// bases (recursively when there are several), then 3-way merge with Temporary
+/// branch labels and fold conflicts into the tree.
+#[allow(clippy::too_many_arguments)]
+fn merge_two_as_virtual_ancestor(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    left_commit: &ObjectId,
+    left_map: &MergeEntryMap,
+    right_commit: &ObjectId,
+    right_map: &MergeEntryMap,
+    style: ConflictStyle,
+    call_depth: usize,
+    merge_bases: &impl Fn(&ObjectId, &ObjectId) -> Result<Vec<ObjectId>>,
+) -> Result<MergeEntryMap> {
+    let mut sub_bases = merge_bases(left_commit, right_commit)?;
+    // merge-ort.c: when `merge_ort_internal` recomputes bases (`merge_bases ==
+    // NULL`), it reverses the list ("recursive algorithm will perform better").
+    // This is that recompute path (pairwise virtual merge of two sides).
+    sub_bases.reverse();
+    let (sub_base_map, ancestor_label) = if sub_bases.is_empty() {
+        (MergeEntryMap::new(), "empty tree".to_string())
+    } else if sub_bases.len() == 1 {
+        let sb = sub_bases[0];
+        let sb_tree = commit_tree_oid(db, format, &sb)?;
+        (
+            flatten_tree(db, format, &sb_tree)?,
+            abbreviate_oid_default(&sb),
+        )
+    } else {
+        // Multiple sub-bases: fold them recursively (git's call_depth stays at
+        // the elevated value while the inner fold increases it further).
+        (
+            fold_virtual_merge_bases(db, format, &sub_bases, style, call_depth, merge_bases)?,
+            "merged common ancestors".to_string(),
+        )
+    };
+
+    // merge-ort's process_entry content path: extra_marker_size = call_depth * 2.
+    let marker_size = DEFAULT_CONFLICT_MARKER_SIZE + call_depth * 2;
+    let marker_size_fn = |_: &[u8]| marker_size;
+    let merge = merge_entry_maps(
+        db,
+        format,
+        &sub_base_map,
+        left_map,
+        right_map,
+        &MergeTreesOptions {
+            ours_label: "Temporary merge branch 1",
+            theirs_label: "Temporary merge branch 2",
+            ancestor_label: &ancestor_label,
+            detect_renames: true,
+            rename_threshold: DEFAULT_RENAME_THRESHOLD,
+            style,
+            path_marker_size: Some(&marker_size_fn),
+            ..Default::default()
+        },
+    )?;
+
+    let mut next = MergeEntryMap::new();
+    for entry in merge.paths {
+        if let Some(leaf) = fold_virtual_ancestor_path(db, &entry)? {
+            next.insert(entry.path, leaf);
+        }
+    }
+    Ok(next)
+}
+
+/// Abbreviate an oid the way merge-ort labels a unique merge base in conflict
+/// markers (`strbuf_add_unique_abbrev` / `DEFAULT_ABBREV` = 7).
+fn abbreviate_oid_default(oid: &ObjectId) -> String {
+    let hex = oid.to_hex();
+    hex[..7.min(hex.len())].to_string()
 }
 
 fn commit_tree_oid(
@@ -3499,6 +3677,13 @@ fn commit_tree_oid(
     Ok(Commit::parse_ref(format, &object.body)?.tree)
 }
 
+/// Fold a single path from a virtual-ancestor merge into the virtual tree.
+///
+/// Mirrors merge-ort's `call_depth > 0` resolution:
+/// - modify/delete → keep the original base (stage 0), not the surviving side
+/// - distinct types / symlink / gitlink conflicts → keep base (absent when none)
+/// - textual content conflicts → store the conflict-marker blob so nested merges
+///   can re-surface nested markers
 fn fold_virtual_ancestor_path(
     db: &FileObjectDatabase,
     entry: &MergedPath,
@@ -3506,20 +3691,53 @@ fn fold_virtual_ancestor_path(
     if entry.conflict.is_none() {
         return Ok(entry.result);
     }
+
     let base = entry.stages.base;
     let ours = entry.stages.ours;
     let theirs = entry.stages.theirs;
-    if let Some((mode, _)) = entry.worktree.as_ref() {
-        if is_symlink_mode(*mode) {
+
+    match &entry.conflict {
+        Some(MergeConflictKind::ModifyDelete { .. }) => {
+            // merge-ort: `index = call_depth ? 0 : side` — virtual keeps base.
             return Ok(base);
         }
-        if is_gitlink(*mode) {
-            return Ok(theirs.or(ours));
+        Some(
+            MergeConflictKind::DistinctTypes { .. } | MergeConflictKind::DistinctTypesStage,
+        ) => {
+            // merge-ort: at call_depth, "Just use the version from the merge base".
+            return Ok(base);
         }
-        if let Some((mode, bytes)) = &entry.worktree {
+        _ => {}
+    }
+
+    // Prefer stage modes (worktree for gitlinks is empty and mode may be
+    // missing) when classifying symlink / gitlink conflicts.
+    let mode_hint = ours
+        .or(theirs)
+        .or(base)
+        .map(|(mode, _)| mode)
+        .or_else(|| entry.worktree.as_ref().map(|(mode, _)| *mode));
+
+    if let Some(mode) = mode_hint {
+        if is_symlink_mode(mode) {
+            // merge-ort symlink arm at call_depth: result = base (o).
+            return Ok(base);
+        }
+        if is_gitlink(mode) {
+            // merge-ort submodule arm at call_depth: result = base (o),
+            // including null for add/add so the outer merge sees the conflict.
+            return Ok(base);
+        }
+    }
+
+    // Textual content / rename content: persist conflict-marker bytes.
+    if let Some((mode, bytes)) = &entry.worktree {
+        if is_mergeable_file_mode(*mode) {
             let oid = db.write_object(EncodedObject::new(ObjectType::Blob, bytes.clone()))?;
             return Ok(Some((*mode, oid)));
         }
     }
-    Ok(ours.or(theirs))
+
+    // Fallback: prefer base, then either side.
+    Ok(base.or(ours).or(theirs))
 }

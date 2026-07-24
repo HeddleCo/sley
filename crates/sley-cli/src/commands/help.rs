@@ -92,7 +92,7 @@ static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     CommandSpec::new("apply", BUILTIN),
     CommandSpec::new("archimport", RESERVED_CORE_HELPER),
     CommandSpec::new("archive", BUILTIN),
-    CommandSpec::new("backfill", GIT_BUILTIN_RESERVED),
+    CommandSpec::new("backfill", BUILTIN),
     CommandSpec::new("bisect", BUILTIN_MAIN),
     CommandSpec::new("blame", BUILTIN),
     CommandSpec::new("branch", BUILTIN_MAIN),
@@ -1475,8 +1475,7 @@ mod command_registry_tests {
         );
         assert!(COMMAND_REGISTRY.contains_with("daemon", NATIVE));
         assert!(!COMMAND_REGISTRY.contains_with("daemon", GIT_BUILTIN));
-        assert!(COMMAND_REGISTRY.contains_with("backfill", GIT_BUILTIN));
-        assert!(!COMMAND_REGISTRY.contains_with("backfill", NATIVE));
+        assert!(COMMAND_REGISTRY.contains_with("backfill", BUILTIN));
     }
 
     #[test]

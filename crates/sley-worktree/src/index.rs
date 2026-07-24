@@ -755,6 +755,7 @@ pub fn add_exact_tracked_path_from_disk(
             conv_flags,
             index_blob,
             true,
+            false,
         )?
         .into_owned()
     };
@@ -1149,6 +1150,7 @@ pub(crate) fn add_update_tracked_path(
             conv_flags,
             index_blob,
             true,
+            false,
         )?
         .into_owned()
     };
@@ -1600,14 +1602,14 @@ pub(crate) fn update_index_paths_impl(
                     let checks =
                         matcher.attributes_for_path(&git_path, &requested_filter_attrs, false);
                     apply_clean_filter_cow_inner(
-                        config, &checks, &git_path, &body, conv_flags, index_blob, true,
+                        config, &checks, &git_path, &body, conv_flags, index_blob, true, false,
                     )?
                     .into_owned()
                 }
                 (Some(config), Some(UpdateIndexCleanFilter::PathLocal)) => {
                     let checks = filter_attribute_checks(worktree_root, &git_path)?;
                     apply_clean_filter_cow_inner(
-                        config, &checks, &git_path, &body, conv_flags, index_blob, true,
+                        config, &checks, &git_path, &body, conv_flags, index_blob, true, false,
                     )?
                     .into_owned()
                 }

@@ -274,6 +274,11 @@ pub(crate) fn collect_short_status_with_options(
 pub fn run(args: Vec<String>) -> Result<()> {
     sley_core::set_original_cwd(env::current_dir().ok());
     let global = apply_global_options(&args)?;
+    // `--namespace` overrides `GIT_NAMESPACE` for this process (git uses setenv;
+    // the workspace forbids `env::set_var`, so a process-local override is used).
+    if let Some(namespace) = global.namespace.clone() {
+        sley_core::set_git_namespace_override(Some(namespace));
+    }
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cli_session = session::CliSession::from_parsed_globals(
         cwd,
