@@ -5,6 +5,8 @@
 use sley_core::{GitError, ObjectFormat, Result};
 use sley_protocol::*;
 use std::io::{Read, Write};
+#[cfg(feature = "http-client")]
+use std::time::Duration;
 
 pub mod credential;
 
@@ -1507,9 +1509,7 @@ pub trait HttpClient {
         headers: &[(&str, &str)],
         body: &mut dyn std::io::Read,
     ) -> Result<HttpResponse> {
-        let mut buffered = Vec::new();
-        body.read_to_end(&mut buffered)
-            .map_err(|err| GitError::Io(err.to_string()))?;
+        let buffered = read_to_end_bounded(body, MAX_PACKFILE_RESPONSE_BYTES, "HTTP request body")?;
         self.post(url, content_type, headers, &buffered)
     }
 }
@@ -1520,20 +1520,129 @@ pub struct UreqHttpClient {
     agent: ureq::Agent,
 }
 
+/// Max time for the DNS lookup.
+///
+/// glibc's resolver waits 5s per attempt and makes two attempts, so a lookup
+/// that has not answered inside 10s is not going to.
+#[cfg(feature = "http-client")]
+const HTTP_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Max time to establish the connection (TCP handshake, proxy, TLS).
+///
+/// Linux retransmits an unanswered SYN at 1s, 3s, 7s and 15s; 20s admits the
+/// first three retransmits, so a single lossy handshake still succeeds. curl's
+/// 300s default -- which git inherits -- does not bound anything useful here.
+#[cfg(feature = "http-client")]
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Max time to send the request headers (not the body).
+///
+/// A few hundred bytes. A peer that cannot absorb them in 20s is stalled.
+#[cfg(feature = "http-client")]
+const HTTP_SEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Max time to await a `100 Continue`.
+///
+/// ureq's own default, kept as-is: a peer that never sends one is expected, and
+/// the request proceeds without it.
+#[cfg(feature = "http-client")]
+const HTTP_AWAIT_100_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Max time to receive the response headers (not the body).
+///
+/// A smart-HTTP server flushes its response headers before it starts writing
+/// the pack -- `git-upload-pack`'s object enumeration shows up as a gap inside
+/// the body, which `HTTP_BODY_TIMEOUT` covers, not as a delay before the
+/// headers. So this only has to cover a few round trips plus server dispatch,
+/// and 30s is already generous for a phase carrying a few hundred bytes.
+///
+/// Note that ureq also re-checks the *preceding* phase's deadline while it
+/// waits, so the effective bound on "request sent, no headers yet" is the
+/// tighter of this and [`HTTP_SEND_REQUEST_TIMEOUT`] measured from the start of
+/// the request -- 20s in practice, which is what a stalled peer actually hits.
+#[cfg(feature = "http-client")]
+const HTTP_RECV_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Max time to send or to receive a body.
+///
+/// Derived rather than chosen: the largest body sley will buffer divided by the
+/// slowest average rate it will serve (both in `sley_protocol::limits`), so the
+/// size ceiling and the time ceiling cannot drift apart. 4 GiB at 1 MiB/s is
+/// 4096s, a little over an hour.
+///
+/// ureq's timeouts are whole-phase deadlines, not idle timeouts, so this bounds
+/// the total transfer rather than the gap between reads. A peer trickling one
+/// byte per interval is therefore cut off here, while a peer on a merely slow
+/// link is refused only if the transfer would not have finished in the budget.
+#[cfg(feature = "http-client")]
+const HTTP_BODY_TIMEOUT: Duration =
+    Duration::from_secs(MAX_PACKFILE_RESPONSE_BYTES / MIN_TRANSFER_BYTES_PER_SEC);
+
+/// Max time for the whole call, redirects included: the sum of every phase
+/// above. A redirect chain shares this one budget instead of getting a fresh
+/// deadline per hop.
+#[cfg(feature = "http-client")]
+const HTTP_GLOBAL_TIMEOUT: Duration = Duration::from_secs(
+    HTTP_RESOLVE_TIMEOUT.as_secs()
+        + HTTP_CONNECT_TIMEOUT.as_secs()
+        + HTTP_SEND_REQUEST_TIMEOUT.as_secs()
+        + HTTP_AWAIT_100_TIMEOUT.as_secs()
+        + HTTP_RECV_RESPONSE_TIMEOUT.as_secs()
+        + HTTP_BODY_TIMEOUT.as_secs()
+        + HTTP_BODY_TIMEOUT.as_secs(),
+);
+
+/// Every deadline applied to an outbound HTTP request.
+///
+/// ureq 3.3.0's `Timeouts::default()` leaves every field `None` except
+/// `await_100`, which is to say there is no connect, read, write or overall
+/// deadline at all: a peer that accepts and then stalls holds the request open
+/// in unbounded wall-clock, and a byte ceiling never fires because the volume
+/// stays small (sley#163). Every field is named explicitly here, so a field
+/// added to ureq later cannot silently reintroduce an unbounded phase.
+#[cfg(feature = "http-client")]
+fn http_timeouts() -> ureq::config::Timeouts {
+    ureq::config::Timeouts {
+        global: Some(HTTP_GLOBAL_TIMEOUT),
+        per_call: Some(HTTP_GLOBAL_TIMEOUT),
+        resolve: Some(HTTP_RESOLVE_TIMEOUT),
+        connect: Some(HTTP_CONNECT_TIMEOUT),
+        send_request: Some(HTTP_SEND_REQUEST_TIMEOUT),
+        await_100: Some(HTTP_AWAIT_100_TIMEOUT),
+        send_body: Some(HTTP_BODY_TIMEOUT),
+        recv_response: Some(HTTP_RECV_RESPONSE_TIMEOUT),
+        recv_body: Some(HTTP_BODY_TIMEOUT),
+    }
+}
+
+#[cfg(feature = "http-client")]
+fn ureq_agent(timeouts: ureq::config::Timeouts) -> ureq::Agent {
+    // `http_status_as_error(false)` makes ureq deliver 4xx/5xx as a normal
+    // response (carrying status + body) rather than an error, which is what
+    // smart-HTTP callers need (e.g. inspecting 401 to prompt for creds).
+    let mut builder = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .user_agent(HTTP_USER_AGENT)
+        .timeout_global(timeouts.global)
+        .timeout_per_call(timeouts.per_call)
+        .timeout_resolve(timeouts.resolve)
+        .timeout_connect(timeouts.connect)
+        .timeout_send_request(timeouts.send_request)
+        .timeout_await_100(timeouts.await_100)
+        .timeout_send_body(timeouts.send_body)
+        .timeout_recv_response(timeouts.recv_response)
+        .timeout_recv_body(timeouts.recv_body);
+    if let Some(tls_config) = ureq_tls_config() {
+        builder = builder.tls_config(tls_config);
+    }
+    builder.build().into()
+}
+
 #[cfg(feature = "http-client")]
 impl UreqHttpClient {
     pub fn new() -> Self {
-        // `http_status_as_error(false)` makes ureq deliver 4xx/5xx as a normal
-        // response (carrying status + body) rather than an error, which is what
-        // smart-HTTP callers need (e.g. inspecting 401 to prompt for creds).
-        let mut builder = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .user_agent(HTTP_USER_AGENT);
-        if let Some(tls_config) = ureq_tls_config() {
-            builder = builder.tls_config(tls_config);
-        }
         Self {
-            agent: builder.build().into(),
+            agent: ureq_agent(http_timeouts()),
         }
     }
 }
@@ -2928,6 +3037,26 @@ mod http_timeout_tests {
         ] {
             assert!(value.is_some(), "timeout `{name}` is unbounded");
         }
+    }
+
+    /// The body deadline is derived from the size ceiling and the floor rate,
+    /// and the global deadline from the sum of the phases, so no part of the
+    /// budget can be changed without the rest following.
+    #[test]
+    fn deadlines_are_derived_from_the_size_ceiling() {
+        assert_eq!(
+            HTTP_BODY_TIMEOUT.as_secs(),
+            MAX_PACKFILE_RESPONSE_BYTES / MIN_TRANSFER_BYTES_PER_SEC
+        );
+        assert_eq!(
+            HTTP_GLOBAL_TIMEOUT.as_secs(),
+            HTTP_RESOLVE_TIMEOUT.as_secs()
+                + HTTP_CONNECT_TIMEOUT.as_secs()
+                + HTTP_SEND_REQUEST_TIMEOUT.as_secs()
+                + HTTP_AWAIT_100_TIMEOUT.as_secs()
+                + HTTP_RECV_RESPONSE_TIMEOUT.as_secs()
+                + 2 * HTTP_BODY_TIMEOUT.as_secs()
+        );
     }
 
     /// A peer that completes the TCP handshake and then says nothing must be

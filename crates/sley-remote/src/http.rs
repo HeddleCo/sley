@@ -51,6 +51,8 @@ use sley_transport::{
     parse_remote_url, read_service_discovery_response,
 };
 
+use sley_protocol::{MAX_REF_ADVERTISEMENT_BYTES, read_to_end_bounded};
+
 use crate::credentials::{credential_request_for_url, http_url_credential};
 use crate::{CredentialProvider, ProgressSink};
 
@@ -573,8 +575,17 @@ fn read_http_service_discovery_response(
     format: ObjectFormat,
     reader: &mut impl Read,
 ) -> Result<ServiceDiscoveryResponse> {
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes)?;
+    read_http_service_discovery_response_with_limit(format, reader, MAX_REF_ADVERTISEMENT_BYTES)
+}
+
+/// [`read_http_service_discovery_response`] with an explicit ceiling, so the
+/// bound can be exercised without materialising a 128 MiB advertisement.
+fn read_http_service_discovery_response_with_limit(
+    format: ObjectFormat,
+    reader: &mut impl Read,
+    limit: u64,
+) -> Result<ServiceDiscoveryResponse> {
+    let bytes = read_to_end_bounded(reader, limit, "service discovery response")?;
     let first = read_service_discovery_response(format, &mut bytes.as_slice());
     let alternate = match format {
         ObjectFormat::Sha1 => ObjectFormat::Sha256,
@@ -1643,5 +1654,29 @@ mod tests {
             ]))
         );
         assert!(!request_body.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bounded_read_tests {
+    use super::*;
+
+    /// sley#163: the service-discovery response is buffered whole, so it needs
+    /// a ceiling. Without one this call never returns on an endless reader.
+    #[test]
+    fn service_discovery_response_refuses_an_endless_reader() {
+        let mut endless = std::io::repeat(b'x');
+        let error = read_http_service_discovery_response_with_limit(
+            ObjectFormat::Sha1,
+            &mut endless,
+            64 * 1024,
+        )
+        .expect_err("an endless advertisement must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the maximum accepted size"),
+            "unexpected error: {error}"
+        );
     }
 }

@@ -47,6 +47,8 @@ use sley_protocol::{
     read_receive_pack_report_status, read_receive_pack_report_status_v2,
 };
 
+use sley_protocol::{MAX_REF_ADVERTISEMENT_BYTES, read_to_end_bounded};
+
 use crate::pack::push_pack_roots;
 #[cfg(feature = "http")]
 use crate::pack::write_receive_pack_body_with_cancel;
@@ -982,8 +984,15 @@ fn execute_push_http(
         validate_receive_pack_unpack(&report)?;
         Some(report)
     } else {
-        let mut sink = Vec::new();
-        response.body.read_to_end(&mut sink)?;
+        // Drain the body we are not going to parse, so the connection
+        // completes -- but never unboundedly. The report is one pkt-line per
+        // pushed ref, so the advertisement ceiling is already far more than a
+        // legitimate one needs.
+        read_to_end_bounded(
+            &mut response.body,
+            MAX_REF_ADVERTISEMENT_BYTES,
+            "receive-pack response",
+        )?;
         None
     };
     Ok(PushOutcome {

@@ -7062,3 +7062,101 @@ fn protocol_v2_ls_refs_records_bridge_unborn_head_symref_and_empty() {
         }
     );
 }
+
+// --- sley#163: bounded reads on untrusted readers ---------------------------
+
+#[test]
+fn bounded_read_accepts_exactly_the_limit_and_refuses_one_more() {
+    let payload = vec![b'x'; 64];
+
+    let exact = read_to_end_bounded(&mut payload.as_slice(), 64, "test stream")
+        .expect("a stream exactly at the ceiling is accepted");
+    assert_eq!(exact.len(), 64);
+
+    let error = read_to_end_bounded(&mut payload.as_slice(), 63, "test stream")
+        .expect_err("a stream one byte over the ceiling is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("exceeds the maximum accepted size"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn bounded_read_refuses_an_endless_reader() {
+    // `io::repeat` never ends. An unbounded `read_to_end` on it never returns:
+    // it allocates until the process dies. That is the shape of the reads this
+    // replaces, so the bound has to stop it without reading the overage.
+    let mut endless = std::io::repeat(b'x');
+    let error = read_to_end_bounded(&mut endless, 64 * 1024, "test stream")
+        .expect_err("an endless stream must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("exceeds the maximum accepted size"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn bounded_append_counts_the_already_buffered_prefix() {
+    let rest = vec![b'x'; 32];
+
+    let mut buffer = vec![b'p'; 32];
+    let error = append_to_end_bounded(&mut rest.as_slice(), &mut buffer, 48, "test stream")
+        .expect_err("the prefix counts against the ceiling");
+    assert!(
+        error
+            .to_string()
+            .contains("exceeds the maximum accepted size"),
+        "unexpected error: {error}"
+    );
+
+    let mut buffer = vec![b'p'; 32];
+    append_to_end_bounded(&mut rest.as_slice(), &mut buffer, 64, "test stream")
+        .expect("prefix plus body exactly at the ceiling is accepted");
+    assert_eq!(buffer.len(), 64);
+}
+
+#[test]
+fn upload_pack_raw_packfile_response_refuses_an_endless_reader() {
+    let mut endless = std::io::repeat(b'x');
+    let error = crate::upload_pack::read_upload_pack_raw_packfile_response_with_limit(
+        ObjectFormat::Sha1,
+        &mut endless,
+        64 * 1024,
+    )
+    .expect_err("an endless packfile response must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("exceeds the maximum accepted size"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn upload_pack_shallow_info_packfile_response_refuses_an_endless_reader() {
+    // An empty shallow-info section and a NAK, then a pack header followed by
+    // a body that never ends.
+    let mut prefix = Vec::new();
+    prefix.extend_from_slice(b"0000");
+    prefix.extend_from_slice(b"0008NAK\n");
+    prefix.extend_from_slice(b"PACK\x00\x00\x00\x02");
+    let mut stream = std::io::Cursor::new(prefix).chain(std::io::repeat(b'x'));
+
+    let error =
+        crate::upload_pack::read_upload_pack_shallow_info_and_raw_packfile_response_with_limit(
+            ObjectFormat::Sha1,
+            &mut stream,
+            64 * 1024,
+        )
+        .expect_err("an endless packfile body must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("exceeds the maximum accepted size"),
+        "unexpected error: {error}"
+    );
+}
