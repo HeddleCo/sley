@@ -844,15 +844,20 @@ pub(crate) fn transfer_receive_hidden_ref_patterns(config: &GitConfig) -> Vec<St
 /// The object ids the local repository can offer as `have`s during negotiation.
 /// Ref tips are offered first, then every object visible through the local
 /// object database, including alternates recorded in `objects/info/alternates`.
+///
+/// Tips whose objects are missing (e.g. a partial client whose packs were
+/// deleted, t5616 "fetch does not lazy-fetch missing targets of its refs") are
+/// skipped: a have must name an object the client can actually prove.
 pub fn local_have_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
     let mut seen = HashSet::new();
     let mut haves = Vec::new();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format)
+        .with_promisor_remote_present(repo_has_promisor_remote(git_dir));
     for advertisement in local_fetch_advertisements(git_dir, format)? {
-        if seen.insert(advertisement.oid) {
+        if seen.insert(advertisement.oid) && db.contains(&advertisement.oid)? {
             haves.push(advertisement.oid);
         }
     }
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     for oid in db.object_ids()? {
         if seen.insert(oid) {
             haves.push(oid);
@@ -918,6 +923,7 @@ fn local_negotiation_have_oids_stopping_at(
             .map(|signature| signature.time.seconds)
             .unwrap_or(0))
     };
+    // mark_complete runs once at fetch entry; have-building still peels tips.
     for advertisement in local_fetch_advertisements(git_dir, format)? {
         if let Some(commit) = peel_to_commit_for_negotiation(&db, format, &advertisement.oid)?
             && seen.insert(commit)
@@ -996,10 +1002,13 @@ fn peel_to_commit<R: ObjectReader>(
     }
 }
 
-/// Negotiation-frontier variant of [`peel_to_commit`]. An annotated tag may be
-/// present in a promisor pack while its filtered target is legitimately absent.
-/// Such a tag cannot establish a commit-have boundary, but it must not abort an
-/// unrelated branch fetch. Missing objects not proven promised remain errors.
+/// Negotiation-frontier variant of [`peel_to_commit`].
+///
+/// An annotated tag may be present in a promisor pack while its filtered target
+/// is legitimately absent; such a tip cannot establish a commit-have boundary.
+/// Missing tips more generally (including after a partial client deleted its
+/// packs, t5616 "fetch does not lazy-fetch missing targets of its refs") also
+/// cannot contribute haves — skip them instead of aborting an unrelated fetch.
 fn peel_to_commit_for_negotiation<R: ObjectReader>(
     remote_db: &R,
     format: ObjectFormat,
@@ -1009,7 +1018,7 @@ fn peel_to_commit_for_negotiation<R: ObjectReader>(
     loop {
         let object = match remote_db.read_object(&oid) {
             Ok(object) => object,
-            Err(GitError::NotFound(_)) if remote_db.is_promised_object(&oid) => return Ok(None),
+            Err(GitError::NotFound(_)) => return Ok(None),
             Err(error) => return Err(error),
         };
         match object.object_type {
@@ -1018,6 +1027,43 @@ fn peel_to_commit_for_negotiation<R: ObjectReader>(
             _ => return Ok(None),
         }
     }
+}
+
+/// Git's `mark_complete` over every local ref: a tip present only in the
+/// commit-graph (not the ODB) is fatal. Exact-OID wants skip negotiation, so
+/// this must run independently of have-building (t5330 #4).
+pub fn mark_complete_local_refs(git_dir: &Path, format: ObjectFormat) -> Result<()> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format)
+        .with_promisor_remote_present(repo_has_promisor_remote(git_dir));
+    for advertisement in local_fetch_advertisements(git_dir, format)? {
+        die_if_commit_graph_only_missing(git_dir, &db, format, &advertisement.oid)?;
+    }
+    Ok(())
+}
+
+/// Git's `die_in_commit_graph_only`: a local ref tip that the commit-graph
+/// knows about but the object database does not is fatal during fetch's
+/// `mark_complete` pass. Do not lazy-fetch through the promisor to "repair"
+/// it — the user must pass `--refetch` deliberately.
+fn die_if_commit_graph_only_missing(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<()> {
+    // `commit_graph_tree_oid` returns Some only when the oid is covered by a
+    // usable monolithic graph; Missing/Invalid graphs are Ok(None).
+    let in_graph = sley_rev::commit_graph_tree_oid(git_dir, format, oid)?.is_some();
+    let in_odb = db.contains(oid)?;
+    if in_graph && !in_odb {
+        eprintln!(
+            "fatal: You are attempting to fetch {oid}, which is in the commit graph file but not in the object database.\n\
+This is probably due to repo corruption.\n\
+If you are attempting to repair this repo corruption by refetching the missing object, use 'git fetch --refetch' with the missing object."
+        );
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
 }
 
 /// Compute the deepen plan for a shallow local fetch, mirroring upstream
@@ -1605,15 +1651,20 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
         return Ok(LocalFetchPackOutcome::default());
     }
 
-    // A lazy promisor request names the exact missing objects it needs. The
-    // repository's partial-clone filter describes ordinary traversal, but it
-    // must not remove an explicitly wanted blob from this direct response.
+    // A lazy promisor request names the exact missing objects it needs. Git's
+    // `promisor_remote_get_direct` always passes `--filter=blob:none`, so a
+    // tree want does not pull its blobs. Explicitly wanted tips stay packed via
+    // `retain_filtered_pack_objects` even when the filter would otherwise drop
+    // them (e.g. an explicit blob want under blob:none).
     let direct_promisor_object_fetch = promisor
         && deepen.is_none()
         && !record_promisor_refs
         && request_mode == LocalFetchPackRequestMode::ExactObjects;
     let transfer_filter = if direct_promisor_object_fetch {
-        None
+        Some(
+            filter
+                .unwrap_or(sley_odb::PackObjectFilter::BlobNone),
+        )
     } else {
         filter
     };
@@ -1860,7 +1911,10 @@ pub fn hydrate_objects_from_local_promisor_remotes(
         };
         crate::promisor::trace_promisor_remote_contact(&remote_name);
         for oid in missing.iter().copied() {
-            let _ = install_fetch_pack_via_local_upload_pack(
+            // Keep blob:none so tree wants do not pull blobs, but do not
+            // swallow install failures — a silent miss leaves the caller with
+            // a NotFound that is harder to diagnose (t5616 .gitmodules).
+            if let Err(err) = install_fetch_pack_via_local_upload_pack(
                 git_dir,
                 &promisor_git_dir,
                 format,
@@ -1872,7 +1926,12 @@ pub fn hydrate_objects_from_local_promisor_remotes(
                 Some(Vec::new()),
                 false,
                 None,
-            );
+            ) {
+                // A remote that lacks the oid is expected; try the next
+                // promisor. Transport/IO failures still fall through so a
+                // later remote can succeed.
+                let _ = err;
+            }
         }
         db.refresh_read_cache();
         missing.retain(|oid| !db.contains(oid).unwrap_or(false));

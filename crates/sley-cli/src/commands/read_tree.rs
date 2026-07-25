@@ -116,6 +116,15 @@ pub(crate) fn cmd_read_tree(cli_session: &session::CliSession, args: &[String]) 
                 sley_worktree::ReadTreeTransitionMode::Overlay,
             )?;
             if !parsed.dry_run {
+                // Git's cache-tree update prefetches every missing non-gitlink
+                // index blob in one promisor request before verifying existence
+                // (t1022). Mirror that batch boundary when the repo is partial.
+                prefetch_read_tree_index_blobs(
+                    git_dir,
+                    db,
+                    &entries,
+                    cli_session.lazy_fetch(),
+                )?;
                 sley_worktree::persist_read_tree_entries(git_dir, format, entries)?;
                 if parsed.update_worktree && parsed.sparse_checkout {
                     apply_read_tree_sparse_checkout(
@@ -557,6 +566,39 @@ fn read_tree_check_cache_tree() -> bool {
         std::env::var("GIT_TEST_CHECK_CACHE_TREE").as_deref(),
         Ok("false" | "0")
     )
+}
+
+/// Prefetch every missing non-gitlink blob referenced by the planned index,
+/// matching git's `cache_tree_update` → `prefetch_cache_entries` path used when
+/// a promisor remote is configured (t1022).
+fn prefetch_read_tree_index_blobs(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    entries: &[(Vec<u8>, sley_worktree::ReadTreeEntry)],
+    lazy_fetch: bool,
+) -> Result<()> {
+    if !lazy_fetch || entries.is_empty() {
+        return Ok(());
+    }
+    // Only partial clones hydrate on cache-tree write; plain repos no-op.
+    let config = match crate::commands::remote::read_repo_config(git_dir) {
+        Ok(config) => config,
+        Err(_) => return Ok(()),
+    };
+    if crate::promisor_remote_names(&config).is_empty() {
+        return Ok(());
+    }
+    let mut oids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (_path, entry) in entries {
+        if sley_index::is_gitlink(entry.mode) {
+            continue;
+        }
+        if seen.insert(entry.oid) {
+            oids.push(entry.oid);
+        }
+    }
+    crate::prefetch_promisor_objects(db, &oids, true)
 }
 
 /// Which command's porcelain error strings the engine's safety checks should

@@ -502,11 +502,9 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
     let unsafe_paths = unsafe_paths && !touch_index;
     check_apply_path_safety(&worktree_base, &patches, unsafe_paths, index.as_ref())?;
 
-    // Phase 0: whitespace handling. Resolve the per-path rule, then warn/error
-    // or fix the introduced (`+`) lines per `--whitespace=<action>`. In `fix`
-    // mode this rewrites the patch's Insert lines (and trims new blank lines at
-    // EOF) before it is applied. In `error`/`error-all` mode a whitespace error
-    // aborts the whole apply.
+    // Whitespace errors are counted during the sequential apply loop below so a
+    // later patch in the same batch can see the result of an earlier one (git's
+    // `previous_patch` / multi-input `write_out_results` between files).
     let mut ws_error_count = 0usize;
     let mut ws_squelched = 0usize;
     let squelch_limit = if matches!(ws_action, WsAction::ErrorAll) {
@@ -514,80 +512,6 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
     } else {
         5
     };
-    if !matches!(ws_action, WsAction::Nowarn) {
-        for patch in &mut patches {
-            // Binary patches carry no textual hunks to whitespace-check.
-            if patch.is_binary {
-                continue;
-            }
-            let target = patch
-                .new_path
-                .as_deref()
-                .or(patch.old_path.as_deref())
-                .unwrap_or(b"");
-            let mut rule = ws_resolver.rule_for_path(target)?;
-            // A symlink's incomplete line is not news (apply.c clears it). git
-            // uses the post-image mode (new_mode, else old_mode — the index-line
-            // mode lands in old_mode for a content-only symlink patch).
-            if patch.new_mode.or(patch.old_mode) == Some(0o120000) {
-                rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
-            }
-            let base = read_patch_base(
-                &worktree_base,
-                worktree_root,
-                git_dir,
-                format,
-                repo_config,
-                patch,
-                index.as_ref(),
-                db,
-                verify_worktree_match,
-            )?;
-            apply_patch_whitespace(
-                patch,
-                &base,
-                rule,
-                ws_action,
-                patch_input_file,
-                squelch_limit,
-                &mut ws_error_count,
-                &mut ws_squelched,
-            );
-        }
-    }
-    if ws_squelched > 0 {
-        eprintln!(
-            "warning: squelched {ws_squelched} whitespace error{}",
-            if ws_squelched == 1 { "" } else { "s" }
-        );
-    }
-    if ws_error_count > 0 {
-        let n = ws_error_count;
-        // git's `%d line(s) add(s)/applied` plural forms. The "errors" word is
-        // always plural in this message, even for a single line.
-        let adds = if n == 1 { "line adds" } else { "lines add" };
-        match ws_action {
-            // `die_on_ws_error`: an `error:`-prefixed summary, then a non-zero exit.
-            WsAction::Error | WsAction::ErrorAll => {
-                eprintln!("error: {n} {adds} whitespace errors.");
-            }
-            WsAction::Fix => {
-                let applied = if n == 1 {
-                    "line applied"
-                } else {
-                    "lines applied"
-                };
-                eprintln!("warning: {n} {applied} after fixing whitespace errors.");
-            }
-            _ => {
-                eprintln!("warning: {n} {adds} whitespace errors.");
-            }
-        }
-    }
-    if ws_error_count > 0 && matches!(ws_action, WsAction::Error | WsAction::ErrorAll) {
-        return Err(GitError::Exit(1));
-    }
-    let patches = patches;
 
     // git's `check_to_create`: a newly created path (or rename/copy target) must
     // not already exist in the index or working tree, unless another patch in the
@@ -627,14 +551,21 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
         return Ok(());
     }
 
-    // Phase 1: compute every result first (git applies a patch atomically).
+    // Phase 1: compute every result first (git applies a patch atomically within
+    // one input file; across multiple inputs it materializes between them). We
+    // keep an in-memory overlay of prior results in this batch so a later patch
+    // (e.g. t4110's multi-file apply scan) can read the postimage of an earlier
+    // create/modify without requiring intermediate disk writes.
     let mut actions = Vec::new();
+    // path -> content after earlier patches in this batch; tombstones via deleted.
+    let mut result_overlay: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    let mut result_deleted: HashSet<Vec<u8>> = HashSet::new();
     // `--reject`: rejected-hunk `.rej` writeouts collected here (path, bytes), and
     // a flag so the whole command exits 1 at the end (git's `apply_with_reject`).
     let mut reject_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut had_reject = false;
     let apply_file_options = sley_diff_merge::ApplyFileOptions { unidiff_zero };
-    for patch in &patches {
+    for patch in &mut patches {
         // Gitlink (submodule) patch: mode 160000 + `Subproject commit <sha>` body.
         // git updates the index gitlink entry from the recorded commit oid (no
         // blob is written) and, in the working tree, just ensures an (empty)
@@ -643,6 +574,12 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
         if apply_patch_is_gitlink(patch) {
             if patch.is_delete {
                 if let Some(old) = &patch.old_path {
+                    record_apply_result_overlay(
+                        &mut result_overlay,
+                        &mut result_deleted,
+                        old,
+                        None,
+                    );
                     actions.push(ApplyAction::GitlinkRemove { path: old.clone() });
                 }
                 continue;
@@ -657,6 +594,8 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
                 index.as_ref(),
                 db,
                 verify_worktree_match,
+                &result_overlay,
+                &result_deleted,
             )?;
             let content = match sley_diff_merge::apply_file_patch_with_options(
                 &base,
@@ -688,8 +627,20 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
                 && patch.old_mode.is_some_and(|mode| mode != 0o160000)
                 && let Some(old) = &patch.old_path
             {
+                record_apply_result_overlay(
+                    &mut result_overlay,
+                    &mut result_deleted,
+                    old,
+                    None,
+                );
                 actions.push(ApplyAction::Remove { path: old.clone() });
             }
+            record_apply_result_overlay(
+                &mut result_overlay,
+                &mut result_deleted,
+                &target,
+                Some(content),
+            );
             actions.push(ApplyAction::Gitlink { path: target, oid });
             continue;
         }
@@ -703,13 +654,45 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
             index.as_ref(),
             db,
             verify_worktree_match,
+            &result_overlay,
+            &result_deleted,
         )?;
+        // Whitespace handling (git's check_patch path): warn/error/fix on the
+        // introduced `+` lines. Runs per-patch so later patches see earlier
+        // postimages via the overlay.
+        if !matches!(ws_action, WsAction::Nowarn) && !patch.is_binary {
+            let target = patch
+                .new_path
+                .as_deref()
+                .or(patch.old_path.as_deref())
+                .unwrap_or(b"");
+            let mut rule = ws_resolver.rule_for_path(target)?;
+            if patch.new_mode.or(patch.old_mode) == Some(0o120000) {
+                rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
+            }
+            apply_patch_whitespace(
+                patch,
+                &base,
+                rule,
+                ws_action,
+                patch_input_file,
+                squelch_limit,
+                &mut ws_error_count,
+                &mut ws_squelched,
+            );
+        }
         // Binary patches reconstruct the postimage from the recorded blob OIDs
         // (and the `GIT binary patch` payload), not from textual hunks.
         if patch.is_binary {
             match apply_binary_outcome(db, format, patch, &base)? {
                 BinaryApply::Deletion => {
                     if let Some(old) = &patch.old_path {
+                        record_apply_result_overlay(
+                            &mut result_overlay,
+                            &mut result_deleted,
+                            old,
+                            None,
+                        );
                         actions.push(ApplyAction::Remove { path: old.clone() });
                     }
                 }
@@ -727,6 +710,12 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
                         update_index,
                         cached,
                     );
+                    record_apply_result_overlay(
+                        &mut result_overlay,
+                        &mut result_deleted,
+                        &target,
+                        Some(content.clone()),
+                    );
                     actions.push(ApplyAction::Write {
                         path: target,
                         mode,
@@ -736,6 +725,12 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
                     if patch.is_rename
                         && let Some(old) = &patch.old_path
                     {
+                        record_apply_result_overlay(
+                            &mut result_overlay,
+                            &mut result_deleted,
+                            old,
+                            None,
+                        );
                         actions.push(ApplyAction::Remove { path: old.clone() });
                     }
                 }
@@ -820,6 +815,12 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
         // partial `--reject` apply) write the resulting bytes.
         if patch.is_delete && rejected_hunks.is_empty() {
             if let Some(old) = &patch.old_path {
+                record_apply_result_overlay(
+                    &mut result_overlay,
+                    &mut result_deleted,
+                    old,
+                    None,
+                );
                 actions.push(ApplyAction::Remove { path: old.clone() });
             }
         } else {
@@ -830,6 +831,12 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
             let index_mode = apply_index_mode_and_warn(patch, &target, mode, &index_modes);
             let mode =
                 apply_worktree_mode_for_index_apply(mode, index_mode, patch, update_index, cached);
+            record_apply_result_overlay(
+                &mut result_overlay,
+                &mut result_deleted,
+                &target,
+                Some(content.clone()),
+            );
             actions.push(ApplyAction::Write {
                 path: target,
                 mode,
@@ -839,9 +846,47 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
             if patch.is_rename
                 && let Some(old) = &patch.old_path
             {
+                record_apply_result_overlay(
+                    &mut result_overlay,
+                    &mut result_deleted,
+                    old,
+                    None,
+                );
                 actions.push(ApplyAction::Remove { path: old.clone() });
             }
         }
+    }
+
+    // Report whitespace errors after the sequential apply (git prints these as
+    // part of check, then may abort before write).
+    if ws_squelched > 0 {
+        eprintln!(
+            "warning: squelched {ws_squelched} whitespace error{}",
+            if ws_squelched == 1 { "" } else { "s" }
+        );
+    }
+    if ws_error_count > 0 {
+        let n = ws_error_count;
+        let adds = if n == 1 { "line adds" } else { "lines add" };
+        match ws_action {
+            WsAction::Error | WsAction::ErrorAll => {
+                eprintln!("error: {n} {adds} whitespace errors.");
+            }
+            WsAction::Fix => {
+                let applied = if n == 1 {
+                    "line applied"
+                } else {
+                    "lines applied"
+                };
+                eprintln!("warning: {n} {applied} after fixing whitespace errors.");
+            }
+            _ => {
+                eprintln!("warning: {n} {adds} whitespace errors.");
+            }
+        }
+    }
+    if ws_error_count > 0 && matches!(ws_action, WsAction::Error | WsAction::ErrorAll) {
+        return Err(GitError::Exit(1));
     }
 
     if check {
@@ -923,11 +968,11 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
                 }
             }
             ApplyAction::GitlinkRemove { path } => {
-                if !cached && let Ok(rel) = std::str::from_utf8(path) {
-                    // git's `remove_or_warn` rmdir's a gitlink only when empty; a
-                    // populated submodule directory is left untouched (ENOTEMPTY
-                    // is silent).
-                    let _ = fs::remove_dir(worktree_base.join(rel));
+                // git's remove_file(..., rmdir_empty=1): rmdir the gitlink when
+                // empty (ENOTEMPTY is warn-only) and prune empty leading dirs
+                // via remove_path (t4134).
+                if !cached {
+                    merge_remove_worktree_file(&worktree_base, path)?;
                 }
                 if index.is_some() {
                     index_mutations
@@ -2020,6 +2065,10 @@ impl ApplyAction {
 
 /// Read the worktree base content a patch applies against (empty for a new
 /// file). Shared by the whitespace pass and the apply pass.
+///
+/// `result_overlay` / `result_deleted` carry postimages of earlier patches in
+/// the same batch (git's `previous_patch` / materialize-between-inputs), so a
+/// later patch can see a just-created or just-modified file.
 fn read_patch_base(
     worktree_base: &Path,
     filter_worktree_root: &Path,
@@ -2030,6 +2079,8 @@ fn read_patch_base(
     index: Option<&Index>,
     db: &FileObjectDatabase,
     verify_worktree_match: bool,
+    result_overlay: &HashMap<Vec<u8>, Vec<u8>>,
+    result_deleted: &HashSet<Vec<u8>>,
 ) -> Result<Vec<u8>> {
     if patch.is_new {
         return Ok(Vec::new());
@@ -2037,6 +2088,17 @@ fn read_patch_base(
     let Some(old) = patch.old_path.as_deref().or(patch.new_path.as_deref()) else {
         return Ok(Vec::new());
     };
+    // Prior patch in this batch already produced a postimage for this path.
+    if let Some(content) = result_overlay.get(old) {
+        return Ok(content.clone());
+    }
+    if result_deleted.contains(old) {
+        eprintln!(
+            "error: {}: No such file or directory",
+            String::from_utf8_lossy(old)
+        );
+        return Err(GitError::Exit(1));
+    }
     // Gitlink (submodule) preimage: synthesize `Subproject commit <sha>\n` from
     // the index entry's recorded commit (git's `read_file_or_gitlink`), or, when
     // no index entry exists, from the patch's own `-Subproject commit` line
@@ -2108,6 +2170,25 @@ fn read_patch_base(
         return Err(GitError::Exit(1));
     };
     Ok(blob)
+}
+
+/// Record a postimage (or deletion) for later patches in the same apply batch.
+fn record_apply_result_overlay(
+    overlay: &mut HashMap<Vec<u8>, Vec<u8>>,
+    deleted: &mut HashSet<Vec<u8>>,
+    path: &[u8],
+    content: Option<Vec<u8>>,
+) {
+    match content {
+        Some(bytes) => {
+            deleted.remove(path);
+            overlay.insert(path.to_vec(), bytes);
+        }
+        None => {
+            overlay.remove(path);
+            deleted.insert(path.to_vec());
+        }
+    }
 }
 
 /// Write a worktree file for `git apply`, mirroring git's `try_create_file`: a

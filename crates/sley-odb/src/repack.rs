@@ -345,10 +345,21 @@ pub fn repack_reachable_objects_unpack_unreachable(
 ) -> Result<UnpackUnreachableRepackResult> {
     let objects_dir = repository_objects_dir(git_dir);
     let pack_dir = objects_dir.join("pack");
-    let database = if options.local {
-        FileObjectDatabase::without_alternates(objects_dir.clone(), format)
-    } else {
-        FileObjectDatabase::new(objects_dir.clone(), format)
+    let promisor_oids = promisor_pack_object_ids(&objects_dir, format)?;
+    let database = {
+        let database = if options.local {
+            FileObjectDatabase::without_alternates(objects_dir.clone(), format)
+        } else {
+            FileObjectDatabase::new(objects_dir.clone(), format)
+        };
+        // Mirror cruft repack: a `.promisor` sidecar only excuses missing
+        // objects when the repository is treated as having a promisor remote
+        // (git's `is_promisor_object` / `repo_has_promisor_remote`).
+        if promisor_oids.is_empty() {
+            database
+        } else {
+            database.with_promisor_remote_present(true)
+        }
     };
     let retained_pack_stems = repack_retained_pack_stems(
         &pack_dir,
@@ -374,7 +385,7 @@ pub fn repack_reachable_objects_unpack_unreachable(
         &database,
         format,
         roots.iter().copied(),
-        &promisor_pack_object_ids(&objects_dir, format)?,
+        &promisor_oids,
     )?;
     let recent = if recent_roots.is_empty() {
         HashSet::new()

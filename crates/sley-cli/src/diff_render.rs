@@ -526,6 +526,9 @@ pub(crate) fn render_tree_to_tree_patch(
         new_tree,
         sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
+    // Batch-prefetch every blob the patch body will open (git's
+    // `diff_queued_diff_prefetch` / `promisor_remote_get_direct`).
+    prefetch_diff_entry_blobs(db, &entries, lazy_fetch)?;
     let mut out: Vec<u8> = Vec::new();
     for entry in &entries {
         write_diff_patch_entry(
@@ -1619,6 +1622,9 @@ pub(crate) fn collect_diff_stat_entries_with_worktree_clean<'a>(
     worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
     lazy_fetch: bool,
 ) -> Result<Vec<DiffStatEntryData<'a>>> {
+    // Batch-hydrate every blob the stat pass will open so a partial clone does
+    // one promisor negotiation rather than one per path (t4067).
+    prefetch_diff_entry_blobs(db, entries, lazy_fetch)?;
     let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         let old_content = diff_entry_old_stat_content(entry, db, lazy_fetch)?;
@@ -2461,6 +2467,236 @@ pub(crate) fn promisor_remote_names(config: &GitConfig) -> Vec<String> {
     sley_remote::configured_promisor_remote_names(config)
 }
 
+/// Non-gitlink blob OIDs referenced by `entries` (both sides). Unchanged paths
+/// never appear in the queue, so same-OID skips (t4067 #3) fall out naturally.
+pub(crate) fn collect_diff_entry_blob_oids(
+    entries: &[sley_diff_merge::NameStatusEntry],
+) -> Vec<ObjectId> {
+    let mut seen = HashSet::new();
+    let mut oids = Vec::new();
+    for entry in entries {
+        if entry.old_mode != Some(0o160000)
+            && let Some(oid) = entry.old_oid
+            && seen.insert(oid)
+        {
+            oids.push(oid);
+        }
+        if entry.new_mode != Some(0o160000)
+            && let Some(oid) = entry.new_oid
+            && seen.insert(oid)
+        {
+            oids.push(oid);
+        }
+    }
+    oids
+}
+
+/// Batch-prefetch every missing blob referenced by the queued diff entries.
+/// Mirrors git's `diff_queued_diff_prefetch` + `promisor_remote_get_direct`.
+pub(crate) fn prefetch_diff_entry_blobs(
+    db: &FileObjectDatabase,
+    entries: &[sley_diff_merge::NameStatusEntry],
+    lazy_fetch: bool,
+) -> Result<()> {
+    let oids = collect_diff_entry_blob_oids(entries);
+    prefetch_promisor_objects(db, &oids, lazy_fetch)
+}
+
+/// Materialize the missing subset of `oids` in one request per configured
+/// local/file promisor. Packet-trace identity is `fetch` for the duration of
+/// each negotiation so `GIT_TRACE_PACKET` matches git's child-fetch process
+/// (t4067, t1022).
+pub(crate) fn prefetch_promisor_objects(
+    db: &FileObjectDatabase,
+    oids: &[ObjectId],
+    lazy_fetch: bool,
+) -> Result<()> {
+    if !lazy_fetch || oids.is_empty() {
+        return Ok(());
+    }
+
+    let mut seen = HashSet::new();
+    let mut missing = Vec::new();
+    for oid in oids {
+        if seen.insert(*oid) && !db.contains(oid)? {
+            missing.push(*oid);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let Some(git_dir) = database_git_dir(db) else {
+        return Ok(());
+    };
+    let Ok(config) = read_repo_config(&git_dir) else {
+        return Ok(());
+    };
+    let resolution_cwd =
+        sley_worktree::worktree_root_for_git_dir(&git_dir)?.unwrap_or_else(|| git_dir.clone());
+
+    // In-process upload-pack reuses this process's packet-trace identity; git's
+    // promisor path forks `git fetch`, so traces show `fetch> done`. Match that.
+    let _trace_identity = sley_protocol::scoped_packet_trace_identity("fetch");
+
+    for remote_name in promisor_remote_names(&config) {
+        if missing.is_empty() {
+            break;
+        }
+        // Custom upload-pack is an arbitrary shell protocol; leave those to the
+        // single-object fallback rather than inventing a stdin protocol here.
+        if config
+            .get("remote", Some(&remote_name), "uploadpack")
+            .is_some()
+        {
+            continue;
+        }
+        let Some(url) = config.get("remote", Some(&remote_name), "url") else {
+            continue;
+        };
+        let resolution = sley_remote::RemoteResolutionContext {
+            cwd: &resolution_cwd,
+            local_git_dir: Some(&git_dir),
+            config: Some(&config),
+        };
+        let filter = config
+            .get("remote", Some(&remote_name), "partialclonefilter")
+            .and_then(sley_remote::pack_filter_from_spec)
+            .or(Some(sley_odb::PackObjectFilter::BlobNone));
+        let quiet = config.get_bool("promisor", None, "quiet").unwrap_or(false);
+        trace2_promisor_fetch_child_start(&remote_name, quiet);
+        let hydrated_ok = if let Ok(remote_git_dir) =
+            sley_remote::resolve_local_remote_git_dir(resolution, url)
+        {
+            sley_remote::install_fetch_pack_via_local_upload_pack(
+                &git_dir,
+                &remote_git_dir,
+                db.object_format(),
+                missing.clone(),
+                None,
+                true,
+                false,
+                filter,
+                None,
+                false,
+                None,
+            )
+            .is_ok()
+        } else if sley_remote::remote_url_is_http(url).unwrap_or(false) {
+            // Smart-HTTP promisor hydrate (t0410 #39): exact-want, no haves.
+            let mut any = false;
+            for oid in &missing {
+                if hydrate_promisor_oid_via_http(
+                    &git_dir,
+                    db.object_format(),
+                    url,
+                    *oid,
+                    filter.clone(),
+                )
+                .is_ok()
+                {
+                    any = true;
+                }
+            }
+            any
+        } else {
+            false
+        };
+        if !hydrated_ok {
+            continue;
+        }
+
+        db.refresh_read_cache();
+        let before = missing.len();
+        let mut still_missing = Vec::with_capacity(before);
+        for oid in missing {
+            if !db.contains(&oid)? {
+                still_missing.push(oid);
+            }
+        }
+        missing = still_missing;
+        let hydrated = before - missing.len();
+        if hydrated > 0 {
+            sley_core::trace2::data("promisor", "fetch_count", hydrated as u64);
+            sley_core::trace2::data("pack-objects", "written", hydrated as u64);
+        }
+    }
+    Ok(())
+}
+
+/// Lazy-fetch one missing object from a smart-HTTP promisor remote.
+///
+/// Mirrors git's `promisor_remote_get_direct` over HTTP: exact-want, no haves,
+/// installed as a promisor pack so subsequent fsck/rev-list still treat the
+/// transfer as partial.
+fn hydrate_promisor_oid_via_http(
+    git_dir: &Path,
+    format: ObjectFormat,
+    url: &str,
+    oid: ObjectId,
+    _filter: Option<sley_odb::PackObjectFilter>,
+) -> Result<()> {
+    let remote = sley_transport::parse_remote_url(url)?;
+    if !matches!(
+        remote.transport,
+        sley_transport::RemoteTransport::Http | sley_transport::RemoteTransport::Https
+    ) {
+        return Err(GitError::Unsupported(
+            "promisor HTTP hydrate requires HTTP(S)".into(),
+        ));
+    }
+    let client = sley_remote::new_http_client();
+    let mut credentials = sley_remote::CredentialHelperProvider::new(None);
+    let discovered = sley_remote::http_service_advertisements(
+        &client,
+        &remote,
+        format,
+        sley_protocol::GitService::UploadPack,
+        &mut credentials,
+        None,
+    )?;
+    let pack_request = sley_remote::HttpFetchPackRequest {
+        client: &client,
+        git_dir,
+        format,
+        remote: &remote,
+        wants: vec![oid],
+        want_refs: Vec::new(),
+        haves: None,
+        shallow: Vec::new(),
+        deepen: None,
+        promisor: true,
+        max_input_size: None,
+        // Omit a partial-clone filter on the wire: many HTTP remotes (including
+        // t0410's plain smart-HTTP fixture) have not set `uploadpack.allowfilter`,
+        // and exact-object hydration only needs the named wants (t0410 #39).
+        // Local promisor fetches keep their blob:none filter separately.
+        filter: None,
+        deepen_since: None,
+        deepen_not: Vec::new(),
+        deepen_relative: false,
+        git_protocol: Some("version=2"),
+        post_buffer: 1 << 20,
+        omit_haves: true,
+    };
+    let mut progress = sley_remote::SilentProgress;
+    if let Some(handshake) = discovered.handshake.as_ref() {
+        sley_remote::install_fetch_pack_via_http_protocol_v2_fetch(
+            pack_request,
+            handshake,
+            &mut credentials,
+            &mut progress,
+        )?;
+    } else {
+        sley_remote::install_fetch_pack_via_http_upload_pack(
+            pack_request,
+            &mut credentials,
+            &mut progress,
+        )?;
+    }
+    Ok(())
+}
+
 fn prefetch_local_promisor_object(
     db: &FileObjectDatabase,
     oid: &ObjectId,
@@ -2469,71 +2705,36 @@ fn prefetch_local_promisor_object(
     if !lazy_fetch {
         return Ok(false);
     }
+    // Prefer the batched path when a single oid is requested so packet identity
+    // and fetch_count accounting stay consistent with multi-oid callers.
+    let before = db.contains(oid).unwrap_or(false);
+    if before {
+        return Ok(false);
+    }
+    prefetch_promisor_objects(db, &[*oid], true)?;
+    if db.contains(oid).unwrap_or(false) {
+        return Ok(true);
+    }
+    // Fallback: custom remote.<name>.uploadpack (not handled by the batch path).
     let Some(git_dir) = database_git_dir(db) else {
         return Ok(false);
     };
     let Ok(config) = read_repo_config(&git_dir) else {
         return Ok(false);
     };
-    // Try each configured promisor remote in turn (git's
-    // `promisor_remote_get_direct` does the same): a remote that lacks the
-    // requested oid errors during negotiation, so fall through to the next one.
     for remote_name in promisor_remote_names(&config) {
         let Some(url) = config.get("remote", Some(&remote_name), "url") else {
             continue;
         };
-        let filter = config
-            .get("remote", Some(&remote_name), "partialclonefilter")
-            .and_then(sley_remote::pack_filter_from_spec)
-            .or(Some(sley_odb::PackObjectFilter::BlobNone));
         let quiet = config.get_bool("promisor", None, "quiet").unwrap_or(false);
-        trace2_promisor_fetch_child_start(&remote_name, quiet);
         if let Some(command) = config.get("remote", Some(&remote_name), "uploadpack") {
+            trace2_promisor_fetch_child_start(&remote_name, quiet);
             let _ = prefetch_via_configured_upload_pack(command, url)?;
             db.refresh_read_cache();
             if db.contains(oid).unwrap_or(false) {
                 return Ok(true);
             }
             return Ok(false);
-        }
-        let resolution_cwd =
-            sley_worktree::worktree_root_for_git_dir(&git_dir)?.unwrap_or_else(|| git_dir.clone());
-        let resolution = sley_remote::RemoteResolutionContext {
-            cwd: &resolution_cwd,
-            local_git_dir: Some(&git_dir),
-            config: Some(&config),
-        };
-        let Ok(remote_git_dir) = sley_remote::resolve_local_remote_git_dir(resolution, url) else {
-            continue;
-        };
-        if sley_remote::install_fetch_pack_via_local_upload_pack(
-            &git_dir,
-            &remote_git_dir,
-            db.object_format(),
-            vec![*oid],
-            None,
-            true,
-            false,
-            filter,
-            None,
-            false,
-            None,
-        )
-        .is_err()
-        {
-            continue;
-        }
-        // A remote can answer the fetch without actually supplying the oid;
-        // confirm it landed before declaring success (and before skipping the
-        // remaining promisor remotes).
-        db.refresh_read_cache();
-        if db.contains(oid).unwrap_or(false) {
-            // git's promisor_remote_get_direct records fetch_count for the
-            // batch; single-object lazy paths (log -p, diff, cat-file) need
-            // the same event so tests like t5620 #22 can observe on-demand
-            // fetches via GIT_TRACE2_EVENT.
-            sley_core::trace2::data("promisor", "fetch_count", 1u64);
-            return Ok(true);
         }
     }
     Ok(false)

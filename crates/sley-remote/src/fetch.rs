@@ -938,6 +938,11 @@ fn fetch_impl(
                     request.format.name()
                 )));
             }
+            // Git's fetch-pack `mark_complete` over local refs: a tip present
+            // only in the commit-graph dies before negotiation. Exact-OID wants
+            // skip have-building, so this must run for every local fetch
+            // (t5330 #4).
+            crate::local::mark_complete_local_refs(request.git_dir, request.format)?;
             // Protocol v2: real `ls-refs` with ref-prefix filtering so the
             // packet log and advertised set match git (t5702 #24/#48/#49).
             let advertisements = if request.config.get("protocol", None, "version") == Some("2") {

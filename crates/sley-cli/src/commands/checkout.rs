@@ -496,6 +496,20 @@ pub(crate) fn cmd_checkout(
                     let oid =
                         checkout_resolve_start_oid(&git_dir, format, rev, context.replace_objects)?;
                     let tree = sley_rev::peel_to_tree(db, format, &oid)?;
+                    // Path-limited checkout still materializes blobs. In a
+                    // partial clone batch-prefetch the selected tree leaves so
+                    // `checkout HEAD~1 bar` does one negotiation (t4067 #6).
+                    if cli_session.lazy_fetch() {
+                        prefetch_pathspec_tree_blobs(
+                            cwd,
+                            git_dir,
+                            format,
+                            db,
+                            &tree,
+                            &resolved_paths,
+                            worktree_root,
+                        )?;
+                    }
                     sley_worktree::restore_index_and_worktree_paths_from_tree(
                         worktree_root,
                         git_dir,
@@ -2361,6 +2375,51 @@ fn collect_missing_tree_blob_wants(
         }
     }
     Ok(())
+}
+
+/// Prefetch missing non-gitlink blobs under `paths` from `tree_oid` in one
+/// promisor batch (pathspec checkout in a partial clone).
+fn prefetch_pathspec_tree_blobs(
+    cwd: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    tree_oid: &ObjectId,
+    paths: &[PathBuf],
+    worktree_root: &Path,
+) -> Result<()> {
+    let config = read_repo_config(git_dir)?;
+    if crate::promisor_remote_names(&config).is_empty() {
+        return Ok(());
+    }
+    let mut wants = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // Flatten the tree once, then filter to pathspecs (prefix match for dirs).
+    for (path_bytes, (mode, oid)) in sley_diff_merge::flatten_tree(db, format, tree_oid)? {
+        if sley_index::is_gitlink(mode) || db.contains(&oid).unwrap_or(true) {
+            continue;
+        }
+        let relative = PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned());
+        let absolute = worktree_root.join(&relative);
+        let matched = paths.iter().any(|spec| {
+            let canon = if spec.is_absolute() {
+                spec.clone()
+            } else {
+                cwd.join(spec)
+            };
+            absolute == canon
+                || absolute.starts_with(&canon)
+                || relative == *spec
+                || relative.starts_with(spec)
+        });
+        if matched && seen.insert(oid) {
+            wants.push(oid);
+        }
+    }
+    if wants.is_empty() {
+        return Ok(());
+    }
+    crate::prefetch_promisor_objects(db, &wants, true)
 }
 
 fn checkout_index_empty(git_dir: &Path, format: ObjectFormat) -> Result<bool> {

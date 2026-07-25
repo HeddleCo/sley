@@ -1814,6 +1814,12 @@ fn write_commit_diff_patch(
     let color = diff_color_enabled(config);
 
     let show_patch = options.shows_patch_body();
+    // Batch-prefetch every blob the patch/stat path will open so `git show`
+    // does one promisor negotiation in a partial clone (t4067 #1).
+    if show_patch || options.numstat || options.stat || options.compact_summary || options.shortstat
+    {
+        crate::prefetch_diff_entry_blobs(db, entries, lazy_fetch)?;
+    }
     let stat_entries =
         if options.numstat || options.stat || options.compact_summary || options.shortstat {
             collect_diff_stat_entries(entries, db, None, false, lazy_fetch)?

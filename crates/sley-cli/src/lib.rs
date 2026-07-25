@@ -125,6 +125,7 @@ pub(crate) use diff_render::{
     diff_entry_produces_output, diff_line_stats, diff_rename_limit_requires_integer_error,
     diff_stat_decimal_width, diff_stat_pprint_rename, diff_stat_totals, gitlink_diff_content,
     is_binary_content, is_gitlink_pair, parse_diff_max_depth, parse_dirstat_params,
+    collect_diff_entry_blob_oids, prefetch_diff_entry_blobs, prefetch_promisor_objects,
     prefetch_via_configured_upload_pack, promisor_remote_names, read_blob,
     read_object_maybe_prefetch_promisor, render_diff_entries, render_tree_to_tree_patch,
     repo_path_to_path, reverse_diff_entries, reverse_diff_entry, submodule_diff_config,
