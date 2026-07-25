@@ -1,0 +1,18 @@
+schema	sley-upstream-run-metadata-v1
+run_label	full-oracle-6d144c6c
+target	oracle
+candidate_commit	6d144c6ce478243182d452be8c7ec3394f5ce6bd
+candidate_tree_state	dirty
+target_binary	/opt/homebrew/bin/git
+target_binary_checksum	298483689:3699840
+target_version	git version 2.55.0
+upstream_commit	e9019fcafe0040228b8631c30f97ae1adb61bcdc
+upstream_tree_state	dirty
+upstream_t	/tmp/git-src/t
+manifest	/Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/upstream-manifest.tsv
+manifest_checksum	3943088184:5619
+platform	macos
+architecture	arm64
+hash	sha1
+selection_count	891
+selection_checksum	3546182803:22409
