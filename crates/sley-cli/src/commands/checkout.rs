@@ -2242,7 +2242,12 @@ fn prefetch_local_promisor_checkout_blobs(
         return Ok(false);
     }
     let mut wants = Vec::new();
-    collect_missing_checkout_blob_wants(db, format, *commit_oid, &mut wants)?;
+    // Sparse checkouts only need in-cone tip blobs for materialization.
+    // Prefetching the full tip tree over-fetches out-of-cone objects and
+    // breaks partial-clone accounting (t5620 no-cone: 42 missing after
+    // checkout, not 24).
+    let sparse = sley_worktree::active_sparse_checkout(git_dir)?;
+    collect_missing_checkout_blob_wants(db, format, *commit_oid, sparse.as_ref(), &mut wants)?;
     if wants.is_empty() {
         return Ok(true);
     }
@@ -2293,6 +2298,7 @@ fn collect_missing_checkout_blob_wants(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     commit_oid: ObjectId,
+    sparse: Option<&(sley_worktree::SparseCheckout, sley_worktree::SparseCheckoutMode)>,
     wants: &mut Vec<ObjectId>,
 ) -> Result<()> {
     let object = db.read_object(&commit_oid)?;
@@ -2303,13 +2309,15 @@ fn collect_missing_checkout_blob_wants(
         )));
     }
     let commit = Commit::parse_ref(format, &object.body)?;
-    collect_missing_tree_blob_wants(db, format, commit.tree, wants)
+    collect_missing_tree_blob_wants(db, format, commit.tree, "", sparse, wants)
 }
 
 fn collect_missing_tree_blob_wants(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: ObjectId,
+    prefix: &str,
+    sparse: Option<&(sley_worktree::SparseCheckout, sley_worktree::SparseCheckoutMode)>,
     wants: &mut Vec<ObjectId>,
 ) -> Result<()> {
     let object = db.read_object(&tree_oid)?;
@@ -2320,10 +2328,26 @@ fn collect_missing_tree_blob_wants(
         )));
     }
     for entry in Tree::parse(format, &object.body)?.entries {
+        let name = String::from_utf8_lossy(entry.name.as_ref()).into_owned();
+        let path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
         if entry.is_tree() {
-            collect_missing_tree_blob_wants(db, format, entry.oid, wants)?;
-        } else if !entry.is_gitlink() && !db.contains(&entry.oid)? {
-            wants.push(entry.oid);
+            // Trees are present under blob:none filters; walk fully so
+            // no-cone basename patterns (e.g. `**/file.1.txt`) still match
+            // deep leaves. Only blob wants are sparse-filtered below.
+            collect_missing_tree_blob_wants(db, format, entry.oid, &path, sparse, wants)?;
+        } else if !entry.is_gitlink() {
+            if let Some((sparse_cfg, mode)) = sparse
+                && !sley_worktree::path_in_sparse_checkout(path.as_bytes(), sparse_cfg, *mode)
+            {
+                continue;
+            }
+            if !db.contains(&entry.oid)? {
+                wants.push(entry.oid);
+            }
         }
     }
     Ok(())

@@ -1231,7 +1231,9 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
         ssh_options: None,
         upload_pack_command: None,
         reject_shallow: reject_shallow_config.unwrap_or(false),
-            sparse: false,
+        // Partial-clone checkout top-up must stay in-cone under `--sparse`
+        // (t5620: tip cone only → 44 missing blobs, not full tip tree).
+        sparse,
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress_sink = StdoutProgress::default();
@@ -2171,7 +2173,9 @@ fn clone_network_repository(
             .then_some(options.upload_pack_command)
             .flatten(),
         reject_shallow: options.reject_shallow,
-            sparse: false,
+        // Partial-clone checkout top-up must stay in-cone under `--sparse`
+        // (t5620: tip cone only → 44 missing blobs, not full tip tree).
+        sparse: options.sparse,
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress::new(options.quiet);
