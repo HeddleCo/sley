@@ -724,10 +724,15 @@ impl PackIndex {
         if version != 2 && version != 3 {
             return Err(GitError::Unsupported(format!("pack version {version}")));
         }
-        let count = u32_be(&pack_bytes[8..12]) as usize;
+        // sley#4: see `checked_pack_object_count` — a short pack must not be
+        // able to name a count it has no room for.
+        let count = checked_pack_object_count(
+            u32_be(&pack_bytes[8..12]),
+            (trailer_offset.saturating_sub(12)) as u64,
+        )?;
         let mut offset = 12usize;
-        let mut parsed_entries = Vec::with_capacity(count);
-        let mut raw_entries = Vec::with_capacity(count);
+        let mut parsed_entries = Vec::with_capacity(pack_entry_prealloc(count));
+        let mut raw_entries = Vec::with_capacity(pack_entry_prealloc(count));
         for _ in 0..count {
             let entry_offset = offset;
             let header = parse_entry_header(pack_bytes, &mut offset)?;

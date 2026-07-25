@@ -2,11 +2,12 @@ use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use std::io::{Read, Write};
 
 use crate::pktline::{
-    PktLineFrame, ProtocolVersion, line, line_from_str, parse_oid_argument,
+    PktLineFrame, PktLineReadLimits, ProtocolVersion, line, line_from_str, parse_oid_argument,
     parse_protocol_v2_line_text, read_pkt_line_frame, read_pkt_line_frames_until_flush,
-    read_pkt_line_frames_until_response_end, trace_packet_read_payload, trim_trailing_lf,
-    validate_capability_name, validate_protocol_v2_line, validate_protocol_v2_token,
-    write_pkt_line_frame, write_pkt_line_payload,
+    read_pkt_line_frames_until_flush_with_limits, read_pkt_line_frames_until_response_end,
+    read_pkt_line_frames_until_response_end_with_limits, trace_packet_read_payload,
+    trim_trailing_lf, validate_capability_name, validate_protocol_v2_line,
+    validate_protocol_v2_token, write_pkt_line_frame, write_pkt_line_payload,
 };
 use crate::sideband::{
     SideBandChannel, SideBandDemux, SideBandPacket, encode_sideband_packet,
@@ -980,9 +981,24 @@ fn skip_leading_protocol_v2_advertisement_if_present(
 pub fn read_protocol_v2_stateless_rpc_payload_frames(
     reader: &mut impl Read,
 ) -> Result<Vec<PktLineFrame>> {
-    let mut frames = read_pkt_line_frames_until_flush(reader)?;
+    read_protocol_v2_stateless_rpc_payload_frames_with_limits(reader, PktLineReadLimits::CONTROL)
+}
+
+/// As [`read_protocol_v2_stateless_rpc_payload_frames`], with an explicit
+/// accumulation budget. `fetch` responses may carry packfile bytes in sideband
+/// frames and pass [`PktLineReadLimits::PACK_STREAM`]; `ls-refs`,
+/// `object-info`, and `bundle-uri` responses keep the default
+/// [`PktLineReadLimits::CONTROL`] budget.
+pub fn read_protocol_v2_stateless_rpc_payload_frames_with_limits(
+    reader: &mut impl Read,
+    limits: PktLineReadLimits,
+) -> Result<Vec<PktLineFrame>> {
+    // Whether the first flush-terminated stream is the optional capability
+    // advertisement or the payload itself is only known after reading it, so
+    // both reads use the caller's budget.
+    let mut frames = read_pkt_line_frames_until_flush_with_limits(reader, limits)?;
     if frames_start_with_protocol_v2_advertisement(&frames) {
-        frames = read_pkt_line_frames_until_flush(reader)?;
+        frames = read_pkt_line_frames_until_flush_with_limits(reader, limits)?;
     }
     Ok(frames)
 }
@@ -1341,7 +1357,10 @@ pub fn read_protocol_v2_fetch_response(
     format: ObjectFormat,
     reader: &mut impl Read,
 ) -> Result<Vec<ProtocolV2FetchResponseSection>> {
-    let frames = read_protocol_v2_stateless_rpc_payload_frames(reader)?;
+    let frames = read_protocol_v2_stateless_rpc_payload_frames_with_limits(
+        reader,
+        PktLineReadLimits::PACK_STREAM,
+    )?;
     parse_protocol_v2_fetch_response(format, &frames)
 }
 
@@ -1509,7 +1528,10 @@ pub fn read_protocol_v2_fetch_sideband_all_response(
     format: ObjectFormat,
     reader: &mut impl Read,
 ) -> Result<ProtocolV2FetchSidebandAllResponse> {
-    let frames = read_protocol_v2_stateless_rpc_payload_frames(reader)?;
+    let frames = read_protocol_v2_stateless_rpc_payload_frames_with_limits(
+        reader,
+        PktLineReadLimits::PACK_STREAM,
+    )?;
     parse_protocol_v2_fetch_sideband_all_response(format, &frames)
 }
 
@@ -1524,7 +1546,10 @@ pub fn read_protocol_v2_fetch_response_until_response_end(
     format: ObjectFormat,
     reader: &mut impl Read,
 ) -> Result<Vec<ProtocolV2FetchResponseSection>> {
-    let frames = read_pkt_line_frames_until_response_end(reader)?;
+    let frames = read_pkt_line_frames_until_response_end_with_limits(
+        reader,
+        PktLineReadLimits::PACK_STREAM,
+    )?;
     parse_protocol_v2_fetch_response(format, &frames)
 }
 
@@ -1539,7 +1564,10 @@ pub fn read_protocol_v2_fetch_sideband_all_response_until_response_end(
     format: ObjectFormat,
     reader: &mut impl Read,
 ) -> Result<ProtocolV2FetchSidebandAllResponse> {
-    let frames = read_pkt_line_frames_until_response_end(reader)?;
+    let frames = read_pkt_line_frames_until_response_end_with_limits(
+        reader,
+        PktLineReadLimits::PACK_STREAM,
+    )?;
     parse_protocol_v2_fetch_sideband_all_response(format, &frames)
 }
 

@@ -2,9 +2,10 @@ use sley_core::{GitError, Result};
 use std::io::{self, ErrorKind, Read, Write};
 
 use crate::pktline::{
-    PKT_LINE_MAX_PAYLOAD_LEN, PktLineFrame, line_from_str, parse_protocol_v2_line_text,
-    pkt_line_header, read_pkt_line_frame, read_pkt_line_frames_until_flush, trim_trailing_lf,
-    write_pkt_line_payload,
+    PKT_LINE_MAX_PAYLOAD_LEN, PktLineFrame, PktLineReadLimits, line_from_str,
+    parse_protocol_v2_line_text, pkt_line_header, read_pkt_line_frame,
+    read_pkt_line_frames_until_flush, read_pkt_line_frames_until_flush_with_limits,
+    trim_trailing_lf, write_pkt_line_payload,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,7 +158,10 @@ pub fn encode_sideband_stream(packets: &[SideBandPacket]) -> Result<Vec<PktLineF
 }
 
 pub fn read_sideband_stream(reader: &mut impl Read) -> Result<Vec<SideBandPacket>> {
-    let frames = read_pkt_line_frames_until_flush(reader)?;
+    // Sideband channel 1 carries packfile/archive bytes, so this buffered
+    // reader gets the bulk budget rather than the control one (sley#6).
+    let frames =
+        read_pkt_line_frames_until_flush_with_limits(reader, PktLineReadLimits::PACK_STREAM)?;
     parse_sideband_stream(&frames)
 }
 
@@ -588,7 +592,9 @@ pub fn encode_upload_archive_response(
 }
 
 pub fn read_upload_archive_response(reader: &mut impl Read) -> Result<UploadArchiveResponse> {
-    let frames = read_pkt_line_frames_until_flush(reader)?;
+    // Carries the generated archive in sideband data frames (sley#6).
+    let frames =
+        read_pkt_line_frames_until_flush_with_limits(reader, PktLineReadLimits::PACK_STREAM)?;
     parse_upload_archive_response(&frames)
 }
 

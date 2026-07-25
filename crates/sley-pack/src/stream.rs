@@ -156,8 +156,11 @@ where
     let object_step = (total_objects / 100).max(1);
     let mut last_emit_bytes = stream.pack_offset();
     let mut last_emit_objects = 0u64;
-    let mut parsed_entries = Vec::with_capacity(count);
-    let mut raw_entries = Vec::with_capacity(count);
+    // sley#4: the stream has not been read past the header yet, so there is no
+    // length to validate the declared count against — cap the reservation and
+    // let the entry loop's own bounds reject a count the stream cannot honour.
+    let mut parsed_entries = Vec::with_capacity(pack_entry_prealloc(count));
+    let mut raw_entries = Vec::with_capacity(pack_entry_prealloc(count));
     for index in 0..count {
         cancel.check()?;
         let entry_offset = stream.pack_offset();

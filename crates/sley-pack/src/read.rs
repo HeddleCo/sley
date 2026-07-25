@@ -67,9 +67,14 @@ impl PackFile {
         if version != 2 && version != 3 {
             return Err(GitError::Unsupported(format!("pack version {version}")));
         }
-        let count = u32_be(&bytes[8..12]) as usize;
+        // sley#4: the declared count is attacker-controlled; validate it against
+        // the bytes that actually remain before reserving anything for it.
+        let count = checked_pack_object_count(
+            u32_be(&bytes[8..12]),
+            (trailer_offset.saturating_sub(12)) as u64,
+        )?;
         let mut offset = 12usize;
-        let mut entries = Vec::with_capacity(count);
+        let mut entries = Vec::with_capacity(pack_entry_prealloc(count));
         for _ in 0..count {
             let entry_offset = offset;
             let header = parse_entry_header(bytes, &mut offset)?;
@@ -180,14 +185,17 @@ impl PackFile {
         // discards once deltas are resolved.
         let trailer_len = format.raw_len();
         let trailer_offset = bytes.len() - trailer_len;
-        let count = u32_be(&bytes[8..12]) as usize;
+        let count = checked_pack_object_count(
+            u32_be(&bytes[8..12]),
+            (trailer_offset.saturating_sub(12)) as u64,
+        )?;
         let mut offset = 12usize;
         // Per entry in read (offset) order: (offset, base, on-disk stream size).
         // The stream size is what git prints in the size column: it is the
         // resolved object size for an undeltified entry, but the *delta
         // instruction stream* length for a delta entry (builtin/index-pack.c sets
         // `obj->size` from the entry header, before any delta is applied).
-        let mut on_disk: Vec<OnDiskEntry> = Vec::with_capacity(count);
+        let mut on_disk: Vec<OnDiskEntry> = Vec::with_capacity(pack_entry_prealloc(count));
         for _ in 0..count {
             let entry_offset = offset as u64;
             let header = parse_entry_header(bytes, &mut offset)?;
@@ -910,6 +918,10 @@ where
     }
 
     let mut resolved = vec![None; parsed.len()];
+    // sley#5: chain depth of each resolved entry. Undeltified entries and
+    // entries resolved against an external (thin-pack) base are depth 0; a
+    // delta is one deeper than the base it was applied to.
+    let mut depths = vec![0usize; parsed.len()];
     let mut oid_to_index = HashMap::new();
     let mut unresolved = 0usize;
     for (idx, entry) in parsed.iter().enumerate() {
@@ -948,6 +960,24 @@ where
             else {
                 continue;
             };
+            // sley#5: reject before applying the delta, so an over-deep chain
+            // costs nothing beyond the walk that discovered it. An external
+            // base is depth 0 because its own chain lives in another pack that
+            // was bounded when it was read.
+            let base_depth = match base {
+                DeltaBase::Offset(base_offset) => {
+                    offset_to_index.get(base_offset).map(|idx| depths[*idx])
+                }
+                DeltaBase::Ref(base_oid) => oid_to_index.get(base_oid).map(|idx| depths[*idx]),
+            }
+            .unwrap_or(0);
+            let depth = base_depth + 1;
+            if depth > MAX_READ_DELTA_CHAIN_DEPTH {
+                return Err(GitError::InvalidFormat(format!(
+                    "pack delta chain at offset {offset} exceeds maximum depth \
+                     {MAX_READ_DELTA_CHAIN_DEPTH}"
+                )));
+            }
             let body = apply_pack_delta(base_object.body(), delta)?;
             let object = EncodedObject::new(base_object.object_type(), body);
             let oid = object.object_id(format)?;
@@ -972,6 +1002,7 @@ where
                 )));
             }
             oid_to_index.insert(oid, idx);
+            depths[idx] = depth;
             resolved[idx] = Some(pack_object);
             unresolved -= 1;
             progress = true;

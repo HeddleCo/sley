@@ -7066,10 +7066,10 @@ fn protocol_v2_ls_refs_records_bridge_unborn_head_symref_and_empty() {
 // ---- sley#6: bounded pkt-line frame accumulation ---------------------------
 
 /// Number of four-byte control packets a hostile peer sends before giving up.
-/// It must stay above `PktLineReadLimits::CONTROL.max_frames` so the reader's
-/// own bound is what stops it; the assertion in
-/// `over_budget_frame_count_exceeds_the_control_budget` keeps the two in step.
-const OVER_BUDGET_FRAMES: usize = 2 * 1024 * 1024 + 1_024;
+/// Derived from the budget itself, so the fixture always sends more frames than
+/// the reader is allowed to keep and it is the reader's bound -- not the end of
+/// the fixture -- that stops the read.
+const OVER_BUDGET_FRAMES: usize = PktLineReadLimits::CONTROL.max_frames + 1_024;
 
 /// A `Read` that emits `count` copies of a four-byte pkt-line control packet
 /// and then ends. Every frame is well formed and none of them is the packet the
@@ -7145,5 +7145,87 @@ fn read_pkt_line_frames_rejects_over_budget_frame_count() {
     assert!(
         read_pkt_line_frames(&mut reader).is_err(),
         "an over-budget frame stream must be rejected"
+    );
+}
+
+/// An endless peer — the actual attack, which no `remaining` counter lets off
+/// the hook — terminates promptly under an explicit budget. Driven with a small
+/// budget so the test costs nothing; the production budgets are the same code
+/// path with larger numbers.
+#[test]
+fn bounded_read_terminates_against_an_endless_peer() {
+    struct EndlessDelimiters;
+    impl Read for EndlessDelimiters {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            for (index, slot) in buf.iter_mut().enumerate() {
+                *slot = b"0001"[index % 4];
+            }
+            Ok(buf.len())
+        }
+    }
+
+    let limits = PktLineReadLimits {
+        max_frames: 32,
+        max_payload_bytes: 1024,
+    };
+    let error = read_pkt_line_frames_until_flush_with_limits(&mut EndlessDelimiters, limits)
+        .expect_err("an endless stream must be rejected");
+    assert!(
+        format!("{error}").contains("32 frames"),
+        "expected the frame budget to be what stopped it, got: {error}"
+    );
+}
+
+/// The payload-byte budget is what stops a peer that sends few, very large
+/// frames instead of many tiny ones.
+#[test]
+fn bounded_read_rejects_over_budget_payload_bytes() {
+    let mut stream = Vec::new();
+    for _ in 0..8 {
+        stream.extend_from_slice(
+            &PktLineFrame::data(vec![b'x'; 512])
+                .expect("test operation should succeed")
+                .encode(),
+        );
+    }
+    stream.extend_from_slice(b"0000");
+
+    let limits = PktLineReadLimits {
+        max_frames: 1024,
+        max_payload_bytes: 2048,
+    };
+    let error = read_pkt_line_frames_until_flush_with_limits(&mut stream.as_slice(), limits)
+        .expect_err("an over-budget payload must be rejected");
+    assert!(
+        format!("{error}").contains("2048 payload bytes"),
+        "expected the payload budget to be what stopped it, got: {error}"
+    );
+
+    // The same stream is accepted whole once the budget admits it.
+    let generous = PktLineReadLimits {
+        max_frames: 1024,
+        max_payload_bytes: 8192,
+    };
+    let frames = read_pkt_line_frames_until_flush_with_limits(&mut stream.as_slice(), generous)
+        .expect("a within-budget stream must still parse");
+    assert_eq!(frames.len(), 9);
+}
+
+/// An in-memory pkt-line stream still amplifies (a four-byte `0001` becomes a
+/// 32-byte `PktLineFrame`), so the slice parsers carry the budget too.
+#[test]
+fn parse_pkt_line_stream_rejects_over_budget_frame_count() {
+    let limits = PktLineReadLimits {
+        max_frames: 4,
+        max_payload_bytes: 1024,
+    };
+    let stream = b"0001".repeat(16);
+    assert!(
+        parse_pkt_line_stream_with_limits(&stream, limits).is_err(),
+        "an over-budget in-memory stream must be rejected"
+    );
+    assert!(
+        parse_pkt_line_stream(&stream).is_ok(),
+        "the control budget must still admit an ordinary stream"
     );
 }
