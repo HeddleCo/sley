@@ -3159,12 +3159,19 @@ pub fn reset_index_to_commit(
             restored.gid = prior.gid;
             restored.size = prior.size;
         }
-        if prior_entries
-            .get(path)
-            .is_some_and(IndexEntry::is_skip_worktree)
-            || sparse_matcher
-                .as_ref()
-                .is_some_and(|matcher| !matcher.includes_file(path))
+        // Preserve skip-worktree on surviving entries the way git's mixed reset
+        // does. Do *not* force the bit from the current sparse patterns onto an
+        // entry that previously cleared it (e.g. a present out-of-cone file that
+        // sparse-checkout left as "not up to date" — t3705 #16 relies on
+        // `git reset` keeping such an entry non-skip-worktree so a later
+        // `add --sparse --renormalize` can stage it). New out-of-cone paths that
+        // had no prior entry still receive the bit.
+        let prior = prior_entries.get(path);
+        let out_of_cone = sparse_matcher
+            .as_ref()
+            .is_some_and(|matcher| !matcher.includes_file(path));
+        if prior.is_some_and(IndexEntry::is_skip_worktree)
+            || (out_of_cone && prior.is_none())
         {
             restored.set_skip_worktree(true);
         }

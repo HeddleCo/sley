@@ -3636,6 +3636,11 @@ pub(crate) fn racily_clean_entry_indexes_before_write(
     }) else {
         return Ok(Vec::new());
     };
+    // git's `ce_smudge_racily_clean_entry` re-checks content via
+    // `ce_modified_check_fs`, which runs the clean filter (autocrlf/text/eol).
+    // Hashing the raw worktree bytes would falsely smudge every CRLF text file
+    // whose blob is stored as LF (t0020 #27: post-commit size=0 → false dirty).
+    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
     let mut smudged = Vec::new();
     for (position, entry) in index.entries.iter().enumerate() {
         if index_entry_stage(entry) != 0 || sley_index::is_gitlink(entry.mode) {
@@ -3664,7 +3669,18 @@ pub(crate) fn racily_clean_entry_indexes_before_write(
         } else {
             continue;
         };
-        let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
+        let cleaned = if metadata.file_type().is_symlink() {
+            body
+        } else {
+            match apply_clean_filter(&worktree_root, git_dir, &config, entry.path.as_bytes(), &body)
+            {
+                Ok(cleaned) => cleaned,
+                // A clean-filter failure is not "racily clean modified": leave
+                // the entry alone and let a later status/add report the error.
+                Err(_) => continue,
+            }
+        };
+        let oid = EncodedObject::new(ObjectType::Blob, cleaned).object_id(format)?;
         if oid != entry.oid {
             smudged.push(position);
         }
