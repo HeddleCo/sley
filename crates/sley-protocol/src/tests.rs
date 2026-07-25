@@ -7229,3 +7229,239 @@ fn parse_pkt_line_stream_rejects_over_budget_frame_count() {
         "the control budget must still admit an ordinary stream"
     );
 }
+// --- sley#163: bounded reads on untrusted readers ---------------------------
+
+/// A ceiling of `limit` bytes, standing in for whichever real one a call site
+/// uses, so the bound can be exercised without materialising 128 MiB.
+fn test_ceiling(limit: u64) -> crate::ReadCeiling {
+    crate::ReadCeiling {
+        limit,
+        what: "test stream",
+        remedy: "test remedy: raise `git config sley.maxRefAdvertisementBytes`.",
+    }
+}
+
+fn packfile_limits(limit: u64) -> TransportLimits {
+    TransportLimits {
+        max_packfile_response_bytes: limit,
+        ..TransportLimits::default()
+    }
+}
+
+#[test]
+fn bounded_read_accepts_exactly_the_limit_and_refuses_one_more() {
+    let payload = vec![b'x'; 64];
+
+    let exact = read_to_end_bounded(&mut payload.as_slice(), test_ceiling(64))
+        .expect("a stream exactly at the ceiling is accepted");
+    assert_eq!(exact.len(), 64);
+
+    let error = read_to_end_bounded(&mut payload.as_slice(), test_ceiling(63))
+        .expect_err("a stream one byte over the ceiling is refused");
+    assert!(
+        error.to_string().contains("exceeds the configured ceiling"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn bounded_read_refuses_an_endless_reader() {
+    // `io::repeat` never ends. An unbounded `read_to_end` on it never returns:
+    // it allocates until the process dies. That is the shape of the reads this
+    // replaces, so the bound has to stop it without reading the overage.
+    let mut endless = std::io::repeat(b'x');
+    let error = read_to_end_bounded(&mut endless, test_ceiling(64 * 1024))
+        .expect_err("an endless stream must be refused");
+    assert!(
+        error.to_string().contains("exceeds the configured ceiling"),
+        "unexpected error: {error}"
+    );
+}
+
+/// Configuring a ceiling changes where it sits, not whether it exists: the
+/// endless reader is refused at every value, and the value reported is the one
+/// actually in force.
+#[test]
+fn a_raised_ceiling_still_binds() {
+    for limit in [1, 64 * 1024, 4 * 1024 * 1024, 64 * 1024 * 1024] {
+        let mut endless = std::io::repeat(b'x');
+        let error = read_to_end_bounded(&mut endless, test_ceiling(limit))
+            .expect_err("an endless stream must be refused at every ceiling")
+            .to_string();
+        assert!(
+            error.contains(&format!("ceiling of {limit} bytes")),
+            "the configured ceiling must be the one reported: {error}"
+        );
+        assert!(
+            error.contains(&format!("stopped at {} bytes", limit + 1)),
+            "the observed size must be reported: {error}"
+        );
+    }
+}
+
+/// The message has to carry all three of: what was seen, what the limit was,
+/// and what to do about it. A bound whose remedy is "recompile" is a bound the
+/// person who hit it cannot act on.
+#[test]
+fn the_over_ceiling_error_names_the_size_the_limit_and_the_remedy() {
+    let limits = TransportLimits::default();
+
+    let mut endless = std::io::repeat(b'x');
+    let advertisement = read_to_end_bounded(
+        &mut endless,
+        crate::ReadCeiling {
+            limit: 1024,
+            ..limits.ref_advertisement()
+        },
+    )
+    .expect_err("refused")
+    .to_string();
+    assert!(
+        advertisement.contains("stopped at 1025 bytes"),
+        "{advertisement}"
+    );
+    assert!(
+        advertisement.contains("ceiling of 1024 bytes"),
+        "{advertisement}"
+    );
+    assert!(advertisement.contains("ls-refs"), "{advertisement}");
+    assert!(advertisement.contains("ref-prefix"), "{advertisement}");
+    assert!(
+        advertisement.contains("git config sley.maxRefAdvertisementBytes"),
+        "{advertisement}"
+    );
+
+    let mut endless = std::io::repeat(b'x');
+    let packfile = read_to_end_bounded(
+        &mut endless,
+        crate::ReadCeiling {
+            limit: 1024,
+            ..limits.packfile_response()
+        },
+    )
+    .expect_err("refused")
+    .to_string();
+    assert!(packfile.contains("stopped at 1025 bytes"), "{packfile}");
+    assert!(packfile.contains("ceiling of 1024 bytes"), "{packfile}");
+    assert!(
+        packfile.contains("git config sley.maxPackfileResponseBytes"),
+        "{packfile}"
+    );
+}
+
+#[test]
+fn bounded_append_counts_the_already_buffered_prefix() {
+    let rest = vec![b'x'; 32];
+
+    let mut buffer = vec![b'p'; 32];
+    let error = append_to_end_bounded(&mut rest.as_slice(), &mut buffer, test_ceiling(48))
+        .expect_err("the prefix counts against the ceiling");
+    assert!(
+        error.to_string().contains("exceeds the configured ceiling"),
+        "unexpected error: {error}"
+    );
+
+    let mut buffer = vec![b'p'; 32];
+    append_to_end_bounded(&mut rest.as_slice(), &mut buffer, test_ceiling(64))
+        .expect("prefix plus body exactly at the ceiling is accepted");
+    assert_eq!(buffer.len(), 64);
+}
+
+#[test]
+fn upload_pack_raw_packfile_response_refuses_an_endless_reader() {
+    let mut endless = std::io::repeat(b'x');
+    let error = crate::upload_pack::read_upload_pack_raw_packfile_response_with_limits(
+        ObjectFormat::Sha1,
+        &mut endless,
+        packfile_limits(64 * 1024),
+    )
+    .expect_err("an endless packfile response must be refused");
+    assert!(
+        error.to_string().contains("exceeds the configured ceiling"),
+        "unexpected error: {error}"
+    );
+
+    // The ceiling moves with configuration and keeps binding where it lands.
+    let mut endless = std::io::repeat(b'x');
+    let error = crate::upload_pack::read_upload_pack_raw_packfile_response_with_limits(
+        ObjectFormat::Sha1,
+        &mut endless,
+        packfile_limits(4 * 1024 * 1024),
+    )
+    .expect_err("an endless packfile response must be refused at the raised ceiling too")
+    .to_string();
+    assert!(error.contains("ceiling of 4194304 bytes"), "{error}");
+}
+
+#[test]
+fn upload_pack_shallow_info_packfile_response_refuses_an_endless_reader() {
+    // An empty shallow-info section and a NAK, then a pack header followed by
+    // a body that never ends.
+    let mut prefix = Vec::new();
+    prefix.extend_from_slice(b"0000");
+    prefix.extend_from_slice(b"0008NAK\n");
+    prefix.extend_from_slice(b"PACK\x00\x00\x00\x02");
+    let mut stream = std::io::Cursor::new(prefix).chain(std::io::repeat(b'x'));
+
+    let error =
+        crate::upload_pack::read_upload_pack_shallow_info_and_raw_packfile_response_with_limits(
+            ObjectFormat::Sha1,
+            &mut stream,
+            packfile_limits(64 * 1024),
+        )
+        .expect_err("an endless packfile body must be refused");
+    assert!(
+        error.to_string().contains("exceeds the configured ceiling"),
+        "unexpected error: {error}"
+    );
+}
+
+/// The defaults are the documented derivations, and nothing about making them
+/// configurable changed them.
+#[test]
+fn default_transport_limits_are_the_documented_derivations() {
+    let limits = TransportLimits::default();
+    assert_eq!(limits.max_ref_advertisement_bytes, 128 * 1024 * 1024);
+    assert_eq!(limits.max_packfile_response_bytes, 4 * 1024 * 1024 * 1024);
+    assert_eq!(limits.min_transfer_bytes_per_sec, 1024 * 1024);
+    assert_eq!(limits.admitted_refs(), 512 * 1024);
+    assert_eq!(limits.body_transfer_timeout().as_secs(), 4096);
+    assert_eq!(limits, limits.clamped());
+}
+
+/// The wall-clock deadline stays a deadline whatever the size ceiling and the
+/// floor rate are configured to -- otherwise raising a ceiling would quietly
+/// hand back the unbounded wait sley#163 closed.
+#[test]
+fn the_derived_deadline_is_finite_for_every_configuration() {
+    for limits in [
+        TransportLimits {
+            max_packfile_response_bytes: u64::MAX,
+            min_transfer_bytes_per_sec: 1,
+            ..TransportLimits::default()
+        },
+        TransportLimits {
+            max_packfile_response_bytes: u64::MAX,
+            min_transfer_bytes_per_sec: 0,
+            ..TransportLimits::default()
+        },
+        TransportLimits {
+            max_packfile_response_bytes: 0,
+            min_transfer_bytes_per_sec: 0,
+            ..TransportLimits::default()
+        },
+    ] {
+        let clamped = limits.clamped();
+        assert!(clamped.max_packfile_response_bytes <= crate::MAX_CONFIGURABLE_RESPONSE_BYTES);
+        assert!(clamped.max_packfile_response_bytes > 0);
+        let timeout = clamped.body_transfer_timeout();
+        assert!(
+            timeout > std::time::Duration::ZERO,
+            "{limits:?} -> {timeout:?}"
+        );
+        assert!(
+            timeout <= crate::MAX_BODY_TRANSFER_TIMEOUT,
+            "{limits:?} -> {timeout:?}"
+        );
+    }
+}

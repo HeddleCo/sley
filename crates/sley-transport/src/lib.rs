@@ -5,6 +5,8 @@
 use sley_core::{GitError, ObjectFormat, Result};
 use sley_protocol::*;
 use std::io::{Read, Write};
+#[cfg(feature = "http-client")]
+use std::time::Duration;
 
 pub mod credential;
 
@@ -1507,10 +1509,19 @@ pub trait HttpClient {
         headers: &[(&str, &str)],
         body: &mut dyn std::io::Read,
     ) -> Result<HttpResponse> {
-        let mut buffered = Vec::new();
-        body.read_to_end(&mut buffered)
-            .map_err(|err| GitError::Io(err.to_string()))?;
+        let buffered = read_to_end_bounded(body, self.limits().http_request_body())?;
         self.post(url, content_type, headers, &buffered)
+    }
+
+    /// The ceilings this client applies to bodies it buffers whole.
+    ///
+    /// The default is [`TransportLimits::default`], so a client that does
+    /// not override this behaves exactly as it did before the limits became
+    /// configurable. [`UreqHttpClient`] overrides it with the limits it was
+    /// built from, which is what keeps a configured size ceiling and the
+    /// deadline derived from it in agreement.
+    fn limits(&self) -> TransportLimits {
+        TransportLimits::default()
     }
 }
 
@@ -1518,22 +1529,156 @@ pub trait HttpClient {
 #[cfg(feature = "http-client")]
 pub struct UreqHttpClient {
     agent: ureq::Agent,
+    limits: TransportLimits,
+}
+
+/// Max time for the DNS lookup.
+///
+/// glibc's resolver waits 5s per attempt and makes two attempts, so a lookup
+/// that has not answered inside 10s is not going to.
+#[cfg(feature = "http-client")]
+const HTTP_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Max time to establish the connection (TCP handshake, proxy, TLS).
+///
+/// Linux retransmits an unanswered SYN at 1s, 3s, 7s and 15s; 20s admits the
+/// first three retransmits, so a single lossy handshake still succeeds. curl's
+/// 300s default -- which git inherits -- does not bound anything useful here.
+#[cfg(feature = "http-client")]
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Max time to send the request headers (not the body).
+///
+/// A few hundred bytes. A peer that cannot absorb them in 20s is stalled.
+#[cfg(feature = "http-client")]
+const HTTP_SEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Max time to await a `100 Continue`.
+///
+/// ureq's own default, kept as-is: a peer that never sends one is expected, and
+/// the request proceeds without it.
+#[cfg(feature = "http-client")]
+const HTTP_AWAIT_100_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Max time to receive the response headers (not the body).
+///
+/// A smart-HTTP server flushes its response headers before it starts writing
+/// the pack -- `git-upload-pack`'s object enumeration shows up as a gap inside
+/// the body, which `HTTP_BODY_TIMEOUT` covers, not as a delay before the
+/// headers. So this only has to cover a few round trips plus server dispatch,
+/// and 30s is already generous for a phase carrying a few hundred bytes.
+///
+/// Note that ureq also re-checks the *preceding* phase's deadline while it
+/// waits, so the effective bound on "request sent, no headers yet" is the
+/// tighter of this and [`HTTP_SEND_REQUEST_TIMEOUT`] measured from the start of
+/// the request -- 20s in practice, which is what a stalled peer actually hits.
+#[cfg(feature = "http-client")]
+const HTTP_RECV_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Max time to send or to receive a body.
+///
+/// Derived rather than chosen: the largest body sley will buffer divided by the
+/// slowest average rate it will serve -- both fields of the same
+/// [`TransportLimits`] value, so the size ceiling and the time ceiling cannot
+/// drift apart. Raising the ceiling raises the deadline that pays for it,
+/// without a second knob to keep in step. 4 GiB at 1 MiB/s is 4096s, a little
+/// over an hour.
+///
+/// [`TransportLimits::body_transfer_timeout`] clamps the result to
+/// `sley_protocol::MAX_BODY_TRANSFER_TIMEOUT`, so no configured combination of
+/// ceiling and rate can derive a deadline long enough to stop being one.
+///
+/// ureq's timeouts are whole-phase deadlines, not idle timeouts, so this bounds
+/// the total transfer rather than the gap between reads. A peer trickling one
+/// byte per interval is therefore cut off here, while a peer on a merely slow
+/// link is refused only if the transfer would not have finished in the budget.
+#[cfg(feature = "http-client")]
+fn http_body_timeout(limits: TransportLimits) -> Duration {
+    limits.body_transfer_timeout()
+}
+
+/// Max time for the whole call, redirects included: the sum of every phase
+/// above. A redirect chain shares this one budget instead of getting a fresh
+/// deadline per hop.
+#[cfg(feature = "http-client")]
+fn http_global_timeout(limits: TransportLimits) -> Duration {
+    Duration::from_secs(
+        HTTP_RESOLVE_TIMEOUT.as_secs()
+            + HTTP_CONNECT_TIMEOUT.as_secs()
+            + HTTP_SEND_REQUEST_TIMEOUT.as_secs()
+            + HTTP_AWAIT_100_TIMEOUT.as_secs()
+            + HTTP_RECV_RESPONSE_TIMEOUT.as_secs()
+            + 2 * http_body_timeout(limits).as_secs(),
+    )
+}
+
+/// Every deadline applied to an outbound HTTP request.
+///
+/// ureq 3.3.0's `Timeouts::default()` leaves every field `None` except
+/// `await_100`, which is to say there is no connect, read, write or overall
+/// deadline at all: a peer that accepts and then stalls holds the request open
+/// in unbounded wall-clock, and a byte ceiling never fires because the volume
+/// stays small (sley#163). Every field is named explicitly here, so a field
+/// added to ureq later cannot silently reintroduce an unbounded phase.
+#[cfg(feature = "http-client")]
+fn http_timeouts(limits: TransportLimits) -> ureq::config::Timeouts {
+    let body = http_body_timeout(limits);
+    let global = http_global_timeout(limits);
+    ureq::config::Timeouts {
+        global: Some(global),
+        per_call: Some(global),
+        resolve: Some(HTTP_RESOLVE_TIMEOUT),
+        connect: Some(HTTP_CONNECT_TIMEOUT),
+        send_request: Some(HTTP_SEND_REQUEST_TIMEOUT),
+        await_100: Some(HTTP_AWAIT_100_TIMEOUT),
+        send_body: Some(body),
+        recv_response: Some(HTTP_RECV_RESPONSE_TIMEOUT),
+        recv_body: Some(body),
+    }
+}
+
+#[cfg(feature = "http-client")]
+fn ureq_agent(timeouts: ureq::config::Timeouts) -> ureq::Agent {
+    // `http_status_as_error(false)` makes ureq deliver 4xx/5xx as a normal
+    // response (carrying status + body) rather than an error, which is what
+    // smart-HTTP callers need (e.g. inspecting 401 to prompt for creds).
+    let mut builder = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .user_agent(HTTP_USER_AGENT)
+        .timeout_global(timeouts.global)
+        .timeout_per_call(timeouts.per_call)
+        .timeout_resolve(timeouts.resolve)
+        .timeout_connect(timeouts.connect)
+        .timeout_send_request(timeouts.send_request)
+        .timeout_await_100(timeouts.await_100)
+        .timeout_send_body(timeouts.send_body)
+        .timeout_recv_response(timeouts.recv_response)
+        .timeout_recv_body(timeouts.recv_body);
+    if let Some(tls_config) = ureq_tls_config() {
+        builder = builder.tls_config(tls_config);
+    }
+    builder.build().into()
 }
 
 #[cfg(feature = "http-client")]
 impl UreqHttpClient {
+    /// A client with the default ceilings and the deadlines derived from
+    /// them -- the behaviour every caller got before the ceilings became
+    /// configurable.
     pub fn new() -> Self {
-        // `http_status_as_error(false)` makes ureq deliver 4xx/5xx as a normal
-        // response (carrying status + body) rather than an error, which is what
-        // smart-HTTP callers need (e.g. inspecting 401 to prompt for creds).
-        let mut builder = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .user_agent(HTTP_USER_AGENT);
-        if let Some(tls_config) = ureq_tls_config() {
-            builder = builder.tls_config(tls_config);
-        }
+        Self::with_limits(TransportLimits::default())
+    }
+
+    /// A client whose buffered-response ceilings, and the body deadlines
+    /// derived from them, come from `limits`.
+    ///
+    /// `limits` is clamped on the way in, so this cannot build a client with
+    /// an unbounded read or an unbounded wait however it is called.
+    pub fn with_limits(limits: TransportLimits) -> Self {
+        let limits = limits.clamped();
         Self {
-            agent: builder.build().into(),
+            agent: ureq_agent(http_timeouts(limits)),
+            limits,
         }
     }
 }
@@ -1579,6 +1724,10 @@ impl Default for UreqHttpClient {
 
 #[cfg(feature = "http-client")]
 impl HttpClient for UreqHttpClient {
+    fn limits(&self) -> TransportLimits {
+        self.limits
+    }
+
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
         trace_curl_request("GET", url, headers, false);
         let mut request = self.agent.get(url);
@@ -2899,5 +3048,188 @@ mod tests {
         assert!(trace.contains("Send header: Transfer-Encoding: chunked"));
         assert!(!trace.contains("Authorization"));
         assert!(!trace.contains("secret"));
+    }
+}
+
+#[cfg(all(test, feature = "http-client"))]
+mod http_timeout_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// sley#163: ureq 3.3.0's `Timeouts::default()` leaves every field `None`
+    /// except `await_100`, and an unset field is an unbounded phase. Name them
+    /// all, so a field added to ureq later cannot silently reintroduce one.
+    #[test]
+    fn every_ureq_timeout_field_is_set() {
+        let timeouts = UreqHttpClient::new().agent.config().timeouts();
+        for (name, value) in [
+            ("global", timeouts.global),
+            ("per_call", timeouts.per_call),
+            ("resolve", timeouts.resolve),
+            ("connect", timeouts.connect),
+            ("send_request", timeouts.send_request),
+            ("await_100", timeouts.await_100),
+            ("send_body", timeouts.send_body),
+            ("recv_response", timeouts.recv_response),
+            ("recv_body", timeouts.recv_body),
+        ] {
+            assert!(value.is_some(), "timeout `{name}` is unbounded");
+        }
+    }
+
+    /// The body deadline is derived from the size ceiling and the floor rate,
+    /// and the global deadline from the sum of the phases, so no part of the
+    /// budget can be changed without the rest following.
+    #[test]
+    fn deadlines_are_derived_from_the_size_ceiling() {
+        let limits = TransportLimits::default();
+        assert_eq!(
+            http_body_timeout(limits).as_secs(),
+            MAX_PACKFILE_RESPONSE_BYTES / MIN_TRANSFER_BYTES_PER_SEC
+        );
+        assert_eq!(
+            http_global_timeout(limits).as_secs(),
+            HTTP_RESOLVE_TIMEOUT.as_secs()
+                + HTTP_CONNECT_TIMEOUT.as_secs()
+                + HTTP_SEND_REQUEST_TIMEOUT.as_secs()
+                + HTTP_AWAIT_100_TIMEOUT.as_secs()
+                + HTTP_RECV_RESPONSE_TIMEOUT.as_secs()
+                + 2 * http_body_timeout(limits).as_secs()
+        );
+    }
+
+    /// A default client is byte-for-byte what it was before the ceilings
+    /// became configurable: configuring nothing changes nothing.
+    #[test]
+    fn an_unconfigured_client_keeps_the_documented_defaults() {
+        let timeouts = UreqHttpClient::new().agent.config().timeouts();
+        assert_eq!(
+            timeouts.recv_body,
+            Some(Duration::from_secs(
+                MAX_PACKFILE_RESPONSE_BYTES / MIN_TRANSFER_BYTES_PER_SEC
+            ))
+        );
+        assert_eq!(timeouts.send_body, timeouts.recv_body);
+        assert_eq!(UreqHttpClient::new().limits(), TransportLimits::default());
+    }
+
+    /// Raising the size ceiling raises the deadline that pays for it, in the
+    /// same value -- the derivation is the point, not a coincidence of the
+    /// default numbers.
+    #[test]
+    fn a_raised_ceiling_moves_the_body_deadline_with_it() {
+        let raised = TransportLimits {
+            max_packfile_response_bytes: 8 * 1024 * 1024 * 1024,
+            ..TransportLimits::default()
+        };
+        let client = UreqHttpClient::with_limits(raised);
+        let timeouts = client.agent.config().timeouts();
+        assert_eq!(
+            timeouts.recv_body,
+            Some(Duration::from_secs(
+                8 * 1024 * 1024 * 1024 / MIN_TRANSFER_BYTES_PER_SEC
+            ))
+        );
+        assert!(timeouts.recv_body > Some(http_body_timeout(TransportLimits::default())));
+    }
+
+    /// The ceiling moves; it does not disappear. Every field stays set and
+    /// every deadline stays finite even when configuration asks for the
+    /// largest ceiling and the slowest rate representable.
+    #[test]
+    fn no_configuration_can_build_a_client_without_deadlines() {
+        let absurd = TransportLimits {
+            max_ref_advertisement_bytes: u64::MAX,
+            max_packfile_response_bytes: u64::MAX,
+            min_transfer_bytes_per_sec: 1,
+        };
+        let client = UreqHttpClient::with_limits(absurd);
+        assert!(
+            client.limits().max_ref_advertisement_bytes
+                <= sley_protocol::MAX_CONFIGURABLE_RESPONSE_BYTES
+        );
+        assert!(
+            client.limits().max_packfile_response_bytes
+                <= sley_protocol::MAX_CONFIGURABLE_RESPONSE_BYTES
+        );
+        let timeouts = client.agent.config().timeouts();
+        for (name, value) in [
+            ("global", timeouts.global),
+            ("per_call", timeouts.per_call),
+            ("resolve", timeouts.resolve),
+            ("connect", timeouts.connect),
+            ("send_request", timeouts.send_request),
+            ("await_100", timeouts.await_100),
+            ("send_body", timeouts.send_body),
+            ("recv_response", timeouts.recv_response),
+            ("recv_body", timeouts.recv_body),
+        ] {
+            let value = value.unwrap_or_else(|| panic!("timeout `{name}` is unbounded"));
+            assert!(
+                value <= sley_protocol::MAX_BODY_TRANSFER_TIMEOUT * 3,
+                "timeout `{name}` is {value:?}, which is not a deadline"
+            );
+        }
+        assert!(
+            client.limits().body_transfer_timeout() <= sley_protocol::MAX_BODY_TRANSFER_TIMEOUT
+        );
+    }
+
+    /// Zero reads as "unset", not as "refuse everything".
+    #[test]
+    fn a_zero_configured_ceiling_falls_back_to_the_default() {
+        let zeroed = TransportLimits {
+            max_ref_advertisement_bytes: 0,
+            max_packfile_response_bytes: 0,
+            min_transfer_bytes_per_sec: 0,
+        };
+        assert_eq!(zeroed.clamped(), TransportLimits::default());
+    }
+
+    /// A peer that completes the TCP handshake and then says nothing must be
+    /// abandoned on a deadline rather than held open forever.
+    ///
+    /// The request runs on a worker thread behind `recv_timeout`, so with no
+    /// deadline configured this test fails on its own clock instead of hanging
+    /// the suite.
+    #[test]
+    fn stalled_peer_fails_within_the_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let stall = std::thread::spawn(move || {
+            // Accept, then never answer. Holding the stream keeps the
+            // connection established rather than resetting it.
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(120));
+                drop(stream);
+            }
+        });
+
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let client = UreqHttpClient::new();
+            let started = Instant::now();
+            let outcome = client.get(&format!("http://{addr}/info/refs"), &[]);
+            let _ = tx.send((outcome.is_err(), started.elapsed()));
+        });
+
+        match rx.recv_timeout(Duration::from_secs(45)) {
+            Ok((is_err, elapsed)) => {
+                assert!(
+                    is_err,
+                    "a peer that never answers must not produce a response"
+                );
+                println!("stalled peer refused after {elapsed:?}");
+            }
+            Err(_) => panic!(
+                "request to a stalled peer was still blocked after 45s: \
+                 no read/response deadline fired"
+            ),
+        }
+
+        drop(stall);
+        drop(worker);
     }
 }
