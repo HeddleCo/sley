@@ -1,6 +1,7 @@
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use std::io::{Read, Write};
 
+use crate::limits::{TransportLimits, append_to_end_bounded, read_to_end_bounded};
 use crate::pktline::{
     PKT_LINE_MAX_LEN, PktLineFrame, line_from_str, parse_oid_argument, parse_pkt_len,
     parse_protocol_v2_line_text, read_pkt_line_frame, read_pkt_line_frames_until_flush,
@@ -1097,8 +1098,18 @@ pub fn read_upload_pack_raw_packfile_response(
     format: ObjectFormat,
     reader: &mut impl Read,
 ) -> Result<UploadPackRawPackfileResponse> {
-    let mut input = Vec::new();
-    reader.read_to_end(&mut input)?;
+    read_upload_pack_raw_packfile_response_with_limits(format, reader, TransportLimits::default())
+}
+
+/// [`read_upload_pack_raw_packfile_response`] with explicit [`TransportLimits`],
+/// for embedders that configure the ceiling and for tests that need to exercise
+/// the bound without materialising a multi-gigabyte response.
+pub fn read_upload_pack_raw_packfile_response_with_limits(
+    format: ObjectFormat,
+    reader: &mut impl Read,
+    limits: TransportLimits,
+) -> Result<UploadPackRawPackfileResponse> {
+    let input = read_to_end_bounded(reader, limits.packfile_response())?;
     parse_upload_pack_raw_packfile_response(format, &input)
 }
 
@@ -1278,10 +1289,31 @@ pub fn read_upload_pack_shallow_info_and_raw_packfile_response(
     Vec<ProtocolV2FetchShallowInfo>,
     UploadPackRawPackfileResponse,
 )> {
+    read_upload_pack_shallow_info_and_raw_packfile_response_with_limits(
+        format,
+        reader,
+        TransportLimits::default(),
+    )
+}
+
+/// [`read_upload_pack_shallow_info_and_raw_packfile_response`] with explicit
+/// [`TransportLimits`], for embedders that configure the ceiling and for tests
+/// that need to exercise the bound without materialising a multi-gigabyte
+/// response.
+pub fn read_upload_pack_shallow_info_and_raw_packfile_response_with_limits(
+    format: ObjectFormat,
+    reader: &mut impl Read,
+    limits: TransportLimits,
+) -> Result<(
+    Vec<ProtocolV2FetchShallowInfo>,
+    UploadPackRawPackfileResponse,
+)> {
     let (shallow, header) =
         read_upload_pack_shallow_info_and_raw_packfile_response_header(format, reader)?;
     let mut packfile = header.pack_prefix;
-    reader.read_to_end(&mut packfile)?;
+    // The already-read prefix counts against the ceiling, so a caller cannot
+    // spend the budget twice.
+    append_to_end_bounded(&mut *reader, &mut packfile, limits.packfile_response())?;
     Ok((
         shallow,
         UploadPackRawPackfileResponse {

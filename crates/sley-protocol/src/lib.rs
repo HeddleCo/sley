@@ -2,6 +2,7 @@
 // the only retained `expect`s would be documented compile-time invariants.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+mod limits;
 mod pktline;
 mod promisor;
 mod receive_pack;
@@ -14,6 +15,7 @@ mod v2;
 #[cfg(test)]
 mod tests;
 
+pub use limits::*;
 pub use pktline::*;
 pub use promisor::*;
 pub use sideband::*;
