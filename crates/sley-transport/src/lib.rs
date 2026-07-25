@@ -1509,8 +1509,19 @@ pub trait HttpClient {
         headers: &[(&str, &str)],
         body: &mut dyn std::io::Read,
     ) -> Result<HttpResponse> {
-        let buffered = read_to_end_bounded(body, MAX_PACKFILE_RESPONSE_BYTES, "HTTP request body")?;
+        let buffered = read_to_end_bounded(body, self.limits().http_request_body())?;
         self.post(url, content_type, headers, &buffered)
+    }
+
+    /// The ceilings this client applies to bodies it buffers whole.
+    ///
+    /// The default is [`TransportLimits::default`], so a client that does
+    /// not override this behaves exactly as it did before the limits became
+    /// configurable. [`UreqHttpClient`] overrides it with the limits it was
+    /// built from, which is what keeps a configured size ceiling and the
+    /// deadline derived from it in agreement.
+    fn limits(&self) -> TransportLimits {
+        TransportLimits::default()
     }
 }
 
@@ -1518,6 +1529,7 @@ pub trait HttpClient {
 #[cfg(feature = "http-client")]
 pub struct UreqHttpClient {
     agent: ureq::Agent,
+    limits: TransportLimits,
 }
 
 /// Max time for the DNS lookup.
@@ -1566,31 +1578,39 @@ const HTTP_RECV_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Max time to send or to receive a body.
 ///
 /// Derived rather than chosen: the largest body sley will buffer divided by the
-/// slowest average rate it will serve (both in `sley_protocol::limits`), so the
-/// size ceiling and the time ceiling cannot drift apart. 4 GiB at 1 MiB/s is
-/// 4096s, a little over an hour.
+/// slowest average rate it will serve -- both fields of the same
+/// [`TransportLimits`] value, so the size ceiling and the time ceiling cannot
+/// drift apart. Raising the ceiling raises the deadline that pays for it,
+/// without a second knob to keep in step. 4 GiB at 1 MiB/s is 4096s, a little
+/// over an hour.
+///
+/// [`TransportLimits::body_transfer_timeout`] clamps the result to
+/// `sley_protocol::MAX_BODY_TRANSFER_TIMEOUT`, so no configured combination of
+/// ceiling and rate can derive a deadline long enough to stop being one.
 ///
 /// ureq's timeouts are whole-phase deadlines, not idle timeouts, so this bounds
 /// the total transfer rather than the gap between reads. A peer trickling one
 /// byte per interval is therefore cut off here, while a peer on a merely slow
 /// link is refused only if the transfer would not have finished in the budget.
 #[cfg(feature = "http-client")]
-const HTTP_BODY_TIMEOUT: Duration =
-    Duration::from_secs(MAX_PACKFILE_RESPONSE_BYTES / MIN_TRANSFER_BYTES_PER_SEC);
+fn http_body_timeout(limits: TransportLimits) -> Duration {
+    limits.body_transfer_timeout()
+}
 
 /// Max time for the whole call, redirects included: the sum of every phase
 /// above. A redirect chain shares this one budget instead of getting a fresh
 /// deadline per hop.
 #[cfg(feature = "http-client")]
-const HTTP_GLOBAL_TIMEOUT: Duration = Duration::from_secs(
-    HTTP_RESOLVE_TIMEOUT.as_secs()
-        + HTTP_CONNECT_TIMEOUT.as_secs()
-        + HTTP_SEND_REQUEST_TIMEOUT.as_secs()
-        + HTTP_AWAIT_100_TIMEOUT.as_secs()
-        + HTTP_RECV_RESPONSE_TIMEOUT.as_secs()
-        + HTTP_BODY_TIMEOUT.as_secs()
-        + HTTP_BODY_TIMEOUT.as_secs(),
-);
+fn http_global_timeout(limits: TransportLimits) -> Duration {
+    Duration::from_secs(
+        HTTP_RESOLVE_TIMEOUT.as_secs()
+            + HTTP_CONNECT_TIMEOUT.as_secs()
+            + HTTP_SEND_REQUEST_TIMEOUT.as_secs()
+            + HTTP_AWAIT_100_TIMEOUT.as_secs()
+            + HTTP_RECV_RESPONSE_TIMEOUT.as_secs()
+            + 2 * http_body_timeout(limits).as_secs(),
+    )
+}
 
 /// Every deadline applied to an outbound HTTP request.
 ///
@@ -1601,17 +1621,19 @@ const HTTP_GLOBAL_TIMEOUT: Duration = Duration::from_secs(
 /// stays small (sley#163). Every field is named explicitly here, so a field
 /// added to ureq later cannot silently reintroduce an unbounded phase.
 #[cfg(feature = "http-client")]
-fn http_timeouts() -> ureq::config::Timeouts {
+fn http_timeouts(limits: TransportLimits) -> ureq::config::Timeouts {
+    let body = http_body_timeout(limits);
+    let global = http_global_timeout(limits);
     ureq::config::Timeouts {
-        global: Some(HTTP_GLOBAL_TIMEOUT),
-        per_call: Some(HTTP_GLOBAL_TIMEOUT),
+        global: Some(global),
+        per_call: Some(global),
         resolve: Some(HTTP_RESOLVE_TIMEOUT),
         connect: Some(HTTP_CONNECT_TIMEOUT),
         send_request: Some(HTTP_SEND_REQUEST_TIMEOUT),
         await_100: Some(HTTP_AWAIT_100_TIMEOUT),
-        send_body: Some(HTTP_BODY_TIMEOUT),
+        send_body: Some(body),
         recv_response: Some(HTTP_RECV_RESPONSE_TIMEOUT),
-        recv_body: Some(HTTP_BODY_TIMEOUT),
+        recv_body: Some(body),
     }
 }
 
@@ -1640,9 +1662,23 @@ fn ureq_agent(timeouts: ureq::config::Timeouts) -> ureq::Agent {
 
 #[cfg(feature = "http-client")]
 impl UreqHttpClient {
+    /// A client with the default ceilings and the deadlines derived from
+    /// them -- the behaviour every caller got before the ceilings became
+    /// configurable.
     pub fn new() -> Self {
+        Self::with_limits(TransportLimits::default())
+    }
+
+    /// A client whose buffered-response ceilings, and the body deadlines
+    /// derived from them, come from `limits`.
+    ///
+    /// `limits` is clamped on the way in, so this cannot build a client with
+    /// an unbounded read or an unbounded wait however it is called.
+    pub fn with_limits(limits: TransportLimits) -> Self {
+        let limits = limits.clamped();
         Self {
-            agent: ureq_agent(http_timeouts()),
+            agent: ureq_agent(http_timeouts(limits)),
+            limits,
         }
     }
 }
@@ -1688,6 +1724,10 @@ impl Default for UreqHttpClient {
 
 #[cfg(feature = "http-client")]
 impl HttpClient for UreqHttpClient {
+    fn limits(&self) -> TransportLimits {
+        self.limits
+    }
+
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
         trace_curl_request("GET", url, headers, false);
         let mut request = self.agent.get(url);

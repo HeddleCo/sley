@@ -1,7 +1,7 @@
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use std::io::{Read, Write};
 
-use crate::limits::{MAX_PACKFILE_RESPONSE_BYTES, append_to_end_bounded, read_to_end_bounded};
+use crate::limits::{TransportLimits, append_to_end_bounded, read_to_end_bounded};
 use crate::pktline::{
     PKT_LINE_MAX_LEN, PktLineFrame, line_from_str, parse_oid_argument, parse_pkt_len,
     parse_protocol_v2_line_text, read_pkt_line_frame, read_pkt_line_frames_until_flush,
@@ -1098,17 +1098,18 @@ pub fn read_upload_pack_raw_packfile_response(
     format: ObjectFormat,
     reader: &mut impl Read,
 ) -> Result<UploadPackRawPackfileResponse> {
-    read_upload_pack_raw_packfile_response_with_limit(format, reader, MAX_PACKFILE_RESPONSE_BYTES)
+    read_upload_pack_raw_packfile_response_with_limits(format, reader, TransportLimits::default())
 }
 
-/// [`read_upload_pack_raw_packfile_response`] with an explicit ceiling, so the
-/// bound can be exercised without materialising a multi-gigabyte response.
-pub(crate) fn read_upload_pack_raw_packfile_response_with_limit(
+/// [`read_upload_pack_raw_packfile_response`] with explicit [`TransportLimits`],
+/// for embedders that configure the ceiling and for tests that need to exercise
+/// the bound without materialising a multi-gigabyte response.
+pub fn read_upload_pack_raw_packfile_response_with_limits(
     format: ObjectFormat,
     reader: &mut impl Read,
-    limit: u64,
+    limits: TransportLimits,
 ) -> Result<UploadPackRawPackfileResponse> {
-    let input = read_to_end_bounded(reader, limit, "upload-pack packfile response")?;
+    let input = read_to_end_bounded(reader, limits.packfile_response())?;
     parse_upload_pack_raw_packfile_response(format, &input)
 }
 
@@ -1288,20 +1289,21 @@ pub fn read_upload_pack_shallow_info_and_raw_packfile_response(
     Vec<ProtocolV2FetchShallowInfo>,
     UploadPackRawPackfileResponse,
 )> {
-    read_upload_pack_shallow_info_and_raw_packfile_response_with_limit(
+    read_upload_pack_shallow_info_and_raw_packfile_response_with_limits(
         format,
         reader,
-        MAX_PACKFILE_RESPONSE_BYTES,
+        TransportLimits::default(),
     )
 }
 
-/// [`read_upload_pack_shallow_info_and_raw_packfile_response`] with an explicit
-/// ceiling, so the bound can be exercised without materialising a
-/// multi-gigabyte response.
-pub(crate) fn read_upload_pack_shallow_info_and_raw_packfile_response_with_limit(
+/// [`read_upload_pack_shallow_info_and_raw_packfile_response`] with explicit
+/// [`TransportLimits`], for embedders that configure the ceiling and for tests
+/// that need to exercise the bound without materialising a multi-gigabyte
+/// response.
+pub fn read_upload_pack_shallow_info_and_raw_packfile_response_with_limits(
     format: ObjectFormat,
     reader: &mut impl Read,
-    limit: u64,
+    limits: TransportLimits,
 ) -> Result<(
     Vec<ProtocolV2FetchShallowInfo>,
     UploadPackRawPackfileResponse,
@@ -1311,12 +1313,7 @@ pub(crate) fn read_upload_pack_shallow_info_and_raw_packfile_response_with_limit
     let mut packfile = header.pack_prefix;
     // The already-read prefix counts against the ceiling, so a caller cannot
     // spend the budget twice.
-    append_to_end_bounded(
-        &mut *reader,
-        &mut packfile,
-        limit,
-        "upload-pack packfile response",
-    )?;
+    append_to_end_bounded(&mut *reader, &mut packfile, limits.packfile_response())?;
     Ok((
         shallow,
         UploadPackRawPackfileResponse {

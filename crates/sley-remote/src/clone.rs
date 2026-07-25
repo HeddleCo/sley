@@ -647,7 +647,12 @@ fn fetch_http_partial_clone_checkout_blobs(
     let client: &dyn HttpClient = match http_client {
         Some(client) => client,
         None => {
-            default_client = UreqHttpClient::new();
+            // Built from config so the buffered-response ceilings and the body
+            // deadlines derived from them follow the same settings the rest of
+            // the request does.
+            default_client = UreqHttpClient::with_limits(
+                crate::http::transport_limits_from_config(Some(config)),
+            );
             &default_client
         }
     };

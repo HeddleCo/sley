@@ -51,7 +51,7 @@ use sley_transport::{
     parse_remote_url, read_service_discovery_response,
 };
 
-use sley_protocol::{MAX_REF_ADVERTISEMENT_BYTES, read_to_end_bounded};
+use sley_protocol::{TransportLimits, read_to_end_bounded};
 
 use crate::credentials::{credential_request_for_url, http_url_credential};
 use crate::{CredentialProvider, ProgressSink};
@@ -79,6 +79,17 @@ impl HttpOperationBatch {
             client: UreqHttpClient::new(),
         }
     }
+
+    /// A batch whose client applies the ceilings `config` asks for.
+    ///
+    /// See [`transport_limits_from_config`]; with no relevant keys set this
+    /// is exactly [`Self::new`].
+    pub fn with_config(config: Option<&GitConfig>) -> Self {
+        Self {
+            client: UreqHttpClient::with_limits(transport_limits_from_config(config)),
+        }
+    }
+
     pub fn client(&self) -> &UreqHttpClient {
         &self.client
     }
@@ -92,6 +103,11 @@ impl Default for HttpOperationBatch {
 
 pub fn new_http_client() -> UreqHttpClient {
     UreqHttpClient::new()
+}
+
+/// [`new_http_client`] with the ceilings `config` asks for.
+pub fn new_http_client_with_config(config: Option<&GitConfig>) -> UreqHttpClient {
+    UreqHttpClient::with_limits(transport_limits_from_config(config))
 }
 
 /// Perform an HTTP request, retrying once with credential-provider-supplied
@@ -245,9 +261,19 @@ pub struct HttpUploadPackDiscovery {
 /// [`http_service_advertisements`] instead.
 pub fn http_advertised_refs(
     format: ObjectFormat,
-    mut response: HttpResponse,
+    response: HttpResponse,
 ) -> Result<RefAdvertisementSet> {
-    let discovery = read_http_service_discovery_response(format, &mut response.body)?;
+    http_advertised_refs_with_limits(format, response, TransportLimits::default())
+}
+
+/// [`http_advertised_refs`] with explicit ceilings.
+pub fn http_advertised_refs_with_limits(
+    format: ObjectFormat,
+    mut response: HttpResponse,
+    limits: TransportLimits,
+) -> Result<RefAdvertisementSet> {
+    let discovery =
+        read_http_service_discovery_response_with_limits(format, &mut response.body, limits)?;
     match discovery.payload {
         ServiceDiscoveryPayload::AdvertisedRefs(set) => Ok(set),
         ServiceDiscoveryPayload::ProtocolV2(_) => Err(GitError::Unsupported(
@@ -494,9 +520,12 @@ fn http_service_advertisements_with_expected_format<C: HttpClient + ?Sized>(
     })?;
     http_check_status(&response, &url)?;
     http_validate_content_type(&response, &smart_http_advertisement_content_type(service)?)?;
-    let discovery = read_http_service_discovery_response(
+    // The advertisement ceiling follows the same config the protocol version
+    // does, so an operator who has to raise it does not also have to rebuild.
+    let discovery = read_http_service_discovery_response_with_limits(
         expected_format.unwrap_or(ObjectFormat::Sha1),
         &mut response.body,
+        transport_limits_from_config(config),
     )?;
     let object_format = service_discovery_object_format(&discovery)?;
     if let Some(expected) = expected_format
@@ -571,21 +600,18 @@ pub fn http_discover_upload_pack<C: HttpClient + ?Sized>(
     })
 }
 
-fn read_http_service_discovery_response(
+/// Read a smart-HTTP service-discovery response under an explicit ceiling.
+///
+/// There is deliberately no ceiling-free variant: every caller has the git
+/// config in scope, so the bound always follows configuration rather than a
+/// compiled-in constant. Tests pass a small ceiling to exercise the bound
+/// without materialising a 128 MiB advertisement.
+fn read_http_service_discovery_response_with_limits(
     format: ObjectFormat,
     reader: &mut impl Read,
+    limits: TransportLimits,
 ) -> Result<ServiceDiscoveryResponse> {
-    read_http_service_discovery_response_with_limit(format, reader, MAX_REF_ADVERTISEMENT_BYTES)
-}
-
-/// [`read_http_service_discovery_response`] with an explicit ceiling, so the
-/// bound can be exercised without materialising a 128 MiB advertisement.
-fn read_http_service_discovery_response_with_limit(
-    format: ObjectFormat,
-    reader: &mut impl Read,
-    limit: u64,
-) -> Result<ServiceDiscoveryResponse> {
-    let bytes = read_to_end_bounded(reader, limit, "service discovery response")?;
+    let bytes = read_to_end_bounded(reader, limits.ref_advertisement())?;
     let first = read_service_discovery_response(format, &mut bytes.as_slice());
     let alternate = match format {
         ObjectFormat::Sha1 => ObjectFormat::Sha256,
@@ -1044,6 +1070,54 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
     }
 }
 
+/// Resolve the buffered-response ceilings from git config.
+///
+/// The keys, all optional, all sizes in git's usual `k`/`m`/`g` notation:
+///
+/// * `sley.maxRefAdvertisementBytes` -- ceiling on a buffered v0/v1 reference
+///   advertisement (default 128 MiB, about 512Ki refs). The remedy of first
+///   resort for a repository with more refs than that is protocol v2
+///   `ls-refs` with a `ref-prefix`, which sley already uses by default for
+///   `git-upload-pack`; this key exists for the paths that cannot, chiefly
+///   `git-receive-pack` and servers without v2.
+/// * `sley.maxPackfileResponseBytes` -- ceiling on a packfile-bearing
+///   response buffered whole (default 4 GiB). The body deadline is derived
+///   from it, so raising it raises the time budget that pays for it.
+/// * `sley.minTransferBytesPerSec` -- the slowest average rate served
+///   (default 1 MiB/s), the other half of that derivation.
+///
+/// Every value is clamped by [`TransportLimits::clamped`]: an unset, zero or
+/// unparseable value falls back to the default, and no value can raise a
+/// ceiling past `sley_protocol::MAX_CONFIGURABLE_RESPONSE_BYTES` or derive a
+/// deadline past `sley_protocol::MAX_BODY_TRANSFER_TIMEOUT`. Configuration
+/// moves these bounds; it cannot remove them.
+pub fn transport_limits_from_config(config: Option<&GitConfig>) -> TransportLimits {
+    let defaults = TransportLimits::default();
+    let size = |key: &str, fallback: u64| -> u64 {
+        config
+            .and_then(|config| config.get("sley", None, key))
+            .and_then(sley_config::parse_config_int)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .filter(|bytes| *bytes > 0)
+            .unwrap_or(fallback)
+    };
+    TransportLimits {
+        max_ref_advertisement_bytes: size(
+            "maxRefAdvertisementBytes",
+            defaults.max_ref_advertisement_bytes,
+        ),
+        max_packfile_response_bytes: size(
+            "maxPackfileResponseBytes",
+            defaults.max_packfile_response_bytes,
+        ),
+        min_transfer_bytes_per_sec: size(
+            "minTransferBytesPerSec",
+            defaults.min_transfer_bytes_per_sec,
+        ),
+    }
+    .clamped()
+}
+
 pub(crate) fn http_post_buffer(config: Option<&GitConfig>) -> usize {
     const DEFAULT_HTTP_POST_BUFFER: usize = 1 << 20;
     config
@@ -1256,9 +1330,12 @@ mod tests {
         sley_transport::write_service_discovery_response(&mut encoded, &response)
             .expect("discovery response");
 
-        let parsed =
-            read_http_service_discovery_response(ObjectFormat::Sha1, &mut encoded.as_slice())
-                .expect("adaptive discovery");
+        let parsed = read_http_service_discovery_response_with_limits(
+            ObjectFormat::Sha1,
+            &mut encoded.as_slice(),
+            TransportLimits::default(),
+        )
+        .expect("adaptive discovery");
         let ServiceDiscoveryPayload::AdvertisedRefs(set) = parsed.payload else {
             panic!("expected advertised refs");
         };

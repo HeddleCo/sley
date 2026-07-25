@@ -47,7 +47,7 @@ use sley_protocol::{
     read_receive_pack_report_status, read_receive_pack_report_status_v2,
 };
 
-use sley_protocol::{MAX_REF_ADVERTISEMENT_BYTES, read_to_end_bounded};
+use sley_protocol::read_to_end_bounded;
 
 use crate::pack::push_pack_roots;
 #[cfg(feature = "http")]
@@ -990,8 +990,7 @@ fn execute_push_http(
         // legitimate one needs.
         read_to_end_bounded(
             &mut response.body,
-            MAX_REF_ADVERTISEMENT_BYTES,
-            "receive-pack response",
+            crate::http::transport_limits_from_config(Some(request.config)).receive_pack_response(),
         )?;
         None
     };
