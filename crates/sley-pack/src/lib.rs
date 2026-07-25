@@ -3877,6 +3877,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn configured_delta_chain_depth_limit_allows_deeper_pack() {
+        let limits = PackReadLimits {
+            max_delta_depth: 60,
+            ..PackReadLimits::default()
+        };
+        let pack = ofs_delta_chain_pack(ObjectFormat::Sha1, 60);
+
+        let parsed = PackFile::parse_with_limits(&pack, ObjectFormat::Sha1, limits)
+            .expect("a chain at the configured ceiling must resolve");
+        assert_eq!(parsed.entries.len(), 61);
+
+        let indexed = PackIndex::write_v2_for_pack_with_limits(&pack, ObjectFormat::Sha1, limits)
+            .expect("the in-memory indexer must use the configured ceiling");
+        assert_eq!(indexed.entries.len(), 61);
+
+        let streamed = PackIndex::write_v2_for_pack_reader_to_trailer_with_limits(
+            &mut Cursor::new(pack),
+            ObjectFormat::Sha1,
+            limits,
+        )
+        .expect("the streaming indexer must use the configured ceiling");
+        assert_eq!(streamed.entries.len(), 61);
+    }
+
+    #[test]
+    fn configured_delta_chain_depth_limit_remains_finite_and_actionable() {
+        let limits = PackReadLimits {
+            max_delta_depth: 60,
+            ..PackReadLimits::default()
+        };
+        let pack = ofs_delta_chain_pack(ObjectFormat::Sha1, 61);
+
+        let error = PackFile::parse_with_limits(&pack, ObjectFormat::Sha1, limits)
+            .expect_err("a chain past the configured ceiling must be rejected");
+        let message = format!("{error}");
+
+        assert!(
+            message.contains("observed depth 61"),
+            "expected the observed depth in the error, got: {error}"
+        );
+        assert!(
+            message.contains("configured limit 60"),
+            "expected the configured limit in the error, got: {error}"
+        );
+        assert!(
+            message.contains("PackReadLimits::max_delta_depth")
+                && message.contains("git repack --depth="),
+            "expected actionable remedies in the error, got: {error}"
+        );
+    }
+
     /// Regression (sley#5): the read path enforced no chain-depth limit at all.
     /// `DEFAULT_PACK_DEPTH` existed but was consulted only when *writing*.
     #[test]
