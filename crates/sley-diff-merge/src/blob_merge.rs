@@ -198,7 +198,7 @@ fn merge_blobs_internal(
         stable
     };
 
-    let mut writer = MergeWriter::new(options, ours);
+    let mut writer = MergeWriter::new(options, ours, base);
     // Cursors: next unconsumed line in base, ours, theirs.
     let mut base_idx = 0usize;
     let mut our_idx = 0usize;
@@ -525,17 +525,23 @@ struct MergeWriter<'a> {
     out: Vec<u8>,
     conflicted: bool,
     conflicts: usize,
+    /// Whether the *current* conflict markers should end in CRLF. Computed per
+    /// conflict via git's `is_cr_needed` (both post-images + ancestor agree).
     crlf: bool,
+    /// Ancestor bytes (for the first-line CRLF probe in `is_cr_needed`).
+    base_blob: &'a [u8],
     options: &'a MergeBlobOptions<'a>,
 }
 
 impl<'a> MergeWriter<'a> {
-    fn new(options: &'a MergeBlobOptions<'a>, ours: &[u8]) -> Self {
+    fn new(options: &'a MergeBlobOptions<'a>, _ours: &[u8], base: &'a [u8]) -> Self {
         Self {
             out: Vec::new(),
             conflicted: false,
             conflicts: 0,
-            crlf: ours.windows(2).any(|window| window == b"\r\n"),
+            // Default LF; set per conflict in `emit_conflict`.
+            crlf: false,
+            base_blob: base,
             options,
         }
     }
@@ -593,6 +599,12 @@ impl<'a> MergeWriter<'a> {
         }
         let ours_inner = &ours[prefix..ours.len() - suffix];
         let theirs_inner = &theirs[prefix..theirs.len() - suffix];
+
+        // git's `is_cr_needed`: markers use CRLF only when both post-images and
+        // the ancestor agree the surrounding lines end in CR/LF. Mixed endings
+        // (e.g. CR-at-eol on ours only under `--ignore-space-at-eol`) fall back
+        // to LF-only markers, matching xdiff/xmerge.c.
+        self.crlf = conflict_markers_need_cr(ours, theirs, self.base_blob);
 
         self.conflicted = true;
         self.conflicts += 1;
@@ -697,6 +709,58 @@ impl<'a> MergeWriter<'a> {
             conflicted: self.conflicted,
         };
         (result, self.conflicts)
+    }
+}
+
+/// git's `is_cr_needed` / `is_eol_crlf`: true only when both post-image sides
+/// and the ancestor's first line end in CR/LF. Returns false (LF markers) when
+/// any side is LF-only or the style is indeterminate.
+fn conflict_markers_need_cr(
+    ours: &[DiffLine<'_>],
+    theirs: &[DiffLine<'_>],
+    base_blob: &[u8],
+) -> bool {
+    fn line_is_crlf(line: &DiffLine<'_>) -> Option<bool> {
+        let bytes = line.content;
+        if bytes.is_empty() {
+            return None;
+        }
+        if bytes.last() == Some(&b'\n') {
+            return Some(bytes.len() > 1 && bytes[bytes.len() - 2] == b'\r');
+        }
+        // No-newline final line: indeterminate from this line alone.
+        None
+    }
+    fn side_is_crlf(side: &[DiffLine<'_>]) -> Option<bool> {
+        // Prefer the first line of the conflict region (git probes the
+        // preceding line when available; for a refined single-line conflict
+        // that is the conflict line itself).
+        side.first().and_then(line_is_crlf)
+    }
+    fn ancestor_first_is_crlf(base_blob: &[u8]) -> Option<bool> {
+        if base_blob.is_empty() {
+            return None;
+        }
+        let end = base_blob
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(base_blob.len());
+        let line = &base_blob[..end];
+        if line.last() == Some(&b'\n') {
+            Some(line.len() > 1 && line[line.len() - 2] == b'\r')
+        } else {
+            None
+        }
+    }
+    match (
+        side_is_crlf(ours),
+        side_is_crlf(theirs),
+        ancestor_first_is_crlf(base_blob),
+    ) {
+        (Some(true), Some(true), Some(true)) => true,
+        (Some(true), Some(true), None) => true,
+        _ => false,
     }
 }
 

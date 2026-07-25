@@ -190,7 +190,15 @@ pub(super) struct LogDiffContext<'a> {
     pub(super) show_root: bool,
     pub(super) detect_renames: bool,
     pub(super) detect_copies: bool,
+    /// `--find-copies-harder` / implied by `--follow` (git always sets
+    /// `find_copies_harder` in `try_to_follow_renames`).
+    pub(super) find_copies_harder: bool,
     pub(super) pathspec: Option<DiffPathspec>,
+    /// When `--follow` rewound the path across renames/copies, map each
+    /// selected commit oid to the pathspec that was active for that commit.
+    /// Entries are filtered against this path (and its rename/copy source)
+    /// instead of the original CLI pathspec.
+    pub(super) follow_paths: Option<&'a HashMap<ObjectId, Vec<u8>>>,
     pub(super) patch_abbrev: usize,
     pub(super) raw_abbrev: Option<usize>,
     pub(super) pickaxe: Option<&'a CompiledPickaxe>,
@@ -201,6 +209,34 @@ pub(super) struct LogDiffContext<'a> {
 }
 
 impl LogDiffContext<'_> {
+    /// Filter name-status entries by the active pathspec. Under `--follow`, use
+    /// the per-commit followed path (after rename/copy rewinds) so older commits
+    /// that only touch the pre-rename path still render.
+    fn filter_diff_entries(
+        &self,
+        entries: Vec<sley_diff_merge::NameStatusEntry>,
+        oid: &ObjectId,
+    ) -> Vec<sley_diff_merge::NameStatusEntry> {
+        if let Some(follow_paths) = self.follow_paths
+            && let Some(path) = follow_paths.get(oid)
+        {
+            return entries
+                .into_iter()
+                .filter(|entry| {
+                    entry.path.as_bytes() == path.as_slice()
+                        || entry
+                            .old_path
+                            .as_ref()
+                            .is_some_and(|old| old.as_bytes() == path.as_slice())
+                })
+                .collect();
+        }
+        match &self.pathspec {
+            Some(pathspec) => apply_diff_pathspec(entries, pathspec),
+            None => entries,
+        }
+    }
+
     /// Render the diff block for one commit (against its first parent, or the
     /// empty tree for roots when log.showRoot allows). Returns an empty buffer
     /// when nothing is to be shown; otherwise the buffer holds the block's
@@ -283,14 +319,14 @@ impl LogDiffContext<'_> {
         let base = sley_diff_merge::DiffNameStatusOptions {
             detect_renames: self.detect_renames,
             detect_copies: self.detect_copies,
-            find_copies_harder: false,
+            find_copies_harder: self.find_copies_harder,
             rename_empty: true,
             ..Default::default()
         };
         let rename_options = sley_diff_merge::DiffNameStatusOptions {
             detect_renames: self.detect_renames,
             detect_copies: self.detect_copies,
-            find_copies_harder: false,
+            find_copies_harder: self.find_copies_harder,
             rename_empty: true,
             detect_inexact: true,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
@@ -321,10 +357,7 @@ impl LogDiffContext<'_> {
                 base,
             )?,
         };
-        let entries = match &self.pathspec {
-            Some(pathspec) => apply_diff_pathspec(entries, pathspec),
-            None => entries,
-        };
+        let entries = self.filter_diff_entries(entries, &record.oid);
         let entries = if let Some(pickaxe) = self.pickaxe
             && !self.pickaxe_all
         {
@@ -537,14 +570,14 @@ impl LogDiffContext<'_> {
         let base = sley_diff_merge::DiffNameStatusOptions {
             detect_renames: self.detect_renames,
             detect_copies: self.detect_copies,
-            find_copies_harder: false,
+            find_copies_harder: self.find_copies_harder,
             rename_empty: true,
             ..Default::default()
         };
         let rename_options = sley_diff_merge::DiffNameStatusOptions {
             detect_renames: self.detect_renames,
             detect_copies: self.detect_copies,
-            find_copies_harder: false,
+            find_copies_harder: self.find_copies_harder,
             rename_empty: true,
             detect_inexact: true,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
@@ -569,10 +602,7 @@ impl LogDiffContext<'_> {
                 base,
             )?
         };
-        let entries = match &self.pathspec {
-            Some(pathspec) => apply_diff_pathspec(entries, pathspec),
-            None => entries,
-        };
+        let entries = self.filter_diff_entries(entries, &record.oid);
         if entries.is_empty() {
             return Ok(());
         }

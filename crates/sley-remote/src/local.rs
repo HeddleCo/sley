@@ -557,38 +557,52 @@ pub(crate) fn apply_receive_pack_ref_transaction(
     // receive.denyCurrentBranch=updateInstead: update the checked-out worktree
     // before rewriting the branch tip (git update_worktree before ref update).
     maybe_update_worktrees_for_update_instead(remote_git_dir, format, store, &updates)?;
-    let mut tx = store.transaction();
-    for command in &deletes {
-        tx.delete_with_precondition(
-            command.name.clone(),
-            RefDeletePrecondition::Direct((!command.old_id.is_null()).then_some(command.old_id)),
-            None,
-        );
+    // Git's non-atomic receive-pack applies deletes and other updates in two
+    // separate transactions (PHASE_DELETIONS then PHASE_OTHERS). A single
+    // transaction would treat F/D pairs like delete `branch/conflict` + create
+    // `branch` as name conflicts (refs_verify_refnames_available with skip=NULL;
+    // t1404). The two-phase split is what makes t5516's simultaneous F/D push
+    // succeed.
+    if !deletes.is_empty() {
+        let mut delete_tx = store.transaction();
+        for command in &deletes {
+            delete_tx.delete_with_precondition(
+                command.name.clone(),
+                RefDeletePrecondition::Direct(
+                    (!command.old_id.is_null()).then_some(command.old_id),
+                ),
+                None,
+            );
+        }
+        delete_tx.commit()?;
     }
-    let log_updates = receive_pack_log_all_ref_updates(remote_git_dir);
-    for command in &updates {
-        let precondition = if command.old_id.is_null() {
-            RefPrecondition::MustNotExist
-        } else {
-            RefPrecondition::MustExistAndMatch(RefTarget::Direct(command.old_id))
-        };
-        let reflog = if log_updates && receive_pack_should_write_reflog(&command.name) {
-            Some(receive_pack_reflog_entry(
-                format,
-                command.old_id,
-                command.new_id,
-            ))
-        } else {
-            None
-        };
-        tx.update_to(
-            command.name.clone(),
-            RefTarget::Direct(command.new_id),
-            precondition,
-            reflog,
-        );
+    if !updates.is_empty() {
+        let log_updates = receive_pack_log_all_ref_updates(remote_git_dir);
+        let mut update_tx = store.transaction();
+        for command in &updates {
+            let precondition = if command.old_id.is_null() {
+                RefPrecondition::MustNotExist
+            } else {
+                RefPrecondition::MustExistAndMatch(RefTarget::Direct(command.old_id))
+            };
+            let reflog = if log_updates && receive_pack_should_write_reflog(&command.name) {
+                Some(receive_pack_reflog_entry(
+                    format,
+                    command.old_id,
+                    command.new_id,
+                ))
+            } else {
+                None
+            };
+            update_tx.update_to(
+                command.name.clone(),
+                RefTarget::Direct(command.new_id),
+                precondition,
+                reflog,
+            );
+        }
+        update_tx.commit()?;
     }
-    tx.commit()?;
     Ok(deletes
         .into_iter()
         .map(|command| command.name.clone())

@@ -47,6 +47,10 @@ enum ShowCommitFormat {
     Fuller,
     /// `--pretty=raw`: the raw commit object headers + raw message.
     Raw,
+    /// `--pretty=email` / `mboxrd`: mbox-style From/From:/Date:/Subject: + body.
+    /// `mboxrd` additionally quotes leading `From ` lines in the body; for the
+    /// expand-tabs surface both share the same layout and indent defaults.
+    Email { mboxrd: bool },
     /// `--oneline`: `<abbrev-oid> <subject>`.
     Oneline,
     /// `--pretty=oneline`/`--format=oneline`: `<full-oid> <subject>`.
@@ -201,6 +205,7 @@ fn show_default_expand_tabs(format: &ShowCommitFormat) -> i32 {
         ShowCommitFormat::Medium | ShowCommitFormat::Full | ShowCommitFormat::Fuller => 8,
         ShowCommitFormat::Short
         | ShowCommitFormat::Raw
+        | ShowCommitFormat::Email { .. }
         | ShowCommitFormat::Oneline
         | ShowCommitFormat::FullOneline
         | ShowCommitFormat::Custom { .. } => 0,
@@ -284,7 +289,10 @@ fn show_commit_format_needs_mailmap(format: &ShowCommitFormat, use_mailmap: bool
         | ShowCommitFormat::Fuller => use_mailmap,
         ShowCommitFormat::Custom { compiled, .. } => show_compiled_format_uses_mailmap(compiled),
         // `--pretty=raw` shows the raw, un-mailmapped identity lines.
-        ShowCommitFormat::Raw | ShowCommitFormat::Oneline | ShowCommitFormat::FullOneline => false,
+        ShowCommitFormat::Raw
+        | ShowCommitFormat::Email { .. }
+        | ShowCommitFormat::Oneline
+        | ShowCommitFormat::FullOneline => false,
     }
 }
 
@@ -903,6 +911,46 @@ fn show_commit(
                     oid,
                 )?;
                 stdout.write_all(&notes)?;
+            }
+        }
+        ShowCommitFormat::Email { mboxrd } => {
+            // git's CMIT_FMT_EMAIL: mbox From line, From:/Date:/Subject: headers,
+            // blank line, then unindented body (pp_remainder with indent=0).
+            // Expand-tabs applies to both subject and body lines.
+            writeln!(
+                stdout,
+                "From {oid} Mon Sep 17 00:00:00 2001"
+            )?;
+            writeln!(
+                stdout,
+                "From: {}",
+                commit_identity_mailmapped(&commit.author, mailmap)
+            )?;
+            writeln!(
+                stdout,
+                "Date: {}",
+                commit_identity_date(&commit.author, &DateMode::Rfc2822)
+            )?;
+            let display_message = commit_message_for_commit_encoding(commit, &output_encoding);
+            let subject = commit_subject_bytes(&display_message);
+            let subject = crate::commands::log::log_expand_tabs(&subject, expand_tabs);
+            write!(stdout, "Subject: [PATCH] ")?;
+            stdout.write_all(&subject)?;
+            stdout.write_all(b"\n")?;
+            writeln!(stdout)?;
+            // Body = message after the subject paragraph (skip subject + blank).
+            let body = commit_body(&display_message);
+            for line in commit_message_lines(body) {
+                let mut line_out = crate::commands::log::log_expand_tabs(line, expand_tabs);
+                if *mboxrd && line_out.starts_with(b"From ") {
+                    // mboxrd: quote leading "From " as ">From ".
+                    let mut quoted = Vec::with_capacity(line_out.len() + 1);
+                    quoted.push(b'>');
+                    quoted.extend_from_slice(&line_out);
+                    line_out = quoted;
+                }
+                stdout.write_all(&line_out)?;
+                stdout.write_all(b"\n")?;
             }
         }
         ShowCommitFormat::Oneline => {
@@ -2390,11 +2438,8 @@ fn parse_pretty_value(value: &str) -> Result<ShowCommitFormat> {
             compiled: CompiledLogFormat::compile("%h (%s, %as)", LogFormatDialect::Log)?,
             final_newline: true,
         }),
-        // Built-in named layouts sley does not yet render. Reject explicitly
-        // rather than mis-formatting them as literal text.
-        "email" | "mboxrd" => Err(GitError::Unsupported(format!(
-            "show does not support --pretty={value}"
-        ))),
+        "email" => Ok(ShowCommitFormat::Email { mboxrd: false }),
+        "mboxrd" => Ok(ShowCommitFormat::Email { mboxrd: true }),
         other if other.contains('%') => Ok(ShowCommitFormat::Custom {
             compiled: CompiledLogFormat::compile(other, LogFormatDialect::Log)?,
             final_newline: true,

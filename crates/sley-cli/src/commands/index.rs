@@ -1100,8 +1100,9 @@ pub(crate) fn cmd_ls_files(
     }
     if selected && !output_stage {
         if (cached || deleted || modified)
-            && let Some(index) = sley_worktree::read_repository_index(&git_dir, format)?
+            && let Some(mut index) = sley_worktree::read_repository_index(&git_dir, format)?
         {
+            ls_files_clear_skip_worktree_from_present(&mut index, &worktree_root, &git_dir)?;
             let index = ls_files_display_index(
                 repo.object_database(),
                 format,
@@ -1163,11 +1164,14 @@ pub(crate) fn cmd_ls_files(
         }
         return Ok(());
     }
-    if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
+    if let Some(mut index) = sley_worktree::read_repository_index(&git_dir, format)? {
         // Sparse-directory entries are always stage zero. `ls-files -u` can
         // therefore inspect the serialized index directly: expanding it adds
         // no possible unmerged result and would incorrectly advertise an
         // `ensure_full_index` transition to interactive patch callers.
+        if !unmerged {
+            ls_files_clear_skip_worktree_from_present(&mut index, &worktree_root, &git_dir)?;
+        }
         let index = if unmerged {
             index
         } else {
@@ -1991,6 +1995,46 @@ struct LsFilesWriteOptions<'a> {
 
 fn ls_files_tag(entry: &sley_index::IndexEntry) -> char {
     if entry.is_skip_worktree() { 'S' } else { 'H' }
+}
+
+/// git's `clear_skip_worktree_from_present_files` (called from `repo_read_index`):
+/// under an active sparse checkout, a SKIP_WORKTREE entry whose worktree path
+/// exists loses the bit for display/command purposes. When
+/// `sparse.expectFilesOutsideOfPatterns` is true the clearing is suppressed so
+/// intentionally present out-of-cone files keep their `S` tag (t1090).
+fn ls_files_clear_skip_worktree_from_present(
+    index: &mut sley_index::Index,
+    worktree_root: &Path,
+    git_dir: &Path,
+) -> Result<()> {
+    let worktree_config = GitConfig::read(git_dir.join("config.worktree")).unwrap_or_default();
+    let repo_config = read_repo_config(git_dir).unwrap_or_default();
+    let sparse_enabled = worktree_config
+        .get_bool("core", None, "sparseCheckout")
+        .or_else(|| repo_config.get_bool("core", None, "sparseCheckout"))
+        .unwrap_or(false);
+    if !sparse_enabled {
+        return Ok(());
+    }
+    let expect_outside = worktree_config
+        .get_bool("sparse", None, "expectFilesOutsideOfPatterns")
+        .or_else(|| repo_config.get_bool("sparse", None, "expectFilesOutsideOfPatterns"))
+        .unwrap_or(false);
+    if expect_outside {
+        return Ok(());
+    }
+    for entry in &mut index.entries {
+        if !entry.is_skip_worktree() {
+            continue;
+        }
+        let Ok(rel) = std::str::from_utf8(entry.path.as_bytes()) else {
+            continue;
+        };
+        if worktree_root.join(rel).symlink_metadata().is_ok() {
+            entry.set_skip_worktree(false);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn cmd_ls_tree(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {

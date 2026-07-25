@@ -1122,26 +1122,49 @@ fn check_apply_path_safety(
 
     // path_is_beyond_symlink: a symlink created (or already present) must not be
     // an ancestor directory of any other affected file (e.g. `tmp -> ..` then
-    // `tmp/foo`).
+    // `tmp/foo`). Pure renames/copies of existing symlinks often omit mode
+    // headers (t4115), so also treat a rename/copy whose source is a worktree
+    // or index symlink as creating a symlink at the new path.
     let created_symlinks: Vec<&[u8]> = patches
         .iter()
-        .filter(|p| !p.is_delete && p.new_mode == Some(0o120000))
+        .filter(|p| !p.is_delete)
+        .filter(|p| {
+            p.new_mode == Some(0o120000)
+                || ((p.is_rename || p.is_copy)
+                    && (p.old_mode == Some(0o120000)
+                        || p.old_path.as_deref().is_some_and(|old| {
+                            worktree_component_is_symlink(worktree_root, old)
+                                || index_component_is_symlink(index, old)
+                        })))
+        })
         .filter_map(|p| p.new_path.as_deref())
         .collect();
     // A symlink removed by the patch is no longer an obstacle: git applies the
     // patches in order, so a `symlink → directory` typechange (delete the
-    // symlink, create files beneath the new directory) is allowed.
+    // symlink, create files beneath the new directory) is allowed. Renames that
+    // move a symlink away also clear the old path.
     let deleted_symlinks: Vec<&[u8]> = patches
         .iter()
-        .filter(|p| p.is_delete)
+        .filter(|p| p.is_delete || p.is_rename)
         .filter_map(|p| p.old_path.as_deref())
-        .filter(|path| worktree_component_is_symlink(worktree_root, path))
+        .filter(|path| {
+            worktree_component_is_symlink(worktree_root, path)
+                || index_component_is_symlink(index, path)
+        })
         .collect();
     for patch in patches {
-        if patch.is_delete {
-            continue;
-        }
-        let Some(name) = patch.new_path.as_deref().or(patch.old_path.as_deref()) else {
+        // git's `check_patch` only deposits results for non-deletes into
+        // `path_is_beyond_symlink`; deletes are blocked later when loading the
+        // preimage (or via an existing worktree/index symlink). In-patch
+        // symlink *creates* (including pure renames of existing symlinks) only
+        // gate *new* files: modify/delete under a rename-created symlink fails
+        // with "No such file or directory" instead (t4115 #6/#7).
+        let name = if patch.is_delete {
+            patch.old_path.as_deref()
+        } else {
+            patch.new_path.as_deref().or(patch.old_path.as_deref())
+        };
+        let Some(name) = name else {
             continue;
         };
         for (i, &b) in name.iter().enumerate() {
@@ -1152,10 +1175,10 @@ fn check_apply_path_safety(
             if deleted_symlinks.iter().any(|s| *s == ancestor) {
                 continue;
             }
-            if created_symlinks.iter().any(|s| *s == ancestor)
-                || worktree_component_is_symlink(worktree_root, ancestor)
-                || index_component_is_symlink(index, ancestor)
-            {
+            let created_blocks = patch.is_new && created_symlinks.iter().any(|s| *s == ancestor);
+            let existing_blocks = worktree_component_is_symlink(worktree_root, ancestor)
+                || index_component_is_symlink(index, ancestor);
+            if created_blocks || existing_blocks {
                 eprintln!(
                     "error: affected file '{}' is beyond a symbolic link",
                     String::from_utf8_lossy(name)
@@ -1723,7 +1746,14 @@ fn apply_write_mode(
     if !trust_filemode && let Some(mode) = patch.old_mode {
         return Ok(mode);
     }
-    let path = std::str::from_utf8(target)
+    // Rename/copy targets do not exist yet; inherit the source path's mode so
+    // an executable `foo` renamed to `bar` keeps the +x bit (t4102 validate).
+    let mode_source = if patch.is_rename || patch.is_copy {
+        patch.old_path.as_deref().unwrap_or(target)
+    } else {
+        target
+    };
+    let path = std::str::from_utf8(mode_source)
         .map_err(|err| GitError::InvalidPath(err.to_string()))
         .map(|relative| worktree_root.join(relative))?;
     match fs::symlink_metadata(path) {
@@ -1742,9 +1772,19 @@ fn apply_index_mode_and_warn(
     index_modes: &HashMap<Vec<u8>, u32>,
 ) -> u32 {
     let existing = index_modes.get(target).copied();
+    // For rename/copy without an explicit new mode, the source index entry
+    // carries the filemode that must be preserved (t4102).
+    let source_index_mode = if patch.is_rename || patch.is_copy {
+        patch
+            .old_path
+            .as_deref()
+            .and_then(|old| index_modes.get(old).copied())
+    } else {
+        None
+    };
     if !patch.is_new
         && let Some(old_mode) = patch.old_mode
-        && let Some(actual) = existing
+        && let Some(actual) = existing.or(source_index_mode)
         && canon_mode(actual) != canon_mode(old_mode)
     {
         eprintln!(
@@ -1755,10 +1795,11 @@ fn apply_index_mode_and_warn(
         );
     }
     // An explicit new mode (new file / mode change) wins; otherwise preserve the
-    // existing index entry's mode, falling back to the materialised worktree mode.
+    // existing index entry's mode (or the rename source), falling back to the
+    // materialised worktree mode.
     if let Some(new_mode) = patch.new_mode {
         canon_mode(new_mode)
-    } else if let Some(actual) = existing {
+    } else if let Some(actual) = existing.or(source_index_mode) {
         actual
     } else {
         canon_mode(worktree_mode)

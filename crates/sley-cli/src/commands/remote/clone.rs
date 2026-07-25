@@ -2390,7 +2390,7 @@ fn clone_bare_network_repository(
     if options.tag_opt != Some("--no-tags") {
         refspecs.push("+refs/tags/*:refs/tags/*".to_string());
     }
-    run_fetch(
+    let outcome = run_fetch(
         options.context.cwd(),
         &git_dir,
         format,
@@ -2434,8 +2434,11 @@ fn clone_bare_network_repository(
             negotiate_only: false,
         },
         &[],
-    )
-    .map(|_| ())
+    )?;
+    if let Some(reason) = outcome.rejection.as_ref() {
+        return Err(GitError::Command(reason.clone()));
+    }
+    Ok(())
 }
 
 /// Map a [`sley_remote::clone`] result that failed because the requested branch
@@ -3740,6 +3743,11 @@ fn remove_clone_worktree_files(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<()> {
+    // `--no-checkout` clones leave an unborn index: git removes any hydrated
+    // worktree paths and deletes `.git/index` entirely (t1091 "unborn index").
+    // Writing an empty index would make `sparse-checkout`/`switch` see a born
+    // repository and break the unborn-index interaction.
+    let index_path = sley_worktree::repository_index_path(git_dir);
     let index = sley_worktree::read_repository_index(git_dir, format)?.unwrap_or(Index {
         version: 2,
         entries: Vec::new(),
@@ -3753,16 +3761,12 @@ fn remove_clone_worktree_files(
             prune_empty_clone_dirs(worktree_root, path.parent())?;
         }
     }
-    fs::write(
-        sley_worktree::repository_index_path(git_dir),
-        Index {
-            version: 2,
-            entries: Vec::new(),
-            extensions: Vec::new(),
-            checksum: None,
-        }
-        .write(format)?,
-    )?;
+    match fs::remove_file(&index_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    let _ = format;
     Ok(())
 }
 

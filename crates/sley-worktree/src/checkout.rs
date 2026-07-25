@@ -1195,9 +1195,14 @@ fn write_delayed_checkout_output(
     remove_existing_worktree_path(&file_path)?;
     fs::write(&file_path, body)?;
     set_worktree_file_mode(&file_path, entry.mode)?;
-    let metadata = fs::metadata(&file_path)?;
+    // Prefer symlink_metadata so a replaced symlink is not followed, and force
+    // the cached size from the body we just wrote. On some filesystems a
+    // same-second delayed smudge can leave the index size as 0 after the
+    // racy-clean smudge pass (t2082 delayed checkout → verify_checkout dirty).
+    let metadata = fs::symlink_metadata(&file_path)?;
     let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
     index_entry.mode = entry.mode;
+    index_entry.size = (body.len() as u64).min(u32::MAX as u64) as u32;
     Ok(Some(index_entry))
 }
 
@@ -2549,6 +2554,25 @@ pub(crate) fn restore_index_and_worktree_paths_from_entries(
     let mut replacement_leaf_paths = BTreeSet::new();
     for path in matched_paths {
         if let Some(entry) = source_entries.get(&path) {
+            // git's `update_some` leaves the existing index entry when oid+mode
+            // already match, and `checkout_entry` then returns early when
+            // `ie_match_stat` says the worktree is already up to date — so an
+            // artificial mtime on an unmodified path is preserved (t2022).
+            let existing = index.entries.iter().find(|index_entry| {
+                index_entry.path.as_bytes() == path.as_slice()
+                    && index_entry.stage() == Stage::Normal
+            });
+            if let Some(existing) = existing
+                && existing.oid == entry.oid
+                && existing.mode == entry.mode
+                && !existing.is_intent_to_add()
+                && let Ok(file_path) = worktree_path(worktree_root, &path)
+                && let Ok(metadata) = fs::symlink_metadata(&file_path)
+                && worktree_entry_is_uptodate(existing, &metadata)
+            {
+                restored.insert(path);
+                continue;
+            }
             replacement_entries.push(materialize_path_restore_entry_filtered(
                 db,
                 format,

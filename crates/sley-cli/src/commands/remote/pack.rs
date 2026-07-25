@@ -1479,6 +1479,27 @@ pub(super) fn configured_protocol_version(config: Option<&GitConfig>) -> Option<
     }
 }
 
+/// Whether the client should speak protocol v2 for file/local transports.
+///
+/// Mirrors git `get_protocol_version_config`: explicit `protocol.version` wins;
+/// otherwise `GIT_TEST_PROTOCOL_VERSION` can force a version; unset defaults to
+/// v2 (protocol.c).
+pub(super) fn client_requests_protocol_v2(config: Option<&GitConfig>) -> bool {
+    match configured_protocol_version(config) {
+        Some(ProtocolVersion::V2) => true,
+        Some(ProtocolVersion::V0 | ProtocolVersion::V1) => false,
+        None => match std::env::var("GIT_TEST_PROTOCOL_VERSION")
+            .ok()
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            Some("0") | Some("1") => false,
+            Some("2") | None => true,
+            Some(_) => true,
+        },
+    }
+}
+
 pub(super) fn configured_legacy_protocol(config: Option<&GitConfig>) -> bool {
     matches!(
         configured_protocol_version(config),
@@ -2270,12 +2291,50 @@ fn run_push(
     }
     // `--dry-run`: report what would happen, but neither send the pack/refs nor
     // run receive-side hooks nor update local tracking refs (git's TRANSPORT_PUSH_DRY_RUN).
+    // Use the same porcelain status path as a real push so HTTP dry-run matches
+    // the local transport (t5548 #22-#25).
     if options.dry_run {
-        if !options.quiet {
-            eprintln!("To {}", push_display_remote(resolved_remote));
-            for command in &plan.commands {
-                eprintln!("   {}  {}", command.new_id, command.name);
+        let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+        let mut refs: Vec<sley_remote::PushReportRef> = plan
+            .commands
+            .iter()
+            .map(|command| sley_remote::PushReportRef {
+                src: push_source_name_for_command(git_dir, format, refspecs, command),
+                dst: command.name.clone(),
+                old_id: command.old_id,
+                new_id: command.new_id,
+                forced: push_command_was_forced(
+                    common_git_dir,
+                    &local_db,
+                    format,
+                    refspecs,
+                    command,
+                    options.force,
+                ),
+                status: sley_remote::PushRefStatus::Ok,
+                reports: Vec::new(),
+            })
+            .collect();
+        refs.extend(plan.preflight_rejections.iter().map(|(command, status)| {
+            sley_remote::PushReportRef {
+                src: push_source_name_for_command(git_dir, format, refspecs, command),
+                dst: command.name.clone(),
+                old_id: command.old_id,
+                new_id: command.new_id,
+                forced: false,
+                status: status.clone(),
+                reports: Vec::new(),
             }
+        }));
+        let report = sley_remote::PushStatusReport { refs };
+        let url = sley_remote::push_url_for_display(resolved_remote);
+        let had_errors = report.had_errors();
+        if !options.quiet || had_errors {
+            render_push_status(&report, &url, porcelain, true, &local_db, &local_db)?;
+        }
+        if had_errors {
+            eprintln!("error: failed to push some refs to '{url}'");
+            return Err(GitError::Exit(1));
         }
         return Ok(());
     }

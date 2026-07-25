@@ -85,7 +85,20 @@ pub fn resolve_local_remote_git_dir(
     {
         return Ok(git_dir);
     }
-    resolve_configured_local_remote_git_dir(config, repository, local_git_dir, context.cwd)
+    // Only claim a configured remote when one actually exists. A bare path that
+    // is not a git repo (t5510 #55 `git fetch "a\!'b"`) must not surface as
+    // "remote <name> url" not-found — git reports the path-shaped fatal instead.
+    if remote_exists(config, repository)
+        && !remote_config_values(config, repository, "url").is_empty()
+    {
+        return resolve_configured_local_remote_git_dir(
+            config,
+            repository,
+            local_git_dir,
+            context.cwd,
+        );
+    }
+    Err(GitError::repository_not_found(repository.to_string()))
 }
 
 /// Resolve the fetch URL for `remote` using `config` (name lookup + `insteadOf`).
