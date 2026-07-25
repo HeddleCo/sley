@@ -971,25 +971,25 @@ fn diff_files_entry_is_racy_clean_equivalent(
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Ok(false);
     }
-    // `git diff-files` reports stat-dirty entries even when content is
-    // byte-identical (e.g. `reset --mixed --no-refresh` restores a zeroed cached
-    // stat). Only suppress entries that are racily clean *and* content-identical
-    // — the stat shortcut rescue for same-second edits, not invalid stats.
+    // `git diff-files` selects via `ie_match_stat`, not `ie_modified`:
     //
-    // Exception: a smudged cache entry (size == 0) is git's signal that the
-    // cached size is untrustworthy (racy clean at write time). ie_modified then
-    // falls through to ce_modified_check_fs / content comparison with filters.
-    // Mirror that so a size-0 entry whose cleaned worktree content matches the
-    // index oid is treated as clean (common after filtered checkout).
+    // * Stat-dirty (including fully zeroed stats from `read-tree` / `reset
+    //   --no-refresh`, and racy-smudged `size == 0` entries) is reported `M`
+    //   even when content is byte-identical. `ie_modified` (used by
+    //   `update-index --refresh`) is the routine that re-hashes size-0 entries
+    //   and "rescues" them; `diff-files` must not.
+    // * Only the racily-clean branch of `ie_match_stat` re-hashes content, and
+    //   only then suppresses the pair when the bytes still match.
     let index_mtime = fs::metadata(sley_worktree::repository_index_path(git_dir))
         .ok()
         .and_then(|metadata| sley_index::file_mtime_parts(&metadata));
     let stat_cache = sley_index::IndexStatCache::from_index_mtime(index, index_mtime);
     match stat_cache.index_entry_worktree_stat_verdict(index_entry, &metadata) {
-        sley_index::StatVerdict::Dirty if index_entry.size != 0 => return Ok(false),
-        sley_index::StatVerdict::Dirty
-        | sley_index::StatVerdict::Clean
-        | sley_index::StatVerdict::RacyNeedsContentCheck => {}
+        // Dirty (any size, including 0) and Clean: keep the entry. Clean here
+        // means the content engine already found a real difference despite a
+        // matching stat (should not happen without a racy miss); never drop it.
+        sley_index::StatVerdict::Dirty | sley_index::StatVerdict::Clean => return Ok(false),
+        sley_index::StatVerdict::RacyNeedsContentCheck => {}
     }
     let body = fs::read(&absolute)?;
     let clean = sley_worktree::apply_clean_filter(worktree_root, git_dir, config, path, &body)?;

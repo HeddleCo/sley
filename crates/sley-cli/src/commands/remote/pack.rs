@@ -2821,16 +2821,94 @@ fn custom_receive_pack_command_exits_successfully(
     command: &str,
     remote_git_dir: &Path,
 ) -> Result<bool> {
+    // Probe the custom receive-pack the same way a local transport would spawn
+    // it: shell-out with the repo path, exec-path helpers on PATH, and no
+    // GIT_PROTOCOL (push is still v0; t5702 #57 greps the dumped env).
+    // Feed a lone flush so receive-pack exits cleanly after advertising refs.
+    Ok(run_custom_local_pack_command(
+        command,
+        remote_git_dir,
+        None,
+        b"0000",
+    )?
+    .success())
+}
+
+/// Spawn a custom local `upload-pack` / `receive-pack` / `upload-archive` command
+/// with the environment git's connect layer would set for a file transport.
+///
+/// `git_protocol` is `Some("version=2")` for protocol-v2 upload-pack, and `None`
+/// for receive-pack / upload-archive (which must not advertise GIT_PROTOCOL).
+fn run_custom_local_pack_command(
+    command: &str,
+    remote_git_dir: &Path,
+    git_protocol: Option<&str>,
+    stdin_bytes: &[u8],
+) -> Result<std::process::ExitStatus> {
     let repo = remote_git_dir.to_string_lossy();
-    let command = format!("{command} {}", sley_config::sq_quote(&repo));
-    let status = Proc::new("/bin/sh")
-        .arg("-c")
-        .arg(command)
-        .stdin(std::process::Stdio::null())
+    let shell = format!("{command} {}", sley_config::sq_quote(&repo));
+    let mut proc = Proc::new("/bin/sh");
+    proc.arg("-c").arg(shell);
+    // Resolve dashed helpers (`git-receive-pack`, `git-upload-pack`) via the
+    // sley exec-path, and point their adapters at this binary via SLEY_BIN.
+    let exec_path = std::env::var("GIT_EXEC_PATH").ok().or_else(|| {
+        let exe = std::env::current_exe().ok()?;
+        let output = Proc::new(&exe).arg("--exec-path").output().ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|path| !path.is_empty())
+    });
+    if let Some(exec_path) = exec_path {
+        let path = std::env::var("PATH").unwrap_or_default();
+        proc.env("PATH", format!("{exec_path}:{path}"));
+    }
+    if let Ok(sley_bin) = std::env::var("SLEY_BIN") {
+        proc.env("SLEY_BIN", sley_bin);
+    } else if let Ok(exe) = std::env::current_exe() {
+        proc.env("SLEY_BIN", exe);
+    }
+    match git_protocol {
+        Some(version) => {
+            proc.env("GIT_PROTOCOL", version);
+        }
+        None => {
+            proc.env_remove("GIT_PROTOCOL");
+        }
+    }
+    proc.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
-    Ok(status.success())
+        .stderr(std::process::Stdio::null());
+    let mut child = proc.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write as _;
+        let _ = stdin.write_all(stdin_bytes);
+    }
+    Ok(child.wait()?)
+}
+
+/// Probe a custom `--upload-pack` so callers that dump the child environment
+/// (t5702 #58) observe `GIT_PROTOCOL=version=2` when protocol v2 is active.
+pub(crate) fn probe_custom_local_upload_pack(
+    command: &str,
+    remote_git_dir: &Path,
+    protocol_v2: bool,
+) -> Result<()> {
+    let protocol = protocol_v2.then_some("version=2");
+    // Empty stdin is enough for protocol-v2 upload-pack: it advertises and
+    // exits on EOF. Ignore status — the env dump is the observable effect.
+    let _ = run_custom_local_pack_command(command, remote_git_dir, protocol, b"")?;
+    Ok(())
+}
+
+/// Probe a custom archive `--exec` without setting GIT_PROTOCOL (t5702 #59).
+pub(crate) fn probe_custom_local_upload_archive(
+    command: &str,
+    remote_git_dir: &Path,
+) -> Result<()> {
+    let _ = run_custom_local_pack_command(command, remote_git_dir, None, b"")?;
+    Ok(())
 }
 
 fn trace_local_receive_pack_advertisement(remote_git_dir: &Path, format: ObjectFormat) {

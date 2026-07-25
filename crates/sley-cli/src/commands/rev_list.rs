@@ -532,6 +532,12 @@ pub(crate) fn cmd_rev_list(
         sley_rev::NoWalkMode::Sorted => RevListWalkMode::NoWalkSorted,
         sley_rev::NoWalkMode::Unsorted => RevListWalkMode::NoWalkUnsorted,
     };
+    // git's setup_revisions die: `options '--no-walk' and '--graph' cannot be
+    // used together` (revision.c). Graph rendering needs a full parent walk.
+    if graph && !matches!(walk_mode, RevListWalkMode::Walk) {
+        eprintln!("fatal: options '--no-walk' and '--graph' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
     let first_parent = revision_options.first_parent;
     let pathspecs = setup.pathspecs;
     let full_history = revision_options.full_history;

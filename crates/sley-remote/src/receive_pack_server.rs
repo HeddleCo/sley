@@ -464,6 +464,7 @@ fn quarantine_hook_env(git_dir: &Path, object_dir: &Path) -> Vec<(String, String
 /// Whether receive-pack should refuse an update to the currently checked-out
 /// branch under `receive.denyCurrentBranch`. Unconfigured / refuse / true deny;
 /// `updateInstead` / `warn` / `ignore` allow the update through.
+/// Checks the main worktree and every linked worktree (t5516 worktrees).
 fn receive_denies_current_branch_for_server(
     git_dir: &Path,
     format: ObjectFormat,
@@ -483,21 +484,42 @@ fn receive_denies_current_branch_for_server(
     if !denies {
         return false;
     }
-    // Bare repositories have no checked-out branch.
-    if sley_worktree::worktree_root_for_git_dir(git_dir)
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return false;
-    }
-    // Worktree HEAD is the un-namespaced checkout pointer; match against the
-    // logical (client-visible) command name, as git's find_shared_symref does.
+    branch_checked_out_anywhere(git_dir, format, logical_ref)
+}
+
+fn branch_checked_out_anywhere(git_dir: &Path, format: ObjectFormat, logical_ref: &str) -> bool {
     let store = FileRefStore::new(git_dir, format);
-    matches!(
+    if matches!(
         store.read_ref("HEAD").ok().flatten(),
         Some(RefTarget::Symbolic(target)) if target == logical_ref
-    )
+    ) {
+        if sley_worktree::worktree_root_for_git_dir(git_dir)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return true;
+        }
+    }
+    let common = sley_odb::repository_common_dir(git_dir);
+    let worktrees_dir = common.join("worktrees");
+    let Ok(entries) = std::fs::read_dir(worktrees_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let wt_git_dir = entry.path();
+        if !wt_git_dir.is_dir() {
+            continue;
+        }
+        let wt_store = FileRefStore::new(&wt_git_dir, format);
+        if matches!(
+            wt_store.read_ref("HEAD").ok().flatten(),
+            Some(RefTarget::Symbolic(target)) if target == logical_ref
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 fn needs_pack_data(states: &[ReceivePackCommandState]) -> bool {
