@@ -52,7 +52,8 @@ impl PackFile {
             return Err(GitError::InvalidFormat("pack file too short".into()));
         }
         let trailer_offset = bytes.len() - trailer_len;
-        let checksum = sley_core::digest_bytes(format, &bytes[..trailer_offset])?;
+        let entry_region = pack_entry_region(bytes, trailer_offset)?;
+        let checksum = sley_core::digest_bytes(format, entry_region)?;
         let expected = ObjectId::from_raw(format, &bytes[trailer_offset..])?;
         if checksum != expected {
             return Err(GitError::InvalidFormat(format!(
@@ -72,28 +73,29 @@ impl PackFile {
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             let entry_offset = offset;
-            let header = parse_entry_header(bytes, &mut offset)?;
-            let base =
-                match header.kind {
-                    PackObjectKind::OfsDelta => Some(DeltaBase::Offset(
-                        parse_ofs_delta_base_offset(bytes, &mut offset, entry_offset as u64)?,
-                    )),
-                    PackObjectKind::RefDelta => {
-                        let hash_len = format.raw_len();
-                        if offset + hash_len > trailer_offset {
-                            return Err(GitError::InvalidFormat(
-                                "truncated ref-delta base object id".into(),
-                            ));
-                        }
-                        let oid = ObjectId::from_raw(format, &bytes[offset..offset + hash_len])?;
-                        offset += hash_len;
-                        Some(DeltaBase::Ref(oid))
+            let header = parse_entry_header(entry_region, &mut offset)?;
+            let base = match header.kind {
+                PackObjectKind::OfsDelta => Some(DeltaBase::Offset(parse_ofs_delta_base_offset(
+                    entry_region,
+                    &mut offset,
+                    entry_offset as u64,
+                )?)),
+                PackObjectKind::RefDelta => {
+                    let hash_len = format.raw_len();
+                    if offset + hash_len > trailer_offset {
+                        return Err(GitError::InvalidFormat(
+                            "truncated ref-delta base object id".into(),
+                        ));
                     }
-                    _ => None,
-                };
+                    let oid = ObjectId::from_raw(format, &entry_region[offset..offset + hash_len])?;
+                    offset += hash_len;
+                    Some(DeltaBase::Ref(oid))
+                }
+                _ => None,
+            };
             let mut body = Vec::new();
             let consumed = inflate_into(
-                &bytes[offset..trailer_offset],
+                &entry_region[offset..],
                 &mut body,
                 header.size.min(usize::MAX as u64) as usize,
             )?;
@@ -180,6 +182,7 @@ impl PackFile {
         // discards once deltas are resolved.
         let trailer_len = format.raw_len();
         let trailer_offset = bytes.len() - trailer_len;
+        let entry_region = pack_entry_region(bytes, trailer_offset)?;
         let count = u32_be(&bytes[8..12]) as usize;
         let mut offset = 12usize;
         // Per entry in read (offset) order: (offset, base, on-disk stream size).
@@ -190,30 +193,31 @@ impl PackFile {
         let mut on_disk: Vec<OnDiskEntry> = Vec::with_capacity(count);
         for _ in 0..count {
             let entry_offset = offset as u64;
-            let header = parse_entry_header(bytes, &mut offset)?;
+            let header = parse_entry_header(entry_region, &mut offset)?;
             let stream_size = header.size;
-            let base =
-                match header.kind {
-                    PackObjectKind::OfsDelta => Some(DeltaBase::Offset(
-                        parse_ofs_delta_base_offset(bytes, &mut offset, entry_offset)?,
-                    )),
-                    PackObjectKind::RefDelta => {
-                        let hash_len = format.raw_len();
-                        if offset + hash_len > trailer_offset {
-                            return Err(GitError::InvalidFormat(
-                                "truncated ref-delta base object id".into(),
-                            ));
-                        }
-                        let oid = ObjectId::from_raw(format, &bytes[offset..offset + hash_len])?;
-                        offset += hash_len;
-                        Some(DeltaBase::Ref(oid))
+            let base = match header.kind {
+                PackObjectKind::OfsDelta => Some(DeltaBase::Offset(parse_ofs_delta_base_offset(
+                    entry_region,
+                    &mut offset,
+                    entry_offset,
+                )?)),
+                PackObjectKind::RefDelta => {
+                    let hash_len = format.raw_len();
+                    if offset + hash_len > trailer_offset {
+                        return Err(GitError::InvalidFormat(
+                            "truncated ref-delta base object id".into(),
+                        ));
                     }
-                    _ => None,
-                };
+                    let oid = ObjectId::from_raw(format, &entry_region[offset..offset + hash_len])?;
+                    offset += hash_len;
+                    Some(DeltaBase::Ref(oid))
+                }
+                _ => None,
+            };
             // Skip the compressed body to reach the next entry header.
             let mut body = Vec::new();
             let consumed = inflate_into(
-                &bytes[offset..trailer_offset],
+                &entry_region[offset..],
                 &mut body,
                 header.size.min(usize::MAX as u64) as usize,
             )?;
@@ -594,14 +598,15 @@ where
         .len()
         .checked_sub(format.raw_len())
         .ok_or_else(|| GitError::InvalidFormat("pack smaller than its trailer".into()))?;
+    let entry_region = pack_entry_region(pack_bytes, trailer_offset)?;
     let mut cursor = usize::try_from(offset)
         .ok()
         .filter(|&value| value < trailer_offset)
         .ok_or_else(|| GitError::InvalidFormat("pack object offset out of range".into()))?;
-    let header = parse_entry_header(pack_bytes, &mut cursor)?;
+    let header = parse_entry_header(entry_region, &mut cursor)?;
     let base = match header.kind {
         PackObjectKind::OfsDelta => Some(DeltaBase::Offset(parse_ofs_delta_base_offset(
-            pack_bytes,
+            entry_region,
             &mut cursor,
             offset,
         )?)),
@@ -612,7 +617,7 @@ where
                     "truncated ref-delta base object id".into(),
                 ));
             }
-            let oid = ObjectId::from_raw(format, &pack_bytes[cursor..cursor + hash_len])?;
+            let oid = ObjectId::from_raw(format, &entry_region[cursor..cursor + hash_len])?;
             cursor += hash_len;
             Some(DeltaBase::Ref(oid))
         }
@@ -620,7 +625,7 @@ where
     };
     let mut body = Vec::new();
     inflate_into(
-        &pack_bytes[cursor..trailer_offset],
+        &entry_region[cursor..],
         &mut body,
         header.size.min(usize::MAX as u64) as usize,
     )?;
@@ -780,19 +785,20 @@ where
         .len()
         .checked_sub(format.raw_len())
         .ok_or_else(|| GitError::InvalidFormat("pack smaller than its trailer".into()))?;
+    let entry_region = pack_entry_region(pack_bytes, trailer_offset)?;
     let mut cursor = usize::try_from(offset)
         .ok()
         .filter(|&value| value < trailer_offset)
         .ok_or_else(|| GitError::InvalidFormat("pack object offset out of range".into()))?;
-    let header = parse_entry_header(pack_bytes, &mut cursor)?;
+    let header = parse_entry_header(entry_region, &mut cursor)?;
     let resolved = match header.kind {
         PackObjectKind::Commit => (ObjectType::Commit, header.size),
         PackObjectKind::Tree => (ObjectType::Tree, header.size),
         PackObjectKind::Blob => (ObjectType::Blob, header.size),
         PackObjectKind::Tag => (ObjectType::Tag, header.size),
         PackObjectKind::OfsDelta => {
-            let base_offset = parse_ofs_delta_base_offset(pack_bytes, &mut cursor, offset)?;
-            let size = delta_result_size_from_stream(&pack_bytes[cursor..trailer_offset])?;
+            let base_offset = parse_ofs_delta_base_offset(entry_region, &mut cursor, offset)?;
+            let size = delta_result_size_from_stream(&entry_region[cursor..])?;
             // The end-of-chain type only depends on the base, so reuse it across
             // reads instead of re-walking the chain per object (sley#26).
             let base_type = match type_cache.get(base_offset) {
@@ -817,9 +823,9 @@ where
                     "truncated ref-delta base object id".into(),
                 ));
             }
-            let oid = ObjectId::from_raw(format, &pack_bytes[cursor..cursor + hash_len])?;
+            let oid = ObjectId::from_raw(format, &entry_region[cursor..cursor + hash_len])?;
             cursor += hash_len;
-            let size = delta_result_size_from_stream(&pack_bytes[cursor..trailer_offset])?;
+            let size = delta_result_size_from_stream(&entry_region[cursor..])?;
             let base_type = resolve_ref_base_type(&oid)?
                 .ok_or_else(|| GitError::not_found(format!("ref-delta base object {oid}")))?;
             (base_type, size)
@@ -842,6 +848,25 @@ pub(crate) fn delta_result_size_from_stream(compressed: &[u8]) -> Result<u64> {
     let mut prefix = Vec::new();
     inflate_prefix(compressed, DELTA_HEADER_PREFIX_LEN, &mut prefix)?;
     decoded_delta_result_size(&prefix)
+}
+
+/// The pack's entry region: everything between the 12-byte header and the
+/// trailing checksum.
+///
+/// Every varint cursor must walk *this* slice rather than the whole pack.
+/// [`next_byte`] stops at the end of whatever slice it is handed, so passing it
+/// the pack *including* the trailer lets an entry header whose continuation bit
+/// never clears go on consuming checksum bytes, leaving the cursor past
+/// `trailer_offset`. The entry-body slice `[cursor..trailer_offset]` that
+/// follows is then built with `start > end`, which panics — on remote input,
+/// since packs arrive straight off the wire (sley#162).
+///
+/// Bounding the cursor here makes that unrepresentable: a runaway varint simply
+/// runs out of slice and is reported as the truncated header it always was.
+fn pack_entry_region(bytes: &[u8], trailer_offset: usize) -> Result<&[u8]> {
+    bytes
+        .get(..trailer_offset)
+        .ok_or_else(|| GitError::InvalidFormat("pack smaller than its trailer".into()))
 }
 
 pub(crate) fn parse_entry_header(bytes: &[u8], offset: &mut usize) -> Result<EntryHeader> {
