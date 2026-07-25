@@ -4896,7 +4896,20 @@ impl FileRefStore {
                 Ok(file) => file,
                 Err(err) => {
                     release_pending_locks(&pending);
-                    return Err(GitError::Io(format!("could not lock ref {name}: {err}")));
+                    // Match git's `unable_to_lock_message` +
+                    // `error: cannot lock ref '%s': %s` wording used by
+                    // files-backend (t5510 lock / FETCH_HEAD partial-update tests).
+                    let detail = if err.kind() == std::io::ErrorKind::AlreadyExists {
+                        format!(
+                            "Unable to create '{}': File exists.",
+                            lock_path.display()
+                        )
+                    } else {
+                        format!("Unable to create '{}': {err}", lock_path.display())
+                    };
+                    return Err(GitError::InvalidFormat(format!(
+                        "error: cannot lock ref '{name}': {detail}"
+                    )));
                 }
             };
             // The lock file is private until it is renamed into place, so it

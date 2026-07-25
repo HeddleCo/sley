@@ -464,6 +464,7 @@ fn hydrate_oids_via_http(
         format,
         remote: &remote,
         wants: wants.to_vec(),
+        want_refs: Vec::new(),
         haves: None,
         shallow: Vec::new(),
         deepen: None,

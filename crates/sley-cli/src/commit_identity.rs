@@ -123,11 +123,12 @@ pub(crate) fn committer_identity_for_reflog(effective_config: &GitConfig) -> Res
 /// stores the same bytes git would.
 ///
 /// git's `commit-tree` / `commit` run author and committer dates through
-/// `parse_date`, accepting ISO-8601 (`2005-04-07T22:13:13`), `<date> <time> <tz>`
-/// (`2005-01-01 00:00:00 +0000`), RFC-2822, and the raw form. The full date.c
-/// port lives in [`commands::approxidate`]; route the value through it and emit
-/// the canonical raw form. Values that do not parse are passed through verbatim
-/// so the sequencer still reports the original "invalid date" error.
+/// `parse_date` / `approxidate_careful`, accepting ISO-8601
+/// (`2005-04-07T22:13:13`), `<date> <time> <tz>`, RFC-2822, fuzzy approxidates,
+/// and the raw form. Values that do not parse are passed through verbatim so
+/// callers that only need best-effort conversion (env `GIT_*_DATE`) still get a
+/// diagnostic from the sequencer; prefer [`try_canonicalize_commit_date`] when a
+/// hard reject with git's `invalid date format` message is required (`--date=`).
 pub(crate) fn canonicalize_commit_date(date: &str) -> String {
     if date.is_empty() {
         return default_commit_date();
@@ -136,6 +137,17 @@ pub(crate) fn canonicalize_commit_date(date: &str) -> String {
         Some((seconds, tz)) => format!("{seconds} {tz}"),
         None => date.to_string(),
     }
+}
+
+/// Like [`canonicalize_commit_date`] but returns `None` when the value does not
+/// parse — used for `git commit --date=` so we can die with
+/// `fatal: invalid date format: …` matching git's `parse_force_date`.
+pub(crate) fn try_canonicalize_commit_date(date: &str) -> Option<String> {
+    if date.is_empty() {
+        return Some(default_commit_date());
+    }
+    crate::commands::approxidate::parse_commit_date(date)
+        .map(|(seconds, tz)| format!("{seconds} {tz}"))
 }
 
 pub(crate) fn default_commit_date() -> String {

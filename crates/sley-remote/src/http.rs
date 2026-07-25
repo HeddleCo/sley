@@ -32,9 +32,9 @@ use sley_odb::{FileObjectDatabase, ObjectReader};
 use sley_protocol::{
     GitService, ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchAcknowledgment,
     ProtocolV2FetchRequest, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
-    ProtocolV2LsRefsRequest, ProtocolVersion, RefAdvertisement, RefAdvertisementSet,
-    TransportHandshake, UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRequest,
-    encode_protocol_v2_command_options, parse_protocol_v2_fetch_features,
+    ProtocolV2FetchWantedRef, ProtocolV2LsRefsRequest, ProtocolVersion, RefAdvertisement,
+    RefAdvertisementSet, TransportHandshake, UploadPackFeatures, UploadPackNegotiationRequest,
+    UploadPackRequest, encode_protocol_v2_command_options, parse_protocol_v2_fetch_features,
     parse_upload_pack_features, protocol_v2_object_format,
     read_protocol_v2_fetch_negotiation_response, read_protocol_v2_fetch_response,
     read_protocol_v2_fetch_sideband_all_response,
@@ -358,6 +358,7 @@ fn protocol_v2_fetch_command_request(
 #[allow(clippy::too_many_arguments)]
 fn protocol_v2_fetch_request_from_upload_pack_semantics(
     wants: Vec<ObjectId>,
+    want_refs: Vec<String>,
     haves: Vec<ObjectId>,
     shallow: Vec<ObjectId>,
     deepen: Option<u32>,
@@ -371,6 +372,7 @@ fn protocol_v2_fetch_request_from_upload_pack_semantics(
         parse_protocol_v2_fetch_features(&handshake.capabilities)?.unwrap_or_default();
     Ok(ProtocolV2FetchRequest {
         wants,
+        want_refs,
         haves,
         shallow,
         deepen,
@@ -831,8 +833,11 @@ pub struct HttpFetchPackRequest<'a, C: HttpClient + ?Sized> {
     pub format: ObjectFormat,
     /// Resolved HTTP(S) remote.
     pub remote: &'a RemoteUrl,
-    /// Wanted object ids.
+    /// Wanted object ids (exact OIDs).
     pub wants: Vec<ObjectId>,
+    /// Wanted ref names for protocol-v2 `want-ref` (resolved at request time
+    /// when the server advertised `ref-in-want`). Empty when unused.
+    pub want_refs: Vec<String>,
     /// Caller-selected negotiation haves. `None` means advertise the default
     /// local haves.
     pub haves: Option<Vec<ObjectId>>,
@@ -861,13 +866,22 @@ pub struct HttpFetchPackRequest<'a, C: HttpClient + ?Sized> {
     pub omit_haves: bool,
 }
 
+/// Outcome of a protocol-v2 HTTP fetch, including any `wanted-refs` the server
+/// resolved for `want-ref` lines (so the client can update tracking refs to the
+/// OIDs current at request time rather than the earlier ls-refs snapshot).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HttpProtocolV2FetchOutcome {
+    pub shallow_info: Vec<ProtocolV2FetchShallowInfo>,
+    pub wanted_refs: Vec<ProtocolV2FetchWantedRef>,
+}
+
 pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
     request: HttpFetchPackRequest<'_, C>,
     credentials: &mut dyn CredentialProvider,
     progress: &mut dyn ProgressSink,
     cancel: CancelFlag<'_>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
-    if request.wants.is_empty() {
+    if request.wants.is_empty() && request.want_refs.is_empty() {
         return Ok(Vec::new());
     }
     let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
@@ -1051,17 +1065,20 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
     credentials: &mut dyn CredentialProvider,
     progress: &mut dyn ProgressSink,
     cancel: CancelFlag<'_>,
-) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
-    if request.wants.is_empty() {
-        return Ok(Vec::new());
+) -> Result<HttpProtocolV2FetchOutcome> {
+    if request.wants.is_empty() && request.want_refs.is_empty() {
+        return Ok(HttpProtocolV2FetchOutcome::default());
     }
     trace_protocol_v2_advertisement_read(handshake)?;
     let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
-    if !request_replays_shallow_boundary(request.deepen, request.deepen_since, &request.deepen_not)
+    // When using want-ref, the advertised OIDs may be stale/wrong; always talk to
+    // the server so it can resolve names at request time.
+    if request.want_refs.is_empty()
+        && !request_replays_shallow_boundary(request.deepen, request.deepen_since, &request.deepen_not)
         && request.filter.is_none()
         && all_wants_present(&local_db, &request.wants)?
     {
-        return Ok(Vec::new());
+        return Ok(HttpProtocolV2FetchOutcome::default());
     }
     let haves = request_negotiation_haves(
         request.git_dir,
@@ -1071,6 +1088,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
     )?;
     let mut fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
         request.wants,
+        request.want_refs,
         haves,
         request.shallow,
         request.deepen,
@@ -1154,7 +1172,16 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
                 cancel,
             )?
         };
-        return Ok(shallow_info_from_protocol_v2_fetch_header(&header));
+        let mut wanted_refs = Vec::new();
+        for section in &header.sections {
+            if let ProtocolV2FetchResponseSection::WantedRefs(wanted) = section {
+                wanted_refs.extend(wanted.iter().cloned());
+            }
+        }
+        return Ok(HttpProtocolV2FetchOutcome {
+            shallow_info: shallow_info_from_protocol_v2_fetch_header(&header),
+            wanted_refs,
+        });
     }
 }
 
@@ -1716,6 +1743,7 @@ mod tests {
         .expect("test operation should succeed");
         let fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
             vec![want.clone()],
+            Vec::new(),
             vec![have.clone()],
             vec![shallow.clone()],
             Some(3),
@@ -1777,6 +1805,7 @@ mod tests {
         .expect("test operation should succeed");
         let fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
             vec![want],
+            Vec::new(),
             Vec::new(),
             vec![shallow.clone()],
             Some(1),

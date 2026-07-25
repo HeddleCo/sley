@@ -1427,7 +1427,22 @@ fn submodule_name_for_path_at_commit(
     else {
         return Ok(None);
     };
-    let gitmodules = db.read_object(&gitmodules_oid)?;
+    // Partial clones omit the `.gitmodules` blob until demanded. Hydrate it
+    // from configured promisor remotes so on-demand submodule recursion can
+    // resolve names (t5616 "lazily fetched .gitmodules works").
+    let gitmodules = match db.read_object(&gitmodules_oid) {
+        Ok(object) => object,
+        Err(GitError::NotFound(_)) => {
+            let _ = sley_remote::hydrate_objects_from_local_promisor_remotes(
+                git_dir,
+                format,
+                &[gitmodules_oid],
+            )?;
+            db.refresh_read_cache();
+            db.read_object(&gitmodules_oid)?
+        }
+        Err(err) => return Err(err),
+    };
     if gitmodules.object_type != ObjectType::Blob {
         return Ok(None);
     }

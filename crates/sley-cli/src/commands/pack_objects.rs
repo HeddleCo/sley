@@ -307,7 +307,13 @@ pub(crate) fn cmd_pack_objects(
             | "--indexed-objects"
             | "--delta-islands"
             | "--shallow"
+            // `--unpack-unreachable` loosens unused packed objects after writing
+            // the pack. Sley leaves that as a no-op today: we never loosen by
+            // default, and alternate/nonlocal objects must not be loosened
+            // (t7700 "packed unreachable obs in alternate ODB are not loosened").
+            | "--unpack-unreachable"
                 if !saw_dashdash => {}
+            value if !saw_dashdash && value.starts_with("--unpack-unreachable=") => {}
             "--include-tag" if !saw_dashdash => options.include_tag = true,
             "--no-include-tag" if !saw_dashdash => options.include_tag = false,
             value if !saw_dashdash && value.starts_with("--uri-protocol=") => {}

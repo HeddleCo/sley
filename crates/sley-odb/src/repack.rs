@@ -13,11 +13,11 @@ use crate::loose::LooseObjectStore;
 use crate::pack::FileObjectDatabase;
 use crate::pack::promisor_pack_object_ids;
 use crate::reachability::{
-    BitmapPseudoMergeGroup, ReachabilityBitmapOptions, ReachablePackObject,
+    BitmapPseudoMergeGroup, PackObjectFilter, ReachabilityBitmapOptions, ReachablePackObject,
     build_pack_bitmap_with_cached_objects, build_pack_name_hash_cache,
     collect_reachable_object_ids_excluding_promised_missing, existing_pack_files, loose_object_ids,
     pack_inputs, prune_loose_objects, prune_obsolete_pack_paths, prune_stale_multi_pack_index,
-    remove_file_if_exists,
+    remove_file_if_exists, retain_filtered_pack_objects,
 };
 use crate::registry::{
     alternate_object_dirs, collect_packed_object_ids, object_ids_in_objects_dir,
@@ -455,13 +455,50 @@ pub fn repack_reachable_objects_with_blob_limit_to(
     limit: u64,
     filter_to: &Path,
 ) -> Result<Option<RepackResult>> {
+    repack_reachable_objects_with_object_filter(
+        git_dir,
+        format,
+        roots,
+        options,
+        &PackObjectFilter::BlobLimit(limit),
+        Some(filter_to),
+        None,
+    )
+}
+
+/// Repack reachable objects with a partial-clone style object filter.
+///
+/// Kept objects land in the ordinary pack directory (the `RepackResult`);
+/// filtered-out objects are written to a second pack under `filter_to` when
+/// provided, otherwise next to the main pack under the same `objects/pack/`
+/// prefix. Multiple packs are produced when `max_pack_size` is set.
+pub fn repack_reachable_objects_with_object_filter(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    options: &RepackOptions,
+    filter: &PackObjectFilter,
+    filter_to: Option<&Path>,
+    max_pack_size: Option<u64>,
+) -> Result<Option<RepackResult>> {
     repack_reachable_objects_with_filter_to(
         git_dir,
         format,
         roots,
         options,
-        Some((limit, filter_to)),
+        Some(FilterRepackSpec {
+            filter: filter.clone(),
+            filter_to,
+            max_pack_size,
+        }),
     )
+}
+
+#[derive(Clone)]
+struct FilterRepackSpec<'a> {
+    filter: PackObjectFilter,
+    filter_to: Option<&'a Path>,
+    max_pack_size: Option<u64>,
 }
 
 fn repack_reachable_objects_with_filter_to(
@@ -469,7 +506,7 @@ fn repack_reachable_objects_with_filter_to(
     format: ObjectFormat,
     roots: &[ObjectId],
     options: &RepackOptions,
-    filter_to: Option<(u64, &Path)>,
+    filter_to: Option<FilterRepackSpec<'_>>,
 ) -> Result<Option<RepackResult>> {
     let objects_dir = repository_objects_dir(git_dir);
     let database = if options.local {
@@ -549,23 +586,43 @@ fn repack_reachable_objects_with_filter_to(
     }
 
     let mut filtered_out = Vec::new();
-    if let Some((limit, _)) = filter_to {
+    if let Some(spec) = filter_to.as_ref() {
         let wanted = roots.iter().copied().collect::<HashSet<_>>();
-        objects.retain(|entry| {
-            let omit = entry.object.object_type == ObjectType::Blob
-                && !wanted.contains(&entry.oid)
-                && entry.object.body.len() as u64 >= limit;
-            if omit {
-                filtered_out.push(entry.clone());
+        // Partition into kept vs filtered-out using the same rules as
+        // transfer-pack filters. Filtered-out objects still need a home so
+        // `repack -d` does not lose them.
+        let before: HashMap<ObjectId, ReachablePackObject> = objects
+            .iter()
+            .map(|entry| (entry.oid, entry.clone()))
+            .collect();
+        retain_filtered_pack_objects(
+            &mut objects,
+            Some(&spec.filter),
+            &wanted,
+            &database,
+            format,
+        )?;
+        let kept: HashSet<ObjectId> = objects.iter().map(|entry| entry.oid).collect();
+        for (oid, entry) in before {
+            if !kept.contains(&oid) {
+                filtered_out.push(entry);
             }
-            !omit
-        });
+        }
     }
 
-    if let Some((_, prefix)) = filter_to
-        && !filtered_out.is_empty()
-    {
-        write_filtered_repack(&filtered_out, format, prefix)?;
+    let mut local_filtered_stems: HashSet<String> = HashSet::new();
+    if !filtered_out.is_empty() {
+        let pack_dir = objects_dir.join("pack");
+        let (prefix, is_local_prefix) = match filter_to.as_ref().and_then(|spec| spec.filter_to) {
+            Some(prefix) => (prefix.to_path_buf(), false),
+            None => (pack_dir.join("pack"), true),
+        };
+        let max_pack_size = filter_to.as_ref().and_then(|spec| spec.max_pack_size);
+        let written_stems =
+            write_filtered_repack_with_size(&filtered_out, format, &prefix, max_pack_size)?;
+        if is_local_prefix {
+            local_filtered_stems.extend(written_stems);
+        }
     }
 
     if objects.is_empty() {
@@ -589,11 +646,23 @@ fn repack_reachable_objects_with_filter_to(
 
     // Every pre-existing local pack is superseded under `-a` (their reachable
     // objects are in the new pack; their unreachable ones are being dropped).
+    // Local filtered packs written just above must be retained.
     let new_pack_file_name = format!("pack-{}.pack", written.checksum.to_hex());
     let obsolete_packs = existing_pack_files(&objects_dir.join("pack"))?
         .into_iter()
-        .filter(|path| path.file_name().and_then(|name| name.to_str()) != Some(&new_pack_file_name))
+        .filter(|path| {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return true;
+            };
+            if name == new_pack_file_name {
+                return false;
+            }
+            let stem = name.strip_suffix(".pack").unwrap_or(name);
+            !local_filtered_stems.contains(stem)
+        })
         .collect();
+    let mut retained_pack_stems = retained_pack_stems;
+    retained_pack_stems.extend(local_filtered_stems);
 
     let packed_oid_set: HashSet<&ObjectId> = written.entries.iter().map(|e| &e.oid).collect();
     let mut packed_loose: Vec<ObjectId> = loose_object_ids(&objects_dir, format)?
@@ -629,15 +698,93 @@ fn write_filtered_repack(
     format: ObjectFormat,
     prefix: &Path,
 ) -> Result<()> {
-    let written = PackFile::write_packed_with_known_ids(&pack_inputs(objects), format)?;
-    let component_path = |extension: &str| {
-        let mut path = prefix.as_os_str().to_os_string();
-        path.push(format!("-{}.{}", written.checksum.to_hex(), extension));
-        PathBuf::from(path)
-    };
-    write_pack_component(&component_path("pack"), &written.pack)?;
-    write_pack_component(&component_path("idx"), &written.index)?;
+    write_filtered_repack_with_size(objects, format, prefix, None)?;
     Ok(())
+}
+
+/// Write one or more filtered packs under `prefix-<checksum>.{pack,idx}`.
+/// Returns the pack stems written (e.g. `pack-<checksum>`) so the caller can
+/// retain them when they land in the local pack directory.
+fn write_filtered_repack_with_size(
+    objects: &[ReachablePackObject],
+    format: ObjectFormat,
+    prefix: &Path,
+    max_pack_size: Option<u64>,
+) -> Result<Vec<String>> {
+    if objects.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Ensure the destination directory exists (filter-to may point outside the
+    // repository, e.g. `../filtered.git/objects/pack/pack`).
+    if let Some(parent) = prefix.parent() {
+        fs::create_dir_all(parent).map_err(|err| GitError::Io(err.to_string()))?;
+    }
+    let mut stems = Vec::new();
+    let chunks = split_objects_by_pack_size(objects, max_pack_size);
+    for chunk in chunks {
+        let written = PackFile::write_packed_with_known_ids(&pack_inputs(&chunk), format)?;
+        let stem = format!("pack-{}", written.checksum.to_hex());
+        // When prefix already ends with `pack`, produce `pack-<checksum>`;
+        // otherwise append `-<checksum>` to the given prefix (git's filter-to).
+        let component_path = |extension: &str| -> PathBuf {
+            let prefix_str = prefix.to_string_lossy();
+            if prefix_str.ends_with("pack")
+                || prefix
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n == "pack")
+            {
+                let mut path = prefix.as_os_str().to_os_string();
+                // prefix is `.../pack` → `.../pack-<checksum>.ext`
+                path.push(format!("-{}.{}", written.checksum.to_hex(), extension));
+                PathBuf::from(path)
+            } else {
+                let mut path = prefix.as_os_str().to_os_string();
+                path.push(format!("-{}.{}", written.checksum.to_hex(), extension));
+                PathBuf::from(path)
+            }
+        };
+        // Prefer the stem from the actual written path's file stem.
+        let pack_path = component_path("pack");
+        if let Some(stem_os) = pack_path.file_stem() {
+            stems.push(stem_os.to_string_lossy().into_owned());
+        } else {
+            stems.push(stem);
+        }
+        write_pack_component(&pack_path, &written.pack)?;
+        write_pack_component(&component_path("idx"), &written.index)?;
+    }
+    Ok(stems)
+}
+
+/// Split filtered objects into groups that each fit under `max_pack_size`
+/// (approximate: raw object body sizes + a small per-object header budget).
+fn split_objects_by_pack_size(
+    objects: &[ReachablePackObject],
+    max_pack_size: Option<u64>,
+) -> Vec<Vec<ReachablePackObject>> {
+    let Some(limit) = max_pack_size.filter(|limit| *limit > 0) else {
+        return vec![objects.to_vec()];
+    };
+    let mut chunks: Vec<Vec<ReachablePackObject>> = Vec::new();
+    let mut current: Vec<ReachablePackObject> = Vec::new();
+    let mut current_size = 12u64; // pack header
+    for entry in objects {
+        let entry_size = entry.object.body.len() as u64 + 32; // header + trailer budget
+        if !current.is_empty() && current_size.saturating_add(entry_size) > limit {
+            chunks.push(std::mem::take(&mut current));
+            current_size = 12;
+        }
+        current_size = current_size.saturating_add(entry_size);
+        current.push(entry.clone());
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(Vec::new());
+    }
+    chunks
 }
 
 fn repack_retained_pack_stems(
