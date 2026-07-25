@@ -2901,3 +2901,77 @@ mod tests {
         assert!(!trace.contains("secret"));
     }
 }
+
+#[cfg(all(test, feature = "http-client"))]
+mod http_timeout_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// sley#163: ureq 3.3.0's `Timeouts::default()` leaves every field `None`
+    /// except `await_100`, and an unset field is an unbounded phase. Name them
+    /// all, so a field added to ureq later cannot silently reintroduce one.
+    #[test]
+    fn every_ureq_timeout_field_is_set() {
+        let timeouts = UreqHttpClient::new().agent.config().timeouts();
+        for (name, value) in [
+            ("global", timeouts.global),
+            ("per_call", timeouts.per_call),
+            ("resolve", timeouts.resolve),
+            ("connect", timeouts.connect),
+            ("send_request", timeouts.send_request),
+            ("await_100", timeouts.await_100),
+            ("send_body", timeouts.send_body),
+            ("recv_response", timeouts.recv_response),
+            ("recv_body", timeouts.recv_body),
+        ] {
+            assert!(value.is_some(), "timeout `{name}` is unbounded");
+        }
+    }
+
+    /// A peer that completes the TCP handshake and then says nothing must be
+    /// abandoned on a deadline rather than held open forever.
+    ///
+    /// The request runs on a worker thread behind `recv_timeout`, so with no
+    /// deadline configured this test fails on its own clock instead of hanging
+    /// the suite.
+    #[test]
+    fn stalled_peer_fails_within_the_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let stall = std::thread::spawn(move || {
+            // Accept, then never answer. Holding the stream keeps the
+            // connection established rather than resetting it.
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(120));
+                drop(stream);
+            }
+        });
+
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let client = UreqHttpClient::new();
+            let started = Instant::now();
+            let outcome = client.get(&format!("http://{addr}/info/refs"), &[]);
+            let _ = tx.send((outcome.is_err(), started.elapsed()));
+        });
+
+        match rx.recv_timeout(Duration::from_secs(45)) {
+            Ok((is_err, elapsed)) => {
+                assert!(
+                    is_err,
+                    "a peer that never answers must not produce a response"
+                );
+                println!("stalled peer refused after {elapsed:?}");
+            }
+            Err(_) => panic!(
+                "request to a stalled peer was still blocked after 45s: \
+                 no read/response deadline fired"
+            ),
+        }
+
+        drop(stall);
+        drop(worker);
+    }
+}
