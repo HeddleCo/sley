@@ -6,23 +6,48 @@ use super::*;
 
 impl PackFile {
     pub fn parse_sha1(bytes: &[u8]) -> Result<Self> {
-        Self::parse(bytes, ObjectFormat::Sha1)
+        Self::parse_sha1_with_limits(bytes, PackReadLimits::default())
+    }
+
+    pub fn parse_sha1_with_limits(bytes: &[u8], limits: PackReadLimits) -> Result<Self> {
+        Self::parse_with_limits(bytes, ObjectFormat::Sha1, limits)
     }
 
     pub fn parse(bytes: &[u8], format: ObjectFormat) -> Result<Self> {
-        Self::parse_with_base(bytes, format, |_| Ok(None))
+        Self::parse_with_limits(bytes, format, PackReadLimits::default())
+    }
+
+    /// Parse and resolve a complete pack with explicit read limits.
+    pub fn parse_with_limits(
+        bytes: &[u8],
+        format: ObjectFormat,
+        limits: PackReadLimits,
+    ) -> Result<Self> {
+        Self::parse_with_base_and_limits(bytes, format, |_| Ok(None), limits)
     }
 
     pub fn parse_bundle(bundle: &Bundle) -> Result<Self> {
-        Self::parse(&bundle.pack, bundle.format)
+        Self::parse_bundle_with_limits(bundle, PackReadLimits::default())
+    }
+
+    pub fn parse_bundle_with_limits(bundle: &Bundle, limits: PackReadLimits) -> Result<Self> {
+        Self::parse_with_limits(&bundle.pack, bundle.format, limits)
     }
 
     pub fn index_pack(bytes: &[u8], format: ObjectFormat) -> Result<PackWrite> {
+        Self::index_pack_with_limits(bytes, format, PackReadLimits::default())
+    }
+
+    pub fn index_pack_with_limits(
+        bytes: &[u8],
+        format: ObjectFormat,
+        limits: PackReadLimits,
+    ) -> Result<PackWrite> {
         let PackIndexBuild {
             index,
             pack_checksum,
             entries,
-        } = PackIndex::write_v2_for_pack(bytes, format)?;
+        } = PackIndex::write_v2_for_pack_with_limits(bytes, format, limits)?;
         Ok(PackWrite {
             pack: bytes.to_vec(),
             index,
@@ -36,13 +61,26 @@ impl PackFile {
     where
         F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
     {
-        Self::parse_with_base(bytes, format, external_base)
+        Self::parse_thin_with_limits(bytes, format, external_base, PackReadLimits::default())
     }
 
-    pub(crate) fn parse_with_base<F>(
+    pub fn parse_thin_with_limits<F>(
+        bytes: &[u8],
+        format: ObjectFormat,
+        external_base: F,
+        limits: PackReadLimits,
+    ) -> Result<Self>
+    where
+        F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+    {
+        Self::parse_with_base_and_limits(bytes, format, external_base, limits)
+    }
+
+    pub(crate) fn parse_with_base_and_limits<F>(
         bytes: &[u8],
         format: ObjectFormat,
         mut external_base: F,
+        limits: PackReadLimits,
     ) -> Result<Self>
     where
         F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
@@ -68,9 +106,14 @@ impl PackFile {
         if version != 2 && version != 3 {
             return Err(GitError::Unsupported(format!("pack version {version}")));
         }
-        let count = u32_be(&bytes[8..12]) as usize;
+        // sley#4: the declared count is attacker-controlled; validate it against
+        // the bytes that actually remain before reserving anything for it.
+        let count = checked_pack_object_count(
+            u32_be(&bytes[8..12]),
+            (trailer_offset.saturating_sub(12)) as u64,
+        )?;
         let mut offset = 12usize;
-        let mut entries = Vec::with_capacity(count);
+        let mut entries = Vec::with_capacity(pack_entry_prealloc(count));
         for _ in 0..count {
             let entry_offset = offset;
             let header = parse_entry_header(entry_region, &mut offset)?;
@@ -156,7 +199,7 @@ impl PackFile {
         }
         Ok(Self {
             version,
-            entries: resolve_pack_entries(entries, format, &mut external_base)?,
+            entries: resolve_pack_entries(entries, format, &mut external_base, limits)?,
             checksum,
         })
     }
@@ -172,10 +215,18 @@ impl PackFile {
     /// deltas — the object id of the *immediate* base (which may itself be a
     /// delta). This mirrors `builtin/index-pack.c`'s `show_pack_info`.
     pub fn verify_pack_stats(bytes: &[u8], format: ObjectFormat) -> Result<PackVerifyStats> {
+        Self::verify_pack_stats_with_limits(bytes, format, PackReadLimits::default())
+    }
+
+    pub fn verify_pack_stats_with_limits(
+        bytes: &[u8],
+        format: ObjectFormat,
+        limits: PackReadLimits,
+    ) -> Result<PackVerifyStats> {
         // Resolve the whole pack first: this validates the trailing checksum,
         // every object's inflate, and yields the resolved oid/type/size keyed by
         // offset. `verify-pack` is exactly this validation plus the stat report.
-        let pack = Self::parse(bytes, format)?;
+        let pack = Self::parse_with_limits(bytes, format, limits)?;
 
         // Independently walk the on-disk entries to recover each object's stored
         // kind and (for deltas) its base reference — information `PackFile`
@@ -183,14 +234,17 @@ impl PackFile {
         let trailer_len = format.raw_len();
         let trailer_offset = bytes.len() - trailer_len;
         let entry_region = pack_entry_region(bytes, trailer_offset)?;
-        let count = u32_be(&bytes[8..12]) as usize;
+        let count = checked_pack_object_count(
+            u32_be(&bytes[8..12]),
+            (trailer_offset.saturating_sub(12)) as u64,
+        )?;
         let mut offset = 12usize;
         // Per entry in read (offset) order: (offset, base, on-disk stream size).
         // The stream size is what git prints in the size column: it is the
         // resolved object size for an undeltified entry, but the *delta
         // instruction stream* length for a delta entry (builtin/index-pack.c sets
         // `obj->size` from the entry header, before any delta is applied).
-        let mut on_disk: Vec<OnDiskEntry> = Vec::with_capacity(count);
+        let mut on_disk: Vec<OnDiskEntry> = Vec::with_capacity(pack_entry_prealloc(count));
         for _ in 0..count {
             let entry_offset = offset as u64;
             let header = parse_entry_header(entry_region, &mut offset)?;
@@ -925,6 +979,7 @@ pub(crate) fn resolve_pack_entries<F>(
     parsed: Vec<ParsedPackEntry>,
     format: ObjectFormat,
     external_base: &mut F,
+    limits: PackReadLimits,
 ) -> Result<Vec<PackObject>>
 where
     F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
@@ -935,6 +990,10 @@ where
     }
 
     let mut resolved = vec![None; parsed.len()];
+    // sley#5: chain depth of each resolved entry. Undeltified entries and
+    // entries resolved against an external (thin-pack) base are depth 0; a
+    // delta is one deeper than the base it was applied to.
+    let mut depths = vec![0usize; parsed.len()];
     let mut oid_to_index = HashMap::new();
     let mut unresolved = 0usize;
     for (idx, entry) in parsed.iter().enumerate() {
@@ -973,6 +1032,26 @@ where
             else {
                 continue;
             };
+            // sley#5: reject before applying the delta, so an over-deep chain
+            // costs nothing beyond the walk that discovered it. An external
+            // base is depth 0 because its own chain lives in another pack that
+            // was bounded when it was read.
+            let base_depth = match base {
+                DeltaBase::Offset(base_offset) => {
+                    offset_to_index.get(base_offset).map(|idx| depths[*idx])
+                }
+                DeltaBase::Ref(base_oid) => oid_to_index.get(base_oid).map(|idx| depths[*idx]),
+            }
+            .unwrap_or(0);
+            let depth = base_depth + 1;
+            if depth > limits.max_delta_depth {
+                return Err(GitError::InvalidFormat(format!(
+                    "pack delta chain at offset {offset} has observed depth {depth}, which \
+                     exceeds maximum depth (configured limit {}); raise \
+                     PackReadLimits::max_delta_depth or run `git repack --depth={}`",
+                    limits.max_delta_depth, limits.max_delta_depth
+                )));
+            }
             let body = apply_pack_delta(base_object.body(), delta)?;
             let object = EncodedObject::new(base_object.object_type(), body);
             let oid = object.object_id(format)?;
@@ -997,6 +1076,7 @@ where
                 )));
             }
             oid_to_index.insert(oid, idx);
+            depths[idx] = depth;
             resolved[idx] = Some(pack_object);
             unresolved -= 1;
             progress = true;

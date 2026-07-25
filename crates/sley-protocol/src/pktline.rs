@@ -158,6 +158,119 @@ pub const PKT_LINE_MAX_LEN: usize = 65_520;
 
 pub const PKT_LINE_MAX_PAYLOAD_LEN: usize = PKT_LINE_MAX_LEN - 4;
 
+/// Bounds applied while accumulating pkt-line frames from a peer.
+///
+/// sley#6: pkt-line reads terminate on a control packet (flush / response-end)
+/// or on end of stream, both of which a hostile peer simply never sends. Every
+/// accumulating reader therefore takes a budget; there is no unbounded entry
+/// point. The two presets below are the whole budget for the protocol crate —
+/// grep `PktLineReadLimits::` to see every call site's choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PktLineReadLimits {
+    /// Maximum number of frames accumulated by a single read.
+    pub max_frames: usize,
+    /// Maximum total payload bytes accumulated by a single read (the four
+    /// length-header bytes of each frame are not counted; `max_frames` bounds
+    /// those).
+    pub max_payload_bytes: usize,
+}
+
+impl PktLineReadLimits {
+    /// Budget for streams whose length is driven by *ref and command counts*:
+    /// v1 and v2 ref advertisements, `ls-refs` results, capability
+    /// advertisements, push command lists, and status reports. This is the
+    /// default for every reader that is not explicitly handling bulk data.
+    ///
+    /// `max_frames`: a v1 advertisement emits one frame per ref. The largest
+    /// ref counts that occur in practice come from Gerrit-style hosting, which
+    /// publishes a ref per patchset and reaches the low millions on big
+    /// projects; 2^21 = 2_097_152 sits above that. A `0001`/`0002` control
+    /// packet is four bytes on the wire but still costs a 32-byte
+    /// `PktLineFrame` resident, which is why frames are capped separately from
+    /// payload bytes; 2^21 caps that bookkeeping at ~64 MiB.
+    ///
+    /// `max_payload_bytes`: an advertisement line is
+    /// `<oid> SP <refname> LF` — about 110 bytes for a 40-hex oid and a
+    /// typical refname, so 256 MiB admits roughly 2.4M such lines. It is
+    /// deliberately not the binding constraint below `max_frames`; it exists to
+    /// stop a peer sending a smaller number of maximum-size (65 516-byte)
+    /// frames instead.
+    pub const CONTROL: Self = Self {
+        max_frames: 2 * 1024 * 1024,
+        max_payload_bytes: 256 * 1024 * 1024,
+    };
+
+    /// Budget for the buffered readers that may carry bulk payload in sideband
+    /// frames: v2 `fetch` responses and `upload-archive` responses.
+    ///
+    /// These helpers hold the entire packfile/archive in memory by
+    /// construction, so they are already unsuitable for very large transfers —
+    /// the streaming installer
+    /// (`sley_remote::install_protocol_v2_fetch_response_from_reader`) is what
+    /// clone and fetch actually use, and it never accumulates frames. The
+    /// budget here is therefore "as much as buffering can plausibly be asked to
+    /// do", not "as much as git can serve":
+    ///
+    /// `max_payload_bytes` = 2 GiB. Beyond that a caller must stream.
+    ///
+    /// `max_frames` = 2^22 = 4_194_304. A sideband data frame carries up to
+    /// 65 515 payload bytes, so 2 GiB of packfile needs only ~32 800 frames;
+    /// 4M leaves two orders of magnitude of headroom for servers that emit
+    /// small frames, while capping accumulator bookkeeping at ~128 MiB.
+    pub const PACK_STREAM: Self = Self {
+        max_frames: 4 * 1024 * 1024,
+        max_payload_bytes: 2 * 1024 * 1024 * 1024,
+    };
+}
+
+impl Default for PktLineReadLimits {
+    fn default() -> Self {
+        Self::CONTROL
+    }
+}
+
+/// Running total for one bounded accumulation.
+struct PktLineBudget {
+    limits: PktLineReadLimits,
+    frames: usize,
+    payload_bytes: usize,
+}
+
+impl PktLineBudget {
+    fn new(limits: PktLineReadLimits) -> Self {
+        Self {
+            limits,
+            frames: 0,
+            payload_bytes: 0,
+        }
+    }
+
+    /// Charge one frame against the budget before it is retained. Returns the
+    /// rejection as `InvalidFormat` so it travels the same path as any other
+    /// malformed-stream diagnosis.
+    fn charge(&mut self, frame: &PktLineFrame) -> Result<()> {
+        self.frames += 1;
+        if self.frames > self.limits.max_frames {
+            return Err(GitError::InvalidFormat(format!(
+                "pkt-line stream exceeds {} frames without a terminating packet",
+                self.limits.max_frames
+            )));
+        }
+        let payload = match frame {
+            PktLineFrame::Data(payload) => payload.len(),
+            PktLineFrame::Flush | PktLineFrame::Delimiter | PktLineFrame::ResponseEnd => 0,
+        };
+        self.payload_bytes = self.payload_bytes.saturating_add(payload);
+        if self.payload_bytes > self.limits.max_payload_bytes {
+            return Err(GitError::InvalidFormat(format!(
+                "pkt-line stream exceeds {} payload bytes without a terminating packet",
+                self.limits.max_payload_bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolVersion {
     V0,
@@ -324,10 +437,22 @@ fn try_encode_pkt_line_payload(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(encode_pkt_line_payload(payload))
 }
 
-pub fn parse_pkt_line_stream(mut input: &[u8]) -> Result<Vec<PktLineFrame>> {
+pub fn parse_pkt_line_stream(input: &[u8]) -> Result<Vec<PktLineFrame>> {
+    parse_pkt_line_stream_with_limits(input, PktLineReadLimits::CONTROL)
+}
+
+/// sley#6: an in-memory pkt-line stream is bounded by its own length, but the
+/// decode still amplifies — a four-byte `0001` becomes a 32-byte
+/// `PktLineFrame` — so the same budget applies here as to the reader path.
+pub fn parse_pkt_line_stream_with_limits(
+    mut input: &[u8],
+    limits: PktLineReadLimits,
+) -> Result<Vec<PktLineFrame>> {
+    let mut budget = PktLineBudget::new(limits);
     let mut frames = Vec::new();
     while !input.is_empty() {
         let (frame, consumed) = PktLineFrame::parse(input)?;
+        budget.charge(&frame)?;
         frames.push(frame);
         input = &input[consumed..];
     }
@@ -337,6 +462,7 @@ pub fn parse_pkt_line_stream(mut input: &[u8]) -> Result<Vec<PktLineFrame>> {
 pub(crate) fn parse_pkt_line_frames_until_flush_from(
     mut input: &[u8],
 ) -> Result<(Vec<PktLineFrame>, usize)> {
+    let mut budget = PktLineBudget::new(PktLineReadLimits::CONTROL);
     let mut frames = Vec::new();
     let mut total = 0usize;
     loop {
@@ -348,6 +474,7 @@ pub(crate) fn parse_pkt_line_frames_until_flush_from(
         let (frame, consumed) = PktLineFrame::parse(input)?;
         total += consumed;
         let done = matches!(frame, PktLineFrame::Flush);
+        budget.charge(&frame)?;
         frames.push(frame);
         input = &input[consumed..];
         if done {
@@ -412,27 +539,60 @@ pub fn read_pkt_line_frame(reader: &mut impl Read) -> Result<Option<PktLineFrame
 }
 
 pub fn read_pkt_line_frames(reader: &mut impl Read) -> Result<Vec<PktLineFrame>> {
+    read_pkt_line_frames_with_limits(reader, PktLineReadLimits::CONTROL)
+}
+
+pub fn read_pkt_line_frames_with_limits(
+    reader: &mut impl Read,
+    limits: PktLineReadLimits,
+) -> Result<Vec<PktLineFrame>> {
+    let mut budget = PktLineBudget::new(limits);
     let mut frames = Vec::new();
     while let Some(frame) = read_pkt_line_frame(reader)? {
+        budget.charge(&frame)?;
         frames.push(frame);
     }
     Ok(frames)
 }
 
 pub fn read_pkt_line_frames_until_flush(reader: &mut impl Read) -> Result<Vec<PktLineFrame>> {
-    read_pkt_line_frames_until_control(reader, |frame| matches!(frame, PktLineFrame::Flush))
+    read_pkt_line_frames_until_flush_with_limits(reader, PktLineReadLimits::CONTROL)
+}
+
+pub fn read_pkt_line_frames_until_flush_with_limits(
+    reader: &mut impl Read,
+    limits: PktLineReadLimits,
+) -> Result<Vec<PktLineFrame>> {
+    read_pkt_line_frames_until_control(reader, |frame| matches!(frame, PktLineFrame::Flush), limits)
 }
 
 pub fn read_pkt_line_frames_until_response_end(
     reader: &mut impl Read,
 ) -> Result<Vec<PktLineFrame>> {
-    read_pkt_line_frames_until_control(reader, |frame| matches!(frame, PktLineFrame::ResponseEnd))
+    read_pkt_line_frames_until_response_end_with_limits(reader, PktLineReadLimits::CONTROL)
 }
 
+pub fn read_pkt_line_frames_until_response_end_with_limits(
+    reader: &mut impl Read,
+    limits: PktLineReadLimits,
+) -> Result<Vec<PktLineFrame>> {
+    read_pkt_line_frames_until_control(
+        reader,
+        |frame| matches!(frame, PktLineFrame::ResponseEnd),
+        limits,
+    )
+}
+
+/// sley#6: the shared accumulation primitive. It stops only on a control
+/// packet the peer chooses to send, so `limits` is a required argument — there
+/// is deliberately no variant of this function that accumulates without a
+/// budget, which is what closes the class rather than one call site.
 fn read_pkt_line_frames_until_control(
     reader: &mut impl Read,
     stop: impl Fn(&PktLineFrame) -> bool,
+    limits: PktLineReadLimits,
 ) -> Result<Vec<PktLineFrame>> {
+    let mut budget = PktLineBudget::new(limits);
     let mut frames = Vec::new();
     loop {
         let Some(frame) = read_pkt_line_frame(reader)? else {
@@ -441,6 +601,7 @@ fn read_pkt_line_frames_until_control(
             ));
         };
         let done = stop(&frame);
+        budget.charge(&frame)?;
         frames.push(frame);
         if done {
             return Ok(frames);

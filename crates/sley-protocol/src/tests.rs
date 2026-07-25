@@ -7063,6 +7063,172 @@ fn protocol_v2_ls_refs_records_bridge_unborn_head_symref_and_empty() {
     );
 }
 
+// ---- sley#6: bounded pkt-line frame accumulation ---------------------------
+
+/// Number of four-byte control packets a hostile peer sends before giving up.
+/// Derived from the budget itself, so the fixture always sends more frames than
+/// the reader is allowed to keep and it is the reader's bound -- not the end of
+/// the fixture -- that stops the read.
+const OVER_BUDGET_FRAMES: usize = PktLineReadLimits::CONTROL.max_frames + 1_024;
+
+/// A `Read` that emits `count` copies of a four-byte pkt-line control packet
+/// and then ends. Every frame is well formed and none of them is the packet the
+/// reader is waiting for, which is exactly what a malicious ref advertisement
+/// looks like: valid framing, no terminator.
+struct RepeatedPktLineFrames {
+    frame: [u8; 4],
+    remaining: usize,
+    position: usize,
+}
+
+impl RepeatedPktLineFrames {
+    fn new(frame: &[u8; 4], count: usize) -> Self {
+        Self {
+            frame: *frame,
+            remaining: count,
+            position: 0,
+        }
+    }
+}
+
+impl Read for RepeatedPktLineFrames {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut written = 0;
+        while written < buf.len() && self.remaining > 0 {
+            buf[written] = self.frame[self.position];
+            written += 1;
+            self.position += 1;
+            if self.position == self.frame.len() {
+                self.position = 0;
+                self.remaining -= 1;
+            }
+        }
+        Ok(written)
+    }
+}
+
+/// Regression (sley#6): `read_pkt_line_frames_until_flush` accumulated frames
+/// into an unbounded `Vec` until a flush arrived. A peer that streams valid
+/// non-flush packets forever is never refused; before the fix this returned
+/// only once the peer stopped, having bought one heap allocation per packet.
+#[test]
+fn read_pkt_line_frames_until_flush_rejects_over_budget_frame_count() {
+    // `0001` (delimiter) is a legal packet that is not a flush.
+    let mut reader = RepeatedPktLineFrames::new(b"0001", OVER_BUDGET_FRAMES);
+    let error = read_pkt_line_frames_until_flush(&mut reader)
+        .expect_err("an over-budget frame stream must be rejected");
+    assert!(
+        format!("{error}").contains("exceeds"),
+        "expected a budget error, got: {error}"
+    );
+}
+
+/// The same primitive backs the response-end form used by protocol v2, so the
+/// v2 path is covered by the same bound rather than by its own patch.
+#[test]
+fn read_pkt_line_frames_until_response_end_rejects_over_budget_frame_count() {
+    // `0000` (flush) is a legal packet that is not a response-end.
+    let mut reader = RepeatedPktLineFrames::new(b"0000", OVER_BUDGET_FRAMES);
+    let error = read_pkt_line_frames_until_response_end(&mut reader)
+        .expect_err("an over-budget frame stream must be rejected");
+    assert!(
+        format!("{error}").contains("exceeds"),
+        "expected a budget error, got: {error}"
+    );
+}
+
+/// `read_pkt_line_frames` stops at end of stream rather than at a control
+/// packet, but accumulates the same way, so it carries the same budget.
+#[test]
+fn read_pkt_line_frames_rejects_over_budget_frame_count() {
+    let mut reader = RepeatedPktLineFrames::new(b"0001", OVER_BUDGET_FRAMES);
+    assert!(
+        read_pkt_line_frames(&mut reader).is_err(),
+        "an over-budget frame stream must be rejected"
+    );
+}
+
+/// An endless peer — the actual attack, which no `remaining` counter lets off
+/// the hook — terminates promptly under an explicit budget. Driven with a small
+/// budget so the test costs nothing; the production budgets are the same code
+/// path with larger numbers.
+#[test]
+fn bounded_read_terminates_against_an_endless_peer() {
+    struct EndlessDelimiters;
+    impl Read for EndlessDelimiters {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            for (index, slot) in buf.iter_mut().enumerate() {
+                *slot = b"0001"[index % 4];
+            }
+            Ok(buf.len())
+        }
+    }
+
+    let limits = PktLineReadLimits {
+        max_frames: 32,
+        max_payload_bytes: 1024,
+    };
+    let error = read_pkt_line_frames_until_flush_with_limits(&mut EndlessDelimiters, limits)
+        .expect_err("an endless stream must be rejected");
+    assert!(
+        format!("{error}").contains("32 frames"),
+        "expected the frame budget to be what stopped it, got: {error}"
+    );
+}
+
+/// The payload-byte budget is what stops a peer that sends few, very large
+/// frames instead of many tiny ones.
+#[test]
+fn bounded_read_rejects_over_budget_payload_bytes() {
+    let mut stream = Vec::new();
+    for _ in 0..8 {
+        stream.extend_from_slice(
+            &PktLineFrame::data(vec![b'x'; 512])
+                .expect("test operation should succeed")
+                .encode(),
+        );
+    }
+    stream.extend_from_slice(b"0000");
+
+    let limits = PktLineReadLimits {
+        max_frames: 1024,
+        max_payload_bytes: 2048,
+    };
+    let error = read_pkt_line_frames_until_flush_with_limits(&mut stream.as_slice(), limits)
+        .expect_err("an over-budget payload must be rejected");
+    assert!(
+        format!("{error}").contains("2048 payload bytes"),
+        "expected the payload budget to be what stopped it, got: {error}"
+    );
+
+    // The same stream is accepted whole once the budget admits it.
+    let generous = PktLineReadLimits {
+        max_frames: 1024,
+        max_payload_bytes: 8192,
+    };
+    let frames = read_pkt_line_frames_until_flush_with_limits(&mut stream.as_slice(), generous)
+        .expect("a within-budget stream must still parse");
+    assert_eq!(frames.len(), 9);
+}
+
+/// An in-memory pkt-line stream still amplifies (a four-byte `0001` becomes a
+/// 32-byte `PktLineFrame`), so the slice parsers carry the budget too.
+#[test]
+fn parse_pkt_line_stream_rejects_over_budget_frame_count() {
+    let limits = PktLineReadLimits {
+        max_frames: 4,
+        max_payload_bytes: 1024,
+    };
+    let stream = b"0001".repeat(16);
+    assert!(
+        parse_pkt_line_stream_with_limits(&stream, limits).is_err(),
+        "an over-budget in-memory stream must be rejected"
+    );
+    assert!(
+        parse_pkt_line_stream(&stream).is_ok(),
+        "the control budget must still admit an ordinary stream"
+    );
+}
 // --- sley#163: bounded reads on untrusted readers ---------------------------
 
 /// A ceiling of `limit` bytes, standing in for whichever real one a call site

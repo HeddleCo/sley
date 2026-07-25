@@ -686,11 +686,26 @@ impl PackIndexViewData {
 
 impl PackIndex {
     pub fn write_v2_for_pack_sha1(pack_bytes: &[u8]) -> Result<PackIndexBuild> {
-        Self::write_v2_for_pack(pack_bytes, ObjectFormat::Sha1)
+        Self::write_v2_for_pack_sha1_with_limits(pack_bytes, PackReadLimits::default())
+    }
+
+    pub fn write_v2_for_pack_sha1_with_limits(
+        pack_bytes: &[u8],
+        limits: PackReadLimits,
+    ) -> Result<PackIndexBuild> {
+        Self::write_v2_for_pack_with_limits(pack_bytes, ObjectFormat::Sha1, limits)
     }
 
     pub fn write_v2_for_pack(pack_bytes: &[u8], format: ObjectFormat) -> Result<PackIndexBuild> {
-        Self::write_v2_for_pack_with_base(pack_bytes, format, |_| Ok(None))
+        Self::write_v2_for_pack_with_limits(pack_bytes, format, PackReadLimits::default())
+    }
+
+    pub fn write_v2_for_pack_with_limits(
+        pack_bytes: &[u8],
+        format: ObjectFormat,
+        limits: PackReadLimits,
+    ) -> Result<PackIndexBuild> {
+        Self::write_v2_for_pack_with_base_and_limits(pack_bytes, format, |_| Ok(None), limits)
     }
 
     /// Validate and index a pack while resolving ref-deltas against an external
@@ -699,7 +714,24 @@ impl PackIndex {
     pub fn write_v2_for_pack_with_base<F>(
         pack_bytes: &[u8],
         format: ObjectFormat,
+        external_base: F,
+    ) -> Result<PackIndexBuild>
+    where
+        F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+    {
+        Self::write_v2_for_pack_with_base_and_limits(
+            pack_bytes,
+            format,
+            external_base,
+            PackReadLimits::default(),
+        )
+    }
+
+    pub fn write_v2_for_pack_with_base_and_limits<F>(
+        pack_bytes: &[u8],
+        format: ObjectFormat,
         mut external_base: F,
+        limits: PackReadLimits,
     ) -> Result<PackIndexBuild>
     where
         F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
@@ -724,10 +756,15 @@ impl PackIndex {
         if version != 2 && version != 3 {
             return Err(GitError::Unsupported(format!("pack version {version}")));
         }
-        let count = u32_be(&pack_bytes[8..12]) as usize;
+        // sley#4: see `checked_pack_object_count` — a short pack must not be
+        // able to name a count it has no room for.
+        let count = checked_pack_object_count(
+            u32_be(&pack_bytes[8..12]),
+            (trailer_offset.saturating_sub(12)) as u64,
+        )?;
         let mut offset = 12usize;
-        let mut parsed_entries = Vec::with_capacity(count);
-        let mut raw_entries = Vec::with_capacity(count);
+        let mut parsed_entries = Vec::with_capacity(pack_entry_prealloc(count));
+        let mut raw_entries = Vec::with_capacity(pack_entry_prealloc(count));
         for _ in 0..count {
             let entry_offset = offset;
             let header = parse_entry_header(pack_bytes, &mut offset)?;
@@ -816,7 +853,7 @@ impl PackIndex {
             )));
         }
 
-        let resolved = resolve_pack_entries(parsed_entries, format, &mut external_base)?;
+        let resolved = resolve_pack_entries(parsed_entries, format, &mut external_base, limits)?;
         let entries = resolved
             .iter()
             .zip(raw_entries)
@@ -847,7 +884,18 @@ impl PackIndex {
     where
         R: Read + Seek,
     {
-        index_pack_from_reader(reader, format)
+        Self::write_v2_for_pack_reader_with_limits(reader, format, PackReadLimits::default())
+    }
+
+    pub fn write_v2_for_pack_reader_with_limits<R>(
+        reader: &mut R,
+        format: ObjectFormat,
+        limits: PackReadLimits,
+    ) -> Result<PackStreamIndexBuild>
+    where
+        R: Read + Seek,
+    {
+        index_pack_from_reader_with_limits(reader, format, limits)
     }
 
     /// Validate and index a pack from the reader's current position, stopping
@@ -863,7 +911,22 @@ impl PackIndex {
     where
         R: Read,
     {
-        index_pack_from_reader_to_trailer(reader, format)
+        Self::write_v2_for_pack_reader_to_trailer_with_limits(
+            reader,
+            format,
+            PackReadLimits::default(),
+        )
+    }
+
+    pub fn write_v2_for_pack_reader_to_trailer_with_limits<R>(
+        reader: &mut R,
+        format: ObjectFormat,
+        limits: PackReadLimits,
+    ) -> Result<PackStreamIndexBuild>
+    where
+        R: Read,
+    {
+        index_pack_from_reader_to_trailer_with_limits(reader, format, limits)
     }
 
     /// `write_v2_for_pack_reader_to_trailer` that reports streaming pack
@@ -879,7 +942,25 @@ impl PackIndex {
         R: Read,
         F: FnMut(PackStreamProgress),
     {
-        index_pack_from_reader_to_trailer_with_progress(reader, format, progress)
+        Self::write_v2_for_pack_reader_to_trailer_with_progress_and_limits(
+            reader,
+            format,
+            PackReadLimits::default(),
+            progress,
+        )
+    }
+
+    pub fn write_v2_for_pack_reader_to_trailer_with_progress_and_limits<R, F>(
+        reader: &mut R,
+        format: ObjectFormat,
+        limits: PackReadLimits,
+        progress: F,
+    ) -> Result<PackStreamIndexBuild>
+    where
+        R: Read,
+        F: FnMut(PackStreamProgress),
+    {
+        index_pack_from_reader_to_trailer_with_progress_and_limits(reader, format, limits, progress)
     }
 
     /// Like [`Self::write_v2_for_pack_reader_to_trailer_with_progress`], but
@@ -899,7 +980,29 @@ impl PackIndex {
         R: Read,
         F: FnMut(PackStreamProgress),
     {
-        index_pack_from_reader_to_trailer_with_progress_and_cancel(reader, format, cancel, progress)
+        Self::write_v2_for_pack_reader_to_trailer_with_progress_and_cancel_and_limits(
+            reader,
+            format,
+            cancel,
+            PackReadLimits::default(),
+            progress,
+        )
+    }
+
+    pub fn write_v2_for_pack_reader_to_trailer_with_progress_and_cancel_and_limits<R, F>(
+        reader: &mut R,
+        format: ObjectFormat,
+        cancel: CancelFlag<'_>,
+        limits: PackReadLimits,
+        progress: F,
+    ) -> Result<PackStreamIndexBuild>
+    where
+        R: Read,
+        F: FnMut(PackStreamProgress),
+    {
+        index_pack_from_reader_to_trailer_with_progress_and_cancel_and_limits(
+            reader, format, cancel, limits, progress,
+        )
     }
 
     pub fn write_v2_for_pack_reader_with_len<R>(
@@ -910,7 +1013,24 @@ impl PackIndex {
     where
         R: Read,
     {
-        index_pack_from_reader_with_len(reader, format, pack_len)
+        Self::write_v2_for_pack_reader_with_len_and_limits(
+            reader,
+            format,
+            pack_len,
+            PackReadLimits::default(),
+        )
+    }
+
+    pub fn write_v2_for_pack_reader_with_len_and_limits<R>(
+        reader: &mut R,
+        format: ObjectFormat,
+        pack_len: u64,
+        limits: PackReadLimits,
+    ) -> Result<PackStreamIndexBuild>
+    where
+        R: Read,
+    {
+        index_pack_from_reader_with_len_and_limits(reader, format, pack_len, limits)
     }
 
     /// Validate and index a pack from a filesystem path without loading the
@@ -919,8 +1039,16 @@ impl PackIndex {
         path: impl AsRef<Path>,
         format: ObjectFormat,
     ) -> Result<PackStreamIndexBuild> {
+        Self::write_v2_for_pack_path_with_limits(path, format, PackReadLimits::default())
+    }
+
+    pub fn write_v2_for_pack_path_with_limits(
+        path: impl AsRef<Path>,
+        format: ObjectFormat,
+        limits: PackReadLimits,
+    ) -> Result<PackStreamIndexBuild> {
         let mut file = File::open(path)?;
-        Self::write_v2_for_pack_reader(&mut file, format)
+        Self::write_v2_for_pack_reader_with_limits(&mut file, format, limits)
     }
 
     pub fn parse_v2_sha1(bytes: &[u8]) -> Result<Self> {

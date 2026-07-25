@@ -95,8 +95,11 @@ impl PackReadSource for std::fs::File {
     }
 }
 
-/// Hard limits applied by every targeted read through a
-/// [`BoundedPackDecoder`].
+/// Hard limits applied while reading packs.
+///
+/// Whole-pack readers use [`Self::max_delta_depth`]. Targeted reads through a
+/// [`BoundedPackDecoder`] additionally enforce the materialization and cache
+/// limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackReadLimits {
     /// Maximum number of delta entries between a target and its base.
@@ -118,7 +121,7 @@ pub struct PackReadLimits {
 impl Default for PackReadLimits {
     fn default() -> Self {
         Self {
-            max_delta_depth: DEFAULT_PACK_DEPTH,
+            max_delta_depth: MAX_READ_DELTA_CHAIN_DEPTH,
             max_materialized_bytes: 64 * 1024 * 1024,
             max_cached_bytes: 16 * 1024 * 1024,
         }

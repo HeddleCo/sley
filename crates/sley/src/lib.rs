@@ -101,10 +101,14 @@ pub mod notes {
 /// Streaming pack indexing primitives for embedders ([`sley_pack`]).
 pub mod pack {
     pub use sley_pack::{
-        PackIndexEntry, PackIndexedObject, PackReadStream, PackStreamIndexBuild,
+        PackIndexEntry, PackIndexedObject, PackReadLimits, PackReadStream, PackStreamIndexBuild,
         PackStreamProgress, PackWrite, index_pack_from_reader, index_pack_from_reader_to_trailer,
-        index_pack_from_reader_to_trailer_with_progress, index_pack_from_stream,
-        index_pack_from_stream_with_progress,
+        index_pack_from_reader_to_trailer_with_limits,
+        index_pack_from_reader_to_trailer_with_progress,
+        index_pack_from_reader_to_trailer_with_progress_and_limits,
+        index_pack_from_reader_with_limits, index_pack_from_stream,
+        index_pack_from_stream_with_limits, index_pack_from_stream_with_progress,
+        index_pack_from_stream_with_progress_and_limits,
     };
 }
 
