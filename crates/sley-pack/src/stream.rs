@@ -15,24 +15,40 @@ pub fn index_pack_from_reader<R>(
 where
     R: Read + Seek,
 {
+    index_pack_from_reader_with_limits(reader, format, PackReadLimits::default())
+}
+
+pub fn index_pack_from_reader_with_limits<R>(
+    reader: &mut R,
+    format: ObjectFormat,
+    limits: PackReadLimits,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read + Seek,
+{
     let start = reader.stream_position()?;
     let end = reader.seek(SeekFrom::End(0))?;
     let pack_len = end
         .checked_sub(start)
         .ok_or_else(|| GitError::InvalidFormat("pack stream position overflow".into()))?;
     reader.seek(SeekFrom::Start(start))?;
-    index_pack_from_reader_with_len(reader, format, pack_len)
+    index_pack_from_reader_with_len_and_limits(reader, format, pack_len, limits)
 }
 
-pub(crate) fn index_pack_from_reader_with_len<R>(
+pub(crate) fn index_pack_from_reader_with_len_and_limits<R>(
     reader: &mut R,
     format: ObjectFormat,
     pack_len: u64,
+    limits: PackReadLimits,
 ) -> Result<PackStreamIndexBuild>
 where
     R: Read,
 {
-    index_pack_from_stream(PackReadStream::new(reader, format, Some(pack_len))?, format)
+    index_pack_from_stream_with_limits(
+        PackReadStream::new(reader, format, Some(pack_len))?,
+        format,
+        limits,
+    )
 }
 
 /// Validate and index one pack from a stream, stopping after its trailer.
@@ -46,7 +62,18 @@ pub fn index_pack_from_reader_to_trailer<R>(
 where
     R: Read,
 {
-    index_pack_from_stream(PackReadStream::new(reader, format, None)?, format)
+    index_pack_from_reader_to_trailer_with_limits(reader, format, PackReadLimits::default())
+}
+
+pub fn index_pack_from_reader_to_trailer_with_limits<R>(
+    reader: &mut R,
+    format: ObjectFormat,
+    limits: PackReadLimits,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+{
+    index_pack_from_stream_with_limits(PackReadStream::new(reader, format, None)?, format, limits)
 }
 
 /// Index one non-seekable pack through its trailer and report receive progress.
@@ -62,28 +89,49 @@ where
     R: Read,
     F: FnMut(PackStreamProgress),
 {
-    index_pack_from_reader_to_trailer_with_progress_and_cancel(
+    index_pack_from_reader_to_trailer_with_progress_and_limits(
         reader,
         format,
-        CancelFlag::never(),
+        PackReadLimits::default(),
         progress,
     )
 }
 
-pub(crate) fn index_pack_from_reader_to_trailer_with_progress_and_cancel<R, F>(
+pub fn index_pack_from_reader_to_trailer_with_progress_and_limits<R, F>(
     reader: &mut R,
     format: ObjectFormat,
-    cancel: CancelFlag<'_>,
+    limits: PackReadLimits,
     progress: F,
 ) -> Result<PackStreamIndexBuild>
 where
     R: Read,
     F: FnMut(PackStreamProgress),
 {
-    index_pack_from_stream_with_progress_and_cancel(
+    index_pack_from_reader_to_trailer_with_progress_and_cancel_and_limits(
+        reader,
+        format,
+        CancelFlag::never(),
+        limits,
+        progress,
+    )
+}
+
+pub(crate) fn index_pack_from_reader_to_trailer_with_progress_and_cancel_and_limits<R, F>(
+    reader: &mut R,
+    format: ObjectFormat,
+    cancel: CancelFlag<'_>,
+    limits: PackReadLimits,
+    progress: F,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+    F: FnMut(PackStreamProgress),
+{
+    index_pack_from_stream_with_progress_and_cancel_and_limits(
         PackReadStream::new(reader, format, None)?,
         format,
         cancel,
+        limits,
         progress,
     )
 }
@@ -99,7 +147,18 @@ pub fn index_pack_from_stream<R>(
 where
     R: Read,
 {
-    index_pack_from_stream_with_progress(stream, format, |_| {})
+    index_pack_from_stream_with_limits(stream, format, PackReadLimits::default())
+}
+
+pub fn index_pack_from_stream_with_limits<R>(
+    stream: PackReadStream<'_, R>,
+    format: ObjectFormat,
+    limits: PackReadLimits,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+{
+    index_pack_from_stream_with_progress_and_limits(stream, format, limits, |_| {})
 }
 
 /// Approximate cadence for progress emission: report at least every this many
@@ -119,13 +178,38 @@ where
     R: Read,
     F: FnMut(PackStreamProgress),
 {
-    index_pack_from_stream_with_progress_and_cancel(stream, format, CancelFlag::never(), progress)
+    index_pack_from_stream_with_progress_and_limits(
+        stream,
+        format,
+        PackReadLimits::default(),
+        progress,
+    )
 }
 
-pub(crate) fn index_pack_from_stream_with_progress_and_cancel<R, F>(
+pub fn index_pack_from_stream_with_progress_and_limits<R, F>(
+    stream: PackReadStream<'_, R>,
+    format: ObjectFormat,
+    limits: PackReadLimits,
+    progress: F,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+    F: FnMut(PackStreamProgress),
+{
+    index_pack_from_stream_with_progress_and_cancel_and_limits(
+        stream,
+        format,
+        CancelFlag::never(),
+        limits,
+        progress,
+    )
+}
+
+pub(crate) fn index_pack_from_stream_with_progress_and_cancel_and_limits<R, F>(
     mut stream: PackReadStream<'_, R>,
     format: ObjectFormat,
     cancel: CancelFlag<'_>,
+    limits: PackReadLimits,
     mut progress: F,
 ) -> Result<PackStreamIndexBuild>
 where
@@ -247,7 +331,7 @@ where
         )));
     }
 
-    let resolved = resolve_pack_entries(parsed_entries, format, &mut |_| Ok(None))?;
+    let resolved = resolve_pack_entries(parsed_entries, format, &mut |_| Ok(None), limits)?;
     let entries = resolved
         .iter()
         .zip(raw_entries)

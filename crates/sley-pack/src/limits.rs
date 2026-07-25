@@ -28,14 +28,12 @@ const MIN_PACK_ENTRY_BYTES: u64 = 3;
 /// reallocations and cannot be steered by the declared count.
 pub const PACK_OBJECT_COUNT_PREALLOC_CAP: usize = 64 * 1024;
 
-/// Maximum delta chain depth accepted when *reading* a pack (sley#5).
+/// Default maximum delta chain depth accepted when reading a pack (sley#5).
 ///
 /// Deliberately the same value as [`DEFAULT_PACK_DEPTH`], which sley's writer
-/// uses and which is also git's `pack.depth` default, and the same value
-/// already enforced on the targeted-read path by
-/// `PackReadLimits::default().max_delta_depth` — a pack that
-/// `BoundedPackDecoder` refuses to read one object from should not be readable
-/// in bulk by `PackFile::parse`.
+/// uses and which is also git's `pack.depth` default. This is the value used by
+/// [`PackReadLimits::default`]; callers that legitimately consume deeper packs
+/// can raise [`PackReadLimits::max_delta_depth`] while retaining a finite bound.
 ///
 /// The bound is what makes whole-pack resolution linear: `resolve_pack_entries`
 /// makes repeated passes over the entry list, and each pass advances every
