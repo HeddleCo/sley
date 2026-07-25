@@ -1661,22 +1661,169 @@ mod tests {
 mod bounded_read_tests {
     use super::*;
 
+    fn limits_of(bytes: u64) -> TransportLimits {
+        TransportLimits {
+            max_ref_advertisement_bytes: bytes,
+            ..TransportLimits::default()
+        }
+    }
+
     /// sley#163: the service-discovery response is buffered whole, so it needs
     /// a ceiling. Without one this call never returns on an endless reader.
     #[test]
     fn service_discovery_response_refuses_an_endless_reader() {
         let mut endless = std::io::repeat(b'x');
-        let error = read_http_service_discovery_response_with_limit(
+        let error = read_http_service_discovery_response_with_limits(
             ObjectFormat::Sha1,
             &mut endless,
-            64 * 1024,
+            limits_of(64 * 1024),
         )
         .expect_err("an endless advertisement must be refused");
         assert!(
-            error
-                .to_string()
-                .contains("exceeds the maximum accepted size"),
+            error.to_string().contains("exceeds the configured ceiling"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// The ceiling moves, and it still binds where it now sits. A raised
+    /// limit is a different wall, not the absence of one.
+    #[test]
+    fn a_raised_ceiling_admits_more_and_still_refuses_an_endless_reader() {
+        // Below the old ceiling, above the new one: proof the wall moved.
+        let mut endless = std::io::repeat(b'x');
+        let error = read_http_service_discovery_response_with_limits(
+            ObjectFormat::Sha1,
+            &mut endless,
+            limits_of(4 * 1024 * 1024),
+        )
+        .expect_err("an endless advertisement must be refused at the raised ceiling too");
+        assert!(
+            error.to_string().contains("4194304 bytes"),
+            "the raised ceiling must be the one reported: {error}"
+        );
+
+        // A body that the default ceiling would refuse is admitted once the
+        // ceiling is raised past it -- it fails on parsing, not on size.
+        let body = vec![b'x'; 128 * 1024];
+        let error = read_http_service_discovery_response_with_limits(
+            ObjectFormat::Sha1,
+            &mut body.as_slice(),
+            limits_of(64 * 1024),
+        )
+        .expect_err("128 KiB must not fit under a 64 KiB ceiling");
+        assert!(
+            error.to_string().contains("exceeds the configured ceiling"),
+            "unexpected error: {error}"
+        );
+        let error = read_http_service_discovery_response_with_limits(
+            ObjectFormat::Sha1,
+            &mut body.as_slice(),
+            limits_of(256 * 1024),
+        )
+        .expect_err("the body is not a valid advertisement");
+        assert!(
+            !error.to_string().contains("exceeds the configured ceiling"),
+            "the raised ceiling must admit the body: {error}"
+        );
+    }
+
+    /// A limit whose only remedy is "rebuild" is not a remedy. The error has
+    /// to name what was seen, what the ceiling was, and what to do -- and the
+    /// real remedy here is the protocol, not a larger buffer.
+    #[test]
+    fn the_over_ceiling_error_names_the_size_the_limit_and_the_remedy() {
+        let mut endless = std::io::repeat(b'x');
+        let error = read_http_service_discovery_response_with_limits(
+            ObjectFormat::Sha1,
+            &mut endless,
+            limits_of(64 * 1024),
+        )
+        .expect_err("an endless advertisement must be refused")
+        .to_string();
+        // what was read, and the ceiling it was measured against
+        assert!(error.contains("stopped at 65537 bytes"), "{error}");
+        assert!(error.contains("ceiling of 65536 bytes"), "{error}");
+        // the remedy, in the order it should be tried
+        assert!(error.contains("ls-refs"), "{error}");
+        assert!(error.contains("ref-prefix"), "{error}");
+        assert!(
+            error.contains("git config sley.maxRefAdvertisementBytes"),
+            "{error}"
+        );
+        // and never "edit this constant"
+        assert!(!error.contains("recompile"), "{error}");
+    }
+
+    /// The default ceilings are what an unconfigured caller has always had.
+    #[test]
+    fn no_configuration_leaves_the_documented_defaults_in_place() {
+        assert_eq!(
+            transport_limits_from_config(None),
+            TransportLimits::default()
+        );
+        let empty = GitConfig::parse(b"[core]\n\tbare = false\n").expect("config");
+        assert_eq!(
+            transport_limits_from_config(Some(&empty)),
+            TransportLimits::default()
+        );
+        assert_eq!(
+            TransportLimits::default().max_ref_advertisement_bytes,
+            128 * 1024 * 1024
+        );
+        assert_eq!(TransportLimits::default().admitted_refs(), 512 * 1024);
+    }
+
+    /// Config raises the ceiling in the units an operator already uses, and
+    /// the derived body deadline moves with it.
+    #[test]
+    fn git_config_raises_the_ceilings_and_the_derived_deadline() {
+        let config = GitConfig::parse(
+            b"[sley]\n\tmaxRefAdvertisementBytes = 512m\n\tmaxPackfileResponseBytes = 8g\n",
+        )
+        .expect("config");
+        let limits = transport_limits_from_config(Some(&config));
+        assert_eq!(limits.max_ref_advertisement_bytes, 512 * 1024 * 1024);
+        assert_eq!(limits.max_packfile_response_bytes, 8 * 1024 * 1024 * 1024);
+        // 2Mi refs at the worst-case 256 bytes each -- past the million-ref
+        // shape a ref-per-patchset review system reaches.
+        assert_eq!(limits.admitted_refs(), 2 * 1024 * 1024);
+        assert!(
+            limits.body_transfer_timeout() > TransportLimits::default().body_transfer_timeout()
+        );
+    }
+
+    /// Configuration moves a ceiling; it never removes one. Whatever config
+    /// asks for, the result is finite and the deadline is still a deadline.
+    #[test]
+    fn git_config_cannot_remove_a_ceiling() {
+        let config = GitConfig::parse(
+            b"[sley]\n\tmaxRefAdvertisementBytes = 0\n\tmaxPackfileResponseBytes = 1024g\n\tminTransferBytesPerSec = 0\n",
+        )
+        .expect("config");
+        let limits = transport_limits_from_config(Some(&config));
+        // 0 reads as "unset", not as "refuse everything"
+        assert_eq!(
+            limits.max_ref_advertisement_bytes,
+            TransportLimits::default().max_ref_advertisement_bytes
+        );
+        assert_eq!(
+            limits.min_transfer_bytes_per_sec,
+            TransportLimits::default().min_transfer_bytes_per_sec
+        );
+        // and an absurd ceiling is clamped rather than trusted
+        assert_eq!(
+            limits.max_packfile_response_bytes,
+            sley_protocol::MAX_CONFIGURABLE_RESPONSE_BYTES
+        );
+        assert!(limits.body_transfer_timeout() <= sley_protocol::MAX_BODY_TRANSFER_TIMEOUT);
+        assert!(limits.body_transfer_timeout() > std::time::Duration::ZERO);
+
+        // an unparseable value is not a way to opt out either
+        let garbage =
+            GitConfig::parse(b"[sley]\n\tmaxRefAdvertisementBytes = enormous\n").expect("config");
+        assert_eq!(
+            transport_limits_from_config(Some(&garbage)),
+            TransportLimits::default()
         );
     }
 }

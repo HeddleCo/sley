@@ -3044,19 +3044,108 @@ mod http_timeout_tests {
     /// budget can be changed without the rest following.
     #[test]
     fn deadlines_are_derived_from_the_size_ceiling() {
+        let limits = TransportLimits::default();
         assert_eq!(
-            HTTP_BODY_TIMEOUT.as_secs(),
+            http_body_timeout(limits).as_secs(),
             MAX_PACKFILE_RESPONSE_BYTES / MIN_TRANSFER_BYTES_PER_SEC
         );
         assert_eq!(
-            HTTP_GLOBAL_TIMEOUT.as_secs(),
+            http_global_timeout(limits).as_secs(),
             HTTP_RESOLVE_TIMEOUT.as_secs()
                 + HTTP_CONNECT_TIMEOUT.as_secs()
                 + HTTP_SEND_REQUEST_TIMEOUT.as_secs()
                 + HTTP_AWAIT_100_TIMEOUT.as_secs()
                 + HTTP_RECV_RESPONSE_TIMEOUT.as_secs()
-                + 2 * HTTP_BODY_TIMEOUT.as_secs()
+                + 2 * http_body_timeout(limits).as_secs()
         );
+    }
+
+    /// A default client is byte-for-byte what it was before the ceilings
+    /// became configurable: configuring nothing changes nothing.
+    #[test]
+    fn an_unconfigured_client_keeps_the_documented_defaults() {
+        let timeouts = UreqHttpClient::new().agent.config().timeouts();
+        assert_eq!(
+            timeouts.recv_body,
+            Some(Duration::from_secs(
+                MAX_PACKFILE_RESPONSE_BYTES / MIN_TRANSFER_BYTES_PER_SEC
+            ))
+        );
+        assert_eq!(timeouts.send_body, timeouts.recv_body);
+        assert_eq!(UreqHttpClient::new().limits(), TransportLimits::default());
+    }
+
+    /// Raising the size ceiling raises the deadline that pays for it, in the
+    /// same value -- the derivation is the point, not a coincidence of the
+    /// default numbers.
+    #[test]
+    fn a_raised_ceiling_moves_the_body_deadline_with_it() {
+        let raised = TransportLimits {
+            max_packfile_response_bytes: 8 * 1024 * 1024 * 1024,
+            ..TransportLimits::default()
+        };
+        let client = UreqHttpClient::with_limits(raised);
+        let timeouts = client.agent.config().timeouts();
+        assert_eq!(
+            timeouts.recv_body,
+            Some(Duration::from_secs(
+                8 * 1024 * 1024 * 1024 / MIN_TRANSFER_BYTES_PER_SEC
+            ))
+        );
+        assert!(timeouts.recv_body > Some(http_body_timeout(TransportLimits::default())));
+    }
+
+    /// The ceiling moves; it does not disappear. Every field stays set and
+    /// every deadline stays finite even when configuration asks for the
+    /// largest ceiling and the slowest rate representable.
+    #[test]
+    fn no_configuration_can_build_a_client_without_deadlines() {
+        let absurd = TransportLimits {
+            max_ref_advertisement_bytes: u64::MAX,
+            max_packfile_response_bytes: u64::MAX,
+            min_transfer_bytes_per_sec: 1,
+        };
+        let client = UreqHttpClient::with_limits(absurd);
+        assert!(
+            client.limits().max_ref_advertisement_bytes
+                <= sley_protocol::MAX_CONFIGURABLE_RESPONSE_BYTES
+        );
+        assert!(
+            client.limits().max_packfile_response_bytes
+                <= sley_protocol::MAX_CONFIGURABLE_RESPONSE_BYTES
+        );
+        let timeouts = client.agent.config().timeouts();
+        for (name, value) in [
+            ("global", timeouts.global),
+            ("per_call", timeouts.per_call),
+            ("resolve", timeouts.resolve),
+            ("connect", timeouts.connect),
+            ("send_request", timeouts.send_request),
+            ("await_100", timeouts.await_100),
+            ("send_body", timeouts.send_body),
+            ("recv_response", timeouts.recv_response),
+            ("recv_body", timeouts.recv_body),
+        ] {
+            let value = value.unwrap_or_else(|| panic!("timeout `{name}` is unbounded"));
+            assert!(
+                value <= sley_protocol::MAX_BODY_TRANSFER_TIMEOUT * 3,
+                "timeout `{name}` is {value:?}, which is not a deadline"
+            );
+        }
+        assert!(
+            client.limits().body_transfer_timeout() <= sley_protocol::MAX_BODY_TRANSFER_TIMEOUT
+        );
+    }
+
+    /// Zero reads as "unset", not as "refuse everything".
+    #[test]
+    fn a_zero_configured_ceiling_falls_back_to_the_default() {
+        let zeroed = TransportLimits {
+            max_ref_advertisement_bytes: 0,
+            max_packfile_response_bytes: 0,
+            min_transfer_bytes_per_sec: 0,
+        };
+        assert_eq!(zeroed.clamped(), TransportLimits::default());
     }
 
     /// A peer that completes the TCP handshake and then says nothing must be
