@@ -72,6 +72,11 @@ Notable closes this wave banked into exact:
 
 **Total SLEY_FAILURE cells:** 1178 across 262 scripts (was ~1371 / 278 at prior matrix).
 
+## Follow-ups
+
+- **Lost EXACT triage:** [`LOST_EXACT_TRIAGE.md`](./LOST_EXACT_TRIAGE.md) — 10 CODE single-cell regressions + 1 HARNESS (`t1517`)
+- **Next waves:** [`NEXT_WAVES.md`](./NEXT_WAVES.md) — R0 restore → N1–N6 residual fan-out
+
 ## Artifacts
 
 All under `crates/sley-testkit/matrix-rerun-20260725-full/`:
@@ -80,3 +85,4 @@ All under `crates/sley-testkit/matrix-rerun-20260725-full/`:
 - `upstream-sley-*.{csv,tsv,txt}`
 - `upstream-cell-comparison.csv` + `-summary.csv`
 - `run.log`
+- `LOST_EXACT_TRIAGE.md`, `NEXT_WAVES.md`
