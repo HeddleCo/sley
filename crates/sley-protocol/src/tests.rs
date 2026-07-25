@@ -7062,3 +7062,88 @@ fn protocol_v2_ls_refs_records_bridge_unborn_head_symref_and_empty() {
         }
     );
 }
+
+// ---- sley#6: bounded pkt-line frame accumulation ---------------------------
+
+/// Number of four-byte control packets a hostile peer sends before giving up.
+/// It must stay above `PktLineReadLimits::CONTROL.max_frames` so the reader's
+/// own bound is what stops it; the assertion in
+/// `over_budget_frame_count_exceeds_the_control_budget` keeps the two in step.
+const OVER_BUDGET_FRAMES: usize = 2 * 1024 * 1024 + 1_024;
+
+/// A `Read` that emits `count` copies of a four-byte pkt-line control packet
+/// and then ends. Every frame is well formed and none of them is the packet the
+/// reader is waiting for, which is exactly what a malicious ref advertisement
+/// looks like: valid framing, no terminator.
+struct RepeatedPktLineFrames {
+    frame: [u8; 4],
+    remaining: usize,
+    position: usize,
+}
+
+impl RepeatedPktLineFrames {
+    fn new(frame: &[u8; 4], count: usize) -> Self {
+        Self {
+            frame: *frame,
+            remaining: count,
+            position: 0,
+        }
+    }
+}
+
+impl Read for RepeatedPktLineFrames {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut written = 0;
+        while written < buf.len() && self.remaining > 0 {
+            buf[written] = self.frame[self.position];
+            written += 1;
+            self.position += 1;
+            if self.position == self.frame.len() {
+                self.position = 0;
+                self.remaining -= 1;
+            }
+        }
+        Ok(written)
+    }
+}
+
+/// Regression (sley#6): `read_pkt_line_frames_until_flush` accumulated frames
+/// into an unbounded `Vec` until a flush arrived. A peer that streams valid
+/// non-flush packets forever is never refused; before the fix this returned
+/// only once the peer stopped, having bought one heap allocation per packet.
+#[test]
+fn read_pkt_line_frames_until_flush_rejects_over_budget_frame_count() {
+    // `0001` (delimiter) is a legal packet that is not a flush.
+    let mut reader = RepeatedPktLineFrames::new(b"0001", OVER_BUDGET_FRAMES);
+    let error = read_pkt_line_frames_until_flush(&mut reader)
+        .expect_err("an over-budget frame stream must be rejected");
+    assert!(
+        format!("{error}").contains("exceeds"),
+        "expected a budget error, got: {error}"
+    );
+}
+
+/// The same primitive backs the response-end form used by protocol v2, so the
+/// v2 path is covered by the same bound rather than by its own patch.
+#[test]
+fn read_pkt_line_frames_until_response_end_rejects_over_budget_frame_count() {
+    // `0000` (flush) is a legal packet that is not a response-end.
+    let mut reader = RepeatedPktLineFrames::new(b"0000", OVER_BUDGET_FRAMES);
+    let error = read_pkt_line_frames_until_response_end(&mut reader)
+        .expect_err("an over-budget frame stream must be rejected");
+    assert!(
+        format!("{error}").contains("exceeds"),
+        "expected a budget error, got: {error}"
+    );
+}
+
+/// `read_pkt_line_frames` stops at end of stream rather than at a control
+/// packet, but accumulates the same way, so it carries the same budget.
+#[test]
+fn read_pkt_line_frames_rejects_over_budget_frame_count() {
+    let mut reader = RepeatedPktLineFrames::new(b"0001", OVER_BUDGET_FRAMES);
+    assert!(
+        read_pkt_line_frames(&mut reader).is_err(),
+        "an over-budget frame stream must be rejected"
+    );
+}

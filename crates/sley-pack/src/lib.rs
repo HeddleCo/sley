@@ -3683,4 +3683,248 @@ mod tests {
         };
         let _ = fs::remove_dir_all(&root);
     }
+
+    // ---- sley#4 / sley#5: bounds on untrusted pack input --------------------
+
+    fn zlib_compress(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(bytes)
+            .expect("test operation should succeed");
+        encoder.finish().expect("test operation should succeed")
+    }
+
+    /// A structurally valid 32-byte pack — correct signature, version, and
+    /// trailing checksum — whose object-count field says `declared`.
+    fn pack_with_declared_object_count(declared: u32) -> Vec<u8> {
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&declared.to_be_bytes());
+        let checksum = sley_core::digest_bytes(ObjectFormat::Sha1, &pack)
+            .expect("test operation should succeed");
+        pack.extend_from_slice(checksum.as_bytes());
+        pack
+    }
+
+    /// Regression (sley#4): the pack header's 32-bit object count is
+    /// attacker-controlled and went straight to `Vec::with_capacity`. A 32-byte
+    /// pack declaring `u32::MAX` objects asks the allocator for ~480 GiB before
+    /// a single entry is inspected; that allocation fails and Rust's OOM handler
+    /// calls `abort()`. Hence the child process: `abort()` takes the whole test
+    /// binary with it, so neither `JoinHandle::join` nor `catch_unwind` can
+    /// observe it the way they observe the sley#35 delta bomb.
+    #[test]
+    fn rejects_absurd_declared_object_count_without_preallocating() {
+        const CHILD_ENV: &str = "SLEY_PACK_OBJECT_COUNT_BOMB_CHILD";
+        const TEST_PATH: &str = "tests::rejects_absurd_declared_object_count_without_preallocating";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            for declared in [u32::MAX, 1 << 30, 1 << 24] {
+                let pack = pack_with_declared_object_count(declared);
+                assert!(
+                    PackFile::parse_sha1(&pack).is_err(),
+                    "a 32-byte pack declaring {declared} objects must be rejected"
+                );
+                assert!(
+                    PackIndex::write_v2_for_pack(&pack, ObjectFormat::Sha1).is_err(),
+                    "index-pack must reject {declared} objects in a 32-byte pack too"
+                );
+                assert!(
+                    PackFile::verify_pack_stats(&pack, ObjectFormat::Sha1).is_err(),
+                    "verify-pack must reject {declared} objects in a 32-byte pack too"
+                );
+            }
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("test binary path should be available");
+        let status = Command::new(exe)
+            .args(["--exact", TEST_PATH, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("re-running the test binary should succeed");
+        assert!(
+            status.success(),
+            "child process died ({status:?}) parsing packs with oversized declared \
+             object counts — the declared count reached an allocation instead of a \
+             bounds check"
+        );
+    }
+
+    /// A pack that declares a merely implausible count — not one large enough
+    /// to abort the process — is still rejected by the header check rather than
+    /// part-way through the entry loop.
+    #[test]
+    fn rejects_declared_object_count_larger_than_pack_can_hold() {
+        let pack = pack_with_declared_object_count(64);
+        let error = PackFile::parse_sha1(&pack).expect_err("declared count must be rejected");
+        assert!(
+            format!("{error}").contains("only has room for"),
+            "expected a declared-count bound error, got: {error}"
+        );
+    }
+
+    /// A delta that ignores its base and emits `result` as a single insert
+    /// instruction. Every link of a chain built from this is the same tiny
+    /// size, so chain *depth* is the only variable under test.
+    fn literal_delta(base_len: usize, result: &[u8]) -> Vec<u8> {
+        assert!(result.len() <= 0x7f, "insert instruction size is one byte");
+        let mut delta = Vec::new();
+        write_delta_varint(&mut delta, base_len as u64);
+        write_delta_varint(&mut delta, result.len() as u64);
+        delta.push(result.len() as u8);
+        delta.extend_from_slice(result);
+        delta
+    }
+
+    /// Distinct 8-byte bodies, so no two links of a chain share an object id.
+    fn chain_bodies(depth: usize) -> Vec<Vec<u8>> {
+        (0..=depth)
+            .map(|idx| format!("{idx:08}").into_bytes())
+            .collect()
+    }
+
+    /// One `ofs-delta` chain of `depth` links on top of a single blob, laid out
+    /// front to back the way a real packer emits it.
+    fn ofs_delta_chain_pack(format: ObjectFormat, depth: usize) -> Vec<u8> {
+        let bodies = chain_bodies(depth);
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&(depth as u32 + 1).to_be_bytes());
+
+        let mut base_offset = pack.len();
+        write_entry_header(&mut pack, ObjectType::Blob, bodies[0].len() as u64);
+        pack.extend_from_slice(&zlib_compress(&bodies[0]));
+
+        for idx in 1..=depth {
+            let delta = literal_delta(bodies[idx - 1].len(), &bodies[idx]);
+            let entry_offset = pack.len();
+            write_pack_entry_header_kind(&mut pack, 6, delta.len() as u64);
+            write_ofs_delta_offset(&mut pack, entry_offset - base_offset);
+            pack.extend_from_slice(&zlib_compress(&delta));
+            base_offset = entry_offset;
+        }
+
+        let checksum =
+            sley_core::digest_bytes(format, &pack).expect("test operation should succeed");
+        pack.extend_from_slice(checksum.as_bytes());
+        pack
+    }
+
+    /// One `ref-delta` chain of `depth` links on top of a single blob. When
+    /// `reversed`, the deltas are laid out deepest-first — legal for ref-deltas
+    /// (unlike ofs-deltas, whose base must precede them) and the adversarial
+    /// shape from sley#5: each full pass of `resolve_pack_entries` can then
+    /// advance the chain by only one link, so an unbounded chain costs one
+    /// whole-list scan per link.
+    fn ref_delta_chain_pack(format: ObjectFormat, depth: usize, reversed: bool) -> Vec<u8> {
+        let bodies = chain_bodies(depth);
+
+        let mut base_entry = Vec::new();
+        write_entry_header(&mut base_entry, ObjectType::Blob, bodies[0].len() as u64);
+        base_entry.extend_from_slice(&zlib_compress(&bodies[0]));
+
+        let mut delta_entries = Vec::with_capacity(depth);
+        for idx in 1..=depth {
+            let delta = literal_delta(bodies[idx - 1].len(), &bodies[idx]);
+            let base_oid = sley_core::object_id_for_bytes(format, "blob", &bodies[idx - 1])
+                .expect("test operation should succeed");
+            let mut entry = Vec::new();
+            write_pack_entry_header_kind(&mut entry, 7, delta.len() as u64);
+            entry.extend_from_slice(base_oid.as_bytes());
+            entry.extend_from_slice(&zlib_compress(&delta));
+            delta_entries.push(entry);
+        }
+        if reversed {
+            delta_entries.reverse();
+        }
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&(depth as u32 + 1).to_be_bytes());
+        if !reversed {
+            pack.extend_from_slice(&base_entry);
+        }
+        for entry in &delta_entries {
+            pack.extend_from_slice(entry);
+        }
+        if reversed {
+            pack.extend_from_slice(&base_entry);
+        }
+
+        let checksum =
+            sley_core::digest_bytes(format, &pack).expect("test operation should succeed");
+        pack.extend_from_slice(checksum.as_bytes());
+        pack
+    }
+
+    /// A chain exactly at the ceiling still resolves: the bound must not reject
+    /// anything sley's own writer (or git at its `pack.depth` default) emits.
+    #[test]
+    fn resolves_delta_chain_at_the_depth_ceiling() {
+        for pack in [
+            ofs_delta_chain_pack(ObjectFormat::Sha1, DEFAULT_PACK_DEPTH),
+            ref_delta_chain_pack(ObjectFormat::Sha1, DEFAULT_PACK_DEPTH, false),
+        ] {
+            let parsed = PackFile::parse_sha1(&pack).expect("a chain at the ceiling must resolve");
+            assert_eq!(parsed.entries.len(), DEFAULT_PACK_DEPTH + 1);
+        }
+    }
+
+    /// Regression (sley#5): the read path enforced no chain-depth limit at all.
+    /// `DEFAULT_PACK_DEPTH` existed but was consulted only when *writing*.
+    #[test]
+    fn rejects_delta_chain_deeper_than_the_ceiling() {
+        for pack in [
+            ofs_delta_chain_pack(ObjectFormat::Sha1, DEFAULT_PACK_DEPTH + 1),
+            ref_delta_chain_pack(ObjectFormat::Sha1, DEFAULT_PACK_DEPTH + 1, false),
+        ] {
+            let error =
+                PackFile::parse_sha1(&pack).expect_err("a chain past the ceiling must be rejected");
+            assert!(
+                format!("{error}").contains("exceeds maximum depth"),
+                "expected a chain-depth error, got: {error}"
+            );
+        }
+    }
+
+    /// Regression (sley#5): a long chain laid out back to front made
+    /// `resolve_pack_entries` run one full pass per link — O(N^2) scans on top
+    /// of O(N) delta applications — with nothing to stop it. The depth ceiling
+    /// also bounds the pass count, because every pass advances each chain by at
+    /// least one link, so resolution now gives up after a fixed number of passes
+    /// instead of after N of them.
+    #[test]
+    fn rejects_adversarially_ordered_long_delta_chain_promptly() {
+        let pack = ref_delta_chain_pack(ObjectFormat::Sha1, 5_000, true);
+        let started = std::time::Instant::now();
+        let error = PackFile::parse_sha1(&pack)
+            .expect_err("a long adversarial chain must be rejected, not resolved");
+        let elapsed = started.elapsed();
+        assert!(
+            format!("{error}").contains("exceeds maximum depth"),
+            "expected a chain-depth error, got: {error}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "rejection took {elapsed:?}; resolution is still doing work proportional \
+             to the chain length"
+        );
+    }
+
+    /// `index-pack` resolves through the same helper, so it inherits the same
+    /// ceiling — the bound belongs to the shared resolver, not to one caller.
+    #[test]
+    fn index_pack_rejects_delta_chain_deeper_than_the_ceiling() {
+        let pack = ofs_delta_chain_pack(ObjectFormat::Sha1, DEFAULT_PACK_DEPTH + 1);
+        let error = PackIndex::write_v2_for_pack(&pack, ObjectFormat::Sha1)
+            .expect_err("index-pack must reject a chain past the ceiling");
+        assert!(
+            format!("{error}").contains("exceeds maximum depth"),
+            "expected a chain-depth error, got: {error}"
+        );
+    }
 }
