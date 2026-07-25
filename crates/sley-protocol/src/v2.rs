@@ -2,7 +2,7 @@ use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use std::io::{Read, Write};
 
 use crate::pktline::{
-    PktLineFrame, ProtocolVersion, line, line_from_str, parse_oid_argument,
+    PktLineFrame, ProtocolVersion, line, line_from_str, parse_error_line, parse_oid_argument,
     parse_protocol_v2_line_text, read_pkt_line_frame, read_pkt_line_frames_until_flush,
     read_pkt_line_frames_until_response_end, trace_packet_read_payload, trim_trailing_lf,
     validate_capability_name, validate_protocol_v2_line, validate_protocol_v2_token,
@@ -925,6 +925,11 @@ fn frames_start_with_protocol_v2_advertisement(frames: &[PktLineFrame]) -> bool 
 /// sideband-wrapped. We demux it here so the section-header reader in
 /// `read_protocol_v2_fetch_response_header` sees a plain payload rather than a raw
 /// control byte.
+/// Map a server `ERR <msg>` / sideband-fatal payload to git's client wording.
+fn remote_protocol_error(message: impl AsRef<str>) -> GitError {
+    GitError::InvalidFormat(format!("fatal: remote error: {}", message.as_ref().trim_end()))
+}
+
 fn skip_leading_protocol_v2_advertisement_if_present(
     reader: &mut impl Read,
     sideband_all: bool,
@@ -935,6 +940,12 @@ fn skip_leading_protocol_v2_advertisement_if_present(
     let PktLineFrame::Data(payload) = &first else {
         return Ok(Some(first));
     };
+    // Plain `ERR <msg>` packets (no sideband) are how upload-pack reports
+    // `not our ref` / `unknown ref` before any response section starts.
+    if trim_trailing_lf(payload).starts_with(b"ERR ") {
+        let error = parse_error_line(payload)?;
+        return Err(remote_protocol_error(error.message));
+    }
     if trim_trailing_lf(payload) != b"version 2" {
         if sideband_all {
             // Not an advertisement: the first fetch-response frame is
@@ -946,9 +957,7 @@ fn skip_leading_protocol_v2_advertisement_if_present(
                 SideBandChannel::Progress => read_protocol_v2_fetch_metadata_frame(reader, true)?,
                 SideBandChannel::Fatal => {
                     let message = String::from_utf8_lossy(&packet.data).into_owned();
-                    return Err(GitError::InvalidFormat(format!(
-                        "sideband fatal: {message}"
-                    )));
+                    return Err(remote_protocol_error(message));
                 }
             };
             return Ok(Some(demuxed));
@@ -1481,6 +1490,12 @@ fn read_protocol_v2_fetch_metadata_frame(
     loop {
         let frame = read_pkt_line_frame(reader)?
             .ok_or_else(|| GitError::InvalidFormat("fetch response ended before flush".into()))?;
+        if let PktLineFrame::Data(payload) = &frame
+            && trim_trailing_lf(payload).starts_with(b"ERR ")
+        {
+            let error = parse_error_line(payload)?;
+            return Err(remote_protocol_error(error.message));
+        }
         if sideband_all && let PktLineFrame::Data(payload) = frame {
             let packet = parse_sideband_packet(&payload)?;
             match packet.channel {
@@ -1488,9 +1503,7 @@ fn read_protocol_v2_fetch_metadata_frame(
                 SideBandChannel::Progress => continue,
                 SideBandChannel::Fatal => {
                     let message = String::from_utf8_lossy(&packet.data).into_owned();
-                    return Err(GitError::InvalidFormat(format!(
-                        "sideband fatal: {message}"
-                    )));
+                    return Err(remote_protocol_error(message));
                 }
             }
         }

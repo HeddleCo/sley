@@ -556,7 +556,7 @@ impl<'a> ReachablePackThinBaseCandidates<'a> {
 /// dropping the objects the filter omits. Explicitly-`wanted` objects (the tips
 /// the client asked for) are always retained even when the filter would drop
 /// them. Shared by the in-process fetch pack builders and the upload-pack server.
-fn retain_filtered_pack_objects<R>(
+pub(crate) fn retain_filtered_pack_objects<R>(
     objects: &mut Vec<ReachablePackObject>,
     filter: Option<&PackObjectFilter>,
     wanted: &HashSet<ObjectId>,
@@ -1448,7 +1448,20 @@ pub(crate) fn prune_stale_multi_pack_index(
         removed_stems.contains(stem)
     });
     if references_removed_pack {
+        // Mirror git's `clear_midx_file`: drop the MIDX and every sidecar
+        // (`multi-pack-index-*.bitmap`, `.rev`, …).
         remove_file_if_exists(&midx_path)?;
+        if let Ok(entries) = fs::read_dir(pack_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if name.starts_with("multi-pack-index") {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
     }
     Ok(())
 }

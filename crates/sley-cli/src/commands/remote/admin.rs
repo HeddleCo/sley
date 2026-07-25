@@ -210,9 +210,17 @@ pub(crate) fn cmd_remote_add(context: &RemoteCommandContext, args: &[String]) ->
     let mut mirror = RemoteAddMirror::None;
     let mut fetch = false;
     let mut positional = Vec::new();
+    let mut positional_only = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
+        if positional_only {
+            positional.push(arg.as_str());
+            continue;
+        }
         match arg.as_str() {
+            // `git remote add origin -- ../path` uses `--` as end-of-options
+            // (t5510 case-insensitive D/F fixtures).
+            "--" => positional_only = true,
             "-f" | "--fetch" => fetch = true,
             "--no-fetch" => fetch = false,
             "-t" | "--track" => {

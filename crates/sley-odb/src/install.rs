@@ -1090,7 +1090,7 @@ impl FileObjectDatabase {
         &self,
         reader: &mut R,
         options: RawPackInstallOptions,
-        progress: F,
+        mut progress: F,
     ) -> Result<PackInstallResult>
     where
         R: Read,
@@ -1106,22 +1106,42 @@ impl FileObjectDatabase {
                 .write(true)
                 .create_new(true)
                 .open(&temp_pack_path)?;
-            let built = {
+            // Stream the pack bytes first, reporting progress, then re-index with
+            // access to this database as external bases. Thin packs from a full
+            // server against a partial clone need REF_DELTA bases that live only
+            // as promisor-promised (or previously installed) objects.
+            {
                 let mut tee = PackInstallTeeReader {
                     reader,
                     writer: &mut file,
                     max_input_size: options.max_input_size,
                     written: 0,
                 };
-                PackIndex::write_v2_for_pack_reader_to_trailer_with_progress(
-                    &mut tee,
-                    self.format,
-                    progress,
-                )?
-            };
+                let mut buf = [0u8; 64 * 1024];
+                loop {
+                    let n = tee.read(&mut buf).map_err(|err| GitError::Io(err.to_string()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    progress(PackStreamProgress {
+                        received_bytes: tee.written as u64,
+                        received_objects: 0,
+                        total_objects: 0,
+                    });
+                }
+            }
             file.flush()?;
             file.sync_all()?;
             drop(file);
+
+            let pack_bytes = fs::read(&temp_pack_path)?;
+            let built = PackIndex::write_v2_for_pack_with_base(&pack_bytes, self.format, |oid| {
+                match self.read_object(oid) {
+                    Ok(object) => Ok(Some((*object).clone())),
+                    Err(GitError::NotFound(_)) => Ok(None),
+                    Err(err) => Err(err),
+                }
+            })?;
 
             self.install_pack_file_from_temp(
                 &temp_pack_path,

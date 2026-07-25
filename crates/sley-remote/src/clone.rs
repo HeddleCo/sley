@@ -381,13 +381,17 @@ fn clone_impl(
         None => {
             // The remote advertised no tip for the branch we are tracking. When
             // the caller did not request an explicit branch this is an
-            // empty/unborn-repository clone: upstream `builtin/clone.c` warns,
-            // skips the checkout, and leaves `HEAD` as an unborn symref pointing
-            // at the remote's (or local default) branch — `update_head`'s
-            // `unborn` arm. We mirror that by setting `HEAD` and returning a
-            // marker for the CLI to print the warning. An explicit-branch miss
-            // is still a hard error (the CLI maps it to git's "Remote branch …
-            // not found" message).
+            // empty/unborn-repository clone: upstream `builtin/clone.c` leaves
+            // `HEAD` as an unborn symref pointing at the remote's (or local
+            // default) branch — `update_head`'s `unborn` arm. An explicit-branch
+            // miss is still a hard error (the CLI maps it to git's "Remote
+            // branch … not found" message).
+            //
+            // "Empty" is strictly "no mapped refs after fetch" (git's
+            // `if (!mapped_refs)`). An unborn HEAD on a non-empty remote still
+            // fetches other branches (t5702 #19): that is not empty, and the
+            // CLI warns "remote HEAD refers to nonexistent ref" instead of the
+            // empty-repository message.
             if request.options.branch_explicit {
                 return Err(GitError::reference_not_found(format!(
                     "remote ref {remote_branch_ref}"
@@ -405,10 +409,14 @@ fn clone_impl(
             // Install branch upstream config for the unborn branch, matching
             // git's `install_branch_config` in the unborn path.
             (services.configure_branch)(&git_dir, request.options.checkout_branch)?;
+            let empty = !fetch_outcome
+                .ref_updates
+                .iter()
+                .any(|update| update.dst.is_some());
             return Ok(CloneOutcome {
                 git_dir,
                 branch_oid: None,
-                empty: true,
+                empty,
                 pack_generation_progress: fetch_outcome.pack_generation_progress,
             });
         }
@@ -691,6 +699,7 @@ fn fetch_http_partial_clone_checkout_blobs(
         format: request.format,
         remote,
         wants,
+        want_refs: Vec::new(),
         haves: None,
         shallow: Vec::new(),
         deepen: None,

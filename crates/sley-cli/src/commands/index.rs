@@ -338,12 +338,17 @@ impl LsTreePathContext {
         full_name: bool,
         full_tree: bool,
     ) -> Result<Self> {
+        // Bare repositories have no worktree prefix; pathspecs are already
+        // root-relative (git's `ls-tree` in a bare repo).
         let prefix = if full_tree {
             String::new()
         } else {
-            worktree_prefix(cli_session, cwd, git_dir)?
-                .trim_end_matches('/')
-                .to_string()
+            match cli_session.optional_worktree_for_git_dir(git_dir)? {
+                Some(_) => worktree_prefix(cli_session, cwd, git_dir)?
+                    .trim_end_matches('/')
+                    .to_string(),
+                None => String::new(),
+            }
         };
         let cwd_depth = path_component_count(prefix.as_bytes());
         Ok(Self {

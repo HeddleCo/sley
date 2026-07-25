@@ -546,7 +546,51 @@ fn fetch_impl(
                 has_merge_config,
                 tracking_refspecs: &tracking_refspecs,
             })?;
-            let wants = updates.iter().map(|update| update.oid).collect();
+            // Prefer protocol-v2 `want-ref` when the server advertised `ref-in-want`
+            // so tracking refs land on the OID current at request time (not the
+            // earlier ls-refs snapshot). Exact-OID wants still go as `want`.
+            let v2_fetch_features = discovered
+                .handshake
+                .as_ref()
+                .and_then(|handshake| {
+                    sley_protocol::parse_protocol_v2_fetch_features(&handshake.capabilities)
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or_default();
+            let use_ref_in_want = discovered.set.protocol == ProtocolVersion::V2
+                && v2_fetch_features.ref_in_want
+                && options.depth.is_none()
+                && options.deepen_since.is_none()
+                && options.deepen_not.is_empty()
+                && !promisor_remote
+                && options.filter.is_none()
+                && !options.refetch;
+            let mut seen_want_refs = HashSet::new();
+            let want_refs: Vec<String> = if use_ref_in_want {
+                updates
+                    .iter()
+                    .filter(|update| update.src.starts_with("refs/"))
+                    .filter(|update| seen_want_refs.insert(update.src.clone()))
+                    .map(|update| update.src.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let wants: Vec<ObjectId> = if use_ref_in_want {
+                let mut seen = HashSet::new();
+                updates
+                    .iter()
+                    .filter(|update| {
+                        ObjectId::from_hex(request.format, &update.src).is_ok()
+                            || !update.src.starts_with("refs/")
+                    })
+                    .map(|update| update.oid)
+                    .filter(|oid| seen.insert(*oid))
+                    .collect()
+            } else {
+                updates.iter().map(|update| update.oid).collect()
+            };
             // Shallow fetch: replay the current boundary as `shallow` lines and ask
             // the server to deepen to `depth`, then fold the server's shallow-info
             // back into `$GIT_DIR/shallow`. A `None` depth keeps the full-fetch path.
@@ -559,6 +603,7 @@ fn fetch_impl(
                 format: request.format,
                 remote,
                 wants,
+                want_refs,
                 haves: negotiation_haves.clone(),
                 shallow: existing_shallow,
                 deepen: options.depth,
@@ -579,12 +624,20 @@ fn fetch_impl(
                             .into(),
                     )
                 })?;
-                crate::http::install_fetch_pack_via_http_protocol_v2_fetch(
+                let v2_outcome = crate::http::install_fetch_pack_via_http_protocol_v2_fetch(
                     pack_request,
                     handshake,
                     services.credentials,
                     services.progress,
-                )?
+                )?;
+                for wanted in v2_outcome.wanted_refs {
+                    for update in &mut updates {
+                        if update.src == wanted.name {
+                            update.oid = wanted.oid;
+                        }
+                    }
+                }
+                v2_outcome.shallow_info
             } else {
                 crate::http::install_fetch_pack_via_http_upload_pack(
                     pack_request,
@@ -802,8 +855,26 @@ fn fetch_impl(
                     request.format.name()
                 )));
             }
-            let advertisements =
-                crate::local::local_fetch_advertisements(remote_git_dir, request.format)?;
+            // Protocol v2: real `ls-refs` with ref-prefix filtering so the
+            // packet log and advertised set match git (t5702 #24/#48/#49).
+            let advertisements = if request.config.get("protocol", None, "version") == Some("2") {
+                let mut prefixes =
+                    sley_protocol::refspec_ref_prefixes(&parsed_refspecs, request.format);
+                if options.auto_follow_tags || options.fetch_all_tags {
+                    prefixes.push("refs/tags/".into());
+                }
+                if prefixes.is_empty() {
+                    prefixes.push("HEAD".into());
+                }
+                crate::local::local_protocol_v2_ls_refs_advertisements(
+                    remote_git_dir,
+                    request.format,
+                    &prefixes,
+                    &[],
+                )?
+            } else {
+                crate::local::local_fetch_advertisements(remote_git_dir, request.format)?
+            };
             let remote_config =
                 sley_config::read_repo_config(remote_common_git_dir, None).unwrap_or_default();
             let mut promisor_decision = crate::PromisorRemoteDecision::default();
@@ -1942,8 +2013,10 @@ fn validate_incoming_fetch_objects(
     if destination_has_promisor {
         for oid in &roots {
             if !db.contains(oid)? {
-                println!("missing commit {oid}");
-                return Err(GitError::Exit(128));
+                // Match git's check_connected wording (clone.c / fetch-pack.c).
+                return Err(GitError::InvalidFormat(
+                    "fatal: remote did not send all necessary objects".into(),
+                ));
             }
         }
         if policy.is_none_or(|policy| !policy.enabled) && !require_connectivity {
@@ -1991,7 +2064,11 @@ fn validate_incoming_fetch_objects(
     if report.is_ok() {
         Ok(())
     } else {
-        Err(GitError::Exit(128))
+        // Full connectivity failure for a non-promisor destination matches
+        // git's check_connected die message used by clone and fetch-pack.
+        Err(GitError::InvalidFormat(
+            "fatal: remote did not send all necessary objects".into(),
+        ))
     }
 }
 

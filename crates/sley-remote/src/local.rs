@@ -27,11 +27,11 @@ use sley_odb::{
     build_reachable_pack_filtered, collect_reachable_object_ids,
 };
 use sley_protocol::{
-    PKT_LINE_MAX_PAYLOAD_LEN, PktLineFrame, ProtocolV2FetchAcknowledgment, ProtocolV2FetchFeatures,
-    ProtocolV2FetchRequest, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
-    ProtocolV2FetchWantedRef, ProtocolV2LsRefsFeatures, ProtocolV2LsRefsRecord,
-    ProtocolV2LsRefsRef, ProtocolV2LsRefsRequest, ProtocolVersion, ReceivePackCommand,
-    ReceivePackCommandStatus, ReceivePackFeatures, ReceivePackPushRequest,
+    PKT_LINE_MAX_PAYLOAD_LEN, PktLineFrame, ProtocolErrorLine, ProtocolV2FetchAcknowledgment,
+    ProtocolV2FetchFeatures, ProtocolV2FetchRequest, ProtocolV2FetchResponseSection,
+    ProtocolV2FetchShallowInfo, ProtocolV2FetchWantedRef, ProtocolV2LsRefsFeatures,
+    ProtocolV2LsRefsRecord, ProtocolV2LsRefsRef, ProtocolV2LsRefsRequest, ProtocolVersion,
+    ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures, ReceivePackPushRequest,
     ReceivePackPushRequestHeader, ReceivePackReportStatus, ReceivePackRequest,
     ReceivePackUnpackStatus, RefAdvertisement, SideBandChannel, SideBandPacket, TransportHandshake,
     UploadPackAckStatus, UploadPackAcknowledgment, UploadPackFeatures,
@@ -39,13 +39,14 @@ use sley_protocol::{
     UploadPackRequest, apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
     classify_protocol_v2_command_request, encode_protocol_v2_fetch_capability,
     encode_protocol_v2_ls_refs_capability, encode_receive_pack_features,
-    encode_upload_pack_features, read_protocol_v2_command_request, read_upload_pack_acknowledgment,
+    encode_upload_pack_features, protocol_v2_ls_refs_records_to_ref_advertisement_set,
+    read_protocol_v2_command_request, read_upload_pack_acknowledgment,
     read_upload_pack_negotiation_request, read_upload_pack_request,
-    validate_receive_pack_push_request_features, write_pkt_line_frame, write_pkt_line_payload,
-    write_protocol_v2_advertisement, write_protocol_v2_fetch_request,
-    write_protocol_v2_fetch_response, write_protocol_v2_ls_refs_response,
-    write_upload_pack_acknowledgment, write_upload_pack_negotiation_request,
-    write_upload_pack_request,
+    validate_receive_pack_push_request_features, write_error_line, write_pkt_line_frame,
+    write_pkt_line_payload, write_protocol_v2_advertisement, write_protocol_v2_command_request,
+    write_protocol_v2_fetch_request, write_protocol_v2_fetch_response,
+    write_protocol_v2_ls_refs_response, write_upload_pack_acknowledgment,
+    write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::{
     DeleteRef, FileRefStore, Ref, RefDeletePrecondition, RefPrecondition, RefTarget, ReflogEntry,
@@ -615,6 +616,39 @@ fn canonical_receive_pack_update_commands(
         });
     }
     Ok(canonical)
+}
+
+/// Protocol-v2 `ls-refs` advertisements for a local repository with optional
+/// `ref-prefix` filtering. Writes the client command and server response to the
+/// packet trace so tests can observe filtered ads (t5702).
+pub fn local_protocol_v2_ls_refs_advertisements(
+    git_dir: &Path,
+    format: ObjectFormat,
+    ref_prefixes: &[String],
+    server_options: &[String],
+) -> Result<Vec<RefAdvertisement>> {
+    sley_protocol::set_packet_trace_identity("fetch");
+    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    let request = ProtocolV2LsRefsRequest {
+        peel: true,
+        symrefs: true,
+        unborn: lsrefs_unborn_config(&config) != LsRefsUnbornConfig::Ignore,
+        ref_prefixes: ref_prefixes.to_vec(),
+    };
+    let mut command = request.to_command_request()?;
+    for option in server_options {
+        command.capabilities.push(Capability {
+            name: "server-option".into(),
+            value: Some(option.clone()),
+        });
+    }
+    let mut request_bytes = Vec::new();
+    write_protocol_v2_command_request(&mut request_bytes, &command)?;
+    let records = local_ls_refs_v2_records(git_dir, format, &request, &config)?;
+    let mut response_bytes = Vec::new();
+    write_protocol_v2_ls_refs_response(&mut response_bytes, &records)?;
+    let set = protocol_v2_ls_refs_records_to_ref_advertisement_set(&records)?;
+    Ok(set.refs)
 }
 
 /// The ref advertisements a local repository would send to a fetching client:
@@ -2438,6 +2472,58 @@ fn packfile_section_lines(pack: &[u8]) -> Vec<Vec<u8>> {
     lines
 }
 
+/// Protocol-level upload-pack error that must be written as an `ERR` pkt-line
+/// (git's `packet_writer_error`) so the client can report
+/// `fatal: remote error: …`.
+fn upload_pack_protocol_error(message: impl Into<String>) -> GitError {
+    GitError::Command(format!("upload-pack-protocol-error:{}", message.into()))
+}
+
+fn upload_pack_protocol_error_message(err: &GitError) -> Option<&str> {
+    match err {
+        GitError::Command(msg) => msg.strip_prefix("upload-pack-protocol-error:"),
+        _ => None,
+    }
+}
+
+/// Resolve each `want-ref` against the active namespace and hideRefs, returning
+/// the logical name → oid mapping. Unknown or hidden refs produce the same
+/// `unknown ref <name>` protocol error as git's `parse_want_ref`.
+fn resolve_upload_pack_want_refs(
+    git_dir: &Path,
+    format: ObjectFormat,
+    want_refs: &[String],
+) -> Result<Vec<ProtocolV2FetchWantedRef>> {
+    let store = FileRefStore::new(git_dir, format);
+    let hidden = transfer_upload_hidden_ref_patterns(git_dir);
+    let mut wanted = Vec::with_capacity(want_refs.len());
+    let mut seen = HashSet::new();
+    for name in want_refs {
+        if !seen.insert(name.as_str()) {
+            return Err(upload_pack_protocol_error(format!("duplicate want-ref {name}")));
+        }
+        let physical = sley_core::expand_namespace(name);
+        if sley_core::ref_is_hidden(Some(name.as_str()), &physical, &hidden) {
+            return Err(upload_pack_protocol_error(format!("unknown ref {name}")));
+        }
+        let Some(target) = store.read_ref(&physical)? else {
+            return Err(upload_pack_protocol_error(format!("unknown ref {name}")));
+        };
+        let reference = Ref {
+            name: physical,
+            target,
+        };
+        let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? else {
+            return Err(upload_pack_protocol_error(format!("unknown ref {name}")));
+        };
+        wanted.push(ProtocolV2FetchWantedRef {
+            oid,
+            name: name.clone(),
+        });
+    }
+    Ok(wanted)
+}
+
 /// Build the protocol-v2 `fetch` response sections for a request against the
 /// repository at `git_dir`. Mirrors `upload-pack.c::upload_pack_v2`'s
 /// stateless single-round behavior: the client always sends `done` (the v2
@@ -2449,6 +2535,22 @@ fn local_fetch_v2_sections(
     request: &ProtocolV2FetchRequest,
 ) -> Result<Vec<ProtocolV2FetchResponseSection>> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
+
+    // Validate direct wants and resolve want-refs before acknowledgments, matching
+    // git's `process_args` / `parse_want` / `parse_want_ref` ordering: a missing
+    // object or unknown ref dies with an ERR packet before any ACK section.
+    for oid in &request.wants {
+        if !db.contains(oid)? {
+            return Err(upload_pack_protocol_error(format!(
+                "upload-pack: not our ref {oid}"
+            )));
+        }
+    }
+    let resolved_want_refs = if request.want_refs.is_empty() {
+        Vec::new()
+    } else {
+        resolve_upload_pack_want_refs(git_dir, format, &request.want_refs)?
+    };
 
     let mut sections = Vec::new();
 
@@ -2483,37 +2585,17 @@ fn local_fetch_v2_sections(
         }
     }
 
-    // Wanted-refs: resolve each `want-ref <name>` to its current oid.
-    if !request.want_refs.is_empty() {
-        let store = FileRefStore::new(git_dir, format);
-        let mut wanted = Vec::new();
-        for name in &request.want_refs {
-            let reference = Ref {
-                name: name.clone(),
-                target: store
-                    .read_ref(name)?
-                    .ok_or_else(|| GitError::not_found(format!("want-ref {name}")))?,
-            };
-            let (oid, _) = resolve_for_each_ref_target(&store, &reference)?
-                .ok_or_else(|| GitError::not_found(format!("want-ref {name}")))?;
-            wanted.push(sley_protocol::ProtocolV2FetchWantedRef {
-                oid,
-                name: name.clone(),
-            });
-        }
-        sections.push(ProtocolV2FetchResponseSection::WantedRefs(wanted));
+    // Wanted-refs: emit the logical name → current oid mapping resolved above.
+    if !resolved_want_refs.is_empty() {
+        sections.push(ProtocolV2FetchResponseSection::WantedRefs(
+            resolved_want_refs.clone(),
+        ));
     }
 
     // Resolve want-refs into concrete wants for the pack walk.
     let mut wants: Vec<ObjectId> = request.wants.clone();
-    if !request.want_refs.is_empty()
-        && let Some(ProtocolV2FetchResponseSection::WantedRefs(wanted)) = sections
-            .iter()
-            .find(|s| matches!(s, ProtocolV2FetchResponseSection::WantedRefs(_)))
-    {
-        for w in wanted {
-            wants.push(w.oid);
-        }
+    for w in &resolved_want_refs {
+        wants.push(w.oid);
     }
     // A capability-only fetch command (for example the upstream
     // `packfile-uris` validation probe) has no pack request to answer. Git
@@ -2755,10 +2837,27 @@ fn serve_upload_pack_v2_inner(
                 writer.flush()?;
             }
             sley_protocol::ProtocolV2Command::Fetch(fetch) => {
-                let sections = local_fetch_v2_sections(git_dir, format, &fetch)?;
-                if !sections.is_empty() {
-                    write_protocol_v2_fetch_response(writer, &sections)?;
-                    writer.flush()?;
+                match local_fetch_v2_sections(git_dir, format, &fetch) {
+                    Ok(sections) => {
+                        if !sections.is_empty() {
+                            write_protocol_v2_fetch_response(writer, &sections)?;
+                            writer.flush()?;
+                        }
+                    }
+                    Err(err) => {
+                        // Mirror git's packet_writer_error + die: emit ERR so the
+                        // client can report `fatal: remote error: …`, then fail.
+                        if let Some(message) = upload_pack_protocol_error_message(&err) {
+                            write_error_line(
+                                writer,
+                                &ProtocolErrorLine {
+                                    message: message.to_string(),
+                                },
+                            )?;
+                            writer.flush()?;
+                        }
+                        return Err(err);
+                    }
                 }
             }
             sley_protocol::ProtocolV2Command::ObjectInfo(_)

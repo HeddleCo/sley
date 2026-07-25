@@ -1299,6 +1299,10 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
     }
     if outcome.empty {
         warn_cloned_empty_repository();
+    } else if outcome.branch_oid.is_none() && checkout {
+        // Unborn remote HEAD on a non-empty repository: refs were fetched but
+        // there is no tip to check out (t5702 #19). Bare clones skip this.
+        warn_remote_head_nonexistent();
     } else if !checkout {
         remove_clone_worktree_files(&checkout_destination, &git_dir, format)?;
     } else if sparse {
@@ -2264,6 +2268,8 @@ fn clone_network_repository(
 
         if empty {
             warn_cloned_empty_repository();
+        } else if outcome.branch_oid.is_none() && options.checkout {
+            warn_remote_head_nonexistent();
         } else if !options.checkout {
             remove_clone_worktree_files(options.destination, &git_dir, format)?;
         } else if options.sparse {
@@ -3923,6 +3929,13 @@ fn warn_cloned_empty_repository() {
     eprintln!("warning: You appear to have cloned an empty repository.");
 }
 
+/// git's unborn-HEAD checkout warning from `builtin/clone.c::checkout`: the
+/// remote's default branch was advertised as unborn (or otherwise has no tip
+/// after fetch), so worktree materialisation is skipped.
+fn warn_remote_head_nonexistent() {
+    eprintln!("warning: remote HEAD refers to nonexistent ref, unable to checkout");
+}
+
 fn die_no_directory_name() -> String {
     // Upstream `die()`s here; sley callers only reach this with degenerate URLs
     // that the CLI already rejects. Fall back to a stable placeholder so the
@@ -4032,20 +4045,27 @@ fn clone_remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Resu
     if remote_store.read_ref(&target)?.is_some() {
         return Ok(Some(branch.to_string()));
     }
-    let namespace = sley_core::get_git_namespace();
-    let heads_prefix = if namespace.is_empty() {
-        "refs/heads/".to_string()
-    } else {
-        format!("{namespace}refs/heads/")
-    };
-    if remote_store
-        .list_refs()?
-        .into_iter()
-        .any(|reference| reference.name.starts_with(&heads_prefix))
-    {
+    // Unborn HEAD (points at a not-yet-created branch). Local/file:// clones
+    // discover this by reading the source filesystem rather than the protocol
+    // advertisement, so they must emulate `lsrefs.unborn`: when the server is
+    // configured to `ignore`, unborn HEADs are not advertised and the client
+    // falls back to its own default branch name (t5702 #17 / #22). Otherwise
+    // the unborn target is propagated even when the remote has other refs
+    // (t5702 #19 / #21).
+    if remote_lsrefs_unborn_ignored(remote_git_dir) {
         return Ok(None);
     }
     Ok(Some(branch.to_string()))
+}
+
+/// Whether the remote's `lsrefs.unborn` is `ignore` (server will not advertise
+/// an unborn HEAD over protocol v2). Defaults to advertising when unset.
+fn remote_lsrefs_unborn_ignored(remote_git_dir: &Path) -> bool {
+    read_repo_config_on_disk(remote_git_dir)
+        .ok()
+        .and_then(|config| config.get("lsrefs", None, "unborn").map(str::to_string))
+        .as_deref()
+        == Some("ignore")
 }
 
 fn clone_branch_pointing_at(
@@ -4262,9 +4282,10 @@ pub(super) fn register_promisor_remote(
     filter_spec: &str,
 ) -> Result<()> {
     let mut config = read_repo_config_on_disk(git_dir)?;
-    if config.get("remote", Some(name), "url").is_none() {
-        return Ok(());
-    }
+    // git's `partial_clone_register` records `remote.<name>.promisor` even when
+    // the fetch target is a bare URL with no pre-configured remote section
+    // (t5702 "partial fetch" uses `file://…` and creates
+    // `remote.<url>.promisor=true`). Do not require an existing `remote.<name>.url`.
     if config.get_bool("remote", Some(name), "promisor") == Some(true)
         && config
             .get("remote", Some(name), "partialclonefilter")

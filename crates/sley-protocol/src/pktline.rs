@@ -628,6 +628,47 @@ pub fn encode_refspec(refspec: &RefSpec) -> Result<String> {
     Ok(out)
 }
 
+/// Expand a short ref name into the protocol-v2 `ref-prefix` candidates git's
+/// `expand_ref_prefix` produces (`%.*s`, `refs/%.*s`, …, `refs/remotes/%.*s/HEAD`).
+pub fn expand_ref_prefix(prefix: &str) -> Vec<String> {
+    vec![
+        prefix.to_string(),
+        format!("refs/{prefix}"),
+        format!("refs/tags/{prefix}"),
+        format!("refs/heads/{prefix}"),
+        format!("refs/remotes/{prefix}"),
+        format!("refs/remotes/{prefix}/HEAD"),
+    ]
+}
+
+/// Build the protocol-v2 `ref-prefix` list for a set of fetch refspecs the way
+/// upstream `refspec_ref_prefixes` (refspec.c) does: exact SHA-1 sources are
+/// skipped, pattern sources contribute the prefix before `*`, and plain sources
+/// are expanded through [`expand_ref_prefix`].
+pub fn refspec_ref_prefixes(refspecs: &[RefSpec], format: ObjectFormat) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    for refspec in refspecs {
+        if refspec.negative {
+            continue;
+        }
+        let Some(src) = refspec.src.as_deref() else {
+            continue;
+        };
+        // Exact OID wants do not constrain the advertisement.
+        if ObjectId::from_hex(format, src).is_ok() {
+            continue;
+        }
+        if refspec.pattern {
+            if let Some(glob) = src.find('*') {
+                prefixes.push(src[..glob].to_string());
+            }
+        } else {
+            prefixes.extend(expand_ref_prefix(src));
+        }
+    }
+    prefixes
+}
+
 pub fn refspec_matches_source(refspec: &RefSpec, source: &str) -> Result<bool> {
     Ok(refspec_map_source(refspec, source)?.is_some())
 }
