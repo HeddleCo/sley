@@ -1,0 +1,18 @@
+schema	sley-upstream-run-metadata-v1
+run_label	full-sley-fd46d208
+target	sley
+candidate_commit	fd46d208e449869e5c6bf402d70ea8c88898fc72
+candidate_tree_state	dirty
+target_binary	/Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/target/release/sley
+target_binary_checksum	2370480542:28963856
+target_version	git version 2.55.0
+upstream_commit	e9019fcafe0040228b8631c30f97ae1adb61bcdc
+upstream_tree_state	dirty
+upstream_t	/tmp/git-src/t
+manifest	/Users/lukethorne/.grok/worktrees/heddleco-sley/2026-07-22-be8ad20f/crates/sley-testkit/upstream-manifest.tsv
+manifest_checksum	3943088184:5619
+platform	macos
+architecture	arm64
+hash	sha1
+selection_count	891
+selection_checksum	3546182803:22409
