@@ -53,12 +53,17 @@ pub fn resolve_remote(
 ///
 /// This preserves Git's precedence: a configured remote name first, then the
 /// literal path relative to the invocation cwd, then an `insteadOf` rewrite.
+/// A `[remote "<name>"]` section without a `url` (for example only
+/// `negotiationInclude`/`negotiationRestrict`) does not claim the name: fall
+/// through to path-based resolution so `git push <path>` still works when
+/// callers inject remote.* config for the path basename (t5516 negotiation).
 pub fn resolve_local_remote_git_dir(
     context: RemoteResolutionContext<'_>,
     repository: &str,
 ) -> Result<PathBuf> {
     if let (Some(git_dir), Some(config)) = (context.local_git_dir, context.config)
         && remote_exists(config, repository)
+        && !remote_config_values(config, repository, "url").is_empty()
     {
         return resolve_configured_local_remote_git_dir(config, repository, git_dir, context.cwd);
     }

@@ -24,6 +24,7 @@ use sley::plumbing::sley_odb::ObjectReader;
 use sley::plumbing::sley_remote::{
     FetchOptions, LsRemoteRecord, PackGenerationProgress, TransferProgress,
 };
+use std::env;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
@@ -120,6 +121,10 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
             "--no-multiple" if source.is_none() => fetch_multiple = false,
             "-q" | "--quiet" => options.quiet = true,
             "--no-quiet" => options.quiet = false,
+            // `-v` / `--verbose` is accepted for parity (t5516 `fetch -v`);
+            // progress is already default when stderr is a tty / when not quiet.
+            "-v" | "--verbose" => {}
+            "--no-verbose" => {}
             "--porcelain" => porcelain = Some(true),
             "--no-porcelain" => porcelain = Some(false),
             "--show-forced-updates" => show_forced_updates = Some(true),
@@ -1613,18 +1618,37 @@ fn fetch_raw_oid_refspecs(
     else {
         return Ok(false);
     };
+    // Protocol v0 rejects unadvertised exact-OID wants unless uploadpack
+    // allow*sha1inwant permits them (t5516 #101-#104, #106).
+    reject_raw_oid_wants_if_disallowed(config, &remote_git_dir, format, &wants)?;
     // A filtered fetch omits objects, so its pack is only valid as a promisor
     // pack — exactly as for an already-promisor remote.
     let promisor = config
         .get_bool("remote", Some(source), "promisor")
         .unwrap_or(false)
         || options.filter.is_some();
+    // Honour --depth for bare-oid fetches (t5516 shallow allow*sha1 tests).
+    let deepen = match options.depth {
+        Some(depth) if depth > 0 => {
+            let remote_db = FileObjectDatabase::from_git_dir(&remote_git_dir, format);
+            let client_shallow = sley_remote::read_shallow(git_dir, format).unwrap_or_default();
+            Some(sley_remote::compute_local_deepen(
+                &remote_db,
+                format,
+                &wants,
+                client_shallow,
+                depth,
+                options.deepen_relative,
+            )?)
+        }
+        _ => None,
+    };
     sley_remote::install_fetch_pack_via_local_upload_pack(
         git_dir,
         &remote_git_dir,
         format,
         wants,
-        None,
+        deepen.as_ref(),
         promisor,
         false,
         options.filter.clone(),
@@ -1639,6 +1663,107 @@ fn fetch_raw_oid_refspecs(
         register_promisor_remote(git_dir, source, spec)?;
     }
     Ok(true)
+}
+
+/// Client-side allowtip/allowreachable/allowany gate for bare exact-OID wants
+/// on the protocol-v0 local path (mirrors fetch-pack's unadvertised check).
+fn reject_raw_oid_wants_if_disallowed(
+    client_config: &GitConfig,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    wants: &[ObjectId],
+) -> Result<()> {
+    let protocol_v0 = env::var("GIT_TEST_PROTOCOL_VERSION")
+        .ok()
+        .as_deref()
+        == Some("0")
+        || matches!(
+            client_config.get("protocol", None, "version").as_deref(),
+            Some("0") | Some("1")
+        );
+    if !protocol_v0 {
+        return Ok(());
+    }
+    let advertisements = sley_remote::local_fetch_advertisements(remote_git_dir, format)?;
+    let advertised_tips: std::collections::HashSet<ObjectId> = advertisements
+        .iter()
+        .filter(|ad| !ad.name.ends_with("^{}"))
+        .map(|ad| ad.oid)
+        .collect();
+    let remote_config = read_repo_config(remote_git_dir).unwrap_or_default();
+    let allow_any = remote_config
+        .get_bool("uploadpack", None, "allowanysha1inwant")
+        .unwrap_or(false);
+    let allow_tip = remote_config
+        .get_bool("uploadpack", None, "allowtipsha1inwant")
+        .unwrap_or(false);
+    let allow_reachable = remote_config
+        .get_bool("uploadpack", None, "allowreachablesha1inwant")
+        .unwrap_or(false);
+    let mut all_tips = std::collections::HashSet::new();
+    if (allow_tip || allow_reachable) && !allow_any {
+        let store = sley_refs::FileRefStore::new(remote_git_dir, format);
+        for reference in store.list_refs()? {
+            match reference.target {
+                sley_refs::RefTarget::Direct(oid) => {
+                    all_tips.insert(oid);
+                }
+                sley_refs::RefTarget::Symbolic(target) => {
+                    if let Some(sley_refs::RefTarget::Direct(oid)) = store.read_ref(&target)? {
+                        all_tips.insert(oid);
+                    }
+                }
+            }
+        }
+        if let Some(sley_refs::RefTarget::Symbolic(target)) = store.read_ref("HEAD")? {
+            if let Some(sley_refs::RefTarget::Direct(oid)) = store.read_ref(&target)? {
+                all_tips.insert(oid);
+            }
+        } else if let Some(sley_refs::RefTarget::Direct(oid)) = store.read_ref("HEAD")? {
+            all_tips.insert(oid);
+        }
+    }
+    let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
+    let mut reachable: Option<std::collections::HashSet<ObjectId>> = None;
+    for oid in wants {
+        if advertised_tips.contains(oid) {
+            continue;
+        }
+        if allow_any {
+            continue;
+        }
+        if allow_tip && all_tips.contains(oid) {
+            continue;
+        }
+        if allow_reachable {
+            // With allowreachablesha1inwant the client *requests* the want and
+            // the server answers "not our ref" for objects that exist but are
+            // not reachable from any tip (t5516 #102/#104 final grep).
+            let set = match reachable.as_ref() {
+                Some(set) => set,
+                None => {
+                    let starts: Vec<ObjectId> = if all_tips.is_empty() {
+                        advertised_tips.iter().copied().collect()
+                    } else {
+                        all_tips.iter().copied().collect()
+                    };
+                    let set = sley_odb::collect_reachable_object_ids_tolerating_promised_missing(
+                        &remote_db, format, starts,
+                    )?;
+                    reachable = Some(set);
+                    reachable.as_ref().expect("just set")
+                }
+            };
+            if set.contains(oid) {
+                continue;
+            }
+            eprintln!("error: upload-pack: not our ref {oid}");
+            return Err(GitError::Exit(1));
+        }
+        eprintln!("error: Server does not allow request for unadvertised object {oid}");
+        return Err(GitError::Exit(1));
+    }
+    Ok(())
 }
 
 fn trace2_fetch_refetch_maintenance() {

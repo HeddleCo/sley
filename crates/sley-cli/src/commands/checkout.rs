@@ -1147,6 +1147,16 @@ pub(crate) fn cmd_checkout(
         let from = checkout_reflog_from.clone();
         let target = branch_target.ok_or_else(|| GitError::reference_not_found("branch"))?;
         if branch_target != Some(checkout_old_head) || recurse_submodules || force {
+            // Process-filter smudge metadata for a branch switch carries the
+            // destination ref and commit (git's `checkout_metadata` /
+            // t0021 required process filter on `checkout <branch>`).
+            let branch_ref = branch_ref_name(branch)?;
+            let _process_filter_metadata = sley_worktree::set_process_filter_metadata(Some(vec![
+                ("ref".to_string(), branch_ref),
+                ("treeish".to_string(), target.to_hex()),
+            ]));
+            let _process_filter_cwd =
+                sley_worktree::set_process_filter_cwd(Some(worktree_root.clone()));
             if let Err(err) =
                 checkout_twoway_dirty(&context, Some(&target), recurse_submodules, force)
             {

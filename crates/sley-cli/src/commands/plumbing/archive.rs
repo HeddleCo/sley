@@ -17,6 +17,7 @@ pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[Stri
     let mut prefix = Vec::new();
     let mut output: Option<String> = None;
     let mut remote: Option<String> = None;
+    let mut exec: Option<String> = None;
     let mut treeish = None;
     let mut pathspecs = Vec::new();
     let mut list = false;
@@ -76,6 +77,15 @@ pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[Stri
                         .clone(),
                 );
             }
+            "--exec" => {
+                exec = Some(
+                    iter.next()
+                        .ok_or_else(|| {
+                            GitError::Command("archive --exec requires a value".into())
+                        })?
+                        .clone(),
+                );
+            }
             "-o" | "--output" => {
                 output = Some(
                     iter.next()
@@ -110,6 +120,9 @@ pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[Stri
             }
             value if value.starts_with("--remote=") => {
                 remote = Some(value["--remote=".len()..].to_string());
+            }
+            value if value.starts_with("--exec=") => {
+                exec = Some(value["--exec=".len()..].to_string());
             }
             value if value.starts_with("--output=") => {
                 output = Some(value["--output=".len()..].to_string());
@@ -163,8 +176,19 @@ pub(crate) fn cmd_archive(cli_session: &crate::session::CliSession, args: &[Stri
     let git_dir = if let Some(remote) = remote.as_deref() {
         archive_remote_git_dir(remote, &cwd, local_git_dir.as_deref())?
     } else {
+        if exec.is_some() {
+            return Err(GitError::Command(
+                "--exec can only be used with --remote".into(),
+            ));
+        }
         cli_session.git_dir()?
     };
+    // Custom `--exec` for remote archive: git spawns the command without
+    // GIT_PROTOCOL (t5702 #59). Local archive remains in-process; probe the
+    // custom command so env dumps observe the missing protocol env.
+    if let Some(command) = exec.as_deref() {
+        let _ = crate::commands::remote::probe_custom_local_upload_archive(command, &git_dir);
+    }
     let format = repository_object_format(&git_dir)?;
     let db =
         crate::repository::open_object_database(&git_dir, format, cli_session.replace_objects())?;

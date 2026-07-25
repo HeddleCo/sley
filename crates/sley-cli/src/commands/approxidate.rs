@@ -1171,4 +1171,12 @@ mod tests {
         assert!(parse_expiry_date("~/dir").is_none());
         assert!(parse_expiry_date(":(optional)no-such-path").is_none());
     }
+
+    #[test]
+    fn asctime_with_tz() {
+        let r = parse_commit_date("Thu Apr 7 22:13:13 2005 +0000");
+        assert!(r.is_some(), "expected parse");
+        // 1112911993 is 2005-04-07 22:13:13 UTC
+        assert_eq!(r.unwrap().0, 1_112_911_993);
+    }
 }

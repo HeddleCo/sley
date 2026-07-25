@@ -1752,6 +1752,19 @@ pub(crate) fn cmd_update_ref(
             let prefix = format!("could not lock ref {tx_name}: ");
             update_ref_lock_failure(&tx_name, message.trim_start_matches(&prefix))
         }
+        // files-backend lock failures surface as
+        // `error: cannot lock ref '<name>': <detail>` (sley-refs). Wrap them the
+        // way git's `refs_update_ref` does: `fatal: update_ref failed for ref
+        // '<name>': cannot lock ref '<name>': <detail>` (t1400 #192).
+        Err(GitError::InvalidFormat(message))
+            if message.starts_with("error: cannot lock ref '") =>
+        {
+            let detail = message
+                .strip_prefix("error: cannot lock ref '")
+                .and_then(|rest| rest.split_once("': ").map(|(_, detail)| detail))
+                .unwrap_or(message.as_str());
+            update_ref_lock_failure(&tx_name, detail)
+        }
         Err(GitError::InvalidFormat(message)) if message == "entry too large" => {
             eprintln!(
                 "fatal: update_ref failed for ref '{tx_name}': reftable: transaction failure: entry too large"

@@ -4643,10 +4643,22 @@ impl FileRefStore {
             .iter()
             .any(|change| matches!(change, CoalescedRefChange::Update(_)))
         {
+            // Names deleted in this same transaction are skipped, matching
+            // git's refs_verify_refnames_available `skip` list so a simultaneous
+            // `:refs/heads/branch/conflict` + `refs/heads/branch` push succeeds
+            // (t5516 F/D conflict with deletion and creation).
+            let deleted: BTreeSet<&str> = changes
+                .iter()
+                .filter_map(|change| match change {
+                    CoalescedRefChange::Delete(delete) => Some(delete.name.as_str()),
+                    _ => None,
+                })
+                .collect();
             let mut names = self
                 .list_refs()?
                 .into_iter()
                 .map(|reference| reference.name)
+                .filter(|name| !deleted.contains(name.as_str()))
                 .collect::<BTreeSet<_>>();
             for change in &changes {
                 if let CoalescedRefChange::Update(update) = change {
@@ -4808,12 +4820,24 @@ impl FileRefStore {
             .iter()
             .filter(|change| matches!(change, CoalescedRefChange::Update(_)))
             .count();
+        // A lone update with no deletes can use the cheap single-name probe.
+        // When deletes ride along (t5516 simultaneous F/D), fall through to the
+        // multi-name check with deleted names removed from the conflict set —
+        // git's refs_verify_refnames_available `skip` list.
         let targeted_conflict_check = update_count == 1 && !has_delete;
         let conflict_names = if update_count > 0 && !targeted_conflict_check {
+            let deleted: BTreeSet<&str> = changes
+                .iter()
+                .filter_map(|change| match change {
+                    CoalescedRefChange::Delete(delete) => Some(delete.name.as_str()),
+                    _ => None,
+                })
+                .collect();
             let mut names = self
                 .list_refs()?
                 .into_iter()
                 .map(|reference| reference.name)
+                .filter(|name| !deleted.contains(name.as_str()))
                 .collect::<BTreeSet<_>>();
             for change in &changes {
                 if let CoalescedRefChange::Update(update) = change {

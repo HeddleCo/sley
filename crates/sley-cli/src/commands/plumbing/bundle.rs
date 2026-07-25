@@ -377,6 +377,15 @@ fn parse_bundle_revision_args(args: &[String]) -> Result<BundleRevisionOptions> 
             value if value.starts_with("--filter=") => {
                 options.filter = Some(value["--filter=".len()..].to_string());
             }
+            // git rev-list accepts `-N` as shorthand for `--max-count=N`
+            // (t5510 `git bundle create bundle3 -1 HEAD`).
+            value if value.len() > 1
+                && value.starts_with('-')
+                && value.as_bytes()[1].is_ascii_digit()
+                && value.bytes().skip(1).all(|b| b.is_ascii_digit()) =>
+            {
+                options.max_count = Some(parse_bundle_usize("-N", &value[1..])?);
+            }
             value => options.specs.push(value.to_string()),
         }
     }
@@ -584,9 +593,11 @@ fn filter_bundle_references(
             .is_ok_and(|object| object.object_type == ObjectType::Tag)
     });
     if let Some(since) = options.since {
+        // git revision.c: exclude when `commit->date < max_age` (so date >= since
+        // is kept). Equality must include the boundary commit (t5510 #187).
         refs.retain(|reference| {
             bundle_object_timestamp(db, format, &reference.oid)
-                .is_none_or(|timestamp| timestamp > since)
+                .is_none_or(|timestamp| timestamp >= since)
         });
     }
     if let Some(max_count) = options.max_count {
@@ -684,6 +695,31 @@ fn bundle_display_ref(
     Ok(spec.to_string())
 }
 
+/// git's `write_bundle_prerequisites` appends the commit's oneline subject after
+/// the prerequisite oid (CMIT_FMT_ONELINE). Empty when the object is missing or
+/// not a commit.
+fn bundle_prerequisite_comment(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Vec<u8>> {
+    let object = db.read_object(oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Ok(Vec::new());
+    }
+    let message = Commit::parse_ref(format, &object.body)?.message;
+    // Oneline: first line, trim trailing whitespace (git strbuf_trim).
+    let end = message
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(message.len());
+    let mut line = message[..end].to_vec();
+    while line.last().is_some_and(|b| b.is_ascii_whitespace()) {
+        line.pop();
+    }
+    Ok(line)
+}
+
 fn bundle_boundary_prerequisites(
     db: &FileObjectDatabase,
     format: ObjectFormat,
@@ -702,7 +738,7 @@ fn bundle_boundary_prerequisites(
             if bundle_is_commit(db, format, &oid)? && prerequisite_seen.insert(oid) {
                 prerequisites.push(BundlePrerequisite {
                     oid,
-                    comment: Vec::new(),
+                    comment: bundle_prerequisite_comment(db, format, &oid)?,
                 });
             }
             continue;
@@ -715,7 +751,7 @@ fn bundle_boundary_prerequisites(
                         if prerequisite_seen.insert(parent) {
                             prerequisites.push(BundlePrerequisite {
                                 oid: parent,
-                                comment: Vec::new(),
+                                comment: bundle_prerequisite_comment(db, format, &parent)?,
                             });
                         }
                     } else {
@@ -762,7 +798,9 @@ fn bundle_limit_excludes(
             let object = db.read_object(&oid)?;
             match object.object_type {
                 ObjectType::Commit => {
-                    if bundle_object_timestamp(db, format, &oid).is_some_and(|time| time <= since) {
+                    // Mirror rev-list: commits strictly older than --since become
+                    // excluded boundary tips; equal timestamps stay in the bundle.
+                    if bundle_object_timestamp(db, format, &oid).is_some_and(|time| time < since) {
                         if seen.insert(oid) {
                             excludes.push(oid);
                         }

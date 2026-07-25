@@ -885,13 +885,25 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
     let mut accepted = Vec::new();
     let mut preflight_rejections = Vec::new();
     for (command, force) in command_forces {
+        // Up-to-date (old == new, non-null): report and do not send (t5548
+        // porcelain `=` lines for HTTP).
+        if command.old_id == command.new_id && !command.new_id.is_null() {
+            preflight_rejections.push((command, PushRefStatus::UpToDate));
+            continue;
+        }
         if push_command_is_non_fast_forward(common_git_dir, &local_db, format, &command, force)? {
             preflight_rejections.push((command, PushRefStatus::RejectNonFastForward));
         } else {
             accepted.push((command, force));
         }
     }
-    if options.atomic && !preflight_rejections.is_empty() {
+    // Atomic: convert would-be-OK (not UpToDate) to atomic-push-failed when any
+    // local rejection exists. UpToDate stays as-is (git transport_print_push_status).
+    if options.atomic
+        && preflight_rejections
+            .iter()
+            .any(|(_, status)| !matches!(status, PushRefStatus::UpToDate))
+    {
         preflight_rejections.extend(
             accepted
                 .drain(..)
@@ -1210,7 +1222,9 @@ fn execute_push_local(
         remote_excluded_tip_roots(&remote_git_dir, request.format, &remote_refs)?;
     let starts = push_pack_roots(&commands, &pack_objects);
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
-    let remote_config = sley_config::read_repo_config(&remote_git_dir, None).unwrap_or_default();
+    // Local-push remote policy must ignore client `-c` (t5400/t5507).
+    let remote_config =
+        sley_config::read_repo_config_file_only(&remote_git_dir).unwrap_or_default();
     let remote_excluded = collect_remote_reachable_exclusions(
         &remote_common_git_dir,
         request.format,
@@ -1296,7 +1310,7 @@ pub fn stage_local_push_quarantine(
     }
     let remote_refs = crate::local::local_fetch_advertisements(remote_git_dir, format)?;
     let remote_excluded_tips = remote_excluded_tip_roots(remote_git_dir, format, &remote_refs)?;
-    let remote_config = sley_config::read_repo_config(remote_git_dir, None).unwrap_or_default();
+    let remote_config = sley_config::read_repo_config_file_only(remote_git_dir).unwrap_or_default();
     let remote_excluded = collect_remote_reachable_exclusions(
         remote_common_git_dir,
         format,
@@ -1535,7 +1549,7 @@ pub fn push_local_with_report_and_objects(
     // reads raw even when source resolution and ancestry honor replacements.
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, format);
     let remote_config =
-        sley_config::read_repo_config(request.remote_git_dir, None).unwrap_or_default();
+        sley_config::read_repo_config_file_only(request.remote_git_dir).unwrap_or_default();
     // receive-pack parses its fsck namespace before considering individual ref
     // updates. Preserve that ordering even when the local client can reject a
     // checked-out branch without otherwise entering the receive server.
@@ -1959,14 +1973,13 @@ fn receive_denies_current_branch(
     if !denies {
         return Ok(false);
     }
-    if sley_worktree::worktree_root_for_git_dir(remote_git_dir)?.is_none() {
-        return Ok(false);
-    }
-    let store = FileRefStore::new(remote_git_dir, format);
-    Ok(matches!(
-        store.read_ref("HEAD")?,
-        Some(RefTarget::Symbolic(target)) if target == command.name
-    ))
+    // Refuse when any worktree (main or linked) has this branch checked out
+    // (git find_shared_symref) — t5516 denyCurrentBranch and worktrees.
+    Ok(branch_is_checked_out_in_any_worktree(
+        format,
+        remote_git_dir,
+        &command.name,
+    )?)
 }
 
 fn receive_targets_current_branch(
@@ -1977,14 +1990,48 @@ fn receive_targets_current_branch(
     if !command.name.starts_with("refs/heads/") {
         return Ok(false);
     }
-    if sley_worktree::worktree_root_for_git_dir(remote_git_dir)?.is_none() {
+    branch_is_checked_out_in_any_worktree(format, remote_git_dir, &command.name)
+}
+
+/// Whether `branch_ref` (e.g. `refs/heads/new-wt`) is the current branch of the
+/// main worktree or any linked worktree under `$GIT_COMMON_DIR/worktrees/`.
+fn branch_is_checked_out_in_any_worktree(
+    format: ObjectFormat,
+    remote_git_dir: &Path,
+    branch_ref: &str,
+) -> Result<bool> {
+    let store = FileRefStore::new(remote_git_dir, format);
+    if matches!(
+        store.read_ref("HEAD")?,
+        Some(RefTarget::Symbolic(ref target)) if target == branch_ref
+    ) {
+        // Only count the main worktree when it has a working tree.
+        if sley_worktree::worktree_root_for_git_dir(remote_git_dir)?.is_some() {
+            return Ok(true);
+        }
+    }
+    let common = sley_odb::repository_common_dir(remote_git_dir);
+    let worktrees_dir = common.join("worktrees");
+    if !worktrees_dir.is_dir() {
         return Ok(false);
     }
-    let store = FileRefStore::new(remote_git_dir, format);
-    Ok(matches!(
-        store.read_ref("HEAD")?,
-        Some(RefTarget::Symbolic(target)) if target == command.name
-    ))
+    let Ok(entries) = std::fs::read_dir(&worktrees_dir) else {
+        return Ok(false);
+    };
+    for entry in entries.flatten() {
+        let wt_git_dir = entry.path();
+        if !wt_git_dir.is_dir() {
+            continue;
+        }
+        let wt_store = FileRefStore::new(&wt_git_dir, format);
+        if matches!(
+            wt_store.read_ref("HEAD")?,
+            Some(RefTarget::Symbolic(ref target)) if target == branch_ref
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn receive_denies_current_branch_delete(
@@ -2149,7 +2196,9 @@ fn local_push_via_receive_pack_server(
     )?;
     let mut packfile = Vec::new();
     write_push_packfile_with_cancel(&pack_request, &mut packfile, request.cancel)?;
-    let config = sley_config::read_repo_config(request.remote_git_dir, None).unwrap_or_default();
+    // Local receive-pack must not inherit the client's `-c` overrides for
+    // remote policy (t5400/t5507 denyDeletes / receive.*).
+    let config = sley_config::read_repo_config_file_only(request.remote_git_dir).unwrap_or_default();
     let validation = sley_fsck::FsckPolicy::from_config(
         &config,
         sley_fsck::FsckConfigKind::Receive,

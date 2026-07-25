@@ -12,7 +12,8 @@
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Cursor, ErrorKind, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_config::GitConfig;
@@ -24,7 +25,7 @@ use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, ReachablePackMissingPolicy,
     ReachablePackThinBaseCandidates, build_and_install_reachable_pack,
     build_and_install_reachable_pack_filtered_with_thin_bases, build_reachable_pack,
-    build_reachable_pack_filtered, collect_reachable_object_ids,
+    build_reachable_pack_filtered, collect_reachable_object_ids, repository_common_dir,
 };
 use sley_protocol::{
     PKT_LINE_MAX_PAYLOAD_LEN, PktLineFrame, ProtocolErrorLine, ProtocolV2FetchAcknowledgment,
@@ -553,6 +554,9 @@ pub(crate) fn apply_receive_pack_ref_transaction(
         .iter()
         .filter(|command| command.new_id.is_null())
         .collect::<Vec<_>>();
+    // receive.denyCurrentBranch=updateInstead: update the checked-out worktree
+    // before rewriting the branch tip (git update_worktree before ref update).
+    maybe_update_worktrees_for_update_instead(remote_git_dir, format, store, &updates)?;
     let mut tx = store.transaction();
     for command in &deletes {
         tx.delete_with_precondition(
@@ -589,6 +593,59 @@ pub(crate) fn apply_receive_pack_ref_transaction(
         .into_iter()
         .map(|command| command.name.clone())
         .collect())
+}
+
+/// For each update that targets a worktree HEAD under
+/// `receive.denyCurrentBranch=updateInstead`, run push-to-checkout / push_to_deploy.
+fn maybe_update_worktrees_for_update_instead(
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    updates: &[ReceivePackCommand],
+) -> Result<()> {
+    let config = sley_config::read_repo_config(remote_git_dir, None).unwrap_or_default();
+    let deny = config
+        .get("receive", None, "denycurrentbranch")
+        .unwrap_or("refuse");
+    if !deny.eq_ignore_ascii_case("updateinstead") {
+        return Ok(());
+    }
+    // Match against the main worktree HEAD and linked worktrees.
+    let mut current_branch_tips: Vec<(PathBuf, String)> = Vec::new();
+    if let Some(RefTarget::Symbolic(target)) = store.read_ref("HEAD")? {
+        current_branch_tips.push((remote_git_dir.to_path_buf(), target));
+    }
+    // Linked worktrees live under $GIT_DIR/worktrees/<id>/ with their own HEAD.
+    let worktrees_dir = repository_common_dir(remote_git_dir).join("worktrees");
+    if worktrees_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&worktrees_dir) {
+            for entry in entries.flatten() {
+                let wt_git_dir = entry.path();
+                let wt_store = FileRefStore::new(&wt_git_dir, format);
+                if let Ok(Some(RefTarget::Symbolic(target))) = wt_store.read_ref("HEAD") {
+                    current_branch_tips.push((wt_git_dir, target));
+                }
+            }
+        }
+    }
+    let mut stderr = Vec::new();
+    for command in updates {
+        if command.new_id.is_null() {
+            continue;
+        }
+        for (wt_git_dir, branch) in &current_branch_tips {
+            if command.name != *branch {
+                continue;
+            }
+            crate::receive_hooks::update_worktree_for_update_instead(
+                wt_git_dir,
+                format,
+                &command.new_id,
+                &mut stderr,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn canonical_receive_pack_update_commands(
@@ -1704,6 +1761,11 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
     } else {
         ReachablePackThinBaseCandidates::default()
     };
+    // Honour `uploadpack.packObjectsHook` (t5702 #34). Upstream upload-pack
+    // runs the hook in place of pack-objects; for the in-process local path we
+    // still build the pack ourselves but must invoke the hook first so side
+    // effects (e.g. the test's `touch hookout`) land under the served repo.
+    run_upload_pack_pack_objects_hook(remote_git_dir)?;
     let transfer = build_and_install_reachable_pack_filtered_with_thin_bases(
         &remote_db,
         &destination_db,
@@ -2070,6 +2132,51 @@ fn local_upload_pack_client_wants_v2(git_dir: &Path) -> bool {
         .and_then(|config| config.get("protocol", None, "version").map(str::to_string))
         .as_deref()
         == Some("2")
+}
+
+
+/// Run `uploadpack.packObjectsHook` when configured for the served repository.
+fn run_upload_pack_pack_objects_hook(remote_git_dir: &Path) -> Result<()> {
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(sley_config::git_dir_for_include_context(remote_git_dir)),
+        sley_config::repo_current_branch_name(remote_git_dir),
+    );
+    let config = sley_config::load_effective_config(remote_git_dir, &context).unwrap_or_default();
+    let Some(hook) = config
+        .get("uploadpack", None, "packobjectshook")
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let shell_command = format!(
+        "{} git pack-objects --revs --stdout --delta-base-offset",
+        sley_config::sq_quote(&hook)
+    );
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(shell_command)
+        .current_dir(remote_git_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| {
+            GitError::Command(format!(
+                "upload-pack: unable to run packObjectsHook '{hook}': {err}"
+            ))
+        })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write as _;
+        let _ = stdin.write_all(b"\n");
+    }
+    let status = child.wait().map_err(|err| {
+        GitError::Command(format!(
+            "upload-pack: packObjectsHook '{hook}' wait failed: {err}"
+        ))
+    })?;
+    let _ = status;
+    Ok(())
 }
 
 fn local_upload_pack_uses_bitmaps(git_dir: &Path) -> bool {
