@@ -107,12 +107,18 @@ jobs:
       - name: Format check
         run: cargo fmt --all --check
 
-      # 3. Treat every workspace lint as an error. `--no-deps` excludes third-
+      # 3. Hard-fail panic-prone calls in the production libraries that parse or
+      #    orchestrate untrusted remote input. The scope check fails on every
+      #    unclassified new workspace crate so this list cannot silently shrink.
+      - name: Untrusted-input panic gate
+        run: python3 .github/workflows/scripts/clippy-panic-gate.py
+
+      # 4. Treat every workspace lint as an error. `--no-deps` excludes third-
       #    party warnings while retaining every Sley target, including tests.
-      - name: Clippy
+      - name: Workspace Clippy
         run: cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings
 
-      # 4. Run all workspace tests. The suite includes the t-file CLI parity
+      # 5. Run all workspace tests. The suite includes the t-file CLI parity
       #    tests, unit tests across the domain crates, and the upstream
       #    integration harness (sley-testkit, #[ignore]-gated; run on demand
       #    with --ignored + GIT_SRC_DIR). Most tests do NOT shell out to git;
@@ -128,7 +134,7 @@ jobs:
           GIT_COMMITTER_EMAIL: committer@example.com
         run: cargo test --locked --workspace
 
-      # 5. Public library documentation must resolve every intra-doc link and
+      # 6. Public library documentation must resolve every intra-doc link and
       #    compile without warnings. Binaries are excluded because Cargo emits a
       #    filename-collision warning for the intentionally shared `sley` name.
       - name: API documentation
