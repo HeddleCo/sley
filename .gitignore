@@ -2,5 +2,6 @@
 /tmp-*/
 /.heddle/
 /bench-results/
+/crates/sley-testkit/matrix-rerun-*/
 **/__pycache__/
 *.pyc
