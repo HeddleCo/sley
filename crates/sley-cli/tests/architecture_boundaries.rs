@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 const MAX_DIRECT_ODB_OPENINGS: usize = 178;
 // The first parity wave adds one intentional direct ref-store read in remote
 // handling. Keep that debt visible while preventing further unreviewed growth.
-const MAX_DIRECT_REF_STORE_OPENINGS: usize = 172;
+// The parity replay adds eight intentional ref-store reads across alias,
+// backfill, fetch, notes, repack, and submodule paths. Keep that debt visible
+// while preventing further unreviewed growth.
+const MAX_DIRECT_REF_STORE_OPENINGS: usize = 179;
 const MAX_REPOSITORY_CONTEXT_DISCOVERIES: usize = 0;
 const MAX_COMPAT_SESSION_READS: usize = 0;
 const MAX_COMPAT_GIT_DIR_DISCOVERIES: usize = 0;

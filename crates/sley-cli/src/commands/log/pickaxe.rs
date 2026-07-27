@@ -190,15 +190,26 @@ pub(super) fn diff_filter_commit_matches(
         .any(|entry| diff_filter_entry_matches(entry, opts.mask)))
 }
 
+/// Result of `--follow` path history: the commits that touched the followed
+/// path, and the pathspec that was active at each commit (newest → oldest), so
+/// the renderer can filter name-status/patch after rename/copy rewinds.
+pub(super) struct LogFollowResult<'a> {
+    pub records: Vec<&'a sley_rev::CommitRecord>,
+    /// Parallel to `records`: the path being followed when that commit was
+    /// examined (i.e. after any prior rename/copy rewinds from newer commits).
+    pub paths: Vec<Vec<u8>>,
+}
+
 pub(super) fn log_follow_single_path<'a>(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     selected: Vec<&'a sley_rev::CommitRecord>,
     start_path: &[u8],
     detect_renames: bool,
-) -> Result<Vec<&'a sley_rev::CommitRecord>> {
+) -> Result<LogFollowResult<'a>> {
     let mut path = start_path.to_vec();
     let mut kept = Vec::new();
+    let mut paths = Vec::new();
     for record in selected {
         let parent_tree = match record.commit.parents.first() {
             Some(parent) => {
@@ -207,10 +218,14 @@ pub(super) fn log_follow_single_path<'a>(
             }
             None => None,
         };
+        // git's `try_to_follow_renames` (tree-diff.c) always enables
+        // `find_copies_harder` so a pure copy (added path identical to an
+        // unchanged source) is discovered and the pathspec rewound to the
+        // source — t4206 requires this for `log --follow`.
         let base = sley_diff_merge::DiffNameStatusOptions {
             detect_renames,
-            detect_copies: false,
-            find_copies_harder: false,
+            detect_copies: detect_renames,
+            find_copies_harder: detect_renames,
             rename_empty: true,
             ..Default::default()
         };
@@ -221,9 +236,9 @@ pub(super) fn log_follow_single_path<'a>(
                 parent,
                 &record.commit.tree,
                 sley_diff_merge::DiffNameStatusOptions {
-                    detect_renames,
-                    detect_copies: false,
-                    find_copies_harder: false,
+                    detect_renames: true,
+                    detect_copies: true,
+                    find_copies_harder: true,
                     rename_empty: true,
                     detect_inexact: true,
                     rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
@@ -247,11 +262,16 @@ pub(super) fn log_follow_single_path<'a>(
             )?,
         };
         let mut matched = false;
+        let path_at_commit = path.clone();
         for entry in entries {
             if entry.path.as_bytes() == path.as_slice() {
                 matched = true;
-                if matches!(entry.status, sley_diff_merge::NameStatus::Renamed(_))
-                    && let Some(old_path) = entry.old_path
+                // Follow renames *and* copies (git status 'R' or 'C').
+                if matches!(
+                    entry.status,
+                    sley_diff_merge::NameStatus::Renamed(_)
+                        | sley_diff_merge::NameStatus::Copied(_)
+                ) && let Some(old_path) = entry.old_path
                 {
                     path = old_path.as_bytes().to_vec();
                 }
@@ -260,9 +280,13 @@ pub(super) fn log_follow_single_path<'a>(
         }
         if matched {
             kept.push(record);
+            paths.push(path_at_commit);
         }
     }
-    Ok(kept)
+    Ok(LogFollowResult {
+        records: kept,
+        paths,
+    })
 }
 
 /// Whether a commit's diff (against its first parent, or the empty tree for a

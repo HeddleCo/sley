@@ -183,6 +183,13 @@ fn cmd_commit_graph_write(cli_session: &crate::session::CliSession, args: &[Stri
     // on the write invocation take effect.
     let repo_config =
         sley_config::read_repo_config(&git_dir, effective_config_parameters_env().as_deref()).ok();
+    // git's `commit_graph_compatible()`: grafts and shallow boundaries make a
+    // graph lie about parents. `cmd_commit_graph` also calls
+    // `disable_replace_refs()`, so replace refs are intentionally *not*
+    // checked here — only grafts/shallow.
+    if !commit_graph_write_compatible(&git_dir, format) {
+        return Ok(());
+    }
     let changed_paths_version = commit_graph_changed_paths_version(repo_config.as_ref())?;
     if !(-1..=2).contains(&changed_paths_version) {
         eprintln!(
@@ -2015,6 +2022,20 @@ fn commit_graph_bloom_paths_v1_v2_compatible(changes: &[sley_diff_merge::NameSta
                 .as_ref()
                 .is_none_or(|path| path.as_bytes().iter().all(u8::is_ascii))
     })
+}
+
+/// Write-side `commit_graph_compatible`: grafts and shallow clones make the
+/// on-disk parent list disagree with the graph, so writing is a silent no-op
+/// (git returns 0 without creating/updating the file). Replace refs are *not*
+/// checked here because `cmd_commit_graph` disables them before writing.
+fn commit_graph_write_compatible(git_dir: &Path, format: ObjectFormat) -> bool {
+    if sley_worktree::is_shallow_repository(git_dir) {
+        return false;
+    }
+    if !sley_rev::revlist::load_commit_grafts_from_git_dir(git_dir, format).is_empty() {
+        return false;
+    }
+    true
 }
 
 /// `commitGraph.generationVersion` (git's `get_configured_generation_version`):

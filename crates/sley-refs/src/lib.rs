@@ -4643,6 +4643,13 @@ impl FileRefStore {
             .iter()
             .any(|change| matches!(change, CoalescedRefChange::Update(_)))
         {
+            // Match git's files/reftable prepare: `refs_verify_refnames_available`
+            // is called with `skip = NULL`. A ref deleted in the *same*
+            // transaction still occupies its name for D/F purposes, so
+            // `create long + delete short` (and the reverse) fail with
+            // "'<other>' exists; cannot create '<name>'" (t1404). Receive-pack
+            // (t5516) resolves simultaneous F/D by applying deletes in a
+            // separate prior transaction, not by skipping deleted names here.
             let mut names = self
                 .list_refs()?
                 .into_iter()
@@ -4808,6 +4815,11 @@ impl FileRefStore {
             .iter()
             .filter(|change| matches!(change, CoalescedRefChange::Update(_)))
             .count();
+        // A lone update with no deletes can use the cheap single-name probe.
+        // When deletes ride along, still check against the full live set:
+        // git passes `skip = NULL` to refs_verify_refnames_available, so a
+        // name being deleted in this transaction still D/F-conflicts with a
+        // create/update of a prefix or descendant (t1404 add-del / del-add).
         let targeted_conflict_check = update_count == 1 && !has_delete;
         let conflict_names = if update_count > 0 && !targeted_conflict_check {
             let mut names = self
@@ -4850,7 +4862,12 @@ impl FileRefStore {
                 && let Err(err) = fs::create_dir_all(parent)
             {
                 release_pending_locks(&pending);
-                if err.kind() == std::io::ErrorKind::NotADirectory {
+                // On some platforms (notably macOS) a file sitting on a path
+                // component surfaces as AlreadyExists rather than NotADirectory.
+                // Both mean a D/F collision with an existing ref at `parent`.
+                if err.kind() == std::io::ErrorKind::NotADirectory
+                    || err.kind() == std::io::ErrorKind::AlreadyExists
+                {
                     return Err(ref_directory_conflict_error(
                         name,
                         &parent_to_ref_name(&self.ref_base_dir(name), parent),
@@ -4896,7 +4913,17 @@ impl FileRefStore {
                 Ok(file) => file,
                 Err(err) => {
                     release_pending_locks(&pending);
-                    return Err(GitError::Io(format!("could not lock ref {name}: {err}")));
+                    // Match git's `unable_to_lock_message` +
+                    // `error: cannot lock ref '%s': %s` wording used by
+                    // files-backend (t5510 lock / FETCH_HEAD partial-update tests).
+                    let detail = if err.kind() == std::io::ErrorKind::AlreadyExists {
+                        format!("Unable to create '{}': File exists.", lock_path.display())
+                    } else {
+                        format!("Unable to create '{}': {err}", lock_path.display())
+                    };
+                    return Err(GitError::InvalidFormat(format!(
+                        "error: cannot lock ref '{name}': {detail}"
+                    )));
                 }
             };
             // The lock file is private until it is renamed into place, so it

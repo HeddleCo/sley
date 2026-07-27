@@ -2168,6 +2168,7 @@ impl GraphParents {
         }
     }
 
+    #[allow(dead_code)]
     fn grafted_vec<R: ObjectReader>(&self, reader: &R, oid: &ObjectId) -> Vec<ObjectId> {
         if reader.is_shallow_graft(oid) {
             Vec::new()
@@ -2243,6 +2244,7 @@ struct GraphCommit {
     commit_time: u64,
 }
 
+#[allow(dead_code)]
 struct GraphCommitMetadata<'a> {
     parents: &'a GraphParents,
     commit_time: i64,
@@ -2451,7 +2453,7 @@ impl RawCommitGraph {
             .ok_or_else(|| GitError::InvalidFormat("commit-graph missing OIDF chunk".into()))?;
         if oidf.len() != 256 * 4 {
             return Err(GitError::InvalidFormat(
-                "commit-graph OIDF chunk has invalid length".into(),
+                "commit-graph oid fanout chunk is wrong size".into(),
             ));
         }
         let mut fanout = [0u32; 256];
@@ -2461,7 +2463,7 @@ impl RawCommitGraph {
             *slot = read_u32_be(&data[start..start + 4]);
             if *slot < previous {
                 return Err(GitError::InvalidFormat(
-                    "commit-graph OIDF fanout is not monotonic".into(),
+                    "commit-graph fanout values out of order".into(),
                 ));
             }
             previous = *slot;
@@ -2474,7 +2476,7 @@ impl RawCommitGraph {
             .ok_or_else(|| GitError::InvalidFormat("commit-graph OIDL chunk overflow".into()))?;
         if oidl.len() != expected_oidl_len {
             return Err(GitError::InvalidFormat(
-                "commit-graph OIDL chunk has invalid length".into(),
+                "commit-graph OID lookup chunk is the wrong size".into(),
             ));
         }
         let cdat = raw_commit_graph_chunk(&chunks, *b"CDAT")
@@ -2485,7 +2487,7 @@ impl RawCommitGraph {
             .ok_or_else(|| GitError::InvalidFormat("commit-graph CDAT chunk overflow".into()))?;
         if cdat.len() != expected_cdat_len {
             return Err(GitError::InvalidFormat(
-                "commit-graph CDAT chunk has invalid length".into(),
+                "commit-graph commit data chunk is wrong size".into(),
             ));
         }
         let edge = raw_commit_graph_chunk(&chunks, *b"EDGE");
@@ -2662,6 +2664,11 @@ impl RawCommitGraph {
         };
         let mut edge_idx = (parent_two & RAW_COMMIT_GRAPH_EXTRA_EDGE_MASK) as usize;
         loop {
+            if edge.len() / 4 <= edge_idx {
+                return Err(GitError::InvalidFormat(
+                    "commit-graph extra-edges pointer out of bounds".into(),
+                ));
+            }
             let start = edge
                 .start
                 .checked_add(edge_idx.checked_mul(4).ok_or_else(|| {
@@ -2675,7 +2682,7 @@ impl RawCommitGraph {
             })?;
             let Some(bytes) = self.bytes.as_ref().get(start..end) else {
                 return Err(GitError::InvalidFormat(
-                    "commit-graph EDGE entry points past chunk".into(),
+                    "commit-graph extra-edges pointer out of bounds".into(),
                 ));
             };
             let raw = read_u32_be(bytes);
@@ -2713,6 +2720,12 @@ impl RawCommitGraph {
         };
         let mut edge_idx = (parent_two & RAW_COMMIT_GRAPH_EXTRA_EDGE_MASK) as usize;
         loop {
+            // git: `chunk_extra_edges_size / sizeof(uint32_t) <= parent_data_pos`
+            if edge.len() / 4 <= edge_idx {
+                return Err(GitError::InvalidFormat(
+                    "commit-graph extra-edges pointer out of bounds".into(),
+                ));
+            }
             let start = edge
                 .start
                 .checked_add(edge_idx.checked_mul(4).ok_or_else(|| {
@@ -2726,7 +2739,7 @@ impl RawCommitGraph {
             })?;
             let Some(bytes) = self.bytes.as_ref().get(start..end) else {
                 return Err(GitError::InvalidFormat(
-                    "commit-graph EDGE entry points past chunk".into(),
+                    "commit-graph extra-edges pointer out of bounds".into(),
                 ));
             };
             let raw = read_u32_be(bytes);
@@ -2807,13 +2820,17 @@ impl<'a> CommitGraphContext<'a> {
 
     /// Resolve `oid`'s graph metadata, loading and parsing the graph on first
     /// use. Returns `None` when the commit is not in the graph.
+    ///
+    /// A damaged graph is treated as absent (load already printed diagnostics):
+    /// never abort a walk solely because the acceleration file is corrupt.
     fn lookup(&mut self, oid: &ObjectId) -> Result<Option<&GraphCommit>> {
         let commits = self.commits.get_or_insert_with(|| {
-            load_commit_graph_map(self.git_dir, self.format).map_err(|err| err.to_string())
+            // Soft-fail every load error: callers fall back to object reads.
+            Ok(load_commit_graph_map(self.git_dir, self.format).unwrap_or_default())
         });
         match commits {
             Ok(map) => Ok(map.get(oid)),
-            Err(message) => Err(GitError::InvalidFormat(message.clone())),
+            Err(_) => Ok(None),
         }
     }
 
@@ -2862,6 +2879,7 @@ impl<'a> CommitGraphContext<'a> {
         }
         let format = self.format;
         if let Some(parents) = self.parents(oid)? {
+            verify_commit_graph_entry_exists(reader, oid)?;
             return Ok(parents.to_vec());
         }
         commit_parents(reader, format, oid)
@@ -2904,6 +2922,7 @@ impl<'a> CommitGraphContext<'a> {
 
     /// `oid`'s parents and committer time from the graph in one lookup, or `None`
     /// when the commit is not represented (the caller then reads the object).
+    #[allow(dead_code)]
     fn metadata(&mut self, oid: &ObjectId) -> Result<Option<GraphCommitMetadata<'_>>> {
         Ok(self.lookup(oid)?.map(|commit| GraphCommitMetadata {
             parents: &commit.parents,
@@ -2918,22 +2937,64 @@ impl<'a> CommitGraphContext<'a> {
     ) -> Result<Option<CommitMetadata>> {
         match self.direct_graph() {
             DirectCommitGraph::Raw(graph) => {
-                let Some(mut metadata) = graph.metadata(oid).unwrap_or(None) else {
-                    return Ok(None);
+                let mut metadata = match graph.metadata(oid) {
+                    Ok(Some(metadata)) => metadata,
+                    Ok(None) => return Ok(None),
+                    Err(GitError::InvalidFormat(message))
+                        if message.contains("extra-edges pointer out of bounds") =>
+                    {
+                        // git prints the error and treats the entry as unparsed
+                        // so the walk falls back to the object database.
+                        eprintln!("error: {message}");
+                        return Ok(None);
+                    }
+                    Err(_) => return Ok(None),
                 };
+                // `GIT_COMMIT_GRAPH_PARANOIA`: refuse graph hits whose objects
+                // are missing from the ODB (stale graph entries).
+                verify_commit_graph_entry_exists(reader, oid)?;
                 if reader.is_shallow_graft(oid) {
                     metadata.parents.clear();
                 }
-                return Ok(Some(metadata));
+                Ok(Some(metadata))
             }
-            DirectCommitGraph::Invalid(_) => return Ok(None),
-            DirectCommitGraph::Missing => {}
+            // Damaged/missing graph: do not consult the map-load path (it would
+            // re-parse and either re-print or, historically, hard-fail). Fall
+            // straight through to the object-reading caller.
+            DirectCommitGraph::Invalid(_) | DirectCommitGraph::Missing => Ok(None),
         }
-        Ok(self.metadata(oid)?.map(|metadata| CommitMetadata {
-            oid: *oid,
-            parents: metadata.parents.grafted_vec(reader, oid),
-            commit_time: metadata.commit_time,
-        }))
+    }
+}
+
+fn commit_graph_paranoia_enabled() -> bool {
+    match std::env::var("GIT_COMMIT_GRAPH_PARANOIA") {
+        Ok(value) => matches!(
+            value.as_str(),
+            "1" | "true" | "yes" | "on" | "TRUE" | "YES" | "ON"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// When `GIT_COMMIT_GRAPH_PARANOIA` is set, a graph hit for `oid` must still
+/// resolve in the object database; otherwise the graph is stale.
+fn verify_commit_graph_entry_exists<R: ObjectReader>(reader: &R, oid: &ObjectId) -> Result<()> {
+    if !commit_graph_paranoia_enabled() {
+        return Ok(());
+    }
+    match reader.read_object(oid) {
+        Ok(_) => Ok(()),
+        Err(GitError::NotFound(_)) => {
+            eprintln!(
+                "error: commit {} exists in commit-graph but not in the object database",
+                oid.to_hex()
+            );
+            Err(GitError::not_found(format!(
+                "commit {} exists in commit-graph but not in the object database",
+                oid.to_hex()
+            )))
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -2955,6 +3016,20 @@ fn load_commit_graph_map(
     git_dir: &Path,
     format: sley_core::ObjectFormat,
 ) -> Result<HashMap<ObjectId, GraphCommit>> {
+    // Never abort a walk on a damaged graph file: soft-fail to an empty map.
+    // Diagnostics are printed by the load path itself.
+    Ok(load_commit_graph_map_inner(git_dir, format).unwrap_or_default())
+}
+
+fn load_commit_graph_map_inner(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+) -> Result<HashMap<ObjectId, GraphCommit>> {
+    // Load-side `commit_graph_compatible`: grafts, shallow boundaries, and
+    // replace refs all rewrite parents, so a graph must not be consulted.
+    if !commit_graph_load_compatible(git_dir, format) {
+        return Ok(HashMap::new());
+    }
     let info = repository_objects_dir(git_dir).join("info");
     let single = info.join("commit-graph");
     if single.exists() {
@@ -2962,20 +3037,30 @@ fn load_commit_graph_map(
             Ok(bytes) => bytes,
             Err(err) => return Err(GitError::Io(err.to_string())),
         };
+        // Hash-version mismatch is a soft error: warn once and fall back to
+        // object reads, matching `load_commit_graph_one` (graph stays usable
+        // for the walk only as "absent").
         if commit_graph_hash_version_mismatch(&bytes, format) {
-            return Err(GitError::InvalidFormat(
-                "commit-graph hash version mismatch".into(),
-            ));
+            return Ok(HashMap::new());
+        }
+        // Prefer the hot-path reader's diagnostics (git-compatible wording)
+        // so corrupt-chunk tests see the same `error:` lines as git. Never
+        // surface parse failure as a hard walk error.
+        match RawCommitGraph::parse_for_lookup(RawCommitGraphBytes::Owned(bytes.clone()), format) {
+            Ok(_) => {}
+            Err(GitError::InvalidFormat(message)) => {
+                report_commit_graph_load_error(&message);
+                return Ok(HashMap::new());
+            }
+            Err(err) => {
+                report_commit_graph_load_error(&err.to_string());
+                return Ok(HashMap::new());
+            }
         }
         return match CommitGraph::parse(&bytes, format) {
-            Ok(graph) => graph_to_map(&graph),
+            Ok(graph) => graph_to_map(&graph).or_else(|_| Ok(HashMap::new())),
             Err(_) => {
                 warn_invalid_commit_graph_bloom_chunks(&bytes, &single, format);
-                if RawCommitGraph::parse_for_lookup(RawCommitGraphBytes::Owned(bytes), format)
-                    .is_err()
-                {
-                    return Ok(HashMap::new());
-                }
                 Ok(HashMap::new())
             }
         };
@@ -2986,6 +3071,9 @@ fn load_commit_graph_map(
 }
 
 fn load_direct_commit_graph(git_dir: &Path, format: sley_core::ObjectFormat) -> DirectCommitGraph {
+    if !commit_graph_load_compatible(git_dir, format) {
+        return DirectCommitGraph::Missing;
+    }
     let path = repository_objects_dir(git_dir)
         .join("info")
         .join("commit-graph");
@@ -3000,13 +3088,80 @@ fn load_direct_commit_graph(git_dir: &Path, format: sley_core::ObjectFormat) -> 
         },
     };
     if commit_graph_hash_version_mismatch(bytes.as_ref(), format) {
-        return DirectCommitGraph::Invalid("commit-graph hash version mismatch".into());
+        // Soft-fail: warned on stderr; treat as absent so walks fall back to objects.
+        return DirectCommitGraph::Missing;
     }
     warn_invalid_commit_graph_bloom_chunks(bytes.as_ref(), &path, format);
     match RawCommitGraph::parse_for_lookup(bytes, format) {
         Ok(graph) => DirectCommitGraph::Raw(Box::new(graph)),
-        Err(GitError::InvalidFormat(message)) => DirectCommitGraph::Invalid(message),
-        Err(err) => DirectCommitGraph::Invalid(err.to_string()),
+        Err(GitError::InvalidFormat(message)) => {
+            // Surface parse failures on stderr the way git's chunk readers do
+            // (`error: commit-graph ...`). Use `Invalid` (not `Missing`) so
+            // `metadata_owned` returns `None` without falling through to the
+            // map-load path, which would re-parse and re-print the same errors.
+            report_commit_graph_load_error(&message);
+            DirectCommitGraph::Invalid(message)
+        }
+        Err(err) => {
+            let message = err.to_string();
+            report_commit_graph_load_error(&message);
+            DirectCommitGraph::Invalid(message)
+        }
+    }
+}
+
+/// Map internal parse diagnostics onto git's chunk-reader wording and emit the
+/// secondary "required ... missing or corrupted" lines when appropriate.
+fn report_commit_graph_load_error(message: &str) {
+    let (primary, secondary) = match message {
+        m if m.contains("OIDF chunk has invalid length")
+            || m == "commit-graph oid fanout chunk is wrong size" =>
+        {
+            (
+                "commit-graph oid fanout chunk is wrong size",
+                Some("commit-graph required OID fanout chunk missing or corrupted"),
+            )
+        }
+        m if m.contains("OIDF fanout is not monotonic")
+            || m == "commit-graph fanout values out of order" =>
+        {
+            (
+                "commit-graph fanout values out of order",
+                Some("commit-graph required OID fanout chunk missing or corrupted"),
+            )
+        }
+        m if m.contains("OIDL chunk has invalid length")
+            || m.contains("OIDF fanout does not match OIDL")
+            || m == "commit-graph OID lookup chunk is the wrong size" =>
+        {
+            (
+                "commit-graph OID lookup chunk is the wrong size",
+                Some("commit-graph required OID lookup chunk missing or corrupted"),
+            )
+        }
+        m if m.contains("CDAT chunk has invalid length")
+            || m == "commit-graph commit data chunk is wrong size" =>
+        {
+            (
+                "commit-graph commit data chunk is wrong size",
+                Some("commit-graph required commit data chunk missing or corrupted"),
+            )
+        }
+        m if m.contains("generation data is the wrong size")
+            || m == "commit-graph generations chunk is wrong size" =>
+        {
+            ("commit-graph generations chunk is wrong size", None)
+        }
+        m if m.contains("extra-edges pointer out of bounds")
+            || m.contains("EDGE entry points past chunk") =>
+        {
+            ("commit-graph extra-edges pointer out of bounds", None)
+        }
+        other => (other, None),
+    };
+    eprintln!("error: {primary}");
+    if let Some(secondary) = secondary {
+        eprintln!("error: {secondary}");
     }
 }
 
@@ -3033,7 +3188,7 @@ fn raw_commit_graph_validate_generation_data(
         .ok_or_else(|| GitError::InvalidFormat("commit-graph generation data overflow".into()))?;
     if gda2.len() != expected_gda2_len {
         return Err(GitError::InvalidFormat(
-            "commit-graph generation data is the wrong size".into(),
+            "commit-graph generations chunk is wrong size".into(),
         ));
     }
     let gdo2 = raw_commit_graph_chunk(chunks, *b"GDO2");
@@ -3091,6 +3246,42 @@ fn commit_graph_hash_function_id(format: ObjectFormat) -> u32 {
         ObjectFormat::Sha1 => 1,
         ObjectFormat::Sha256 => 2,
     }
+}
+
+/// Load-side `commit_graph_compatible`: any history rewrite (grafts, shallow,
+/// replace refs) makes the on-disk graph untrustworthy for parent walks.
+fn commit_graph_load_compatible(git_dir: &Path, format: sley_core::ObjectFormat) -> bool {
+    if git_dir.join("shallow").is_file() {
+        return false;
+    }
+    if !revlist::load_commit_grafts_from_git_dir(git_dir, format).is_empty() {
+        return false;
+    }
+    // Presence of any `refs/replace/*` is enough; git only consults the map
+    // when replace-refs are enabled, but ignoring the graph when replacements
+    // exist is always correct (and matches when they are enabled).
+    let replace_dir = git_dir.join("refs").join("replace");
+    if replace_dir.is_dir()
+        && fs::read_dir(&replace_dir)
+            .map(|entries| entries.filter_map(|entry| entry.ok()).next().is_some())
+            .unwrap_or(false)
+    {
+        return false;
+    }
+    // Packed replace refs (less common in these tests but parity-correct).
+    if let Ok(packed) = fs::read_to_string(git_dir.join("packed-refs")) {
+        for line in packed.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            if let Some((_oid, name)) = line.split_once(' ')
+                && name.starts_with("refs/replace/")
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Warn (once per process, on stderr) when a commit-graph file's hash-version
@@ -4449,8 +4640,13 @@ fn commit_metadata_lookup<R: ObjectReader>(
     format: sley_core::ObjectFormat,
     oid: &ObjectId,
 ) -> Result<CommitMetadata> {
-    if let Some(metadata) = graph.metadata_owned(reader, oid)? {
-        return Ok(metadata);
+    match graph.metadata_owned(reader, oid) {
+        Ok(Some(metadata)) => return Ok(metadata),
+        Ok(None) => {}
+        Err(GitError::InvalidFormat(message)) if message.contains("commit-graph") => {
+            // Damaged graph must never abort a walk.
+        }
+        Err(err) => return Err(err),
     }
     let (parents, commit_time) = commit_metadata_from_object(reader, format, oid)?;
     Ok(CommitMetadata {
@@ -6819,12 +7015,25 @@ pub fn merge_bases<R: ObjectReader>(
             }
         }
     }
+    // Deterministic equal-date order, then stable date sort newest-first —
+    // matching git's `commit_list_sort_by_date` / `compare_commits_by_commit_date`.
+    // Callers that fold virtual ancestors (merge) reverse this list so the fold
+    // sees oldest first (builtin/merge.c try_merge_strategy).
     let mut bases: Vec<ObjectId> = candidates
         .into_iter()
         .filter(|candidate| !dominated.contains(candidate))
         .collect();
     bases.sort_by_key(|oid| oid.to_hex());
-    Ok(bases)
+    let mut dated: Vec<(i64, ObjectId)> = Vec::with_capacity(bases.len());
+    for oid in bases {
+        let time = graph
+            .commit_time(&oid)?
+            .map(Ok)
+            .unwrap_or_else(|| commit_metadata_from_object(reader, format, &oid).map(|(_, t)| t))?;
+        dated.push((time, oid));
+    }
+    dated.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    Ok(dated.into_iter().map(|(_, oid)| oid).collect())
 }
 
 /// BFS the ancestry of `start`, recording the shortest distance to each commit.
