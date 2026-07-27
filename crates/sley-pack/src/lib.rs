@@ -24,6 +24,7 @@ use std::sync::Arc;
 // This is a pure code move: no function body was altered.
 mod bounded_read;
 mod delta;
+mod fix_thin;
 mod index;
 pub mod inflate;
 mod limits;
@@ -33,6 +34,7 @@ mod write;
 
 pub use bounded_read::*;
 pub(crate) use delta::*;
+pub use fix_thin::*;
 pub use index::*;
 pub use limits::{MAX_READ_DELTA_CHAIN_DEPTH, PACK_OBJECT_COUNT_PREALLOC_CAP};
 pub(crate) use limits::{checked_pack_object_count, pack_entry_prealloc};
@@ -1141,6 +1143,316 @@ mod tests {
             sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", result)
                 .expect("test operation should succeed")
         );
+    }
+
+    #[test]
+    fn fixes_thin_pack_and_indexes_it_without_external_bases() {
+        for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+            let base = b"hello";
+            let result = b"hello world";
+            let pack = thin_ref_delta_pack(format, base, result);
+            let base_object = EncodedObject::new(ObjectType::Blob, base.to_vec());
+            let base_oid = base_object
+                .object_id(format)
+                .expect("test operation should succeed");
+
+            let fixed = fix_thin_pack(&pack, format, |oid| {
+                Ok((oid == &base_oid).then(|| base_object.clone()))
+            })
+            .expect("thin pack completion should succeed");
+
+            assert_eq!(u32_be(&fixed.pack[8..12]), 2);
+            assert_eq!(fixed.appended_bases, vec![base_oid]);
+            assert_eq!(fixed.index.entries.len(), 2);
+            let parsed =
+                PackFile::parse(&fixed.pack, format).expect("completed pack should stand alone");
+            assert_eq!(parsed.entries.len(), 2);
+            assert_eq!(parsed.entries[0].object.body, result);
+            assert_eq!(parsed.entries[1].object, base_object);
+            let rebuilt = PackIndex::write_v2_for_pack(&fixed.pack, format)
+                .expect("completed pack should index without a resolver");
+            assert_eq!(rebuilt, fixed.index);
+        }
+    }
+
+    #[test]
+    fn fix_thin_is_idempotent_for_a_complete_pack() {
+        let original = single_object_pack(ObjectFormat::Sha1, ObjectType::Blob, b"complete\n");
+        let mut resolver_called = false;
+        let fixed = fix_thin_pack(&original, ObjectFormat::Sha1, |_| {
+            resolver_called = true;
+            Ok(None)
+        })
+        .expect("complete pack should remain complete");
+
+        assert_eq!(fixed.pack, original);
+        assert!(fixed.appended_bases.is_empty());
+        assert!(!resolver_called);
+        assert_eq!(fixed.index.entries.len(), 1);
+    }
+
+    #[test]
+    fn fix_thin_does_not_duplicate_a_base_already_in_the_body() {
+        let pack =
+            two_object_delta_pack(ObjectFormat::Sha1, b"hello", b"hello world", DeltaKind::Ref);
+        let original_count = u32_be(&pack[8..12]);
+        let mut resolver_called = false;
+        let fixed = fix_thin_pack(&pack, ObjectFormat::Sha1, |_| {
+            resolver_called = true;
+            Ok(None)
+        })
+        .expect("in-pack ref base should remain self-contained");
+
+        assert_eq!(fixed.pack, pack);
+        assert_eq!(u32_be(&fixed.pack[8..12]), original_count);
+        assert_eq!(fixed.index.entries.len(), original_count as usize);
+        assert!(fixed.appended_bases.is_empty());
+        assert!(!resolver_called);
+    }
+
+    #[test]
+    fn fix_thin_appends_a_repeated_external_base_once() {
+        let base = b"shared";
+        let pack =
+            thin_ref_delta_pack_many(ObjectFormat::Sha1, base, &[b"shared one", b"shared two"]);
+        let base_object = EncodedObject::new(ObjectType::Blob, base.to_vec());
+        let base_oid = base_object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let mut calls = 0;
+        let fixed = fix_thin_pack(&pack, ObjectFormat::Sha1, |oid| {
+            calls += 1;
+            Ok((oid == &base_oid).then(|| base_object.clone()))
+        })
+        .expect("shared base completion should succeed");
+
+        assert_eq!(calls, 1);
+        assert_eq!(fixed.appended_bases, vec![base_oid]);
+        assert_eq!(u32_be(&fixed.pack[8..12]), 3);
+        assert_eq!(fixed.index.entries.len(), 3);
+    }
+
+    #[test]
+    fn fix_thin_rejects_missing_and_wrong_external_bases() {
+        let base = b"hello";
+        let pack = thin_ref_delta_pack(ObjectFormat::Sha1, base, b"hello world");
+        assert!(fix_thin_pack(&pack, ObjectFormat::Sha1, |_| Ok(None)).is_err());
+
+        let wrong = EncodedObject::new(ObjectType::Blob, b"wrong".to_vec());
+        let error = fix_thin_pack(&pack, ObjectFormat::Sha1, |_| Ok(Some(wrong.clone())))
+            .expect_err("wrong base body must not be accepted for the requested oid");
+        assert!(error.to_string().contains("resolved to object"));
+    }
+
+    #[test]
+    fn fix_thin_preserves_the_delta_depth_limit_boundary() {
+        let base = b"hello";
+        let pack = thin_ref_delta_pack(ObjectFormat::Sha1, base, b"hello world");
+        let base_object = EncodedObject::new(ObjectType::Blob, base.to_vec());
+        let base_oid = base_object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let resolve = |oid: &ObjectId| Ok((oid == &base_oid).then(|| base_object.clone()));
+
+        fix_thin_pack_with_limits(
+            &pack,
+            ObjectFormat::Sha1,
+            resolve,
+            PackReadLimits {
+                max_delta_depth: 1,
+                ..PackReadLimits::default()
+            },
+        )
+        .expect("one delta must pass at the exact limit");
+
+        let error = fix_thin_pack_with_limits(
+            &pack,
+            ObjectFormat::Sha1,
+            resolve,
+            PackReadLimits {
+                max_delta_depth: 0,
+                ..PackReadLimits::default()
+            },
+        )
+        .expect_err("one delta must fail immediately above the configured limit");
+        assert!(error.to_string().contains("observed depth 1"));
+    }
+
+    #[test]
+    fn streaming_indexer_resolves_thin_bases_but_rejects_missing_ones() {
+        let base = b"hello";
+        let result = b"hello stream";
+        let pack = thin_ref_delta_pack(ObjectFormat::Sha1, base, result);
+        let base_object = EncodedObject::new(ObjectType::Blob, base.to_vec());
+        let base_oid = base_object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+
+        let mut reader = Cursor::new(&pack);
+        let built =
+            PackIndex::write_v2_for_pack_reader_with_base(&mut reader, ObjectFormat::Sha1, |oid| {
+                Ok((oid == &base_oid).then(|| base_object.clone()))
+            })
+            .expect("streaming indexer should resolve the supplied base");
+        assert_eq!(built.entries.len(), 1);
+        assert_eq!(
+            built.entries[0].oid,
+            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", result)
+                .expect("test operation should succeed")
+        );
+
+        let mut missing_reader = Cursor::new(&pack);
+        let error = PackIndex::write_v2_for_pack_reader_with_base(
+            &mut missing_reader,
+            ObjectFormat::Sha1,
+            |_| Ok(None),
+        )
+        .expect_err("an unresolved streamed base must remain an error");
+        assert!(error.to_string().contains("unresolved delta base"));
+    }
+
+    #[test]
+    fn fixed_pack_passes_upstream_git_and_supports_clone() {
+        let format = ObjectFormat::Sha1;
+        let base = EncodedObject::new(
+            ObjectType::Blob,
+            b"the original contents are deliberately similar\n".repeat(32),
+        );
+        let mut target_body = base.body.clone();
+        target_body.extend_from_slice(b"completed thin pack\n");
+        let target = EncodedObject::new(ObjectType::Blob, target_body);
+        let target_oid = target
+            .object_id(format)
+            .expect("test operation should succeed");
+
+        let mut tree_body = b"100644 payload\0".to_vec();
+        tree_body.extend_from_slice(target_oid.as_bytes());
+        let tree = EncodedObject::new(ObjectType::Tree, tree_body);
+        let tree_oid = tree
+            .object_id(format)
+            .expect("test operation should succeed");
+        let commit = EncodedObject::new(
+            ObjectType::Commit,
+            format!(
+                "tree {tree_oid}\nauthor Sley <sley@example.com> 1 +0000\n\
+                 committer Sley <sley@example.com> 1 +0000\n\nthin pack fixture\n"
+            )
+            .into_bytes(),
+        );
+        let commit_oid = commit
+            .object_id(format)
+            .expect("test operation should succeed");
+        let base_oid = base
+            .object_id(format)
+            .expect("test operation should succeed");
+        let thin = PackFile::write_thin(
+            &[commit, tree, target],
+            format,
+            HashMap::from([(base_oid, base.clone())]),
+        )
+        .expect("write thin pack");
+        assert!(thin.delta_count > 0, "fixture must really be thin");
+        assert!(PackIndex::write_v2_for_pack(&thin.pack, format).is_err());
+
+        let fixed = fix_thin_pack(&thin.pack, format, |oid| {
+            Ok((oid == &base_oid).then(|| base.clone()))
+        })
+        .expect("fix thin pack");
+        let root = unique_temp_dir("fix-thin-git");
+        let strict_pack = root.join("strict.pack");
+        fs::create_dir_all(&root).expect("create test root");
+        fs::write(&strict_pack, &fixed.pack).expect("write strict pack");
+        run_git_success(&root, &["index-pack", "--strict", "strict.pack"]);
+
+        let complete_repo = root.join("complete.git");
+        run_git_success(
+            &root,
+            &[
+                "init",
+                "--bare",
+                "-q",
+                complete_repo.to_str().expect("utf8 complete repo path"),
+            ],
+        );
+        let complete_pack_dir = complete_repo.join("objects/pack");
+        let complete_stem = format!("pack-{}", fixed.index.pack_checksum);
+        fs::write(
+            complete_pack_dir.join(format!("{complete_stem}.pack")),
+            &fixed.pack,
+        )
+        .expect("write completed repository pack");
+        fs::write(
+            complete_pack_dir.join(format!("{complete_stem}.idx")),
+            &fixed.index.index,
+        )
+        .expect("write completed repository index");
+        fs::create_dir_all(complete_repo.join("refs/heads")).expect("create refs");
+        fs::write(
+            complete_repo.join("refs/heads/main"),
+            format!("{commit_oid}\n"),
+        )
+        .expect("write main ref");
+        fs::write(complete_repo.join("HEAD"), b"ref: refs/heads/main\n").expect("write HEAD");
+        run_git_success(&complete_repo, &["fsck", "--full"]);
+
+        let clone_path = root.join("clone");
+        run_git_success(
+            &root,
+            &[
+                "clone",
+                "--no-local",
+                "-q",
+                complete_repo.to_str().expect("utf8 complete repo path"),
+                clone_path.to_str().expect("utf8 clone path"),
+            ],
+        );
+        run_git_success(&clone_path, &["fsck", "--full"]);
+
+        let thin_repo = root.join("thin.git");
+        run_git_success(
+            &root,
+            &[
+                "init",
+                "--bare",
+                "-q",
+                thin_repo.to_str().expect("utf8 thin repo path"),
+            ],
+        );
+        let thin_index = PackIndex::write_v2_for_pack_with_base(&thin.pack, format, |oid| {
+            Ok((oid == &base_oid).then(|| base.clone()))
+        })
+        .expect("sley can build the deliberately permissive thin index");
+        let thin_pack_dir = thin_repo.join("objects/pack");
+        let thin_stem = format!("pack-{}", thin_index.pack_checksum);
+        fs::write(thin_pack_dir.join(format!("{thin_stem}.pack")), &thin.pack)
+            .expect("write thin repository pack");
+        fs::write(
+            thin_pack_dir.join(format!("{thin_stem}.idx")),
+            &thin_index.index,
+        )
+        .expect("write thin repository index");
+        fs::create_dir_all(thin_repo.join("refs/heads")).expect("create thin refs");
+        fs::write(thin_repo.join("refs/heads/main"), format!("{commit_oid}\n"))
+            .expect("write thin main ref");
+        fs::write(thin_repo.join("HEAD"), b"ref: refs/heads/main\n").expect("write thin HEAD");
+        let broken_clone_path = root.join("broken-clone");
+        let failed_clone = Command::new("git")
+            .current_dir(&root)
+            .args([
+                "clone",
+                "--no-local",
+                "-q",
+                thin_repo.to_str().expect("utf8 thin repo path"),
+                broken_clone_path.to_str().expect("utf8 broken clone path"),
+            ])
+            .output()
+            .expect("run failing clone");
+        assert!(
+            !failed_clone.status.success(),
+            "clone from uncompleted thin pack unexpectedly succeeded"
+        );
+
+        fs::remove_dir_all(root).expect("remove git interoperability fixture");
     }
 
     #[test]
@@ -2803,6 +3115,29 @@ mod tests {
             .expect("test operation should succeed");
         pack.extend_from_slice(&encoder.finish().expect("test operation should succeed"));
 
+        let checksum =
+            sley_core::digest_bytes(format, &pack).expect("test operation should succeed");
+        pack.extend_from_slice(checksum.as_bytes());
+        pack
+    }
+
+    fn thin_ref_delta_pack_many(format: ObjectFormat, base: &[u8], results: &[&[u8]]) -> Vec<u8> {
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&(results.len() as u32).to_be_bytes());
+        let base_oid = sley_core::object_id_for_bytes(format, "blob", base)
+            .expect("test operation should succeed");
+        for result in results {
+            let delta = append_suffix_delta(base, result);
+            write_pack_entry_header_kind(&mut pack, 7, delta.len() as u64);
+            pack.extend_from_slice(base_oid.as_bytes());
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(&delta)
+                .expect("test operation should succeed");
+            pack.extend_from_slice(&encoder.finish().expect("test operation should succeed"));
+        }
         let checksum =
             sley_core::digest_bytes(format, &pack).expect("test operation should succeed");
         pack.extend_from_slice(checksum.as_bytes());

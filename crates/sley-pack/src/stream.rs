@@ -18,6 +18,24 @@ where
     index_pack_from_reader_with_limits(reader, format, PackReadLimits::default())
 }
 
+/// [`index_pack_from_reader`] with an external ref-delta base resolver.
+pub fn index_pack_from_reader_with_base<R, F>(
+    reader: &mut R,
+    format: ObjectFormat,
+    external_base: F,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read + Seek,
+    F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+{
+    index_pack_from_reader_with_base_and_limits(
+        reader,
+        format,
+        external_base,
+        PackReadLimits::default(),
+    )
+}
+
 pub fn index_pack_from_reader_with_limits<R>(
     reader: &mut R,
     format: ObjectFormat,
@@ -35,6 +53,25 @@ where
     index_pack_from_reader_with_len_and_limits(reader, format, pack_len, limits)
 }
 
+pub fn index_pack_from_reader_with_base_and_limits<R, F>(
+    reader: &mut R,
+    format: ObjectFormat,
+    external_base: F,
+    limits: PackReadLimits,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read + Seek,
+    F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+{
+    let start = reader.stream_position()?;
+    let end = reader.seek(SeekFrom::End(0))?;
+    let pack_len = end
+        .checked_sub(start)
+        .ok_or_else(|| GitError::InvalidFormat("pack stream position overflow".into()))?;
+    reader.seek(SeekFrom::Start(start))?;
+    index_pack_from_reader_with_len_base_and_limits(reader, format, pack_len, external_base, limits)
+}
+
 pub(crate) fn index_pack_from_reader_with_len_and_limits<R>(
     reader: &mut R,
     format: ObjectFormat,
@@ -44,9 +81,29 @@ pub(crate) fn index_pack_from_reader_with_len_and_limits<R>(
 where
     R: Read,
 {
-    index_pack_from_stream_with_limits(
+    index_pack_from_stream_with_base_and_limits(
         PackReadStream::new(reader, format, Some(pack_len))?,
         format,
+        |_| Ok(None),
+        limits,
+    )
+}
+
+pub(crate) fn index_pack_from_reader_with_len_base_and_limits<R, F>(
+    reader: &mut R,
+    format: ObjectFormat,
+    pack_len: u64,
+    external_base: F,
+    limits: PackReadLimits,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+    F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+{
+    index_pack_from_stream_with_base_and_limits(
+        PackReadStream::new(reader, format, Some(pack_len))?,
+        format,
+        external_base,
         limits,
     )
 }
@@ -65,6 +122,24 @@ where
     index_pack_from_reader_to_trailer_with_limits(reader, format, PackReadLimits::default())
 }
 
+/// [`index_pack_from_reader_to_trailer`] with an external ref-delta resolver.
+pub fn index_pack_from_reader_to_trailer_with_base<R, F>(
+    reader: &mut R,
+    format: ObjectFormat,
+    external_base: F,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+    F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+{
+    index_pack_from_reader_to_trailer_with_base_and_limits(
+        reader,
+        format,
+        external_base,
+        PackReadLimits::default(),
+    )
+}
+
 pub fn index_pack_from_reader_to_trailer_with_limits<R>(
     reader: &mut R,
     format: ObjectFormat,
@@ -73,7 +148,30 @@ pub fn index_pack_from_reader_to_trailer_with_limits<R>(
 where
     R: Read,
 {
-    index_pack_from_stream_with_limits(PackReadStream::new(reader, format, None)?, format, limits)
+    index_pack_from_stream_with_base_and_limits(
+        PackReadStream::new(reader, format, None)?,
+        format,
+        |_| Ok(None),
+        limits,
+    )
+}
+
+pub fn index_pack_from_reader_to_trailer_with_base_and_limits<R, F>(
+    reader: &mut R,
+    format: ObjectFormat,
+    external_base: F,
+    limits: PackReadLimits,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+    F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+{
+    index_pack_from_stream_with_base_and_limits(
+        PackReadStream::new(reader, format, None)?,
+        format,
+        external_base,
+        limits,
+    )
 }
 
 /// Index one non-seekable pack through its trailer and report receive progress.
@@ -150,6 +248,24 @@ where
     index_pack_from_stream_with_limits(stream, format, PackReadLimits::default())
 }
 
+/// [`index_pack_from_stream`] with an external ref-delta base resolver.
+pub fn index_pack_from_stream_with_base<R, F>(
+    stream: PackReadStream<'_, R>,
+    format: ObjectFormat,
+    external_base: F,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+    F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+{
+    index_pack_from_stream_with_base_and_limits(
+        stream,
+        format,
+        external_base,
+        PackReadLimits::default(),
+    )
+}
+
 pub fn index_pack_from_stream_with_limits<R>(
     stream: PackReadStream<'_, R>,
     format: ObjectFormat,
@@ -159,6 +275,26 @@ where
     R: Read,
 {
     index_pack_from_stream_with_progress_and_limits(stream, format, limits, |_| {})
+}
+
+pub fn index_pack_from_stream_with_base_and_limits<R, F>(
+    stream: PackReadStream<'_, R>,
+    format: ObjectFormat,
+    external_base: F,
+    limits: PackReadLimits,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+    F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+{
+    index_pack_from_stream_with_base_progress_and_cancel_and_limits(
+        stream,
+        format,
+        external_base,
+        CancelFlag::never(),
+        limits,
+        |_| {},
+    )
 }
 
 /// Approximate cadence for progress emission: report at least every this many
@@ -206,14 +342,37 @@ where
 }
 
 pub(crate) fn index_pack_from_stream_with_progress_and_cancel_and_limits<R, F>(
+    stream: PackReadStream<'_, R>,
+    format: ObjectFormat,
+    cancel: CancelFlag<'_>,
+    limits: PackReadLimits,
+    progress: F,
+) -> Result<PackStreamIndexBuild>
+where
+    R: Read,
+    F: FnMut(PackStreamProgress),
+{
+    index_pack_from_stream_with_base_progress_and_cancel_and_limits(
+        stream,
+        format,
+        |_| Ok(None),
+        cancel,
+        limits,
+        progress,
+    )
+}
+
+pub(crate) fn index_pack_from_stream_with_base_progress_and_cancel_and_limits<R, B, F>(
     mut stream: PackReadStream<'_, R>,
     format: ObjectFormat,
+    mut external_base: B,
     cancel: CancelFlag<'_>,
     limits: PackReadLimits,
     mut progress: F,
 ) -> Result<PackStreamIndexBuild>
 where
     R: Read,
+    B: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
     F: FnMut(PackStreamProgress),
 {
     let mut header = [0u8; 12];
@@ -331,7 +490,7 @@ where
         )));
     }
 
-    let resolved = resolve_pack_entries(parsed_entries, format, &mut |_| Ok(None), limits)?;
+    let resolved = resolve_pack_entries(parsed_entries, format, &mut external_base, limits)?;
     let entries = resolved
         .iter()
         .zip(raw_entries)

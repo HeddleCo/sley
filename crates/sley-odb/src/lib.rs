@@ -1159,6 +1159,53 @@ mod tests {
     }
 
     #[test]
+    fn file_database_completes_thin_pack_before_installing_it() {
+        let root = temp_root("sley-file-odb-install-fix-thin");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create object database");
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let base = EncodedObject::new(ObjectType::Blob, vec![b'a'; 4096]);
+        let base_oid = db.write_object(base.clone()).expect("write external base");
+        let mut target = base.clone();
+        target.body[2048] = b'b';
+        let target_oid = target.object_id(format).expect("target oid");
+        let thin = PackFile::write_thin(
+            std::slice::from_ref(&target),
+            format,
+            HashMap::from([(base_oid, base)]),
+        )
+        .expect("write thin pack");
+        assert!(PackFile::parse(&thin.pack, format).is_err());
+
+        let installed = db
+            .install_raw_pack_from_reader_with_external_bases(&mut thin.pack.as_slice())
+            .expect("install completed pack");
+        let installed_bytes = fs::read(&installed.pack_path).expect("read installed pack");
+        let parsed = PackFile::parse(&installed_bytes, format)
+            .expect("installed pack must resolve without the database");
+        assert_eq!(parsed.entries.len(), 2);
+        assert!(installed.object_ids.contains(&base_oid));
+        assert!(installed.object_ids.contains(&target_oid));
+
+        fs::remove_file(
+            db.loose()
+                .object_path(&base_oid)
+                .expect("external base path"),
+        )
+        .expect("remove loose external base");
+        let reopened = FileObjectDatabase::from_git_dir(&git_dir, format);
+        assert_eq!(
+            reopened
+                .read_object(&target_oid)
+                .expect("read target from standalone pack")
+                .as_ref(),
+            &target
+        );
+        fs::remove_dir_all(root).expect("remove thin install fixture");
+    }
+
+    #[test]
     fn incoming_pack_quarantine_discards_rejected_and_promotes_accepted_objects() {
         let root = temp_root("sley-incoming-pack-quarantine");
         let git_dir = root.join("repo.git");

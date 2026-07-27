@@ -6,7 +6,7 @@ use sley_formats::{Bundle, BundleReference};
 use sley_object::{EncodedObject, ObjectType};
 use sley_pack::{
     PackFile, PackIndex, PackInput, PackStreamIndexBuild, PackStreamProgress, PackWrite,
-    PackWriteOptions,
+    PackWriteOptions, fix_thin_pack,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -1028,7 +1028,9 @@ impl FileObjectDatabase {
     }
 
     /// Install a pack whose ref-deltas may use objects already available from
-    /// this database (including alternates) as bases.
+    /// this database (including alternates) as bases. Required bases are
+    /// appended as full entries before the pack is stored, so the installed
+    /// pack remains independently valid.
     pub fn install_raw_pack_from_reader_with_external_bases<R>(
         &self,
         reader: &mut R,
@@ -1038,13 +1040,13 @@ impl FileObjectDatabase {
     {
         let mut pack = Vec::new();
         reader.read_to_end(&mut pack)?;
-        let built = PackIndex::write_v2_for_pack_with_base(&pack, self.format, |oid| {
-            match self.read_object(oid) {
-                Ok(object) => Ok(Some((*object).clone())),
-                Err(GitError::NotFound(_)) => Ok(None),
-                Err(err) => Err(err),
-            }
+        let fixed = fix_thin_pack(&pack, self.format, |oid| match self.read_object(oid) {
+            Ok(object) => Ok(Some((*object).clone())),
+            Err(GitError::NotFound(_)) => Ok(None),
+            Err(err) => Err(err),
         })?;
+        let pack = fixed.pack;
+        let built = fixed.index;
         let pack_dir = self.objects_dir.join("pack");
         fs::create_dir_all(&pack_dir)?;
         let temp_pack_path = unique_temp_path(&pack_dir);
