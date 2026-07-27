@@ -2309,6 +2309,7 @@ mod tests {
             ConvFlags::Off,
             SafeCrlfIndexBlob::None,
             true,
+            false,
         )
         .expect_err("UTF-16 without a BOM must be rejected when writing an object");
 

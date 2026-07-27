@@ -624,27 +624,24 @@ pub(crate) fn cmd_checkout(
         }
     }
 
-    // `-f`: discard local index/worktree changes (including conflict stages)
-    // before switching, so the clean-tree checkout below succeeds — git's
-    // force semantics. Untracked files are preserved.
+    // `-f`: discard local *superproject* index/worktree changes (including
+    // conflict stages) before switching so a subsequent clean rebuild succeeds.
+    //
+    // git's `merge_working_tree` with `discard_changes` resets straight to the
+    // *target* tree (builtin/checkout.c); it never force-resets to the HEAD
+    // being left. A recursive reset to the current HEAD is actively wrong when
+    // that HEAD records an invalid/missing gitlink (t2013 "from invalid commit"):
+    // `submodule_move_head` would try to check out the bad oid and abort the
+    // whole switch. Keep this pre-pass superproject-only; recursive submodule
+    // updates belong to the target transition below.
     if force {
         if let Ok(Some(head_oid)) = resolve_ref_peeled(store, "HEAD") {
-            if recurse_submodules {
-                commands::read_tree::reset_index_and_worktree_to_commit(
-                    &worktree_root,
-                    &git_dir,
-                    format,
-                    &head_oid,
-                    true,
-                )?;
-            } else {
-                sley_worktree::reset_index_and_worktree_to_commit(
-                    &worktree_root,
-                    &git_dir,
-                    format,
-                    &head_oid,
-                )?;
-            }
+            sley_worktree::reset_index_and_worktree_to_commit(
+                &worktree_root,
+                &git_dir,
+                format,
+                &head_oid,
+            )?;
         } else {
             // Unborn HEAD: discard the staged state entirely.
             let index_path = sley_worktree::repository_index_path(&git_dir);
@@ -1148,15 +1145,38 @@ pub(crate) fn cmd_checkout(
     // Creating a branch at the commit already checked out does not need a
     // two-way unpack. Avoiding that index rebuild is observable: Git preserves
     // optional extensions such as UNTR across `checkout -b new HEAD`.
-    } else if recurse_submodules
-        || (branch_update_rollback.is_some() && !force && branch_target != Some(checkout_old_head))
+    //
+    // For every worktree-updating branch switch, prefer the shared two-way
+    // unpack-trees engine (git's `merge_working_tree`). The older "clean rebuild"
+    // path (`checkout_branch_filtered`) only looks at status dirtiness and misses
+    // untracked files that status treats as inside a submodule, and therefore
+    // silently clobbers them when a gitlink appears or when a submodule is
+    // replaced by ordinary paths (t2013 replace-submodule-with-directory /
+    // untracked-file-with-same-name). Same-HEAD create-branch stays above.
+    } else if branch_target != Some(checkout_old_head)
+        || recurse_submodules
+        || force
+        || branch_update_rollback.is_some()
     {
         let from = checkout_reflog_from.clone();
         let target = branch_target.ok_or_else(|| GitError::reference_not_found("branch"))?;
-        if let Err(err) = checkout_twoway_dirty(&context, Some(&target), recurse_submodules, force)
-        {
-            checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
-            return Err(err);
+        if branch_target != Some(checkout_old_head) || recurse_submodules || force {
+            // Process-filter smudge metadata for a branch switch carries the
+            // destination ref and commit (git's `checkout_metadata` /
+            // t0021 required process filter on `checkout <branch>`).
+            let branch_ref = branch_ref_name(branch)?;
+            let _process_filter_metadata = sley_worktree::set_process_filter_metadata(Some(vec![
+                ("ref".to_string(), branch_ref),
+                ("treeish".to_string(), target.to_hex()),
+            ]));
+            let _process_filter_cwd =
+                sley_worktree::set_process_filter_cwd(Some(worktree_root.clone()));
+            if let Err(err) =
+                checkout_twoway_dirty(&context, Some(&target), recurse_submodules, force)
+            {
+                checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+                return Err(err);
+            }
         }
         if let Err(err) =
             switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from, &config)
@@ -1165,6 +1185,8 @@ pub(crate) fn cmd_checkout(
             return Err(err);
         }
     } else {
+        // Same-HEAD, no force, no recurse: preserve index extensions (UNTR) via
+        // the lightweight path — `checkout -b new` at the current tip.
         match sley_worktree::checkout_branch_filtered(
             &worktree_root,
             git_dir.clone(),
@@ -2244,7 +2266,12 @@ fn prefetch_local_promisor_checkout_blobs(
         return Ok(false);
     }
     let mut wants = Vec::new();
-    collect_missing_checkout_blob_wants(db, format, *commit_oid, &mut wants)?;
+    // Sparse checkouts only need in-cone tip blobs for materialization.
+    // Prefetching the full tip tree over-fetches out-of-cone objects and
+    // breaks partial-clone accounting (t5620 no-cone: 42 missing after
+    // checkout, not 24).
+    let sparse = sley_worktree::active_sparse_checkout(git_dir)?;
+    collect_missing_checkout_blob_wants(db, format, *commit_oid, sparse.as_ref(), &mut wants)?;
     if wants.is_empty() {
         return Ok(true);
     }
@@ -2295,6 +2322,10 @@ fn collect_missing_checkout_blob_wants(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     commit_oid: ObjectId,
+    sparse: Option<&(
+        sley_worktree::SparseCheckout,
+        sley_worktree::SparseCheckoutMode,
+    )>,
     wants: &mut Vec<ObjectId>,
 ) -> Result<()> {
     let object = db.read_object(&commit_oid)?;
@@ -2305,13 +2336,18 @@ fn collect_missing_checkout_blob_wants(
         )));
     }
     let commit = Commit::parse_ref(format, &object.body)?;
-    collect_missing_tree_blob_wants(db, format, commit.tree, wants)
+    collect_missing_tree_blob_wants(db, format, commit.tree, "", sparse, wants)
 }
 
 fn collect_missing_tree_blob_wants(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: ObjectId,
+    prefix: &str,
+    sparse: Option<&(
+        sley_worktree::SparseCheckout,
+        sley_worktree::SparseCheckoutMode,
+    )>,
     wants: &mut Vec<ObjectId>,
 ) -> Result<()> {
     let object = db.read_object(&tree_oid)?;
@@ -2322,10 +2358,26 @@ fn collect_missing_tree_blob_wants(
         )));
     }
     for entry in Tree::parse(format, &object.body)?.entries {
+        let name = String::from_utf8_lossy(entry.name.as_ref()).into_owned();
+        let path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
         if entry.is_tree() {
-            collect_missing_tree_blob_wants(db, format, entry.oid, wants)?;
-        } else if !entry.is_gitlink() && !db.contains(&entry.oid)? {
-            wants.push(entry.oid);
+            // Trees are present under blob:none filters; walk fully so
+            // no-cone basename patterns (e.g. `**/file.1.txt`) still match
+            // deep leaves. Only blob wants are sparse-filtered below.
+            collect_missing_tree_blob_wants(db, format, entry.oid, &path, sparse, wants)?;
+        } else if !entry.is_gitlink() {
+            if let Some((sparse_cfg, mode)) = sparse
+                && !sley_worktree::path_in_sparse_checkout(path.as_bytes(), sparse_cfg, *mode)
+            {
+                continue;
+            }
+            if !db.contains(&entry.oid)? {
+                wants.push(entry.oid);
+            }
         }
     }
     Ok(())

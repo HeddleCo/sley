@@ -27,13 +27,13 @@ use sley_config::GitConfig;
 use sley_core::{
     CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
 };
-use sley_odb::FileObjectDatabase;
+use sley_odb::{FileObjectDatabase, ObjectReader};
 use sley_protocol::{
     GitService, ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchAcknowledgment,
     ProtocolV2FetchRequest, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
-    ProtocolV2LsRefsRequest, ProtocolVersion, RefAdvertisement, RefAdvertisementSet,
-    TransportHandshake, UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRequest,
-    encode_protocol_v2_command_options, parse_protocol_v2_fetch_features,
+    ProtocolV2FetchWantedRef, ProtocolV2LsRefsRequest, ProtocolVersion, RefAdvertisement,
+    RefAdvertisementSet, TransportHandshake, UploadPackFeatures, UploadPackNegotiationRequest,
+    UploadPackRequest, encode_protocol_v2_command_options, parse_protocol_v2_fetch_features,
     parse_upload_pack_features, protocol_v2_object_format,
     read_protocol_v2_fetch_negotiation_response, read_protocol_v2_fetch_response,
     read_protocol_v2_fetch_response_header, read_protocol_v2_fetch_sideband_all_response,
@@ -357,6 +357,7 @@ fn protocol_v2_fetch_command_request(
 #[allow(clippy::too_many_arguments)]
 fn protocol_v2_fetch_request_from_upload_pack_semantics(
     wants: Vec<ObjectId>,
+    want_refs: Vec<String>,
     haves: Vec<ObjectId>,
     shallow: Vec<ObjectId>,
     deepen: Option<u32>,
@@ -370,6 +371,7 @@ fn protocol_v2_fetch_request_from_upload_pack_semantics(
         parse_protocol_v2_fetch_features(&handshake.capabilities)?.unwrap_or_default();
     Ok(ProtocolV2FetchRequest {
         wants,
+        want_refs,
         haves,
         shallow,
         deepen,
@@ -873,8 +875,19 @@ pub struct NegotiatedPackResponse {
     pub body: Box<dyn Read + Send>,
     /// Shallow-boundary updates parsed before the packfile section.
     pub shallow_info: Vec<ProtocolV2FetchShallowInfo>,
+    /// Ref names and object ids resolved by protocol-v2 `want-ref`.
+    pub wanted_refs: Vec<ProtocolV2FetchWantedRef>,
     /// Whether the response contains a packfile section.
     pub has_packfile: bool,
+}
+
+/// Outcome of a protocol-v2 HTTP fetch, including any `wanted-refs` the server
+/// resolved for `want-ref` lines (so the client can update tracking refs to the
+/// OIDs current at request time rather than the earlier ls-refs snapshot).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HttpProtocolV2FetchOutcome {
+    pub shallow_info: Vec<ProtocolV2FetchShallowInfo>,
+    pub wanted_refs: Vec<ProtocolV2FetchWantedRef>,
 }
 
 pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
@@ -973,23 +986,138 @@ pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
     Ok(shallow_info)
 }
 
+/// Protocol-v2 `--negotiate-only` over smart HTTP.
+///
+/// Discovers the upload-pack advertisement, requires the `wait-for-done` fetch
+/// feature, POSTs a `fetch` command with only haves, and returns the ACKed
+/// common object ids.
+pub fn negotiate_only_http<C: HttpClient + ?Sized>(
+    client: &C,
+    remote: &RemoteUrl,
+    format: ObjectFormat,
+    tip_oids: &[ObjectId],
+    git_dir: &Path,
+    credentials: &mut dyn CredentialProvider,
+    config: Option<&GitConfig>,
+) -> Result<Vec<ObjectId>> {
+    let discovery = http_discover_upload_pack(client, remote, credentials, config)?;
+    let Some(handshake) = discovery.advertisements.handshake.as_ref() else {
+        eprintln!("warning: --negotiate-only requires protocol v2");
+        return Err(GitError::Exit(1));
+    };
+    if handshake.protocol != ProtocolVersion::V2 {
+        eprintln!("warning: --negotiate-only requires protocol v2");
+        return Err(GitError::Exit(1));
+    }
+    let features = parse_protocol_v2_fetch_features(&handshake.capabilities)?.unwrap_or_default();
+    if !features.wait_for_done {
+        eprintln!("warning: server does not support wait-for-done");
+        return Err(GitError::Exit(1));
+    }
+    let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut seen = std::collections::HashSet::new();
+    let mut haves = Vec::new();
+    for tip in tip_oids {
+        let mut stack = vec![*tip];
+        while let Some(oid) = stack.pop() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            haves.push(oid);
+            let Ok(object) = local_db.read_object(&oid) else {
+                continue;
+            };
+            if object.object_type != sley_object::ObjectType::Commit {
+                continue;
+            }
+            if let Ok(commit) = sley_object::Commit::parse_ref(format, &object.body) {
+                for parent in commit.parents {
+                    if !seen.contains(&parent) {
+                        stack.push(parent);
+                    }
+                }
+            }
+        }
+    }
+    let fetch = ProtocolV2FetchRequest {
+        haves,
+        wait_for_done: true,
+        done: false,
+        thin_pack: true,
+        ofs_delta: true,
+        include_tag: false,
+        ..ProtocolV2FetchRequest::default()
+    };
+    let git_protocol = http_git_protocol_header_value(config)?;
+    let mut response = http_protocol_v2_fetch_post(
+        client,
+        remote,
+        format,
+        handshake,
+        fetch,
+        credentials,
+        HttpRpcOptions {
+            git_protocol: git_protocol.as_deref(),
+            post_buffer: 1_048_576,
+        },
+    )?;
+    let negotiation =
+        read_protocol_v2_fetch_negotiation_response(format, &mut response.body, false, true)?;
+    let mut acked = Vec::new();
+    for ack in negotiation.acknowledgments {
+        if let ProtocolV2FetchAcknowledgment::Ack(oid) = ack {
+            acked.push(oid);
+        }
+    }
+    Ok(acked)
+}
+
 pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
-    mut request: HttpFetchPackRequest<'_, C>,
+    request: HttpFetchPackRequest<'_, C>,
     handshake: &TransportHandshake,
     credentials: &mut dyn CredentialProvider,
     progress: &mut dyn ProgressSink,
     cancel: CancelFlag<'_>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
-    if request.wants.is_empty() {
-        return Ok(Vec::new());
+    install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs(
+        request,
+        Vec::new(),
+        handshake,
+        credentials,
+        progress,
+        cancel,
+    )
+    .map(|outcome| outcome.shallow_info)
+}
+
+/// Install a protocol-v2 HTTP fetch while resolving `want-ref` names at request
+/// time. Keeping the names separate from [`HttpFetchPackRequest`] preserves the
+/// exact-OID request API used by independent partial-clone callers.
+pub fn install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs<C: HttpClient + ?Sized>(
+    mut request: HttpFetchPackRequest<'_, C>,
+    want_refs: Vec<String>,
+    handshake: &TransportHandshake,
+    credentials: &mut dyn CredentialProvider,
+    progress: &mut dyn ProgressSink,
+    cancel: CancelFlag<'_>,
+) -> Result<HttpProtocolV2FetchOutcome> {
+    if request.wants.is_empty() && want_refs.is_empty() {
+        return Ok(HttpProtocolV2FetchOutcome::default());
     }
     trace_protocol_v2_advertisement_read(handshake)?;
     let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
-    if !request_replays_shallow_boundary(request.deepen, request.deepen_since, &request.deepen_not)
+    // When using want-ref, the advertised OIDs may be stale/wrong; always talk to
+    // the server so it can resolve names at request time.
+    if want_refs.is_empty()
+        && !request_replays_shallow_boundary(
+            request.deepen,
+            request.deepen_since,
+            &request.deepen_not,
+        )
         && request.filter.is_none()
         && all_wants_present(&local_db, &request.wants)?
     {
-        return Ok(Vec::new());
+        return Ok(HttpProtocolV2FetchOutcome::default());
     }
     let haves = request_negotiation_haves(
         request.git_dir,
@@ -1002,12 +1130,16 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
     let max_input_size = request.max_input_size;
     let mut negotiated = negotiate_fetch_pack_via_http_protocol_v2_after_trace(
         request,
+        want_refs,
         handshake,
         credentials,
         cancel,
     )?;
     if !negotiated.has_packfile {
-        return Ok(negotiated.shallow_info);
+        return Ok(HttpProtocolV2FetchOutcome {
+            shallow_info: negotiated.shallow_info,
+            wanted_refs: negotiated.wanted_refs,
+        });
     }
     if promisor {
         install_protocol_v2_packfile_from_reader_with_cancel(
@@ -1026,7 +1158,10 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
             cancel,
         )?;
     }
-    Ok(negotiated.shallow_info)
+    Ok(HttpProtocolV2FetchOutcome {
+        shallow_info: negotiated.shallow_info,
+        wanted_refs: negotiated.wanted_refs,
+    })
 }
 
 /// Negotiate a multi-round protocol-v2 smart-HTTP fetch without accessing or
@@ -1053,11 +1188,18 @@ pub fn negotiate_fetch_pack_via_http_protocol_v2<C: HttpClient + ?Sized>(
         ));
     }
     trace_protocol_v2_advertisement_read(handshake)?;
-    negotiate_fetch_pack_via_http_protocol_v2_after_trace(request, handshake, credentials, cancel)
+    negotiate_fetch_pack_via_http_protocol_v2_after_trace(
+        request,
+        Vec::new(),
+        handshake,
+        credentials,
+        cancel,
+    )
 }
 
 fn negotiate_fetch_pack_via_http_protocol_v2_after_trace<C: HttpClient + ?Sized>(
     mut request: HttpFetchPackRequest<'_, C>,
+    want_refs: Vec<String>,
     handshake: &TransportHandshake,
     credentials: &mut dyn CredentialProvider,
     cancel: CancelFlag<'_>,
@@ -1074,6 +1216,7 @@ fn negotiate_fetch_pack_via_http_protocol_v2_after_trace<C: HttpClient + ?Sized>
     };
     let fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
         request.wants,
+        want_refs,
         haves,
         request.shallow,
         request.deepen,
@@ -1099,9 +1242,16 @@ fn negotiate_fetch_pack_via_http_protocol_v2_after_trace<C: HttpClient + ?Sized>
     )?;
     let header =
         read_protocol_v2_fetch_response_header(request.format, &mut response.body, sideband_all)?;
+    let mut wanted_refs = Vec::new();
+    for section in &header.sections {
+        if let ProtocolV2FetchResponseSection::WantedRefs(wanted) = section {
+            wanted_refs.extend(wanted.iter().cloned());
+        }
+    }
     Ok(NegotiatedPackResponse {
         body: response.body,
         shallow_info: shallow_info_from_protocol_v2_fetch_header(&header),
+        wanted_refs,
         has_packfile: header.has_packfile,
     })
 }
@@ -2326,6 +2476,7 @@ mod tests {
         .expect("test operation should succeed");
         let fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
             vec![want.clone()],
+            Vec::new(),
             vec![have.clone()],
             vec![shallow.clone()],
             Some(3),
@@ -2387,6 +2538,7 @@ mod tests {
         .expect("test operation should succeed");
         let fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
             vec![want],
+            Vec::new(),
             Vec::new(),
             vec![shallow.clone()],
             Some(1),

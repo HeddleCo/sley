@@ -275,6 +275,41 @@ pub(crate) fn cmd_interpret_trailers(
 /// Matching git's `amend_strbuf_with_trailers`, divider handling is disabled
 /// (`no_divider = true`): a `---` line in a commit/tag *body* is ordinary text,
 /// not a patch divider, so trailers append after it rather than before it.
+/// True when `message` ends with a recognised trailer block containing at least
+/// one trailer (git's `has_conforming_footer` via `trailer_iterator`). Honouring
+/// `trailer.<name>.*` config is essential: a configured token can tip the 25%
+/// rule so a mixed paragraph still counts as a trailer block (t7501 signoff /
+/// `trailer.Myfooter.ifexists=add`).
+pub(crate) fn message_has_conforming_trailer_block(
+    config: Option<&GitConfig>,
+    message: &str,
+) -> bool {
+    let config = load_trailer_config(config);
+    let opts = Options {
+        in_place: false,
+        trim_empty: false,
+        only_trailers: false,
+        only_input: true,
+        unfold: false,
+        no_divider: true,
+        default_where: config.where_,
+        default_if_exists: config.if_exists,
+        default_if_missing: config.if_missing,
+        out_separator: config.out_separator,
+        separators: config.separators.clone(),
+        comment_prefix: config.comment_prefix.clone(),
+        conf_items: config.conf_items.clone(),
+        trailers: Vec::new(),
+        files: Vec::new(),
+    };
+    let end = find_end_of_log_message(message, opts.no_divider, &opts.comment_prefix);
+    let start = find_trailer_block_start(message, end, &opts);
+    if start >= end {
+        return false;
+    }
+    !parse_trailers(&message[start..end], &opts).is_empty()
+}
+
 pub(crate) fn apply_trailers_to_message(
     config: Option<&GitConfig>,
     message: &str,

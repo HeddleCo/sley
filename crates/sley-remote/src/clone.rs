@@ -32,6 +32,7 @@
 //! SSH clone uses the same [`crate::fetch`] SSH dispatch as fetch; only the
 //! caller-side URL resolution and post-clone presentation stay in the CLI.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use sley_config::GitConfig;
@@ -39,7 +40,7 @@ use sley_core::{DynCancelFlag, GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{InitOptions, RefStorageFormat, RepositoryBootstrap};
 use sley_object::{Commit, ObjectType, Tree};
 use sley_odb::{FileObjectDatabase, ObjectReader};
-use sley_refs::{FileRefStore, RefTarget, RefUpdate};
+use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry};
 use sley_transport::RemoteUrl;
 #[cfg(feature = "http")]
 use sley_transport::{HttpClient, UreqHttpClient};
@@ -119,6 +120,10 @@ pub struct CloneOptions<'a> {
     /// Whether clone should populate the worktree. `--no-checkout` still writes
     /// refs/config but must not hydrate filtered blobs solely for checkout.
     pub checkout: bool,
+    /// `--sparse`: only materialize top-level cone blobs (`/*` + `!/*/`) during
+    /// partial-clone checkout top-up. Full tip-tree blobs would over-fetch
+    /// out-of-cone history (t5620 sparse backfill expects 44 missing, not 24).
+    pub sparse: bool,
     /// Partial-clone object filter (`--filter=blob:none`) to apply to the
     /// clone fetch. Only honored by the in-process local server.
     pub filter: Option<sley_odb::PackObjectFilter>,
@@ -390,13 +395,17 @@ fn clone_impl(
         None => {
             // The remote advertised no tip for the branch we are tracking. When
             // the caller did not request an explicit branch this is an
-            // empty/unborn-repository clone: upstream `builtin/clone.c` warns,
-            // skips the checkout, and leaves `HEAD` as an unborn symref pointing
-            // at the remote's (or local default) branch — `update_head`'s
-            // `unborn` arm. We mirror that by setting `HEAD` and returning a
-            // marker for the CLI to print the warning. An explicit-branch miss
-            // is still a hard error (the CLI maps it to git's "Remote branch …
-            // not found" message).
+            // empty/unborn-repository clone: upstream `builtin/clone.c` leaves
+            // `HEAD` as an unborn symref pointing at the remote's (or local
+            // default) branch — `update_head`'s `unborn` arm. An explicit-branch
+            // miss is still a hard error (the CLI maps it to git's "Remote
+            // branch … not found" message).
+            //
+            // "Empty" is strictly "no mapped refs after fetch" (git's
+            // `if (!mapped_refs)`). An unborn HEAD on a non-empty remote still
+            // fetches other branches (t5702 #19): that is not empty, and the
+            // CLI warns "remote HEAD refers to nonexistent ref" instead of the
+            // empty-repository message.
             if request.options.branch_explicit {
                 return Err(GitError::reference_not_found(format!(
                     "remote ref {remote_branch_ref}"
@@ -414,10 +423,14 @@ fn clone_impl(
             // Install branch upstream config for the unborn branch, matching
             // git's `install_branch_config` in the unborn path.
             (services.configure_branch)(&git_dir, request.options.checkout_branch)?;
+            let empty = !fetch_outcome
+                .ref_updates
+                .iter()
+                .any(|update| update.dst.is_some());
             return Ok(CloneOutcome {
                 git_dir,
                 branch_oid: None,
-                empty: true,
+                empty,
                 pack_generation_progress: fetch_outcome.pack_generation_progress,
             });
         }
@@ -473,14 +486,55 @@ fn clone_impl(
     write_clone_remote_head(&store, request.options)?;
 
     if request.options.checkout {
-        sley_worktree::checkout_branch_filtered(
-            request.destination,
-            &git_dir,
-            request.format,
-            request.options.checkout_branch,
-            request.options.committer.clone(),
-            &checkout_config,
-        )?;
+        if request.options.sparse {
+            // Default sparse-clone cone (`/*` + `!/*/`) — only top-level files
+            // are materialised; out-of-cone paths get skip-worktree without
+            // requiring their blobs (which were deliberately not top-up fetched).
+            let sparse = sley_worktree::SparseCheckout {
+                patterns: vec![b"/*".to_vec(), b"!/*/".to_vec()],
+                sparse_index: false,
+            };
+            // Write sparse config/patterns before checkout so any later reapply
+            // sees an active sparse-checkout definition.
+            let info = git_dir.join("info");
+            fs::create_dir_all(&info)?;
+            fs::write(info.join("sparse-checkout"), b"/*\n!/*/\n")?;
+            sley_worktree::checkout_commit_to_index_and_worktree_sparse(
+                request.destination,
+                &git_dir,
+                request.format,
+                &branch_oid,
+                Some((&sparse, sley_worktree::SparseCheckoutMode::Cone)),
+                None,
+                None,
+            )?;
+            // Point HEAD at the branch (checkout_branch_filtered does this too).
+            let refs = FileRefStore::new(&git_dir, request.format);
+            let branch_ref = format!("refs/heads/{}", request.options.checkout_branch);
+            let mut tx = refs.transaction();
+            tx.update(RefUpdate {
+                name: "HEAD".into(),
+                expected: None,
+                new: RefTarget::Symbolic(branch_ref),
+                reflog: Some(ReflogEntry {
+                    old_oid: ObjectId::null(request.format),
+                    new_oid: branch_oid,
+                    committer: request.options.committer.clone(),
+                    message: format!("clone: checkout {}", request.options.checkout_branch)
+                        .into_bytes(),
+                }),
+            });
+            tx.commit()?;
+        } else {
+            sley_worktree::checkout_branch_filtered(
+                request.destination,
+                &git_dir,
+                request.format,
+                request.options.checkout_branch,
+                request.options.committer.clone(),
+                &checkout_config,
+            )?;
+        }
     }
 
     Ok(CloneOutcome {
@@ -557,6 +611,7 @@ fn fetch_partial_clone_checkout_blobs(
                 &local_db,
                 request.format,
                 commit_oid,
+                request.options.sparse,
                 &mut seen,
                 &mut wants,
             )?;
@@ -635,6 +690,7 @@ fn fetch_http_partial_clone_checkout_blobs(
         &local_db,
         request.format,
         commit_oid,
+        request.options.sparse,
         &mut seen,
         &mut wants,
     )?;
@@ -718,6 +774,7 @@ fn collect_checkout_materialization_wants(
     local_db: &FileObjectDatabase,
     format: ObjectFormat,
     commit_oid: ObjectId,
+    sparse: bool,
     seen: &mut std::collections::HashSet<ObjectId>,
     wants: &mut Vec<ObjectId>,
 ) -> Result<()> {
@@ -729,14 +786,26 @@ fn collect_checkout_materialization_wants(
         )));
     }
     let commit = Commit::parse_ref(format, &commit_object.body)?;
-    collect_tree_materialization_wants(remote_db, local_db, format, commit.tree, seen, wants)
+    collect_tree_materialization_wants(
+        remote_db,
+        local_db,
+        format,
+        commit.tree,
+        sparse,
+        /*at_root=*/ true,
+        seen,
+        wants,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_tree_materialization_wants(
     remote_db: &FileObjectDatabase,
     local_db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: ObjectId,
+    sparse: bool,
+    at_root: bool,
     seen: &mut std::collections::HashSet<ObjectId>,
     wants: &mut Vec<ObjectId>,
 ) -> Result<()> {
@@ -755,8 +824,14 @@ fn collect_tree_materialization_wants(
     }
     for entry in Tree::parse(format, &tree_object.body)?.entries {
         if entry.is_tree() {
+            // Default sparse-clone cone (`/*` + `!/*/`) excludes every directory
+            // at the root: do not descend or materialize out-of-cone blobs.
+            if sparse && at_root {
+                continue;
+            }
             collect_tree_materialization_wants(
-                remote_db, local_db, format, entry.oid, seen, wants,
+                remote_db, local_db, format, entry.oid, sparse, /*at_root=*/ false, seen,
+                wants,
             )?;
         } else if !entry.is_gitlink() && seen.insert(entry.oid) && !local_db.contains(&entry.oid)? {
             wants.push(entry.oid);
@@ -830,5 +905,6 @@ fn clone_fetch_options(options: CloneFetchOptions<'_>) -> FetchOptions {
         atomic: false,
         negotiation_restrict: None,
         negotiation_include: None,
+        negotiate_only: false,
     }
 }

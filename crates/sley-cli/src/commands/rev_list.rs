@@ -52,6 +52,7 @@ pub(crate) fn cmd_rev_list(
     let mut want_color = false;
     let mut pretty = RevListPretty::Default;
     let mut preset_oneline = false;
+    let mut graph = false;
     let mut author_patterns = Vec::new();
     let mut committer_patterns = Vec::new();
     let mut grep_patterns = Vec::new();
@@ -292,6 +293,8 @@ pub(crate) fn cmd_rev_list(
                 // `always` forces color; `auto`/`never` are off when not a tty.
                 want_color = value["--color=".len()..].eq_ignore_ascii_case("always");
             }
+            "--graph" => graph = true,
+            "--no-graph" => graph = false,
             "--oneline" => {
                 preset_oneline = true;
                 abbrev_commit = true;
@@ -369,6 +372,11 @@ pub(crate) fn cmd_rev_list(
         return Err(GitError::Command(
             "options '--parents' and '--children' cannot be used together".into(),
         ));
+    }
+    // git forces topo-order whenever `--graph` is set so the walk emits parents
+    // only after children (required for correct column placement).
+    if graph && !setup_args.iter().any(|arg| arg == "--topo-order") {
+        setup_args.push("--topo-order".to_string());
     }
     if preset_oneline {
         let mut compiled = presets::rev_list_oneline()?;
@@ -524,6 +532,12 @@ pub(crate) fn cmd_rev_list(
         sley_rev::NoWalkMode::Sorted => RevListWalkMode::NoWalkSorted,
         sley_rev::NoWalkMode::Unsorted => RevListWalkMode::NoWalkUnsorted,
     };
+    // git's setup_revisions die: `options '--no-walk' and '--graph' cannot be
+    // used together` (revision.c). Graph rendering needs a full parent walk.
+    if graph && !matches!(walk_mode, RevListWalkMode::Walk) {
+        eprintln!("fatal: options '--no-walk' and '--graph' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
     let first_parent = revision_options.first_parent;
     let pathspecs = setup.pathspecs;
     let full_history = revision_options.full_history;
@@ -1408,6 +1422,10 @@ pub(crate) fn cmd_rev_list(
         )?;
     }
     if !quiet {
+        // `--graph`: ASCII history graph prefix (git's graph.c). Only the
+        // per-commit first row is required for `--oneline`; remaining rows for
+        // multi-line formats fall through to padding via `next_line`.
+        let mut graph_state = graph.then(|| sley_rev::graph::Graph::new(Vec::new(), want_color));
         for &record in &selected {
             if rev_list_should_print_commit(record, &object_filter, &object_filter_tip_oids)
                 && !kept_object_oids.contains(&record.oid)
@@ -1419,6 +1437,9 @@ pub(crate) fn cmd_rev_list(
                     left_right,
                     left_right_prefix,
                 );
+                if let Some(graph_state) = graph_state.as_mut() {
+                    graph_state.update(record.oid, &record.parents);
+                }
                 match &pretty {
                     RevListPretty::Default
                     | RevListPretty::Compiled {
@@ -1440,6 +1461,11 @@ pub(crate) fn cmd_rev_list(
                         }
                         if let Some(prefix) = output_prefix {
                             print!("{prefix}");
+                        }
+                        if let Some(graph_state) = graph_state.as_mut() {
+                            let mut row = String::new();
+                            graph_state.next_line(&mut row);
+                            print!("{row}");
                         }
                         if oneline {
                             let RevListPretty::Compiled { compiled, .. } = &pretty else {

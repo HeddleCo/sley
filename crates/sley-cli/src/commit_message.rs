@@ -189,8 +189,11 @@ pub(crate) fn commit_message_from_prepared_chunks(chunks: &[Vec<u8>]) -> Vec<u8>
     out
 }
 
+/// A `-m` chunk is empty only when it has no content at all. A lone newline
+/// (from `-m "$LF"`) is a real paragraph under `--cleanup=verbatim` and must
+/// not be dropped — git keeps it and produces a non-empty message (t6006).
 pub(crate) fn commit_message_chunk_is_empty(chunk: &[u8]) -> bool {
-    chunk.is_empty() || chunk == b"\n"
+    chunk.is_empty()
 }
 
 /// The resolved commit-message cleanup mode (git's `enum

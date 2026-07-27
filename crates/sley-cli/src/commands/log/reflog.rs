@@ -7,6 +7,11 @@ pub(super) struct ReflogWalkOptions<'a> {
     pub(super) output: &'a LogOutput,
     pub(super) reverse: bool,
     pub(super) date_mode: &'a DateMode,
+    /// True when the user passed an explicit `--date=…` (git's
+    /// `date_mode_explicit` / `force_date` for `%gD`/`%gd`).
+    pub(super) date_explicit: bool,
+    /// Effective `%h` abbreviation length (`None` = full).
+    pub(super) abbrev_len: Option<usize>,
     pub(super) replace_objects: bool,
     pub(super) author_filter: Option<&'a sley_grep::GrepMatcher>,
     pub(super) committer_filter: Option<&'a sley_grep::GrepMatcher>,
@@ -106,6 +111,8 @@ pub(super) fn log_walk_reflogs(
                     display_reference: &target.display_reference,
                     full_reference: &target.full_display_reference,
                     date_mode: opts.date_mode,
+                    date_explicit: opts.date_explicit,
+                    abbrev_len: opts.abbrev_len,
                     decorations: &decorations,
                     mailmap: &mailmap,
                 };
@@ -120,7 +127,8 @@ pub(super) fn log_walk_reflogs(
                 }
             }
             LogOutput::Default(_) => {
-                let display_selector = target.display_selector(entry, index, opts.date_mode);
+                let display_selector =
+                    target.display_selector(entry, index, opts.date_mode, opts.date_explicit);
                 emit_default_reflog_walk_format(
                     &mut db,
                     format,
@@ -261,8 +269,17 @@ impl ReflogWalkTarget {
         })
     }
 
-    fn display_selector(&self, entry: &ReflogEntry, index: usize, date_mode: &DateMode) -> String {
-        if self.date_selector {
+    fn display_selector(
+        &self,
+        entry: &ReflogEntry,
+        index: usize,
+        date_mode: &DateMode,
+        date_explicit: bool,
+    ) -> String {
+        // Match git's get_reflog_selector: date form when the walk was started
+        // via a date selector (`HEAD@{yesterday}`) *or* when the user passed
+        // an explicit `--date=…` (`force_date` / `date_mode_explicit`).
+        if self.date_selector || date_explicit {
             commit_identity_date(&entry.committer, date_mode)
         } else {
             index.to_string()
@@ -530,6 +547,8 @@ struct ReflogWalkFormatContext<'a> {
     display_reference: &'a str,
     full_reference: &'a str,
     date_mode: &'a DateMode,
+    date_explicit: bool,
+    abbrev_len: Option<usize>,
     decorations: &'a HashMap<ObjectId, Vec<String>>,
     mailmap: &'a commands::utility::Mailmap,
 }
@@ -556,7 +575,7 @@ fn emit_compiled_reflog_walk_format(
         commit_identity_timestamp(&commit_record.commit.committer),
     );
     let log_context = LogFormatContext {
-        abbrev_len: Some(7),
+        abbrev_len: ctx.abbrev_len,
         decorations: ctx.decorations,
         marker: '>',
         dialect: LogFormatDialect::Log,
@@ -570,6 +589,13 @@ fn emit_compiled_reflog_walk_format(
         mailmap: &CliMailmapAdapter(ctx.mailmap),
         use_mailmap: true,
     };
+    // git's get_reflog_selector: with explicit --date, force date form even when
+    // the walk was started with an index selector (SELECTOR_NONE + force_date).
+    let selector = if ctx.date_explicit {
+        commit_identity_date(&entry.committer, ctx.date_mode)
+    } else {
+        index.to_string()
+    };
     for token in &ctx.compiled.tokens {
         match token {
             FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
@@ -578,10 +604,10 @@ fn emit_compiled_reflog_walk_format(
                 out.extend_from_slice(&reflog_walk_subject(ctx.db, ctx.format, entry)?);
             }
             FormatToken::ReflogGd => {
-                write!(out, "{}@{{{index}}}", ctx.display_reference).map_err(io::Error::from)?;
+                write!(out, "{}@{{{selector}}}", ctx.display_reference).map_err(io::Error::from)?;
             }
             FormatToken::ReflogGD => {
-                write!(out, "{}@{{{index}}}", ctx.full_reference).map_err(io::Error::from)?;
+                write!(out, "{}@{{{selector}}}", ctx.full_reference).map_err(io::Error::from)?;
             }
             FormatToken::ReflogGn => out.extend_from_slice(reflog_name.as_bytes()),
             FormatToken::ReflogGe => out.extend_from_slice(reflog_email.as_bytes()),

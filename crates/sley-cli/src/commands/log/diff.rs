@@ -12,6 +12,8 @@ pub(super) enum LogDiffMerges {
     Separate,
     /// Combined merge diff: `-c` (`dense=false`) / `--cc` (`dense=true`).
     Combined { dense: bool },
+    /// Re-merge the parents and diff that against the commit (`--remerge-diff`).
+    Remerge,
 }
 
 /// Parse a `--diff-merges=<value>` into the supported modes.
@@ -22,13 +24,11 @@ pub(super) fn log_parse_diff_merges(value: &str) -> Result<LogDiffMerges> {
         "on" | "separate" | "m" => Ok(LogDiffMerges::Separate),
         "combined" | "c" => Ok(LogDiffMerges::Combined { dense: false }),
         "dense-combined" | "cc" => Ok(LogDiffMerges::Combined { dense: true }),
+        "remerge" | "r" => Ok(LogDiffMerges::Remerge),
         "" => {
             eprintln!("fatal: invalid value for '--diff-merges': '{value}'");
             Err(GitError::Exit(128))
         }
-        "remerge" | "r" => Err(GitError::Command(format!(
-            "unsupported log option --diff-merges={value}"
-        ))),
         _ => {
             eprintln!("fatal: invalid value for '--diff-merges': '{value}'");
             Err(GitError::Exit(128))
@@ -180,6 +180,8 @@ pub(super) struct LogDiffContext<'a> {
     pub(super) db: &'a FileObjectDatabase,
     pub(super) format: ObjectFormat,
     pub(super) config: &'a GitConfig,
+    /// Repository git dir (needed for remerge-diff merge-base walks).
+    pub(super) git_dir: &'a Path,
     /// Resolves `diff.<driver>.textconv` (and binary/funcname drivers) for the
     /// `-p` patch path so `git log -p` honors textconv like `git diff` does.
     pub(super) userdiff: &'a commands::userdiff::UserdiffResolver,
@@ -188,7 +190,15 @@ pub(super) struct LogDiffContext<'a> {
     pub(super) show_root: bool,
     pub(super) detect_renames: bool,
     pub(super) detect_copies: bool,
+    /// `--find-copies-harder` / implied by `--follow` (git always sets
+    /// `find_copies_harder` in `try_to_follow_renames`).
+    pub(super) find_copies_harder: bool,
     pub(super) pathspec: Option<DiffPathspec>,
+    /// When `--follow` rewound the path across renames/copies, map each
+    /// selected commit oid to the pathspec that was active for that commit.
+    /// Entries are filtered against this path (and its rename/copy source)
+    /// instead of the original CLI pathspec.
+    pub(super) follow_paths: Option<&'a HashMap<ObjectId, Vec<u8>>>,
     pub(super) patch_abbrev: usize,
     pub(super) raw_abbrev: Option<usize>,
     pub(super) pickaxe: Option<&'a CompiledPickaxe>,
@@ -199,6 +209,34 @@ pub(super) struct LogDiffContext<'a> {
 }
 
 impl LogDiffContext<'_> {
+    /// Filter name-status entries by the active pathspec. Under `--follow`, use
+    /// the per-commit followed path (after rename/copy rewinds) so older commits
+    /// that only touch the pre-rename path still render.
+    fn filter_diff_entries(
+        &self,
+        entries: Vec<sley_diff_merge::NameStatusEntry>,
+        oid: &ObjectId,
+    ) -> Vec<sley_diff_merge::NameStatusEntry> {
+        if let Some(follow_paths) = self.follow_paths
+            && let Some(path) = follow_paths.get(oid)
+        {
+            return entries
+                .into_iter()
+                .filter(|entry| {
+                    entry.path.as_bytes() == path.as_slice()
+                        || entry
+                            .old_path
+                            .as_ref()
+                            .is_some_and(|old| old.as_bytes() == path.as_slice())
+                })
+                .collect();
+        }
+        match &self.pathspec {
+            Some(pathspec) => apply_diff_pathspec(entries, pathspec),
+            None => entries,
+        }
+    }
+
     /// Render the diff block for one commit (against its first parent, or the
     /// empty tree for roots when log.showRoot allows). Returns an empty buffer
     /// when nothing is to be shown; otherwise the buffer holds the block's
@@ -251,6 +289,9 @@ impl LogDiffContext<'_> {
         {
             return self.render_combined_merge(record, dense, line_prefix_width, out);
         }
+        if parents.len() > 1 && parent_index.is_none() && self.merges == LogDiffMerges::Remerge {
+            return self.render_remerge_diff(record, line_prefix_width, out);
+        }
         let parent_tree = if let Some(parent_index) = parent_index {
             let Some(parent) = parents.get(parent_index) else {
                 return Ok(());
@@ -271,21 +312,21 @@ impl LogDiffContext<'_> {
                         Some(self.parent_tree(&parents[0])?)
                     }
                     // Handled above.
-                    LogDiffMerges::Combined { .. } => unreachable!(),
+                    LogDiffMerges::Combined { .. } | LogDiffMerges::Remerge => unreachable!(),
                 },
             }
         };
         let base = sley_diff_merge::DiffNameStatusOptions {
             detect_renames: self.detect_renames,
             detect_copies: self.detect_copies,
-            find_copies_harder: false,
+            find_copies_harder: self.find_copies_harder,
             rename_empty: true,
             ..Default::default()
         };
         let rename_options = sley_diff_merge::DiffNameStatusOptions {
             detect_renames: self.detect_renames,
             detect_copies: self.detect_copies,
-            find_copies_harder: false,
+            find_copies_harder: self.find_copies_harder,
             rename_empty: true,
             detect_inexact: true,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
@@ -316,10 +357,7 @@ impl LogDiffContext<'_> {
                 base,
             )?,
         };
-        let entries = match &self.pathspec {
-            Some(pathspec) => apply_diff_pathspec(entries, pathspec),
-            None => entries,
-        };
+        let entries = self.filter_diff_entries(entries, &record.oid);
         let entries = if let Some(pickaxe) = self.pickaxe
             && !self.pickaxe_all
         {
@@ -454,6 +492,203 @@ impl LogDiffContext<'_> {
                         indent_heuristic: self.opts.indent_heuristic,
                     },
                 )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `--remerge-diff`: re-merge the two parents and diff that tree against the
+    /// commit, emitting `remerge CONFLICT (...)` headers for paths that
+    /// conflicted in the re-merge (git's do_remerge_diff).
+    fn render_remerge_diff(
+        &self,
+        record: &sley_rev::CommitRecord,
+        line_prefix_width: i64,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        out.clear();
+        let parents = &record.commit.parents;
+        if parents.len() != 2 {
+            // Octopus: git prints a warning and skips the remerge.
+            if parents.len() > 2 {
+                writeln!(
+                    out,
+                    "diff: warning: Skipping remerge-diff for octopus merges."
+                )?;
+            }
+            return Ok(());
+        }
+        let parent1 = parents[0];
+        let parent2 = parents[1];
+        let label1 = remerge_parent_label(self.db, self.format, &parent1, self.patch_abbrev)?;
+        let label2 = remerge_parent_label(self.db, self.format, &parent2, self.patch_abbrev)?;
+        let bases = sley_rev::merge_bases(self.git_dir, self.format, self.db, &parent1, &parent2)?;
+        let base_map = if bases.is_empty() {
+            sley_diff_merge::MergeEntryMap::new()
+        } else {
+            // Reverse like try_merge_strategy so virtual fold is oldest-first.
+            let mut ordered = bases;
+            ordered.reverse();
+            sley_diff_merge::virtual_ancestor_entry_map_with_style(
+                self.db,
+                self.format,
+                &ordered,
+                sley_diff_merge::ConflictStyle::Merge,
+                |left, right| {
+                    sley_rev::merge_bases(self.git_dir, self.format, self.db, left, right)
+                },
+            )?
+        };
+        let tree1 = self.parent_tree(&parent1)?;
+        let tree2 = self.parent_tree(&parent2)?;
+        let ours_map = sley_diff_merge::flatten_tree(self.db, self.format, &tree1)?;
+        let theirs_map = sley_diff_merge::flatten_tree(self.db, self.format, &tree2)?;
+        let merge = sley_diff_merge::merge_entry_maps(
+            self.db,
+            self.format,
+            &base_map,
+            &ours_map,
+            &theirs_map,
+            &sley_diff_merge::MergeTreesOptions {
+                ours_label: &label1,
+                theirs_label: &label2,
+                ancestor_label: "merged common ancestors",
+                detect_renames: true,
+                rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+                ..Default::default()
+            },
+        )?;
+        let mut conflict_headers: std::collections::BTreeMap<Vec<u8>, String> =
+            std::collections::BTreeMap::new();
+        for path_result in &merge.paths {
+            if let Some(conflict) = &path_result.conflict {
+                let header = remerge_conflict_header(conflict, &path_result.path);
+                conflict_headers.insert(path_result.path.clone(), header);
+            }
+        }
+        let remerge_tree = merge.tree;
+        let commit_tree = record.commit.tree;
+        // Diff remerge_tree (old) → commit_tree (new).
+        let base = sley_diff_merge::DiffNameStatusOptions {
+            detect_renames: self.detect_renames,
+            detect_copies: self.detect_copies,
+            find_copies_harder: self.find_copies_harder,
+            rename_empty: true,
+            ..Default::default()
+        };
+        let rename_options = sley_diff_merge::DiffNameStatusOptions {
+            detect_renames: self.detect_renames,
+            detect_copies: self.detect_copies,
+            find_copies_harder: self.find_copies_harder,
+            rename_empty: true,
+            detect_inexact: true,
+            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            rename_limit: 0,
+            ..Default::default()
+        };
+        let entries = if self.detect_renames {
+            sley_diff_merge::diff_name_status_trees_with_options(
+                self.db,
+                self.format,
+                &remerge_tree,
+                &commit_tree,
+                rename_options,
+            )?
+        } else {
+            sley_diff_merge::diff_name_status_trees_with_options(
+                self.db,
+                self.format,
+                &remerge_tree,
+                &commit_tree,
+                base,
+            )?
+        };
+        let entries = self.filter_diff_entries(entries, &record.oid);
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // Apply pickaxe after collecting entries.
+        let entries = if let Some(pickaxe) = self.pickaxe
+            && !self.pickaxe_all
+        {
+            pickaxe_filter_entries(
+                self.db,
+                entries,
+                pickaxe,
+                self.pickaxe_ignore_case,
+                self.pickaxe_text,
+            )?
+        } else {
+            entries
+        };
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let _ = line_prefix_width;
+        let opts = self.opts;
+        let merges_only = !opts.any();
+        let patch = opts.patch || merges_only || opts.merges_imply_patch;
+        if patch {
+            let word_request = opts.word_diff_mode.map(|mode| WordDiffRequest {
+                mode,
+                cli_regex: opts.word_diff_regex.as_deref(),
+            });
+            for entry in &entries {
+                let mut file_out = Vec::new();
+                write_diff_patch_entry(
+                    &mut file_out,
+                    entry,
+                    DiffRenderOptions {
+                        binary: false,
+                        anchors: &[],
+                        allow_textconv: true,
+                        db: self.db,
+                        lazy_fetch: self.lazy_fetch,
+                        worktree_root: None,
+                        use_worktree_new: false,
+                        format: self.format,
+                        abbrev: self.patch_abbrev,
+                        src_prefix: "a/",
+                        dst_prefix: "b/",
+                        context: self.opts.context.unwrap_or(3),
+                        userdiff: Some(self.userdiff),
+                        funcname: None,
+                        colors: None,
+                        word_diff: word_request.as_ref(),
+                        line_indicators: opts.line_indicators,
+                        suppress_blank_empty: self
+                            .config
+                            .get_bool("diff", None, "suppressblankempty")
+                            .unwrap_or(false),
+                        no_index_contents: None,
+                        submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+                        submodule_dirt: None,
+                        ws_error: None,
+                        color_moved: None,
+                        interhunk: 0,
+                        ws_ignore: self.opts.ws_ignore,
+                        diff_algorithm: self.opts.diff_algorithm,
+                        ignore_blank_lines: self.opts.ignore_blank_lines,
+                        ignore_regexes: &self.opts.ignore_regexes,
+                        line_ranges: None,
+                        indent_heuristic: self.opts.indent_heuristic,
+                    },
+                )?;
+                // Inject remerge CONFLICT header after the first "diff --git" line.
+                if let Some(header) = conflict_headers.get(entry.path.as_bytes()) {
+                    if let Some(pos) = file_out.iter().position(|&b| b == b'\n') {
+                        let mut injected = file_out[..=pos].to_vec();
+                        injected.extend_from_slice(header.as_bytes());
+                        injected.push(b'\n');
+                        injected.extend_from_slice(&file_out[pos + 1..]);
+                        out.extend_from_slice(&injected);
+                    } else {
+                        out.extend_from_slice(&file_out);
+                    }
+                } else {
+                    out.extend_from_slice(&file_out);
+                }
             }
         }
         Ok(())
@@ -600,6 +835,57 @@ impl LogDiffContext<'_> {
     fn parent_tree(&self, parent: &ObjectId) -> Result<ObjectId> {
         let object = self.db.read_object(parent)?;
         Ok(Commit::parse_ref(self.format, &object.body)?.tree)
+    }
+}
+
+/// Parent label for remerge-diff conflict markers: `"%h (%s)"`.
+fn remerge_parent_label(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+    abbrev: usize,
+) -> Result<String> {
+    let object = db.read_object(oid)?;
+    let commit = Commit::parse_ref(format, &object.body)?;
+    let hex = oid.to_hex();
+    let short = &hex[..abbrev.min(hex.len())];
+    let subject = commit
+        .message
+        .split(|&b| b == b'\n')
+        .next()
+        .map(|line| String::from_utf8_lossy(line).into_owned())
+        .unwrap_or_default();
+    Ok(format!("{short} ({subject})"))
+}
+
+/// Format a remerge additional-header line for a conflicted path.
+fn remerge_conflict_header(kind: &sley_diff_merge::MergeConflictKind, path: &[u8]) -> String {
+    let path_str = String::from_utf8_lossy(path);
+    match kind {
+        sley_diff_merge::MergeConflictKind::Content { add_add: true } => {
+            format!("remerge CONFLICT (add/add): Merge conflict in {path_str}")
+        }
+        sley_diff_merge::MergeConflictKind::Content { .. }
+        | sley_diff_merge::MergeConflictKind::RenameContent { .. } => {
+            format!("remerge CONFLICT (content): Merge conflict in {path_str}")
+        }
+        sley_diff_merge::MergeConflictKind::ModifyDelete { .. } => {
+            format!("remerge CONFLICT (modify/delete): {path_str}")
+        }
+        sley_diff_merge::MergeConflictKind::RenameDelete { .. } => {
+            format!("remerge CONFLICT (rename/delete): {path_str}")
+        }
+        sley_diff_merge::MergeConflictKind::RenameRenameTwoToOne { .. }
+        | sley_diff_merge::MergeConflictKind::RenameRenameOneToTwo { .. } => {
+            format!("remerge CONFLICT (rename/rename): {path_str}")
+        }
+        sley_diff_merge::MergeConflictKind::FileDirectory { .. } => {
+            format!("remerge CONFLICT (file/directory): {path_str}")
+        }
+        sley_diff_merge::MergeConflictKind::DistinctTypes { .. } => {
+            format!("remerge CONFLICT (distinct types): {path_str}")
+        }
+        _ => format!("remerge CONFLICT (content): Merge conflict in {path_str}"),
     }
 }
 

@@ -1195,9 +1195,14 @@ fn write_delayed_checkout_output(
     remove_existing_worktree_path(&file_path)?;
     fs::write(&file_path, body)?;
     set_worktree_file_mode(&file_path, entry.mode)?;
-    let metadata = fs::metadata(&file_path)?;
+    // Prefer symlink_metadata so a replaced symlink is not followed, and force
+    // the cached size from the body we just wrote. On some filesystems a
+    // same-second delayed smudge can leave the index size as 0 after the
+    // racy-clean smudge pass (t2082 delayed checkout → verify_checkout dirty).
+    let metadata = fs::symlink_metadata(&file_path)?;
     let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
     index_entry.mode = entry.mode;
+    index_entry.size = (body.len() as u64).min(u32::MAX as u64) as u32;
     Ok(Some(index_entry))
 }
 
@@ -1321,7 +1326,7 @@ pub(crate) fn materialize_tree_entry_with_optional_smudge(
 }
 
 /// Sparse- and skip-worktree-aware variant of
-/// [`checkout_commit_to_index_and_worktree`].
+/// `checkout_commit_to_index_and_worktree`.
 ///
 /// When `sparse` is `None` this behaves like the plain checkout except that it
 /// preserves any pre-existing skip-worktree bits (so an already-sparse worktree
@@ -1330,7 +1335,9 @@ pub(crate) fn materialize_tree_entry_with_optional_smudge(
 /// have their skip-worktree bit cleared, while out-of-cone paths are left out
 /// of the worktree, get their skip-worktree bit set, and have any stale file
 /// removed.
-pub(crate) fn checkout_commit_to_index_and_worktree_sparse(
+/// Sparse-aware checkout of a commit: only materializes in-cone paths; out-of-cone
+/// index entries get skip-worktree and no worktree file (blobs may be absent).
+pub fn checkout_commit_to_index_and_worktree_sparse(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
@@ -2547,6 +2554,25 @@ pub(crate) fn restore_index_and_worktree_paths_from_entries(
     let mut replacement_leaf_paths = BTreeSet::new();
     for path in matched_paths {
         if let Some(entry) = source_entries.get(&path) {
+            // git's `update_some` leaves the existing index entry when oid+mode
+            // already match, and `checkout_entry` then returns early when
+            // `ie_match_stat` says the worktree is already up to date — so an
+            // artificial mtime on an unmodified path is preserved (t2022).
+            let existing = index.entries.iter().find(|index_entry| {
+                index_entry.path.as_bytes() == path.as_slice()
+                    && index_entry.stage() == Stage::Normal
+            });
+            if let Some(existing) = existing
+                && existing.oid == entry.oid
+                && existing.mode == entry.mode
+                && !existing.is_intent_to_add()
+                && let Ok(file_path) = worktree_path(worktree_root, &path)
+                && let Ok(metadata) = fs::symlink_metadata(&file_path)
+                && worktree_entry_is_uptodate(existing, &metadata)
+            {
+                restored.insert(path);
+                continue;
+            }
             replacement_entries.push(materialize_path_restore_entry_filtered(
                 db,
                 format,
@@ -3157,13 +3183,18 @@ pub fn reset_index_to_commit(
             restored.gid = prior.gid;
             restored.size = prior.size;
         }
-        if prior_entries
-            .get(path)
-            .is_some_and(IndexEntry::is_skip_worktree)
-            || sparse_matcher
-                .as_ref()
-                .is_some_and(|matcher| !matcher.includes_file(path))
-        {
+        // Preserve skip-worktree on surviving entries the way git's mixed reset
+        // does. Do *not* force the bit from the current sparse patterns onto an
+        // entry that previously cleared it (e.g. a present out-of-cone file that
+        // sparse-checkout left as "not up to date" — t3705 #16 relies on
+        // `git reset` keeping such an entry non-skip-worktree so a later
+        // `add --sparse --renormalize` can stage it). New out-of-cone paths that
+        // had no prior entry still receive the bit.
+        let prior = prior_entries.get(path);
+        let out_of_cone = sparse_matcher
+            .as_ref()
+            .is_some_and(|matcher| !matcher.includes_file(path));
+        if prior.is_some_and(IndexEntry::is_skip_worktree) || (out_of_cone && prior.is_none()) {
             restored.set_skip_worktree(true);
         }
         index_entries.push(restored);
@@ -3265,7 +3296,7 @@ pub fn path_in_sparse_checkout(
     SparseMatcher::new(sparse, mode).includes_file(path)
 }
 
-pub(crate) fn active_sparse_checkout(
+pub fn active_sparse_checkout(
     git_dir: &Path,
 ) -> Result<Option<(SparseCheckout, SparseCheckoutMode)>> {
     let worktree_config = GitConfig::read(git_dir.join("config.worktree")).unwrap_or_default();

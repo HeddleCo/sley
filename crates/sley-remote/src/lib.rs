@@ -88,9 +88,10 @@ pub use http::{
     http_authorization_headers, http_check_status, http_discover_upload_pack,
     http_protocol_v2_fetch_response, http_send_with_auth, http_service_advertisements,
     http_upload_pack_advertisements, http_upload_pack_features, http_validate_content_type,
-    install_fetch_pack_via_http_protocol_v2_fetch, install_fetch_pack_via_http_upload_pack,
-    negotiate_fetch_pack_via_http_protocol_v2, new_http_client, new_http_client_with_config,
-    remote_url_is_http, transport_limits_from_config,
+    install_fetch_pack_via_http_protocol_v2_fetch,
+    install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs,
+    install_fetch_pack_via_http_upload_pack, negotiate_fetch_pack_via_http_protocol_v2,
+    new_http_client, new_http_client_with_config, remote_url_is_http, transport_limits_from_config,
 };
 // Re-export the smart-HTTP client seam so out-of-crate hosts (e.g. weft) can
 // implement [`HttpClient`] to enforce network policy on the dial without a
@@ -222,8 +223,8 @@ pub use push::{
     PushOutcome, PushPlan, PushQuarantine, PushRefStatus, PushReportRef, PushReportRequest,
     PushRequest, PushServices, PushStatusReport, PushThinMode, ReceivePackPushReport,
     apply_receive_pack_report_to_push_refs, execute_push_action_plan, execute_push_plan,
-    local_push_source_refs, normalize_push_refname, normalize_push_refspec, plan_push,
-    plan_push_actions, push, push_actions, push_local_uses_receive_pack_server,
+    is_fast_forward, local_push_source_refs, normalize_push_refname, normalize_push_refspec,
+    plan_push, plan_push_actions, push, push_actions, push_local_uses_receive_pack_server,
     push_local_with_report, push_local_with_report_and_objects, push_url_for_display,
     read_receive_pack_push_report, reject_non_fast_forward_pushes, run_local_push_post_hooks,
     stage_local_push_quarantine, validate_receive_pack_report, validate_receive_pack_unpack,
@@ -415,6 +416,7 @@ impl<'a> OperationContext<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use std::fs;
@@ -540,6 +542,7 @@ mod tests {
             atomic: false,
             negotiation_restrict: None,
             negotiation_include: None,
+            negotiate_only: false,
         }
     }
 
@@ -829,6 +832,7 @@ mod tests {
             committer: b"Sley Remote Live <sley@example.invalid> 1 +0000".to_vec(),
             detached_head: None,
             checkout: true,
+            sparse: false,
             filter: None,
             filter_auto: false,
             // The live test clones a specific branch via --single-branch, so the
@@ -864,3 +868,7 @@ mod tests {
         assert!(outcome.git_dir.join("shallow").exists());
     }
 }
+
+#[cfg(feature = "http")]
+pub use http::negotiate_only_http;
+pub use local::negotiate_only_local;

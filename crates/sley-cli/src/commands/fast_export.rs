@@ -325,7 +325,9 @@ impl FastExporter {
                     self.nested_tag_refs.push((ref_name, tip.oid));
                 }
                 ObjectType::Blob => {
-                    self.export_blob(tip.oid)?;
+                    if !self.options.no_data {
+                        self.export_blob(tip.oid)?;
+                    }
                 }
                 ObjectType::Tree => {}
             }
@@ -532,15 +534,20 @@ impl FastExporter {
             changes.retain(|entry| fast_export_change_matches_pathspec(entry, &self.pathspec));
         }
 
-        for entry in &changes {
-            if let Some(oid) = entry.new_oid {
-                if entry
-                    .new_mode
-                    .is_some_and(|mode| mode & 0o170000 == 0o160000)
-                {
-                    continue;
+        // With `--no-data`, M-lines reference blob oids by hex (see
+        // `emit_modify_line`); skip streaming blob marks. Required by t6416 #7
+        // (`fast-export --no-data --all | sed | fast-import` timestamp rewrite).
+        if !self.options.no_data {
+            for entry in &changes {
+                if let Some(oid) = entry.new_oid {
+                    if entry
+                        .new_mode
+                        .is_some_and(|mode| mode & 0o170000 == 0o160000)
+                    {
+                        continue;
+                    }
+                    self.export_blob(oid)?;
                 }
-                self.export_blob(oid)?;
             }
         }
 

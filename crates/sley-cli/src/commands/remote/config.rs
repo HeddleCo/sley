@@ -53,9 +53,15 @@ pub(crate) fn read_effective_repo_config(git_dir: &Path, cwd: &Path) -> Result<G
 /// config, so writing it back would persist `git -c key=value` into the file
 /// (upstream keeps `-c` injections process-local and never writes them out).
 /// This is the bug class behind clone wrongly baking `git -c …` into the cloned
-/// repo's config. Includes (`include.path` / `includeIf`) are still resolved.
+/// repo's config, and behind `git -c checkout.defaultRemote=… checkout` leaking
+/// into `.git/config` (t2024 multi-remote DWIM). Includes (`include.path` /
+/// `includeIf`) are still resolved.
+///
+/// **Important:** `sley_config::read_repo_config(git_dir, None)` is *not*
+/// injection-free — `None` still folds the process-local `-c` fragment via
+/// `effective_config_parameters_env()`. This helper loads the file only.
 pub(crate) fn read_repo_config_on_disk(git_dir: &Path) -> Result<GitConfig> {
-    sley_config::read_repo_config(git_dir, None)
+    sley_config::read_repo_config_file_only(git_dir)
 }
 
 /// A single `<section>.<key>` value from the *full effective config* (system +

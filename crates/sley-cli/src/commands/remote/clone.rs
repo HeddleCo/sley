@@ -1231,6 +1231,9 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
         ssh_options: None,
         upload_pack_command: None,
         reject_shallow: reject_shallow_config.unwrap_or(false),
+        // Partial-clone checkout top-up must stay in-cone under `--sparse`
+        // (t5620: tip cone only → 44 missing blobs, not full tip tree).
+        sparse,
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress_sink = StdoutProgress::default();
@@ -1299,6 +1302,10 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
     }
     if outcome.empty {
         warn_cloned_empty_repository();
+    } else if outcome.branch_oid.is_none() && checkout {
+        // Unborn remote HEAD on a non-empty repository: refs were fetched but
+        // there is no tip to check out (t5702 #19). Bare clones skip this.
+        warn_remote_head_nonexistent();
     } else if !checkout {
         remove_clone_worktree_files(&checkout_destination, &git_dir, format)?;
     } else if sparse {
@@ -1571,6 +1578,7 @@ fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Resu
         atomic: false,
         negotiation_restrict: None,
         negotiation_include: None,
+        negotiate_only: false,
     };
     let outcome = super::helper::fetch_with_discovered_remote_helper(
         options.context,
@@ -1788,6 +1796,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
             atomic: false,
             negotiation_restrict: None,
             negotiation_include: None,
+            negotiate_only: false,
         },
     )?;
     if let Some(branch) = head_branch {
@@ -2168,6 +2177,9 @@ fn clone_network_repository(
             .then_some(options.upload_pack_command)
             .flatten(),
         reject_shallow: options.reject_shallow,
+        // Partial-clone checkout top-up must stay in-cone under `--sparse`
+        // (t5620: tip cone only → 44 missing blobs, not full tip tree).
+        sparse: options.sparse,
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress::new(options.quiet);
@@ -2262,6 +2274,8 @@ fn clone_network_repository(
 
         if empty {
             warn_cloned_empty_repository();
+        } else if outcome.branch_oid.is_none() && options.checkout {
+            warn_remote_head_nonexistent();
         } else if !options.checkout {
             remove_clone_worktree_files(options.destination, &git_dir, format)?;
         } else if options.sparse {
@@ -2376,7 +2390,7 @@ fn clone_bare_network_repository(
     if options.tag_opt != Some("--no-tags") {
         refspecs.push("+refs/tags/*:refs/tags/*".to_string());
     }
-    run_fetch(
+    let outcome = run_fetch(
         options.context.cwd(),
         &git_dir,
         format,
@@ -2417,10 +2431,14 @@ fn clone_bare_network_repository(
             atomic: false,
             negotiation_restrict: None,
             negotiation_include: None,
+            negotiate_only: false,
         },
         &[],
-    )
-    .map(|_| ())
+    )?;
+    if let Some(reason) = outcome.rejection.as_ref() {
+        return Err(GitError::Command(reason.clone()));
+    }
+    Ok(())
 }
 
 /// Map a [`sley_remote::clone`] result that failed because the requested branch
@@ -2905,6 +2923,7 @@ fn clone_bare_or_mirror_local_repository(
             atomic: false,
             negotiation_restrict: None,
             negotiation_include: None,
+            negotiate_only: false,
         },
     );
     env::set_current_dir(previous_cwd)?;
@@ -3724,6 +3743,11 @@ fn remove_clone_worktree_files(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<()> {
+    // `--no-checkout` clones leave an unborn index: git removes any hydrated
+    // worktree paths and deletes `.git/index` entirely (t1091 "unborn index").
+    // Writing an empty index would make `sparse-checkout`/`switch` see a born
+    // repository and break the unborn-index interaction.
+    let index_path = sley_worktree::repository_index_path(git_dir);
     let index = sley_worktree::read_repository_index(git_dir, format)?.unwrap_or(Index {
         version: 2,
         entries: Vec::new(),
@@ -3737,16 +3761,12 @@ fn remove_clone_worktree_files(
             prune_empty_clone_dirs(worktree_root, path.parent())?;
         }
     }
-    fs::write(
-        sley_worktree::repository_index_path(git_dir),
-        Index {
-            version: 2,
-            entries: Vec::new(),
-            extensions: Vec::new(),
-            checksum: None,
-        }
-        .write(format)?,
-    )?;
+    match fs::remove_file(&index_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    let _ = format;
     Ok(())
 }
 
@@ -3919,6 +3939,13 @@ fn warn_cloned_empty_repository() {
     eprintln!("warning: You appear to have cloned an empty repository.");
 }
 
+/// git's unborn-HEAD checkout warning from `builtin/clone.c::checkout`: the
+/// remote's default branch was advertised as unborn (or otherwise has no tip
+/// after fetch), so worktree materialisation is skipped.
+fn warn_remote_head_nonexistent() {
+    eprintln!("warning: remote HEAD refers to nonexistent ref, unable to checkout");
+}
+
 fn die_no_directory_name() -> String {
     // Upstream `die()`s here; sley callers only reach this with degenerate URLs
     // that the CLI already rejects. Fall back to a stable placeholder so the
@@ -4012,23 +4039,43 @@ fn remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Result<Str
 
 fn clone_remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Result<Option<String>> {
     let remote_store = FileRefStore::new_without_reference_backend_env(remote_git_dir, format);
-    let Some(RefTarget::Symbolic(target)) = remote_store.read_ref("HEAD")? else {
+    // When GIT_NAMESPACE / `--namespace` is active, the remote's default branch
+    // is the namespaced HEAD (e.g. `refs/namespaces/ns/HEAD` →
+    // `refs/namespaces/ns/refs/heads/two`), advertised to clients as
+    // `HEAD → refs/heads/two`. Read the namespaced form and strip before use.
+    let head_name = sley_core::expand_namespace("HEAD");
+    let Some(RefTarget::Symbolic(target)) = remote_store.read_ref(&head_name)? else {
         return Ok(None);
     };
-    let Some(branch) = target.strip_prefix("refs/heads/") else {
+    let logical_target = sley_core::strip_namespace(&target).unwrap_or(target.as_str());
+    let Some(branch) = logical_target.strip_prefix("refs/heads/") else {
         return Ok(None);
     };
+    // Existence check uses the physical (namespaced) target.
     if remote_store.read_ref(&target)?.is_some() {
         return Ok(Some(branch.to_string()));
     }
-    if remote_store
-        .list_refs()?
-        .into_iter()
-        .any(|reference| reference.name.starts_with("refs/heads/"))
-    {
+    // Unborn HEAD (points at a not-yet-created branch). Local/file:// clones
+    // discover this by reading the source filesystem rather than the protocol
+    // advertisement, so they must emulate `lsrefs.unborn`: when the server is
+    // configured to `ignore`, unborn HEADs are not advertised and the client
+    // falls back to its own default branch name (t5702 #17 / #22). Otherwise
+    // the unborn target is propagated even when the remote has other refs
+    // (t5702 #19 / #21).
+    if remote_lsrefs_unborn_ignored(remote_git_dir) {
         return Ok(None);
     }
     Ok(Some(branch.to_string()))
+}
+
+/// Whether the remote's `lsrefs.unborn` is `ignore` (server will not advertise
+/// an unborn HEAD over protocol v2). Defaults to advertising when unset.
+fn remote_lsrefs_unborn_ignored(remote_git_dir: &Path) -> bool {
+    read_repo_config_on_disk(remote_git_dir)
+        .ok()
+        .and_then(|config| config.get("lsrefs", None, "unborn").map(str::to_string))
+        .as_deref()
+        == Some("ignore")
 }
 
 fn clone_branch_pointing_at(
@@ -4245,9 +4292,10 @@ pub(super) fn register_promisor_remote(
     filter_spec: &str,
 ) -> Result<()> {
     let mut config = read_repo_config_on_disk(git_dir)?;
-    if config.get("remote", Some(name), "url").is_none() {
-        return Ok(());
-    }
+    // git's `partial_clone_register` records `remote.<name>.promisor` even when
+    // the fetch target is a bare URL with no pre-configured remote section
+    // (t5702 "partial fetch" uses `file://…` and creates
+    // `remote.<url>.promisor=true`). Do not require an existing `remote.<name>.url`.
     if config.get_bool("remote", Some(name), "promisor") == Some(true)
         && config
             .get("remote", Some(name), "partialclonefilter")

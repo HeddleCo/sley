@@ -2,14 +2,6 @@ use sley::{GitError, Result};
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-
-/// Accumulated sq-quoted fragment of command-line `-c` / `--config-env`
-/// parameters, in left-to-right order. Stands in for git's mutation of the
-/// process `GIT_CONFIG_PARAMETERS` env var (forbidden here, as the workspace bans
-/// `unsafe`/`set_var`); appended after any inherited `GIT_CONFIG_PARAMETERS` to
-/// form the effective parameter list.
-static CMDLINE_CONFIG_PARAMETERS: Mutex<String> = Mutex::new(String::new());
 
 /// Default pathspec magic set by the global `--{glob,noglob,icase,literal}-pathspecs`
 /// options (and the corresponding `GIT_*_PATHSPECS` env vars). Mirrors git's
@@ -33,6 +25,8 @@ pub(crate) struct GlobalOptions<'a> {
     pub git_dir: Option<PathBuf>,
     pub work_tree: Option<PathBuf>,
     pub attr_source: Option<String>,
+    /// `--namespace` / `--namespace=` override (takes precedence over `GIT_NAMESPACE`).
+    pub namespace: Option<String>,
     pub bare: bool,
     pub replace_objects: bool,
     pub lazy_fetch: bool,
@@ -51,6 +45,7 @@ pub(crate) fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>>
     let mut git_dir = None;
     let mut work_tree = None;
     let mut attr_source = None;
+    let mut namespace = None;
     let mut bare = false;
     let mut replace_objects = env::var_os("GIT_NO_REPLACE_OBJECTS").is_none();
     let mut lazy_fetch = true;
@@ -141,6 +136,15 @@ pub(crate) fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>>
                 work_tree = Some(PathBuf::from(path));
                 index += 2;
             }
+            "--namespace" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("no namespace given for --namespace");
+                    print_global_usage();
+                    return Err(GitError::Exit(129));
+                };
+                namespace = Some(value.clone());
+                index += 2;
+            }
             "--attr-source" => {
                 let Some(source) = args.get(index + 1) else {
                     eprintln!("error: option `attr-source' requires a value");
@@ -155,6 +159,10 @@ pub(crate) fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>>
             }
             value if value.starts_with("--work-tree=") => {
                 work_tree = Some(PathBuf::from(&value["--work-tree=".len()..]));
+                index += 1;
+            }
+            value if value.starts_with("--namespace=") => {
+                namespace = Some(value["--namespace=".len()..].to_string());
                 index += 1;
             }
             value if value.starts_with("--attr-source=") => {
@@ -178,6 +186,7 @@ pub(crate) fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>>
         git_dir,
         work_tree,
         attr_source,
+        namespace,
         bare,
         replace_objects,
         lazy_fetch,
@@ -248,45 +257,20 @@ fn push_config_env(spec: &str) -> Result<GlobalConfigOverride> {
 
 /// Append a `key[=value]` pair to the command-line config-parameter fragment in
 /// sq-quoted new-style (`'key'='value'`) or bare (`'key'`) form, mirroring git's
-/// `git_config_push_split_parameter`. git mutates the process `GIT_CONFIG_PARAMETERS`
-/// env var; because the workspace forbids `unsafe` (and thus `std::env::set_var`),
-/// sley instead accumulates the fragment in a process-global store. The effective
-/// `GIT_CONFIG_PARAMETERS` — the pre-existing env value followed by this fragment —
-/// is reconstructed by [`effective_config_parameters_env`] for both in-process
-/// reads and any shell-alias subprocess, preserving git's left-to-right precedence.
+/// `git_config_push_split_parameter`. Delegates to
+/// [`sley_config::push_cmdline_config_parameter`] so library code (ext:: remotes)
+/// can export the same fragment to child processes.
 fn push_split_parameter(key: &str, value: Option<&str>) {
-    if let Ok(mut fragment) = CMDLINE_CONFIG_PARAMETERS.lock() {
-        if !fragment.is_empty() {
-            fragment.push(' ');
-        }
-        fragment.push_str(&crate::sley_config::sq_quote(key));
-        fragment.push('=');
-        if let Some(value) = value {
-            fragment.push_str(&crate::sley_config::sq_quote(value));
-        }
-    }
+    crate::sley_config::push_cmdline_config_parameter(key, value);
 }
 
 /// The effective `GIT_CONFIG_PARAMETERS` string: the inherited env value (if any)
 /// followed by the command-line `-c`/`--config-env` fragment, space-separated.
 /// This is what git's process env would hold after folding in `-c`, and is both
-/// parsed for in-process reads and exported to shell-alias subprocesses so they
-/// inherit the parent's overrides.
+/// parsed for in-process reads and exported to shell-alias / ext:: subprocesses
+/// so they inherit the parent's overrides.
 pub(crate) fn effective_config_parameters_env() -> Option<String> {
-    let inherited = env::var("GIT_CONFIG_PARAMETERS")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let fragment = CMDLINE_CONFIG_PARAMETERS
-        .lock()
-        .ok()
-        .map(|f| f.clone())
-        .filter(|s| !s.is_empty());
-    match (inherited, fragment) {
-        (Some(inherited), Some(fragment)) => Some(format!("{inherited} {fragment}")),
-        (Some(inherited), None) => Some(inherited),
-        (None, Some(fragment)) => Some(fragment),
-        (None, None) => None,
-    }
+    crate::sley_config::effective_config_parameters_env()
 }
 
 /// Look up the last-set injected override for `key` (canonicalised), across the

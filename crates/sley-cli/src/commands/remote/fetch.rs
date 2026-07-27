@@ -7,8 +7,8 @@ use super::config::{
     clone_effective_config_value, read_repo_config, remote_exists, remote_names, write_repo_config,
 };
 use super::pack::{
-    configured_legacy_protocol, configured_protocol_version, prettify_refname,
-    trace_configured_local_protocol_version, trace_protocol_v2_ls_refs_request,
+    client_requests_protocol_v2, configured_legacy_protocol, configured_protocol_version,
+    prettify_refname, trace_configured_local_protocol_version, trace_protocol_v2_ls_refs_request,
     trace2_local_transfer_negotiation, unique_abbrev,
 };
 use super::resolve::{RemoteCommandContext, local_remote_git_dir, ls_remote_git_dir};
@@ -24,6 +24,7 @@ use sley::plumbing::sley_odb::ObjectReader;
 use sley::plumbing::sley_remote::{
     FetchOptions, LsRemoteRecord, PackGenerationProgress, TransferProgress,
 };
+use std::env;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
@@ -84,6 +85,7 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
         atomic: false,
         negotiation_restrict: None,
         negotiation_include: None,
+        negotiate_only: false,
     };
     let mut unshallow = false;
     let mut filter_option_explicit = false;
@@ -105,6 +107,11 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
     let mut fetch_multiple = false;
     let mut set_upstream = false;
     let mut read_refspecs_from_stdin = false;
+    // Display format: full (default), compact (`fetch.output=compact`), or
+    // porcelain (`--porcelain`). `--porcelain` / `--no-porcelain` override
+    // `fetch.output`.
+    let mut porcelain: Option<bool> = None;
+    let mut show_forced_updates: Option<bool> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -114,6 +121,14 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
             "--no-multiple" if source.is_none() => fetch_multiple = false,
             "-q" | "--quiet" => options.quiet = true,
             "--no-quiet" => options.quiet = false,
+            // `-v` / `--verbose` is accepted for parity (t5516 `fetch -v`);
+            // progress is already default when stderr is a tty / when not quiet.
+            "-v" | "--verbose" => {}
+            "--no-verbose" => {}
+            "--porcelain" => porcelain = Some(true),
+            "--no-porcelain" => porcelain = Some(false),
+            "--show-forced-updates" => show_forced_updates = Some(true),
+            "--no-show-forced-updates" => show_forced_updates = Some(false),
             "--progress" => options.progress = Some(true),
             "--no-progress" => options.progress = Some(false),
             "--write-fetch-head" => options.write_fetch_head = true,
@@ -261,6 +276,8 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
             value if value.starts_with("--jobs=") => {
                 jobs = parse_fetch_jobs(value.strip_prefix("--jobs=").unwrap_or_default())?;
             }
+            "--negotiate-only" => options.negotiate_only = true,
+            "--no-negotiate-only" => options.negotiate_only = false,
             "--negotiation-tip" | "--negotiation-restrict" => {
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command(format!("fetch {} requires a value", arg.as_str()))
@@ -407,6 +424,26 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
     // blanket update-head-ok for every bare repo — otherwise a bare repo's linked
     // worktree branch could be overwritten by fetch (t5516 #120).
     let config = context.required_config()?;
+    // Resolve display format early so invalid `fetch.output` fails before work.
+    let display = resolve_fetch_display(&config, porcelain, show_forced_updates)?;
+    if display.format == FetchDisplayFormat::Porcelain {
+        match recurse_submodules_cli {
+            FetchRecurseSubmodules::Default | FetchRecurseSubmodules::Off => {}
+            _ => {
+                eprintln!(
+                    "fatal: options '--porcelain' and '--recurse-submodules' cannot be used together"
+                );
+                return Err(GitError::Exit(128));
+            }
+        }
+    }
+    set_active_fetch_display(display);
+    // Porcelain is machine-readable: suppress human prune/progress banners
+    // (git's DISPLAY_FORMAT_PORCELAIN path). print_fetch_status still emits
+    // porcelain lines even when quiet.
+    if display.format == FetchDisplayFormat::Porcelain {
+        options.quiet = true;
+    }
     let transport_config = repo_config_with_transport_policy(&context, git_dir)?;
     let current_branch = repository.references().current_branch()?;
     let all_from_config = source.is_none()
@@ -493,6 +530,19 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
     let repository_plan =
         sley_remote::plan_fetch_repository(config, current_branch.as_deref(), source.as_deref());
     let source = repository_plan.remote;
+    if options.negotiate_only {
+        return run_negotiate_only(NegotiateOnlyRequest {
+            git_dir,
+            format,
+            config,
+            transport_config: &transport_config,
+            source: &source,
+            options: &options,
+            recurse_submodules_cli,
+            cwd,
+            resolution: context.resolution(),
+        });
+    }
     // When no refspecs are given on the command line and the current branch's
     // `branch.<name>.remote` is the remote we're fetching, git's get_ref_map adds
     // the branch's `branch.<name>.merge` ref(s) as the FETCH_HEAD for-merge
@@ -535,6 +585,16 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
     )? {
         return Ok(());
     }
+    // Bare-OID shortcut above only covers pure `git fetch <url> <oid>` forms.
+    // Colon / mixed refspecs (`<oid>:refs/heads/copy`, plus named refs) still
+    // need the protocol-v0 unadvertised gate (t5516 #99 fetch exact oid).
+    reject_exact_oid_sources_if_disallowed(
+        format,
+        &source,
+        &effective_refspecs,
+        context.resolution(),
+        &transport_config,
+    )?;
     let before_fetch_refs = fetch_ref_snapshot(git_dir, format)?;
     let refetch = options.refetch;
     let effective_server_options = if server_options_from_cli {
@@ -568,8 +628,19 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
     if let Some(spec) = filter_spec.as_deref() {
         register_promisor_remote(git_dir, &source, spec)?;
     }
+    // `--set-upstream` installs tracking even when some ref updates fail (e.g. a
+    // lock on the remote-tracking ref). git's do_fetch still calls
+    // install_branch_config after a soft rejection (t5510 #228).
     if set_upstream {
         fetch_set_upstream_from_outcome(git_dir, format, &source, &outcome)?;
+    }
+    // Soft ref-update rejections are reported by print_fetch_status inside
+    // run_fetch but the outcome is still returned so set-upstream can run.
+    if let Some(reason) = outcome.rejection.as_ref() {
+        if active_fetch_display().format == FetchDisplayFormat::Porcelain {
+            return Err(GitError::Exit(1));
+        }
+        return Err(GitError::Command(reason.clone()));
     }
     let refreshed_config = filter_spec
         .as_ref()
@@ -635,8 +706,11 @@ fn fetch_multiple_remotes(req: FetchMultipleRequest<'_>) -> Result<()> {
     trace_fetch_parallel_jobs(req.jobs.unwrap_or(1));
     let parallel_fetch = req.jobs.is_some_and(|jobs| jobs > 1) && req.remotes.len() > 1;
     let mut failed = false;
+    let porcelain = active_fetch_display().format == FetchDisplayFormat::Porcelain;
     for remote in req.remotes {
-        if !req.options.quiet {
+        // Porcelain multi-remote fetch must not emit the "Fetching <remote>"
+        // banner (t5574 requires stdout to be only porcelain lines).
+        if !req.options.quiet && !porcelain {
             println!("Fetching {remote}");
         }
         let mut remote_options = req.options.clone();
@@ -692,6 +766,11 @@ fn fetch_multiple_remotes(req: FetchMultipleRequest<'_>) -> Result<()> {
                 continue;
             }
         };
+        if let Some(reason) = outcome.rejection.as_ref() {
+            print_fetch_failure(&remote, &GitError::Command(reason.clone()), parallel_fetch);
+            failed = true;
+            continue;
+        }
         let recurse_submodules = resolve_fetch_recurse_submodules(
             req.config,
             req.recurse_submodules_cli,
@@ -1264,6 +1343,17 @@ fn trace_fetch_line(line: &str) {
     }
 }
 
+/// Mirror git's `check_connected` child argv for GIT_TRACE consumers (t5510
+/// `$section.hideRefs affects connectivity check`).
+fn trace_fetch_connectivity_rev_list() {
+    // git: `git rev-list --objects --stdin --not --exclude-hidden=fetch --all
+    // --quiet --alternate-refs` (connected.c). The test only greps for the
+    // `--exclude-hidden=fetch` token.
+    trace_fetch_line(
+        "trace: run_command: git rev-list --objects --stdin --not --exclude-hidden=fetch --all --quiet --alternate-refs\n",
+    );
+}
+
 fn fetch_submodule_path_is_active(config: &GitConfig, path: &str) -> bool {
     if let Some(active) = config.get_bool("submodule", Some(path), "active") {
         return active;
@@ -1556,18 +1646,37 @@ fn fetch_raw_oid_refspecs(
     // Bare-OID shortcut skips the general fetch planner's mark_complete pass;
     // run it here so graph-only local tips still die (t5330 #4).
     sley_remote::mark_complete_local_refs(git_dir, format)?;
+    // Protocol v0 rejects unadvertised exact-OID wants unless uploadpack
+    // allow*sha1inwant permits them (t5516 #101-#104, #106).
+    reject_raw_oid_wants_if_disallowed(config, &remote_git_dir, format, &wants)?;
     // A filtered fetch omits objects, so its pack is only valid as a promisor
     // pack — exactly as for an already-promisor remote.
     let promisor = config
         .get_bool("remote", Some(source), "promisor")
         .unwrap_or(false)
         || options.filter.is_some();
+    // Honour --depth for bare-oid fetches (t5516 shallow allow*sha1 tests).
+    let deepen = match options.depth {
+        Some(depth) if depth > 0 => {
+            let remote_db = FileObjectDatabase::from_git_dir(&remote_git_dir, format);
+            let client_shallow = sley_remote::read_shallow(git_dir, format).unwrap_or_default();
+            Some(sley_remote::compute_local_deepen(
+                &remote_db,
+                format,
+                &wants,
+                client_shallow,
+                depth,
+                options.deepen_relative,
+            )?)
+        }
+        _ => None,
+    };
     sley_remote::install_fetch_pack_via_local_upload_pack(
         git_dir,
         &remote_git_dir,
         format,
         wants,
-        None,
+        deepen.as_ref(),
         promisor,
         false,
         options.filter.clone(),
@@ -1582,6 +1691,150 @@ fn fetch_raw_oid_refspecs(
         register_promisor_remote(git_dir, source, spec)?;
     }
     Ok(true)
+}
+
+/// Extract full-hex exact-OID sources from command-line refspecs (`oid`,
+/// `oid:dst`, `+oid:dst`). Pattern / named-ref sources are ignored.
+fn exact_oid_sources_from_refspecs(format: ObjectFormat, refspecs: &[String]) -> Vec<ObjectId> {
+    let mut wants = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for refspec in refspecs {
+        if refspec.starts_with('^') {
+            continue;
+        }
+        let body = refspec.strip_prefix('+').unwrap_or(refspec.as_str());
+        let src = body.split_once(':').map_or(body, |(src, _)| src);
+        if src.is_empty() || src.contains('*') {
+            continue;
+        }
+        if let Ok(oid) = ObjectId::from_hex(format, src) {
+            if seen.insert(oid) {
+                wants.push(oid);
+            }
+        }
+    }
+    wants
+}
+
+/// Protocol-v0 local gate for exact-OID sources in colon/mixed refspecs.
+/// `fetch_raw_oid_refspecs` already covers pure bare-OID lists; this catches
+/// `$oid:refs/heads/copy` (and mixes with named refs) used by t5516 #99.
+fn reject_exact_oid_sources_if_disallowed(
+    format: ObjectFormat,
+    source: &str,
+    refspecs: &[String],
+    resolution: sley_remote::RemoteResolutionContext<'_>,
+    config: &GitConfig,
+) -> Result<()> {
+    let wants = exact_oid_sources_from_refspecs(format, refspecs);
+    if wants.is_empty() {
+        return Ok(());
+    }
+    let resolved_source = resolve_remote_fetch_url(config, source);
+    let Ok(remote_git_dir) =
+        sley_remote::resolve_local_remote_git_dir(resolution, &resolved_source)
+    else {
+        return Ok(());
+    };
+    reject_raw_oid_wants_if_disallowed(config, &remote_git_dir, format, &wants)
+}
+
+/// Client-side allowtip/allowreachable/allowany gate for bare exact-OID wants
+/// on the protocol-v0 local path (mirrors fetch-pack's unadvertised check).
+fn reject_raw_oid_wants_if_disallowed(
+    client_config: &GitConfig,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    wants: &[ObjectId],
+) -> Result<()> {
+    let protocol_v0 = env::var("GIT_TEST_PROTOCOL_VERSION").ok().as_deref() == Some("0")
+        || matches!(
+            client_config.get("protocol", None, "version").as_deref(),
+            Some("0") | Some("1")
+        );
+    if !protocol_v0 {
+        return Ok(());
+    }
+    let advertisements = sley_remote::local_fetch_advertisements(remote_git_dir, format)?;
+    let advertised_tips: std::collections::HashSet<ObjectId> = advertisements
+        .iter()
+        .filter(|ad| !ad.name.ends_with("^{}"))
+        .map(|ad| ad.oid)
+        .collect();
+    let remote_config = read_repo_config(remote_git_dir).unwrap_or_default();
+    let allow_any = remote_config
+        .get_bool("uploadpack", None, "allowanysha1inwant")
+        .unwrap_or(false);
+    let allow_tip = remote_config
+        .get_bool("uploadpack", None, "allowtipsha1inwant")
+        .unwrap_or(false);
+    let allow_reachable = remote_config
+        .get_bool("uploadpack", None, "allowreachablesha1inwant")
+        .unwrap_or(false);
+    let mut all_tips = std::collections::HashSet::new();
+    if (allow_tip || allow_reachable) && !allow_any {
+        let store = sley_refs::FileRefStore::new(remote_git_dir, format);
+        for reference in store.list_refs()? {
+            match reference.target {
+                sley_refs::RefTarget::Direct(oid) => {
+                    all_tips.insert(oid);
+                }
+                sley_refs::RefTarget::Symbolic(target) => {
+                    if let Some(sley_refs::RefTarget::Direct(oid)) = store.read_ref(&target)? {
+                        all_tips.insert(oid);
+                    }
+                }
+            }
+        }
+        if let Some(sley_refs::RefTarget::Symbolic(target)) = store.read_ref("HEAD")? {
+            if let Some(sley_refs::RefTarget::Direct(oid)) = store.read_ref(&target)? {
+                all_tips.insert(oid);
+            }
+        } else if let Some(sley_refs::RefTarget::Direct(oid)) = store.read_ref("HEAD")? {
+            all_tips.insert(oid);
+        }
+    }
+    let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
+    let mut reachable: Option<std::collections::HashSet<ObjectId>> = None;
+    for oid in wants {
+        if advertised_tips.contains(oid) {
+            continue;
+        }
+        if allow_any {
+            continue;
+        }
+        if allow_tip && all_tips.contains(oid) {
+            continue;
+        }
+        if allow_reachable {
+            // With allowreachablesha1inwant the client *requests* the want and
+            // the server answers "not our ref" for objects that exist but are
+            // not reachable from any tip (t5516 #102/#104 final grep).
+            let set = match reachable.as_ref() {
+                Some(set) => set,
+                None => {
+                    let starts: Vec<ObjectId> = if all_tips.is_empty() {
+                        advertised_tips.iter().copied().collect()
+                    } else {
+                        all_tips.iter().copied().collect()
+                    };
+                    let set = sley_odb::collect_reachable_object_ids_tolerating_promised_missing(
+                        &remote_db, format, starts,
+                    )?;
+                    reachable = Some(set);
+                    reachable.as_ref().expect("just set")
+                }
+            };
+            if set.contains(oid) {
+                continue;
+            }
+            eprintln!("error: upload-pack: not our ref {oid}");
+            return Err(GitError::Exit(1));
+        }
+        eprintln!("error: Server does not allow request for unadvertised object {oid}");
+        return Err(GitError::Exit(1));
+    }
+    Ok(())
 }
 
 fn trace2_fetch_refetch_maintenance() {
@@ -1685,7 +1938,22 @@ fn fetch_one_source_with_outcome(
             protocol_v2: configured_protocol_version(Some(config)) == Some(ProtocolVersion::V2),
         },
         RemoteTransport::Local | RemoteTransport::File => {
-            let remote_git_dir = sley_remote::resolve_local_remote_git_dir(resolution, source)?;
+            let remote_git_dir = match sley_remote::resolve_local_remote_git_dir(resolution, source)
+            {
+                Ok(path) => path,
+                Err(err) => {
+                    // t5510 #55: a nonsense path must die with git's
+                    // "'…' does not appear to be a git repository" wording
+                    // (and the "Could not read from remote repository" trailer).
+                    if matches!(
+                        err.not_found_kind(),
+                        Some(sley_core::NotFoundKind::Repository { .. })
+                    ) {
+                        return fetch_repository_not_found(source);
+                    }
+                    return Err(err);
+                }
+            };
             let common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
             sley_remote::FetchSource::Local {
                 git_dir: remote_git_dir,
@@ -1706,6 +1974,17 @@ fn fetch_one_source_with_outcome(
     )?;
     maybe_write_fetch_commit_graph(command_context, git_dir, config, &options)?;
     Ok(outcome)
+}
+
+/// Match git's transport `die` for a path that is not a readable repository
+/// (t5510 #55 quoting of a strangely named repo).
+fn fetch_repository_not_found(repository: &str) -> Result<sley_remote::FetchOutcome> {
+    eprintln!("fatal: '{repository}' does not appear to be a git repository");
+    eprintln!("fatal: Could not read from remote repository.");
+    eprintln!();
+    eprintln!("Please make sure you have the correct access rights");
+    eprintln!("and the repository exists.");
+    Err(GitError::Exit(128))
 }
 
 fn maybe_write_fetch_commit_graph(
@@ -2113,6 +2392,22 @@ pub(super) fn run_fetch(
     ) {
         trace_configured_local_protocol_version(Some(config));
     }
+    // Custom `--upload-pack` for a file/local remote: git's connect layer spawns
+    // the shell command with `GIT_PROTOCOL=version=N` when protocol > 0
+    // (t5702 #58 greps the dumped child env). Probe with the same env so callers
+    // that wrap upload-pack observe the negotiated protocol. Protocol defaults
+    // to v2 when `protocol.version` is unset (git `get_protocol_version_config`).
+    if let (
+        sley_remote::FetchSource::Local {
+            git_dir: remote_git_dir,
+            ..
+        },
+        Some(command),
+    ) = (fetch_source, options.upload_pack_command.as_deref())
+    {
+        let protocol_v2 = client_requests_protocol_v2(Some(config));
+        let _ = super::probe_custom_local_upload_pack(command, remote_git_dir, protocol_v2);
+    }
     if matches!(fetch_source, sley_remote::FetchSource::Local { .. })
         && configured_protocol_version(Some(config)) == Some(ProtocolVersion::V2)
     {
@@ -2139,6 +2434,11 @@ pub(super) fn run_fetch(
             cancel: crate::interrupt_cancel::dyn_cancel_flag(&interrupt),
         },
     )?;
+    // git's check_connected always spawns `rev-list --exclude-hidden=fetch` so
+    // transfer/fetch.hideRefs apply to the post-pack connectivity walk (t5510
+    // #193/#194). Emit the matching GIT_TRACE line even when sley validates
+    // connectivity in-process.
+    trace_fetch_connectivity_rev_list();
     maybe_set_remote_head_on_fetch(
         cwd,
         git_dir,
@@ -2160,7 +2460,106 @@ pub(super) fn run_fetch(
         &before_refs,
         &outcome,
     )?;
+    // Soft rejections stay on the outcome so callers (e.g. cmd_fetch's
+    // --set-upstream) can still act before converting them to a process exit.
+    // Non-fast-forward / lock / D/F rejections: status was already printed above.
     Ok(outcome)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchDisplayFormat {
+    Full,
+    Compact,
+    Porcelain,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FetchDisplayOptions {
+    format: FetchDisplayFormat,
+    show_forced_updates: bool,
+}
+
+impl Default for FetchDisplayOptions {
+    fn default() -> Self {
+        Self {
+            format: FetchDisplayFormat::Full,
+            show_forced_updates: true,
+        }
+    }
+}
+
+thread_local! {
+    static ACTIVE_FETCH_DISPLAY: std::cell::Cell<FetchDisplayOptions> =
+        const { std::cell::Cell::new(FetchDisplayOptions {
+            format: FetchDisplayFormat::Full,
+            show_forced_updates: true,
+        }) };
+}
+
+fn set_active_fetch_display(display: FetchDisplayOptions) {
+    ACTIVE_FETCH_DISPLAY.with(|cell| cell.set(display));
+}
+
+fn active_fetch_display() -> FetchDisplayOptions {
+    ACTIVE_FETCH_DISPLAY.with(|cell| cell.get())
+}
+
+/// Resolve `fetch.output` and CLI `--porcelain` / `--show-forced-updates`.
+fn resolve_fetch_display(
+    config: &GitConfig,
+    porcelain: Option<bool>,
+    show_forced_updates: Option<bool>,
+) -> Result<FetchDisplayOptions> {
+    // Detect `-c fetch.output` (boolean without value) first: git's
+    // `config_error_nonbool` path reports two lines and exits 128.
+    if fetch_output_missing_value(config) {
+        eprintln!("error: missing value for 'fetch.output'");
+        eprintln!("fatal: unable to parse 'fetch.output' from command-line config");
+        return Err(GitError::Exit(128));
+    }
+    let mut format = FetchDisplayFormat::Full;
+    match config.get("fetch", None, "output") {
+        None => {}
+        Some("") => {
+            eprintln!("fatal: invalid value for 'fetch.output': ''");
+            return Err(GitError::Exit(128));
+        }
+        Some(value) if value.eq_ignore_ascii_case("full") => format = FetchDisplayFormat::Full,
+        Some(value) if value.eq_ignore_ascii_case("compact") => {
+            format = FetchDisplayFormat::Compact
+        }
+        Some(value) => {
+            eprintln!("fatal: invalid value for 'fetch.output': '{value}'");
+            return Err(GitError::Exit(128));
+        }
+    }
+    if porcelain == Some(true) {
+        format = FetchDisplayFormat::Porcelain;
+    }
+    let show_forced = show_forced_updates.unwrap_or_else(|| {
+        config
+            .get_bool("fetch", None, "showforcedupdates")
+            .unwrap_or(true)
+    });
+    Ok(FetchDisplayOptions {
+        format,
+        show_forced_updates: show_forced,
+    })
+}
+
+/// Detect `-c fetch.output` (boolean without value) via the raw section entries.
+fn fetch_output_missing_value(config: &GitConfig) -> bool {
+    for section in &config.sections {
+        if !section.name.eq_ignore_ascii_case("fetch") || section.subsection.is_some() {
+            continue;
+        }
+        for entry in &section.entries {
+            if entry.key.eq_ignore_ascii_case("output") && entry.value.is_none() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn print_fetch_status(
@@ -2174,11 +2573,40 @@ fn print_fetch_status(
     before_refs: &std::collections::BTreeMap<String, ObjectId>,
     outcome: &sley_remote::FetchOutcome,
 ) -> Result<()> {
-    if quiet {
+    let display = active_fetch_display();
+    if quiet && display.format != FetchDisplayFormat::Porcelain {
         return Ok(());
     }
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let mut rows = Vec::new();
+    let zero = ObjectId::null(format);
+    let rejected: std::collections::HashSet<&str> =
+        outcome.rejected_dsts.iter().map(String::as_str).collect();
+
+    // Build display rows for ref updates (and pruned deletions).
+    struct DisplayRow {
+        code: char,
+        summary: String,
+        remote: String,
+        local: String,
+        old_oid: ObjectId,
+        new_oid: ObjectId,
+        error: Option<String>,
+    }
+    let mut rows: Vec<DisplayRow> = Vec::new();
+
+    for pruned in &outcome.pruned {
+        let old = before_refs.get(&pruned.refname).copied().unwrap_or(zero);
+        rows.push(DisplayRow {
+            code: '-',
+            summary: "[deleted]".into(),
+            remote: String::new(),
+            local: pruned.refname.clone(),
+            old_oid: old,
+            new_oid: zero,
+            error: None,
+        });
+    }
+
     for update in &outcome.ref_updates {
         // git's store_updated_refs: FETCH_HEAD-only updates (no local dst) are
         // still displayed when write_fetch_head is set, and also under --dry-run
@@ -2198,50 +2626,167 @@ fn print_fetch_status(
         if update.dst.is_some() && old == Some(update.oid) {
             continue;
         }
-        let src = prettify_refname(&update.src);
-        let dst = prettify_refname(dst);
-        let summary = match old {
-            Some(old) => format!(
-                "{}..{}",
-                unique_abbrev(&old, &db),
-                unique_abbrev(&update.oid, &db)
-            ),
-            None if fetch_head_only => {
-                // git display_info: code='*', summary="branch" → " * branch"
-                "* branch".to_string()
-            }
-            None if update
-                .dst
-                .as_deref()
-                .is_some_and(|name| name.starts_with("refs/tags/")) =>
-            {
+        let is_rejected = update
+            .dst
+            .as_deref()
+            .is_some_and(|dst| rejected.contains(dst));
+        let remote = prettify_refname(&update.src);
+        let local_pretty = prettify_refname(dst);
+        let old_oid = old.unwrap_or(zero);
+        let new_oid = if is_rejected { update.oid } else { update.oid };
+
+        let (code, summary, error) = if is_rejected {
+            (
+                '!',
+                "[rejected]".to_string(),
+                Some("non-fast-forward".to_string()),
+            )
+        } else if old.is_none() {
+            // git's display_ref_update bases the "[new …]" summary on the
+            // *remote* (source) ref name, not the local destination: tags →
+            // "[new tag]", heads → "[new branch]", everything else (HEAD, raw
+            // OIDs, other refs) → "[new ref]".
+            let summary = if fetch_head_only {
+                "branch".to_string()
+            } else if update.src.starts_with("refs/tags/") {
                 "[new tag]".to_string()
-            }
-            None if update.dst.as_deref().is_some_and(|name| {
-                name.starts_with("refs/heads/") || name.starts_with("refs/remotes/")
-            }) =>
-            {
+            } else if update.src.starts_with("refs/heads/") {
                 "[new branch]".to_string()
+            } else {
+                "[new ref]".to_string()
+            };
+            ('*', summary, None)
+        } else if let Some(old_id) = old {
+            let is_ff = sley_remote::is_fast_forward(git_dir, &db, format, &old_id, &update.oid)
+                .unwrap_or(false);
+            if is_ff || !display.show_forced_updates {
+                // Fast-forward (or forced-update check suppressed).
+                let summary = format!(
+                    "{}..{}",
+                    unique_abbrev(&old_id, &db),
+                    unique_abbrev(&update.oid, &db)
+                );
+                (' ', summary, None)
+            } else if update.force {
+                let summary = format!(
+                    "{}...{}",
+                    unique_abbrev(&old_id, &db),
+                    unique_abbrev(&update.oid, &db)
+                );
+                ('+', summary, Some("forced update".to_string()))
+            } else {
+                // Should have been classified as rejected; defensive.
+                (
+                    '!',
+                    "[rejected]".to_string(),
+                    Some("non-fast-forward".to_string()),
+                )
             }
-            None => "[new ref]".to_string(),
+        } else {
+            continue;
         };
-        rows.push((summary, src, dst));
+
+        rows.push(DisplayRow {
+            code,
+            summary,
+            remote,
+            local: if display.format == FetchDisplayFormat::Porcelain {
+                dst.to_string()
+            } else {
+                local_pretty
+            },
+            old_oid,
+            new_oid,
+            error,
+        });
     }
+
     if rows.is_empty() {
         return Ok(());
     }
-    let source = sley_remote::fetch_head_source_description(config, source);
-    let src_width = rows
-        .iter()
-        .map(|(_, src, _)| src.len())
-        .max()
-        .unwrap_or(0)
-        .max(10);
-    eprintln!("From {source}");
-    for (summary, src, dst) in rows {
-        eprintln!("   {summary:<16}  {src:<src_width$} -> {dst}");
+
+    match display.format {
+        FetchDisplayFormat::Porcelain => {
+            for row in &rows {
+                println!("{} {} {} {}", row.code, row.old_oid, row.new_oid, row.local);
+            }
+        }
+        FetchDisplayFormat::Full | FetchDisplayFormat::Compact => {
+            let source = sley_remote::fetch_head_source_description(config, source);
+            let src_width = rows
+                .iter()
+                .map(|row| row.remote.len())
+                .max()
+                .unwrap_or(0)
+                .max(10);
+            eprintln!("From {source}");
+            for row in &rows {
+                let code = row.code;
+                let summary = &row.summary;
+                // git's full format: " <code> <summary padded>  <remote> -> <local>"
+                // Column 22 (1-indexed) starts the remote name when summary width
+                // is 16 (`cut -c 22-` in t5574).
+                if display.format == FetchDisplayFormat::Compact {
+                    let (remote, local) = compact_ref_pair(&row.remote, &row.local);
+                    eprint!(" {code} {summary:<16}  {remote:<src_width$} -> {local}");
+                } else {
+                    eprint!(
+                        " {code} {summary:<16}  {remote:<src_width$} -> {local}",
+                        remote = row.remote,
+                        local = row.local
+                    );
+                }
+                if let Some(err) = &row.error {
+                    eprint!("  ({err})");
+                }
+                eprintln!();
+            }
+        }
     }
     Ok(())
+}
+
+/// Compact-format pair: replace the shared suffix/prefix component with `*`.
+fn compact_ref_pair(remote: &str, local: &str) -> (String, String) {
+    if remote == local {
+        return (remote.to_string(), "*".to_string());
+    }
+    let mut r = remote.to_string();
+    let mut l = local.to_string();
+    if !find_and_replace_compact(&mut r, local, "*") {
+        find_and_replace_compact(&mut l, remote, "*");
+    }
+    (r, l)
+}
+
+/// git's `find_and_replace`: replace a whole path component matching `needle`
+/// with `placeholder`. Returns true if a replacement was made.
+fn find_and_replace_compact(haystack: &mut String, needle: &str, placeholder: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    if haystack == needle {
+        *haystack = placeholder.to_string();
+        return true;
+    }
+    // Prefer end-anchored match (`foo/bar` vs `bar` → `foo/*`).
+    if let Some(prefix) = haystack.strip_suffix(needle) {
+        if prefix.is_empty() || prefix.ends_with('/') {
+            *haystack = format!("{prefix}{placeholder}");
+            return true;
+        }
+    }
+    if let Some(idx) = haystack.find(needle) {
+        let before = &haystack[..idx];
+        let after = &haystack[idx + needle.len()..];
+        if (before.is_empty() || before.ends_with('/'))
+            && (after.is_empty() || after.starts_with('/'))
+        {
+            *haystack = format!("{before}{placeholder}{after}");
+            return true;
+        }
+    }
+    false
 }
 
 /// git's `do_set_head` behavior in `builtin/fetch.c`: a plain `git fetch
@@ -2303,17 +2848,36 @@ fn maybe_set_remote_head_on_fetch(
         return Ok(());
     }
     let create_only = !follow.eq_ignore_ascii_case("always");
-    if create_only && let Some(existing) = store.read_ref(&head_ref)? {
+    let existing = store.read_ref(&head_ref)?;
+    let hook = crate::commands::refs::ReferenceTransactionHookRunner::new(git_dir);
+    // git's `refs_update_symref_extended(..., create_only)` still runs the
+    // reference-transaction hook through `preparing` even when the ref already
+    // exists (then aborts with CREATE_EXISTS, so no prepared/committed).
+    // t5510 #32 asserts that trailing `preparing` + HEAD create line.
+    if create_only && existing.is_some() {
+        let zero = ObjectId::null(format).to_string();
+        let hook_updates = [sley_refs::RefTransactionHookUpdate {
+            old_value: zero,
+            new_value: format!("ref:{target}"),
+            refname: head_ref.clone(),
+        }];
+        let _ = sley_refs::ReferenceTransactionHook::run(
+            &hook,
+            sley_refs::RefTransactionPhase::Preparing,
+            &hook_updates,
+        )?;
         // `create` never overwrites an existing `<remote>/HEAD`. For the `warn`
         // family git additionally reports when the local HEAD disagrees with the
         // remote's advertised default branch (builtin/fetch.c `report_set_head`).
         // The message goes to stdout and only when not quiet (`verbosity >= 0`).
         if !quiet {
-            report_followremotehead_warn(follow, source, head_name, &existing);
+            if let Some(existing) = existing.as_ref() {
+                report_followremotehead_warn(follow, source, head_name, existing);
+            }
         }
         return Ok(());
     }
-    let mut tx = store.transaction();
+    let mut tx = store.transaction().with_hook(&hook);
     tx.update(RefUpdate {
         name: head_ref,
         expected: None,
@@ -2609,4 +3173,94 @@ pub(super) fn check_transport_allowed_url(url: &str, config: Option<&GitConfig>)
             Err(GitError::Exit(128))
         }
     }
+}
+
+struct NegotiateOnlyRequest<'a> {
+    git_dir: &'a Path,
+    format: ObjectFormat,
+    config: &'a GitConfig,
+    transport_config: &'a GitConfig,
+    source: &'a str,
+    options: &'a FetchOptions,
+    recurse_submodules_cli: FetchRecurseSubmodules,
+    cwd: &'a Path,
+    resolution: sley_remote::RemoteResolutionContext<'a>,
+}
+
+/// `git fetch --negotiate-only`: discover common commits without fetching a pack.
+///
+/// Mirrors builtin/fetch.c's negotiate-only branch and transport.c's v2
+/// `wait-for-done` negotiation. Prints one ACKed oid per stdout line.
+fn run_negotiate_only(req: NegotiateOnlyRequest<'_>) -> Result<()> {
+    match req.recurse_submodules_cli {
+        FetchRecurseSubmodules::Off | FetchRecurseSubmodules::Default => {}
+        FetchRecurseSubmodules::On | FetchRecurseSubmodules::OnDemand => {
+            eprintln!(
+                "fatal: options '--negotiate-only' and '--recurse-submodules' cannot be used together"
+            );
+            return Err(GitError::Exit(128));
+        }
+    }
+
+    let restrict = match &req.options.negotiation_restrict {
+        Some(values) => values.clone(),
+        None => remote_config_values(req.config, req.source, "negotiationrestrict"),
+    };
+    if restrict.is_empty() {
+        eprintln!("fatal: --negotiate-only needs one or more --negotiation-restrict=*");
+        return Err(GitError::Exit(128));
+    }
+
+    // Protocol v0/v1 cannot express wait-for-done; fail like transport.c.
+    if matches!(
+        configured_protocol_version(Some(req.config)),
+        Some(ProtocolVersion::V0 | ProtocolVersion::V1)
+    ) {
+        eprintln!("warning: --negotiate-only requires protocol v2");
+        return Err(GitError::Exit(1));
+    }
+
+    let mut tip_oids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for value in &restrict {
+        let oid = resolve_revision(req.git_dir, req.format, value, true).map_err(|_| {
+            eprintln!("fatal: bad revision '{value}'");
+            GitError::Exit(128)
+        })?;
+        if seen.insert(oid) {
+            tip_oids.push(oid);
+        }
+    }
+
+    let resolved = resolve_remote_fetch_url(req.config, req.source);
+    let rewritten = rewrite_url_with_config(req.transport_config, &resolved, false);
+    check_transport_allowed_url(&rewritten, Some(req.transport_config))?;
+
+    let acked = if let Ok(remote_git_dir) =
+        sley_remote::resolve_local_remote_git_dir(req.resolution, &rewritten)
+    {
+        sley_remote::negotiate_only_local(req.git_dir, &remote_git_dir, req.format, &tip_oids)?
+    } else if sley_remote::remote_url_is_http(&rewritten).unwrap_or(false) {
+        let remote = sley_transport::parse_remote_url(&rewritten)?;
+        let client = sley_remote::new_http_client();
+        let mut credentials = sley_remote::NoCredentials;
+        sley_remote::negotiate_only_http(
+            &client,
+            &remote,
+            req.format,
+            &tip_oids,
+            req.git_dir,
+            &mut credentials,
+            Some(req.transport_config),
+        )?
+    } else {
+        let _ = req.cwd;
+        eprintln!("warning: protocol does not support --negotiate-only, exiting");
+        return Err(GitError::Exit(1));
+    };
+
+    for oid in acked {
+        println!("{oid}");
+    }
+    Ok(())
 }

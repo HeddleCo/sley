@@ -863,6 +863,32 @@ pub(crate) fn cmd_commit(
         eprintln!("fatal: options '--pathspec-from-file' and '-a' cannot be used together");
         return Err(GitError::Exit(128));
     }
+    // git's die_for_incompatible_opt4(also, only, all, interactive).
+    if include_without_paths && only_without_paths {
+        eprintln!("fatal: options '-i/--include' and '-o/--only' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if include_without_paths && all {
+        eprintln!("fatal: options '-i/--include' and '-a/--all' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if only_without_paths && all {
+        eprintln!("fatal: options '-o/--only' and '-a/--all' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if (include_without_paths || only_without_paths || all) && (interactive || patch) {
+        let other = if include_without_paths {
+            "-i/--include"
+        } else if only_without_paths {
+            "-o/--only"
+        } else {
+            "-a/--all"
+        };
+        eprintln!(
+            "fatal: options '{other}' and '--interactive/-p/--patch' cannot be used together"
+        );
+        return Err(GitError::Exit(128));
+    }
     // git: die only when no paths and (--include, or --only without --amend and
     // without --allow-empty). `git commit --allow-empty --only` is valid.
     let amend_style = amend
@@ -915,20 +941,57 @@ pub(crate) fn cmd_commit(
         eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
     }
-    if status_mode != CommitStatusMode::Normal {
-        return cmd_commit_status_preview(
-            cli_session,
-            status_mode,
-            status_null,
-            amend,
-            commit_untracked,
-        );
+    if status_mode != CommitStatusMode::Normal || dry_run {
+        // Status / dry-run previews honour `-a` (and the resulting "would be
+        // committed" set) the way git's `prepare_index(..., is_status=1)` does:
+        // stage onto a temporary view of the index, show status, then roll the
+        // real index back so a dry-run never mutates the worktree state.
+        let git_dir_preview = cli_session.git_dir()?;
+        let format_preview = repository_object_format(&git_dir_preview)?;
+        let index_snapshot = if all {
+            Some(read_index_snapshot(&git_dir_preview)?)
+        } else {
+            None
+        };
+        if all {
+            commit_stage_tracked_changes(cli_session, &git_dir_preview, format_preview)?;
+        }
+        let preview = if status_mode != CommitStatusMode::Normal {
+            cmd_commit_status_preview(
+                cli_session,
+                status_mode,
+                status_null,
+                amend,
+                commit_untracked,
+            )
+        } else {
+            cmd_commit_long_status_preview(cli_session, amend, commit_untracked)
+        };
+        if let Some(snapshot) = &index_snapshot {
+            let _ = restore_index_snapshot(&git_dir_preview, snapshot);
+        }
+        return preview;
     }
-    if dry_run {
-        return cmd_commit_long_status_preview(cli_session, amend, commit_untracked);
-    }
+    // Interactive add during `commit --interactive` must not leave the real
+    // index dirty when the later editor / emptiness check aborts the commit
+    // (git stages into a temporary index and rolls it back on failure). On
+    // success the staged index is kept (and committed).
+    let mut interactive_index_guard = if interactive && !patch {
+        let git_dir = cli_session.git_dir()?;
+        Some(InteractiveIndexGuard {
+            git_dir: git_dir.clone(),
+            snapshot: read_index_snapshot(&git_dir)?,
+            keep: false,
+        })
+    } else {
+        None
+    };
     if interactive && !patch {
-        commands::add_interactive::cmd_add_interactive(cli_session, &pathspec_args)?;
+        if let Err(err) =
+            commands::add_interactive::cmd_add_interactive(cli_session, &pathspec_args)
+        {
+            return Err(err);
+        }
         refresh_commit_selection_cache_tree(cli_session)?;
     }
     if patch {
@@ -1060,15 +1123,27 @@ pub(crate) fn cmd_commit(
             )
         })
         .transpose()?;
-    let fixup_reword_tree = if fixup_commit
-        .as_ref()
-        .is_some_and(|fixup| fixup.is_reword() || (fixup.is_amend_style() && only_without_paths))
-    {
-        let Some(commit) = read_head_commit(&git_dir, format)? else {
-            eprintln!("fatal: You have nothing to amend.");
-            return Err(GitError::Exit(128));
-        };
-        Some(commit.tree)
+    // `--only` without pathspecs (allowed with `--amend` / `--allow-empty` /
+    // fixup amend-style): commit HEAD's tree, ignoring any staged index
+    // changes. git builds a "false index" from HEAD for this case.
+    let only_or_reword_head_tree =
+        (only_without_paths && pathspec_args.is_empty() && (amend || allow_empty))
+            || fixup_commit.as_ref().is_some_and(|fixup| {
+                fixup.is_reword() || (fixup.is_amend_style() && only_without_paths)
+            });
+    let fixup_reword_tree = if only_or_reword_head_tree {
+        match read_head_commit(&git_dir, format)? {
+            Some(commit) => Some(commit.tree),
+            None if amend
+                || fixup_commit
+                    .as_ref()
+                    .is_some_and(CommitFixup::is_amend_style) =>
+            {
+                eprintln!("fatal: You have nothing to amend.");
+                return Err(GitError::Exit(128));
+            }
+            None => Some(ObjectId::empty_tree(format)),
+        }
     } else {
         None
     };
@@ -1220,8 +1295,27 @@ pub(crate) fn cmd_commit(
     if all {
         commit_stage_tracked_changes(cli_session, &git_dir, format)?;
     }
+    // `--include` with pathspecs: stage the named paths into the real index
+    // (keeping already-staged entries) and then commit as-is — git's
+    // `all || (also && pathspec.nr)` branch of prepare_index. Unlike the
+    // default pathspec/`--only` path this is NOT a partial commit.
+    if include_without_paths && !pathspec_args.is_empty() {
+        let refs = FileRefStore::new(&git_dir, format);
+        let head = commands::merge_rebase::head_commit_oid(&refs)?;
+        let tree_map = match &head {
+            Some(oid) => {
+                let tree = commands::merge_rebase::commit_tree_oid(&commit_odb, format, oid)?;
+                sley_diff_merge::flatten_tree(&commit_odb, format, &tree)?
+            }
+            None => BTreeMap::new(),
+        };
+        stage_partial_commit_paths(cli_session, &git_dir, format, &pathspec_args, &tree_map)?;
+        pathspec_args.clear();
+    }
     // Emptiness is judged before the signoff trailer is added (git aborts
-    // `commit -m "" -s`).
+    // `commit -m "" -s`). Cleanup mode is resolved just below; for the
+    // pre-signoff check we only need a whitespace-only verdict (verbatim is
+    // re-checked after cleanup via `commit_message_is_empty_for_cleanup`).
     let empty_before_signoff = commit_message_is_empty(&commit_message_with_trailers(
         repo_config.as_ref(),
         &message,
@@ -1311,9 +1405,10 @@ pub(crate) fn cmd_commit(
         message = commit_stripspace_message(&message, None);
     }
     let mut message = if signoff {
-        commands::replay::append_signoff_before_comments(
+        commands::replay::append_signoff_before_comments_with_config(
             message,
             &commit_signoff_from_env(&identity_config)?,
+            repo_config.as_ref(),
         )
     } else {
         message
@@ -1424,7 +1519,10 @@ pub(crate) fn cmd_commit(
     }
     message = fs::read(&editmsg)?;
     message = commit_cleanup_message(message, cleanup_mode, &comment_char, verbose > 0);
-    if (in_cherry_pick || in_revert) && !allow_empty_message && commit_message_is_empty(&message) {
+    if (in_cherry_pick || in_revert)
+        && !allow_empty_message
+        && commit_message_is_empty_for_cleanup(&message, cleanup_mode)
+    {
         let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
@@ -1478,13 +1576,20 @@ pub(crate) fn cmd_commit(
             cli_session.lazy_fetch(),
         );
     }
-    if !allow_empty_message && empty_before_signoff && !use_editor {
+    // git's message_is_empty with CLEANUP_NONE (verbatim) treats any non-zero
+    // buffer as non-empty, so a bare newline from `-m "$LF" --cleanup=verbatim`
+    // is allowed (t6006). The pre-signoff emptiness flag alone is insufficient.
+    if !allow_empty_message
+        && empty_before_signoff
+        && !use_editor
+        && cleanup_mode != CommitCleanupMode::Verbatim
+    {
         let _ = restore_taken_index_snapshot(&git_dir, &all_index_snapshot);
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
     }
     if !allow_empty_message
-        && (commit_message_is_empty(&message)
+        && (commit_message_is_empty_for_cleanup(&message, cleanup_mode)
             || (template_message_source
                 && cleanup_mode_strips_comments(cleanup_mode)
                 && commit_message_lacks_non_trailer_content(&message)))
@@ -1538,7 +1643,7 @@ pub(crate) fn cmd_commit(
         } else {
             head.iter().copied().collect()
         };
-        return commit_partial_paths(
+        let partial_result = commit_partial_paths(
             cli_session,
             &git_dir,
             format,
@@ -1554,6 +1659,12 @@ pub(crate) fn cmd_commit(
             amend,
             no_post_rewrite,
         );
+        if partial_result.is_ok() {
+            if let Some(guard) = interactive_index_guard.as_mut() {
+                guard.keep = true;
+            }
+        }
+        return partial_result;
     }
     let precomputed_index_tree = if !allow_empty && !amend && fixup_reword_tree.is_none() {
         match commit_index_tree_if_changed(&git_dir, format, &commit_odb)? {
@@ -1621,10 +1732,15 @@ pub(crate) fn cmd_commit(
         encoding: commit_encoding_header,
         signature,
     };
-    let result = if amend {
+    let result = if let Some(tree) = fixup_reword_tree {
+        // Forced HEAD tree: amend --only / allow-empty --only / fixup reword.
+        if amend {
+            sley_sequencer::amend_tree(&git_dir, format, tree, options)
+        } else {
+            sley_sequencer::commit_tree_at_head(&git_dir, format, tree, options)
+        }
+    } else if amend {
         sley_sequencer::amend_index(&git_dir, format, options)
-    } else if let Some(tree) = fixup_reword_tree {
-        sley_sequencer::commit_tree_at_head(&git_dir, format, tree, options)
     } else if let Some(tree) = precomputed_index_tree {
         sley_sequencer::commit_tree_at_head_with_odb(&git_dir, format, tree, options, &commit_odb)
     } else {
@@ -1642,6 +1758,9 @@ pub(crate) fn cmd_commit(
     );
     commands::hooks::run_post_index_change_hook_at(&git_dir, false, false)?;
     if let Some((summary_author, summary_committer, summary_message)) = summary {
+        // git's `author_date_is_interesting()` = force_date || author_message
+        // (reuse from -C/-c/amend). Shows the `Date:` line in the summary.
+        let show_author_date = author_date.is_some() || reuse_message.is_some() || amend;
         print_commit_summary(
             &git_dir,
             format,
@@ -1651,6 +1770,7 @@ pub(crate) fn cmd_commit(
             &summary_message,
             &summary_author,
             &summary_committer,
+            show_author_date,
             cli_session.lazy_fetch(),
         )?;
     }
@@ -1665,6 +1785,15 @@ pub(crate) fn cmd_commit(
         && !no_post_rewrite
         && let Some(old_oid) = amended_old_oid
     {
+        // git's commit_post_rewrite: copy notes (notes.rewrite.amend) then run
+        // the post-rewrite hook.
+        copy_notes_for_amend(
+            &git_dir,
+            format,
+            &old_oid,
+            &result.oid,
+            repo_config.as_ref(),
+        )?;
         commands::hooks::run_hook_at(
             &git_dir,
             "post-rewrite",
@@ -1674,6 +1803,9 @@ pub(crate) fn cmd_commit(
                 ..commands::hooks::HookRun::default()
             },
         )?;
+    }
+    if let Some(guard) = interactive_index_guard.as_mut() {
+        guard.keep = true;
     }
     Ok(())
 }
@@ -1705,14 +1837,17 @@ fn run_auto_maintenance_after_commit(
 
 /// Print git's post-commit summary (`print_commit_summary`), e.g.
 /// `[main (root-commit) 0bed67f] initial` followed by an optional `Author:`/
-/// `Committer:` line and the shortstat + `create/delete mode` summary of the diff
+/// `Date:` line and the shortstat + `create/delete mode` summary of the diff
 /// against the parent. `new_oid` is the freshly written commit; `parent` is its
 /// first parent (None for a root commit, which diffs against the empty tree and
 /// adds the `(root-commit)` marker). `author`/`committer` are the raw identity
 /// buffers (`Name <email> seconds tz`); the `Author:` line is emitted only when
-/// they differ in name/email, matching git. The object database is borrowed from
-/// the caller so the summary reuses any hot pack/MIDX state from the commit path
-/// instead of opening a second database for the same repository.
+/// they differ in name/email, matching git. The `Date:` line is emitted when
+/// `show_author_date` is set (git's `SUMMARY_SHOW_AUTHOR_DATE` /
+/// `author_date_is_interesting()` — `--date` given or author reused from
+/// `-C`/`-c`/amend). The object database is borrowed from the caller so the
+/// summary reuses any hot pack/MIDX state from the commit path instead of
+/// opening a second database for the same repository.
 fn print_commit_summary(
     git_dir: &Path,
     format: ObjectFormat,
@@ -1722,6 +1857,7 @@ fn print_commit_summary(
     message: &[u8],
     author: &[u8],
     committer: &[u8],
+    show_author_date: bool,
     lazy_fetch: bool,
 ) -> Result<()> {
     // HEAD branch name, or "detached HEAD" / "HEAD" when unresolvable.
@@ -1746,6 +1882,13 @@ fn print_commit_summary(
     let committer_id = identity_name_email(committer);
     if author_id != committer_id {
         writeln!(out, " Author: {author_id}")?;
+    }
+    // `Date:` line when the author date was forced / interesting
+    // (`SUMMARY_SHOW_AUTHOR_DATE`). Format matches `%ad` default
+    // (`DateMode::Default` → e.g. `Sat Jan 2 03:04:05 2010 -0600`).
+    if show_author_date {
+        let date = commit_identity_date(author, &DateMode::Default);
+        writeln!(out, " Date: {date}")?;
     }
 
     // Shortstat + summary of the diff against the parent tree (empty tree for a
@@ -2265,12 +2408,141 @@ fn restore_partial_commit_untrusted_modes(
     Ok(())
 }
 
+/// git's `commit_post_rewrite` notes step: copy notes from the amended commit
+/// to the replacement, honouring `notes.rewrite.amend` (default on) and
+/// `notes.rewriteRef` / `GIT_NOTES_REWRITE_REF`.
+fn copy_notes_for_amend(
+    git_dir: &Path,
+    format: ObjectFormat,
+    old_oid: &ObjectId,
+    new_oid: &ObjectId,
+    config: Option<&GitConfig>,
+) -> Result<()> {
+    if old_oid == new_oid {
+        return Ok(());
+    }
+    let Some(config) = config else {
+        return Ok(());
+    };
+    // notes.rewrite.amend defaults to true; explicit false disables.
+    // Config may be stored as [notes "rewrite"] amend = … or notes.rewrite.amend.
+    let enabled = config
+        .get_bool("notes", Some("rewrite"), "amend")
+        .or_else(|| {
+            config
+                .get("notes", None, "rewrite.amend")
+                .map(|v| v != "false" && v != "0" && v != "no" && v != "off")
+        })
+        .unwrap_or(true);
+    if !enabled {
+        return Ok(());
+    }
+    let mut patterns: Vec<String> = config
+        .get_all("notes", None, "rewriteRef")
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect();
+    if let Ok(env_refs) = env::var("GIT_NOTES_REWRITE_REF") {
+        patterns.extend(
+            env_refs
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        );
+    }
+    if patterns.is_empty() {
+        return Ok(());
+    }
+    let mode = env::var("GIT_NOTES_REWRITE_MODE")
+        .ok()
+        .or_else(|| config.get("notes", None, "rewriteMode").map(str::to_string))
+        .unwrap_or_else(|| "concatenate".to_string());
+    if mode == "ignore" {
+        return Ok(());
+    }
+    let store = FileRefStore::new(git_dir, format);
+    let identity = sley_notes::NotesCommitIdentity {
+        author: commit_identity_from_env("AUTHOR", config)?,
+        committer: commit_identity_from_env("COMMITTER", config)?,
+    };
+    for reference in store.list_refs()? {
+        if !reference.name.starts_with("refs/notes/") {
+            continue;
+        }
+        let matches = patterns
+            .iter()
+            .any(|pattern| match pattern.strip_suffix('*') {
+                Some(prefix) => reference.name.starts_with(prefix),
+                None => pattern == &reference.name,
+            });
+        if !matches {
+            continue;
+        }
+        let notes_ref = sley_notes::NotesRef::expand(&reference.name);
+        let Some(source_blob) =
+            sley_notes::read_note_for(git_dir, format, &store, &notes_ref, old_oid)?
+        else {
+            continue;
+        };
+        let dest_blob = sley_notes::read_note_for(git_dir, format, &store, &notes_ref, new_oid)?;
+        if dest_blob == Some(source_blob) {
+            continue;
+        }
+        let source = sley_notes::read_note_bytes(git_dir, format, &store, &notes_ref, old_oid)?
+            .unwrap_or_default();
+        let combined = if mode == "overwrite" || dest_blob.is_none() {
+            source
+        } else {
+            let mut cur =
+                sley_notes::read_note_bytes(git_dir, format, &store, &notes_ref, new_oid)?
+                    .unwrap_or_default();
+            if cur.last() == Some(&b'\n') {
+                cur.pop();
+            }
+            cur.extend_from_slice(b"\n\n");
+            cur.extend_from_slice(&source);
+            cur
+        };
+        let expected = sley_notes::notes_ref_expected(&store, &notes_ref)?;
+        sley_notes::upsert_note_bytes_for(
+            git_dir,
+            format,
+            &store,
+            &notes_ref,
+            new_oid,
+            &combined,
+            "Notes added by 'git commit --amend'",
+            &identity,
+            expected,
+        )?;
+    }
+    Ok(())
+}
+
 fn read_index_snapshot(git_dir: &Path) -> Result<Option<Vec<u8>>> {
     let index_path = sley_worktree::repository_index_path(git_dir);
     match fs::read(&index_path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err.into()),
+    }
+}
+
+/// Restores a pre-interactive index snapshot when a `commit --interactive`
+/// aborts (empty message / editor failure). `keep = true` leaves the staged
+/// index in place after a successful commit.
+struct InteractiveIndexGuard {
+    git_dir: PathBuf,
+    snapshot: Option<Vec<u8>>,
+    keep: bool,
+}
+
+impl Drop for InteractiveIndexGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = restore_index_snapshot(&self.git_dir, &self.snapshot);
+        }
     }
 }
 
@@ -2447,7 +2719,37 @@ fn cmd_commit_status_preview(
             sley_worktree::StatusUntrackedMode::All => "--untracked-files=all".to_string(),
         });
     }
-    cmd_status(cli_session, &args)
+    cmd_status(cli_session, &args)?;
+    // `git commit --short/--porcelain` exits 1 when there is nothing to commit
+    // (unlike plain `git status`, which always exits 0). Mirror that gate.
+    let git_dir = cli_session.git_dir()?;
+    let format = repository_object_format(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
+    let entries = crate::collect_short_status_with_options(
+        &worktree_root,
+        &git_dir,
+        format,
+        sley_worktree::ShortStatusOptions {
+            include_ignored: false,
+            ignored_mode: sley_worktree::StatusIgnoredMode::Traditional,
+            untracked_mode: sley_worktree::StatusUntrackedMode::None,
+            reference: if amend { Some("HEAD^1") } else { None },
+        },
+    )?;
+    let mut committable = status_entries_have_index_changes(&entries);
+    if !committable {
+        // Merge with conflicts resolved is always committable (wt-status.c).
+        if git_dir.join("MERGE_HEAD").is_file()
+            && !commit_index_has_unmerged_entries(&git_dir, format)?
+        {
+            committable = true;
+        }
+    }
+    if committable {
+        Ok(())
+    } else {
+        Err(GitError::Exit(1))
+    }
 }
 
 fn cmd_commit_long_status_preview(
@@ -2455,7 +2757,6 @@ fn cmd_commit_long_status_preview(
     amend: bool,
     untracked_override: Option<sley_worktree::StatusUntrackedMode>,
 ) -> Result<()> {
-    let cwd = cli_session.cwd().to_path_buf();
     let git_dir = cli_session.git_dir()?;
     let config = read_repo_config(&git_dir).map_err(report_config_setup_error)?;
     let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
@@ -2482,7 +2783,15 @@ fn cmd_commit_long_status_preview(
             reference: if amend { Some("HEAD^1") } else { None },
         },
     )?;
-    let committable = status_entries_have_index_changes(&entries);
+    let mut committable = status_entries_have_index_changes(&entries);
+    // Merge with all conflicts fixed is always committable even when the index
+    // tree equals HEAD (wt-status.c: merge_in_progress && !has_unmerged).
+    if !committable
+        && git_dir.join("MERGE_HEAD").is_file()
+        && !commit_index_has_unmerged_entries(&git_dir, format)?
+    {
+        committable = true;
+    }
     // `commit --dry-run` carries no `--ignore-submodules` flag, so the resolver
     // reflects only config; apply it so submodule worktree detail honours
     // `submodule.<name>.ignore` / `diff.ignoreSubmodules` the same as `status`.
@@ -2668,8 +2977,47 @@ fn read_porcelain_commit_message_file(path: &str) -> Result<Vec<u8>> {
     Ok(message)
 }
 
+/// Match git's `rest_is_empty` / `message_is_empty` (sequencer.c): a message is
+/// empty when every line is whitespace or a `Signed-off-by:` trailer. With
+/// `cleanup=verbatim` (`COMMIT_MSG_CLEANUP_NONE`), any non-zero-length buffer is
+/// non-empty — even if it is only whitespace/newlines.
 fn commit_message_is_empty(message: &[u8]) -> bool {
-    message.iter().all(u8::is_ascii_whitespace)
+    commit_message_rest_is_empty(message)
+}
+
+/// git's `rest_is_empty(sb, 0)`: true when the buffer is only whitespace and
+/// `Signed-off-by:` lines (t7501 "empty commit message" with a lone SOB).
+fn commit_message_rest_is_empty(message: &[u8]) -> bool {
+    const SOB: &[u8] = b"Signed-off-by: ";
+    let mut i = 0;
+    while i < message.len() {
+        let eol = message[i..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|rel| i + rel)
+            .unwrap_or(message.len());
+        let line = &message[i..eol];
+        if line.len() >= SOB.len() && line.starts_with(SOB) {
+            // Skip this Signed-off-by line.
+        } else if !line.iter().all(|b| b.is_ascii_whitespace()) {
+            return false;
+        }
+        i = if eol < message.len() {
+            eol + 1
+        } else {
+            message.len()
+        };
+    }
+    true
+}
+
+/// Like [`commit_message_is_empty`] but respects cleanup mode the way git does
+/// in `message_is_empty(sb, cleanup_mode)`.
+fn commit_message_is_empty_for_cleanup(message: &[u8], cleanup_mode: CommitCleanupMode) -> bool {
+    if cleanup_mode == CommitCleanupMode::Verbatim && !message.is_empty() {
+        return false;
+    }
+    commit_message_is_empty(message)
 }
 
 fn commit_message_lacks_non_trailer_content(message: &[u8]) -> bool {
@@ -2931,10 +3279,13 @@ fn build_reused_commit_author_identity(
     } else {
         (reused_name, reused_email)
     };
-    // A `--date` override is raw user input; canonicalize it. The reused date
-    // is already in canonical `<seconds> <tz>` form.
+    // A `--date` override is raw user input; reject unparseable values the way
+    // git's `parse_force_date` does (`fatal: invalid date format: …`).
     let date = match date {
-        Some(date) => canonicalize_commit_date(date),
+        Some(date) => try_canonicalize_commit_date(date).ok_or_else(|| {
+            eprintln!("fatal: invalid date format: {date}");
+            GitError::Exit(128)
+        })?,
         None => reused_date,
     };
     sley_sequencer::format_commit_identity_bytes(&name, &email, &date)
@@ -3591,10 +3942,16 @@ fn build_commit_author_identity(
         };
         (name, email)
     };
-    let date = date
-        .map(str::to_string)
-        .unwrap_or_else(|| env::var("GIT_AUTHOR_DATE").unwrap_or_else(|_| "@0 +0000".into()));
-    let date = canonicalize_commit_date(&date);
+    let date = if let Some(date) = date {
+        // Explicit `--date=` must parse (git's `parse_force_date`).
+        try_canonicalize_commit_date(date).ok_or_else(|| {
+            eprintln!("fatal: invalid date format: {date}");
+            GitError::Exit(128)
+        })?
+    } else {
+        let raw = env::var("GIT_AUTHOR_DATE").unwrap_or_else(|_| "@0 +0000".into());
+        canonicalize_commit_date(&raw)
+    };
     validate_commit_identity_name("AUTHOR", &name, &email)?;
     sley_sequencer::format_commit_identity_bytes(&name, &email, &date)
 }
