@@ -1484,7 +1484,10 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         ));
     }
     let stat_family = stat || compact_summary || numstat || shortstat;
-    if diff_rewrite_control && !name_status && !name_only && !stat_family {
+    // `-B` / `--break-rewrites` is supported for name-status/name-only/raw and
+    // the stat family (content is needed to score rewrites). Other modes still
+    // reject it until a patch-side break path is wired.
+    if diff_rewrite_control && !name_status && !name_only && !stat_family && !raw {
         return Err(GitError::Unsupported(
             "diff rewrite controls are not supported for this output mode".into(),
         ));
@@ -1943,7 +1946,9 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
             .unwrap_or(7)
             .min(format.hex_len())
     };
-    let worktree_root = if cached {
+    // Tree-vs-tree diffs never touch the worktree (including bare partial clones
+    // used by t4067). Only require a worktree when a worktree/index side is live.
+    let worktree_root = if cached || diff_trees.len() == 2 {
         repo.worktree_root().ok().map(Path::to_path_buf)
     } else {
         Some(repo.worktree_root()?.to_path_buf())
@@ -2068,6 +2073,45 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
             }
             // `diff <rev> <rev>` / `<rev>..<rev>` / `<rev>...<rev>`: tree vs tree.
             [left, right] => {
+                // Inexact rename/copy scoring opens unpaired *add/delete* blobs
+                // only (Modified pairs are not similarity-scored here). Prefetch
+                // just those so `-M` in a partial clone does one negotiation
+                // (t4067 #5), exact renames fetch nothing (t4067 #8), and a
+                // pure modify without `-B` still fetches nothing (t4067 #9).
+                if lazy_fetch && options.detect_inexact {
+                    let exact_only = sley_diff_merge::DiffNameStatusOptions {
+                        detect_inexact: false,
+                        ..options
+                    };
+                    let preliminary = sley_diff_merge::diff_name_status_trees_with_options(
+                        &db, format, left, right, exact_only,
+                    )?;
+                    let rename_oids: Vec<_> = preliminary
+                        .iter()
+                        .filter(|entry| {
+                            matches!(
+                                entry.status,
+                                sley_diff_merge::NameStatus::Added
+                                    | sley_diff_merge::NameStatus::Deleted
+                            )
+                        })
+                        .flat_map(|entry| {
+                            let mut oids = Vec::new();
+                            if entry.old_mode != Some(0o160000)
+                                && let Some(oid) = entry.old_oid
+                            {
+                                oids.push(oid);
+                            }
+                            if entry.new_mode != Some(0o160000)
+                                && let Some(oid) = entry.new_oid
+                            {
+                                oids.push(oid);
+                            }
+                            oids
+                        })
+                        .collect();
+                    crate::prefetch_promisor_objects(&db, &rename_oids, true)?;
+                }
                 if inexact_renames {
                     let diff =
                         sley_diff_merge::diff_name_status_trees_with_options_and_diagnostics(
@@ -2296,9 +2340,24 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
     } else {
         entries
     };
+    // `-B` / `--break-rewrites`: split complete rewrites into delete+create
+    // before rename detection consumers / raw output (git's `diffcore_break`).
+    // Content is batch-prefetched once for every Modified pair that may break.
+    let mut entries = if diff_rewrite_control {
+        apply_diff_break_rewrites(
+            entries,
+            &relative_lookup_entries,
+            &db,
+            worktree_root.as_deref(),
+            use_worktree_new,
+            worktree_clean.as_ref(),
+            lazy_fetch,
+        )?
+    } else {
+        entries
+    };
     // `-O<orderfile>` / `diff.orderfile` then `--rotate-to` / `--skip-to`, the
     // last steps of git's `diffcore_std` (both no-op on an empty diff).
-    let mut entries = entries;
     if !entries.is_empty()
         && let Some(orderfile) = resolved_orderfile.as_deref()
     {
@@ -2499,6 +2558,9 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
             Ok(())
         };
         if show_patch {
+            // One promisor negotiation for every blob the patch body will open
+            // (git's `diff_queued_diff_prefetch`).
+            crate::prefetch_diff_entry_blobs(&db, &entries, lazy_fetch)?;
             let combined_unmerged = if plain_index_worktree_diff {
                 diff_unmerged_worktree_combined_paths(&git_dir, worktree_root.as_deref(), format)?
             } else {
@@ -3595,6 +3657,88 @@ fn apply_diff_break_rewrite_stats(
         }
     }
     Ok(())
+}
+
+/// Split complete rewrites (`-B`) into a delete + create pair, matching git's
+/// `diffcore_break` default 50% threshold. Blobs are batch-prefetched first.
+fn apply_diff_break_rewrites(
+    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    lookup_entries: &DiffRelativeLookupMap,
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_new: bool,
+    worktree_clean: Option<&DiffWorktreeCleanContext<'_>>,
+    lazy_fetch: bool,
+) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+    // Prefetch every Modified pair's blobs once before scoring (t4067 #9).
+    let modified_oids: Vec<_> = entries
+        .iter()
+        .filter(|entry| matches!(entry.status, sley_diff_merge::NameStatus::Modified))
+        .flat_map(|entry| {
+            let lookup = diff_relative_lookup_entry(entry, lookup_entries);
+            [lookup.old_oid, lookup.new_oid]
+                .into_iter()
+                .flatten()
+                .filter(|_| lookup.old_mode != Some(0o160000) && lookup.new_mode != Some(0o160000))
+        })
+        .collect();
+    crate::prefetch_promisor_objects(db, &modified_oids, lazy_fetch)?;
+
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if !matches!(entry.status, sley_diff_merge::NameStatus::Modified) {
+            out.push(entry);
+            continue;
+        }
+        if entry.old_mode == Some(0o160000) || entry.new_mode == Some(0o160000) {
+            out.push(entry);
+            continue;
+        }
+        let lookup_entry = diff_relative_lookup_entry(&entry, lookup_entries);
+        let old_content = diff_entry_old_content(lookup_entry, db, lazy_fetch)?;
+        let new_content = diff_entry_new_content(
+            lookup_entry,
+            db,
+            worktree_root,
+            use_worktree_new,
+            worktree_clean,
+            lazy_fetch,
+        )?;
+        let (Some(old), Some(new)) = (old_content.as_deref(), new_content.as_deref()) else {
+            out.push(entry);
+            continue;
+        };
+        // diffcore_break does not split very small files, even when their
+        // content similarity is below the requested threshold.
+        if old.len().max(new.len()) < 400 {
+            out.push(entry);
+            continue;
+        }
+        // git DEFAULT_BREAK_SCORE is 50% similarity (below = break).
+        if sley_diff_merge::blob_similarity(old, new) >= 50 {
+            out.push(entry);
+            continue;
+        }
+        out.push(sley_diff_merge::NameStatusEntry {
+            status: sley_diff_merge::NameStatus::Deleted,
+            path: entry.path.clone(),
+            old_path: None,
+            old_mode: entry.old_mode,
+            new_mode: None,
+            old_oid: entry.old_oid,
+            new_oid: None,
+        });
+        out.push(sley_diff_merge::NameStatusEntry {
+            status: sley_diff_merge::NameStatus::Added,
+            path: entry.path,
+            old_path: None,
+            old_mode: None,
+            new_mode: entry.new_mode,
+            old_oid: None,
+            new_oid: entry.new_oid,
+        });
+    }
+    Ok(out)
 }
 
 fn diff_line_stats_from_ignored_hunks(

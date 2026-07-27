@@ -31,6 +31,78 @@ impl AddContext {
     }
 }
 
+/// Port of upstream `edit_patch()`: write the unstaged diff (context 7) to
+/// `$GIT_DIR/ADD_EDIT.patch`, open it in the editor, then `apply --recount
+/// --cached`. Worktree is left untouched.
+fn add_edit_patch(cli_session: &crate::session::CliSession, paths: &[PathBuf]) -> Result<()> {
+    let context = AddContext::open(cli_session)?;
+    let patch_path = context.git_dir.join("ADD_EDIT.patch");
+    let self_bin = env::current_exe().unwrap_or_else(|_| PathBuf::from("sley"));
+
+    // `diff-files -p -U7 --no-color --ignore-submodules=dirty [-- pathspec...]`
+    // mirrors git's `run_diff_files` with `rev.diffopt.context = 7`.
+    let mut diff_args: Vec<String> = vec![
+        "diff-files".into(),
+        "-p".into(),
+        "-U7".into(),
+        "--no-color".into(),
+        "--ignore-submodules=dirty".into(),
+    ];
+    if !paths.is_empty() {
+        diff_args.push("--".into());
+        for path in paths {
+            diff_args.push(path.to_string_lossy().into_owned());
+        }
+    }
+    let diff_out = ProcessCommand::new(&self_bin)
+        .args(&diff_args)
+        .current_dir(&context.cwd)
+        .output()
+        .map_err(|e| GitError::Io(e.to_string()))?;
+    // diff-files exits 1 when differences exist; treat that as success.
+    if !diff_out.status.success() && diff_out.status.code() != Some(1) {
+        let _ = io::stderr().write_all(&diff_out.stderr);
+        eprintln!("fatal: could not generate patch for editing");
+        return Err(GitError::Exit(128));
+    }
+    fs::write(&patch_path, &diff_out.stdout).map_err(|e| GitError::Io(e.to_string()))?;
+
+    if let Err(_err) = crate::commands::replay::launch_editor(&context.git_dir, &patch_path) {
+        // Match git's `die(_("editing patch failed"))`.
+        eprintln!("fatal: editing patch failed");
+        let _ = fs::remove_file(&patch_path);
+        return Err(GitError::Exit(128));
+    }
+
+    let meta = fs::metadata(&patch_path).map_err(|e| {
+        eprintln!("fatal: could not stat '{}'", patch_path.to_string_lossy());
+        GitError::Io(e.to_string())
+    })?;
+    if meta.len() == 0 {
+        eprintln!("fatal: empty patch. aborted");
+        let _ = fs::remove_file(&patch_path);
+        return Err(GitError::Exit(128));
+    }
+
+    let apply_status = ProcessCommand::new(&self_bin)
+        .args([
+            "apply",
+            "--recount",
+            "--cached",
+            &patch_path.to_string_lossy(),
+        ])
+        .current_dir(&context.cwd)
+        .status()
+        .map_err(|e| GitError::Io(e.to_string()))?;
+    if !apply_status.success() {
+        eprintln!("fatal: could not apply '{}'", patch_path.to_string_lossy());
+        let _ = fs::remove_file(&patch_path);
+        return Err(GitError::Exit(128));
+    }
+    let _ = fs::remove_file(&patch_path);
+    Ok(())
+}
+
 pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     // `add -i` / `add --interactive` and `add -p` / `add --patch` route to the
     // interactive engine. git treats `--patch` as implying interactive and lets
@@ -235,7 +307,6 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
                     return Err(GitError::Exit(128));
                 }
                 edit_option = true;
-                paths.push(PathBuf::from(arg));
             }
             "--pathspec-from-file" => {
                 if edit_option {
@@ -314,6 +385,12 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         eprintln!("fatal: the option '--ignore-missing' requires '--dry-run'");
         return Err(GitError::Exit(128));
     }
+    // `git add -e` / `--edit`: edit the unstaged patch then apply it to the index.
+    // Upstream returns early from edit_patch before the empty-pathspec "Nothing
+    // specified" guard, so bare `add -e` is valid.
+    if edit_option {
+        return add_edit_patch(cli_session, &paths);
+    }
     if paths.is_empty() && !update && !all && !refresh {
         eprintln!("Nothing specified, nothing added.");
         eprintln!("hint: Maybe you wanted to say 'git add .'?");
@@ -349,6 +426,11 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         refresh,
         &context.config,
     )?;
+    // Must run before any early-return add path (intent-to-add, exact-tracked
+    // fast path, etc.): `git -C unpopulated-sub add .` must die here.
+    let parsed_index = sley_worktree::read_repository_index(&git_dir, format)?;
+    die_in_unpopulated_submodule(&cwd, &worktree_root, parsed_index.as_ref())?;
+    die_on_pathspec_inside_submodule(&cwd, &worktree_root, parsed_index.as_ref(), &paths)?;
     if renormalize {
         let tracked_paths = resolve_add_renormalize_paths(
             &cwd,
@@ -415,12 +497,6 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         }
         return Ok(());
     }
-    let parsed_index = if paths.is_empty() {
-        None
-    } else {
-        sley_worktree::read_repository_index(&git_dir, format)?
-    };
-    die_on_pathspec_inside_submodule(&cwd, &worktree_root, parsed_index.as_ref(), &paths)?;
     // git's `add` re-stats every tracked path it touches, including ones whose
     // content is unchanged (a `touch`ed file): `builtin/add.c` calls
     // `refresh_index` over the pathspec before/after staging, so the cached stat
@@ -1046,6 +1122,79 @@ fn refresh_index_after_add(
 /// Upstream pathspec.c `die_path_inside_submodule()`: a pathspec that names a
 /// path *inside* a tracked gitlink is fatal — the file belongs to the
 /// submodule's repository, not this one.
+/// Port of `die_in_unpopulated_submodule`: when cwd sits *inside* a gitlink
+/// path recorded in the index (prefix longer than the gitlink and starting
+/// with `gitlink/`), refuse to run. This is the `git -C unpopulated-sub add`
+/// case — discovery walks up to the superproject, but the cwd is still under
+/// the submodule path.
+fn die_in_unpopulated_submodule(
+    cwd: &Path,
+    worktree_root: &Path,
+    index: Option<&Index>,
+) -> Result<()> {
+    let Some(index) = index else {
+        return Ok(());
+    };
+    let absolute = match fs::canonicalize(cwd) {
+        Ok(path) => path,
+        Err(_) => normalize_add_absolute_path(cwd, Path::new(".")),
+    };
+    let Ok(relative) = absolute.strip_prefix(worktree_root).or_else(|_| {
+        // Fall back to lexical strip when canonicalize diverges (macOS /private).
+        cwd.strip_prefix(worktree_root)
+    }) else {
+        // Also try canonical worktree root.
+        let Ok(root) = fs::canonicalize(worktree_root) else {
+            return Ok(());
+        };
+        let Ok(rel) = absolute.strip_prefix(&root) else {
+            return Ok(());
+        };
+        return die_in_unpopulated_submodule_with_prefix(rel, index);
+    };
+    die_in_unpopulated_submodule_with_prefix(relative, index)
+}
+
+fn die_in_unpopulated_submodule_with_prefix(relative: &Path, index: &Index) -> Result<()> {
+    if relative.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let mut prefix = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    // git's setup prefix always ends with '/' when non-empty.
+    if !prefix.is_empty() && !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    let prefix_bytes = prefix.as_bytes();
+    for entry in &index.entries {
+        if entry.mode != 0o160000 || entry.stage() != sley_index::Stage::Normal {
+            continue;
+        }
+        let ce = entry.path.as_bytes();
+        if prefix_bytes.len() <= ce.len() {
+            continue;
+        }
+        if !prefix_bytes.starts_with(ce) {
+            continue;
+        }
+        if prefix_bytes[ce.len()] != b'/' {
+            continue;
+        }
+        eprintln!(
+            "fatal: in unpopulated submodule '{}'",
+            String::from_utf8_lossy(ce)
+        );
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
 fn die_on_pathspec_inside_submodule(
     cwd: &Path,
     worktree_root: &Path,

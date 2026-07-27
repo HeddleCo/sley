@@ -1379,7 +1379,10 @@ fn submodule_name_for_path_at_commit(
     else {
         return Ok(None);
     };
-    let gitmodules = db.read_object(&gitmodules_oid)?;
+    // Partial clones omit the `.gitmodules` blob until demanded. Use the same
+    // lazy-promisor path as cat-file so on-demand submodule recursion can
+    // resolve names (t5616 "lazily fetched .gitmodules works").
+    let gitmodules = crate::read_object_maybe_prefetch_promisor(&db, &gitmodules_oid, true)?;
     if gitmodules.object_type != ObjectType::Blob {
         return Ok(None);
     }
@@ -1550,6 +1553,9 @@ fn fetch_raw_oid_refspecs(
     else {
         return Ok(false);
     };
+    // Bare-OID shortcut skips the general fetch planner's mark_complete pass;
+    // run it here so graph-only local tips still die (t5330 #4).
+    sley_remote::mark_complete_local_refs(git_dir, format)?;
     // A filtered fetch omits objects, so its pack is only valid as a promisor
     // pack — exactly as for an already-promisor remote.
     let promisor = config
