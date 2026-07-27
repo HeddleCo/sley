@@ -1512,7 +1512,8 @@ fn add_refresh_with_pathspec_only_touches_matches_like_upstream_git() {
                 .expect("write index-info");
             assert!(child.wait().expect("wait").success(), "update-index");
             // Age mtimes so both bar and baz look dirty.
-            let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_880_000);
+            let old =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_880_000);
             let _ = filetime_set(repo.join("bar"), old);
             let _ = filetime_set(repo.join("baz"), old);
         }
@@ -1551,9 +1552,7 @@ fn filetime_set(path: PathBuf, when: std::time::SystemTime) -> std::io::Result<(
     // touch -t expects [[CC]YY]MMDDhhmm[.SS]; use epoch via perl for portability.
     let status = SysCommand::new("perl")
         .arg("-e")
-        .arg(format!(
-            "utime {secs}, {secs}, $ARGV[0] or die $!",
-        ))
+        .arg(format!("utime {secs}, {secs}, $ARGV[0] or die $!",))
         .arg(&path)
         .status()?;
     if status.success() {
@@ -1599,9 +1598,7 @@ fn add_ignore_errors_stages_readable_peers_like_upstream_git() {
             run_with_identity(repo, &["commit", "--allow-empty", "-m", "init", "-q"]);
             fs::write(repo.join("foo1"), b"one\n").expect("write foo1");
             fs::write(repo.join("foo2"), b"two\n").expect("write foo2");
-            let mut perms = fs::metadata(repo.join("foo2"))
-                .expect("meta")
-                .permissions();
+            let mut perms = fs::metadata(repo.join("foo2")).expect("meta").permissions();
             perms.set_mode(0o000);
             fs::set_permissions(repo.join("foo2"), perms).expect("chmod 0 foo2");
         }
@@ -1618,19 +1615,19 @@ fn add_ignore_errors_stages_readable_peers_like_upstream_git() {
 
         // Restore perms and re-test config form on fresh unreadable foo2.
         for repo in [&upstream, &rust] {
-            let mut perms = fs::metadata(repo.join("foo2"))
-                .expect("meta")
-                .permissions();
+            let mut perms = fs::metadata(repo.join("foo2")).expect("meta").permissions();
             perms.set_mode(0o644);
             fs::set_permissions(repo.join("foo2"), perms).expect("chmod restore");
             git(repo, &["reset", "-q"]);
             // Drop staged foo1 from the previous step.
-            let _ = run_output(sley_testkit::oracle_git(), repo, &["rm", "-f", "--cached", "foo1"]);
+            let _ = run_output(
+                sley_testkit::oracle_git(),
+                repo,
+                &["rm", "-f", "--cached", "foo1"],
+            );
             fs::write(repo.join("foo1"), b"one\n").expect("rewrite foo1");
             fs::write(repo.join("foo2"), b"two\n").expect("rewrite foo2");
-            let mut perms = fs::metadata(repo.join("foo2"))
-                .expect("meta")
-                .permissions();
+            let mut perms = fs::metadata(repo.join("foo2")).expect("meta").permissions();
             perms.set_mode(0o000);
             fs::set_permissions(repo.join("foo2"), perms).expect("chmod 0 foo2");
             git(repo, &["config", "add.ignore-errors", "1"]);
@@ -1647,9 +1644,7 @@ fn add_ignore_errors_stages_readable_peers_like_upstream_git() {
         );
 
         for repo in [&upstream, &rust] {
-            let mut perms = fs::metadata(repo.join("foo2"))
-                .expect("meta")
-                .permissions();
+            let mut perms = fs::metadata(repo.join("foo2")).expect("meta").permissions();
             perms.set_mode(0o644);
             let _ = fs::set_permissions(repo.join("foo2"), perms);
         }
@@ -1749,11 +1744,15 @@ fn add_case_insensitive_absolute_path_like_upstream_git() {
         // intermediate components are folded the same way git's shell test does.
         let downcased_up = {
             let path = format!("{}/BLUB", upstream.display());
-            path.chars().map(|c| c.to_ascii_lowercase()).collect::<String>()
+            path.chars()
+                .map(|c| c.to_ascii_lowercase())
+                .collect::<String>()
         };
         let downcased_rs = {
             let path = format!("{}/BLUB", rust.display());
-            path.chars().map(|c| c.to_ascii_lowercase()).collect::<String>()
+            path.chars()
+                .map(|c| c.to_ascii_lowercase())
+                .collect::<String>()
         };
 
         // t3700 only requires the command to succeed (exit 0). Oracle git 2.55
@@ -1866,11 +1865,15 @@ fn add_update_resolves_unmerged_paths_like_upstream_git() {
         assert_eq!(
             git(
                 &rust,
-                &["ls-files", "-s", "path1", "path2", "path3", "path4", "path5", "path6"]
+                &[
+                    "ls-files", "-s", "path1", "path2", "path3", "path4", "path5", "path6"
+                ]
             ),
             git(
                 &upstream,
-                &["ls-files", "-s", "path1", "path2", "path3", "path4", "path5", "path6"]
+                &[
+                    "ls-files", "-s", "path1", "path2", "path3", "path4", "path5", "path6"
+                ]
             ),
             "ls-files -s after add -u on unmerged paths differed"
         );

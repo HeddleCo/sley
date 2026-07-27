@@ -117,7 +117,11 @@ fn check_ref_format_branch_prior_checkout_matches_upstream_git() {
                 .expect("update-ref");
             assert!(st.success(), "update-ref failed for {args:?}");
         }
-        for args in [["checkout", "main"], ["checkout", "origin/main"], ["checkout", "main"]] {
+        for args in [
+            ["checkout", "main"],
+            ["checkout", "origin/main"],
+            ["checkout", "main"],
+        ] {
             let st = Command::new(sley_testkit::oracle_git())
                 .current_dir(&root)
                 .args(args)

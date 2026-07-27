@@ -310,11 +310,7 @@ fn alias_missing_value_reports_line_and_file_matches_upstream_git() {
                 .expect("git init");
             assert!(output.status.success());
             // Keep only the malformed alias section, matching t1308 #37.
-            fs::write(
-                dir.join(".git/config"),
-                "[alias]\n\tbr\n",
-            )
-            .expect("write malformed config");
+            fs::write(dir.join(".git/config"), "[alias]\n\tbr\n").expect("write malformed config");
         }
         assert_status_stdout_stderr_match(&upstream, &rust, &["br"]);
     }

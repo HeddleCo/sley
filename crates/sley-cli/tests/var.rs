@@ -184,7 +184,10 @@ fn var_git_editor_default_matches_upstream_git() {
                     "default editor must be non-empty for TERM={term}, got {editor:?}"
                 );
             } else {
-                assert!(!actual.status.success(), "TERM=dumb should fail without EDITOR");
+                assert!(
+                    !actual.status.success(),
+                    "TERM=dumb should fail without EDITOR"
+                );
             }
         }
     }

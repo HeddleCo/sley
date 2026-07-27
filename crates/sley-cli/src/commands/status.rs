@@ -1767,7 +1767,9 @@ pub(crate) fn resolve_commit_comment_char(git_dir: &Path, message: &[u8]) -> Res
 fn adjust_comment_line_char(message: &[u8]) -> Result<String> {
     let mut candidates: Vec<u8> = AUTO_COMMENT_CANDIDATES.to_vec();
     // git: cutoff = sb->len - ignored_log_message_bytes(sb->buf, sb->len);
-    let cutoff = message.len().saturating_sub(ignored_log_message_bytes(message));
+    let cutoff = message
+        .len()
+        .saturating_sub(ignored_log_message_bytes(message));
 
     // Fast path: `#` unused anywhere in the scanned region → keep `#`.
     if !message[..cutoff].contains(&b'#') {
@@ -2011,7 +2013,9 @@ fn config_scope_arg(git_dir: &Path, scope: sley_config::ConfigScope, path: &str)
                 .ok()
                 .map(|p| p.join("config"));
             if Path::new(path) == local.as_path()
-                || common.as_ref().is_some_and(|c| Path::new(path) == c.as_path())
+                || common
+                    .as_ref()
+                    .is_some_and(|c| Path::new(path) == c.as_path())
             {
                 String::new()
             } else {

@@ -5,11 +5,11 @@
 //! ```
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use std::hint::black_box;
 use sley_bench::{BenchFixture, FIXTURE_OBJECT_COUNT, create_fixture};
 use sley_core::ObjectId;
 use sley_object::ObjectType;
 use sley_odb::ObjectReader;
+use std::hint::black_box;
 use std::io::Write;
 use std::sync::OnceLock;
 

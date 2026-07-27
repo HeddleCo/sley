@@ -211,11 +211,7 @@ fn pull_rebase_interactive_opens_sequence_editor() {
     );
 
     let editor = root.join("fake-editor");
-    fs::write(
-        &editor,
-        "#!/bin/sh\necho I was here >fake.out\nfalse\n",
-    )
-    .expect("write editor");
+    fs::write(&editor, "#!/bin/sh\necho I was here >fake.out\nfalse\n").expect("write editor");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -225,10 +221,7 @@ fn pull_rebase_interactive_opens_sequence_editor() {
     }
     let editor_str = editor.to_str().expect("utf8 path");
 
-    for (label, rebase_arg) in [
-        ("interactive", "--rebase=interactive"),
-        ("i", "--rebase=i"),
-    ] {
+    for (label, rebase_arg) in [("interactive", "--rebase=interactive"), ("i", "--rebase=i")] {
         let _ = fs::remove_file(repo.join("fake.out"));
         let _ = run_output(sley_testkit::sley_bin!(), &repo, &["rebase", "--abort"]);
         let output = Command::new(sley_testkit::sley_bin!())
@@ -387,7 +380,8 @@ fn pull_rebase_does_not_reapply_old_patches() {
         "amended tip should conflict when replayed onto the pre-amend push"
     );
     let done = fs::read_to_string(dst.join(".git/rebase-merge/done")).unwrap_or_default();
-    let todo = fs::read_to_string(dst.join(".git/rebase-merge/git-rebase-todo")).unwrap_or_default();
+    let todo =
+        fs::read_to_string(dst.join(".git/rebase-merge/git-rebase-todo")).unwrap_or_default();
     let combined = format!("{done}{todo}");
     let patches: Vec<&str> = combined
         .lines()
@@ -455,10 +449,7 @@ fn pull_rebase_against_local_branch() {
         &["pull", "--rebase", "me", "copy"],
     );
 
-    git(
-        &repo,
-        &["checkout", "-b", "copy2", "to-rebase-orig", "-q"],
-    );
+    git(&repo, &["checkout", "-b", "copy2", "to-rebase-orig", "-q"]);
     // The cell under test: pull --rebase against a *local* branch (remote `.`).
     let output = run_output_with_identity(
         sley_testkit::sley_bin!(),

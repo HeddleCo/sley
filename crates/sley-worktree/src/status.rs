@@ -440,9 +440,7 @@ where
 {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
-    let custom_reference = options
-        .reference
-        .filter(|reference| *reference != "HEAD");
+    let custom_reference = options.reference.filter(|reference| *reference != "HEAD");
     if custom_reference.is_none()
         && !options.include_ignored
         && let Some(()) = stream_short_status_borrowed_head_matches_index_if_possible(
@@ -488,9 +486,7 @@ pub fn collect_short_status_with_database(
     let git_dir = git_dir.as_ref();
     // A non-HEAD reference (e.g. amend's HEAD^1) must not use the
     // head-matches-index fast path — the index matches HEAD, not the parent.
-    let custom_reference = options
-        .reference
-        .filter(|reference| *reference != "HEAD");
+    let custom_reference = options.reference.filter(|reference| *reference != "HEAD");
     if custom_reference.is_none()
         && !options.include_ignored
         && let Some(entries) = short_status_borrowed_head_matches_index_if_possible(

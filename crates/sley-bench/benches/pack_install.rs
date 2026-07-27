@@ -11,7 +11,6 @@
 //! ```
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use std::hint::black_box;
 use sley_bench::{FIXTURE_OBJECT_COUNT, build_blob_pack, create_pack_install_target};
 use sley_core::{AtomicCancel, CancelFlag, GitError};
 use sley_odb::{
@@ -19,6 +18,7 @@ use sley_odb::{
     RawPackInstaller,
 };
 use sley_pack::PackWrite;
+use std::hint::black_box;
 use std::io::Read;
 use std::sync::OnceLock;
 

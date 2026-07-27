@@ -1479,12 +1479,10 @@ fn for_each_ref_is_base_with_non_commits_matches_git() {
         let good = git(&root, &["cat-file", "tag", "broken-tag-good"]);
         let bad_body = String::from_utf8_lossy(&good).replacen("commit", "blob", 1);
         fs::write(root.join("bad-tag"), bad_body.as_bytes()).expect("write bad tag body");
-        let bad_oid = String::from_utf8_lossy(&git(
-            &root,
-            &["hash-object", "-w", "-t", "tag", "bad-tag"],
-        ))
-        .trim()
-        .to_string();
+        let bad_oid =
+            String::from_utf8_lossy(&git(&root, &["hash-object", "-w", "-t", "tag", "bad-tag"]))
+                .trim()
+                .to_string();
         git(&root, &["update-ref", "refs/tags/broken-tag-bad", &bad_oid]);
 
         // Nested tags (immediate predecessor of the is-base test in the suite).
@@ -1530,13 +1528,15 @@ fn for_each_ref_is_base_with_non_commits_matches_git() {
                 actual.status.code()
             );
             assert_eq!(
-                actual.stdout, expected.stdout,
+                actual.stdout,
+                expected.stdout,
                 "is-base stdout mismatch for {args:?}\ngit:\n{}\nsley:\n{}",
                 String::from_utf8_lossy(&expected.stdout),
                 String::from_utf8_lossy(&actual.stdout)
             );
             assert_eq!(
-                actual.stderr, expected.stderr,
+                actual.stderr,
+                expected.stderr,
                 "is-base stderr mismatch for {args:?}\ngit:\n{}\nsley:\n{}",
                 String::from_utf8_lossy(&expected.stderr),
                 String::from_utf8_lossy(&actual.stderr)

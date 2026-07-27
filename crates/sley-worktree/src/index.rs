@@ -1805,8 +1805,7 @@ pub fn refresh_index_paths_with_options(
         // Pathspec-limited refresh (e.g. `git add --refresh bar`) must only
         // re-stat matching entries. Without this filter every stage-0 entry was
         // refreshed whenever *any* path was selected (t3700 "with pathspec").
-        if !selected_paths.is_empty()
-            && !git_path_selected(entry.path.as_bytes(), &selected_paths)
+        if !selected_paths.is_empty() && !git_path_selected(entry.path.as_bytes(), &selected_paths)
         {
             continue;
         }

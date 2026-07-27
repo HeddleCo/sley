@@ -12,9 +12,9 @@
 //! `git` on `PATH`), matching the oracle harness's convention.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use sley_core::{GitError, Result};
 use std::fs;
+use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};

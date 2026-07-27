@@ -182,9 +182,7 @@ impl CeilingDirectory {
             return false;
         }
         match fs::canonicalize(candidate) {
-            Ok(canonical) => {
-                strip_trailing_slashes(&canonical).as_os_str() == ceiling.as_os_str()
-            }
+            Ok(canonical) => strip_trailing_slashes(&canonical).as_os_str() == ceiling.as_os_str(),
             Err(_) => false,
         }
     }

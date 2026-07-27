@@ -1050,7 +1050,12 @@ pub fn myers_diff_lines_prepared(old: &[DiffLine<'_>], new: &[DiffLine<'_>]) -> 
     let new_ref: Vec<DiffLine<'_>> = new_keep.iter().map(|&i| new[i]).collect();
     let mut ref_old_changed = vec![false; old_ref.len()];
     let mut ref_new_changed = vec![false; new_ref.len()];
-    middle_snake_mark_changed(&old_ref, &new_ref, &mut ref_old_changed, &mut ref_new_changed);
+    middle_snake_mark_changed(
+        &old_ref,
+        &new_ref,
+        &mut ref_old_changed,
+        &mut ref_new_changed,
+    );
     for (ref_i, &full_i) in old_keep.iter().enumerate() {
         if ref_old_changed[ref_i] {
             old_changed[full_i] = true;
@@ -1307,26 +1312,8 @@ fn middle_snake_mark_changed(
             return;
         }
         let (mid1, mid2) = xdl_split_middle(old, new, off1, lim1, off2, lim2);
-        recs_cmp(
-            old,
-            new,
-            off1,
-            mid1,
-            off2,
-            mid2,
-            old_changed,
-            new_changed,
-        );
-        recs_cmp(
-            old,
-            new,
-            mid1,
-            lim1,
-            mid2,
-            lim2,
-            old_changed,
-            new_changed,
-        );
+        recs_cmp(old, new, off1, mid1, off2, mid2, old_changed, new_changed);
+        recs_cmp(old, new, mid1, lim1, mid2, lim2, old_changed, new_changed);
     }
     recs_cmp(
         old,
@@ -1461,10 +1448,7 @@ fn xdl_split_middle(
         // Safety: always terminates for finite boxes (edit cost ≤ N+M).
         if ec > (lim1 - off1 + lim2 - off2) as isize + 2 {
             // Fallback split at half the remaining box.
-            return (
-                off1 + (lim1 - off1) / 2,
-                off2 + (lim2 - off2) / 2,
-            );
+            return (off1 + (lim1 - off1) / 2, off2 + (lim2 - off2) / 2);
         }
     }
 }

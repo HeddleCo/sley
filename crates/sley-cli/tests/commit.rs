@@ -2316,7 +2316,9 @@ fn commit_cleanup_whitespace_option_and_config_preserve_comments() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&editor).expect("editor metadata").permissions();
+            let mut perms = fs::metadata(&editor)
+                .expect("editor metadata")
+                .permissions();
             perms.set_mode(0o755);
             fs::set_permissions(&editor, perms).expect("set editor permissions");
         }
@@ -2539,11 +2541,7 @@ fn commit_commentchar_auto_switch_and_exhausted() {
         run_success(
             sley_testkit::sley_bin!(),
             &repo,
-            &[
-                "config",
-                "include.path",
-                &include.to_string_lossy(),
-            ],
+            &["config", "include.path", &include.to_string_lossy()],
         );
         run_success(
             sley_testkit::sley_bin!(),
@@ -2560,7 +2558,9 @@ fn commit_commentchar_auto_switch_and_exhausted() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&editor).expect("editor metadata").permissions();
+            let mut perms = fs::metadata(&editor)
+                .expect("editor metadata")
+                .permissions();
             perms.set_mode(0o755);
             fs::set_permissions(&editor, perms).expect("set editor permissions");
         }
@@ -2592,7 +2592,8 @@ fn commit_commentchar_auto_switch_and_exhausted() {
         );
         let cap = fs::read_to_string(repo.join(".git/COMMIT_EDITMSG.cap")).expect("cap");
         assert!(
-            cap.lines().any(|l| l.starts_with("; Changes to be committed:")),
+            cap.lines()
+                .any(|l| l.starts_with("; Changes to be committed:")),
             "expected '; Changes to be committed:' in template, got:\n{cap}"
         );
 

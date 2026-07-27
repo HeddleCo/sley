@@ -1418,7 +1418,16 @@ fn push_unqualified_dst_refspec_dwim_and_advice_match_upstream_git() {
     git(&seed, &["add", "file"]);
     git(
         &seed,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
     );
 
     let expected = root.join("expected");
@@ -1563,7 +1572,16 @@ fn push_remote_tracking_src_unqualified_dst_dwim_match_upstream_git() {
     git(&seed, &["add", "file"]);
     git(
         &seed,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
     );
     git(
         &seed,

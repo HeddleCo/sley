@@ -152,10 +152,7 @@ pub(crate) fn list_aliases(
         };
         // Listing uses the resolved name exactly as stored (case preserved for
         // both forms). Last definition wins for equal names.
-        if let Some(existing) = aliases
-            .iter_mut()
-            .find(|(n, _)| n == &resolved.name)
-        {
+        if let Some(existing) = aliases.iter_mut().find(|(n, _)| n == &resolved.name) {
             existing.1 = value.to_string();
         } else {
             aliases.push((resolved.name, value.to_string()));
@@ -173,10 +170,7 @@ fn resolve_alias_entry(entry: &sley_config::ConfigStackEntry) -> Option<Resolved
         return None;
     }
     // Treat `[alias ""]` (empty subsection) the same as plain `[alias]`.
-    let subsection = entry
-        .subsection
-        .as_deref()
-        .filter(|name| !name.is_empty());
+    let subsection = entry.subsection.as_deref().filter(|name| !name.is_empty());
     let key = entry.key.as_str();
     let config_key = match subsection {
         Some(name) => format!("alias.{name}.{key}"),
@@ -230,9 +224,7 @@ fn resolve_alias_entry(entry: &sley_config::ConfigStackEntry) -> Option<Resolved
 /// command-line `-c` / `GIT_CONFIG_PARAMETERS`) so alias lookups see the same
 /// layers as git's `read_early_config`, with origin/line metadata for the
 /// missing-value diagnostic.
-fn load_alias_stack(
-    cli_session: &crate::session::CliSession,
-) -> Result<sley_config::ConfigStack> {
+fn load_alias_stack(cli_session: &crate::session::CliSession) -> Result<sley_config::ConfigStack> {
     let cwd = cli_session.cwd();
     let git_dir = cli_session.git_dir().ok();
     let common_git_dir = git_dir
@@ -250,12 +242,7 @@ fn load_alias_stack(
         // Prefer a cwd-relative origin name (`.git/config`) so the missing-
         // value fatal matches git's `bad config line N in file .git/config`.
         let local = alias_config_display_path(cwd, common.join("config"));
-        stack.push_file(
-            &local,
-            sley_config::ConfigScope::Local,
-            true,
-            &context,
-        )?;
+        stack.push_file(&local, sley_config::ConfigScope::Local, true, &context)?;
     }
     let parameters = injected_config_parameters()?;
     stack.push_parameters_with_includes(&parameters, &context)?;

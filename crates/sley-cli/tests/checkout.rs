@@ -188,12 +188,7 @@ fn checkout_dash_c_default_remote_does_not_persist_into_repo_config() {
     let out = run_output(
         sley_testkit::sley_bin!(),
         &repo,
-        &[
-            "-c",
-            "checkout.defaultRemote=repo_a",
-            "checkout",
-            "shared",
-        ],
+        &["-c", "checkout.defaultRemote=repo_a", "checkout", "shared"],
     );
     assert!(
         out.status.success(),
@@ -263,10 +258,18 @@ fn checkout_loosely_defined_local_base_branch_reported_like_strict() {
         )
     }
 
-    let git_strict = run_output(sley_testkit::oracle_git(), &upstream, &["checkout", "strict"]);
+    let git_strict = run_output(
+        sley_testkit::oracle_git(),
+        &upstream,
+        &["checkout", "strict"],
+    );
     let git_loose = {
         git(&upstream, &["checkout", "-q", "main"]);
-        run_output(sley_testkit::oracle_git(), &upstream, &["checkout", "loose"])
+        run_output(
+            sley_testkit::oracle_git(),
+            &upstream,
+            &["checkout", "loose"],
+        )
     };
     assert!(git_strict.status.success() && git_loose.status.success());
     let git_expect = combined(&git_strict).replace("strict", "BRANCHNAME");

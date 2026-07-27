@@ -1449,7 +1449,7 @@ fn add_pathspec_arg_for_matcher(worktree_root: &Path, path: &Path) -> Result<Str
                                 || case_insensitive_path_under_prefix(worktree_root, canonical)
                         })
                     })
-                    .unwrap_or(absolute)
+                    .unwrap_or(absolute),
             }
         }
     };

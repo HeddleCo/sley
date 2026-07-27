@@ -3380,14 +3380,8 @@ mod tests {
                 oid: commit,
             },
         ];
-        let ok = normalize_push_refspec_for_sources(
-            "main:dst",
-            &local_refs,
-            &[],
-            &db,
-            true,
-        )
-        .expect("branch src should guess refs/heads/dst");
+        let ok = normalize_push_refspec_for_sources("main:dst", &local_refs, &[], &db, true)
+            .expect("branch src should guess refs/heads/dst");
         assert_eq!(ok, "refs/heads/main:refs/heads/dst");
     }
 
