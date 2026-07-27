@@ -1792,6 +1792,12 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             }
         }
         prune_repack_shallow_file(&common_git_dir, format, roots)?;
+        // `repack -A -d` never loosens promisor objects (they stay in retained
+        // `.promisor` packs). Emit the TRACE2_PERF counter git's pack-objects
+        // path records so t5616 can observe `loosened:0`.
+        if has_promisor_packs {
+            trace2_perf_data("loosen_unused_packed_objects/loosened", "0");
+        }
         let _ = quiet;
         return Ok(());
     }

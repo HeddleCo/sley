@@ -813,6 +813,11 @@ fn fetch_impl(
                     request.format.name()
                 )));
             }
+            // Git's fetch-pack `mark_complete` over local refs: a tip present
+            // only in the commit-graph dies before negotiation. Exact-OID wants
+            // skip have-building, so this must run for every local fetch
+            // (t5330 #4).
+            crate::local::mark_complete_local_refs(request.git_dir, request.format)?;
             let advertisements =
                 crate::local::local_fetch_advertisements(remote_git_dir, request.format)?;
             let remote_config =
