@@ -37,12 +37,22 @@ pub(super) fn run_branch_create_options(
     replace_objects: bool,
     options: BranchCreateOptions,
 ) -> Result<()> {
-    if options.recurse_submodules {
+    // git's `builtin/branch.c`:
+    //   recurse = (explicit || submodule.recurse) && submodule.propagateBranches
+    // Explicit `--recurse-submodules` without propagateBranches is fatal.
+    let propagate = config
+        .get_bool("submodule", None, "propagateBranches")
+        .unwrap_or(false);
+    let config_recurse = config
+        .get_bool("submodule", None, "recurse")
+        .unwrap_or(false);
+    if options.recurse_submodules && !propagate {
         eprintln!(
             "fatal: branch with --recurse-submodules can only be used if submodule.propagateBranches is enabled"
         );
         return Err(GitError::Exit(128));
     }
+    let recurse_submodules = (options.recurse_submodules || config_recurse) && propagate;
     if options.edit_description {
         return branch_edit_description(git_dir, format, store, &options.positionals);
     }
@@ -54,12 +64,38 @@ pub(super) fn run_branch_create_options(
     }
     match options.positionals.as_slice() {
         [] => print_branch_list(store, BranchListMode::Local),
+        [branch] if options.force && recurse_submodules => create_branches_recursively(
+            git_dir,
+            format,
+            store,
+            config,
+            replace_objects,
+            branch,
+            None,
+            options.track,
+            options.create_reflog,
+            options.quiet,
+            true,
+        ),
         [branch] if options.force => {
             let branch = force_update_branch(
                 git_dir, format, store, config, replace_objects, branch, None,
             )?;
             branch_create_set_tracking(git_dir, store, &branch, None, options.track, options.quiet)
         }
+        [branch] if recurse_submodules => create_branches_recursively(
+            git_dir,
+            format,
+            store,
+            config,
+            replace_objects,
+            branch,
+            None,
+            options.track,
+            options.create_reflog,
+            options.quiet,
+            false,
+        ),
         [branch] => {
             create_branch_from_start_with_reflog(
                 git_dir,
@@ -80,6 +116,19 @@ pub(super) fn run_branch_create_options(
                 options.quiet,
             )
         }
+        [branch, start] if options.force && recurse_submodules => create_branches_recursively(
+            git_dir,
+            format,
+            store,
+            config,
+            replace_objects,
+            branch,
+            Some(start),
+            options.track,
+            options.create_reflog,
+            options.quiet,
+            true,
+        ),
         [branch, start] if options.force => {
             let branch = force_update_branch(
                 git_dir,
@@ -99,6 +148,19 @@ pub(super) fn run_branch_create_options(
                 options.quiet,
             )
         }
+        [branch, start] if recurse_submodules => create_branches_recursively(
+            git_dir,
+            format,
+            store,
+            config,
+            replace_objects,
+            branch,
+            Some(start),
+            options.track,
+            options.create_reflog,
+            options.quiet,
+            false,
+        ),
         [branch, start] => {
             create_branch_from_start_with_reflog(
                 git_dir,
@@ -124,6 +186,387 @@ pub(super) fn run_branch_create_options(
                 .into(),
         )),
     }
+}
+
+/// Port of git's `create_branches_recursively` (`branch.c`): create `branch` in
+/// the superproject and every *active* submodule recorded in the start-point
+/// tree, dry-running the submodule side first so a single failure rolls the
+/// whole operation back (no partial branch set).
+///
+/// Nested submodules are handled by recursing into each submodule's own tree
+/// after its branch is created (matching `submodule--helper create-branch`).
+fn create_branches_recursively(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    config: &GitConfig,
+    replace_objects: bool,
+    branch: &str,
+    start: Option<&String>,
+    track: Option<BranchTrackMode>,
+    create_reflog: bool,
+    quiet: bool,
+    force: bool,
+) -> Result<()> {
+    create_branches_recursively_inner(
+        git_dir,
+        format,
+        store,
+        config,
+        replace_objects,
+        branch,
+        start,
+        /* tracking_name */ start.map(String::as_str),
+        track,
+        create_reflog,
+        quiet,
+        force,
+        /* dry_run */ false,
+    )
+}
+
+fn create_branches_recursively_inner(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    config: &GitConfig,
+    replace_objects: bool,
+    branch: &str,
+    start: Option<&String>,
+    tracking_name: Option<&str>,
+    track: Option<BranchTrackMode>,
+    create_reflog: bool,
+    quiet: bool,
+    force: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let start_rev = start.map_or("HEAD", String::as_str);
+    let start_oid = resolve_branch_start(git_dir, format, store, replace_objects, start_rev)?;
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let start_commit = sley_rev::peel_to_commit(&db, format, &start_oid)?;
+    let children = active_submodule_gitlinks(git_dir, &db, format, config, &start_commit)?;
+
+    // Dry-run submodule creates first (git's first loop with dry_run=1).
+    for child in &children {
+        create_branch_in_submodule(
+            git_dir,
+            format,
+            config,
+            replace_objects,
+            branch,
+            child,
+            tracking_name,
+            track,
+            create_reflog,
+            quiet,
+            force,
+            /* dry_run */ true,
+        )?;
+    }
+
+    if dry_run {
+        // Validate this repository's own create as well.
+        validate_branch_create_here(store, branch, force)?;
+        // And that the start oid is a real commit in this object store.
+        let _ = sley_rev::peel_to_commit(&db, format, &start_oid)?;
+        return Ok(());
+    }
+
+    // Superproject / this-repo create. `start` is the user-facing start-point
+    // at the top level (or None → HEAD); when recursing into a submodule it is
+    // the gitlink oid hex so the new tip matches the superproject recording.
+    if force {
+        let _ = force_update_branch(
+            git_dir,
+            format,
+            store,
+            config,
+            replace_objects,
+            branch,
+            start,
+        )?;
+    } else {
+        create_branch_from_start_with_reflog(
+            git_dir,
+            format,
+            store,
+            config,
+            replace_objects,
+            branch,
+            start,
+            create_reflog,
+        )?;
+    }
+
+    // Tracking uses the original start *name* (branch point), not the peeled
+    // oid — so `origin/branch-a` still sets remote tracking in submodules even
+    // when that ref does not exist there (t3207 remote-tracking tests).
+    let track_start = tracking_name.map(|s| s.to_string());
+    // Soft failures (unable to resolve upstream in a submodule) are ignored by
+    // the tracking helpers themselves; hard errors still propagate.
+    branch_create_set_tracking(git_dir, store, branch, track_start.as_ref(), track, quiet)?;
+
+    // Real submodule creates (git's second loop with dry_run=0).
+    for child in &children {
+        create_branch_in_submodule(
+            git_dir,
+            format,
+            config,
+            replace_objects,
+            branch,
+            child,
+            tracking_name,
+            track,
+            create_reflog,
+            quiet,
+            force,
+            /* dry_run */ false,
+        )?;
+    }
+    Ok(())
+}
+
+struct SubmoduleBranchTarget {
+    path: String,
+    name: String,
+    oid: ObjectId,
+}
+
+fn active_submodule_gitlinks(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    config: &GitConfig,
+    start_commit: &ObjectId,
+) -> Result<Vec<SubmoduleBranchTarget>> {
+    let tree = commands::merge_rebase::commit_tree_oid(db, format, start_commit)?;
+    let leaves = sley_diff_merge::flatten_tree(db, format, &tree)?;
+    let submodules = submodule_config_for_commit(git_dir, db, format, start_commit);
+    let mut out = Vec::new();
+    for (path_bytes, (mode, oid)) in leaves {
+        if !sley_index::is_gitlink(mode) {
+            continue;
+        }
+        let Ok(path) = std::str::from_utf8(&path_bytes) else {
+            continue;
+        };
+        let name = submodules
+            .as_ref()
+            .and_then(|set| set.from_path(path))
+            .map(|sub| sub.name.clone())
+            .unwrap_or_else(|| path.to_string());
+        // git's `is_tree_submodule_active` — inactive submodules are skipped
+        // entirely (t3207 "should not create branches in inactive submodules").
+        if !branch_is_submodule_active(config, &name, path) {
+            continue;
+        }
+        out.push(SubmoduleBranchTarget {
+            path: path.to_string(),
+            name,
+            oid,
+        });
+    }
+    Ok(out)
+}
+
+fn submodule_config_for_commit(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit: &ObjectId,
+) -> Option<sley_submodule::SubmoduleConfigSet> {
+    // Prefer the worktree .gitmodules when present (usual case).
+    if let Some(worktree) = sley_worktree::worktree_root_for_git_dir(git_dir)
+        .ok()
+        .flatten()
+    {
+        if let Ok(cfg) = GitConfig::read(worktree.join(".gitmodules")) {
+            return Some(sley_submodule::SubmoduleConfigSet::parse(&cfg));
+        }
+    }
+    // Fall back to the start commit's tree (needed when creating a branch
+    // whose start introduces a submodule not in the current worktree).
+    let tree = commands::merge_rebase::commit_tree_oid(db, format, commit).ok()?;
+    let leaves = sley_diff_merge::flatten_tree(db, format, &tree).ok()?;
+    let (_, gitmodules_oid) = leaves
+        .into_iter()
+        .find(|(path, _)| path.as_slice() == b".gitmodules")?;
+    let object = db.read_object(&gitmodules_oid.1).ok()?;
+    if object.object_type != ObjectType::Blob {
+        return None;
+    }
+    let cfg = GitConfig::parse(&object.body).ok()?;
+    Some(sley_submodule::SubmoduleConfigSet::parse(&cfg))
+}
+
+fn branch_is_submodule_active(repo_config: &GitConfig, name: &str, path: &str) -> bool {
+    if let Some(active) = repo_config.get_bool("submodule", Some(name), "active") {
+        return active;
+    }
+    let active_specs: Vec<&str> = repo_config
+        .get_all("submodule", None, "active")
+        .into_iter()
+        .flatten()
+        .collect();
+    if !active_specs.is_empty() {
+        return active_specs.iter().any(|spec| {
+            let spec = spec.trim_end_matches('/');
+            if spec.is_empty() || spec == "." {
+                return true;
+            }
+            path == spec || path.starts_with(&format!("{spec}/"))
+        });
+    }
+    repo_config.get("submodule", Some(name), "url").is_some()
+}
+
+fn branch_submodule_admin_git_dir(super_git_dir: &Path, name: &str) -> PathBuf {
+    let mut path = super_git_dir.join("modules");
+    for component in name.split('/') {
+        if !component.is_empty() {
+            path.push(component);
+        }
+    }
+    path
+}
+
+fn validate_branch_create_here(store: &FileRefStore, branch: &str, force: bool) -> Result<()> {
+    let refname = validate_branch_creation_name(branch)?;
+    if !force && store.read_ref(&refname)?.is_some() {
+        eprintln!("fatal: a branch named '{branch}' already exists");
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
+}
+
+fn create_branch_in_submodule(
+    super_git_dir: &Path,
+    super_format: ObjectFormat,
+    super_config: &GitConfig,
+    replace_objects: bool,
+    branch: &str,
+    child: &SubmoduleBranchTarget,
+    tracking_name: Option<&str>,
+    track: Option<BranchTrackMode>,
+    create_reflog: bool,
+    quiet: bool,
+    force: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let sub_git_dir = branch_submodule_admin_git_dir(super_git_dir, &child.name);
+    if !sub_git_dir.is_dir() {
+        // Also try the worktree-populated path's .git file → admin dir.
+        let alt = sley_worktree::worktree_root_for_git_dir(super_git_dir)
+            .ok()
+            .flatten()
+            .and_then(|root| {
+                let sub_root = root.join(&child.path);
+                sley_diff_merge::gitlink_git_dir(&sub_root)
+            });
+        let Some(sub_git_dir) = alt.filter(|p| p.is_dir()) else {
+            eprintln!(
+                "fatal: submodule '{}': unable to find submodule",
+                child.name
+            );
+            return Err(GitError::Exit(128));
+        };
+        return create_branch_in_submodule_at(
+            &sub_git_dir,
+            super_format,
+            super_config,
+            replace_objects,
+            branch,
+            child,
+            tracking_name,
+            track,
+            create_reflog,
+            quiet,
+            force,
+            dry_run,
+        );
+    }
+    create_branch_in_submodule_at(
+        &sub_git_dir,
+        super_format,
+        super_config,
+        replace_objects,
+        branch,
+        child,
+        tracking_name,
+        track,
+        create_reflog,
+        quiet,
+        force,
+        dry_run,
+    )
+}
+
+fn create_branch_in_submodule_at(
+    sub_git_dir: &Path,
+    super_format: ObjectFormat,
+    _super_config: &GitConfig,
+    replace_objects: bool,
+    branch: &str,
+    child: &SubmoduleBranchTarget,
+    tracking_name: Option<&str>,
+    track: Option<BranchTrackMode>,
+    create_reflog: bool,
+    quiet: bool,
+    force: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let format = repository_object_format(sub_git_dir).unwrap_or(super_format);
+    let store = FileRefStore::new(sub_git_dir, format);
+    let config = read_repo_config(sub_git_dir).unwrap_or_default();
+    // Prefix submodule errors like git's "submodule 'name': …".
+    // Suppress the bare "fatal: a branch named …" from the child and re-emit
+    // with git's "submodule 'X': …" prefix so t3207's grep matches.
+    let already_exists = !force
+        && store
+            .read_ref(&format!("refs/heads/{branch}"))
+            .ok()
+            .flatten()
+            .is_some();
+    if dry_run && already_exists {
+        eprintln!(
+            "submodule '{}': fatal: a branch named '{branch}' already exists",
+            child.name
+        );
+        return Err(GitError::Exit(128));
+    }
+
+    // Pass the gitlink oid as the start-point so the branch tip matches the
+    // superproject's recorded commit (not the submodule's current HEAD).
+    let start_oid_hex = child.oid.to_hex();
+    create_branches_recursively_inner(
+        sub_git_dir,
+        format,
+        &store,
+        &config,
+        replace_objects,
+        branch,
+        Some(&start_oid_hex),
+        tracking_name,
+        track,
+        create_reflog,
+        quiet,
+        force,
+        dry_run,
+    )
+    .map_err(|err| {
+        if dry_run {
+            eprintln!(
+                "submodule '{}': cannot create branch '{branch}'",
+                child.name
+            );
+        } else {
+            eprintln!(
+                "fatal: submodule '{}': cannot create branch '{branch}'",
+                child.name
+            );
+        }
+        err
+    })
 }
 
 pub(super) fn branch_create_set_tracking_or_rollback(
@@ -340,6 +783,11 @@ pub(super) fn branch_create_set_tracking_if_branch(
 /// start-point names a remote-tracking branch covered by some remote's fetch
 /// refspec. Returns `None` for local branches (which the default mode must not
 /// track).
+///
+/// The remote-tracking ref need not currently exist in this repository: git's
+/// `remote_find_tracking` matches the refspec alone. That matters for
+/// `branch --recurse-submodules` where a submodule often has no
+/// `origin/<branch>` tip yet (t3207 remote-tracking tests).
 pub(super) fn resolve_remote_tracking_upstream(
     store: &FileRefStore,
     config: &GitConfig,
@@ -350,17 +798,19 @@ pub(super) fn resolve_remote_tracking_upstream(
         let Some((remote_ref, merge)) = branch_upstream_remote_ref(config, &remote, start) else {
             continue;
         };
-        if store.read_ref(&remote_ref)?.is_some() {
-            let display = remote_ref
-                .strip_prefix("refs/remotes/")
-                .unwrap_or(remote_ref.as_str())
-                .to_string();
-            matches.push(ResolvedBranchUpstream {
-                remote,
-                merge,
-                display,
-            });
-        }
+        // Prefer remotes that actually have the tip, but still accept a pure
+        // refspec match so recursive branch create can set tracking in a
+        // submodule whose object store lacks the remote-tracking ref.
+        let _ = store; // existence is optional (see module docs).
+        let display = remote_ref
+            .strip_prefix("refs/remotes/")
+            .unwrap_or(remote_ref.as_str())
+            .to_string();
+        matches.push(ResolvedBranchUpstream {
+            remote,
+            merge,
+            display,
+        });
     }
     if matches.len() > 1 {
         let remote_ref = branch_tracking_ref_candidate(start);

@@ -47,6 +47,10 @@ enum ShowCommitFormat {
     Fuller,
     /// `--pretty=raw`: the raw commit object headers + raw message.
     Raw,
+    /// `--pretty=email` / `mboxrd`: mbox-style From/From:/Date:/Subject: + body.
+    /// `mboxrd` additionally quotes leading `From ` lines in the body; for the
+    /// expand-tabs surface both share the same layout and indent defaults.
+    Email { mboxrd: bool },
     /// `--oneline`: `<abbrev-oid> <subject>`.
     Oneline,
     /// `--pretty=oneline`/`--format=oneline`: `<full-oid> <subject>`.
@@ -73,6 +77,8 @@ enum ShowMergeMode {
     Separate,
     /// `-c` (`dense=false`) / `--cc` (`dense=true`) / the default: combined.
     Combined { dense: bool },
+    /// `--remerge-diff` / `--diff-merges=remerge`: re-merge parents vs commit.
+    Remerge,
 }
 
 /// Parsed `git show` invocation state.
@@ -199,6 +205,7 @@ fn show_default_expand_tabs(format: &ShowCommitFormat) -> i32 {
         ShowCommitFormat::Medium | ShowCommitFormat::Full | ShowCommitFormat::Fuller => 8,
         ShowCommitFormat::Short
         | ShowCommitFormat::Raw
+        | ShowCommitFormat::Email { .. }
         | ShowCommitFormat::Oneline
         | ShowCommitFormat::FullOneline
         | ShowCommitFormat::Custom { .. } => 0,
@@ -282,7 +289,10 @@ fn show_commit_format_needs_mailmap(format: &ShowCommitFormat, use_mailmap: bool
         | ShowCommitFormat::Fuller => use_mailmap,
         ShowCommitFormat::Custom { compiled, .. } => show_compiled_format_uses_mailmap(compiled),
         // `--pretty=raw` shows the raw, un-mailmapped identity lines.
-        ShowCommitFormat::Raw | ShowCommitFormat::Oneline | ShowCommitFormat::FullOneline => false,
+        ShowCommitFormat::Raw
+        | ShowCommitFormat::Email { .. }
+        | ShowCommitFormat::Oneline
+        | ShowCommitFormat::FullOneline => false,
     }
 }
 
@@ -903,6 +913,43 @@ fn show_commit(
                 stdout.write_all(&notes)?;
             }
         }
+        ShowCommitFormat::Email { mboxrd } => {
+            // git's CMIT_FMT_EMAIL: mbox From line, From:/Date:/Subject: headers,
+            // blank line, then unindented body (pp_remainder with indent=0).
+            // Expand-tabs applies to both subject and body lines.
+            writeln!(stdout, "From {oid} Mon Sep 17 00:00:00 2001")?;
+            writeln!(
+                stdout,
+                "From: {}",
+                commit_identity_mailmapped(&commit.author, mailmap)
+            )?;
+            writeln!(
+                stdout,
+                "Date: {}",
+                commit_identity_date(&commit.author, &DateMode::Rfc2822)
+            )?;
+            let display_message = commit_message_for_commit_encoding(commit, &output_encoding);
+            let subject = commit_subject_bytes(&display_message);
+            let subject = crate::commands::log::log_expand_tabs(&subject, expand_tabs);
+            write!(stdout, "Subject: [PATCH] ")?;
+            stdout.write_all(&subject)?;
+            stdout.write_all(b"\n")?;
+            writeln!(stdout)?;
+            // Body = message after the subject paragraph (skip subject + blank).
+            let body = commit_body(&display_message);
+            for line in commit_message_lines(body) {
+                let mut line_out = crate::commands::log::log_expand_tabs(line, expand_tabs);
+                if *mboxrd && line_out.starts_with(b"From ") {
+                    // mboxrd: quote leading "From " as ">From ".
+                    let mut quoted = Vec::with_capacity(line_out.len() + 1);
+                    quoted.push(b'>');
+                    quoted.extend_from_slice(&line_out);
+                    line_out = quoted;
+                }
+                stdout.write_all(&line_out)?;
+                stdout.write_all(b"\n")?;
+            }
+        }
         ShowCommitFormat::Oneline => {
             write!(stdout, "{}", format_log_oid(oid, options.abbrev_len))?;
             print_log_decorations(oid, decorations);
@@ -1188,6 +1235,7 @@ fn write_commit_trailer(
     // `--first-parent` (and `--diff-merges=first-parent`) renders the full
     // first-parent diff for a merge — the same body an ordinary commit gets.
     let first_parent_merge = layout.is_merge && layout.merge_mode == ShowMergeMode::FirstParent;
+    let remerge_merge = layout.is_merge && layout.merge_mode == ShowMergeMode::Remerge;
     // For an off-mode merge only the stat family renders; for a combined merge,
     // a first-parent merge, and an ordinary commit the body renders fully.
     let body_renders = if combined_merge {
@@ -1195,6 +1243,9 @@ fn write_commit_trailer(
         // combined patch, the first-parent stat family, or the combined
         // name/name-status listing).
         diff_active && (!merge_renders_stat(options) || !entries.is_empty())
+    } else if remerge_merge {
+        // Remerge always attempts a body (may be empty for clean merges).
+        diff_active
     } else if layout.is_merge && !first_parent_merge {
         diff_active && merge_renders_stat(options) && !entries.is_empty()
     } else {
@@ -1226,6 +1277,8 @@ fn write_commit_trailer(
         }
         return if combined_merge {
             write_show_combined(stdout, context, &layout, commit, entries)
+        } else if remerge_merge {
+            write_show_remerge(stdout, context, commit)
         } else if layout.is_merge && !first_parent_merge {
             write_merge_stat(
                 stdout,
@@ -1502,6 +1555,203 @@ fn show_effective_rename_detection(options: &ShowOptions, config: &GitConfig) ->
 /// ([`write_commit_trailer`]) has already written the gap line that precedes
 /// this body. Reads both old and new blob content from the ODB (tree-to-tree
 /// diff, never the worktree).
+/// `--remerge-diff` body for a two-parent merge: re-merge parents, diff that
+/// tree against the commit, inject `remerge CONFLICT (...)` headers.
+fn write_show_remerge(
+    stdout: &mut io::Stdout,
+    context: &ShowContext<'_>,
+    commit: &Commit,
+) -> Result<()> {
+    if context.options.diff_mode == ShowDiffMode::None {
+        return Ok(());
+    }
+    if commit.parents.len() != 2 {
+        if commit.parents.len() > 2 {
+            writeln!(
+                stdout,
+                "diff: warning: Skipping remerge-diff for octopus merges."
+            )?;
+        }
+        return Ok(());
+    }
+    let db = context.db;
+    let format = context.format;
+    let git_dir = context.git_dir;
+    let abbrev = context
+        .options
+        .abbrev_len
+        .unwrap_or(7)
+        .min(format.hex_len());
+    let parent1 = commit.parents[0];
+    let parent2 = commit.parents[1];
+    let label1 = show_remerge_parent_label(db, format, &parent1, abbrev)?;
+    let label2 = show_remerge_parent_label(db, format, &parent2, abbrev)?;
+    let bases = sley_rev::merge_bases(git_dir, format, db, &parent1, &parent2)?;
+    let base_map = if bases.is_empty() {
+        sley_diff_merge::MergeEntryMap::new()
+    } else {
+        let mut ordered = bases;
+        ordered.reverse();
+        sley_diff_merge::virtual_ancestor_entry_map_with_style(
+            db,
+            format,
+            &ordered,
+            sley_diff_merge::ConflictStyle::Merge,
+            |left, right| sley_rev::merge_bases(git_dir, format, db, left, right),
+        )?
+    };
+    let tree1 = {
+        let obj = db.read_object(&parent1)?;
+        Commit::parse_ref(format, &obj.body)?.tree
+    };
+    let tree2 = {
+        let obj = db.read_object(&parent2)?;
+        Commit::parse_ref(format, &obj.body)?.tree
+    };
+    let ours_map = sley_diff_merge::flatten_tree(db, format, &tree1)?;
+    let theirs_map = sley_diff_merge::flatten_tree(db, format, &tree2)?;
+    let merge = sley_diff_merge::merge_entry_maps(
+        db,
+        format,
+        &base_map,
+        &ours_map,
+        &theirs_map,
+        &sley_diff_merge::MergeTreesOptions {
+            ours_label: &label1,
+            theirs_label: &label2,
+            ancestor_label: "merged common ancestors",
+            detect_renames: true,
+            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            ..Default::default()
+        },
+    )?;
+    let mut conflict_headers: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+    for path_result in &merge.paths {
+        if let Some(conflict) = &path_result.conflict {
+            conflict_headers.insert(
+                path_result.path.clone(),
+                show_remerge_conflict_header(conflict, &path_result.path),
+            );
+        }
+    }
+    let entries = sley_diff_merge::diff_name_status_trees_with_options(
+        db,
+        format,
+        &merge.tree,
+        &commit.tree,
+        sley_diff_merge::DiffNameStatusOptions {
+            detect_renames: true,
+            rename_empty: true,
+            detect_inexact: true,
+            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            ..Default::default()
+        },
+    )?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    if context.options.diff_mode == ShowDiffMode::NameOnly {
+        for entry in &entries {
+            writeln!(stdout, "{}", status_quote_path(&entry.path, false))?;
+        }
+        return Ok(());
+    }
+    if context.options.diff_mode == ShowDiffMode::NameStatus {
+        for entry in &entries {
+            write!(stdout, "{}", entry.status.label())?;
+            writeln!(stdout, "\t{}", status_quote_path(&entry.path, false))?;
+        }
+        return Ok(());
+    }
+    let mut buf = Vec::new();
+    for entry in &entries {
+        let mut file_out = Vec::new();
+        write_diff_patch_entry(
+            &mut file_out,
+            entry,
+            DiffRenderOptions {
+                binary: false,
+                anchors: &[],
+                allow_textconv: true,
+                db,
+                lazy_fetch: context.lazy_fetch,
+                worktree_root: None,
+                use_worktree_new: false,
+                format,
+                abbrev,
+                src_prefix: "a/",
+                dst_prefix: "b/",
+                context: 3,
+                userdiff: None,
+                funcname: None,
+                colors: None,
+                word_diff: None,
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                suppress_blank_empty: false,
+                no_index_contents: None,
+                submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+                submodule_dirt: None,
+                ws_error: None,
+                color_moved: None,
+                interhunk: 0,
+                ws_ignore: sley_diff_merge::WsIgnore::EMPTY,
+                diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+                ignore_blank_lines: false,
+                ignore_regexes: &[],
+                line_ranges: None,
+                indent_heuristic: true,
+            },
+        )?;
+        if let Some(header) = conflict_headers.get(entry.path.as_bytes()) {
+            if let Some(pos) = file_out.iter().position(|&b| b == b'\n') {
+                buf.extend_from_slice(&file_out[..=pos]);
+                buf.extend_from_slice(header.as_bytes());
+                buf.push(b'\n');
+                buf.extend_from_slice(&file_out[pos + 1..]);
+            } else {
+                buf.extend_from_slice(&file_out);
+            }
+        } else {
+            buf.extend_from_slice(&file_out);
+        }
+    }
+    stdout.write_all(&buf)?;
+    Ok(())
+}
+
+fn show_remerge_parent_label(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+    abbrev: usize,
+) -> Result<String> {
+    let object = db.read_object(oid)?;
+    let commit = Commit::parse_ref(format, &object.body)?;
+    let hex = oid.to_hex();
+    let short = &hex[..abbrev.min(hex.len())];
+    let subject = commit
+        .message
+        .split(|&b| b == b'\n')
+        .next()
+        .map(|line| String::from_utf8_lossy(line).into_owned())
+        .unwrap_or_default();
+    Ok(format!("{short} ({subject})"))
+}
+
+fn show_remerge_conflict_header(kind: &sley_diff_merge::MergeConflictKind, path: &[u8]) -> String {
+    let path_str = String::from_utf8_lossy(path);
+    match kind {
+        sley_diff_merge::MergeConflictKind::Content { add_add: true } => {
+            format!("remerge CONFLICT (add/add): Merge conflict in {path_str}")
+        }
+        sley_diff_merge::MergeConflictKind::Content { .. }
+        | sley_diff_merge::MergeConflictKind::RenameContent { .. } => {
+            format!("remerge CONFLICT (content): Merge conflict in {path_str}")
+        }
+        _ => format!("remerge CONFLICT (content): Merge conflict in {path_str}"),
+    }
+}
+
 fn write_commit_diff(
     stdout: &mut io::Stdout,
     git_dir: &Path,
@@ -1835,6 +2085,10 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             }
             "--combined-all-paths" => options.combined_all_paths = true,
             "--no-diff-merges" => options.merge_mode = Some(ShowMergeMode::Off),
+            "--remerge-diff" => {
+                options.merge_mode = Some(ShowMergeMode::Remerge);
+                options.restore_patch();
+            }
             "--diff-merges" => {
                 let value = iter
                     .next()
@@ -2150,6 +2404,7 @@ fn show_parse_diff_merges(value: &str) -> Result<ShowMergeMode> {
         "separate" | "m" | "on" => Ok(ShowMergeMode::Separate),
         "c" | "combined" => Ok(ShowMergeMode::Combined { dense: false }),
         "cc" | "dense-combined" => Ok(ShowMergeMode::Combined { dense: true }),
+        "remerge" | "r" => Ok(ShowMergeMode::Remerge),
         _ => {
             eprintln!("fatal: invalid value for '--diff-merges': '{value}'");
             Err(GitError::Exit(128))
@@ -2190,11 +2445,8 @@ fn parse_pretty_value(value: &str) -> Result<ShowCommitFormat> {
             compiled: CompiledLogFormat::compile("%h (%s, %as)", LogFormatDialect::Log)?,
             final_newline: true,
         }),
-        // Built-in named layouts sley does not yet render. Reject explicitly
-        // rather than mis-formatting them as literal text.
-        "email" | "mboxrd" => Err(GitError::Unsupported(format!(
-            "show does not support --pretty={value}"
-        ))),
+        "email" => Ok(ShowCommitFormat::Email { mboxrd: false }),
+        "mboxrd" => Ok(ShowCommitFormat::Email { mboxrd: true }),
         other if other.contains('%') => Ok(ShowCommitFormat::Custom {
             compiled: CompiledLogFormat::compile(other, LogFormatDialect::Log)?,
             final_newline: true,

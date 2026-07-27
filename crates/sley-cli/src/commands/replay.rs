@@ -1493,7 +1493,11 @@ fn do_pick_commit(
                 if !msg.ends_with(b"\n") {
                     msg.push(b'\n');
                 }
-                if !has_conforming_footer(&msg) {
+                let text = String::from_utf8_lossy(&msg);
+                if !commands::interpret_trailers::message_has_conforming_trailer_block(
+                    Some(&ctx.config),
+                    &text,
+                ) {
                     msg.push(b'\n');
                 }
                 msg.extend_from_slice(
@@ -1915,26 +1919,23 @@ pub(crate) fn strip_comment_lines(message: &[u8], comment: u8) -> Vec<u8> {
 
 /// `has_conforming_footer` (approximation): the last paragraph consists of
 /// `Key: value` trailer lines.
-fn has_conforming_footer(message: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(message);
-    let trimmed = text.trim_end_matches('\n');
-    let last_para = match trimmed.rfind("\n\n") {
-        Some(pos) => &trimmed[pos + 2..],
-        None => return false,
-    };
-    if last_para.is_empty() {
-        return false;
-    }
-    last_para.lines().all(|line| {
-        line.split_once(':').is_some_and(|(key, value)| {
-            !key.is_empty() && !key.contains(char::is_whitespace) && value.starts_with(' ')
-        }) || line.starts_with("(cherry picked from commit ")
-    })
-}
-
 /// Append a `Signed-off-by:` trailer ahead of any trailing comment block
 /// (`append_signoff` + `ignored_log_message_bytes`).
+///
+/// `config` is consulted so `trailer.<name>.*` recognition matches git's
+/// `has_conforming_footer` (configured tokens can make a mixed final paragraph
+/// count as a trailer block, suppressing the blank line before the SOB).
 pub(crate) fn append_signoff_before_comments(message: Vec<u8>, signoff: &[u8]) -> Vec<u8> {
+    append_signoff_before_comments_with_config(message, signoff, None)
+}
+
+/// Like [`append_signoff_before_comments`] but with an explicit repo config so
+/// trailer recognition honours `trailer.<name>.*`.
+pub(crate) fn append_signoff_before_comments_with_config(
+    message: Vec<u8>,
+    signoff: &[u8],
+    config: Option<&GitConfig>,
+) -> Vec<u8> {
     // `signoff` is the full "Signed-off-by: name <email>" line (no newline).
     let signoff_line = {
         let mut line = signoff.to_vec();
@@ -1992,7 +1993,10 @@ pub(crate) fn append_signoff_before_comments(message: Vec<u8>, signoff: &[u8]) -
     if !out.is_empty() && !out.ends_with(b"\n") {
         out.push(b'\n');
     }
-    if !has_conforming_footer(body) {
+    let body_text = String::from_utf8_lossy(body);
+    let has_footer =
+        commands::interpret_trailers::message_has_conforming_trailer_block(config, &body_text);
+    if !has_footer {
         let len = out.len();
         if len == 0 {
             out.extend_from_slice(b"\n\n");
@@ -2987,6 +2991,16 @@ pub(crate) fn reset_merge_in(
     };
     index.upgrade_version_for_flags();
     fs::write(&index_path, index.write(format)?)?;
+    // Apply removals before materializations. A directory→gitlink transition
+    // has flattened deletes under `path/` plus a gitlink at `path`; writing the
+    // gitlink directory first and then pruning its children via
+    // `merge_remove_worktree_file` → `merge_prune_empty_dirs` would rmdir the
+    // newly-required empty submodule placeholder (t7112 reset --merge
+    // "replace directory with submodule"). Deletions first leave the parent
+    // gone/empty, then the gitlink write recreates the empty directory.
+    for path in &deletions {
+        crate::commands::merge_rebase::merge_remove_worktree_file(worktree_root, path)?;
+    }
     for (path, (mode, oid)) in &updates {
         let content = if sley_index::is_gitlink(*mode) {
             Vec::new()
@@ -3000,8 +3014,22 @@ pub(crate) fn reset_merge_in(
             *mode,
         )?;
     }
-    for path in &deletions {
-        crate::commands::merge_rebase::merge_remove_worktree_file(worktree_root, path)?;
+    // Belt-and-suspenders: every target gitlink must exist as a directory
+    // placeholder even when no CE_UPDATE was planned (identical oid carried
+    // through) or when a deletion pruned a parent that the target still records
+    // as a submodule path.
+    for (path, (mode, _)) in &target_map {
+        if !sley_index::is_gitlink(*mode) {
+            continue;
+        }
+        let Ok(rel) = std::str::from_utf8(path) else {
+            continue;
+        };
+        let full = worktree_root.join(rel);
+        if full.is_dir() {
+            continue;
+        }
+        crate::commands::merge_rebase::merge_write_worktree_file(worktree_root, path, &[], *mode)?;
     }
     sley_worktree::refresh_index_paths_with_options(
         worktree_root,

@@ -250,50 +250,75 @@ fn ls_remote_local(
         !matches!(config.get("protocol", None, "version"), Some("0" | "1"));
     let mut records = Vec::new();
 
+    let namespace = sley_core::get_git_namespace();
+    let head_physical = if namespace.is_empty() {
+        "HEAD".to_string()
+    } else {
+        format!("{namespace}HEAD")
+    };
     if !filter.refs_only
         && !filter.heads
         && !filter.tags
-        && let Some(target) = store.read_ref("HEAD")?
+        && let Some(target) = store.read_ref(&head_physical)?
     {
         let reference = Ref {
-            name: "HEAD".to_string(),
+            name: head_physical.clone(),
             target,
         };
-        if matches(&reference.name)
+        if matches("HEAD")
             && let Some((oid, symref)) = resolve_for_each_ref_target(&store, &reference)?
         {
+            let logical_symref = symref.map(|s| {
+                sley_core::strip_namespace(&s)
+                    .unwrap_or(s.as_str())
+                    .to_string()
+            });
             records.push(LsRemoteRecord {
                 oid,
-                name: reference.name,
-                symref,
+                name: "HEAD".to_string(),
+                symref: logical_symref,
             });
         }
     }
 
     for reference in store.list_refs()? {
-        if ref_is_hidden_by_patterns(&reference.name, &hidden_refs) {
+        let physical = reference.name.clone();
+        let logical = if namespace.is_empty() {
+            Some(physical.as_str())
+        } else {
+            physical.strip_prefix(namespace.as_str())
+        };
+        let Some(logical) = logical else {
+            continue;
+        };
+        if sley_core::ref_is_hidden(Some(logical), &physical, &hidden_refs) {
             continue;
         }
-        if !ref_class_selected(&reference.name, filter) {
+        if !ref_class_selected(logical, filter) {
             continue;
         }
-        if !matches(&reference.name) {
+        if !matches(logical) {
             continue;
         }
         let Some((oid, symref)) = resolve_for_each_ref_target(&store, &reference)? else {
             continue;
         };
+        let logical_symref = if include_non_head_symrefs {
+            symref.map(|s| {
+                sley_core::strip_namespace(&s)
+                    .unwrap_or(s.as_str())
+                    .to_string()
+            })
+        } else {
+            None
+        };
         records.push(LsRemoteRecord {
             oid,
-            name: reference.name.clone(),
-            symref: if include_non_head_symrefs {
-                symref
-            } else {
-                None
-            },
+            name: logical.to_string(),
+            symref: logical_symref,
         });
         if !filter.refs_only
-            && let Some(record) = peeled_tag_record(&db, format, &oid, &reference.name, matches)?
+            && let Some(record) = peeled_tag_record(&db, format, &oid, logical, matches)?
         {
             records.push(record);
         }
@@ -323,38 +348,11 @@ fn upload_pack_hidden_ref_values(config: &GitConfig) -> Vec<String> {
             if entry.key.eq_ignore_ascii_case("hiderefs")
                 && let Some(value) = entry.value.as_deref()
             {
-                out.push(trim_hidden_ref_pattern(value));
+                out.push(sley_core::trim_hidden_ref_pattern(value));
             }
         }
     }
     out
-}
-
-fn trim_hidden_ref_pattern(value: &str) -> String {
-    value.trim_end_matches('/').to_string()
-}
-
-fn ref_is_hidden_by_patterns(refname: &str, patterns: &[String]) -> bool {
-    for pattern in patterns.iter().rev() {
-        let mut pattern = pattern.as_str();
-        let negated = pattern.strip_prefix('!').is_some();
-        if negated {
-            pattern = &pattern[1..];
-        }
-        if let Some(rest) = pattern.strip_prefix('^') {
-            pattern = rest;
-        }
-        if hidden_ref_pattern_matches(refname, pattern) {
-            return !negated;
-        }
-    }
-    false
-}
-
-fn hidden_ref_pattern_matches(refname: &str, pattern: &str) -> bool {
-    refname
-        .strip_prefix(pattern)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// The peeled `^{}` record for `name` when `oid` is an annotated tag and the

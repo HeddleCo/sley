@@ -556,7 +556,13 @@ fn merge_octopus(
         if !options.quiet {
             println!("Trying simple merge with {name}");
         }
-        let base_map = virtual_ancestor_entry_map(&db, format, &common, common_git_dir)?;
+        let base_map = virtual_ancestor_entry_map(
+            &db,
+            format,
+            &common,
+            common_git_dir,
+            merge_conflict_style_from_config(&context.config),
+        )?;
         let theirs_tree = commit_tree_oid(&db, format, oid)?;
         let theirs_map = sley_diff_merge::flatten_tree(db, format, &theirs_tree)?;
         let (results, conflicts) = three_way_merge_trees_with_favor(
@@ -3467,6 +3473,11 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
     let theirs_label = target.clone();
     let write_db = context.repository.objects_mut();
 
+    // `merge.conflictStyle`: diff3/zdiff3 add the `|||||||` common-ancestor
+    // section to conflict markers (git honours this for `git merge`). Also fed
+    // into the virtual-ancestor recursive merges so nested markers match.
+    let conflict_style = merge_conflict_style_from_config(&context.config);
+
     // Recursive merge of the merge bases into a single virtual ancestor tree
     // (the merge-recursive "virtual ancestor" — git's behaviour for a
     // criss-cross history with >1 merge base). With a single base this is just
@@ -3476,21 +3487,8 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
         // ancestor, so the merge base is the empty tree.
         MergeTreeMap::new()
     } else {
-        virtual_ancestor_entry_map(&write_db, format, &bases, &common_git_dir)?
+        virtual_ancestor_entry_map(&write_db, format, &bases, &common_git_dir, conflict_style)?
     };
-
-    // `merge.conflictStyle`: diff3/zdiff3 add the `|||||||` common-ancestor
-    // section to conflict markers (git honours this for `git merge`).
-    let conflict_style = context
-        .config
-        .get("merge", None, "conflictstyle")
-        .map(str::to_string)
-        .map(|value| match value.as_str() {
-            "diff3" => sley_diff_merge::ConflictStyle::Diff3,
-            "zdiff3" => sley_diff_merge::ConflictStyle::ZDiff3,
-            _ => sley_diff_merge::ConflictStyle::Merge,
-        })
-        .unwrap_or(sley_diff_merge::ConflictStyle::Merge);
     // The diff3 ancestor label mirrors merge-ort's `ancestor_name`: "empty tree"
     // when there is no common ancestor, the merge base's abbreviated oid for a
     // unique base, and "merged common ancestors" for a recursive (multi-base)
@@ -3889,6 +3887,12 @@ pub(crate) fn cmd_merge(cli_session: &crate::session::CliSession, args: &[String
         }
     }
 
+    // DistinctTypes with both sides renamed (symlink↔gitlink): merge-ort removes
+    // the original path from the result map. The worktree still holds HEAD's
+    // entry at that path until we drop it — otherwise `ls-files -o` lists it as
+    // an extra untracked path (t6416 submodule vs symlink).
+    remove_distinct_types_original_paths(&worktree_root, &results)?;
+
     // Record the on-disk stat for cleanly-resolved stage-0 entries now that the
     // worktree holds their content (git's fill_stat_cache_info). Conflict stages
     // and gitlinks keep zero stat.
@@ -4187,7 +4191,13 @@ pub(crate) fn cmd_merge_recursive(
             .iter()
             .map(|rev| sley_rev::RevisionResolver::new(&git_dir, format, db).resolve(rev))
             .collect::<Result<Vec<_>>>()?;
-        virtual_ancestor_entry_map(&db, format, &bases, &common_git_dir)?
+        virtual_ancestor_entry_map(
+            &db,
+            format,
+            &bases,
+            &common_git_dir,
+            merge_conflict_style_from_config(&context.config),
+        )?
     };
 
     let resolver = sley_rev::RevisionResolver::new(&git_dir, format, db);
@@ -4381,6 +4391,41 @@ fn apply_merge_recursive_worktree(
                 }
             },
         }
+    }
+    remove_distinct_types_original_paths(worktree_root, results)?;
+    Ok(())
+}
+
+/// Drop the original colliding path after a DistinctTypes rename-both conflict
+/// (symlink↔gitlink). merge-ort removes it from the result map; without this
+/// the worktree keeps HEAD's entry and `ls-files -o` reports an extra path.
+fn remove_distinct_types_original_paths(
+    worktree_root: &Path,
+    results: &MergePathResults,
+) -> Result<()> {
+    let mut originals = BTreeSet::new();
+    for result in results.values() {
+        let MergePathResult::Conflict {
+            kind:
+                Some(sley_diff_merge::MergeConflictKind::DistinctTypes {
+                    original_path,
+                    ours_renamed: Some(_),
+                    theirs_renamed: Some(_),
+                    ..
+                }),
+            ..
+        } = result
+        else {
+            continue;
+        };
+        originals.insert(original_path.clone());
+    }
+    for path in originals {
+        // Only remove when no result still occupies the original path.
+        if results.contains_key(&path) {
+            continue;
+        }
+        merge_remove_worktree_file(worktree_root, &path)?;
     }
     Ok(())
 }

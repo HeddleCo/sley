@@ -1819,9 +1819,38 @@ fn resolve_add_regular_actions(
         if !path_matches {
             continue;
         }
-        let path = worktree_path_from_git_path(worktree_root, &path)?;
-        if seen.insert(path.clone()) {
-            actions.push(AddAction::Add(path));
+        let abs = worktree_path_from_git_path(worktree_root, &path)?;
+        // git's fix_unmerged_status (read-cache.c): unmerged + missing worktree
+        // becomes DELETED when removals are allowed (add -u/-A), but MODIFIED
+        // when ADD_CACHE_IGNORE_REMOVAL is set (plain/explicit add, --no-all).
+        // The MODIFIED arm then lstat()s and dies with "unable to stat".
+        let missing = match fs::symlink_metadata(&abs) {
+            Ok(_) => false,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                true
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if missing {
+            if options.ignore_removal {
+                let display = abs
+                    .strip_prefix(worktree_root)
+                    .unwrap_or(&abs)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                eprintln!("fatal: unable to stat '{display}': No such file or directory");
+                return Err(GitError::Exit(128));
+            }
+            if seen.insert(abs.clone()) {
+                actions.push(AddAction::Remove(abs));
+            }
+        } else if seen.insert(abs.clone()) {
+            actions.push(AddAction::Add(abs));
         }
     }
     let mut collect_status_action = |entry: sley_worktree::ShortStatusRow<'_>| {
@@ -2314,17 +2343,50 @@ fn reject_add_skip_worktree_paths(
         let Ok(relative) = absolute.strip_prefix(worktree_root) else {
             continue;
         };
-        if relative.as_os_str().is_empty()
-            || relative == Path::new(".")
-            || relative == Path::new("")
-        {
-            continue;
-        }
         let git_path = match add_git_path_bytes(relative) {
             Ok(path) => path,
             Err(_) => continue,
         };
-        if git_path.is_empty() {
+        // `git add .` (or the empty pathspec for the worktree root) matches every
+        // index entry. git's pathspec "seen" walk with PS_IGNORE_SKIP_WORKTREE
+        // reports the pathspec as sparse-only when *no* dense entry matches —
+        // t3705 #4 expects advice listing `.` and exit 1, without removing the
+        // skip-worktree entry. Mirror that with a full-index scan.
+        let is_dot_pathspec = git_path.is_empty()
+            || relative.as_os_str().is_empty()
+            || relative == Path::new(".")
+            || relative == Path::new("");
+        if is_dot_pathspec {
+            if is_refresh {
+                continue;
+            }
+            let Some(index) = index.as_ref() else {
+                continue;
+            };
+            let mut dense_hit = false;
+            let mut sparse_hit = false;
+            for entry in &index.entries {
+                if entry.stage() != sley_index::Stage::Normal {
+                    continue;
+                }
+                let outside = entry.is_skip_worktree()
+                    || active.as_ref().is_some_and(|active| {
+                        !sley_worktree::path_in_sparse_checkout(
+                            entry.path.as_bytes(),
+                            &active.sparse,
+                            active.mode,
+                        )
+                    });
+                if outside {
+                    sparse_hit = true;
+                } else {
+                    dense_hit = true;
+                    break;
+                }
+            }
+            if sparse_hit && !dense_hit {
+                rejected.push(path.to_string_lossy().replace('\\', "/"));
+            }
             continue;
         }
         let metadata = fs::symlink_metadata(&absolute).ok();

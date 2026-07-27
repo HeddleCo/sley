@@ -1089,6 +1089,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
         atomic: false,
         negotiation_restrict: None,
         negotiation_include: None,
+        negotiate_only: false,
     };
     let fetch_recurse_submodules = resolve_fetch_recurse_submodules(
         &config,
@@ -1107,6 +1108,10 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
     // pull-into-void decision keys off the *pre-fetch* state, so capture it now.
     let orig_head_unborn = orig_head.is_none();
     let before_fetch_refs = fetch_ref_snapshot(&git_dir, format)?;
+    // Upstream `git pull` shells out to `git fetch`, so packet traces use the
+    // `fetch` identity (t5702 greps `fetch> …version=2`). Match that while the
+    // in-process fetch runs, then restore `pull` for any later merge traffic.
+    sley_protocol::set_packet_trace_identity("fetch");
     let fetch_outcome = match pull_fetch(
         &remote_context,
         &git_dir,
@@ -1115,8 +1120,12 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
         &refspecs,
         fetch_options.clone(),
     ) {
-        Ok(outcome) => outcome,
+        Ok(outcome) => {
+            sley_protocol::set_packet_trace_identity("pull");
+            outcome
+        }
         Err(err) => {
+            sley_protocol::set_packet_trace_identity("pull");
             if !merge_srcs.is_empty() && format!("{err}").contains("remote ref") {
                 print_pull_no_such_ref_fetched(&merge_srcs);
                 return Err(GitError::Exit(1));
@@ -1131,6 +1140,11 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
             &remote,
             &fetch_outcome,
         )?;
+    }
+    // Fetch keeps soft ref-update rejections on the outcome so callers can
+    // finish post-fetch bookkeeping. Pull must still stop before merge/rebase.
+    if let Some(reason) = fetch_outcome.rejection.as_ref() {
+        return Err(GitError::Command(reason.clone()));
     }
     if dry_run {
         return Ok(());

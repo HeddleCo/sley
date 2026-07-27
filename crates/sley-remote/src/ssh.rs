@@ -500,6 +500,12 @@ fn spawn_service_process(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Export effective `-c` / `GIT_CONFIG_PARAMETERS` so child upload-pack /
+    // receive-pack processes inherit hideRefs and other overrides the parent
+    // received on the command line (git mutates the real env; we cannot).
+    if let Some(params) = sley_config::effective_config_parameters_env() {
+        process.env("GIT_CONFIG_PARAMETERS", params);
+    }
     let mut child = process.spawn()?;
     let stderr_drain = child
         .stderr

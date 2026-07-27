@@ -12,6 +12,7 @@ pub(crate) mod am;
 pub(crate) mod approxidate;
 pub(crate) mod args;
 pub(crate) mod attrs;
+pub(crate) mod backfill;
 pub(crate) mod bisect;
 pub(crate) mod blame;
 pub(crate) mod branch;

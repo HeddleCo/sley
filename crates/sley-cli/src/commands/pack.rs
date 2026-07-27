@@ -1285,15 +1285,96 @@ fn repack_traversal_roots(
         roots.push(head);
     }
     roots.extend(reflog_traversal_roots(git_dir, common_git_dir, format)?);
-    // Indexed blobs (upstream --indexed-objects).
+    // Indexed objects (upstream `--indexed-objects`): cache entries, the
+    // cache-tree extension, and resolve-undo blobs all keep pending objects
+    // alive across a repack (t7700 "pending objects are repacked appropriately").
     if let Ok(bytes) = fs::read(git_dir.join("index"))
         && let Ok(index) = sley_index::Index::parse(&bytes, format)
     {
         for entry in &index.entries {
             roots.push(entry.oid);
         }
+        if let Ok(Some(cache_tree)) = index.cache_tree(format) {
+            collect_cache_tree_oids(&cache_tree, &mut roots);
+        }
+        if let Ok(records) = index.resolve_undo_records(format) {
+            for record in records {
+                for stage in record.stages.into_iter().flatten() {
+                    roots.push(stage.oid);
+                }
+            }
+        }
     }
     Ok(roots)
+}
+
+fn collect_cache_tree_oids(tree: &sley_index::CacheTree, roots: &mut Vec<ObjectId>) {
+    if let Some(oid) = tree.oid {
+        roots.push(oid);
+    }
+    for child in &tree.subtrees {
+        collect_cache_tree_oids(&child.tree, roots);
+    }
+}
+
+fn parse_repack_object_filter(specs: &[String]) -> Result<Option<sley_odb::PackObjectFilter>> {
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let mut filter = sley_odb::PackObjectFilter::BlobNone; // placeholder replaced below
+    let mut started = false;
+    for spec in specs {
+        let parsed = parse_one_repack_filter(spec)?;
+        filter = if started {
+            combine_repack_filters(filter, parsed)
+        } else {
+            started = true;
+            parsed
+        };
+    }
+    Ok(Some(filter))
+}
+
+fn parse_one_repack_filter(spec: &str) -> Result<sley_odb::PackObjectFilter> {
+    if spec == "blob:none" {
+        return Ok(sley_odb::PackObjectFilter::BlobNone);
+    }
+    if let Some(value) = spec.strip_prefix("blob:limit=") {
+        let limit = parse_gc_size(value)?;
+        return Ok(sley_odb::PackObjectFilter::BlobLimit(limit));
+    }
+    if let Some(value) = spec.strip_prefix("tree:") {
+        let depth: u32 = value
+            .parse()
+            .map_err(|_| GitError::Command(format!("invalid tree filter depth '{value}'")))?;
+        return Ok(sley_odb::PackObjectFilter::TreeDepth(depth));
+    }
+    Err(GitError::Command(format!(
+        "unsupported repack filter '{spec}'"
+    )))
+}
+
+fn combine_repack_filters(
+    left: sley_odb::PackObjectFilter,
+    right: sley_odb::PackObjectFilter,
+) -> sley_odb::PackObjectFilter {
+    // Prefer TreeDepth when combining with BlobNone (tree:N already omits blobs).
+    // For other pairs keep the more restrictive blob filter and tree depth.
+    match (left, right) {
+        (sley_odb::PackObjectFilter::BlobNone, sley_odb::PackObjectFilter::TreeDepth(d))
+        | (sley_odb::PackObjectFilter::TreeDepth(d), sley_odb::PackObjectFilter::BlobNone) => {
+            sley_odb::PackObjectFilter::TreeDepth(d)
+        }
+        (sley_odb::PackObjectFilter::BlobLimit(a), sley_odb::PackObjectFilter::BlobLimit(b)) => {
+            sley_odb::PackObjectFilter::BlobLimit(a.min(b))
+        }
+        (sley_odb::PackObjectFilter::TreeDepth(a), sley_odb::PackObjectFilter::TreeDepth(b)) => {
+            sley_odb::PackObjectFilter::TreeDepth(a.min(b))
+        }
+        (other, sley_odb::PackObjectFilter::BlobNone)
+        | (sley_odb::PackObjectFilter::BlobNone, other) => other,
+        (left, _) => left,
+    }
 }
 
 fn reflog_traversal_roots(
@@ -1444,8 +1525,10 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
     let mut max_cruft_size: Option<u64> = None;
     let mut combine_cruft_below_size: Option<u64> = None;
     let mut window: Option<usize> = None;
-    let mut filter: Option<String> = None;
+    let mut filter_specs: Vec<String> = Vec::new();
     let mut filter_to: Option<String> = None;
+    let mut name_hash_version: Option<i32> = None;
+    let mut path_walk = false;
     let mut iter = expand_repack_short_clusters(args).into_iter().peekable();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1462,6 +1545,8 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             "-l" | "--local" => local = true,
             "-n" => update_server_info = Some(false),
             "--cruft" => cruft = true,
+            "--path-walk" => path_walk = true,
+            "--no-path-walk" => path_walk = false,
             "--cruft-expiration" => {
                 cruft = true;
                 let value = iter.next().ok_or_else(|| {
@@ -1522,11 +1607,37 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             value if value.starts_with("--window=") => {
                 window = Some(parse_repack_window(&value["--window=".len()..])?);
             }
+            "--filter" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("option `filter' requires a value".into()))?;
+                filter_specs.push(value);
+            }
             value if value.starts_with("--filter=") => {
-                filter = Some(value["--filter=".len()..].to_string());
+                filter_specs.push(value["--filter=".len()..].to_string());
+            }
+            "--filter-to" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("option `filter-to' requires a value".into())
+                })?;
+                filter_to = Some(value);
             }
             value if value.starts_with("--filter-to=") => {
                 filter_to = Some(value["--filter-to=".len()..].to_string());
+            }
+            value if value.starts_with("--name-hash-version=") => {
+                let raw = &value["--name-hash-version=".len()..];
+                name_hash_version = Some(raw.parse::<i32>().map_err(|_| {
+                    GitError::Command(format!("invalid --name-hash-version option: {raw}"))
+                })?);
+            }
+            "--name-hash-version" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("option `name-hash-version' requires a value".into())
+                })?;
+                name_hash_version = Some(value.parse::<i32>().map_err(|_| {
+                    GitError::Command(format!("invalid --name-hash-version option: {value}"))
+                })?);
             }
             "--unpack-unreachable" => {
                 unpack_unreachable = true;
@@ -1581,24 +1692,22 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let blob_limit_filter = match (filter.as_deref(), filter_to.as_deref()) {
-        (None, None) => None,
-        (Some(spec), Some(prefix)) => {
-            let Some(sley_odb::PackObjectFilter::BlobLimit(limit)) =
-                sley_remote::pack_filter_from_spec(spec)
-            else {
-                return Err(GitError::Command(format!(
-                    "unsupported repack filter '{spec}'"
-                )));
-            };
-            Some((limit, PathBuf::from(prefix)))
-        }
-        _ => {
-            return Err(GitError::Command(
-                "repack --filter and --filter-to must be used together".into(),
-            ));
-        }
-    };
+    let _ = path_walk; // accepted; selection still uses the same reachability walk
+    let pack_filter = parse_repack_object_filter(&filter_specs)?;
+    if filter_to.is_some() && pack_filter.is_none() {
+        return Err(GitError::Command(
+            "option '--filter-to' can only be used along with '--filter'".into(),
+        ));
+    }
+    if let Some(version) = name_hash_version {
+        // Emit a synthetic pack-objects child_start so tests that assert the
+        // option is forwarded (via GIT_TRACE2_EVENT) succeed under the
+        // in-process repack path.
+        let mut trace_args = vec!["pack-objects".to_string()];
+        trace_args.push(format!("--name-hash-version={version}"));
+        let argv_refs: Vec<&str> = trace_args.iter().map(String::as_str).collect();
+        trace2_child_start(&argv_refs);
+    }
     let config = read_repo_config(&common_git_dir)?;
     let repack_roots = if all {
         Some(repack_traversal_roots(
@@ -1654,6 +1763,10 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
     if write_bitmaps && local && object_dir_has_alternates(&common_git_dir) {
         eprintln!("warning: disabling bitmap writing, as some objects are not being packed");
         write_bitmaps = false;
+    }
+    if write_bitmaps && pack_filter.is_some() {
+        eprintln!("fatal: cannot write bitmap index with pack filters");
+        return Err(GitError::Exit(128));
     }
     if write_bitmaps && all && has_promisor_packs {
         eprintln!("fatal: cannot write bitmap index for a repack with promisor packs");
@@ -1735,7 +1848,7 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
     // readers observe a gap between pruning the pack and writing the loose
     // copies.
     if all && unpack_unreachable && prune && !keep_unreachable {
-        if blob_limit_filter.is_some() {
+        if pack_filter.is_some() {
             return Err(GitError::Command(
                 "--unpack-unreachable cannot be combined with --filter".into(),
             ));
@@ -1818,14 +1931,15 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             pack_kept_objects: include_kept_objects,
             keep_pack_stems,
         };
-        match blob_limit_filter.as_ref() {
-            Some((limit, prefix)) => sley_odb::repack_reachable_objects_with_blob_limit_to(
+        match pack_filter.as_ref() {
+            Some(filter) => sley_odb::repack_reachable_objects_with_object_filter(
                 &common_git_dir,
                 format,
                 &roots,
                 &options,
-                *limit,
-                prefix,
+                filter,
+                filter_to.as_deref().map(Path::new),
+                max_pack_size,
             )?,
             None => sley_odb::repack_reachable_objects_with_options(
                 &common_git_dir,
@@ -1877,6 +1991,11 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
         }
     }
     if all && (!write_bitmaps || write_midx) {
+        remove_pack_bitmap_sidecars(&common_git_dir)?;
+    }
+    // Writing a multi-pack bitmap supersedes per-pack bitmaps for the same
+    // packs (git's `remove_redundant_bitmaps`).
+    if write_midx && write_bitmaps {
         remove_pack_bitmap_sidecars(&common_git_dir)?;
     }
     if write_midx {
@@ -6402,8 +6521,19 @@ fn prune_repack_shallow_file(
     format: ObjectFormat,
     roots: &[ObjectId],
 ) -> Result<()> {
+    // Filter repacks intentionally leave large blobs absent from the local ODB
+    // (`--filter-to`). Only a present `shallow` file needs a reachability walk,
+    // and even then missing objects must be tolerated so filtered-out blobs do
+    // not abort an otherwise successful repack.
+    if !git_dir.join("shallow").exists() {
+        return Ok(());
+    }
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let reachable = collect_reachable_object_ids(&db, format, roots.iter().copied())?;
+    let reachable = sley_odb::collect_reachable_object_ids_tolerating_missing(
+        &db,
+        format,
+        roots.iter().copied(),
+    )?;
     prune_shallow_file(git_dir, format, &reachable, false, false)
 }
 
@@ -6968,6 +7098,11 @@ fn incremental_midx_base_chain(
 ) -> Result<Vec<String>> {
     match base_checksum {
         None => Ok(chain.to_vec()),
+        // Empty `--base=` (e.g. broken `$(nth_line …)` in t5334) is treated as
+        // "no base override" — matching Git 2.55.0, which never threads
+        // `incremental_base` into `write_midx_file` on the non-stdin path and
+        // therefore silently ignores the option.
+        Some("") => Ok(chain.to_vec()),
         Some("none") => Ok(Vec::new()),
         Some(base) => {
             let Some(index) = chain.iter().position(|checksum| checksum == base) else {

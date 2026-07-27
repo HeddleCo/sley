@@ -70,6 +70,12 @@ pub(crate) fn cmd_branch(cli_session: &crate::session::CliSession, args: &[Strin
         eprintln!("fatal: options are incompatible");
         return Err(GitError::Exit(128));
     }
+    // git: `--recurse-submodules` is create-only. Reject it with the exact
+    // message when combined with delete/rename/list/etc. (t3207).
+    if branch_has_explicit_recurse_submodules(args) && branch_has_noncreate_action(args) {
+        eprintln!("fatal: --recurse-submodules can only be used to create branches");
+        return Err(GitError::Exit(128));
+    }
     if let Some(verbose) = setup_branch_verbose_list_options(args)? {
         return run_branch_verbose_list_options(
             git_dir,
@@ -139,4 +145,39 @@ pub(super) fn branch_has_conflicting_action_modes(args: &[String]) -> bool {
         }
     }
     (delete && move_or_copy) || (delete && list)
+}
+
+fn branch_has_explicit_recurse_submodules(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--recurse-submodules"
+                | "--recurse-submodules=true"
+                | "--recurse-submodules=1"
+                | "--recurse-submodules=yes"
+                | "--recurse-submodules=on"
+        )
+    })
+}
+
+fn branch_has_noncreate_action(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-d" | "-D"
+                | "--delete"
+                | "-m"
+                | "-M"
+                | "--move"
+                | "-c"
+                | "-C"
+                | "--copy"
+                | "-l"
+                | "--list"
+                | "--edit-description"
+                | "--unset-upstream"
+                | "--show-current"
+        ) || arg.starts_with("--set-upstream-to")
+            || arg.starts_with("--set-upstream=")
+    })
 }

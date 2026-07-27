@@ -2353,10 +2353,25 @@ pub(crate) fn diff_entry_new_content(
             Ok(_) => {
                 let content = fs::read(path)?;
                 return match worktree_clean {
-                    Some(clean) => clean
-                        .attributes
-                        .apply_clean_filter(clean.config, &entry.path, &content)
-                        .map(Some),
+                    Some(clean) => {
+                        // Honour has_crlf_in_index so text=auto does not strip
+                        // CRLF when the recorded (old/index) blob already has
+                        // CRLF — otherwise unstaged diffs show mixed endings
+                        // (`-a\r` / `+b`) and break apply round-trips (t4124).
+                        let index_blob = match entry.old_oid {
+                            Some(oid) => sley_worktree::SafeCrlfIndexBlob::Lookup { odb: db, oid },
+                            None => sley_worktree::SafeCrlfIndexBlob::None,
+                        };
+                        clean
+                            .attributes
+                            .apply_clean_filter_respecting_index(
+                                clean.config,
+                                &entry.path,
+                                &content,
+                                index_blob,
+                            )
+                            .map(Some)
+                    }
                     None => Ok(Some(content)),
                 };
             }

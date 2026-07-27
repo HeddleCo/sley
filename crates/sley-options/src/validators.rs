@@ -50,12 +50,9 @@ pub fn log_break_rewrites_form_error() -> Result<()> {
 
 pub fn log_validate_diff_merges(value: &str) -> Result<()> {
     match value {
-        "off" | "none" => Ok(()),
+        "off" | "none" | "on" | "first-parent" | "1" | "separate" | "m" | "combined" | "c"
+        | "dense-combined" | "cc" | "remerge" | "r" => Ok(()),
         "" => log_diff_merges_invalid_value(value),
-        "on" | "first-parent" | "1" | "separate" | "m" | "combined" | "c" | "dense-combined"
-        | "cc" | "remerge" | "r" => Err(GitError::Command(format!(
-            "unsupported log option --diff-merges={value}"
-        ))),
         _ => log_diff_merges_invalid_value(value),
     }
 }

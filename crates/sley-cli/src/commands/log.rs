@@ -21,7 +21,7 @@ use diff::{
 use graph::{graph_show_commit, graph_show_commit_msg, graph_show_oneline, graph_show_padding};
 use line_log::{LineLogOutputCtx, run_line_log_output};
 use pickaxe::{
-    CompiledPickaxe, DiffFilterMatchOptions, PickaxeSpec, compile_pickaxe_regex,
+    CompiledPickaxe, DiffFilterMatchOptions, LogFollowResult, PickaxeSpec, compile_pickaxe_regex,
     diff_filter_commit_matches, diff_filter_entry_matches, log_follow_single_path,
     parse_diff_filter_arg, pickaxe_commit_matches, pickaxe_filter_entries,
     resolve_diff_filter_mask,
@@ -847,10 +847,44 @@ fn log_source_labels_for_selected(
     labels
 }
 
-fn log_unborn_head_branch(git_dir: &Path) -> Option<String> {
-    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let target = head.trim().strip_prefix("ref: ")?;
-    target.strip_prefix("refs/heads/").map(str::to_string)
+/// Classification of a failed default-HEAD revision resolution for `git log`.
+enum MissingDefaultHead {
+    /// HEAD is missing, not a symref, or points at a broken/invalid ref body.
+    Broken,
+    /// HEAD is a clean symref to an unborn `refs/heads/*` branch.
+    Unborn(String),
+    /// Failure is not about the default HEAD tip (e.g. unrelated parse error).
+    Other,
+}
+
+/// Port of git's `diagnose_missing_default` (revision.c): decide between the
+/// "appears to be broken" and "does not have any commits yet" messages.
+fn diagnose_missing_default_head(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+) -> MissingDefaultHead {
+    let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) else {
+        return MissingDefaultHead::Broken;
+    };
+    let head = head.trim();
+    let Some(target) = head.strip_prefix("ref: ") else {
+        // Direct or empty HEAD is not a clean branch symref → broken.
+        return MissingDefaultHead::Broken;
+    };
+    let target = target.trim();
+    let store = sley_refs::FileRefStore::new(git_dir.to_path_buf(), format);
+    match store.read_ref(target) {
+        // Target ref absent: unborn only for refs/heads/* (git's skip_prefix).
+        Ok(None) => match target.strip_prefix("refs/heads/") {
+            Some(branch) if !branch.is_empty() => MissingDefaultHead::Unborn(branch.to_string()),
+            _ => MissingDefaultHead::Broken,
+        },
+        // Target ref exists with a valid oid (object may still be missing) —
+        // not the unborn/broken diagnosis path; let the original error stand.
+        Ok(Some(_)) => MissingDefaultHead::Other,
+        // Invalid loose-ref body (short/garbage hash) → REF_ISBROKEN.
+        Err(_) => MissingDefaultHead::Broken,
+    }
 }
 
 fn log_pathspec_magic(value: &str) -> Option<(&str, &str)> {
@@ -2417,13 +2451,23 @@ fn cmd_log_impl(
             return Err(GitError::Exit(128));
         }
         Err(err) if inserted_default_head => {
-            if repository.resolve_revision("HEAD").is_err()
-                && let Some(branch) = log_unborn_head_branch(&git_dir)
-            {
-                eprintln!("fatal: your current branch '{branch}' does not have any commits yet");
-                return Err(GitError::Exit(128));
+            // Match git's diagnose_missing_default (revision.c): a missing
+            // default tip is "unborn" only when HEAD is a clean symref to
+            // refs/heads/* whose target does not exist. A direct/broken HEAD
+            // or a target ref with invalid contents is "broken".
+            match diagnose_missing_default_head(&git_dir, format) {
+                MissingDefaultHead::Broken => {
+                    eprintln!("fatal: your current branch appears to be broken");
+                    return Err(GitError::Exit(128));
+                }
+                MissingDefaultHead::Unborn(branch) => {
+                    eprintln!(
+                        "fatal: your current branch '{branch}' does not have any commits yet"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                MissingDefaultHead::Other => return Err(err),
             }
-            return Err(err);
         }
         Err(err) => {
             if matches!(
@@ -2431,6 +2475,9 @@ fn cmd_log_impl(
                 Err(GitError::NotFound(
                     sley::NotFoundKind::BrokenReference { .. }
                 ))
+            ) || matches!(
+                diagnose_missing_default_head(&git_dir, format),
+                MissingDefaultHead::Broken
             ) {
                 eprintln!("fatal: your current branch appears to be broken");
                 return Err(GitError::Exit(128));
@@ -2618,50 +2665,30 @@ fn cmd_log_impl(
         };
     // Per-commit diff rendering context (only consulted when a diff-output
     // option was given).
-    let log_diff = if diff_opts.any() || diff_opts.merges_imply_patch {
-        let show_root = show_root_flag
-            .unwrap_or_else(|| config.get_bool("log", None, "showroot").unwrap_or(true));
-        // diff.renames: false disables detection, "copies"/"copy" adds copy
-        // detection, anything else (or unset) means rename detection.
-        // A command-line `-M`/`-C`/`--no-renames` overrides `diff.renames`.
-        let (detect_renames, detect_copies) = (filter_detect_renames, filter_detect_copies);
-        let diff_pathspec = if pathspecs.is_empty() {
-            None
-        } else {
-            let worktree_root = repository.worktree_root()?;
-            Some(DiffPathspec::new(
-                &cwd,
-                worktree_root,
-                &pathspecs,
-                effective_pathspec_flags(cli_session),
-            )?)
-        };
-        let repo_abbrev = repository_abbrev_from_config(&git_dir, format, &config)?;
-        Some(LogDiffContext {
-            db: &db,
-            lazy_fetch,
-            format,
-            config: &config,
-            userdiff: log_userdiff
-                .as_ref()
-                .expect("log diff context requires userdiff resolver"),
-            opts: &diff_opts,
-            merges: diff_opts.merges.unwrap_or(if first_parent {
-                LogDiffMerges::FirstParent
-            } else {
-                LogDiffMerges::Off
-            }),
-            show_root,
-            detect_renames,
-            detect_copies,
-            pathspec: diff_pathspec,
-            patch_abbrev: repo_abbrev.unwrap_or(7).min(format.hex_len()),
-            raw_abbrev: repo_abbrev,
-            pickaxe: compiled_pickaxe.as_ref(),
-            pickaxe_ignore_case,
-            pickaxe_text,
-            pickaxe_all,
-        })
+    // Built after `--follow` so per-commit followed paths can be threaded into
+    // the renderer; deferred construction lives just before the output loop.
+    let log_diff_requested = diff_opts.any() || diff_opts.merges_imply_patch;
+    let show_root_for_diff =
+        show_root_flag.unwrap_or_else(|| config.get_bool("log", None, "showroot").unwrap_or(true));
+    let follow_copy = saw_follow && pathspecs.len() == 1;
+    let log_detect_renames = filter_detect_renames || follow_copy;
+    let log_detect_copies = filter_detect_copies || follow_copy;
+    let log_find_copies_harder = find_copies_harder || follow_copy;
+    let log_diff_pathspec = if pathspecs.is_empty() {
+        None
+    } else if log_diff_requested {
+        let worktree_root = repository.worktree_root()?;
+        Some(DiffPathspec::new(
+            &cwd,
+            worktree_root,
+            &pathspecs,
+            effective_pathspec_flags(cli_session),
+        )?)
+    } else {
+        None
+    };
+    let log_repo_abbrev = if log_diff_requested {
+        repository_abbrev_from_config(&git_dir, format, &config)?
     } else {
         None
     };
@@ -2825,6 +2852,8 @@ fn cmd_log_impl(
             format,
             &reflog_revisions,
             ReflogWalkOptions {
+                abbrev_len,
+                date_explicit,
                 max_count,
                 skip,
                 output: &output,
@@ -3397,9 +3426,58 @@ fn cmd_log_impl(
     }
     let follow_applied =
         saw_follow && pathspecs.len() == 1 && !full_history && !revision_options.simplify_merges;
+    // Per-commit path after `--follow` rename/copy rewinds (newest → oldest),
+    // keyed by commit oid so the renderer filters name-status/patch correctly.
+    let mut follow_paths: HashMap<ObjectId, Vec<u8>> = HashMap::new();
     if follow_applied {
-        selected = log_follow_single_path(&db, format, selected, pathspecs[0].as_bytes(), true)?;
+        let LogFollowResult { records, paths } =
+            log_follow_single_path(&db, format, selected, pathspecs[0].as_bytes(), true)?;
+        for (record, path) in records.iter().zip(paths.into_iter()) {
+            follow_paths.insert(record.oid, path);
+        }
+        selected = records;
     }
+    let log_diff = if log_diff_requested {
+        Some(LogDiffContext {
+            git_dir: &git_dir,
+            db: &db,
+            lazy_fetch,
+            format,
+            config: &config,
+            userdiff: log_userdiff
+                .as_ref()
+                .expect("log diff context requires userdiff resolver"),
+            opts: &diff_opts,
+            merges: diff_opts.merges.unwrap_or(if first_parent {
+                LogDiffMerges::FirstParent
+            } else {
+                LogDiffMerges::Off
+            }),
+            show_root: show_root_for_diff,
+            detect_renames: log_detect_renames,
+            detect_copies: log_detect_copies,
+            find_copies_harder: log_find_copies_harder,
+            // Under `--follow`, per-commit paths supersede the original pathspec.
+            pathspec: if follow_applied {
+                None
+            } else {
+                log_diff_pathspec
+            },
+            follow_paths: if follow_applied {
+                Some(&follow_paths)
+            } else {
+                None
+            },
+            patch_abbrev: log_repo_abbrev.unwrap_or(7).min(format.hex_len()),
+            raw_abbrev: log_repo_abbrev,
+            pickaxe: compiled_pickaxe.as_ref(),
+            pickaxe_ignore_case,
+            pickaxe_text,
+            pickaxe_all,
+        })
+    } else {
+        None
+    };
     // Pathspec-limited / --full-history simplification (TREESAME prune + parent
     // rewriting). Owned binding outlives `selected` (a Vec of references).
     let simplified_storage;
