@@ -682,7 +682,7 @@ where
 ///
 /// The section header (`packfile\n`) has already been consumed; remaining
 /// frames are pure sideband until flush — do not skip upload-pack ACKs.
-fn install_protocol_v2_packfile_from_reader_with_cancel<I, R>(
+pub(crate) fn install_protocol_v2_packfile_from_reader_with_cancel<I, R>(
     reader: &mut R,
     destination: &I,
     promisor: bool,
