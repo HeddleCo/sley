@@ -13,7 +13,7 @@ use sley_protocol::{
     SideBandPacket, validate_receive_pack_push_request_features, write_receive_pack_report_status,
     write_receive_pack_report_status_v2, write_sideband_packet,
 };
-use sley_refs::FileRefStore;
+use sley_refs::{FileRefStore, RefTarget};
 
 use crate::local::{apply_receive_pack_ref_transaction, receive_pack_features};
 use crate::proc_receive::{
@@ -84,6 +84,47 @@ pub fn serve_receive_pack(
         .cloned()
         .map(ReceivePackCommandState::new)
         .collect();
+
+    // transfer.hideRefs / receive.hideRefs: deny updates matching patterns
+    // using git's full-vs-stripped subject rules (namespace-aware).
+    let hidden_patterns = crate::local::transfer_receive_hidden_ref_patterns(request.config);
+    if !hidden_patterns.is_empty() {
+        for state in &mut command_states {
+            if state.error_string.is_some() {
+                continue;
+            }
+            let logical = state.command.name.as_str();
+            let physical = sley_core::expand_namespace(logical);
+            if sley_core::ref_is_hidden(Some(logical), &physical, &hidden_patterns) {
+                let reason = if state.command.new_id.is_null() {
+                    "deny deleting a hidden ref"
+                } else {
+                    "deny updating a hidden ref"
+                };
+                state.error_string = Some(reason.into());
+            }
+        }
+    }
+
+    // receive.denyCurrentBranch: refuse (or allow with updateInstead) updates
+    // to the currently checked-out branch. Matching is on the logical
+    // (namespace-stripped) name against the worktree HEAD, same as git.
+    for state in &mut command_states {
+        if state.error_string.is_some() || state.command.new_id.is_null() {
+            continue;
+        }
+        if !state.command.name.starts_with("refs/heads/") {
+            continue;
+        }
+        if receive_denies_current_branch_for_server(
+            request.git_dir,
+            request.format,
+            request.config,
+            &state.command.name,
+        ) {
+            state.error_string = Some("branch is currently checked out".into());
+        }
+    }
 
     let proc_patterns = parse_proc_receive_refs(request.config);
     let run_proc_receive = mark_proc_receive_commands(&proc_patterns, &mut command_states);
@@ -420,6 +461,65 @@ fn quarantine_hook_env(git_dir: &Path, object_dir: &Path) -> Vec<(String, String
     ]
 }
 
+/// Whether receive-pack should refuse an update to the currently checked-out
+/// branch under `receive.denyCurrentBranch`. Unconfigured / refuse / true deny;
+/// `updateInstead` / `warn` / `ignore` allow the update through.
+/// Checks the main worktree and every linked worktree (t5516 worktrees).
+fn receive_denies_current_branch_for_server(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    logical_ref: &str,
+) -> bool {
+    if !logical_ref.starts_with("refs/heads/") {
+        return false;
+    }
+    let deny = config
+        .get("receive", None, "denycurrentbranch")
+        .unwrap_or("refuse");
+    let denies = matches!(
+        deny.to_ascii_lowercase().as_str(),
+        "true" | "yes" | "on" | "1" | "refuse"
+    );
+    if !denies {
+        return false;
+    }
+    branch_checked_out_anywhere(git_dir, format, logical_ref)
+}
+
+fn branch_checked_out_anywhere(git_dir: &Path, format: ObjectFormat, logical_ref: &str) -> bool {
+    let store = FileRefStore::new(git_dir, format);
+    if matches!(
+        store.read_ref("HEAD").ok().flatten(),
+        Some(RefTarget::Symbolic(target)) if target == logical_ref
+    ) && sley_worktree::worktree_root_for_git_dir(git_dir)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return true;
+    }
+    let common = sley_odb::repository_common_dir(git_dir);
+    let worktrees_dir = common.join("worktrees");
+    let Ok(entries) = std::fs::read_dir(worktrees_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let wt_git_dir = entry.path();
+        if !wt_git_dir.is_dir() {
+            continue;
+        }
+        let wt_store = FileRefStore::new(&wt_git_dir, format);
+        if matches!(
+            wt_store.read_ref("HEAD").ok().flatten(),
+            Some(RefTarget::Symbolic(target)) if target == logical_ref
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
 fn needs_pack_data(states: &[ReceivePackCommandState]) -> bool {
     states
         .iter()
@@ -481,10 +581,16 @@ fn apply_command_updates(
     format: ObjectFormat,
     states: &[ReceivePackCommandState],
 ) -> Result<()> {
+    // Expand logical client-side names into the active namespace before writing
+    // (git's receive-pack `namespaced_name = namespace + name`).
     let applicable: Vec<ReceivePackCommand> = states
         .iter()
         .filter(|state| state.error_string.is_none() && !state.defer_ref_update())
-        .map(|state| state.command.clone())
+        .map(|state| {
+            let mut command = state.command.clone();
+            command.name = sley_core::expand_namespace(&command.name);
+            command
+        })
         .collect();
     if applicable.is_empty() {
         return Ok(());

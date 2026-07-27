@@ -179,6 +179,17 @@ pub fn amend_index(
     commit_tree_with_amend(git_dir, format, tree, options, true)
 }
 
+/// Amend HEAD with an explicit tree (e.g. `commit --amend --only` without
+/// pathspecs, which reuses HEAD's tree and ignores the index).
+pub fn amend_tree(
+    git_dir: impl AsRef<Path>,
+    format: sley_core::ObjectFormat,
+    tree: ObjectId,
+    options: CommitIndexOptions,
+) -> Result<CommitIndexResult> {
+    commit_tree_with_amend(git_dir, format, tree, options, true)
+}
+
 pub fn commit_tree_at_head(
     git_dir: impl AsRef<Path>,
     format: sley_core::ObjectFormat,

@@ -14,6 +14,8 @@ pub(super) fn setup_reflog_show_options(
     let mut format = ReflogFormat::Default;
     let mut max_count = None;
     let mut abbrev_commit = None;
+    let mut abbrev_len = None;
+    let mut date_mode = None;
     let mut refs = Vec::new();
     let mut pathspecs = Vec::new();
     let mut grep_patterns = Vec::new();
@@ -33,6 +35,32 @@ pub(super) fn setup_reflog_show_options(
             "--oneline" => format = ReflogFormat::Default,
             "--abbrev-commit" => abbrev_commit = Some(true),
             "--no-abbrev-commit" => abbrev_commit = Some(false),
+            "--abbrev" => {
+                // Bare `--abbrev` restores the default short width.
+                abbrev_len = Some(7);
+                abbrev_commit = Some(true);
+            }
+            "--no-abbrev" => {
+                abbrev_len = None;
+                abbrev_commit = Some(false);
+            }
+            value if value.starts_with("--abbrev=") => {
+                let width = value["--abbrev=".len()..]
+                    .parse::<usize>()
+                    .map_err(|_| GitError::Command(format!("invalid --abbrev value: {value}")))?;
+                abbrev_len = Some(width);
+                abbrev_commit = Some(true);
+            }
+            "--date" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(GitError::Command("--date requires a value".into()));
+                };
+                date_mode = Some(crate::log_cli::log_date_mode(value)?);
+            }
+            value if value.starts_with("--date=") => {
+                date_mode = Some(crate::log_cli::log_date_mode(&value["--date=".len()..])?);
+            }
             "--format=%H" | "--pretty=%H" => {
                 format = ReflogFormat::NewOid {
                     final_newline: true,
@@ -162,6 +190,8 @@ pub(super) fn setup_reflog_show_options(
         format,
         max_count,
         abbrev_commit,
+        abbrev_len,
+        date_mode,
         pathspecs,
         grep_patterns,
         grep_pattern_kind,
