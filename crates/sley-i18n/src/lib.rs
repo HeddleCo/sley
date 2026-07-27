@@ -629,10 +629,7 @@ fn push_language_variants(raw: &str, out: &mut Vec<String>) {
     // Strip encoding: `is_IS.UTF-8` → `is_IS`
     let base = raw.split('.').next().unwrap_or(raw);
     let base = base.split('@').next().unwrap_or(base);
-    if base.is_empty()
-        || base.eq_ignore_ascii_case("C")
-        || base.eq_ignore_ascii_case("POSIX")
-    {
+    if base.is_empty() || base.eq_ignore_ascii_case("C") || base.eq_ignore_ascii_case("POSIX") {
         return;
     }
     if !out.iter().any(|existing| existing == base) {
@@ -692,15 +689,20 @@ fn parse_mo(bytes: &[u8]) -> Option<BTreeMap<String, String>> {
 }
 
 fn read_u32_le(bytes: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(bytes.get(off..off + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+        bytes.get(off..off + 4)?.try_into().ok()?,
+    ))
 }
 
 fn read_u32_be(bytes: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(bytes.get(off..off + 4)?.try_into().ok()?))
+    Some(u32::from_be_bytes(
+        bytes.get(off..off + 4)?.try_into().ok()?,
+    ))
 }
 
 fn substitute_percent_s(template: &str, args: &[&str]) -> String {
-    let mut out = String::with_capacity(template.len() + args.iter().map(|a| a.len()).sum::<usize>());
+    let mut out =
+        String::with_capacity(template.len() + args.iter().map(|a| a.len()).sum::<usize>());
     let mut arg_idx = 0;
     let bytes = template.as_bytes();
     let mut i = 0;

@@ -1600,20 +1600,23 @@ fn for_each_ref_broken_ref_warns_once() {
             String::from_utf8_lossy(&expected.stderr)
         );
         assert_eq!(
-            actual.stdout, expected.stdout,
+            actual.stdout,
+            expected.stdout,
             "stdout mismatch\nsley:\n{}\ngit:\n{}",
             String::from_utf8_lossy(&actual.stdout),
             String::from_utf8_lossy(&expected.stdout)
         );
         assert_eq!(
-            actual.stderr, expected.stderr,
+            actual.stderr,
+            expected.stderr,
             "stderr mismatch (double warn?)\nsley:\n{}\ngit:\n{}",
             String::from_utf8_lossy(&actual.stderr),
             String::from_utf8_lossy(&expected.stderr)
         );
         let err = String::from_utf8_lossy(&actual.stderr);
         assert_eq!(
-            err.matches("warning: ignoring broken ref refs/heads/bogus").count(),
+            err.matches("warning: ignoring broken ref refs/heads/bogus")
+                .count(),
             1,
             "expected exactly one broken-ref warning, got:\n{err}"
         );

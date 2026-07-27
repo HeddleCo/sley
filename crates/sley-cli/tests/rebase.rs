@@ -350,19 +350,12 @@ fn rebase_interactive_reads_sequence_editor_from_common_config_in_worktree() {
             fs::set_permissions(&editor, perms).expect("chmod");
         }
         let wt = root.join("wt");
-        fs::write(
-            wt.join("script-from-scratch"),
-            "label xyz\nexec true\n",
-        )
-        .expect("write todo script");
+        fs::write(wt.join("script-from-scratch"), "label xyz\nexec true\n")
+            .expect("write todo script");
         // Config goes to the common gitdir (same as `git -C wt config`).
         git_with_identity(
             &wt,
-            &[
-                "config",
-                "sequence.editor",
-                editor.to_str().expect("utf8"),
-            ],
+            &["config", "sequence.editor", editor.to_str().expect("utf8")],
         );
         // Clear env override so only config is consulted.
         let output = Command::new(sley_testkit::sley_bin!())

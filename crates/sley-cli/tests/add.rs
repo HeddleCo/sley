@@ -1966,7 +1966,8 @@ fn add_patch_selective_hunk_does_not_clobber_with_worktree_refresh() {
     let staged = run(sley, &rust, &["cat-file", "blob", ":a"]);
     let expected = b"a\na\na\na\na\na\na\nb\na\na\na\na\n";
     assert_eq!(
-        staged, expected,
+        staged,
+        expected,
         "selective second-hunk stage was clobbered by worktree refresh\nstaged:\n{}\nexpected:\n{}",
         String::from_utf8_lossy(&staged),
         String::from_utf8_lossy(expected)
@@ -2069,7 +2070,10 @@ fn add_patch_no_auto_advance_selective_multi_file() {
 
     let sley = sley_testkit::sley_bin!();
     for name in ["a.file", "b.file", "c.file"] {
-        write_lines(&rust.join(name), &["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
+        write_lines(
+            &rust.join(name),
+            &["1", "2", "3", "4", "5", "6", "7", "8", "9"],
+        );
     }
     run(sley, &rust, &["add", "-A"]);
     run_with_identity(&rust, &["commit", "-m", "initial", "-q"]);

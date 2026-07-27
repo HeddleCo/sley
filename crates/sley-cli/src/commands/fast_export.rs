@@ -146,7 +146,7 @@ pub(crate) fn cmd_fast_export(
             format,
             reader: &db,
             config: Some(&config),
-                    assume_dashdash: false,
+            assume_dashdash: false,
         },
     )?;
     if let Some(leftover) = setup.leftovers.first() {

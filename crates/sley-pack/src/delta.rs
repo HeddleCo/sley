@@ -920,32 +920,14 @@ mod git_delta_acceptance_tests {
         // scales the budget to 60 * (50-10) / (50-1+1) = 48.
         let current = Some((60usize, 1usize));
         assert!(delta_is_acceptable_with_depth(
-            &[1; 48],
-            200,
-            200,
-            20,
-            10,
-            current,
-            50
+            &[1; 48], 200, 200, 20, 10, current, 50
         ));
         assert!(!delta_is_acceptable_with_depth(
-            &[1; 49],
-            200,
-            200,
-            20,
-            10,
-            current,
-            50
+            &[1; 49], 200, 200, 20, 10, current, 50
         ));
         // Same-depth base keeps the full current budget.
         assert!(delta_is_acceptable_with_depth(
-            &[1; 60],
-            200,
-            200,
-            20,
-            0,
-            current,
-            50
+            &[1; 60], 200, 200, 20, 0, current, 50
         ));
     }
 }

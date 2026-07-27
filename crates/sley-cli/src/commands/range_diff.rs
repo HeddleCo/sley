@@ -152,7 +152,7 @@ fn range_tip(repo: &RepositoryContext, setup_args: &[String]) -> Result<ObjectId
             format: repo.format(),
             reader: repo.objects(),
             config: Some(repo.config()),
-                    assume_dashdash: false,
+            assume_dashdash: false,
         },
     )?;
     setup
@@ -394,7 +394,7 @@ fn is_commit_range(repo: &RepositoryContext, arg: &str) -> bool {
             format: repo.format(),
             reader: repo.objects(),
             config: Some(repo.config()),
-                    assume_dashdash: false,
+            assume_dashdash: false,
         },
     );
     let Ok(setup) = setup else {
@@ -439,7 +439,7 @@ fn read_patches(
             format,
             reader: db,
             config: Some(repo.config()),
-                    assume_dashdash: false,
+            assume_dashdash: false,
         },
     )?;
     let starts = setup

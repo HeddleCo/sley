@@ -8473,16 +8473,10 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
     #[test]
     fn list_root_refs_uses_alternate_backend_worktree_storage() {
         let format = ObjectFormat::Sha1;
-        let main_oid = ObjectId::from_hex(
-            format,
-            "1111111111111111111111111111111111111111",
-        )
-        .expect("main oid");
-        let worktree_oid = ObjectId::from_hex(
-            format,
-            "2222222222222222222222222222222222222222",
-        )
-        .expect("worktree oid");
+        let main_oid = ObjectId::from_hex(format, "1111111111111111111111111111111111111111")
+            .expect("main oid");
+        let worktree_oid = ObjectId::from_hex(format, "2222222222222222222222222222222222222222")
+            .expect("worktree oid");
 
         // --- files backend with alternate storage path ---
         let common_dir = temp_git_dir();

@@ -1810,15 +1810,11 @@ pub(crate) fn checkout_submodule_to_commit(
     if let Ok(meta) = fs::symlink_metadata(&sub_root)
         && meta.file_type().is_symlink()
     {
-        eprintln!(
-            "error: expected submodule path '{path_str}' not to be a symbolic link"
-        );
+        eprintln!("error: expected submodule path '{path_str}' not to be a symbolic link");
         return Err(GitError::Exit(128));
     }
     if sley_submodule::submodule_path_has_symlink_parent(worktree_root, Path::new(&*path_str))? {
-        eprintln!(
-            "error: expected submodule path '{path_str}' not to be a symbolic link"
-        );
+        eprintln!("error: expected submodule path '{path_str}' not to be a symbolic link");
         return Err(GitError::Exit(128));
     }
     let (submodule_name, submodule_url) = submodule_name_and_url_for_path(worktree_root, &path_str)

@@ -365,7 +365,7 @@ fn read_shortlog_from_revisions(
             format,
             reader: db,
             config: Some(repo.config()),
-                    assume_dashdash: false,
+            assume_dashdash: false,
         },
     )?;
     if let Some(leftover) = setup.leftovers.first() {

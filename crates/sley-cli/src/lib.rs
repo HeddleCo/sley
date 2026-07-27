@@ -308,9 +308,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     if let Ok(git_dir) = cli_session.git_dir()
         && let Ok(config) = read_repo_config(&git_dir)
     {
-        sley_core::activate_precompose_unicode(
-            config.get_bool("core", None, "precomposeunicode"),
-        );
+        sley_core::activate_precompose_unicode(config.get_bool("core", None, "precomposeunicode"));
         if dispatch_args.len() > 1 {
             sley_core::precompose_argv_if_needed(&mut dispatch_args[1..]);
         }

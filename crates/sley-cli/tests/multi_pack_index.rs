@@ -605,11 +605,7 @@ fn multi_pack_index_expire_removes_repacked_packs() {
             );
         }
         // Build five disjoint packs A..E (same topology as t5319 setup expire).
-        run_success(
-            sley_testkit::oracle_git(),
-            &root,
-            &["branch", "A", "HEAD"],
-        );
+        run_success(sley_testkit::oracle_git(), &root, &["branch", "A", "HEAD"]);
         run_success(
             sley_testkit::oracle_git(),
             &root,
@@ -630,11 +626,7 @@ fn multi_pack_index_expire_removes_repacked_packs() {
             &root,
             &["branch", "E", "HEAD~18"],
         );
-        let pack_prefix = root
-            .join(".git")
-            .join("objects")
-            .join("pack")
-            .join("pack");
+        let pack_prefix = root.join(".git").join("objects").join("pack").join("pack");
         let pack_prefix = pack_prefix.to_str().expect("utf8 pack prefix");
         for (name, stdin) in [
             ("A", "refs/heads/A\n^refs/heads/B\n"),
@@ -731,11 +723,7 @@ fn multi_pack_index_expire_removes_repacked_packs() {
         // Four largest packs before expire are the expected survivors.
         let mut sized: Vec<(u64, PathBuf)> = after_repack
             .iter()
-            .filter_map(|path| {
-                fs::metadata(path)
-                    .ok()
-                    .map(|m| (m.len(), path.clone()))
-            })
+            .filter_map(|path| fs::metadata(path).ok().map(|m| (m.len(), path.clone())))
             .collect();
         sized.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let expect: Vec<PathBuf> = sized.iter().take(4).map(|(_, p)| p.clone()).collect();

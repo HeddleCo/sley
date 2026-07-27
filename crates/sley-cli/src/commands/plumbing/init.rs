@@ -459,11 +459,7 @@ pub(crate) fn cmd_init(
 /// Uses gettext when `git-compat-i18n` is enabled so upstream tests like
 /// `t0204-gettext-reencode-sanity` see Icelandic (and re-encoded ISO-8859-1)
 /// output under `LANGUAGE=is`. Falls back to English otherwise.
-fn print_init_repository_message(
-    reinitialized: bool,
-    shared: bool,
-    git_dir: &Path,
-) -> Result<()> {
+fn print_init_repository_message(reinitialized: bool, shared: bool, git_dir: &Path) -> Result<()> {
     let path = git_dir.to_string_lossy();
     let slash = if path.ends_with('/') { "" } else { "/" };
     let msgid = match (reinitialized, shared) {

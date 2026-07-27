@@ -1198,7 +1198,8 @@ fn log_fetch_head_in_bare_repo() {
             &["fetch", src.to_str().expect("utf8")],
         );
         assert_eq!(
-            code, 0,
+            code,
+            0,
             "fetch failed: {}\n{}",
             String::from_utf8_lossy(&stdout),
             String::from_utf8_lossy(&stderr)
@@ -1209,7 +1210,8 @@ fn log_fetch_head_in_bare_repo() {
             &["log", "-1", "--format=%s", "FETCH_HEAD"],
         );
         assert_eq!(
-            code, 0,
+            code,
+            0,
             "log FETCH_HEAD failed: {}\n{}",
             String::from_utf8_lossy(&stdout),
             String::from_utf8_lossy(&stderr)

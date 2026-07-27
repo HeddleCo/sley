@@ -308,10 +308,7 @@ fn run_dashed_remote_curl(
 /// Emit the two-layer trace2 events git produces when `git http-fetch` spawns
 /// the dashed `git-http-fetch` helper. Full dumb-HTTP fetch is not implemented;
 /// after the oracle-matching events, fail with the reserved-helper diagnostic.
-fn run_dashed_http_fetch_stub(
-    cli_session: &session::CliSession,
-    args: &[String],
-) -> Result<()> {
+fn run_dashed_http_fetch_stub(cli_session: &session::CliSession, args: &[String]) -> Result<()> {
     let mut child_argv = Vec::with_capacity(args.len() + 1);
     child_argv.push("git-http-fetch".to_string());
     child_argv.extend(args.iter().cloned());

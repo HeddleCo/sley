@@ -488,12 +488,7 @@ fn checkout_patch_head_no_staged_abort_preserves_state() {
 
             let args = ["checkout", "-p", treeish];
             // n=skip bar, y=select dir/foo, n=refuse worktree-only apply
-            let output = run_with_input(
-                sley_testkit::sley_bin!(),
-                &repo,
-                &args,
-                b"n\ny\nn\n",
-            );
+            let output = run_with_input(sley_testkit::sley_bin!(), &repo, &args, b"n\ny\nn\n");
             assert!(
                 output.status.success(),
                 "checkout -p {treeish} abort failed: {}",

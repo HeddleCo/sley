@@ -2229,7 +2229,7 @@ fn update_index_adds_sha256_index_entries() {
 #[cfg(unix)]
 #[test]
 fn update_index_filemode_false_does_not_confuse_symlink_type_change() {
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     let root = unique_temp_dir("update-index-filemode0-symlink");
     let expected = root.join("expected");
@@ -2293,7 +2293,11 @@ fn update_index_adds_gitlink_via_gitfile() {
     let root = unique_temp_dir("update-index-gitfile");
     fs::create_dir_all(&root).expect("create temp");
     {
-        run_success(sley_testkit::sley_bin!(), &root, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
         run_success(
             sley_testkit::sley_bin!(),
             &root,
@@ -2314,7 +2318,11 @@ fn update_index_adds_gitlink_via_gitfile() {
 
         let sub = root.join("sub1");
         fs::create_dir_all(&sub).expect("mkdir sub1");
-        run_success(sley_testkit::sley_bin!(), &sub, &["init", "-q", "-b", "main"]);
+        run_success(
+            sley_testkit::sley_bin!(),
+            &sub,
+            &["init", "-q", "-b", "main"],
+        );
         run_success(
             sley_testkit::sley_bin!(),
             &sub,
@@ -2328,11 +2336,8 @@ fn update_index_adds_gitlink_via_gitfile() {
         // Move .git to .real and leave a gitfile (absolute form).
         let real = sub.join(".real");
         fs::rename(sub.join(".git"), &real).expect("mv .git .real");
-        fs::write(
-            sub.join(".git"),
-            format!("gitdir: {}\n", real.display()),
-        )
-        .expect("write gitfile");
+        fs::write(sub.join(".git"), format!("gitdir: {}\n", real.display()))
+            .expect("write gitfile");
         fs::write(sub.join("f"), b"x\n").expect("write sub file");
         // add/commit must resolve the gitfile worktree (not treat as bare).
         run_success(sley_testkit::sley_bin!(), &sub, &["add", "f"]);

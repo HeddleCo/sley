@@ -764,12 +764,7 @@ fn restore_patch_source_head_preserves_divergent_index() {
             let source_arg = format!("--source={source}");
             let args = ["restore", "-p", source_arg.as_str()];
             // n = skip bar, y = discard dir/foo worktree hunk; extra n if loop continues
-            let output = run_with_input(
-                sley_testkit::sley_bin!(),
-                &repo,
-                &args,
-                b"n\ny\nn\n",
-            );
+            let output = run_with_input(sley_testkit::sley_bin!(), &repo, &args, b"n\ny\nn\n");
             assert!(
                 output.status.success(),
                 "restore -p {source_arg} failed: {}",

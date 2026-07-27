@@ -500,7 +500,6 @@ fn same_dir_identity(a: &Path, b: &Path) -> bool {
     }
 }
 
-
 /// Read a config file from disk and resolve its `include`/`includeIf` directives.
 ///
 /// Missing files (including missing *included* files) are treated as empty, which
@@ -3923,16 +3922,8 @@ mod tests {
              [includeIf \"gitdir/i:BAR/\"]\n\tpath = bar8.cfg\n",
         )
         .expect("write config");
-        fs::write(
-            physical.join(".git/bar7.cfg"),
-            "[test]\n\tseven = 7\n",
-        )
-        .expect("write bar7");
-        fs::write(
-            physical.join(".git/bar8.cfg"),
-            "[test]\n\teight = 8\n",
-        )
-        .expect("write bar8");
+        fs::write(physical.join(".git/bar7.cfg"), "[test]\n\tseven = 7\n").expect("write bar7");
+        fs::write(physical.join(".git/bar8.cfg"), "[test]\n\teight = 8\n").expect("write bar8");
 
         let discovered = physical.join(".git");
         // Discovery path is physical; logical `$PWD` names the symlink.
@@ -3970,11 +3961,8 @@ mod tests {
         assert_eq!(config.get("test", None, "eight"), None);
 
         // Unanchored physical-name pattern still matches the discovered path.
-        fs::write(
-            &main,
-            "[includeIf \"gitdir:foo/\"]\n\tpath = bar7.cfg\n",
-        )
-        .expect("rewrite config");
+        fs::write(&main, "[includeIf \"gitdir:foo/\"]\n\tpath = bar7.cfg\n")
+            .expect("rewrite config");
         let config =
             load_config_with_includes(&main, &physical_ctx).expect("load physical-name include");
         assert_eq!(config.get("test", None, "seven"), Some("7"));

@@ -494,7 +494,10 @@ fn locale_is_single_byte() -> bool {
         return false;
     };
     let locale = locale.to_ascii_lowercase();
-    if locale == "c" || locale == "posix" || locale.starts_with("c.") || locale.starts_with("posix.")
+    if locale == "c"
+        || locale == "posix"
+        || locale.starts_with("c.")
+        || locale.starts_with("posix.")
     {
         return false;
     }
@@ -1485,17 +1488,15 @@ fn match_seq(
     let text = ctx.text;
     match node {
         Node::Empty => cont(pos),
-        Node::Literal(unit) => {
-            literal_match_len(
-                text,
-                pos,
-                unit,
-                ignore_case,
-                ctx.unicode_case_fold,
-                ctx.single_byte_case_fold,
-            )
-            .and_then(|width| cont(pos + width))
-        }
+        Node::Literal(unit) => literal_match_len(
+            text,
+            pos,
+            unit,
+            ignore_case,
+            ctx.unicode_case_fold,
+            ctx.single_byte_case_fold,
+        )
+        .and_then(|width| cont(pos + width)),
         Node::AnyChar => {
             let remaining = text.get(pos..)?;
             if remaining.is_empty() {

@@ -1628,9 +1628,15 @@ fn log_grep_searches_in_log_output_encoding() {
         ];
         for (prefix, needle) in cases {
             let mut sley_cmd = Command::new(sley_testkit::sley_bin!());
-            sley_cmd.current_dir(&root).args(*prefix).arg(OsStr::from_bytes(needle));
+            sley_cmd
+                .current_dir(&root)
+                .args(*prefix)
+                .arg(OsStr::from_bytes(needle));
             let mut git_cmd = Command::new(sley_testkit::oracle_git());
-            git_cmd.current_dir(&root).args(*prefix).arg(OsStr::from_bytes(needle));
+            git_cmd
+                .current_dir(&root)
+                .args(*prefix)
+                .arg(OsStr::from_bytes(needle));
             let actual = sley_cmd.output().expect("run sley");
             let expected = git_cmd.output().expect("run git");
             assert_eq!(
@@ -1639,7 +1645,8 @@ fn log_grep_searches_in_log_output_encoding() {
                 "status for prefix={prefix:?} needle={needle:02x?}"
             );
             assert_eq!(
-                actual.stdout, expected.stdout,
+                actual.stdout,
+                expected.stdout,
                 "stdout for prefix={prefix:?} needle={needle:02x?}\nsley={:?}\ngit={:?}",
                 String::from_utf8_lossy(&actual.stdout),
                 String::from_utf8_lossy(&expected.stdout)

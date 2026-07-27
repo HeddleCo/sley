@@ -231,11 +231,27 @@ fn pull_options_verbosity_stderr_matches_t5521() {
     let cases: &[(&str, &[&str], bool)] = &[
         ("no-rebase", &["pull", "--no-rebase", parent_arg], true),
         ("rebase", &["pull", "--rebase", parent_arg], true),
-        ("v-no-rebase", &["pull", "-v", "--no-rebase", parent_arg], true),
+        (
+            "v-no-rebase",
+            &["pull", "-v", "--no-rebase", parent_arg],
+            true,
+        ),
         ("v-rebase", &["pull", "-v", "--rebase", parent_arg], true),
-        ("q-no-rebase", &["pull", "-q", "--no-rebase", parent_arg], false),
-        ("q-v-no-rebase", &["pull", "-q", "-v", "--no-rebase", parent_arg], true),
-        ("v-q-no-rebase", &["pull", "-v", "-q", "--no-rebase", parent_arg], false),
+        (
+            "q-no-rebase",
+            &["pull", "-q", "--no-rebase", parent_arg],
+            false,
+        ),
+        (
+            "q-v-no-rebase",
+            &["pull", "-q", "-v", "--no-rebase", parent_arg],
+            true,
+        ),
+        (
+            "v-q-no-rebase",
+            &["pull", "-v", "-q", "--no-rebase", parent_arg],
+            false,
+        ),
     ];
     for (label, args, expect_stderr) in cases {
         let cloned = root.join(format!("cloned-{label}"));
@@ -318,11 +334,7 @@ fn pull_force_allows_non_fast_forward_tracking_update() {
         f.write_all(config.as_bytes()).expect("append config");
     }
     // Seed via remote "two" so origin tracks parent's main.
-    let seed = run_output_with_identity(
-        sley_testkit::sley_bin!(),
-        &cloned,
-        &["pull", "two"],
-    );
+    let seed = run_output_with_identity(sley_testkit::sley_bin!(), &cloned, &["pull", "two"]);
     assert!(
         seed.status.success(),
         "seed pull two failed: {}",
@@ -362,16 +374,8 @@ fn pull_force_allows_non_fast_forward_tracking_update() {
         String::from_utf8_lossy(&forced.stderr)
     );
     // origin must now match parent's main (forced back), not the local commit A.
-    let origin = run_output(
-        sley_testkit::sley_bin!(),
-        &cloned,
-        &["rev-parse", "origin"],
-    );
-    let parent_main = run_output(
-        sley_testkit::sley_bin!(),
-        &parent,
-        &["rev-parse", "main"],
-    );
+    let origin = run_output(sley_testkit::sley_bin!(), &cloned, &["rev-parse", "origin"]);
+    let parent_main = run_output(sley_testkit::sley_bin!(), &parent, &["rev-parse", "main"]);
     assert_eq!(
         origin.stdout, parent_main.stdout,
         "origin should be forced back to parent main"

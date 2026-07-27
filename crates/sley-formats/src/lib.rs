@@ -3328,9 +3328,10 @@ fn probe_and_record_filesystem_traits(git_dir: &Path, config_path: &Path) -> Res
 
 fn upsert_core_bool(config: &mut GitConfig, key: &str, value: bool) {
     let text = if value { "true" } else { "false" };
-    let section = config.sections.iter_mut().rev().find(|section| {
-        section.name.eq_ignore_ascii_case("core") && section.subsection.is_none()
-    });
+    let section =
+        config.sections.iter_mut().rev().find(|section| {
+            section.name.eq_ignore_ascii_case("core") && section.subsection.is_none()
+        });
     if let Some(section) = section {
         if let Some(entry) = section
             .entries
