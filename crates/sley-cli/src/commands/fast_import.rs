@@ -328,6 +328,9 @@ pub(crate) fn cmd_fast_import(
     // anything we don't model so a caller never gets a silently-wrong import.
     let mut require_done = false;
     let mut options = FastImportOptions::default();
+    // Resolve git_dir first so `--relative-marks` can rewrite marks paths
+    // left-to-right (git's sticky relative_marks_paths at each option).
+    let git_dir = cli_session.git_dir()?;
     for arg in args {
         match arg.as_str() {
             // No-op flags that don't change the minimal-subset behavior.
@@ -359,8 +362,18 @@ pub(crate) fn cmd_fast_import(
                     option_value(value, "--cat-blob-fd="),
                 )?);
             }
+            "--relative-marks" => {
+                options.relative_marks = true;
+            }
+            "--no-relative-marks" => {
+                options.relative_marks = false;
+            }
             value if value.starts_with("--export-marks=") => {
-                options.export_marks = Some(PathBuf::from(option_value(value, "--export-marks=")));
+                options.export_marks = Some(make_fast_import_path(
+                    &git_dir,
+                    options.relative_marks,
+                    option_value(value, "--export-marks="),
+                ));
             }
             value if value.starts_with("--export-pack-edges=") => {
                 options.export_pack_edges =
@@ -368,13 +381,21 @@ pub(crate) fn cmd_fast_import(
             }
             value if value.starts_with("--import-marks=") => {
                 options.import_marks.push(MarksImport {
-                    path: PathBuf::from(option_value(value, "--import-marks=")),
+                    path: make_fast_import_path(
+                        &git_dir,
+                        options.relative_marks,
+                        option_value(value, "--import-marks="),
+                    ),
                     missing_ok: false,
                 });
             }
             value if value.starts_with("--import-marks-if-exists=") => {
                 options.import_marks.push(MarksImport {
-                    path: PathBuf::from(option_value(value, "--import-marks-if-exists=")),
+                    path: make_fast_import_path(
+                        &git_dir,
+                        options.relative_marks,
+                        option_value(value, "--import-marks-if-exists="),
+                    ),
                     missing_ok: true,
                 });
             }
@@ -398,7 +419,6 @@ pub(crate) fn cmd_fast_import(
         }
     }
 
-    let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let mut db = FastImportDatabase::new(FileObjectDatabase::from_git_dir(&git_dir, format));
     let store = FileRefStore::new(&git_dir, format);
@@ -769,10 +789,16 @@ fn ensure_unsafe_marks_feature(options: &FastImportOptions, feature: &[u8]) -> R
 fn marks_feature_path(git_dir: &Path, relative: bool, value: &[u8]) -> Result<PathBuf> {
     let text = std::str::from_utf8(trim_ascii(value))
         .map_err(|_| GitError::InvalidFormat("fast-import: marks path is not utf8".into()))?;
-    if relative {
-        Ok(git_dir.join("info").join("fast-import").join(text))
+    Ok(make_fast_import_path(git_dir, relative, text))
+}
+
+/// git's `make_fast_import_path`: when `--relative-marks` is active and `path`
+/// is not absolute, place it under `.git/info/fast-import/`.
+fn make_fast_import_path(git_dir: &Path, relative: bool, path: &str) -> PathBuf {
+    if relative && !Path::new(path).is_absolute() {
+        git_dir.join("info").join("fast-import").join(path)
     } else {
-        Ok(PathBuf::from(text))
+        PathBuf::from(path)
     }
 }
 
