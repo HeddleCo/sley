@@ -211,8 +211,7 @@ where
         // When an explicit `--` is present, every positional before it is a
         // revision, even if it happens to carry pathspec magic. This decision
         // must be known before parsing the earlier tokens.
-        let has_pathspec_separator =
-            self.ctx.assume_dashdash || args.iter().any(|arg| arg == "--");
+        let has_pathspec_separator = self.ctx.assume_dashdash || args.iter().any(|arg| arg == "--");
         let mut iter = args.iter().peekable();
         while let Some(arg) = iter.next() {
             if positional_only {

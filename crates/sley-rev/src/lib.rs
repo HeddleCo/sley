@@ -6957,8 +6957,8 @@ mod tests {
                 format: ObjectFormat::Sha1,
                 reader: &db,
                 config: None,
-                        assume_dashdash: false,
-        },
+                assume_dashdash: false,
+            },
         )
         .expect("setup should parse parent shorthand range");
         assert_eq!(
@@ -8658,8 +8658,8 @@ mod tests {
                 format: ObjectFormat::Sha1,
                 reader: &fixture.db,
                 config: None,
-                        assume_dashdash: false,
-        },
+                assume_dashdash: false,
+            },
         )
     }
 
@@ -9684,9 +9684,8 @@ mod tests {
         let now = parse_reflog_selector_date("now").expect("now should parse");
         assert!((nowish - now).abs() <= 2, "nowish={nowish} now={now}");
     }
-}
 
-#[test]
+    #[test]
     fn setup_revisions_skips_path_ambiguity_inside_git_dir() {
         let fixture = setup_revisions_fixture();
         // Ensure the git-dir-resident `HEAD` file exists (it always does).
@@ -9703,10 +9702,11 @@ mod tests {
                 format: ObjectFormat::Sha1,
                 reader: &fixture.db,
                 config: None,
-                        assume_dashdash: false,
-        },
+                assume_dashdash: false,
+            },
         )
         .expect("HEAD inside git dir must not be path-ambiguous");
         assert_eq!(setup.options.positives[0].oid, fixture.tip);
         assert!(setup.pathspecs.is_empty());
     }
+}
