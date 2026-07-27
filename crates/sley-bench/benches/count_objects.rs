@@ -1,4 +1,5 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use sley_bench::{BenchFixture, create_fixture};
 use sley_core::{GitError, Result};
 use std::io::Write;

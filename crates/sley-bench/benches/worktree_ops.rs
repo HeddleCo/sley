@@ -11,7 +11,8 @@
 //! The reference `git` binary is taken from `GIT_BENCH_BIN` (falling back to
 //! `git` on `PATH`), matching the oracle harness's convention.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use sley_core::{GitError, Result};
 use std::fs;
 use std::path::{Path, PathBuf};

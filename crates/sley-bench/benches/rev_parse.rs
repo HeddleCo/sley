@@ -1,5 +1,5 @@
 use criterion::{
-    BenchmarkId, Criterion, SamplingMode, Throughput, black_box, criterion_group, criterion_main,
+    BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
 use sley_bench::{
     BenchFixture, FIXTURE_OBJECT_COUNT, LARGE_FIXTURE_OBJECT_COUNT, MEDIUM_FIXTURE_OBJECT_COUNT,
@@ -7,6 +7,7 @@ use sley_bench::{
 };
 use sley_core::{GitError, Result};
 use sley_odb::ObjectPrefixResolution;
+use std::hint::black_box;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};

@@ -4,7 +4,8 @@
 //! cargo bench -p sley-bench --bench batch_check_profile -- --quick
 //! ```
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 use sley_bench::{BenchFixture, FIXTURE_OBJECT_COUNT, create_fixture};
 use sley_core::ObjectId;
 use sley_object::ObjectType;
