@@ -702,6 +702,21 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
         let Some(file_path) = safe_worktree_path(&self.worktree_root, path) else {
             return Ok(());
         };
+        // git's `check_leading_path` (symlinks.c): walk each leading component
+        // with lstat. When a non-directory (symlink or regular file) sits on
+        // the path, `lstat(full_path)` can still "succeed" by following the
+        // intermediate symlink (e.g. tracked `frotz` → `xyzzy` makes
+        // `frotz/filfre` appear as `xyzzy/filfre`). Git then only checks that
+        // *leading* component: if it is tracked (will be CE_REMOVE'd by the
+        // merge, as in the symlink→dir D/F case of t2007) the path is free;
+        // if untracked it is the obstruction. Never report the through-symlink
+        // leaf as an untracked file.
+        if let Some(leading) = leading_nondir_component(&self.worktree_root, path)? {
+            if self.original_paths.contains(leading.as_slice()) {
+                return Ok(());
+            }
+            return reject_untracked_would_be_overwritten(self.porcelain, &leading);
+        }
         let Ok(metadata) = fs::symlink_metadata(&file_path) else {
             return Ok(());
         };
@@ -736,23 +751,7 @@ impl sley_unpack_trees::WorktreeProbe for ReadTreeWorktree<'_> {
             }
             return self.verify_clean_subdirectory(path, &file_path);
         }
-        match self.porcelain {
-            UnpackPorcelain::ReadTree => {
-                let display = String::from_utf8_lossy(path);
-                eprintln!(
-                    "error: Untracked working tree file '{display}' would be overwritten by merge."
-                );
-            }
-            UnpackPorcelain::Checkout => {
-                eprintln!(
-                    "error: The following untracked working tree files would be overwritten by checkout:"
-                );
-                eprintln!("\t{}", String::from_utf8_lossy(path));
-                eprintln!("Please move or remove them before you switch branches.");
-                eprintln!("Aborting");
-            }
-        }
-        Err(GitError::Exit(128))
+        reject_untracked_would_be_overwritten(self.porcelain, path)
     }
 
     fn verify_absent_remove(
@@ -2162,6 +2161,73 @@ fn stat_info_from_lstat(file_path: &Path) -> Result<sley_unpack_trees::StatInfo>
         gid: 0,
         size: md.len().min(u32::MAX as u64) as u32,
     })
+}
+
+/// git's `check_leading_path` reduced to the verify_absent case: walk each
+/// leading path component of `git_path` with `lstat`. Return the repo-relative
+/// prefix of the first non-directory (symlink or regular file). Return `None`
+/// when every leading component is a real directory, or when a component is
+/// missing (nothing can be "in the way" through a hole).
+///
+/// Intermediate symlinks matter because `lstat("frotz/filfre")` follows
+/// `frotz` when it is a symlink, making a tracked target leaf look like an
+/// untracked file at the new path (t2007 symlink→dir).
+fn leading_nondir_component(worktree_root: &Path, git_path: &[u8]) -> Result<Option<Vec<u8>>> {
+    let Ok(text) = std::str::from_utf8(git_path) else {
+        return Ok(None);
+    };
+    let mut current = worktree_root.to_path_buf();
+    let mut accumulated = Vec::new();
+    let mut components = text.split('/').filter(|c| !c.is_empty()).peekable();
+    while let Some(component) = components.next() {
+        // The leaf itself is checked by the caller via symlink_metadata; only
+        // leading components participate in check_leading_path.
+        if components.peek().is_none() {
+            break;
+        }
+        if !accumulated.is_empty() {
+            accumulated.push(b'/');
+        }
+        accumulated.extend_from_slice(component.as_bytes());
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            // Real directory: keep walking.
+            Ok(md) if md.is_dir() && !md.file_type().is_symlink() => {}
+            // Symlink or regular file (or other non-dir) occupies this component.
+            Ok(_) => return Ok(Some(accumulated)),
+            Err(err)
+                if err.kind() == io::ErrorKind::NotFound
+                    || err.kind() == io::ErrorKind::NotADirectory =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(None)
+}
+
+/// Emit the porcelain-specific "untracked would be overwritten" abort for
+/// `path` and return exit 128, matching git's `add_rejected_path` path for
+/// `ERROR_WOULD_LOSE_UNTRACKED_OVERWRITTEN`.
+fn reject_untracked_would_be_overwritten(porcelain: UnpackPorcelain, path: &[u8]) -> Result<()> {
+    match porcelain {
+        UnpackPorcelain::ReadTree => {
+            let display = String::from_utf8_lossy(path);
+            eprintln!(
+                "error: Untracked working tree file '{display}' would be overwritten by merge."
+            );
+        }
+        UnpackPorcelain::Checkout => {
+            eprintln!(
+                "error: The following untracked working tree files would be overwritten by checkout:"
+            );
+            eprintln!("\t{}", String::from_utf8_lossy(path));
+            eprintln!("Please move or remove them before you switch branches.");
+            eprintln!("Aborting");
+        }
+    }
+    Err(GitError::Exit(128))
 }
 
 /// git's `write_entry` D/F-removal preamble: remove whatever currently occupies
