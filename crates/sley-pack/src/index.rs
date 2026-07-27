@@ -887,6 +887,24 @@ impl PackIndex {
         Self::write_v2_for_pack_reader_with_limits(reader, format, PackReadLimits::default())
     }
 
+    /// [`Self::write_v2_for_pack_reader`] with an external ref-delta resolver.
+    pub fn write_v2_for_pack_reader_with_base<R, F>(
+        reader: &mut R,
+        format: ObjectFormat,
+        external_base: F,
+    ) -> Result<PackStreamIndexBuild>
+    where
+        R: Read + Seek,
+        F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+    {
+        Self::write_v2_for_pack_reader_with_base_and_limits(
+            reader,
+            format,
+            external_base,
+            PackReadLimits::default(),
+        )
+    }
+
     pub fn write_v2_for_pack_reader_with_limits<R>(
         reader: &mut R,
         format: ObjectFormat,
@@ -896,6 +914,19 @@ impl PackIndex {
         R: Read + Seek,
     {
         index_pack_from_reader_with_limits(reader, format, limits)
+    }
+
+    pub fn write_v2_for_pack_reader_with_base_and_limits<R, F>(
+        reader: &mut R,
+        format: ObjectFormat,
+        external_base: F,
+        limits: PackReadLimits,
+    ) -> Result<PackStreamIndexBuild>
+    where
+        R: Read + Seek,
+        F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+    {
+        index_pack_from_reader_with_base_and_limits(reader, format, external_base, limits)
     }
 
     /// Validate and index a pack from the reader's current position, stopping
@@ -918,6 +949,25 @@ impl PackIndex {
         )
     }
 
+    /// [`Self::write_v2_for_pack_reader_to_trailer`] with an external
+    /// ref-delta resolver.
+    pub fn write_v2_for_pack_reader_to_trailer_with_base<R, F>(
+        reader: &mut R,
+        format: ObjectFormat,
+        external_base: F,
+    ) -> Result<PackStreamIndexBuild>
+    where
+        R: Read,
+        F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+    {
+        Self::write_v2_for_pack_reader_to_trailer_with_base_and_limits(
+            reader,
+            format,
+            external_base,
+            PackReadLimits::default(),
+        )
+    }
+
     pub fn write_v2_for_pack_reader_to_trailer_with_limits<R>(
         reader: &mut R,
         format: ObjectFormat,
@@ -927,6 +977,24 @@ impl PackIndex {
         R: Read,
     {
         index_pack_from_reader_to_trailer_with_limits(reader, format, limits)
+    }
+
+    pub fn write_v2_for_pack_reader_to_trailer_with_base_and_limits<R, F>(
+        reader: &mut R,
+        format: ObjectFormat,
+        external_base: F,
+        limits: PackReadLimits,
+    ) -> Result<PackStreamIndexBuild>
+    where
+        R: Read,
+        F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+    {
+        index_pack_from_reader_to_trailer_with_base_and_limits(
+            reader,
+            format,
+            external_base,
+            limits,
+        )
     }
 
     /// `write_v2_for_pack_reader_to_trailer` that reports streaming pack
