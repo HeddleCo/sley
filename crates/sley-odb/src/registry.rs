@@ -10,7 +10,7 @@ use std::{env, fs};
 use crate::loose::collect_loose_object_ids;
 use crate::pack::{
     FileObjectDatabase, LruOffsetCache, PackBytesCache, PackData, PackHeaderTypeCache,
-    delta_base_cache_budget, load_pack_data, load_pack_index_data,
+    load_pack_data, load_pack_index_data,
 };
 
 #[derive(Debug)]
@@ -24,13 +24,13 @@ pub(crate) struct RegisteredPack {
 }
 
 impl RegisteredPack {
-    pub(crate) fn new(idx: PathBuf, pack: PathBuf) -> Self {
+    pub(crate) fn new(idx: PathBuf, pack: PathBuf, delta_base_cache_budget: usize) -> Self {
         Self {
             idx,
             pack,
             index: RwLock::new(None),
             data: Mutex::new(None),
-            delta_cache: Arc::new(Mutex::new(LruOffsetCache::new(delta_base_cache_budget()))),
+            delta_cache: Arc::new(Mutex::new(LruOffsetCache::new(delta_base_cache_budget))),
             header_type_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -747,6 +747,7 @@ fn pack_dir_modified(pack_dir: &Path) -> Result<Option<std::time::SystemTime>> {
 pub(crate) fn scan_pack_registry(
     pack_dir: &Path,
     _format: ObjectFormat,
+    delta_base_cache_budget: usize,
 ) -> Result<PackRegistrySnapshot> {
     let modified = pack_dir_modified(pack_dir)?;
     let entries = match fs::read_dir(pack_dir) {
@@ -792,7 +793,7 @@ pub(crate) fn scan_pack_registry(
         packs.push((
             modified,
             metadata.len(),
-            Arc::new(RegisteredPack::new(idx, pack)),
+            Arc::new(RegisteredPack::new(idx, pack, delta_base_cache_budget)),
         ));
     }
     // Git keeps a most-recently-used pack order; seed ours with newer/larger

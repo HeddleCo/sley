@@ -44,7 +44,12 @@ static TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// delta base before emitting any candidate bytes.
 #[derive(Debug, Clone)]
 pub struct ReusablePackCandidate {
+    /// In-memory pack bytes supplied by generic readers.
     pub pack: Arc<[u8]>,
+    /// File-backed pack source supplied by filesystem readers. When present,
+    /// reachable-pack reuse validates and streams this path through the ODB's
+    /// mmap-capable loader instead of copying the complete pack into the heap.
+    pub pack_path: Option<PathBuf>,
     pub entries: Vec<PackIndexEntry>,
     pub pack_checksum: ObjectId,
 }

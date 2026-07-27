@@ -11,8 +11,9 @@ use crate::pktline::{
     write_pkt_line_payload,
 };
 use crate::sideband::{
-    SideBandChannel, SideBandDemux, SideBandPacket, encode_sideband_packet,
-    parse_and_demux_sideband_packets, parse_sideband_packet, write_sideband_payload,
+    SideBandChannel, SideBandDemux, SideBandPacket, StreamingSidebandWriter,
+    encode_sideband_packet, parse_and_demux_sideband_packets, parse_sideband_packet,
+    write_sideband_payload,
 };
 use crate::v0::{RefAdvertisement, RefAdvertisementSet, TransportHandshake};
 
@@ -1539,6 +1540,57 @@ pub fn write_protocol_v2_fetch_response(
     sections: &[ProtocolV2FetchResponseSection],
 ) -> Result<()> {
     write_protocol_v2_fetch_response_inner(writer, sections, false, false)
+}
+
+/// Write ordinary response sections followed by a streamed `packfile` section.
+///
+/// The callback receives a sideband channel-1 writer, so raw pack bytes are
+/// framed as they arrive and never coexist with a `Vec<Vec<u8>>` copy of the
+/// complete sideband response.
+pub fn write_protocol_v2_fetch_response_with_streaming_packfile<W, F, T>(
+    writer: &mut W,
+    sections: &[ProtocolV2FetchResponseSection],
+    write_packfile: F,
+) -> Result<T>
+where
+    W: Write,
+    F: FnOnce(&mut StreamingSidebandWriter<'_, W>) -> Result<T>,
+{
+    if sections
+        .iter()
+        .any(|section| matches!(section, ProtocolV2FetchResponseSection::Packfile(_)))
+    {
+        return Err(GitError::InvalidFormat(
+            "streaming fetch response prefix contains a packfile section".into(),
+        ));
+    }
+
+    let mut in_packfile = false;
+    for (idx, section) in sections.iter().enumerate() {
+        if idx != 0 {
+            write_pkt_line_frame(writer, &PktLineFrame::Delimiter)?;
+        }
+        write_protocol_v2_fetch_payload(
+            writer,
+            &line_from_str(protocol_v2_fetch_section_name(section)),
+            false,
+            &mut in_packfile,
+        )?;
+        for payload in format_protocol_v2_fetch_section_lines(section)? {
+            write_protocol_v2_fetch_payload(writer, &payload, false, &mut in_packfile)?;
+        }
+    }
+    if !sections.is_empty() {
+        write_pkt_line_frame(writer, &PktLineFrame::Delimiter)?;
+    }
+    write_pkt_line_payload(writer, &line_from_str("packfile"))?;
+
+    let result = {
+        let mut packfile = StreamingSidebandWriter::new(writer);
+        write_packfile(&mut packfile)?
+    };
+    writer.write_all(b"0000")?;
+    Ok(result)
 }
 
 pub fn read_protocol_v2_fetch_sideband_all_response(

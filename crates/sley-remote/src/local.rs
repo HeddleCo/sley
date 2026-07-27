@@ -23,9 +23,10 @@ use sley_core::{
 use sley_object::{Commit, ObjectType, Tag};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, ReachablePackMissingPolicy,
-    ReachablePackThinBaseCandidates, build_and_install_reachable_pack,
+    ReachablePackReuseWrite, ReachablePackThinBaseCandidates, build_and_install_reachable_pack,
     build_and_install_reachable_pack_filtered_with_thin_bases, build_reachable_pack,
     build_reachable_pack_filtered, collect_reachable_object_ids, repository_common_dir,
+    write_reachable_pack_with_reuse_stats_to_writer,
 };
 use sley_protocol::{
     PKT_LINE_MAX_PAYLOAD_LEN, PktLineFrame, ProtocolErrorLine, ProtocolV2FetchAcknowledgment,
@@ -34,18 +35,19 @@ use sley_protocol::{
     ProtocolV2LsRefsRecord, ProtocolV2LsRefsRef, ProtocolV2LsRefsRequest, ProtocolVersion,
     ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures, ReceivePackPushRequest,
     ReceivePackPushRequestHeader, ReceivePackReportStatus, ReceivePackRequest,
-    ReceivePackUnpackStatus, RefAdvertisement, SideBandChannel, SideBandPacket, TransportHandshake,
-    UploadPackAckStatus, UploadPackAcknowledgment, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackPackfileResponse, UploadPackRawPackfileResponse,
-    UploadPackRequest, apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
-    classify_protocol_v2_command_request, encode_protocol_v2_fetch_capability,
-    encode_protocol_v2_ls_refs_capability, encode_receive_pack_features,
-    encode_upload_pack_features, protocol_v2_ls_refs_records_to_ref_advertisement_set,
-    read_protocol_v2_command_request, read_upload_pack_acknowledgment,
-    read_upload_pack_negotiation_request, read_upload_pack_request,
-    validate_receive_pack_push_request_features, write_error_line, write_pkt_line_frame,
-    write_pkt_line_payload, write_protocol_v2_advertisement, write_protocol_v2_command_request,
-    write_protocol_v2_fetch_request, write_protocol_v2_fetch_response,
+    ReceivePackUnpackStatus, RefAdvertisement, SideBandChannel, SideBandPacket,
+    StreamingSidebandWriter, TransportHandshake, UploadPackAckStatus, UploadPackAcknowledgment,
+    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackPackfileResponse,
+    UploadPackRawPackfileResponse, UploadPackRequest, apply_receive_pack_push_request,
+    build_upload_pack_raw_packfile_response, classify_protocol_v2_command_request,
+    encode_protocol_v2_fetch_capability, encode_protocol_v2_ls_refs_capability,
+    encode_receive_pack_features, encode_upload_pack_features, prepare_upload_pack_response,
+    protocol_v2_ls_refs_records_to_ref_advertisement_set, read_protocol_v2_command_request,
+    read_upload_pack_acknowledgment, read_upload_pack_negotiation_request,
+    read_upload_pack_request, validate_receive_pack_push_request_features, write_error_line,
+    write_pkt_line_frame, write_pkt_line_payload, write_protocol_v2_advertisement,
+    write_protocol_v2_command_request, write_protocol_v2_fetch_request,
+    write_protocol_v2_fetch_response, write_protocol_v2_fetch_response_with_streaming_packfile,
     write_protocol_v2_ls_refs_response, write_upload_pack_acknowledgment,
     write_upload_pack_negotiation_request, write_upload_pack_request,
 };
@@ -175,6 +177,44 @@ pub fn upload_pack_from_local_repository(
                 .map(|pack| pack.map(|pack| pack.pack))
         },
     )
+}
+
+/// Serve a v0/v1 upload-pack response directly to `writer`. Raw pack bytes pass
+/// through a bounded sideband adapter instead of being duplicated into a
+/// complete packet vector.
+pub fn write_upload_pack_from_local_repository(
+    git_dir: &Path,
+    format: ObjectFormat,
+    features: &UploadPackFeatures,
+    request: UploadPackRequest,
+    haves: HashSet<ObjectId>,
+    sideband: bool,
+    writer: &mut impl std::io::Write,
+) -> Result<ReachablePackReuseWrite> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let plan = prepare_upload_pack_response(features, request, haves, |oid| db.contains(oid))?;
+    let excluded = collect_reachable_object_ids(&db, format, plan.known_haves)?;
+    for acknowledgment in &plan.acknowledgments {
+        write_upload_pack_acknowledgment(writer, acknowledgment)?;
+    }
+
+    let build = if sideband {
+        let build = {
+            let mut packfile = StreamingSidebandWriter::new(writer);
+            write_reachable_pack_with_reuse_stats_to_writer(
+                &db,
+                format,
+                plan.wants,
+                &excluded,
+                &mut packfile,
+            )?
+        };
+        std::io::Write::write_all(writer, b"0000")?;
+        build
+    } else {
+        write_reachable_pack_with_reuse_stats_to_writer(&db, format, plan.wants, &excluded, writer)?
+    };
+    build.ok_or_else(|| GitError::InvalidObject("upload-pack request produced empty pack".into()))
 }
 
 /// The receive-pack capabilities advertised for a local repository: report
@@ -2703,16 +2743,26 @@ fn resolve_upload_pack_want_refs(
     Ok(wanted)
 }
 
-/// Build the protocol-v2 `fetch` response sections for a request against the
-/// repository at `git_dir`. Mirrors `upload-pack.c::upload_pack_v2`'s
-/// stateless single-round behavior: the client always sends `done` (the v2
-/// clone/fetch path negotiates haves up front and finishes with `done`), so the
-/// acknowledgments section is omitted and the response is just the packfile.
-fn local_fetch_v2_sections(
+struct LocalFetchV2PackPlan {
+    database: FileObjectDatabase,
+    wants: Vec<ObjectId>,
+    excluded: HashSet<ObjectId>,
+    filter: Option<sley_odb::PackObjectFilter>,
+}
+
+struct LocalFetchV2Plan {
+    sections: Vec<ProtocolV2FetchResponseSection>,
+    pack: Option<LocalFetchV2PackPlan>,
+}
+
+/// Prepare the non-pack sections and reachability inputs for one protocol-v2
+/// fetch. Keeping the pack as a plan lets the stdio server write it directly to
+/// sideband while in-process callers can retain their materialized response API.
+fn local_fetch_v2_plan(
     git_dir: &Path,
     format: ObjectFormat,
     request: &ProtocolV2FetchRequest,
-) -> Result<Vec<ProtocolV2FetchResponseSection>> {
+) -> Result<LocalFetchV2Plan> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
 
     // Validate direct wants and resolve want-refs before acknowledgments, matching
@@ -2760,7 +2810,10 @@ fn local_fetch_v2_sections(
         // client explicitly asked the server not to start the pack until a
         // subsequent request carries `done`.
         if !ready || request.wait_for_done {
-            return Ok(sections);
+            return Ok(LocalFetchV2Plan {
+                sections,
+                pack: None,
+            });
         }
     }
 
@@ -2782,7 +2835,10 @@ fn local_fetch_v2_sections(
     // capabilities; emitting an empty `packfile` section is observably
     // different and can also corrupt a surrounding TAP stream.
     if wants.is_empty() {
-        return Ok(sections);
+        return Ok(LocalFetchV2Plan {
+            sections,
+            pack: None,
+        });
     }
 
     // Apply upload-pack's shallow request before constructing the pack. The
@@ -2886,18 +2942,89 @@ fn local_fetch_v2_sections(
         .filter
         .as_deref()
         .and_then(crate::pack_filter_from_spec);
-    let pack = if filter.is_some() {
-        build_reachable_pack_filtered(&db, format, wants, &excluded, filter)?
+    Ok(LocalFetchV2Plan {
+        sections,
+        pack: Some(LocalFetchV2PackPlan {
+            database: db,
+            wants,
+            excluded,
+            filter,
+        }),
+    })
+}
+
+/// Build the protocol-v2 `fetch` response sections for an in-process caller.
+/// The stdio upload-pack server uses [`write_local_fetch_v2_response`] instead
+/// so the pack never becomes a second sideband-framing buffer.
+fn local_fetch_v2_sections(
+    git_dir: &Path,
+    format: ObjectFormat,
+    request: &ProtocolV2FetchRequest,
+) -> Result<Vec<ProtocolV2FetchResponseSection>> {
+    let LocalFetchV2Plan { mut sections, pack } = local_fetch_v2_plan(git_dir, format, request)?;
+    let Some(pack) = pack else {
+        return Ok(sections);
+    };
+    let pack = if pack.filter.is_some() {
+        build_reachable_pack_filtered(
+            &pack.database,
+            format,
+            pack.wants,
+            &pack.excluded,
+            pack.filter,
+        )?
     } else {
-        build_reachable_pack(&db, format, wants, &excluded)?
+        build_reachable_pack(&pack.database, format, pack.wants, &pack.excluded)?
     }
     .map(|pack| pack.pack)
     .unwrap_or_default();
-
     sections.push(ProtocolV2FetchResponseSection::Packfile(
         packfile_section_lines(&pack),
     ));
     Ok(sections)
+}
+
+fn write_local_fetch_v2_response(
+    git_dir: &Path,
+    format: ObjectFormat,
+    request: &ProtocolV2FetchRequest,
+    writer: &mut impl std::io::Write,
+) -> Result<()> {
+    let LocalFetchV2Plan { sections, pack } = local_fetch_v2_plan(git_dir, format, request)?;
+    let Some(pack) = pack else {
+        if !sections.is_empty() {
+            write_protocol_v2_fetch_response(writer, &sections)?;
+        }
+        return Ok(());
+    };
+
+    write_protocol_v2_fetch_response_with_streaming_packfile(writer, &sections, |packfile| {
+        if pack.filter.is_some() {
+            let generated = build_reachable_pack_filtered(
+                &pack.database,
+                format,
+                pack.wants,
+                &pack.excluded,
+                pack.filter,
+            )?
+            .ok_or_else(|| {
+                GitError::InvalidObject("upload-pack request produced empty pack".into())
+            })?;
+            std::io::Write::write_all(packfile, &generated.pack)?;
+        } else {
+            write_reachable_pack_with_reuse_stats_to_writer(
+                &pack.database,
+                format,
+                pack.wants,
+                &pack.excluded,
+                packfile,
+            )?
+            .ok_or_else(|| {
+                GitError::InvalidObject("upload-pack request produced empty pack".into())
+            })?;
+        }
+        Ok(())
+    })
 }
 
 /// Serve a protocol-v2 upload-pack session over `reader`/`writer` for the
@@ -3016,13 +3143,8 @@ fn serve_upload_pack_v2_inner(
                 writer.flush()?;
             }
             sley_protocol::ProtocolV2Command::Fetch(fetch) => {
-                match local_fetch_v2_sections(git_dir, format, &fetch) {
-                    Ok(sections) => {
-                        if !sections.is_empty() {
-                            write_protocol_v2_fetch_response(writer, &sections)?;
-                            writer.flush()?;
-                        }
-                    }
+                match write_local_fetch_v2_response(git_dir, format, &fetch, writer) {
+                    Ok(()) => writer.flush()?,
                     Err(err) => {
                         // Mirror git's packet_writer_error + die: emit ERR so the
                         // client can report `fatal: remote error: …`, then fail.
