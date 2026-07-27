@@ -45,15 +45,8 @@ fn run_env(program: &str, cwd: &Path, args: &[&str]) -> Output {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        // A just-built oracle invokes nested `git` commands (notably automatic
-        // maintenance). Keep those on the same 2.55 binary instead of falling
-        // through to an older system Git on PATH.
-        .env(
-            "GIT_EXEC_PATH",
-            Path::new(sley_testkit::oracle_git())
-                .parent()
-                .unwrap_or_else(|| Path::new(".")),
-        )
+        // The absolute oracle binary uses its compiled libexec path for Git
+        // subcommands. Do not replace it with bin/, which hides git-submodule.
         .output()
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
