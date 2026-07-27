@@ -240,23 +240,30 @@ fn now_unix() -> i64 {
 /// git's `match_string`: case-insensitive prefix match; returns the number of
 /// matched leading chars, or 0 on a non-alphanumeric mismatch.
 fn match_string(date: &[u8], pat: &str) -> usize {
+    // git's `match_string`: walk both strings in lockstep. A longer alnum
+    // continuation in `date` after `pat` is exhausted is a mismatch (return 0)
+    // so "seventeen" does not match "seven" (t7501 bogus-date cell).
     let pat = pat.as_bytes();
     let mut i = 0;
     while i < date.len() {
         let d = date[i];
-        let p = if i < pat.len() { pat[i] } else { 0 };
-        if p != 0 && d.eq_ignore_ascii_case(&p) {
-            i += 1;
-            continue;
+        if i < pat.len() {
+            let p = pat[i];
+            if d.eq_ignore_ascii_case(&p) {
+                i += 1;
+                continue;
+            }
+            // Mismatch: non-alnum ends the match; alnum fails entirely.
+            if !d.is_ascii_alphanumeric() {
+                break;
+            }
+            return 0;
         }
-        if !d.is_ascii_alphanumeric() {
-            break;
+        // Pattern exhausted: alnum continuation is a non-match (git returns 0).
+        if d.is_ascii_alphanumeric() {
+            return 0;
         }
-        // Mismatch on an alphanumeric char that doesn't continue the pattern.
-        if i >= pat.len() {
-            break;
-        }
-        return 0;
+        break;
     }
     i
 }
@@ -1022,8 +1029,19 @@ pub(crate) fn parse_commit_date(date: &str) -> Option<(i64, String)> {
     if let Some((raw_secs, raw_tz)) = split_raw_seconds_tz(trimmed) {
         return Some((raw_secs, raw_tz));
     }
-    let (seconds, offset) = parse_date_basic_full(trimmed.as_bytes())?;
-    Some((seconds, format_tz_offset(offset)))
+    // Absolute / ISO / RFC forms first (git's `parse_date` → `parse_date_basic`).
+    if let Some((seconds, offset)) = parse_date_basic_full(trimmed.as_bytes()) {
+        return Some((seconds, format_tz_offset(offset)));
+    }
+    // Fuzzy relative / partial forms — git's `parse_force_date` falls back to
+    // `approxidate_careful` and stores `@<timestamp>` (no explicit zone). Under
+    // sley's UTC-convention local clock that zone is `+0000`, which is also what
+    // the test suite pins via `TZ=UTC` / test-lib.
+    let (ts, had_error) = approxidate_careful(trimmed.as_bytes());
+    if had_error {
+        return None;
+    }
+    Some((ts, "+0000".to_string()))
 }
 
 /// Recognise git's already-canonical `<seconds> <+HHMM>` raw date (with an
@@ -1152,5 +1170,13 @@ mod tests {
         assert!(parse_expiry_date("Blue").is_none());
         assert!(parse_expiry_date("~/dir").is_none());
         assert!(parse_expiry_date(":(optional)no-such-path").is_none());
+    }
+
+    #[test]
+    fn asctime_with_tz() {
+        let r = parse_commit_date("Thu Apr 7 22:13:13 2005 +0000");
+        assert!(r.is_some(), "expected parse");
+        // 1112911993 is 2005-04-07 22:13:13 UTC
+        assert_eq!(r.expect("valid approxidate").0, 1_112_911_993);
     }
 }
