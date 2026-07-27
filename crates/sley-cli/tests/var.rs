@@ -140,3 +140,56 @@ fn var_list_reports_config_overrides_and_computed_values() {
     }
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+/// t7005-editor #1: with no GIT_EDITOR/VISUAL/EDITOR/core.editor and a non-dumb
+/// TERM, `git var GIT_EDITOR` falls back to the compiled default (`vi`).
+#[test]
+fn var_git_editor_default_matches_upstream_git() {
+    let repo = init_repo("var-editor-default");
+    {
+        let home = repo.join("home");
+        let xdg = repo.join("xdg");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&xdg).expect("xdg");
+
+        for (term, expect_success) in [("vt100", true), ("dumb", false)] {
+            let run = |program: &str| {
+                Command::new(program)
+                    .current_dir(&repo)
+                    .args(["var", "GIT_EDITOR"])
+                    .env("HOME", &home)
+                    .env("XDG_CONFIG_HOME", &xdg)
+                    .env("TERM", term)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env_remove("GIT_EDITOR")
+                    .env_remove("VISUAL")
+                    .env_remove("EDITOR")
+                    .env_remove("GIT_SEQUENCE_EDITOR")
+                    .output()
+                    .unwrap_or_else(|err| panic!("failed to run {program}: {err}"))
+            };
+            let expected = run(sley_testkit::oracle_git());
+            let actual = run(sley_testkit::sley_bin!());
+            assert_eq!(
+                actual.status.code(),
+                expected.status.code(),
+                "status for TERM={term}"
+            );
+            assert_eq!(actual.stdout, expected.stdout, "stdout for TERM={term}");
+            if expect_success {
+                assert!(actual.status.success(), "TERM={term} should succeed");
+                let editor = String::from_utf8_lossy(&actual.stdout);
+                assert!(
+                    !editor.trim().is_empty(),
+                    "default editor must be non-empty for TERM={term}, got {editor:?}"
+                );
+            } else {
+                assert!(
+                    !actual.status.success(),
+                    "TERM=dumb should fail without EDITOR"
+                );
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+}

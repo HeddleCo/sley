@@ -60,8 +60,25 @@ pub(crate) fn dispatch_with_aliases(
         if try_alias {
             match commands::alias::alias_lookup(&cli_session, &command)? {
                 commands::alias::AliasLookup::None => {}
-                commands::alias::AliasLookup::MissingValue(key) => {
-                    eprintln!("error: missing value for '{key}'");
+                commands::alias::AliasLookup::MissingValue(missing) => {
+                    // git's `config_error_nonbool` + config die trailer:
+                    //   error: missing value for 'alias.br'
+                    //   fatal: bad config line 2 in file .git/config
+                    eprintln!("error: missing value for '{}'", missing.key);
+                    match (missing.file.as_deref(), missing.line) {
+                        (Some(path), Some(line)) => {
+                            eprintln!("fatal: bad config line {line} in file {path}");
+                        }
+                        (Some(path), None) => {
+                            eprintln!("fatal: bad config line in file {path}");
+                        }
+                        (None, Some(line)) => {
+                            eprintln!("fatal: bad config line {line}");
+                        }
+                        (None, None) => {
+                            eprintln!("fatal: bad config line");
+                        }
+                    }
                     return Err(GitError::Exit(128));
                 }
                 commands::alias::AliasLookup::Value(alias_string) => {
@@ -376,7 +393,7 @@ fn dispatch_command(
         "check-attr" => commands::attrs::cmd_check_attr(cli_session, &args[1..]),
         "check-ignore" => commands::attrs::cmd_check_ignore(cli_session, &args[1..]),
         "check-mailmap" => commands::utility::cmd_check_mailmap(cli_session, &args[1..]),
-        "check-ref-format" => commands::utility::cmd_check_ref_format(&args[1..]),
+        "check-ref-format" => commands::utility::cmd_check_ref_format(cli_session, &args[1..]),
         "clean" => commands::plumbing::cmd_clean(cli_session, &args[1..]),
         "clone" => commands::remote::cmd_clone(cli_session, &args[1..]),
         "config" => commands::config_cmd::cmd_config(cli_session, &args[1..]),

@@ -491,8 +491,9 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
             .map(AddAction::path)
             .cloned()
             .collect::<Vec<_>>();
+        let mut verbose_actions = actions;
         if !action_paths.is_empty() {
-            let had_errors = update_index_paths_filtered_for_add(
+            let outcome = update_index_paths_filtered_for_add(
                 &worktree_root,
                 &git_dir,
                 format,
@@ -509,7 +510,15 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
                 &context.config,
                 ignore_errors,
             )?;
-            if had_errors {
+            if ignore_errors {
+                // Only report paths that actually landed in the index.
+                let succeeded: BTreeSet<_> = outcome.succeeded.iter().collect();
+                verbose_actions.retain(|action| succeeded.contains(action.path()));
+            }
+            if outcome.had_errors {
+                if verbose {
+                    print_add_actions(&worktree_root, &verbose_actions)?;
+                }
                 return Err(GitError::Exit(1));
             }
         }
@@ -525,7 +534,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
             )?;
         }
         if verbose {
-            print_add_actions(&worktree_root, &actions)?;
+            print_add_actions(&worktree_root, &verbose_actions)?;
         }
         return Ok(());
     }
@@ -623,7 +632,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
             ignore_skip_worktree_entries: false,
             allow_skip_worktree_entries: sparse,
         };
-        let had_errors = if ignore_errors {
+        let outcome = if ignore_errors {
             update_index_paths_filtered_for_add(
                 &worktree_root,
                 &git_dir,
@@ -643,7 +652,10 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
                 update_options,
                 &context.config,
             )?;
-            false
+            AddIndexUpdateOutcome {
+                had_errors: false,
+                succeeded: action_paths.clone(),
+            }
         } else {
             update_index_paths_filtered_for_add(
                 &worktree_root,
@@ -653,23 +665,49 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
                 update_options,
                 &context.config,
                 false,
-            )?;
-            false
+            )?
         };
+        let mut verbose_actions = actions;
+        if ignore_errors {
+            let succeeded: BTreeSet<_> = outcome.succeeded.iter().collect();
+            verbose_actions.retain(|action| succeeded.contains(action.path()));
+        }
         if warn_embedded {
             warn_on_embedded_repos(
                 &context.config,
                 &worktree_root,
-                &actions,
+                &verbose_actions,
                 &previously_tracked,
             )?;
         }
-        if had_errors {
+        if outcome.had_errors {
             if verbose {
-                print_add_actions(&worktree_root, &actions)?;
+                print_add_actions(&worktree_root, &verbose_actions)?;
             }
             return Err(GitError::Exit(1));
         }
+        // Reuse filtered list for the post-success verbose print below.
+        if verbose {
+            print_add_actions(&worktree_root, &verbose_actions)?;
+        }
+        if do_refresh && !add_refresh_is_redundant(&worktree_root, &refresh_paths, &verbose_actions)
+        {
+            refresh_index_after_add(
+                &cwd,
+                &worktree_root,
+                &git_dir,
+                format,
+                &refresh_paths,
+                false,
+                pathspec_magic,
+            )?;
+        }
+        if !ignored_paths.is_empty() {
+            print_add_ignored_paths(&context.config, &ignored_paths);
+            return Err(GitError::Exit(1));
+        }
+        commands::hooks::run_post_index_change_hook(cli_session, false, false)?;
+        return Ok(());
     }
     if do_refresh && !add_refresh_is_redundant(&worktree_root, &refresh_paths, &actions) {
         refresh_index_after_add(
@@ -782,6 +820,17 @@ fn add_update_tracked_action_to_add_action(
     }
 }
 
+/// Result of a (possibly partial) index update for `git add`.
+///
+/// `had_errors` is true when at least one path failed under `--ignore-errors`
+/// / `add.ignoreErrors`. `succeeded` lists the paths that were written so
+/// verbose mode can print only those (git's `ADD_CACHE_VERBOSE` path only
+/// prints successful `add '…'` lines).
+struct AddIndexUpdateOutcome {
+    had_errors: bool,
+    succeeded: Vec<PathBuf>,
+}
+
 fn update_index_paths_filtered_for_add(
     worktree_root: &Path,
     git_dir: &Path,
@@ -790,7 +839,7 @@ fn update_index_paths_filtered_for_add(
     options: sley_worktree::UpdateIndexOptions,
     config: &GitConfig,
     ignore_errors: bool,
-) -> Result<bool> {
+) -> Result<AddIndexUpdateOutcome> {
     if !ignore_errors {
         sley_worktree::update_index_paths_filtered(
             worktree_root,
@@ -800,11 +849,15 @@ fn update_index_paths_filtered_for_add(
             options,
             config,
         )?;
-        return Ok(false);
+        return Ok(AddIndexUpdateOutcome {
+            had_errors: false,
+            succeeded: paths.to_vec(),
+        });
     }
     let mut had_errors = false;
+    let mut succeeded = Vec::new();
     for path in paths {
-        if let Err(err) = sley_worktree::update_index_paths_filtered(
+        match sley_worktree::update_index_paths_filtered(
             worktree_root,
             git_dir,
             format,
@@ -812,11 +865,39 @@ fn update_index_paths_filtered_for_add(
             options,
             config,
         ) {
-            eprintln!("error: {err}");
-            had_errors = true;
+            Ok(_) => succeeded.push(path.clone()),
+            Err(err) => {
+                print_add_ignore_errors_message(worktree_root, path, &err);
+                had_errors = true;
+            }
         }
     }
-    Ok(had_errors)
+    Ok(AddIndexUpdateOutcome {
+        had_errors,
+        succeeded,
+    })
+}
+
+/// git's `index_path` / `add_to_index` failure lines under `ADD_CACHE_IGNORE_ERRORS`:
+/// `error: open("path"): Permission denied` then `error: unable to index file 'path'`.
+fn print_add_ignore_errors_message(worktree_root: &Path, path: &Path, err: &GitError) {
+    let display = path
+        .strip_prefix(worktree_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let message = err.to_string();
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("permission denied") {
+        eprintln!("error: open(\"{display}\"): Permission denied");
+        eprintln!("error: unable to index file '{display}'");
+    } else if let Some(io_msg) = message.strip_prefix("io error: ") {
+        eprintln!("error: open(\"{display}\"): {io_msg}");
+        eprintln!("error: unable to index file '{display}'");
+    } else {
+        eprintln!("error: {message}");
+        eprintln!("error: unable to index file '{display}'");
+    }
 }
 
 fn try_add_regular_exact_tracked_raw(
@@ -890,8 +971,13 @@ fn refresh_index_after_add(
     strict_pathspec: bool,
     pathspec_magic: sley_worktree::PathspecMatchMagic,
 ) -> Result<()> {
+    // Empty `refresh_paths` means "every tracked entry" (bare `add -u`/`-A` or
+    // bare `--refresh`). Non-empty means "only pathspec matches"; when nothing
+    // matches and we are non-strict, skip the refresh entirely rather than
+    // falling through to a full-index refresh (empty path list in the engine
+    // means "all").
     let selected = if refresh_paths.is_empty() {
-        Vec::new()
+        None
     } else {
         let Some(mut index) = sley_worktree::read_repository_index(git_dir, format)? else {
             if strict_pathspec {
@@ -937,13 +1023,17 @@ fn refresh_index_after_add(
             eprintln!("fatal: pathspec '{}' did not match any files", spec.display);
             return Err(GitError::Exit(128));
         }
-        selected
+        if selected.is_empty() {
+            return Ok(());
+        }
+        Some(selected)
     };
+    let paths = selected.as_deref().unwrap_or(&[]);
     sley_worktree::refresh_index_paths_with_options(
         worktree_root,
         git_dir,
         format,
-        &selected,
+        paths,
         /* quiet */ true,
         /* ignore_missing */ true,
         /* ignore_submodules */ false,
@@ -1334,7 +1424,35 @@ fn add_pathspec_arg_for_matcher(worktree_root: &Path, path: &Path) -> Result<Str
     if !path.is_absolute() {
         return Ok(path.to_string_lossy().into_owned());
     }
-    let absolute = normalize_add_pathspec_absolute_path_lexically(path);
+    // Resolve absolute pathspecs the same way the rest of `add` does
+    // (`normalize_add_absolute_path`): canonicalize the parent so symlink
+    // prefixes (`/var` → `/private/var` on macOS) and case-insensitive
+    // directory folds land under `worktree_root`. Lexical-only normalization
+    // fails t3700 "path is case-insensitive", where the user lowercases the
+    // whole absolute path including intermediate components.
+    let absolute = normalize_add_absolute_path(worktree_root, path);
+    let absolute = match absolute.strip_prefix(worktree_root) {
+        Ok(_) => absolute,
+        Err(_) => {
+            let lexical = normalize_add_pathspec_absolute_path_lexically(path);
+            match lexical.strip_prefix(worktree_root) {
+                Ok(_) => lexical,
+                Err(_) => case_insensitive_existing_path_under_worktree(worktree_root, &absolute)
+                    .or_else(|| {
+                        case_insensitive_existing_path_under_worktree(worktree_root, &lexical)
+                    })
+                    .or_else(|| {
+                        // Last resort: canonicalize the full path (folds case +
+                        // resolves symlinks) when the file exists.
+                        fs::canonicalize(path).ok().filter(|canonical| {
+                            canonical.starts_with(worktree_root)
+                                || case_insensitive_path_under_prefix(worktree_root, canonical)
+                        })
+                    })
+                    .unwrap_or(absolute),
+            }
+        }
+    };
     let absolute = match absolute.strip_prefix(worktree_root) {
         Ok(_) => absolute,
         Err(_) => case_insensitive_existing_path_under_worktree(worktree_root, &absolute)
@@ -1349,6 +1467,26 @@ fn add_pathspec_arg_for_matcher(worktree_root: &Path, path: &Path) -> Result<Str
     } else {
         Ok(format!(":/{}", String::from_utf8_lossy(&git_path)))
     }
+}
+
+/// True when `path` lies under `prefix` ignoring ASCII case of every component
+/// (used after canonicalize on case-insensitive filesystems).
+fn case_insensitive_path_under_prefix(prefix: &Path, path: &Path) -> bool {
+    let prefix_components = prefix
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let path_components = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    if path_components.len() < prefix_components.len() {
+        return false;
+    }
+    prefix_components
+        .iter()
+        .zip(&path_components)
+        .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
 fn normalize_add_pathspec_absolute_path_lexically(path: &Path) -> PathBuf {
@@ -2193,6 +2331,22 @@ pub(super) fn normalize_add_absolute_path(cwd: &Path, path: &Path) -> PathBuf {
         && let Some(parent) = absolute.parent()
         && let Ok(canonical_parent) = fs::canonicalize(parent)
     {
+        // On case-insensitive filesystems the parent canonicalize already folds
+        // intermediate components (`/var/.../t/tmp` → `/private/var/.../T/tmp`).
+        // Prefer the on-disk spelling of the final component too so
+        // `git add $(pwd | tr A-Z a-z)/blub` stages `BLUB` (t3700).
+        let wanted = name.to_string_lossy();
+        if let Ok(entries) = fs::read_dir(&canonical_parent) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&wanted)
+                {
+                    return entry.path();
+                }
+            }
+        }
         return canonical_parent.join(name);
     }
     if let Ok(canonical) = fs::canonicalize(&absolute) {

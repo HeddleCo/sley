@@ -10,11 +10,17 @@
 //! - `alias.<name> = <value>` — no subsection, case-*insensitive* name.
 //! - `[alias "<name>"] command = <value>` — subsection, case-*sensitive* name.
 //!   An empty subsection (`alias..<key>`) is treated as the plain form.
+//!
+//! Historically git also accepts the "simple dotted" form
+//! `alias.foo.bar = value` (written that way or as `[alias "foo"] bar = …`):
+//! when a subsection-style key is not the dedicated `command` key, the full
+//! remainder after `alias.` becomes the two-level alias name (`foo.bar`),
+//! matched case-insensitively. See `config_alias_cb` in git's `alias.c`.
 
 use crate::sley_config;
 use sley::plumbing::sley_config::ConfigIncludeContext;
 use sley::plumbing::sley_core;
-use sley::{GitConfig, GitError, Result};
+use sley::{GitError, Result};
 use std::env;
 use std::fs;
 use std::mem;
@@ -46,6 +52,19 @@ pub(crate) fn is_builtin_command(command: &str) -> bool {
     crate::commands::help::is_builtin_command(command)
 }
 
+/// Diagnostic payload for git's `config_error_nonbool` on a bare alias key:
+/// `error: missing value for '<key>'` followed by
+/// `fatal: bad config line <N> in file <path>` when the entry came from a file.
+#[derive(Debug, Clone)]
+pub(crate) struct AliasMissingValue {
+    /// Canonical config key (`alias.br`, `alias.noval.command`, …).
+    pub key: String,
+    /// Origin path as git would report it (e.g. `.git/config`), when known.
+    pub file: Option<String>,
+    /// 1-based physical source line, when known.
+    pub line: Option<usize>,
+}
+
 /// The result of looking up a command name in the `alias.*` namespace, mirroring
 /// `alias_lookup`'s `config_alias_cb`.
 pub(crate) enum AliasLookup {
@@ -53,9 +72,22 @@ pub(crate) enum AliasLookup {
     None,
     /// An alias is defined with this value string.
     Value(String),
-    /// An alias key matched but its value is a bare boolean (missing value);
-    /// carries the full config key for git's `missing value for '<key>'` error.
-    MissingValue(String),
+    /// An alias key matched but its value is a bare boolean (missing value).
+    MissingValue(AliasMissingValue),
+}
+
+/// One resolved alias definition: the command name users type, the expansion
+/// value, and the original config key (for diagnostics).
+struct ResolvedAlias<'a> {
+    /// Name used as a git subcommand (`st`, `simple.dotted`, …).
+    name: String,
+    /// Subsection-form names are case-sensitive; plain / dotted are not.
+    case_sensitive: bool,
+    /// Full config key (`alias.<…>`) as git reports it.
+    config_key: String,
+    value: Option<&'a str>,
+    file: Option<&'a str>,
+    line: Option<usize>,
 }
 
 /// Look up `command` against the `alias.*` config, faithfully reproducing git's
@@ -65,45 +97,31 @@ pub(crate) fn alias_lookup(
     cli_session: &crate::session::CliSession,
     command: &str,
 ) -> Result<AliasLookup> {
-    let config = load_alias_config(cli_session)?;
+    let stack = load_alias_stack(cli_session)?;
     let mut found: Option<String> = None;
-    for section in &config.sections {
-        if !section.name.eq_ignore_ascii_case("alias") {
+    for entry in &stack.entries {
+        let Some(resolved) = resolve_alias_entry(entry) else {
+            continue;
+        };
+        let matches = if resolved.case_sensitive {
+            resolved.name == command
+        } else {
+            resolved.name.eq_ignore_ascii_case(command)
+        };
+        if !matches {
             continue;
         }
-        // Treat `[alias ""]` (empty subsection) the same as plain `[alias]`.
-        let subsection = section
-            .subsection
-            .as_deref()
-            .filter(|name| !name.is_empty());
-        for entry in &section.entries {
-            // With a subsection, only the `command` key is an alias.
-            if subsection.is_some() && !entry.key.eq_ignore_ascii_case("command") {
-                continue;
-            }
-            let matches = match subsection {
-                // Subsection name: byte-exact (case-sensitive).
-                Some(name) => name == command,
-                // Plain alias name: case-insensitive.
-                None => entry.key.eq_ignore_ascii_case(command),
-            };
-            if !matches {
-                continue;
-            }
-            match &entry.value {
-                Some(value) => found = Some(value.clone()),
-                None => {
-                    // git's `git_config_string` on a NULL value aborts config
-                    // parsing with `config_error_nonbool` — a fatal "missing
-                    // value for '<key>'". The reported key is `alias.<name>` for
-                    // the plain form, `alias.<subsection>.command` for the
-                    // subsection form.
-                    let key = match subsection {
-                        Some(name) => format!("alias.{name}.command"),
-                        None => format!("alias.{}", entry.key),
-                    };
-                    return Ok(AliasLookup::MissingValue(key));
-                }
+        match resolved.value {
+            Some(value) => found = Some(value.to_string()),
+            None => {
+                // git's `git_config_string` on a NULL value aborts config
+                // parsing with `config_error_nonbool` — a fatal "missing
+                // value for '<key>'" plus the bad-config-line trailer.
+                return Ok(AliasLookup::MissingValue(AliasMissingValue {
+                    key: resolved.config_key,
+                    file: resolved.file.map(str::to_string),
+                    line: resolved.line,
+                }));
             }
         }
     }
@@ -114,50 +132,99 @@ pub(crate) fn alias_lookup(
 }
 
 /// Every alias `(name, value)` defined in the effective config, for
-/// `git help -a`. Mirrors `list_aliases`: plain entries contribute their key,
-/// subsection entries contribute the subsection name (only for the `command`
-/// key). The last value for a name wins, then names are sorted.
+/// `git help -a`. Mirrors `list_aliases`: subsection `command` keys contribute
+/// the subsection name; any other subsection key falls back to the simple
+/// dotted name (`subsection.key`); plain keys contribute themselves. The last
+/// value for a name wins, then names are sorted.
 pub(crate) fn list_aliases(
     cli_session: &crate::session::CliSession,
 ) -> Result<Vec<(String, String)>> {
-    let config = load_alias_config(cli_session)?;
+    let stack = load_alias_stack(cli_session)?;
     let mut aliases: Vec<(String, String)> = Vec::new();
-    for section in &config.sections {
-        if !section.name.eq_ignore_ascii_case("alias") {
+    for entry in &stack.entries {
+        let Some(resolved) = resolve_alias_entry(entry) else {
             continue;
-        }
-        let subsection = section
-            .subsection
-            .as_deref()
-            .filter(|name| !name.is_empty());
-        for entry in &section.entries {
-            let Some(value) = &entry.value else {
-                continue;
-            };
-            let name = match subsection {
-                Some(name) => {
-                    if !entry.key.eq_ignore_ascii_case("command") {
-                        continue;
-                    }
-                    name.to_string()
-                }
-                None => entry.key.clone(),
-            };
-            if let Some(existing) = aliases.iter_mut().find(|(n, _)| n == &name) {
-                existing.1 = value.clone();
-            } else {
-                aliases.push((name, value.clone()));
-            }
+        };
+        let Some(value) = resolved.value else {
+            // git's list path also dies on bare booleans; for help -a we skip
+            // incomplete entries so a partial config still lists the rest.
+            continue;
+        };
+        // Listing uses the resolved name exactly as stored (case preserved for
+        // both forms). Last definition wins for equal names.
+        if let Some(existing) = aliases.iter_mut().find(|(n, _)| n == &resolved.name) {
+            existing.1 = value.to_string();
+        } else {
+            aliases.push((resolved.name, value.to_string()));
         }
     }
     aliases.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(aliases)
 }
 
-/// Load the effective config (system + global + repository) with the
-/// command-line `-c` / `GIT_CONFIG_PARAMETERS` overrides folded in, so alias
-/// lookups see `git -c alias.x=… x` just like file-defined aliases.
-fn load_alias_config(cli_session: &crate::session::CliSession) -> Result<GitConfig> {
+/// Map one config stack entry in the `alias` section to its alias name, using
+/// git's `config_alias_cb` two-syntax rules (including the simple dotted
+/// fallback when the key is not the dedicated `command` key).
+fn resolve_alias_entry(entry: &sley_config::ConfigStackEntry) -> Option<ResolvedAlias<'_>> {
+    if !entry.section.eq_ignore_ascii_case("alias") {
+        return None;
+    }
+    // Treat `[alias ""]` (empty subsection) the same as plain `[alias]`.
+    let subsection = entry.subsection.as_deref().filter(|name| !name.is_empty());
+    let key = entry.key.as_str();
+    let config_key = match subsection {
+        Some(name) => format!("alias.{name}.{key}"),
+        None => format!("alias.{key}"),
+    };
+    let file = match entry.origin.kind {
+        sley_config::ConfigOriginKind::File if !entry.origin.name.is_empty() => {
+            Some(entry.origin.name.as_str())
+        }
+        _ => None,
+    };
+    let line = entry.line_number;
+    let value = entry.value.as_deref();
+
+    // git: if (subsection && strcmp(key, "command")) fall back to two-level.
+    // Note: `command` is compared case-sensitively, just like git's strcmp.
+    if let Some(name) = subsection {
+        if key == "command" {
+            return Some(ResolvedAlias {
+                name: name.to_string(),
+                case_sensitive: true,
+                config_key,
+                value,
+                file,
+                line,
+            });
+        }
+        // Simple dotted form: `alias.foo.bar` / `[alias "foo"] bar = …`
+        // becomes the two-level alias name `foo.bar` (case-insensitive).
+        return Some(ResolvedAlias {
+            name: format!("{name}.{key}"),
+            case_sensitive: false,
+            config_key,
+            value,
+            file,
+            line,
+        });
+    }
+
+    Some(ResolvedAlias {
+        name: key.to_string(),
+        case_sensitive: false,
+        config_key,
+        value,
+        file,
+        line,
+    })
+}
+
+/// Load the effective config event stream (system + global + repository +
+/// command-line `-c` / `GIT_CONFIG_PARAMETERS`) so alias lookups see the same
+/// layers as git's `read_early_config`, with origin/line metadata for the
+/// missing-value diagnostic.
+fn load_alias_stack(cli_session: &crate::session::CliSession) -> Result<sley_config::ConfigStack> {
     let cwd = cli_session.cwd();
     let git_dir = cli_session.git_dir().ok();
     let common_git_dir = git_dir
@@ -167,15 +234,33 @@ fn load_alias_config(cli_session: &crate::session::CliSession) -> Result<GitConf
         .as_ref()
         .and_then(|dir| repo_current_branch_name(dir));
     let context = ConfigIncludeContext::new(common_git_dir.clone(), branch);
-    let mut config = sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)?;
+    let mut stack = sley_config::ConfigStack::new();
+    for (path, scope) in sley_config::default_config_layer_paths() {
+        stack.push_file(&path, scope, true, &context)?;
+    }
+    if let Some(common) = common_git_dir.as_ref() {
+        // Prefer a cwd-relative origin name (`.git/config`) so the missing-
+        // value fatal matches git's `bad config line N in file .git/config`.
+        let local = alias_config_display_path(cwd, common.join("config"));
+        stack.push_file(&local, sley_config::ConfigScope::Local, true, &context)?;
+    }
     let parameters = injected_config_parameters()?;
-    sley_config::append_injected_config_sections_with_includes(
-        &mut config,
-        &parameters,
-        &context,
-        cwd,
-    )?;
-    Ok(config)
+    stack.push_parameters_with_includes(&parameters, &context)?;
+    Ok(stack)
+}
+
+/// Display a config path the way git reports it: relative to the working
+/// directory when it lies underneath.
+fn alias_config_display_path(cwd: &Path, path: PathBuf) -> PathBuf {
+    if let Ok(relative) = path.strip_prefix(cwd) {
+        return relative.to_path_buf();
+    }
+    if let Ok(process_cwd) = env::current_dir()
+        && let Ok(relative) = path.strip_prefix(&process_cwd)
+    {
+        return relative.to_path_buf();
+    }
+    path
 }
 
 /// Execute a `!`-prefixed alias through git's shell path, reproducing git's
@@ -349,5 +434,60 @@ mod tests {
         assert!(is_deprecated_command("whatchanged"));
         assert!(is_deprecated_command("pack-redundant"));
         assert!(!is_deprecated_command("status"));
+    }
+
+    #[test]
+    fn resolve_alias_entry_simple_dotted_fallback() {
+        let entry = sley_config::ConfigStackEntry {
+            section: "alias".into(),
+            subsection: Some("simple".into()),
+            key: "dotted".into(),
+            value: Some("!echo ran".into()),
+            scope: sley_config::ConfigScope::Local,
+            origin: sley_config::ConfigOrigin::file(".git/config"),
+            included_from: None,
+            line_number: Some(3),
+        };
+        let resolved = resolve_alias_entry(&entry).expect("alias entry");
+        assert_eq!(resolved.name, "simple.dotted");
+        assert!(!resolved.case_sensitive);
+        assert_eq!(resolved.config_key, "alias.simple.dotted");
+        assert_eq!(resolved.value, Some("!echo ran"));
+    }
+
+    #[test]
+    fn resolve_alias_entry_subsection_command_is_case_sensitive() {
+        let entry = sley_config::ConfigStackEntry {
+            section: "alias".into(),
+            subsection: Some("SubCase".into()),
+            key: "command".into(),
+            value: Some("!echo upper".into()),
+            scope: sley_config::ConfigScope::Local,
+            origin: sley_config::ConfigOrigin::file(".git/config"),
+            included_from: None,
+            line_number: Some(2),
+        };
+        let resolved = resolve_alias_entry(&entry).expect("alias entry");
+        assert_eq!(resolved.name, "SubCase");
+        assert!(resolved.case_sensitive);
+        assert_eq!(resolved.config_key, "alias.SubCase.command");
+    }
+
+    #[test]
+    fn resolve_alias_entry_plain_form() {
+        let entry = sley_config::ConfigStackEntry {
+            section: "alias".into(),
+            subsection: None,
+            key: "st".into(),
+            value: Some("status".into()),
+            scope: sley_config::ConfigScope::Local,
+            origin: sley_config::ConfigOrigin::file(".git/config"),
+            included_from: None,
+            line_number: Some(2),
+        };
+        let resolved = resolve_alias_entry(&entry).expect("alias entry");
+        assert_eq!(resolved.name, "st");
+        assert!(!resolved.case_sensitive);
+        assert_eq!(resolved.config_key, "alias.st");
     }
 }

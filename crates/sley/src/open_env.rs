@@ -134,7 +134,7 @@ fn discover_git_dir_with_ceilings(start: &Path) -> Result<PathBuf> {
         if candidate != absolute.as_path()
             && ceilings
                 .iter()
-                .any(|ceiling| paths_refer_to_same_dir(ceiling, candidate))
+                .any(|ceiling| ceiling.matches_discovery_candidate(candidate))
         {
             break;
         }
@@ -164,14 +164,72 @@ fn discover_git_dir_with_ceilings(start: &Path) -> Result<PathBuf> {
     discover_git_dir(start)
 }
 
-fn discovery_ceiling_directories() -> Vec<PathBuf> {
-    match env::var("GIT_CEILING_DIRECTORIES") {
-        Ok(value) if !value.is_empty() => value
-            .split(':')
-            .filter(|entry| !entry.is_empty())
-            .map(PathBuf::from)
-            .collect(),
-        _ => Vec::new(),
+/// One `GIT_CEILING_DIRECTORIES` entry after git's `canonicalize_ceiling_entry`
+/// processing (empty entries disable realpath for subsequent ceilings).
+struct CeilingDirectory {
+    path: PathBuf,
+    resolved: bool,
+}
+
+impl CeilingDirectory {
+    fn matches_discovery_candidate(&self, candidate: &Path) -> bool {
+        let ceiling = strip_trailing_slashes(&self.path);
+        let candidate_raw = strip_trailing_slashes(candidate);
+        if ceiling.as_os_str() == candidate_raw.as_os_str() {
+            return true;
+        }
+        if !self.resolved {
+            return false;
+        }
+        match fs::canonicalize(candidate) {
+            Ok(canonical) => strip_trailing_slashes(&canonical).as_os_str() == ceiling.as_os_str(),
+            Err(_) => false,
+        }
+    }
+}
+
+fn discovery_ceiling_directories() -> Vec<CeilingDirectory> {
+    let Ok(value) = env::var("GIT_CEILING_DIRECTORIES") else {
+        return Vec::new();
+    };
+    if value.is_empty() {
+        return Vec::new();
+    }
+    let mut empty_entry_found = false;
+    let mut out = Vec::new();
+    for entry in value.split(':') {
+        if entry.is_empty() {
+            empty_entry_found = true;
+            continue;
+        }
+        let path = Path::new(entry);
+        if !path.is_absolute() {
+            continue;
+        }
+        if empty_entry_found {
+            out.push(CeilingDirectory {
+                path: strip_trailing_slashes(path),
+                resolved: false,
+            });
+            continue;
+        }
+        if let Ok(canonical) = fs::canonicalize(path) {
+            out.push(CeilingDirectory {
+                path: strip_trailing_slashes(&canonical),
+                resolved: true,
+            });
+        }
+    }
+    out
+}
+
+fn strip_trailing_slashes(path: &Path) -> PathBuf {
+    let raw = path.as_os_str().to_string_lossy();
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.is_empty() {
+        PathBuf::from(std::path::MAIN_SEPARATOR.to_string())
+    } else {
+        PathBuf::from(trimmed)
     }
 }
 
@@ -192,16 +250,6 @@ fn device_of(path: &Path) -> Option<u64> {
     {
         let _ = path;
         None
-    }
-}
-
-fn paths_refer_to_same_dir(left: &Path, right: &Path) -> bool {
-    if left == right {
-        return true;
-    }
-    match (fs::canonicalize(left), fs::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
     }
 }
 

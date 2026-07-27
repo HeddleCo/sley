@@ -192,3 +192,127 @@ fn builtin_init_is_not_replaced_by_alias() {
     }
     let _ = fs::remove_dir_all(&root);
 }
+
+/// t0014 #12: `alias.simple.dotted = !echo …` expands as `git simple.dotted`.
+///
+/// git stores this as `[alias "simple"] dotted = …` and
+/// `config_alias_cb` falls back to the two-level name `simple.dotted`.
+#[test]
+fn simple_dotted_alias_syntax_matches_upstream_git() {
+    let root = unique_temp_dir("alias-simple-dotted");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream dir");
+    fs::create_dir_all(&rust).expect("create rust dir");
+    {
+        for (dir, program) in [
+            (&upstream, sley_testkit::oracle_git()),
+            (&rust, sley_testkit::sley_bin!()),
+        ] {
+            let output = Command::new(program)
+                .current_dir(dir)
+                .args(["init", "-q"])
+                .output()
+                .unwrap_or_else(|err| panic!("failed to init with {program}: {err}"));
+            assert!(
+                output.status.success(),
+                "{program} init failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = Command::new(program)
+                .current_dir(dir)
+                .args(["config", "alias.simple.dotted", "!echo ran-simple-dotted"])
+                .output()
+                .unwrap_or_else(|err| panic!("failed to set alias with {program}: {err}"));
+            assert!(
+                output.status.success(),
+                "{program} config alias failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_status_stdout_stderr_match(&upstream, &rust, &["simple.dotted"]);
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t0014 #21: simple dotted aliases appear under `git help -a` by their
+/// dotted name (`simple.listed`), not only as a bare subsection.
+#[test]
+fn simple_dotted_aliases_listed_in_help_a_matches_upstream_git() {
+    let root = unique_temp_dir("alias-dotted-help-a");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream dir");
+    fs::create_dir_all(&rust).expect("create rust dir");
+    {
+        for (dir, program) in [
+            (&upstream, sley_testkit::oracle_git()),
+            (&rust, sley_testkit::sley_bin!()),
+        ] {
+            let output = Command::new(program)
+                .current_dir(dir)
+                .args(["init", "-q"])
+                .output()
+                .unwrap_or_else(|err| panic!("failed to init with {program}: {err}"));
+            assert!(
+                output.status.success(),
+                "{program} init failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = Command::new(program)
+                .current_dir(dir)
+                .args(["config", "alias.simple.listed", "!echo test"])
+                .output()
+                .unwrap_or_else(|err| panic!("failed to set alias with {program}: {err}"));
+            assert!(
+                output.status.success(),
+                "{program} config alias failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &["help", "-a"]);
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &["help", "-a"]);
+        assert_eq!(
+            actual.status.code(),
+            expected.status.code(),
+            "help -a status differed\nstderr:\n{}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        let expected_out = String::from_utf8_lossy(&expected.stdout);
+        let actual_out = String::from_utf8_lossy(&actual.stdout);
+        assert!(
+            expected_out.contains("simple.listed"),
+            "oracle help -a missing simple.listed:\n{expected_out}"
+        );
+        assert!(
+            actual_out.contains("simple.listed"),
+            "sley help -a missing simple.listed:\n{actual_out}"
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t1308 #37 (alias path): bare `alias.br` without a value reports both
+/// `missing value for 'alias.br'` and `fatal: bad config line N in file …`.
+#[test]
+fn alias_missing_value_reports_line_and_file_matches_upstream_git() {
+    let root = unique_temp_dir("alias-missing-value");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream dir");
+    fs::create_dir_all(&rust).expect("create rust dir");
+    {
+        for dir in [&upstream, &rust] {
+            let output = Command::new(sley_testkit::oracle_git())
+                .current_dir(dir)
+                .args(["init", "-q"])
+                .output()
+                .expect("git init");
+            assert!(output.status.success());
+            // Keep only the malformed alias section, matching t1308 #37.
+            fs::write(dir.join(".git/config"), "[alias]\n\tbr\n").expect("write malformed config");
+        }
+        assert_status_stdout_stderr_match(&upstream, &rust, &["br"]);
+    }
+    let _ = fs::remove_dir_all(&root);
+}

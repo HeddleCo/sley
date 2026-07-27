@@ -1425,6 +1425,17 @@ pub(crate) fn update_index_paths_impl(
             reports.push(format!("remove '{}'", String::from_utf8_lossy(&git_path)));
             continue;
         }
+        // git's `add_one_path` → `ie_match_stat(..., flags=0)` treats
+        // CE_VALID/assume-unchanged as a match, so a dirty assume-unchanged
+        // path is a silent no-op (even when named on the command line).
+        // `--really-refresh` clears the bit before path processing; plain
+        // `--refresh keep.txt` must leave assume-unchanged entries alone.
+        if index.entries[existing_range.clone()]
+            .iter()
+            .any(|entry| entry.flags & INDEX_FLAG_ASSUME_UNCHANGED != 0)
+        {
+            continue;
+        }
         // lstat (not stat): a symlink must be inspected as the link itself, never
         // followed to its target. `Path::exists`/`fs::metadata` both stat through
         // the link, which makes a symlink-to-directory look like a directory
@@ -1789,6 +1800,13 @@ pub fn refresh_index_paths_with_options(
     let mut index_dirty = false;
     for entry in &mut index.entries {
         if index_entry_stage(entry) != 0 {
+            continue;
+        }
+        // Pathspec-limited refresh (e.g. `git add --refresh bar`) must only
+        // re-stat matching entries. Without this filter every stage-0 entry was
+        // refreshed whenever *any* path was selected (t3700 "with pathspec").
+        if !selected_paths.is_empty() && !git_path_selected(entry.path.as_bytes(), &selected_paths)
+        {
             continue;
         }
         if entry.flags & INDEX_FLAG_ASSUME_UNCHANGED != 0 {

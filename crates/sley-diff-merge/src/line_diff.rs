@@ -985,3 +985,554 @@ pub enum DiffAlgorithm {
     Patience,
     Histogram,
 }
+
+/// Line-level diff with git's `xdl_cleanup_records` pre-pass plus the
+/// bidirectional middle-snake search (`xdl_recs_cmp` / `xdl_split`).
+///
+/// Lines that appear only on one side are forced into the change set; Myers
+/// then runs only over lines present on both sides (the KEEP /
+/// `reference_index` set). Word-diff depends on this for SES choice among
+/// equal-cost alignments (bibtex brace matching in `t4034-diff-words.sh`).
+///
+/// The multi-match INVESTIGATE path (`xdl_clean_mmatch`) is approximated by
+/// always KEEPing lines that appear on both sides: word-diff buffers stay
+/// under the `bogosqrt` multi-match threshold, so this matches git there.
+pub fn myers_diff_lines_prepared(old: &[DiffLine<'_>], new: &[DiffLine<'_>]) -> Vec<DiffOp> {
+    if old.is_empty() && new.is_empty() {
+        return Vec::new();
+    }
+    if old.is_empty() {
+        return vec![DiffOp::Insert(new.len())];
+    }
+    if new.is_empty() {
+        return vec![DiffOp::Delete(old.len())];
+    }
+
+    // Count occurrences by the same equality DiffLine uses (bytes + newline flag).
+    let mut new_counts: HashMap<(&[u8], bool), usize> = HashMap::new();
+    for line in new {
+        *new_counts
+            .entry((line.content, line.has_newline))
+            .or_insert(0) += 1;
+    }
+    let mut old_counts: HashMap<(&[u8], bool), usize> = HashMap::new();
+    for line in old {
+        *old_counts
+            .entry((line.content, line.has_newline))
+            .or_insert(0) += 1;
+    }
+
+    let mut old_changed = vec![false; old.len()];
+    let mut new_changed = vec![false; new.len()];
+    let mut old_keep: Vec<usize> = Vec::new();
+    let mut new_keep: Vec<usize> = Vec::new();
+
+    for (i, line) in old.iter().enumerate() {
+        let key = (line.content, line.has_newline);
+        if new_counts.get(&key).copied().unwrap_or(0) == 0 {
+            old_changed[i] = true;
+        } else {
+            old_keep.push(i);
+        }
+    }
+    for (i, line) in new.iter().enumerate() {
+        let key = (line.content, line.has_newline);
+        if old_counts.get(&key).copied().unwrap_or(0) == 0 {
+            new_changed[i] = true;
+        } else {
+            new_keep.push(i);
+        }
+    }
+
+    // Bidirectional middle-snake over KEEP lines, marking unmatched KEEP
+    // entries as changed. DISCARD lines are already changed.
+    let old_ref: Vec<DiffLine<'_>> = old_keep.iter().map(|&i| old[i]).collect();
+    let new_ref: Vec<DiffLine<'_>> = new_keep.iter().map(|&i| new[i]).collect();
+    let mut ref_old_changed = vec![false; old_ref.len()];
+    let mut ref_new_changed = vec![false; new_ref.len()];
+    middle_snake_mark_changed(
+        &old_ref,
+        &new_ref,
+        &mut ref_old_changed,
+        &mut ref_new_changed,
+    );
+    for (ref_i, &full_i) in old_keep.iter().enumerate() {
+        if ref_old_changed[ref_i] {
+            old_changed[full_i] = true;
+        }
+    }
+    for (ref_i, &full_i) in new_keep.iter().enumerate() {
+        if ref_new_changed[ref_i] {
+            new_changed[full_i] = true;
+        }
+    }
+
+    // git always runs `xdl_change_compact` after the main search (word-diff
+    // uses flags=0, so indent heuristic is off). Slide change groups to the
+    // same canonical positions git does.
+    change_compact_no_indent(old, new, &mut old_changed, &mut new_changed);
+
+    // Rebuild a coalesced op script from the two changed[] arrays, the same
+    // way `xdl_build_script` walks them after the main search.
+    ops_from_changed(&old_changed, &new_changed)
+}
+
+/// Rebuild a coalesced [`DiffOp`] script from two parallel `changed[]` flags.
+fn ops_from_changed(old_changed: &[bool], new_changed: &[bool]) -> Vec<DiffOp> {
+    let mut ops: Vec<DiffOp> = Vec::new();
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let n_old = old_changed.len();
+    let n_new = new_changed.len();
+    while i < n_old || j < n_new {
+        if i < n_old && old_changed[i] {
+            let mut run = 0usize;
+            while i < n_old && old_changed[i] {
+                run += 1;
+                i += 1;
+            }
+            ops.push(DiffOp::Delete(run));
+        } else if j < n_new && new_changed[j] {
+            let mut run = 0usize;
+            while j < n_new && new_changed[j] {
+                run += 1;
+                j += 1;
+            }
+            ops.push(DiffOp::Insert(run));
+        } else {
+            let mut run = 0usize;
+            while i < n_old && j < n_new && !old_changed[i] && !new_changed[j] {
+                run += 1;
+                i += 1;
+                j += 1;
+            }
+            if run == 0 {
+                break;
+            }
+            ops.push(DiffOp::Equal(run));
+        }
+    }
+    coalesce_ops(ops)
+}
+
+/// Port of git's `xdl_change_compact` with indent heuristic disabled (the
+/// word-diff path sets `xpp.flags = 0`).
+fn change_compact_no_indent(
+    old: &[DiffLine<'_>],
+    new: &[DiffLine<'_>],
+    old_changed: &mut [bool],
+    new_changed: &mut [bool],
+) {
+    struct File<'a> {
+        recs: &'a [DiffLine<'a>],
+        changed: &'a mut [bool],
+    }
+    struct Group {
+        start: usize,
+        end: usize,
+    }
+    fn nrec(f: &File<'_>) -> usize {
+        f.recs.len()
+    }
+    fn ch(f: &File<'_>, i: isize) -> bool {
+        if i < 0 || i as usize >= f.changed.len() {
+            false
+        } else {
+            f.changed[i as usize]
+        }
+    }
+    fn set_ch(f: &mut File<'_>, i: usize, v: bool) {
+        f.changed[i] = v;
+    }
+    fn match_at(f: &File<'_>, a: usize, b: usize) -> bool {
+        a < f.recs.len() && b < f.recs.len() && f.recs[a] == f.recs[b]
+    }
+    fn group_init(f: &File<'_>) -> Group {
+        let mut end = 0usize;
+        while end < nrec(f) && ch(f, end as isize) {
+            end += 1;
+        }
+        Group { start: 0, end }
+    }
+    fn group_next(f: &File<'_>, g: &mut Group) -> bool {
+        if g.end == nrec(f) {
+            return false;
+        }
+        g.start = g.end + 1;
+        g.end = g.start;
+        while g.end < nrec(f) && ch(f, g.end as isize) {
+            g.end += 1;
+        }
+        true
+    }
+    fn group_previous(f: &File<'_>, g: &mut Group) -> bool {
+        if g.start == 0 {
+            return false;
+        }
+        g.end = g.start - 1;
+        g.start = g.end;
+        while g.start > 0 && ch(f, g.start as isize - 1) {
+            g.start -= 1;
+        }
+        true
+    }
+    fn slide_down(f: &mut File<'_>, g: &mut Group) -> bool {
+        if g.end < nrec(f) && match_at(f, g.start, g.end) {
+            set_ch(f, g.start, false);
+            set_ch(f, g.end, true);
+            g.start += 1;
+            g.end += 1;
+            while g.end < nrec(f) && ch(f, g.end as isize) {
+                g.end += 1;
+            }
+            true
+        } else {
+            false
+        }
+    }
+    fn slide_up(f: &mut File<'_>, g: &mut Group) -> bool {
+        if g.start > 0 && match_at(f, g.start - 1, g.end - 1) {
+            g.start -= 1;
+            g.end -= 1;
+            set_ch(f, g.start, true);
+            set_ch(f, g.end, false);
+            while g.start > 0 && ch(f, g.start as isize - 1) {
+                g.start -= 1;
+            }
+            true
+        } else {
+            false
+        }
+    }
+    fn compact_one(xdf: &mut File<'_>, xdfo: &mut File<'_>) {
+        let mut g = group_init(xdf);
+        let mut go = group_init(xdfo);
+        loop {
+            if g.end == g.start {
+                if !group_next(xdf, &mut g) {
+                    break;
+                }
+                if !group_next(xdfo, &mut go) {
+                    break;
+                }
+                continue;
+            }
+            loop {
+                let groupsize = g.end - g.start;
+                let mut end_matching_other: Option<usize> = None;
+
+                while slide_up(xdf, &mut g) {
+                    let _ = group_previous(xdfo, &mut go);
+                }
+                let earliest_end = g.end;
+                if go.end > go.start {
+                    end_matching_other = Some(g.end);
+                }
+                loop {
+                    if !slide_down(xdf, &mut g) {
+                        break;
+                    }
+                    let _ = group_next(xdfo, &mut go);
+                    if go.end > go.start {
+                        end_matching_other = Some(g.end);
+                    }
+                }
+                if groupsize == g.end - g.start {
+                    // Slide done for this size.
+                    if g.end != earliest_end && end_matching_other.is_some() {
+                        while go.end == go.start {
+                            let _ = slide_up(xdf, &mut g);
+                            let _ = group_previous(xdfo, &mut go);
+                        }
+                        // indent heuristic omitted (word-diff flags=0)
+                    }
+                    break;
+                }
+            }
+            if !group_next(xdf, &mut g) {
+                break;
+            }
+            if !group_next(xdfo, &mut go) {
+                break;
+            }
+        }
+    }
+
+    let mut f1 = File {
+        recs: old,
+        changed: old_changed,
+    };
+    let mut f2 = File {
+        recs: new,
+        changed: new_changed,
+    };
+    // git compacts old then new.
+    compact_one(&mut f1, &mut f2);
+    compact_one(&mut f2, &mut f1);
+}
+
+/// Port of `xdl_recs_cmp` + `xdl_split` (need_min path only): shrink common
+/// prefix/suffix, then recursively split at the middle snake. Marks lines that
+/// lie off the common subsequence as changed.
+fn middle_snake_mark_changed(
+    old: &[DiffLine<'_>],
+    new: &[DiffLine<'_>],
+    old_changed: &mut [bool],
+    new_changed: &mut [bool],
+) {
+    #[allow(clippy::too_many_arguments)]
+    fn recs_cmp(
+        old: &[DiffLine<'_>],
+        new: &[DiffLine<'_>],
+        mut off1: usize,
+        mut lim1: usize,
+        mut off2: usize,
+        mut lim2: usize,
+        old_changed: &mut [bool],
+        new_changed: &mut [bool],
+    ) {
+        while off1 < lim1 && off2 < lim2 && old[off1] == new[off2] {
+            off1 += 1;
+            off2 += 1;
+        }
+        while off1 < lim1 && off2 < lim2 && old[lim1 - 1] == new[lim2 - 1] {
+            lim1 -= 1;
+            lim2 -= 1;
+        }
+        if off1 == lim1 {
+            for changed in &mut new_changed[off2..lim2] {
+                *changed = true;
+            }
+            return;
+        }
+        if off2 == lim2 {
+            for changed in &mut old_changed[off1..lim1] {
+                *changed = true;
+            }
+            return;
+        }
+        let (mid1, mid2) = xdl_split_middle(old, new, off1, lim1, off2, lim2);
+        recs_cmp(old, new, off1, mid1, off2, mid2, old_changed, new_changed);
+        recs_cmp(old, new, mid1, lim1, mid2, lim2, old_changed, new_changed);
+    }
+    recs_cmp(
+        old,
+        new,
+        0,
+        old.len(),
+        0,
+        new.len(),
+        old_changed,
+        new_changed,
+    );
+}
+
+/// Port of git's `xdl_split` with `need_min` forced true (no heuristic early
+/// exit). Returns the `(i1, i2)` split point of the middle snake.
+fn xdl_split_middle(
+    old: &[DiffLine<'_>],
+    new: &[DiffLine<'_>],
+    off1: usize,
+    lim1: usize,
+    off2: usize,
+    lim2: usize,
+) -> (usize, usize) {
+    // Diagonal k = i1 - i2. Use a map so k can be negative without offset math.
+    let dmin = off1 as isize - lim2 as isize;
+    let dmax = lim1 as isize - off2 as isize;
+    let fmid = off1 as isize - off2 as isize;
+    let bmid = lim1 as isize - lim2 as isize;
+    let odd = ((fmid - bmid) & 1) != 0;
+
+    let mut fmin = fmid;
+    let mut fmax = fmid;
+    let mut bmin = bmid;
+    let mut bmax = bmid;
+    let mut kvdf: HashMap<isize, isize> = HashMap::new();
+    let mut kvdb: HashMap<isize, isize> = HashMap::new();
+    kvdf.insert(fmid, off1 as isize);
+    kvdb.insert(bmid, lim1 as isize);
+
+    let mut ec = 0isize;
+    loop {
+        ec += 1;
+
+        // Extend forward domain.
+        if fmin > dmin {
+            fmin -= 1;
+            kvdf.insert(fmin - 1, -1);
+        } else {
+            fmin += 1;
+        }
+        if fmax < dmax {
+            fmax += 1;
+            kvdf.insert(fmax + 1, -1);
+        } else {
+            fmax -= 1;
+        }
+
+        let mut d = fmax;
+        while d >= fmin {
+            let i1 = if kvdf.get(&(d - 1)).copied().unwrap_or(-1)
+                >= kvdf.get(&(d + 1)).copied().unwrap_or(-1)
+            {
+                kvdf.get(&(d - 1)).copied().unwrap_or(-1) + 1
+            } else {
+                kvdf.get(&(d + 1)).copied().unwrap_or(-1)
+            };
+            let mut i1 = i1;
+            let mut i2 = i1 - d;
+            while (i1 as usize) < lim1
+                && (i2 as usize) < lim2
+                && old[i1 as usize] == new[i2 as usize]
+            {
+                i1 += 1;
+                i2 += 1;
+            }
+            kvdf.insert(d, i1);
+            if odd
+                && bmin <= d
+                && d <= bmax
+                && let Some(&bd) = kvdb.get(&d)
+                && bd <= i1
+            {
+                return (i1 as usize, i2 as usize);
+            }
+            d -= 2;
+        }
+
+        // Extend backward domain.
+        if bmin > dmin {
+            bmin -= 1;
+            kvdb.insert(bmin - 1, isize::MAX / 4);
+        } else {
+            bmin += 1;
+        }
+        if bmax < dmax {
+            bmax += 1;
+            kvdb.insert(bmax + 1, isize::MAX / 4);
+        } else {
+            bmax -= 1;
+        }
+
+        let mut d = bmax;
+        while d >= bmin {
+            let i1 = if kvdb.get(&(d - 1)).copied().unwrap_or(isize::MAX / 4)
+                < kvdb.get(&(d + 1)).copied().unwrap_or(isize::MAX / 4)
+            {
+                kvdb.get(&(d - 1)).copied().unwrap_or(isize::MAX / 4)
+            } else {
+                kvdb.get(&(d + 1)).copied().unwrap_or(isize::MAX / 4) - 1
+            };
+            let mut i1 = i1;
+            let mut i2 = i1 - d;
+            while i1 > off1 as isize
+                && i2 > off2 as isize
+                && old[(i1 - 1) as usize] == new[(i2 - 1) as usize]
+            {
+                i1 -= 1;
+                i2 -= 1;
+            }
+            kvdb.insert(d, i1);
+            if !odd
+                && fmin <= d
+                && d <= fmax
+                && let Some(&fd) = kvdf.get(&d)
+                && i1 <= fd
+            {
+                return (i1 as usize, i2 as usize);
+            }
+            d -= 2;
+        }
+
+        // Safety: always terminates for finite boxes (edit cost ≤ N+M).
+        if ec > (lim1 - off1 + lim2 - off2) as isize + 2 {
+            // Fallback split at half the remaining box.
+            return (off1 + (lim1 - off1) / 2, off2 + (lim2 - off2) / 2);
+        }
+    }
+}
+
+#[cfg(test)]
+mod prepared_diff_tests {
+    use super::*;
+
+    fn words(items: &[&str]) -> Vec<DiffLine<'static>> {
+        items
+            .iter()
+            .map(|w| {
+                let owned = w.as_bytes().to_vec();
+                let leaked: &'static [u8] = Box::leak(owned.into_boxed_slice());
+                DiffLine {
+                    content: leaked,
+                    has_newline: true,
+                }
+            })
+            .collect()
+    }
+
+    fn fmt_ops(ops: &[DiffOp]) -> String {
+        ops.iter()
+            .map(|op| match op {
+                DiffOp::Equal(n) => format!("E{n}"),
+                DiffOp::Delete(n) => format!("D{n}"),
+                DiffOp::Insert(n) => format!("I{n}"),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn bibtex_year_block_matches_git_xdiff_alignment() {
+        // Token sequence from t4034 bibtex year/note change group.
+        let minus = words(&["year", "=", "{", "1987", "}", ","]);
+        let plus = words(&[
+            "year",
+            "=",
+            "1987,",
+            "note",
+            "=",
+            "{",
+            "This",
+            "is",
+            "in",
+            "fact",
+            "a",
+            "rather",
+            "funny",
+            "read",
+            "since",
+            "ethernet",
+            "works",
+            "well",
+            "in",
+            "practice.",
+            "The",
+            "{",
+            "\\em",
+            "pre",
+            "}",
+            "reference",
+            "is",
+            "the",
+            "right",
+            "one,",
+            "however.",
+            "}",
+        ]);
+        let ops = myers_diff_lines_prepared(&minus, &plus);
+        // Git xdiff (cleanup + middle-snake + compact): equal `year=`; insert
+        // through `The`; equal `{`; delete `1987`; insert `\em pre } reference
+        // ... however.`; equal `}`; delete `,`.
+        assert_eq!(fmt_ops(&ops), "E2 I19 E1 D1 I9 E1 D1");
+    }
+
+    #[test]
+    fn prepared_diff_identical_is_single_equal() {
+        let lines = words(&["a", "b", "c"]);
+        assert_eq!(
+            myers_diff_lines_prepared(&lines, &lines),
+            vec![DiffOp::Equal(3)]
+        );
+    }
+}
