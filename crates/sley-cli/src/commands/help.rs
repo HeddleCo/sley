@@ -275,7 +275,8 @@ static COMMAND_REGISTRY: CommandRegistry<'static> = CommandRegistry::new(&[
     CommandSpec::new("show-index", BUILTIN),
     CommandSpec::new("show-ref", BUILTIN),
     CommandSpec::new("sparse-checkout", BUILTIN_MAIN),
-    CommandSpec::new("stage", GIT_BUILTIN_RESERVED),
+    // git.c: `{ "stage", cmd_add, ... }` — synonym for `add`, not a reserved helper.
+    CommandSpec::new("stage", BUILTIN),
     CommandSpec::new("stash", BUILTIN_MAIN),
     CommandSpec::new("status", BUILTIN_MAIN),
     CommandSpec::new("stripspace", BUILTIN),
@@ -1446,9 +1447,9 @@ mod command_registry_tests {
         assert_eq!(
             COMMAND_REGISTRY.names_with(NATIVE).count(),
             if cfg!(feature = "git-compat-i18n") {
-                138
+                139
             } else {
-                137
+                138
             }
         );
         assert_eq!(COMMAND_REGISTRY.names_with(GIT_BUILTIN).count(), 149);

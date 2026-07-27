@@ -15,6 +15,13 @@ fn hook_environment(cli_session: &CliSession) -> Result<sley::hooks::HookEnviron
     Ok(hook_environment_at(Some(&git_dir)))
 }
 
+/// Like [`hook_environment`], but allow out-of-repo invocations so
+/// `git hook list|run` can still execute global configured hooks (t1800).
+fn hook_environment_optional(cli_session: &CliSession) -> sley::hooks::HookEnvironment {
+    let git_dir = cli_session.git_dir().ok();
+    hook_environment_at(git_dir.as_deref())
+}
+
 fn hook_environment_at(git_dir: Option<&Path>) -> sley::hooks::HookEnvironment {
     sley::hooks::HookEnvironment {
         injected_config: crate::injected_config_parameters().ok(),
@@ -39,7 +46,9 @@ pub(crate) fn run_hook_l_at(git_dir: &Path, hook_name: &str, args: &[&str]) -> R
 }
 
 pub(crate) fn cmd_hook(cli_session: &CliSession, args: &[String]) -> Result<()> {
-    sley::hooks::cmd_hook_with_env(args, &hook_environment(cli_session)?)
+    // `git hook list|run` must work outside a repository so global hooks
+    // configured via `hook.<name>.event` / `.command` still execute (t1800).
+    sley::hooks::cmd_hook_with_env(args, &hook_environment_optional(cli_session))
 }
 
 pub(crate) fn run_post_index_change_hook_at(

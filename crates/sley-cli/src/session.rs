@@ -303,6 +303,14 @@ impl CliSession {
         if let Some(root) = crate::sley_worktree::worktree_root_for_git_dir(git_dir)? {
             return Ok(Some(root));
         }
+        // Intrinsic layout only recognizes a worktree when the admin dir is
+        // named `.git` (or has a linked-worktree `gitdir`/`commondir` pair).
+        // A gitfile that points at a differently-named directory (e.g. the
+        // t2105 `gitdir: .real` layout) has a real worktree at the gitfile's
+        // parent; fall back to CLI setup discovery so `add` / `commit` work.
+        if let Some(setup) = crate::setup::setup_git_directory(self) {
+            return Ok(setup.worktree);
+        }
         Ok(None)
     }
 

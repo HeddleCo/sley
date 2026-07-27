@@ -45,15 +45,8 @@ fn run_env(program: &str, cwd: &Path, args: &[&str]) -> Output {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        // A just-built oracle invokes nested `git` commands (notably automatic
-        // maintenance). Keep those on the same 2.55 binary instead of falling
-        // through to an older system Git on PATH.
-        .env(
-            "GIT_EXEC_PATH",
-            Path::new(sley_testkit::oracle_git())
-                .parent()
-                .unwrap_or_else(|| Path::new(".")),
-        )
+        // The absolute oracle binary uses its compiled libexec path for Git
+        // subcommands. Do not replace it with bin/, which hides git-submodule.
         .output()
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
@@ -731,6 +724,136 @@ fn am_empty_and_in_progress_match_git() {
     let g = git(&git_target, &["am", garbage.to_string_lossy().as_ref()]);
     let r = sley(&rs_target, &["am", garbage.to_string_lossy().as_ref()]);
     assert_outputs_equal("am while in progress", &g, &r);
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// format-patch emits a file→gitlink type-change as delete + new-gitlink. `am`
+/// (and `am --3way`, which prefers the straight apply when it succeeds) must
+/// accept that split, stage the gitlink, and leave an empty submodule directory
+/// (t4255 "replace tracked file with submodule creates empty directory").
+#[test]
+fn am_file_to_gitlink_type_change_creates_empty_dir_like_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("am-file-to-gitlink");
+    let sub = root.join("sub");
+    fs::create_dir_all(&sub).expect("sub dir");
+    git_ok(&sub, &["init", "-q", "-b", "main"]);
+    write(&sub, "file1", "x\n");
+    git_ok(&sub, &["add", "file1"]);
+    git_ok(&sub, &["commit", "-q", "-m", "sub base"]);
+
+    let source = root.join("source");
+    fs::create_dir_all(&source).expect("source dir");
+    git_ok(&source, &["init", "-q", "-b", "main"]);
+    git_ok(
+        &source,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "config",
+            "protocol.file.allow",
+            "always",
+        ],
+    );
+    write(&source, "file2", "y\n");
+    git_ok(&source, &["add", "file2"]);
+    git_ok(&source, &["commit", "-q", "-m", "base"]);
+    git_ok(
+        &source,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub.to_string_lossy().as_ref(),
+            "sub1",
+        ],
+    );
+    git_ok(&source, &["commit", "-q", "-m", "add sub1"]);
+    git_ok(&source, &["rm", "sub1"]);
+    write(&source, "sub1", "content\n");
+    git_ok(&source, &["add", "sub1"]);
+    git_ok(&source, &["commit", "-q", "-m", "file"]);
+    let file_oid = git_ok(&source, &["rev-parse", "HEAD"]);
+    git_ok(&source, &["revert", "--no-edit", "HEAD"]);
+    let sub_oid = git_ok(&source, &["rev-parse", "HEAD"]);
+
+    let patches = root.join("patches");
+    fs::create_dir_all(&patches).expect("patches dir");
+    git_ok(
+        &source,
+        &[
+            "format-patch",
+            "-1",
+            &sub_oid,
+            "-o",
+            patches.to_string_lossy().as_ref(),
+        ],
+    );
+    let patch = patch_paths(&patches).remove(0);
+
+    for (label, am_args) in [
+        ("am", vec!["am", patch.as_str()]),
+        ("am --3way", vec!["am", "--3way", patch.as_str()]),
+    ] {
+        let git_target = root.join(format!("git-{label}"));
+        let rs_target = root.join(format!("rs-{label}"));
+        for target in [&git_target, &rs_target] {
+            copy_dir_all(&source, target);
+            // Detach to the file state so the type-change patch is the one to apply.
+            git_ok(target, &["checkout", "-q", "-f", &file_oid]);
+            // Drop any residual submodule checkout left by the copy.
+            let _ = fs::remove_dir_all(target.join("sub1"));
+            write(target, "sub1", "content\n");
+            git_ok(target, &["reset", "-q", "--hard", &file_oid]);
+        }
+
+        let g = git(&git_target, &am_args);
+        let r = sley(&rs_target, &am_args);
+        assert!(
+            g.status.success(),
+            "{label}: oracle am failed: {}",
+            String::from_utf8_lossy(&g.stderr)
+        );
+        assert!(
+            r.status.success(),
+            "{label}: sley am failed: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+        assert_eq!(
+            git_ok(&rs_target, &["rev-parse", "HEAD"]),
+            git_ok(&git_target, &["rev-parse", "HEAD"]),
+            "{label}: HEAD OID differs after am"
+        );
+        assert_eq!(
+            git_ok(&rs_target, &["ls-files", "-s", "sub1"]),
+            git_ok(&git_target, &["ls-files", "-s", "sub1"]),
+            "{label}: gitlink index entry differs"
+        );
+        assert!(
+            rs_target.join("sub1").is_dir(),
+            "{label}: sley must leave empty submodule directory"
+        );
+        assert!(
+            fs::read_dir(rs_target.join("sub1"))
+                .expect("read sub1")
+                .next()
+                .is_none(),
+            "{label}: sley submodule directory must be empty"
+        );
+        assert_eq!(
+            fs::read_dir(rs_target.join("sub1"))
+                .expect("sley sub1")
+                .count(),
+            fs::read_dir(git_target.join("sub1"))
+                .expect("git sub1")
+                .count(),
+            "{label}: empty-dir content differs"
+        );
+    }
 
     fs::remove_dir_all(&root).ok();
 }

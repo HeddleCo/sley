@@ -584,7 +584,15 @@ fn repack_reachable_objects_with_filter_to(
     }
 
     let inputs = pack_inputs(&objects);
-    let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
+    let written = if options.force_rewrite {
+        // A forced repack must not reproduce an existing pack through the
+        // writer's canonical reorder path after bypassing whole-pack reuse.
+        // Preserve traversal order while still allowing fresh delta selection.
+        let write_options = PackWriteOptions::new().with_reorder(false);
+        PackFile::write_packed_with_known_ids_and_options(&inputs, format, &write_options)?
+    } else {
+        PackFile::write_packed_with_known_ids(&inputs, format)?
+    };
     let object_count = written.entries.len();
 
     // Every pre-existing local pack is superseded under `-a` (their reachable

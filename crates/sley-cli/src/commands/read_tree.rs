@@ -1804,8 +1804,17 @@ pub(crate) fn checkout_submodule_to_commit(
         return Ok(());
     };
     let path_str = String::from_utf8_lossy(path);
+    // git's `validate_submodule_path`: any path component that is a symlink
+    // (including the leaf) is fatal. Following the leaf would migrate/delete
+    // a linked repo's gitdir (t7423).
+    if let Ok(meta) = fs::symlink_metadata(&sub_root)
+        && meta.file_type().is_symlink()
+    {
+        eprintln!("error: expected submodule path '{path_str}' not to be a symbolic link");
+        return Err(GitError::Exit(128));
+    }
     if sley_submodule::submodule_path_has_symlink_parent(worktree_root, Path::new(&*path_str))? {
-        eprintln!("fatal: refusing to checkout submodule path '{path_str}' through a symlink");
+        eprintln!("error: expected submodule path '{path_str}' not to be a symbolic link");
         return Err(GitError::Exit(128));
     }
     let (submodule_name, submodule_url) = submodule_name_and_url_for_path(worktree_root, &path_str)
@@ -1957,7 +1966,15 @@ fn remove_submodule_worktree(worktree_root: &Path, git_dir: &Path, path: &[u8]) 
         return Ok(());
     };
     let path_str = String::from_utf8_lossy(path);
-    if sley_submodule::submodule_path_has_symlink_parent(worktree_root, Path::new(&*path_str))? {
+    // Refuse through a symlinked parent *or* when the submodule path itself is
+    // a symlink: following the leaf would migrate/delete the linked repo's
+    // gitdir (t7423: checkout -f --recurse-submodules must not migrate gitdir
+    // of a symlinked repo when removing the submodule).
+    if sley_submodule::submodule_path_has_symlink_parent(worktree_root, Path::new(&*path_str))?
+        || fs::symlink_metadata(&sub_root)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+    {
         eprintln!("fatal: refusing to remove submodule path '{path_str}' through a symlink");
         return Err(GitError::Exit(128));
     }

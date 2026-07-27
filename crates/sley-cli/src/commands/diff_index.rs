@@ -255,6 +255,7 @@ pub(crate) fn cmd_diff_index(
             format,
             reader: db,
             config: Some(repo.config()),
+            assume_dashdash: false,
         },
     )?;
     if !setup.leftovers.is_empty()

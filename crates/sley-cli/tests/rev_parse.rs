@@ -1174,3 +1174,53 @@ fn rev_parse_show_prefix_ceiling_symlink_no_resolve_matches_upstream_git() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn log_fetch_head_in_bare_repo() {
+    // t5900 regression: bare `git log FETCH_HEAD` must not treat FETCH_HEAD as
+    // an ambiguous worktree path just because the file exists in the git dir.
+    let root = unique_temp_dir("log-fetch-head-bare");
+    fs::create_dir_all(&root).expect("create temp");
+    let src = root.join("src");
+    let bare = root.join("bare");
+    fs::create_dir_all(&src).expect("mkdir src");
+    {
+        sley(&src, &["init", "-q", "-b", "main"]);
+        sley(&src, &["config", "user.email", "t@t.invalid"]);
+        sley(&src, &["config", "user.name", "t"]);
+        fs::write(src.join("f"), b"hi\n").expect("write");
+        sley(&src, &["add", "f"]);
+        sley(&src, &["commit", "-m", "src", "-q"]);
+        sley(&root, &["init", "--bare", "-q", "bare"]);
+        let (code, stdout, stderr) = run_status(
+            sley_testkit::sley_bin!(),
+            &bare,
+            &["fetch", src.to_str().expect("utf8")],
+        );
+        assert_eq!(
+            code,
+            0,
+            "fetch failed: {}\n{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+        let (code, stdout, stderr) = run_status(
+            sley_testkit::sley_bin!(),
+            &bare,
+            &["log", "-1", "--format=%s", "FETCH_HEAD"],
+        );
+        assert_eq!(
+            code,
+            0,
+            "log FETCH_HEAD failed: {}\n{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&stdout).trim(),
+            "src",
+            "unexpected subject"
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}

@@ -301,7 +301,19 @@ pub fn run(args: Vec<String>) -> Result<()> {
     {
         setup::trace_repo_setup(&setup_result);
     }
-    dispatch::dispatch_with_aliases(&cli_session, global.args, &global.config, 0)
+    // git's `precompose_argv_prefix`: once the repo config is known, convert
+    // NFD path arguments to NFC when `core.precomposeunicode` is true. Command
+    // name (argv[0]) is left alone; options and pathspecs are normalized.
+    let mut dispatch_args: Vec<String> = global.args.to_vec();
+    if let Ok(git_dir) = cli_session.git_dir()
+        && let Ok(config) = read_repo_config(&git_dir)
+    {
+        sley_core::activate_precompose_unicode(config.get_bool("core", None, "precomposeunicode"));
+        if dispatch_args.len() > 1 {
+            sley_core::precompose_argv_if_needed(&mut dispatch_args[1..]);
+        }
+    }
+    dispatch::dispatch_with_aliases(&cli_session, &dispatch_args, &global.config, 0)
 }
 
 #[cfg(test)]

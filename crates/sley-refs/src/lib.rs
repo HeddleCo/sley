@@ -1691,7 +1691,13 @@ impl FileRefStore {
                 refs.insert(reference.name.clone(), reference);
             }
             if self.git_dir != self.common_dir {
-                for reference in self.list_reftable_refs_with_prefix(prefix)? {
+                // Per-worktree namespaces under an alternate reftable path live
+                // at `<alt>/worktrees/<id>/`, not on the shared stack that
+                // `storage_dir` points at after FileRefStore::new.
+                for reference in self
+                    .reftable_store_with_storage(self.current_worktree_storage_dir())
+                    .list_reftable_refs_with_prefix(prefix)?
+                {
                     if reftable_current_worktree_ref(&reference.name) {
                         refs.insert(reference.name.clone(), reference);
                     }
@@ -2581,15 +2587,26 @@ impl FileRefStore {
 
     /// List the live one-level references held by the active ref backend.
     ///
+    /// Root refs (`HEAD`, `ORIG_HEAD`, …) are per-worktree. Listing therefore
+    /// reads the *current worktree* storage directory — including the
+    /// `worktrees/<id>/` suffix under an alternate `extensions.refStorage` /
+    /// `GIT_REFERENCE_BACKEND` path — rather than the shared stack or the
+    /// administrative gitdir stub (`ref: refs/heads/.invalid`) that alternate
+    /// backends leave in place. Without this, `for-each-ref --include-root-refs`
+    /// from a linked worktree reports the main worktree's `HEAD` (or omits it).
+    ///
     /// `FETCH_HEAD` and `MERGE_HEAD` are working-state files rather than
     /// migratable refs, so they are deliberately excluded for both backends.
     /// Callers which expose a narrower root-ref surface (for example
     /// `for-each-ref --include-root-refs`) should apply their own semantic
     /// predicate to this backend-independent inventory.
     pub fn list_root_refs(&self) -> Result<Vec<Ref>> {
+        // Root refs live on the current worktree stack/dir, not the shared
+        // alternate storage root and not the admin-dir stub.
+        let base = self.current_worktree_storage_dir();
         if self.uses_reftable()? {
             let mut refs = BTreeMap::<String, Ref>::new();
-            for table in self.reftables()? {
+            for table in self.reftable_store_with_storage(base).reftables()? {
                 for record in table.refs {
                     if record.name.starts_with("refs/")
                         || !is_root_ref_syntax(&record.name)
@@ -2617,7 +2634,14 @@ impl FileRefStore {
         }
 
         let mut refs = Vec::new();
-        for entry in fs::read_dir(&self.git_dir)? {
+        let entries = match fs::read_dir(&base) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(err) => return Err(err.into()),
+        };
+        for entry in entries {
             let entry = entry?;
             if !entry.file_type()?.is_file() {
                 continue;
@@ -8440,6 +8464,154 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         assert_eq!(reftable, expected);
         fs::remove_dir_all(files_dir).expect("remove test files repo");
         fs::remove_dir_all(reftable_dir).expect("remove test reftable repo");
+    }
+
+    /// t1423-ref-backend: `for-each-ref --include-root-refs` from a linked
+    /// worktree must surface that worktree's HEAD/ORIG_HEAD under an alternate
+    /// `files://` or `reftable://` storage path, not the main worktree's HEAD
+    /// (and not the admin-dir `refs/heads/.invalid` stub).
+    #[test]
+    fn list_root_refs_uses_alternate_backend_worktree_storage() {
+        let format = ObjectFormat::Sha1;
+        let main_oid = ObjectId::from_hex(format, "1111111111111111111111111111111111111111")
+            .expect("main oid");
+        let worktree_oid = ObjectId::from_hex(format, "2222222222222222222222222222222222222222")
+            .expect("worktree oid");
+
+        // --- files backend with alternate storage path ---
+        let common_dir = temp_git_dir();
+        let alt_files = temp_git_dir();
+        fs::write(
+            common_dir.join("config"),
+            format!(
+                "[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefStorage = files://{}\n",
+                alt_files.display()
+            ),
+        )
+        .expect("write files alt config");
+        // Admin-dir stubs (what worktree add leaves behind for alt backends).
+        let wt_admin = common_dir.join("worktrees").join("wt");
+        fs::create_dir_all(wt_admin.join("refs")).expect("wt admin");
+        fs::write(wt_admin.join("commondir"), b"../..\n").expect("commondir");
+        fs::write(wt_admin.join("HEAD"), b"ref: refs/heads/.invalid\n").expect("stub HEAD");
+        fs::write(
+            wt_admin.join("refs").join("heads"),
+            b"this worktree stores references elsewhere\n",
+        )
+        .expect("stub refs/heads");
+        // Real per-worktree root refs live under the alternate path.
+        let wt_alt = alt_files.join("worktrees").join("wt");
+        fs::create_dir_all(&wt_alt).expect("wt alt");
+        fs::write(wt_alt.join("HEAD"), format!("{worktree_oid}\n")).expect("wt HEAD");
+        fs::write(wt_alt.join("ORIG_HEAD"), format!("{worktree_oid}\n")).expect("wt ORIG_HEAD");
+        // Main worktree HEAD on the shared alternate root.
+        fs::write(alt_files.join("HEAD"), format!("{main_oid}\n")).expect("main HEAD");
+
+        let main_store = FileRefStore::new(&common_dir, format);
+        let wt_store = FileRefStore::new(&wt_admin, format);
+        let main_roots = main_store.list_root_refs().expect("main files roots");
+        let wt_roots = wt_store.list_root_refs().expect("wt files roots");
+        assert_eq!(
+            main_roots,
+            vec![Ref {
+                name: "HEAD".into(),
+                target: RefTarget::Direct(main_oid),
+            }]
+        );
+        assert_eq!(
+            wt_roots,
+            vec![
+                Ref {
+                    name: "HEAD".into(),
+                    target: RefTarget::Direct(worktree_oid),
+                },
+                Ref {
+                    name: "ORIG_HEAD".into(),
+                    target: RefTarget::Direct(worktree_oid),
+                },
+            ]
+        );
+
+        // --- reftable backend with alternate storage path ---
+        let common_rt = temp_git_dir();
+        let alt_rt = temp_git_dir();
+        fs::write(
+            common_rt.join("config"),
+            format!(
+                "[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefStorage = reftable://{}\n",
+                alt_rt.display()
+            ),
+        )
+        .expect("write reftable alt config");
+        let wt_admin_rt = common_rt.join("worktrees").join("wt");
+        fs::create_dir_all(wt_admin_rt.join("refs")).expect("wt admin rt");
+        fs::write(wt_admin_rt.join("commondir"), b"../..\n").expect("commondir rt");
+        fs::write(wt_admin_rt.join("HEAD"), b"ref: refs/heads/.invalid\n").expect("stub HEAD rt");
+        write_reftable_stack(
+            &alt_rt,
+            &[(
+                "0x000000000001-0x000000000001-00000000.ref",
+                vec![
+                    ReftableRefRecord {
+                        name: "HEAD".into(),
+                        update_index: 1,
+                        value: ReftableRefValue::Direct(main_oid),
+                    },
+                    ReftableRefRecord {
+                        name: "refs/heads/master".into(),
+                        update_index: 1,
+                        value: ReftableRefValue::Direct(main_oid),
+                    },
+                ],
+            )],
+        );
+        let wt_alt_rt = alt_rt.join("worktrees").join("wt");
+        write_reftable_stack(
+            &wt_alt_rt,
+            &[(
+                "0x000000000001-0x000000000001-00000000.ref",
+                vec![
+                    ReftableRefRecord {
+                        name: "HEAD".into(),
+                        update_index: 1,
+                        value: ReftableRefValue::Direct(worktree_oid),
+                    },
+                    ReftableRefRecord {
+                        name: "ORIG_HEAD".into(),
+                        update_index: 1,
+                        value: ReftableRefValue::Direct(worktree_oid),
+                    },
+                ],
+            )],
+        );
+
+        let main_rt = FileRefStore::new(&common_rt, format);
+        let wt_rt = FileRefStore::new(&wt_admin_rt, format);
+        assert_eq!(
+            main_rt.list_root_refs().expect("main reftable roots"),
+            vec![Ref {
+                name: "HEAD".into(),
+                target: RefTarget::Direct(main_oid),
+            }]
+        );
+        assert_eq!(
+            wt_rt.list_root_refs().expect("wt reftable roots"),
+            vec![
+                Ref {
+                    name: "HEAD".into(),
+                    target: RefTarget::Direct(worktree_oid),
+                },
+                Ref {
+                    name: "ORIG_HEAD".into(),
+                    target: RefTarget::Direct(worktree_oid),
+                },
+            ]
+        );
+
+        fs::remove_dir_all(common_dir).expect("cleanup");
+        fs::remove_dir_all(alt_files).expect("cleanup");
+        fs::remove_dir_all(common_rt).expect("cleanup");
+        fs::remove_dir_all(alt_rt).expect("cleanup");
     }
 
     #[test]

@@ -276,12 +276,16 @@ pub(crate) struct DeltaWindowEntry<'a> {
 
 /// Rank object types for delta grouping. Objects of the same type are far more
 /// likely to delta well, so the sort groups by this rank first.
+///
+/// Order matches git's `type_size_sort` (higher type enum first: tag → blob →
+/// tree → commit) so same-type windows form with the same locality default
+/// packing uses.
 pub(crate) fn delta_type_rank(object_type: ObjectType) -> u8 {
     match object_type {
-        ObjectType::Commit => 0,
-        ObjectType::Tree => 1,
-        ObjectType::Blob => 2,
-        ObjectType::Tag => 3,
+        ObjectType::Tag => 0,
+        ObjectType::Blob => 1,
+        ObjectType::Tree => 2,
+        ObjectType::Commit => 3,
     }
 }
 
@@ -373,18 +377,33 @@ pub(crate) fn plan_streaming_window_deltas(
             let Some(delta) = base_entry.index.delta(target) else {
                 continue;
             };
-            if !delta_is_acceptable(
+            let current = best_delta
+                .as_ref()
+                .map(|current| (current.len(), best_base_depth + 1));
+            if !delta_is_acceptable_with_depth(
                 &delta,
                 target.len(),
                 base_entry.index.source_len(),
                 object_ids[idx].as_bytes().len(),
+                base_depth,
+                current,
+                options.depth,
             ) {
                 continue;
             }
-            if best_delta
-                .as_ref()
-                .is_none_or(|current| delta.len() < current.len())
-            {
+            // Prefer smaller deltas; for equal size prefer shallower chains
+            // (git try_delta: "Prefer only shallower same-sized deltas").
+            let better = match best_delta.as_ref() {
+                None => true,
+                Some(current) if delta.len() < current.len() => true,
+                Some(current)
+                    if delta.len() == current.len() && base_depth + 1 < best_base_depth + 1 =>
+                {
+                    true
+                }
+                _ => false,
+            };
+            if better {
                 best_delta = Some(delta);
                 best_base_depth = base_depth;
                 best_base = match &base_entry.base {
@@ -414,18 +433,27 @@ pub(crate) fn plan_streaming_window_deltas(
             let Some(delta) = base_index.delta(target) else {
                 continue;
             };
-            if !delta_is_acceptable(
+            let current = best_delta
+                .as_ref()
+                .map(|current| (current.len(), best_base_depth + 1));
+            if !delta_is_acceptable_with_depth(
                 &delta,
                 target.len(),
                 base_index.source_len(),
                 object_ids[idx].as_bytes().len(),
+                0,
+                current,
+                options.depth,
             ) {
                 continue;
             }
-            if best_delta
-                .as_ref()
-                .is_none_or(|current| delta.len() < current.len())
-            {
+            let better = match best_delta.as_ref() {
+                None => true,
+                Some(current) if delta.len() < current.len() => true,
+                Some(current) if delta.len() == current.len() && 1 < best_base_depth + 1 => true,
+                _ => false,
+            };
+            if better {
                 best_delta = Some(delta);
                 best_base_depth = 0;
                 best_base = StreamingPlannedBase::External {
@@ -444,12 +472,18 @@ pub(crate) fn plan_streaming_window_deltas(
             && base.object_type == target_type
         {
             let base_index = DeltaIndex::new(&base.body);
+            let current = best_delta
+                .as_ref()
+                .map(|current| (current.len(), best_base_depth + 1));
             if let Some(delta) = base_index.delta(target).filter(|delta| {
-                delta_is_acceptable(
+                delta_is_acceptable_with_depth(
                     delta,
                     target.len(),
                     base.body.len(),
                     object_ids[idx].as_bytes().len(),
+                    0,
+                    current,
+                    options.depth,
                 )
             }) {
                 best_delta = Some(delta);
@@ -592,6 +626,7 @@ pub(crate) fn plan_pack_deltas(
         let mut best_base = PlannedBase::None;
 
         // Try in-pack candidates from the window (same type only).
+        let mut best_base_depth = 0usize;
         for base_entry in window.iter().rev() {
             let base_idx = base_entry.idx;
             if objects[base_idx].object_type != target_type {
@@ -605,19 +640,34 @@ pub(crate) fn plan_pack_deltas(
             let Some(delta) = base_entry.index.delta(target) else {
                 continue;
             };
-            if !delta_is_acceptable(
+            let current = best_delta
+                .as_ref()
+                .map(|current| (current.len(), best_base_depth + 1));
+            if !delta_is_acceptable_with_depth(
                 &delta,
                 target.len(),
                 objects[base_idx].body.len(),
                 object_ids[idx].as_bytes().len(),
+                depth[base_idx],
+                current,
+                options.depth,
             ) {
                 continue;
             }
-            if best_delta
-                .as_ref()
-                .is_none_or(|current| delta.len() < current.len())
-            {
+            let better = match best_delta.as_ref() {
+                None => true,
+                Some(current) if delta.len() < current.len() => true,
+                Some(current)
+                    if delta.len() == current.len()
+                        && depth[base_idx] + 1 < best_base_depth + 1 =>
+                {
+                    true
+                }
+                _ => false,
+            };
+            if better {
                 best_delta = Some(delta);
+                best_base_depth = depth[base_idx];
                 best_base = PlannedBase::InPack {
                     base_idx,
                     delta: Vec::new(),
@@ -636,19 +686,29 @@ pub(crate) fn plan_pack_deltas(
             let Some(delta) = base_index.delta(target) else {
                 continue;
             };
-            if !delta_is_acceptable(
+            let current = best_delta
+                .as_ref()
+                .map(|current| (current.len(), best_base_depth + 1));
+            if !delta_is_acceptable_with_depth(
                 &delta,
                 target.len(),
                 base_index.source_len(),
                 object_ids[idx].as_bytes().len(),
+                0,
+                current,
+                options.depth,
             ) {
                 continue;
             }
-            if best_delta
-                .as_ref()
-                .is_none_or(|current| delta.len() < current.len())
-            {
+            let better = match best_delta.as_ref() {
+                None => true,
+                Some(current) if delta.len() < current.len() => true,
+                Some(current) if delta.len() == current.len() && 1 < best_base_depth + 1 => true,
+                _ => false,
+            };
+            if better {
                 best_delta = Some(delta);
+                best_base_depth = 0;
                 best_base = PlannedBase::External {
                     base_oid: *base_oid,
                     delta: Vec::new(),
@@ -664,12 +724,18 @@ pub(crate) fn plan_pack_deltas(
             && base.object_type == target_type
         {
             let base_index = DeltaIndex::new(&base.body);
+            let current = best_delta
+                .as_ref()
+                .map(|current| (current.len(), best_base_depth + 1));
             if let Some(delta) = base_index.delta(target).filter(|delta| {
-                delta_is_acceptable(
+                delta_is_acceptable_with_depth(
                     delta,
                     target.len(),
                     base.body.len(),
                     object_ids[idx].as_bytes().len(),
+                    0,
+                    current,
+                    options.depth,
                 )
             }) {
                 best_delta = Some(delta);
@@ -713,16 +779,58 @@ pub(crate) fn plan_pack_deltas(
 /// undeltified representation, and rejects source/target size relationships
 /// which cannot fit inside that budget before running the delta search. Its
 /// `create_delta()` accepts a result exactly at the limit.
+///
+/// Depth is treated as a first candidate (`src_depth = 0`, no existing delta)
+/// so this matches git's initial `try_delta` budget. Prefer
+/// [`delta_is_acceptable_with_depth`] when replacing an existing delta or
+/// considering a non-zero base depth.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn delta_is_acceptable(
     delta: &[u8],
     target_len: usize,
     source_len: usize,
     object_id_len: usize,
 ) -> bool {
+    delta_is_acceptable_with_depth(delta, target_len, source_len, object_id_len, 0, None, 50)
+}
+
+/// Git `try_delta` size filter with depth-scaled max size.
+///
+/// When the target already has a delta, git starts from that delta's size and
+/// scales the budget by `(max_depth - src_depth) / (max_depth - ref_depth + 1)`.
+/// Deeper bases must therefore beat the current delta by a margin, which keeps
+/// chains shallow and packs closer to git's size (critical for midx batch
+/// selection on small packs).
+pub(crate) fn delta_is_acceptable_with_depth(
+    delta: &[u8],
+    target_len: usize,
+    source_len: usize,
+    object_id_len: usize,
+    src_depth: usize,
+    current: Option<(usize, usize)>,
+    max_depth: usize,
+) -> bool {
     if target_len < 50 || source_len < 50 {
         return false;
     }
-    let max_size = (target_len / 2).wrapping_sub(object_id_len);
+    if src_depth >= max_depth {
+        return false;
+    }
+    // Mirror builtin/pack-objects.c try_delta: first candidate uses half the
+    // target minus one oid; replacements start from the current delta size and
+    // the target's current chain depth.
+    let (mut max_size, ref_depth) = match current {
+        None => ((target_len / 2).wrapping_sub(object_id_len), 1usize),
+        Some((delta_len, trg_depth)) => (delta_len, trg_depth.max(1)),
+    };
+    if max_size == 0 {
+        return false;
+    }
+    let denominator = max_depth.saturating_sub(ref_depth).saturating_add(1);
+    if denominator == 0 {
+        return false;
+    }
+    max_size = max_size.saturating_mul(max_depth.saturating_sub(src_depth)) / denominator;
     if max_size == 0 {
         return false;
     }
@@ -788,7 +896,7 @@ pub(crate) fn write_delta_insert(out: &mut Vec<u8>, mut bytes: &[u8]) {
 
 #[cfg(test)]
 mod git_delta_acceptance_tests {
-    use super::delta_is_acceptable;
+    use super::{delta_is_acceptable, delta_is_acceptable_with_depth};
 
     #[test]
     fn first_candidate_uses_git_half_target_minus_oid_budget() {
@@ -804,5 +912,22 @@ mod git_delta_acceptance_tests {
         assert!(!delta_is_acceptable(&[1], 1_000, 100, 20));
         assert!(!delta_is_acceptable(&[1], 100, 3_232, 20));
         assert!(delta_is_acceptable(&[1], 1_000, 999, 20));
+    }
+
+    #[test]
+    fn deeper_base_must_beat_depth_scaled_budget() {
+        // Replacing a 60-byte depth-1 delta: max_depth=50, src_depth=10
+        // scales the budget to 60 * (50-10) / (50-1+1) = 48.
+        let current = Some((60usize, 1usize));
+        assert!(delta_is_acceptable_with_depth(
+            &[1; 48], 200, 200, 20, 10, current, 50
+        ));
+        assert!(!delta_is_acceptable_with_depth(
+            &[1; 49], 200, 200, 20, 10, current, 50
+        ));
+        // Same-depth base keeps the full current budget.
+        assert!(delta_is_acceptable_with_depth(
+            &[1; 60], 200, 200, 20, 0, current, 50
+        ));
     }
 }

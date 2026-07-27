@@ -118,6 +118,10 @@ fn ssh_url(path: &Path) -> String {
     format!("ssh://fake-host{}", path.to_string_lossy())
 }
 
+fn git_plus_ssh_url(path: &Path) -> String {
+    format!("git+ssh://fake-host{}", path.to_string_lossy())
+}
+
 fn percent_encoded_ssh_url(path: &Path) -> String {
     format!(
         "ssh://fake-host{}",
@@ -333,6 +337,66 @@ fn ls_remote_ssh_repository_matches_upstream_git_protocol_v0() {
             );
             assert_same_output(actual, expected, &args);
         }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Regression for t5813: `git+ssh://` is a deprecated alias for SSH, not a
+/// remote helper name (`git-remote-git+ssh`).
+#[test]
+fn ls_remote_git_plus_ssh_url_matches_upstream_git() {
+    let root = unique_temp_dir("ls-remote-git-plus-ssh");
+    {
+        fs::create_dir_all(&root).expect("create root");
+        let remote = prepare_remote_repo(&root);
+        let fake_ssh = fake_ssh_script(&root);
+        let fake_ssh = fake_ssh.to_str().expect("fake ssh path is utf8");
+        let remote_url = git_plus_ssh_url(&remote);
+
+        for args in [
+            vec!["ls-remote", remote_url.as_str()],
+            vec!["ls-remote", "--heads", remote_url.as_str()],
+            vec!["ls-remote", "--symref", remote_url.as_str(), "HEAD"],
+        ] {
+            let mut expected_args = vec!["-c", "protocol.version=0"];
+            expected_args.extend(args.iter().copied());
+            let expected = run_with_env(
+                sley_testkit::oracle_git(),
+                &root,
+                &expected_args,
+                &[("GIT_SSH", fake_ssh)],
+            );
+            let actual = run_with_env(
+                sley_testkit::sley_bin!(),
+                &root,
+                &args,
+                &[("GIT_SSH", fake_ssh)],
+            );
+            assert_same_output(actual, expected, &args);
+        }
+
+        // Disabled path still rejects (protocol.ssh.allow=never).
+        let denied = run_with_env(
+            sley_testkit::sley_bin!(),
+            &root,
+            &[
+                "-c",
+                "protocol.ssh.allow=never",
+                "ls-remote",
+                remote_url.as_str(),
+            ],
+            &[("GIT_SSH", fake_ssh)],
+        );
+        assert!(
+            !denied.status.success(),
+            "git+ssh must honor protocol.ssh.allow=never\nstderr:\n{}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&denied.stderr);
+        assert!(
+            stderr.contains("not allowed") || stderr.contains("transport"),
+            "expected transport-not-allowed message, got: {stderr}"
+        );
     };
     let _ = fs::remove_dir_all(&root);
 }

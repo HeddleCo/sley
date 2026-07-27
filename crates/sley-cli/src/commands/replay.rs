@@ -1106,6 +1106,9 @@ fn select_revisions(
             }
         })
         .collect::<Vec<_>>();
+    // cherry-pick/revert use setup_revisions with assume_dashdash=1 (builtin/revert.c),
+    // so positionals are revisions only — a tag like `b` must not be rejected as
+    // "both revision and filename" when a path `B` exists (case-insensitive FS).
     let setup = sley_rev::setup_revisions(
         &setup_args,
         &sley_rev::RevisionSetupContext {
@@ -1115,6 +1118,7 @@ fn select_revisions(
             format: ctx.format,
             reader: &db,
             config: Some(&config),
+            assume_dashdash: true,
         },
     )?;
     if !setup.leftovers.is_empty() || !setup.pathspecs.is_empty() {
