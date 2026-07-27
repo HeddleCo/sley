@@ -2316,9 +2316,9 @@ fn commit_cleanup_whitespace_option_and_config_preserve_comments() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&editor).unwrap().permissions();
+            let mut perms = fs::metadata(&editor).expect("editor metadata").permissions();
             perms.set_mode(0o755);
-            fs::set_permissions(&editor, perms).unwrap();
+            fs::set_permissions(&editor, perms).expect("set editor permissions");
         }
 
         for (name, extra_env, args) in [
@@ -2447,7 +2447,7 @@ fn commit_signoff_empty_message_places_sob_on_third_line() {
 
         // Oracle parity on the committed object.
         let oracle_root = root.join("oracle");
-        fs::create_dir_all(&oracle_root).unwrap();
+        fs::create_dir_all(&oracle_root).expect("create oracle root");
         prepare_commit_repo(&oracle_root);
         run_output_with_identity(
             sley_testkit::oracle_git(),
@@ -2464,7 +2464,10 @@ fn commit_signoff_empty_message_places_sob_on_third_line() {
         let sley_msg = cat_head(sley_testkit::oracle_git(), &root);
         let git_msg = cat_head(sley_testkit::oracle_git(), &oracle_root);
         fn body(raw: &[u8]) -> &[u8] {
-            let i = raw.windows(2).position(|w| w == b"\n\n").unwrap();
+            let i = raw
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .expect("commit header separator");
             &raw[i + 2..]
         }
         assert_eq!(
@@ -2488,10 +2491,10 @@ fn commit_commentchar_auto_switch_and_exhausted() {
         fs::create_dir_all(&root).expect("mkdir");
         // Hermetic HOME so advice paths shorten to ~/...
         let home = root.join("home");
-        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&home).expect("create home");
 
         let repo = root.join("repo");
-        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&repo).expect("create repository");
         prepare_commit_repo(&repo);
         // Parent commit then #foo so amend has a parent (Changes to be committed).
         let out = Command::new(sley_testkit::sley_bin!())
@@ -2507,9 +2510,9 @@ fn commit_commentchar_auto_switch_and_exhausted() {
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("HOME", &home)
             .output()
-            .unwrap();
+            .expect("create parent commit");
         assert!(out.status.success());
-        fs::write(repo.join("foo"), b"foo\n").unwrap();
+        fs::write(repo.join("foo"), b"foo\n").expect("write worktree file");
         run_success(sley_testkit::sley_bin!(), &repo, &["add", "foo"]);
         let out = Command::new(sley_testkit::sley_bin!())
             .current_dir(&repo)
@@ -2524,7 +2527,7 @@ fn commit_commentchar_auto_switch_and_exhausted() {
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("HOME", &home)
             .output()
-            .unwrap();
+            .expect("create commented commit");
         assert!(out.status.success());
 
         let include = repo.join("config-include");
@@ -2532,7 +2535,7 @@ fn commit_commentchar_auto_switch_and_exhausted() {
             &include,
             b"[core]\n\tcommentString=:\n\tcommentString=%\n\tcommentChar=auto\n",
         )
-        .unwrap();
+        .expect("write include config");
         run_success(
             sley_testkit::sley_bin!(),
             &repo,
@@ -2553,13 +2556,13 @@ fn commit_commentchar_auto_switch_and_exhausted() {
             &editor,
             b"#!/bin/sh\ncp \"$1\" \"$1.cap\"\nmv \"$1\" \"$1.orig\"\n(echo message; cat \"$1.orig\") >\"$1\"\n",
         )
-        .unwrap();
+        .expect("write editor");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&editor).unwrap().permissions();
+            let mut perms = fs::metadata(&editor).expect("editor metadata").permissions();
             perms.set_mode(0o755);
-            fs::set_permissions(&editor, perms).unwrap();
+            fs::set_permissions(&editor, perms).expect("set editor permissions");
         }
 
         let out = Command::new(sley_testkit::sley_bin!())
@@ -2576,7 +2579,7 @@ fn commit_commentchar_auto_switch_and_exhausted() {
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("HOME", &home)
             .output()
-            .unwrap();
+            .expect("amend commit");
         assert!(
             out.status.success(),
             "auto switch amend failed: {}",
@@ -2595,7 +2598,7 @@ fn commit_commentchar_auto_switch_and_exhausted() {
 
         // #81: exhaust candidates then auto must fail.
         let text = "# 1\n; 2\n@ 3\n! 4\n$ 5\n% 6\n^ 7\n& 8\n| 9\n: 10\n";
-        fs::write(repo.join("text"), text.as_bytes()).unwrap();
+        fs::write(repo.join("text"), text.as_bytes()).expect("write message file");
         // Clear auto config so -F text can succeed (mirrors test_config cleanup).
         run_success(
             sley_testkit::sley_bin!(),
@@ -2620,7 +2623,7 @@ fn commit_commentchar_auto_switch_and_exhausted() {
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("HOME", &home)
             .output()
-            .unwrap();
+            .expect("amend from message file");
         assert!(
             out.status.success(),
             "amend -F text failed: {}",
@@ -2641,7 +2644,7 @@ fn commit_commentchar_auto_switch_and_exhausted() {
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("HOME", &home)
             .output()
-            .unwrap();
+            .expect("amend with auto comment character");
         assert!(
             !out.status.success(),
             "expected auto out-of-options to fail"
