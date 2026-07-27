@@ -2416,7 +2416,7 @@ fn commit_signoff_empty_message_places_sob_on_third_line() {
         );
         assert!(init.status.success());
 
-        let out = run_output_with_identity(
+        let out = run_output_with_identity_and_editor(
             sley_testkit::sley_bin!(),
             &root,
             &["commit", "-s", "--allow-empty", "--allow-empty-message"],
@@ -2454,7 +2454,7 @@ fn commit_signoff_empty_message_places_sob_on_third_line() {
             &oracle_root,
             &["commit", "-m", "initial"],
         );
-        let o = run_output_with_identity(
+        let o = run_output_with_identity_and_editor(
             sley_testkit::oracle_git(),
             &oracle_root,
             &["commit", "-s", "--allow-empty", "--allow-empty-message"],
