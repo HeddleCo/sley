@@ -14,7 +14,8 @@ use std::sync::Arc;
 use std::{env, fs};
 
 use crate::{
-    ObjectReader, ObjectWriter, grafted_parents, unique_temp_path, with_missing_object_context,
+    ObjectReader, ObjectWriter, ReusablePackCandidate, grafted_parents, unique_temp_path,
+    with_missing_object_context,
 };
 
 use crate::install::{
@@ -352,16 +353,46 @@ where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
 {
+    build_reachable_pack_with_reuse_stats(reader, format, starts, excluded)
+        .map(|build| build.map(|build| build.pack))
+}
+
+/// Pack-reuse counters for one reachable-pack build.
+///
+/// `verbatim_entries` were copied from existing pack storage without delta
+/// search or recompression. `redeltified_entries` went through the ordinary
+/// pack writer. `whole_pack` means the output bytes are one self-contained
+/// source pack, including its original header and trailer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReachablePackReuseStats {
+    pub verbatim_entries: u32,
+    pub redeltified_entries: u32,
+    pub whole_pack: bool,
+}
+
+/// A reachable pack together with evidence that its reuse path engaged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachablePackBuild {
+    pub pack: PackWrite,
+    pub reuse: ReachablePackReuseStats,
+}
+
+/// [`build_reachable_pack`] with explicit reuse counters.
+pub fn build_reachable_pack_with_reuse_stats<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+) -> Result<Option<ReachablePackBuild>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
     let objects = collect_reachable_pack_objects(reader, format, starts, excluded)?;
     if objects.is_empty() {
         return Ok(None);
     }
-    // Delta-compress reachable packs (used by install/push/fetch) via git-pack's
-    // sliding-window selection. Self-contained, ofs-delta by default; round-trips
-    // through the existing parser. PackWrite shape is unchanged, so callers are
-    // unaffected.
-    let inputs = pack_inputs(&objects);
-    PackFile::write_packed_with_known_ids(&inputs, format).map(Some)
+    build_reachable_pack_objects_with_reuse(reader, format, objects).map(Some)
 }
 
 pub fn build_reachable_pack_file<R, I>(
@@ -675,6 +706,22 @@ where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
 {
+    build_reachable_pack_filtered_with_reuse_stats(reader, format, starts, excluded, filter)
+        .map(|build| build.map(|build| build.pack))
+}
+
+/// [`build_reachable_pack_filtered`] with explicit reuse counters.
+pub fn build_reachable_pack_filtered_with_reuse_stats<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    filter: Option<PackObjectFilter>,
+) -> Result<Option<ReachablePackBuild>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
     let starts: Vec<ObjectId> = starts.into_iter().collect();
     let wanted: HashSet<ObjectId> = starts.iter().copied().collect();
     let mut objects = collect_reachable_pack_objects(reader, format, starts, excluded)?;
@@ -682,8 +729,394 @@ where
     if objects.is_empty() {
         return Ok(None);
     }
-    let inputs = pack_inputs(&objects);
-    PackFile::write_packed_with_known_ids(&inputs, format).map(Some)
+    build_reachable_pack_objects_with_reuse(reader, format, objects).map(Some)
+}
+
+#[derive(Debug)]
+struct ValidatedReusablePack {
+    pack: Arc<[u8]>,
+    entries: Vec<ValidatedReusableEntry>,
+    oids: HashSet<ObjectId>,
+    checksum: ObjectId,
+    self_contained: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedReusableEntry {
+    oid: ObjectId,
+    start: usize,
+    end: usize,
+    payload_start: usize,
+    kind: u8,
+    base_oid: Option<ObjectId>,
+    crc32: u32,
+}
+
+#[derive(Debug)]
+struct SelectedReusableEntry {
+    pack: Arc<[u8]>,
+    entry: ValidatedReusableEntry,
+}
+
+fn build_reachable_pack_objects_with_reuse<R: ObjectReader>(
+    reader: &R,
+    format: ObjectFormat,
+    objects: Vec<ReachablePackObject>,
+) -> Result<ReachablePackBuild> {
+    let selected: HashSet<ObjectId> = objects.iter().map(|entry| entry.oid).collect();
+    let candidates = reader.reusable_pack_candidates(&selected)?;
+    let mut validated = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if let Some(candidate) = validate_reusable_pack_candidate(format, candidate)? {
+            validated.push(candidate);
+        }
+    }
+
+    // Degenerate pack-reuse case: the selected closure is exactly one
+    // self-contained source pack. Preserve the complete byte stream, including
+    // OFS_DELTA distances, header, and checksum.
+    for candidate in &validated {
+        if candidate.self_contained && candidate.oids == selected {
+            let entries = candidate
+                .entries
+                .iter()
+                .map(|entry| PackIndexEntry {
+                    oid: entry.oid,
+                    crc32: entry.crc32,
+                    offset: entry.start as u64,
+                })
+                .collect::<Vec<_>>();
+            let index = PackIndex::write_v2(format, &entries, &candidate.checksum)?;
+            let delta_count = candidate
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.kind, 6 | 7))
+                .count() as u32;
+            let reuse = ReachablePackReuseStats {
+                verbatim_entries: entries.len() as u32,
+                redeltified_entries: 0,
+                whole_pack: true,
+            };
+            trace_reachable_pack_reuse(reuse);
+            return Ok(ReachablePackBuild {
+                pack: PackWrite {
+                    pack: candidate.pack.to_vec(),
+                    index,
+                    checksum: candidate.checksum,
+                    entries,
+                    delta_count,
+                },
+                reuse,
+            });
+        }
+    }
+
+    // General case: reuse every selected entry whose immediate delta base is
+    // selected too. REF_DELTA entries and non-deltas stay byte-for-byte intact.
+    // OFS_DELTA entries retain their size header, compressed delta program, and
+    // chain, but their location-dependent base header is changed to REF_DELTA.
+    let mut reused_oids = HashSet::new();
+    let mut reused_entries = Vec::new();
+    for candidate in validated {
+        for entry in candidate.entries {
+            if !selected.contains(&entry.oid)
+                || entry
+                    .base_oid
+                    .is_some_and(|base_oid| !selected.contains(&base_oid))
+                || !reused_oids.insert(entry.oid)
+            {
+                continue;
+            }
+            reused_entries.push(SelectedReusableEntry {
+                pack: Arc::clone(&candidate.pack),
+                entry,
+            });
+        }
+    }
+
+    let fresh_objects = objects
+        .iter()
+        .filter(|entry| !reused_oids.contains(&entry.oid))
+        .collect::<Vec<_>>();
+    let fresh_pack = if fresh_objects.is_empty() {
+        None
+    } else {
+        let inputs = fresh_objects
+            .iter()
+            .map(|entry| PackInput {
+                oid: &entry.oid,
+                object: &entry.object,
+            })
+            .collect::<Vec<_>>();
+        Some(PackFile::write_packed_with_known_ids(&inputs, format)?)
+    };
+    let pack = assemble_generated_and_reused_entries(format, fresh_pack, &reused_entries)?;
+    let reuse = ReachablePackReuseStats {
+        verbatim_entries: u32::try_from(reused_entries.len())
+            .map_err(|_| GitError::InvalidFormat("too many reusable pack entries".into()))?,
+        redeltified_entries: u32::try_from(fresh_objects.len())
+            .map_err(|_| GitError::InvalidFormat("too many generated pack entries".into()))?,
+        whole_pack: false,
+    };
+    trace_reachable_pack_reuse(reuse);
+    Ok(ReachablePackBuild { pack, reuse })
+}
+
+fn validate_reusable_pack_candidate(
+    format: ObjectFormat,
+    candidate: ReusablePackCandidate,
+) -> Result<Option<ValidatedReusablePack>> {
+    let hash_len = format.raw_len();
+    if candidate.pack.len() < 12 + hash_len
+        || &candidate.pack[..4] != b"PACK"
+        || candidate.pack_checksum.format() != format
+    {
+        return Ok(None);
+    }
+    let version = u32::from_be_bytes([
+        candidate.pack[4],
+        candidate.pack[5],
+        candidate.pack[6],
+        candidate.pack[7],
+    ]);
+    if !matches!(version, 2 | 3) {
+        return Ok(None);
+    }
+    let declared_count = u32::from_be_bytes([
+        candidate.pack[8],
+        candidate.pack[9],
+        candidate.pack[10],
+        candidate.pack[11],
+    ]) as usize;
+    if declared_count != candidate.entries.len() {
+        return Ok(None);
+    }
+    let trailer_offset = candidate.pack.len() - hash_len;
+    let trailer = ObjectId::from_raw(format, &candidate.pack[trailer_offset..])?;
+    let actual = sley_core::digest_bytes(format, &candidate.pack[..trailer_offset])?;
+    if actual != trailer || trailer != candidate.pack_checksum {
+        return Ok(None);
+    }
+
+    let mut by_offset = candidate.entries;
+    by_offset.sort_by_key(|entry| entry.offset);
+    let mut oids = HashSet::with_capacity(by_offset.len());
+    let mut offset_oids = HashMap::with_capacity(by_offset.len());
+    for entry in &by_offset {
+        if entry.oid.format() != format
+            || !oids.insert(entry.oid)
+            || offset_oids.insert(entry.offset, entry.oid).is_some()
+        {
+            return Ok(None);
+        }
+    }
+
+    let mut entries = Vec::with_capacity(by_offset.len());
+    for (idx, index_entry) in by_offset.iter().enumerate() {
+        let Ok(start) = usize::try_from(index_entry.offset) else {
+            return Ok(None);
+        };
+        let end = match by_offset.get(idx + 1) {
+            Some(next) => match usize::try_from(next.offset) {
+                Ok(offset) => offset,
+                Err(_) => return Ok(None),
+            },
+            None => trailer_offset,
+        };
+        if start < 12 || start >= end || end > trailer_offset {
+            return Ok(None);
+        }
+        let raw = &candidate.pack[start..end];
+        let Some((kind, payload_start, base_oid)) =
+            reusable_entry_header(format, raw, index_entry.offset, &offset_oids)?
+        else {
+            return Ok(None);
+        };
+        entries.push(ValidatedReusableEntry {
+            oid: index_entry.oid,
+            start,
+            end,
+            payload_start,
+            kind,
+            base_oid,
+            crc32: crc32fast::hash(raw),
+        });
+    }
+    let self_contained = entries.iter().all(|entry| {
+        entry
+            .base_oid
+            .is_none_or(|base_oid| oids.contains(&base_oid))
+    });
+    Ok(Some(ValidatedReusablePack {
+        pack: candidate.pack,
+        entries,
+        oids,
+        checksum: trailer,
+        self_contained,
+    }))
+}
+
+fn reusable_entry_header(
+    format: ObjectFormat,
+    raw: &[u8],
+    entry_offset: u64,
+    offset_oids: &HashMap<u64, ObjectId>,
+) -> Result<Option<(u8, usize, Option<ObjectId>)>> {
+    let Some(first) = raw.first().copied() else {
+        return Ok(None);
+    };
+    let kind = (first >> 4) & 0x07;
+    if !matches!(kind, 1 | 2 | 3 | 4 | 6 | 7) {
+        return Ok(None);
+    }
+    let mut cursor = 1usize;
+    let mut byte = first;
+    while byte & 0x80 != 0 {
+        let Some(next) = raw.get(cursor).copied() else {
+            return Ok(None);
+        };
+        cursor += 1;
+        byte = next;
+    }
+    let base_oid = match kind {
+        6 => {
+            let Some(first_offset) = raw.get(cursor).copied() else {
+                return Ok(None);
+            };
+            cursor += 1;
+            let mut byte = first_offset;
+            let mut relative = u64::from(byte & 0x7f);
+            while byte & 0x80 != 0 {
+                let Some(next) = raw.get(cursor).copied() else {
+                    return Ok(None);
+                };
+                cursor += 1;
+                byte = next;
+                let Some(next_relative) = relative
+                    .checked_add(1)
+                    .and_then(|value| value.checked_shl(7))
+                    .and_then(|value| value.checked_add(u64::from(byte & 0x7f)))
+                else {
+                    return Ok(None);
+                };
+                relative = next_relative;
+            }
+            let Some(base_offset) = entry_offset.checked_sub(relative) else {
+                return Ok(None);
+            };
+            let Some(base_oid) = offset_oids.get(&base_offset).copied() else {
+                return Ok(None);
+            };
+            Some(base_oid)
+        }
+        7 => {
+            let end = match cursor.checked_add(format.raw_len()) {
+                Some(end) if end <= raw.len() => end,
+                _ => return Ok(None),
+            };
+            let base_oid = ObjectId::from_raw(format, &raw[cursor..end])?;
+            cursor = end;
+            Some(base_oid)
+        }
+        _ => None,
+    };
+    if cursor >= raw.len() {
+        return Ok(None);
+    }
+    Ok(Some((kind, cursor, base_oid)))
+}
+
+fn assemble_generated_and_reused_entries(
+    format: ObjectFormat,
+    fresh: Option<PackWrite>,
+    reused: &[SelectedReusableEntry],
+) -> Result<PackWrite> {
+    let fresh_count = fresh.as_ref().map_or(0usize, |pack| pack.entries.len());
+    let total = fresh_count
+        .checked_add(reused.len())
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or_else(|| GitError::InvalidFormat("too many pack objects".into()))?;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"PACK");
+    out.extend_from_slice(&2u32.to_be_bytes());
+    out.extend_from_slice(&total.to_be_bytes());
+
+    let mut entries = Vec::with_capacity(total as usize);
+    let mut delta_count = 0u32;
+    if let Some(fresh) = fresh {
+        let hash_len = format.raw_len();
+        if fresh.pack.len() < 12 + hash_len || &fresh.pack[..4] != b"PACK" {
+            return Err(GitError::InvalidFormat(
+                "generated pack is not reusable".into(),
+            ));
+        }
+        out.extend_from_slice(&fresh.pack[12..fresh.pack.len() - hash_len]);
+        delta_count = fresh.delta_count;
+        entries.extend(fresh.entries);
+    }
+
+    for reused in reused {
+        let offset = out.len() as u64;
+        let raw = &reused.pack[reused.entry.start..reused.entry.end];
+        let encoded = if reused.entry.kind == 6 {
+            let base_oid = reused.entry.base_oid.ok_or_else(|| {
+                GitError::InvalidFormat("reused ofs-delta has no base oid".into())
+            })?;
+            let mut entry = raw[..reused.entry.payload_start].to_vec();
+            let mut header_end = 1usize;
+            while entry[header_end - 1] & 0x80 != 0 {
+                header_end += 1;
+            }
+            entry.truncate(header_end);
+            entry[0] = (entry[0] & 0x8f) | (7 << 4);
+            entry.extend_from_slice(base_oid.as_bytes());
+            entry.extend_from_slice(&raw[reused.entry.payload_start..]);
+            entry
+        } else {
+            raw.to_vec()
+        };
+        let crc32 = crc32fast::hash(&encoded);
+        out.extend_from_slice(&encoded);
+        entries.push(PackIndexEntry {
+            oid: reused.entry.oid,
+            crc32,
+            offset,
+        });
+        if matches!(reused.entry.kind, 6 | 7) {
+            delta_count = delta_count
+                .checked_add(1)
+                .ok_or_else(|| GitError::InvalidFormat("too many pack deltas".into()))?;
+        }
+    }
+
+    let checksum = sley_core::digest_bytes(format, &out)?;
+    out.extend_from_slice(checksum.as_bytes());
+    let index = PackIndex::write_v2(format, &entries, &checksum)?;
+    Ok(PackWrite {
+        pack: out,
+        index,
+        checksum,
+        entries,
+        delta_count,
+    })
+}
+
+fn trace_reachable_pack_reuse(stats: ReachablePackReuseStats) {
+    sley_core::trace2::data(
+        "pack-objects",
+        "verbatim-entries",
+        u64::from(stats.verbatim_entries),
+    );
+    sley_core::trace2::data(
+        "pack-objects",
+        "redeltified-entries",
+        u64::from(stats.redeltified_entries),
+    );
+    sley_core::trace2::data(
+        "pack-objects",
+        "whole-pack-reused",
+        u64::from(stats.whole_pack),
+    );
 }
 
 // Keep the public call shape aligned with the unfiltered installer while the
@@ -1031,6 +1464,287 @@ mod thin_base_tests {
             );
             fs::remove_dir_all(root).expect("remove test repository");
         }
+    }
+}
+
+#[cfg(test)]
+mod pack_reuse_tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct CandidateReader {
+        objects: HashMap<ObjectId, Arc<EncodedObject>>,
+        candidates: Vec<ReusablePackCandidate>,
+    }
+
+    impl ObjectReader for CandidateReader {
+        fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
+            self.objects
+                .get(oid)
+                .cloned()
+                .ok_or_else(|| GitError::object_not_found_in(*oid, MissingObjectContext::Read))
+        }
+
+        fn reusable_pack_candidates(
+            &self,
+            object_ids: &HashSet<ObjectId>,
+        ) -> Result<Vec<ReusablePackCandidate>> {
+            Ok(self
+                .candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate
+                        .entries
+                        .iter()
+                        .any(|entry| object_ids.contains(&entry.oid))
+                })
+                .cloned()
+                .collect())
+        }
+    }
+
+    fn reusable_candidate(pack: &PackWrite) -> ReusablePackCandidate {
+        ReusablePackCandidate {
+            pack: Arc::from(pack.pack.clone()),
+            entries: pack.entries.clone(),
+            pack_checksum: pack.checksum,
+        }
+    }
+
+    fn similar_blobs(format: ObjectFormat) -> (EncodedObject, ObjectId, EncodedObject, ObjectId) {
+        let base = EncodedObject::new(ObjectType::Blob, vec![b'a'; 16_384]);
+        let mut target_body = base.body.clone();
+        target_body[8_192..8_256].fill(b'b');
+        let target = EncodedObject::new(ObjectType::Blob, target_body);
+        let base_oid = base.object_id(format).expect("base oid");
+        let target_oid = target.object_id(format).expect("target oid");
+        (base, base_oid, target, target_oid)
+    }
+
+    #[test]
+    fn exact_self_contained_pack_is_returned_verbatim() {
+        for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+            let root = unique_temp_path(&env::temp_dir());
+            let source = FileObjectDatabase::new(root.join("objects"), format);
+            let (base, base_oid, target, target_oid) = similar_blobs(format);
+            let stored = PackFile::write_packed_with_options(
+                &[base, target],
+                format,
+                &PackWriteOptions::new().with_reorder(false),
+            )
+            .expect("write source pack");
+            assert_eq!(stored.delta_count, 1);
+            source.install_pack(&stored).expect("install source pack");
+
+            let build = build_reachable_pack_with_reuse_stats(
+                &source,
+                format,
+                [base_oid, target_oid],
+                &HashSet::new(),
+            )
+            .expect("build reachable pack")
+            .expect("non-empty pack");
+
+            assert_eq!(build.pack.pack, stored.pack);
+            assert_eq!(
+                build.reuse,
+                ReachablePackReuseStats {
+                    verbatim_entries: 2,
+                    redeltified_entries: 0,
+                    whole_pack: true,
+                }
+            );
+            assert_eq!(build.pack.delta_count, 1);
+            PackFile::parse(&build.pack.pack, format).expect("verbatim pack is self-contained");
+            fs::remove_dir_all(root).expect("remove test repository");
+        }
+    }
+
+    #[test]
+    fn partial_pack_reuses_existing_delta_chain_without_redeltifying() {
+        let format = ObjectFormat::Sha1;
+        let root = unique_temp_path(&env::temp_dir());
+        let source = FileObjectDatabase::new(root.join("objects"), format);
+        let (base, base_oid, target, target_oid) = similar_blobs(format);
+        let unrelated = EncodedObject::new(ObjectType::Blob, b"not selected\n".to_vec());
+        let stored = PackFile::write_packed_with_options(
+            &[base.clone(), target.clone(), unrelated],
+            format,
+            &PackWriteOptions::new().with_reorder(false),
+        )
+        .expect("write source pack");
+        assert_eq!(stored.delta_count, 1);
+        source.install_pack(&stored).expect("install source pack");
+
+        let build = build_reachable_pack_with_reuse_stats(
+            &source,
+            format,
+            [base_oid, target_oid],
+            &HashSet::new(),
+        )
+        .expect("build partial reuse pack")
+        .expect("non-empty pack");
+
+        assert_ne!(build.pack.pack, stored.pack);
+        assert_eq!(
+            build.reuse,
+            ReachablePackReuseStats {
+                verbatim_entries: 2,
+                redeltified_entries: 0,
+                whole_pack: false,
+            }
+        );
+        assert_eq!(build.pack.delta_count, 1);
+        let parsed =
+            PackFile::parse(&build.pack.pack, format).expect("partial reuse is self-contained");
+        let parsed = parsed
+            .entries
+            .into_iter()
+            .map(|entry| (entry.entry.oid, entry.object))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(parsed.get(&base_oid), Some(&base));
+        assert_eq!(parsed.get(&target_oid), Some(&target));
+        fs::remove_dir_all(root).expect("remove test repository");
+    }
+
+    #[test]
+    fn thin_whole_pack_candidate_is_refused_and_regenerated() {
+        let format = ObjectFormat::Sha1;
+        let (base, base_oid, target, target_oid) = similar_blobs(format);
+        let thin = PackFile::write_packed_with_options(
+            std::slice::from_ref(&target),
+            format,
+            &PackWriteOptions::new().with_thin_bases(HashMap::from([(base_oid, base)])),
+        )
+        .expect("write thin source pack");
+        assert_eq!(thin.delta_count, 1, "test candidate must really be thin");
+        let reader = CandidateReader {
+            objects: HashMap::from([(target_oid, Arc::new(target.clone()))]),
+            candidates: vec![reusable_candidate(&thin)],
+        };
+
+        let build =
+            build_reachable_pack_with_reuse_stats(&reader, format, [target_oid], &HashSet::new())
+                .expect("refuse thin candidate and regenerate")
+                .expect("non-empty pack");
+
+        assert_ne!(build.pack.pack, thin.pack);
+        assert_eq!(
+            build.reuse,
+            ReachablePackReuseStats {
+                verbatim_entries: 0,
+                redeltified_entries: 1,
+                whole_pack: false,
+            }
+        );
+        let parsed =
+            PackFile::parse(&build.pack.pack, format).expect("fallback pack is self-contained");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].object, target);
+    }
+
+    #[test]
+    fn selected_cross_pack_ref_delta_is_reused_safely() {
+        let format = ObjectFormat::Sha1;
+        let (base, base_oid, target, target_oid) = similar_blobs(format);
+        let base_pack =
+            PackFile::write_packed(std::slice::from_ref(&base), format).expect("write base pack");
+        let target_pack = PackFile::write_packed_with_options(
+            std::slice::from_ref(&target),
+            format,
+            &PackWriteOptions::new().with_thin_bases(HashMap::from([(base_oid, base.clone())])),
+        )
+        .expect("write cross-pack ref-delta");
+        assert_eq!(target_pack.delta_count, 1);
+        let reader = CandidateReader {
+            objects: HashMap::from([
+                (base_oid, Arc::new(base.clone())),
+                (target_oid, Arc::new(target.clone())),
+            ]),
+            candidates: vec![
+                reusable_candidate(&target_pack),
+                reusable_candidate(&base_pack),
+            ],
+        };
+
+        let build = build_reachable_pack_with_reuse_stats(
+            &reader,
+            format,
+            [base_oid, target_oid],
+            &HashSet::new(),
+        )
+        .expect("reuse cross-pack delta")
+        .expect("non-empty pack");
+
+        assert_eq!(
+            build.reuse,
+            ReachablePackReuseStats {
+                verbatim_entries: 2,
+                redeltified_entries: 0,
+                whole_pack: false,
+            }
+        );
+        assert_eq!(build.pack.delta_count, 1);
+        let parsed =
+            PackFile::parse(&build.pack.pack, format).expect("cross-pack reuse is self-contained");
+        let parsed = parsed
+            .entries
+            .into_iter()
+            .map(|entry| (entry.entry.oid, entry.object))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(parsed.get(&base_oid), Some(&base));
+        assert_eq!(parsed.get(&target_oid), Some(&target));
+    }
+
+    #[test]
+    fn closure_spanning_multiple_packs_never_serves_one_partial_pack() {
+        let format = ObjectFormat::Sha1;
+        let root = unique_temp_path(&env::temp_dir());
+        let source = FileObjectDatabase::new(root.join("objects"), format);
+
+        let blob = EncodedObject::new(ObjectType::Blob, b"across packs\n".to_vec());
+        let blob_oid = blob.object_id(format).expect("blob oid");
+        let mut tree_body = b"100644 file\0".to_vec();
+        tree_body.extend_from_slice(blob_oid.as_bytes());
+        let tree = EncodedObject::new(ObjectType::Tree, tree_body);
+        let tree_oid = tree.object_id(format).expect("tree oid");
+        let commit = EncodedObject::new(
+            ObjectType::Commit,
+            format!(
+                "tree {tree_oid}\nauthor A <a@example.com> 0 +0000\ncommitter A <a@example.com> 0 +0000\n\nsplit closure\n"
+            )
+            .into_bytes(),
+        );
+        let commit_oid = commit.object_id(format).expect("commit oid");
+
+        let data_pack = PackFile::write_packed(&[blob, tree], format).expect("write data pack");
+        let commit_pack = PackFile::write_packed(std::slice::from_ref(&commit), format)
+            .expect("write commit pack");
+        source.install_pack(&data_pack).expect("install data pack");
+        source
+            .install_pack(&commit_pack)
+            .expect("install commit pack");
+
+        let build =
+            build_reachable_pack_with_reuse_stats(&source, format, [commit_oid], &HashSet::new())
+                .expect("build multi-pack closure")
+                .expect("non-empty pack");
+
+        assert!(!build.reuse.whole_pack);
+        assert_eq!(build.reuse.verbatim_entries, 3);
+        assert_eq!(build.reuse.redeltified_entries, 0);
+        assert_ne!(build.pack.pack, data_pack.pack);
+        assert_ne!(build.pack.pack, commit_pack.pack);
+        let parsed =
+            PackFile::parse(&build.pack.pack, format).expect("combined closure is self-contained");
+        assert_eq!(parsed.entries.len(), 3);
+        assert!(
+            parsed
+                .entries
+                .iter()
+                .any(|entry| entry.entry.oid == commit_oid && entry.object == commit)
+        );
+        fs::remove_dir_all(root).expect("remove test repository");
     }
 }
 
