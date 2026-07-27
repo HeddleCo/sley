@@ -22,6 +22,10 @@ pub(super) struct ReflogShowOptions {
     format: ReflogFormat,
     max_count: Option<usize>,
     abbrev_commit: Option<bool>,
+    /// Explicit `--abbrev=N` width for the short oid column.
+    abbrev_len: Option<usize>,
+    /// Explicit `--date=…` mode for the `@{…}` selector (git's force_date).
+    date_mode: Option<DateMode>,
     pathspecs: Vec<String>,
     grep_patterns: Vec<String>,
     grep_pattern_kind: sley_grep::PatternKind,
@@ -90,10 +94,12 @@ pub(crate) fn cmd_reflog(cli_session: &crate::session::CliSession, args: &[Strin
     let options = setup_reflog_show_options(&store, &git_dir, format, args)?;
     let config = read_repo_config(&git_dir)?;
     let abbrev_commit = options.abbrev_commit.unwrap_or(true);
-    let abbrev_len = if abbrev_commit {
-        repository_abbrev(&git_dir, format)?
-    } else {
+    let abbrev_len = if !abbrev_commit {
         None
+    } else if let Some(width) = options.abbrev_len {
+        Some(width)
+    } else {
+        repository_abbrev(&git_dir, format)?
     };
     let mut entries = store.read_reflog(&options.reference)?;
     if !options.pathspecs.is_empty() && !reflog_show_pathspecs_match(cwd, &options.pathspecs) {
@@ -142,13 +148,21 @@ pub(crate) fn cmd_reflog(cli_session: &crate::session::CliSession, args: &[Strin
     }
     for (shown, entry) in selected.iter().enumerate() {
         match options.format {
-            ReflogFormat::Default => println!(
-                "{} {}@{{{}}}: {}",
-                format_log_oid(&entry.new_oid, abbrev_len),
-                options.display,
-                shown,
-                String::from_utf8_lossy(&reflog_show_message(entry))
-            ),
+            ReflogFormat::Default => {
+                // git's get_reflog_selector: with explicit --date, force the date
+                // form even when the walk uses index positions (SELECTOR_NONE +
+                // force_date). Without --date, print the entry index.
+                let selector = match &options.date_mode {
+                    Some(mode) => commit_identity_date(&entry.committer, mode),
+                    None => shown.to_string(),
+                };
+                println!(
+                    "{} {}@{{{selector}}}: {}",
+                    format_log_oid(&entry.new_oid, abbrev_len),
+                    options.display,
+                    String::from_utf8_lossy(&reflog_show_message(entry))
+                );
+            }
             ReflogFormat::NewOid { final_newline } => {
                 if final_newline || shown + 1 < selected.len() {
                     println!("{}", entry.new_oid);
@@ -1737,6 +1751,19 @@ pub(crate) fn cmd_update_ref(
         {
             let prefix = format!("could not lock ref {tx_name}: ");
             update_ref_lock_failure(&tx_name, message.trim_start_matches(&prefix))
+        }
+        // files-backend lock failures surface as
+        // `error: cannot lock ref '<name>': <detail>` (sley-refs). Wrap them the
+        // way git's `refs_update_ref` does: `fatal: update_ref failed for ref
+        // '<name>': cannot lock ref '<name>': <detail>` (t1400 #192).
+        Err(GitError::InvalidFormat(message))
+            if message.starts_with("error: cannot lock ref '") =>
+        {
+            let detail = message
+                .strip_prefix("error: cannot lock ref '")
+                .and_then(|rest| rest.split_once("': ").map(|(_, detail)| detail))
+                .unwrap_or(message.as_str());
+            update_ref_lock_failure(&tx_name, detail)
         }
         Err(GitError::InvalidFormat(message)) if message == "entry too large" => {
             eprintln!(

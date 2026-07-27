@@ -1473,6 +1473,12 @@ fn cmd_stash_push(cli_session: &crate::session::CliSession, args: &[String]) -> 
         eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
         return Err(GitError::Exit(128));
     }
+    // git rejects `--pathspec-from-file` together with `--patch` before reading
+    // the pathspec file or entering interactive mode (t3909 "error conditions").
+    if pathspec_from_file.is_some() && patch {
+        eprintln!("fatal: options '--pathspec-from-file' and '--patch' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
     if let Some(pathspec_file) = pathspec_from_file.as_deref() {
         pathspecs.extend(
             read_commit_pathspecs_from_file(pathspec_file, pathspec_file_nul)?

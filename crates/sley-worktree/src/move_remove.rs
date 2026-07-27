@@ -125,17 +125,111 @@ pub fn remove_index_and_worktree_paths(
         }
         by_path
     };
+    // Sparse / skip-worktree gate (builtin/rm.c): when matching index entries,
+    // skip-worktree entries and paths outside the sparse-checkout definition
+    // are ignored unless `--sparse`. A pathspec that matched *only* such
+    // entries is reported via updateSparsePath advice (exit 1); a pathspec that
+    // also matched dense entries silently drops the sparse ones (t3602 #5/#9).
+    // `--ignore-unmatch` suppresses the advice when every match was sparse
+    // (t3602 #10).
+    let active_sparse = if options.sparse {
+        None
+    } else {
+        active_sparse_checkout(git_dir)?
+    };
+    let stage0_skip_worktree: BTreeSet<Vec<u8>> = index_entry_list
+        .iter()
+        .filter(|entry| entry.stage() == Stage::Normal && entry.is_skip_worktree())
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect();
+    let path_outside_sparse = |path: &[u8]| -> bool {
+        if options.sparse {
+            return false;
+        }
+        if stage0_skip_worktree.contains(path) {
+            return true;
+        }
+        match active_sparse.as_ref() {
+            Some((sparse, mode)) => !path_in_sparse_checkout(path, sparse, *mode),
+            None => false,
+        }
+    };
+    // Split a pathspec's matched index paths into dense (to remove) vs sparse
+    // (filtered). Returns `(dense, had_sparse)`.
+    let partition_sparse = |matched: Vec<Vec<u8>>| -> (Vec<Vec<u8>>, bool) {
+        let mut dense = Vec::new();
+        let mut had_sparse = false;
+        for path in matched {
+            if path_outside_sparse(&path) {
+                had_sparse = true;
+            } else {
+                dense.push(path);
+            }
+        }
+        (dense, had_sparse)
+    };
+
     // Paths selected for removal. A single selected path removes ALL of its
     // stage entries (so resolving an unmerged path by removal drops stages
     // 1/2/3 together), matching git's name-keyed removal.
     let mut selected = BTreeSet::new();
+    let mut only_match_sparse: Vec<String> = Vec::new();
     if let Some(mut pathspecs) = RemoveCompiledPathspecs::parse(worktree_root, paths)? {
+        // Match every non-sparse-dir entry first (dense + sparse), then partition
+        // per include pathspec so a mixed dense/sparse match stays silent.
+        let mut all_matched = BTreeSet::new();
         for entry in &index_paths {
             if !sparse_dir_paths.contains(entry) && pathspecs.matches(entry) {
-                selected.insert(entry.clone());
+                all_matched.insert(entry.clone());
             }
         }
-        pathspecs.require_matched_includes(options.ignore_unmatch)?;
+        // Per-include pathspec: did it match any dense entry?
+        for spec in &pathspecs.specs {
+            if spec.element.is_exclude() {
+                continue;
+            }
+            let mut dense_hit = false;
+            let mut sparse_hit = false;
+            for path in &all_matched {
+                if !spec.element.matches_path(path) {
+                    continue;
+                }
+                if path_outside_sparse(path) {
+                    sparse_hit = true;
+                } else {
+                    dense_hit = true;
+                }
+            }
+            if dense_hit {
+                // mark as matched for require_matched via re-walk below
+            } else if sparse_hit {
+                if !options.ignore_unmatch {
+                    only_match_sparse.push(spec.display.clone());
+                }
+            } else if !options.ignore_unmatch && !spec.matched {
+                // require_matched_includes will report these
+            }
+        }
+        // Select only dense matches.
+        for path in all_matched {
+            if !path_outside_sparse(&path) {
+                selected.insert(path);
+            }
+        }
+        // Dense matches already count as "seen"; sparse-only pathspecs are
+        // handled via only_match_sparse. Still die for true non-matches.
+        if !options.ignore_unmatch {
+            for spec in &pathspecs.specs {
+                if spec.element.is_exclude() {
+                    continue;
+                }
+                let sparse_only = only_match_sparse.iter().any(|d| d == &spec.display);
+                if !spec.matched && !sparse_only {
+                    eprintln!("fatal: pathspec '{}' did not match any files", spec.display);
+                    return Err(GitError::Exit(128));
+                }
+            }
+        }
     } else {
         for path in paths {
             let absolute = if path.is_absolute() {
@@ -153,12 +247,28 @@ pub fn remove_index_and_worktree_paths(
             // A pathspec with a trailing slash (e.g. `git rm dir/`) only matches a
             // directory: it must never match a same-named tracked file.
             let git_path = git_path_bytes(relative)?;
+            // Worktree-relative display used in sparse advice (`rm b` → `b`).
+            let display = String::from_utf8_lossy(&git_path).into_owned();
             if !has_trailing_slash && index_paths.contains(&git_path) {
-                selected.insert(git_path);
+                let (dense, had_sparse) = partition_sparse(vec![git_path]);
+                if dense.is_empty() && had_sparse {
+                    if !options.ignore_unmatch {
+                        only_match_sparse.push(display);
+                    }
+                    continue;
+                }
+                selected.extend(dense);
                 continue;
             }
             if has_trailing_slash && gitlink_paths.contains(&git_path) && absolute.is_dir() {
-                selected.insert(git_path);
+                let (dense, had_sparse) = partition_sparse(vec![git_path]);
+                if dense.is_empty() && had_sparse {
+                    if !options.ignore_unmatch {
+                        only_match_sparse.push(display);
+                    }
+                    continue;
+                }
+                selected.extend(dense);
                 continue;
             }
             // A wildcard pathspec (e.g. `git rm "*"` or `git rm "dir/*.c"`) matches
@@ -175,7 +285,14 @@ pub fn remove_index_and_worktree_paths(
                     .cloned()
                     .collect::<Vec<_>>();
                 if !glob_matched.is_empty() {
-                    selected.extend(glob_matched);
+                    let (dense, had_sparse) = partition_sparse(glob_matched);
+                    if dense.is_empty() && had_sparse {
+                        if !options.ignore_unmatch {
+                            only_match_sparse.push(display);
+                        }
+                        continue;
+                    }
+                    selected.extend(dense);
                     continue;
                 }
                 if options.ignore_unmatch {
@@ -205,6 +322,23 @@ pub fn remove_index_and_worktree_paths(
                 );
                 return Err(GitError::Exit(128));
             }
+            let (dense, had_sparse) = partition_sparse(matched);
+            if dense.is_empty() && had_sparse {
+                if !options.ignore_unmatch {
+                    only_match_sparse.push(display);
+                }
+                continue;
+            }
+            if dense.is_empty() {
+                if options.ignore_unmatch {
+                    continue;
+                }
+                eprintln!(
+                    "fatal: pathspec '{}' did not match any files",
+                    String::from_utf8_lossy(&git_path)
+                );
+                return Err(GitError::Exit(128));
+            }
             if !options.recursive {
                 eprintln!(
                     "fatal: not removing '{}' recursively without -r",
@@ -212,45 +346,30 @@ pub fn remove_index_and_worktree_paths(
                 );
                 return Err(GitError::Exit(128));
             }
-            selected.extend(matched);
+            selected.extend(dense);
         }
     }
 
-    // A full sparse index and an expanded sparse index must reject the same
-    // out-of-cone pathspecs unless `--sparse` explicitly opts in. Expansion is
-    // an implementation detail; decide from the selected leaves' actual
-    // CE_SKIP_WORKTREE bits so both layouts share one semantic path.
-    if !options.sparse {
-        let rejected = index_entry_list
-            .iter()
-            .filter(|entry| {
-                entry.stage() == Stage::Normal
-                    && entry.is_skip_worktree()
-                    && selected.contains(entry.path.as_bytes())
-            })
-            .map(|entry| String::from_utf8_lossy(entry.path.as_bytes()).into_owned())
-            .collect::<Vec<_>>();
-        if !rejected.is_empty() {
-            eprintln!("The following paths and/or pathspecs matched paths that exist");
-            eprintln!("outside of your sparse-checkout definition, so will not be");
-            eprintln!("updated in the index:");
-            for path in &rejected {
-                eprintln!("{path}");
-            }
-            let show_hints = sley_config::read_repo_config(git_dir, config_parameters_env)
-                .ok()
-                .and_then(|config| config.get_bool("advice", None, "updateSparsePath"))
-                .unwrap_or(true);
-            if show_hints {
-                eprintln!("hint: If you intend to update such entries, try one of the following:");
-                eprintln!("hint: * Use the --sparse option.");
-                eprintln!("hint: * Disable or modify the sparsity rules.");
-                eprintln!(
-                    "hint: Disable this message with \"git config set advice.updateSparsePath false\""
-                );
-            }
-            return Err(GitError::Exit(1));
+    if !only_match_sparse.is_empty() {
+        eprintln!("The following paths and/or pathspecs matched paths that exist");
+        eprintln!("outside of your sparse-checkout definition, so will not be");
+        eprintln!("updated in the index:");
+        for path in &only_match_sparse {
+            eprintln!("{path}");
         }
+        let show_hints = sley_config::read_repo_config(git_dir, config_parameters_env)
+            .ok()
+            .and_then(|config| config.get_bool("advice", None, "updateSparsePath"))
+            .unwrap_or(true);
+        if show_hints {
+            eprintln!("hint: If you intend to update such entries, try one of the following:");
+            eprintln!("hint: * Use the --sparse option.");
+            eprintln!("hint: * Disable or modify the sparsity rules.");
+            eprintln!(
+                "hint: Disable this message with \"git config set advice.updateSparsePath false\""
+            );
+        }
+        return Err(GitError::Exit(1));
     }
 
     let display_removed_paths = || {
@@ -589,6 +708,7 @@ impl RemoveCompiledPathspecs {
             }
     }
 
+    #[allow(dead_code)] // kept for non-sparse magic pathspec callers
     fn require_matched_includes(&self, ignore_unmatch: bool) -> Result<()> {
         if ignore_unmatch {
             return Ok(());

@@ -434,10 +434,11 @@ fn cmd_submodule_update(
     // failure of the update itself (merge conflict, rebase error, command
     // failure). A plain checkout error continues to the next submodule (so
     // sibling submodules are still updated) but the command's final exit code is
-    // non-zero. We thread both behaviors: `first_error` records a non-fatal
-    // checkout failure, `?` propagates a fatal one immediately.
+    // non-zero. Clone failures are retried once (git's update_clone_task_finished
+    // "Retry scheduled" / "a second time, aborting").
     let mut first_error: Option<GitError> = None;
-    for submodule in selected {
+    let mut failed_clones: Vec<&SubmoduleConfigEntry> = Vec::new();
+    for submodule in &selected {
         let Some(target_oid) = submodule_index_oid(&index, &submodule.path) else {
             // An unmerged (stage > 0) gitlink is skipped with a notice — git's
             // `prepare_to_clone_next_submodule` "Skipping unmerged submodule".
@@ -459,6 +460,31 @@ fn cmd_submodule_update(
                     first_error = Some(err);
                 }
             }
+            UpdateOutcome::CloneFailed => {
+                eprintln!("Failed to clone '{}'. Retry scheduled", submodule.name);
+                failed_clones.push(submodule);
+            }
+        }
+    }
+    // Second pass: retry clones that failed the first time (git's stragglers).
+    for submodule in failed_clones {
+        let Some(target_oid) = submodule_index_oid(&index, &submodule.path) else {
+            continue;
+        };
+        match update_one_submodule(&context, &config, submodule, &target_oid, &options)? {
+            UpdateOutcome::Done => {}
+            UpdateOutcome::NonFatalCheckoutError(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+            UpdateOutcome::CloneFailed => {
+                eprintln!(
+                    "Failed to clone '{}' a second time, aborting",
+                    submodule.name
+                );
+                return Err(GitError::Exit(128));
+            }
         }
     }
     match first_error {
@@ -470,10 +496,13 @@ fn cmd_submodule_update(
 /// The result of updating one submodule. A non-fatal checkout failure is carried
 /// up so the loop continues to the next submodule but the overall command still
 /// exits non-zero (git's `run_update_command` returns the `git checkout` exit
-/// code without `die()`ing the whole run).
+/// code without `die()`ing the whole run). Clone failures are collected for a
+/// single retry pass matching git's parallel-clone scheduler.
 enum UpdateOutcome {
     Done,
     NonFatalCheckoutError(GitError),
+    /// Fresh clone failed (e.g. missing alternate); schedule a retry.
+    CloneFailed,
 }
 
 /// The single `submodule update` primitive — git's `update_submodule` +
@@ -552,14 +581,23 @@ fn update_one_submodule(
 
     let just_populated = submodule_head(&path).is_err();
     if just_populated {
-        populate_submodule_worktree(
+        match populate_submodule_worktree(
             &context.session,
             &context.git_dir,
             submodule,
             &path,
             &url,
             options,
-        )?;
+        ) {
+            Ok(()) => {}
+            // A failed fresh clone (missing alternate, network, etc.) is
+            // non-fatal for the sibling loop: git schedules a retry and only
+            // aborts after the second failure.
+            Err(GitError::Exit(128)) | Err(GitError::Exit(1)) => {
+                return Ok(UpdateOutcome::CloneFailed);
+            }
+            Err(err) => return Err(err),
+        }
     }
 
     // Resolve the effective update strategy via the single resolver. The typed
@@ -716,19 +754,28 @@ fn populate_submodule_worktree(
 /// submodule alternate (`<ref>/modules/<name>`) forwarded as `--reference`
 /// (strategy `die`) or `--reference-if-able` (strategy `info`). `ignore` adds
 /// nothing.
+///
+/// Missing candidates are validated here (git's `compute_alternate_path`) so
+/// strategy `die` emits
+/// `fatal: submodule '<name>' cannot add alternate: path '…' does not exist`
+/// before the clone is attempted — required by t7408 nested missing-alternate.
 fn superproject_alternate_reference_args(git_dir: &Path, name: &str) -> Result<Vec<String>> {
     let common = common_git_dir_for_git_dir(git_dir)?;
     let config = read_repo_config(&common)?;
     if config.get("submodule", None, "alternateLocation") != Some("superproject") {
         return Ok(Vec::new());
     }
-    let flag = match config
+    let strategy = config
         .get("submodule", None, "alternateErrorStrategy")
-        .unwrap_or("die")
-    {
-        "ignore" => return Ok(Vec::new()),
-        "info" => "--reference-if-able",
-        _ => "--reference",
+        .unwrap_or("die");
+    if strategy == "ignore" {
+        return Ok(Vec::new());
+    }
+    let require = strategy != "info";
+    let flag = if require {
+        "--reference"
+    } else {
+        "--reference-if-able"
     };
     let alternates_file = common.join("objects").join("info").join("alternates");
     let Ok(content) = fs::read_to_string(&alternates_file) else {
@@ -742,11 +789,23 @@ fn superproject_alternate_reference_args(git_dir: &Path, name: &str) -> Result<V
         }
         // Each line is a "<reference-gitdir>/objects" path; the reference repo's
         // gitdir is its parent and the submodule's borrowed gitdir is that
-        // repo's `modules/<name>`.
+        // repo's `modules/<name>`. git appends a trailing `/` so a missing
+        // intermediate component is reported as a path that "does not exist".
         let Some(reference_git_dir) = Path::new(line).parent() else {
             continue;
         };
         let candidate = reference_git_dir.join("modules").join(name);
+        // Trailing slash form matches git's strbuf path used in compute_alternate_path.
+        let candidate_display = format!("{}/", candidate.display());
+        if !candidate.is_dir() {
+            let err = format!("path '{candidate_display}' does not exist");
+            if require {
+                eprintln!("fatal: submodule '{name}' cannot add alternate: {err}");
+                return Err(GitError::Exit(128));
+            }
+            eprintln!("submodule '{name}' cannot add alternate: {err}");
+            continue;
+        }
         args.push(flag.to_string());
         args.push(candidate.to_string_lossy().into_owned());
     }

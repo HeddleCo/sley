@@ -1409,6 +1409,7 @@ dependencies = [
  "sley-core",
  "sley-formats",
  "sley-fsck",
+ "sley-index",
  "sley-object",
  "sley-odb",
  "sley-pack",

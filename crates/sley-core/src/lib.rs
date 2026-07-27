@@ -26,6 +26,12 @@ pub use precompose::{
     precompose_unicode_enabled, set_precompose_unicode,
 };
 
+pub mod namespace;
+pub use namespace::{
+    clear_git_namespace_override, expand_namespace, get_git_namespace, namespace_active,
+    ref_is_hidden, set_git_namespace_override, strip_namespace, trim_hidden_ref_pattern,
+};
+
 static ORIGINAL_CWD: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 pub fn set_original_cwd(path: Option<PathBuf>) {

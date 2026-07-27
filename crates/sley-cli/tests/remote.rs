@@ -1476,21 +1476,26 @@ fn push_unqualified_dst_refspec_dwim_and_advice_match_upstream_git() {
         ("tree", "some-tag^{tree}"),
         ("blob", "some-tag:file"),
     ] {
-        let oid = String::from_utf8(git(&expected, &["rev-parse", peels]))
+        let expected_oid = String::from_utf8(git(&expected, &["rev-parse", peels]))
             .expect("utf8 oid")
             .trim()
             .to_string();
-        let refspec = format!("{oid}:dst");
+        let actual_oid = String::from_utf8(git(&actual, &["rev-parse", peels]))
+            .expect("utf8 oid")
+            .trim()
+            .to_string();
+        let expected_refspec = format!("{expected_oid}:dst");
+        let actual_refspec = format!("{actual_oid}:dst");
 
         let expected_out = run_output(
             sley_testkit::oracle_git(),
             &expected,
-            &["push", "origin", &refspec],
+            &["push", "origin", &expected_refspec],
         );
         let actual_out = run_output(
             sley_testkit::sley_bin!(),
             &actual,
-            &["push", "origin", &refspec],
+            &["push", "origin", &actual_refspec],
         );
         assert_eq!(
             actual_out.status.code(),
@@ -1524,7 +1529,7 @@ fn push_unqualified_dst_refspec_dwim_and_advice_match_upstream_git() {
                 "advice.pushUnqualifiedRefName=false",
                 "push",
                 "origin",
-                &refspec,
+                &expected_refspec,
             ],
         );
         let actual_off = run_output(
@@ -1535,7 +1540,7 @@ fn push_unqualified_dst_refspec_dwim_and_advice_match_upstream_git() {
                 "advice.pushUnqualifiedRefName=false",
                 "push",
                 "origin",
-                &refspec,
+                &actual_refspec,
             ],
         );
         assert_eq!(

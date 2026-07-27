@@ -178,6 +178,8 @@ pub struct FetchOptions {
     /// `remote.<name>.negotiationInclude`; `Some` means the CLI list overrides
     /// remote config.
     pub negotiation_include: Option<Vec<String>>,
+    /// Protocol v2 negotiate-only (no pack transfer).
+    pub negotiate_only: bool,
 }
 
 /// A remote-tracking ref removed by a prune pass.
@@ -195,7 +197,12 @@ pub struct FetchOutcome {
     /// The ref updates that were planned (and applied unless `dry_run`), in the
     /// order they were resolved. Includes auto-followed tags; entries without a
     /// `dst` are fetch-only (e.g. a bare `HEAD` fetch) and update no local ref.
+    /// Rejected non-fast-forward destinations remain in this list so porcelain
+    /// output can report them; see [`Self::rejected_dsts`].
     pub ref_updates: Vec<FetchRefUpdate>,
+    /// Local destinations that were planned but not applied because they were
+    /// non-fast-forward without force (git's `! [rejected]` lines).
+    pub rejected_dsts: Vec<String>,
     /// Remote-tracking refs pruned (empty unless `prune` and the remote is a
     /// configured remote). Empty on `dry_run`.
     pub pruned: Vec<PrunedRef>,
@@ -212,6 +219,11 @@ pub struct FetchOutcome {
     /// truthful native counts. `None` means no objects moved or the transport
     /// did not provide trustworthy progress metadata.
     pub pack_generation_progress: Option<PackGenerationProgress>,
+    /// Non-zero fetch failure message after applying accepted updates (e.g.
+    /// non-fast-forward rejection). Callers that need porcelain status should
+    /// render `ref_updates`/`pruned` first, then surface this as the exit
+    /// reason.
+    pub rejection: Option<String>,
 }
 
 /// Repository-derived defaults for one fetch invocation.
@@ -475,6 +487,10 @@ fn fetch_impl(
         &options,
     )?;
     let mut outcome = FetchOutcome::default();
+    // Connectivity must tolerate promised-missing history when destination is
+    // already a partial clone / promisor repository.
+    let destination_has_promisor =
+        promisor_remote || crate::config_has_promisor_remote(request.config);
     let mut quarantine = request
         .validation
         .map(|_| {
@@ -484,7 +500,7 @@ fn fetch_impl(
                 // the quarantined graph with that same missing-object policy;
                 // otherwise the deliberately omitted blobs are rejected before
                 // the `.promisor` pack can be promoted.
-                incoming.with_promisor_remote_present(promisor_remote)
+                incoming.with_promisor_remote_present(destination_has_promisor)
             })
         })
         .transpose()?;
@@ -496,7 +512,7 @@ fn fetch_impl(
     // Advertise refs, plan the ref-map, install the pack, then update refs/prune.
     // The two transports differ only in how they advertise and how they pull the
     // pack; the ref-map planning and ref bookkeeping are identical.
-    let advertisements = match request.source {
+    let _advertisements = match request.source {
         #[cfg(not(feature = "http"))]
         FetchSource::Http(_) => {
             return Err(GitError::Unsupported(
@@ -548,20 +564,75 @@ fn fetch_impl(
                 has_merge_config,
                 tracking_refspecs: &tracking_refspecs,
             })?;
-            let wants = updates.iter().map(|update| update.oid).collect();
+            // Prefer protocol-v2 `want-ref` when the server advertised `ref-in-want`
+            // so tracking refs land on the OID current at request time (not the
+            // earlier ls-refs snapshot). Exact-OID wants still go as `want`.
+            let v2_fetch_features = discovered
+                .handshake
+                .as_ref()
+                .and_then(|handshake| {
+                    sley_protocol::parse_protocol_v2_fetch_features(&handshake.capabilities)
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or_default();
+            let use_ref_in_want = discovered.set.protocol == ProtocolVersion::V2
+                && v2_fetch_features.ref_in_want
+                && options.depth.is_none()
+                && options.deepen_since.is_none()
+                && options.deepen_not.is_empty()
+                && !promisor_remote
+                && options.filter.is_none()
+                && !options.refetch;
+            let mut seen_want_refs = HashSet::new();
+            let want_refs: Vec<String> = if use_ref_in_want {
+                updates
+                    .iter()
+                    .filter(|update| update.src.starts_with("refs/"))
+                    .filter(|update| seen_want_refs.insert(update.src.clone()))
+                    .map(|update| update.src.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let wants: Vec<ObjectId> = if use_ref_in_want {
+                let mut seen = HashSet::new();
+                updates
+                    .iter()
+                    .filter(|update| {
+                        ObjectId::from_hex(request.format, &update.src).is_ok()
+                            || !update.src.starts_with("refs/")
+                    })
+                    .map(|update| update.oid)
+                    .filter(|oid| seen.insert(*oid))
+                    .collect()
+            } else {
+                updates.iter().map(|update| update.oid).collect()
+            };
             // Shallow fetch: replay the current boundary as `shallow` lines and ask
             // the server to deepen to `depth`, then fold the server's shallow-info
             // back into `$GIT_DIR/shallow`. A `None` depth keeps the full-fetch path.
             let existing_shallow =
                 shallow_boundary_for_request(request.git_dir, request.format, &options)?;
             let deepen_not = resolve_deepen_not_refs(&advertisements, &options.deepen_not)?;
+            // Negotiation haves must come from the real repository, not the
+            // (empty) quarantine transfer_git_dir. An empty have set makes the
+            // v2 client send `done` on the first round, which skips the
+            // acknowledgments/`ready` framing path that t5702 #72/#73 validate.
+            let pack_haves = match negotiation_haves.clone() {
+                Some(haves) => Some(haves),
+                None => Some(crate::local::local_negotiation_have_oids(
+                    request.git_dir,
+                    request.format,
+                )?),
+            };
             let pack_request = crate::http::HttpFetchPackRequest {
                 client,
                 git_dir: transfer_git_dir,
                 format: request.format,
                 remote,
                 wants,
-                haves: negotiation_haves.clone(),
+                haves: pack_haves,
                 shallow: existing_shallow,
                 deepen: options.depth,
                 promisor: promisor_remote,
@@ -583,13 +654,23 @@ fn fetch_impl(
                 })?;
                 // Bundle progress+cancel; credentials stays a separate field borrow.
                 let ctx = crate::OperationContext::new(services.progress, services.cancel);
-                crate::http::install_fetch_pack_via_http_protocol_v2_fetch(
-                    pack_request,
-                    handshake,
-                    services.credentials,
-                    ctx.progress,
-                    ctx.cancel,
-                )?
+                let v2_outcome =
+                    crate::http::install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs(
+                        pack_request,
+                        want_refs,
+                        handshake,
+                        services.credentials,
+                        ctx.progress,
+                        ctx.cancel,
+                    )?;
+                for wanted in v2_outcome.wanted_refs {
+                    for update in &mut updates {
+                        if update.src == wanted.name {
+                            update.oid = wanted.oid;
+                        }
+                    }
+                }
+                v2_outcome.shallow_info
             } else {
                 let ctx = crate::OperationContext::new(services.progress, services.cancel);
                 crate::http::install_fetch_pack_via_http_upload_pack(
@@ -600,12 +681,27 @@ fn fetch_impl(
                 )?
             };
             reject_shallow_clone_fetch(&options, &shallow_info)?;
+            if options.prune && !parsed_prune_refspecs.is_empty() {
+                outcome.pruned = prune_refs_from_advertisements(
+                    PruneRefsInput {
+                        config: request.config,
+                        store: &store,
+                        remote: request.remote_name,
+                        advertisements: &advertisements,
+                        refspecs: &parsed_prune_refspecs,
+                        dry_run: options.dry_run,
+                        quiet: true,
+                    },
+                    services.progress,
+                )?;
+            }
             finalize_fetch(
                 FetchFinalize {
                     git_dir: request.git_dir,
                     format: request.format,
                     store: &store,
                     options: &options,
+                    remote_name: request.remote_name,
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
                     log_all_ref_updates: fetch_log_all_ref_updates(request.config),
@@ -686,12 +782,27 @@ fn fetch_impl(
                 ctx.cancel,
             )?;
             reject_shallow_clone_fetch(&options, &shallow_info)?;
+            if options.prune && !parsed_prune_refspecs.is_empty() {
+                outcome.pruned = prune_refs_from_advertisements(
+                    PruneRefsInput {
+                        config: request.config,
+                        store: &store,
+                        remote: request.remote_name,
+                        advertisements: &advertisements,
+                        refspecs: &parsed_prune_refspecs,
+                        dry_run: options.dry_run,
+                        quiet: true,
+                    },
+                    services.progress,
+                )?;
+            }
             finalize_fetch(
                 FetchFinalize {
                     git_dir: request.git_dir,
                     format: request.format,
                     store: &store,
                     options: &options,
+                    remote_name: request.remote_name,
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
                     log_all_ref_updates: fetch_log_all_ref_updates(request.config),
@@ -781,12 +892,27 @@ fn fetch_impl(
                 ctx.cancel,
             )?;
             reject_shallow_clone_fetch(&options, &shallow_info)?;
+            if options.prune && !parsed_prune_refspecs.is_empty() {
+                outcome.pruned = prune_refs_from_advertisements(
+                    PruneRefsInput {
+                        config: request.config,
+                        store: &store,
+                        remote: request.remote_name,
+                        advertisements: &advertisements,
+                        refspecs: &parsed_prune_refspecs,
+                        dry_run: options.dry_run,
+                        quiet: true,
+                    },
+                    services.progress,
+                )?;
+            }
             finalize_fetch(
                 FetchFinalize {
                     git_dir: request.git_dir,
                     format: request.format,
                     store: &store,
                     options: &options,
+                    remote_name: request.remote_name,
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
                     log_all_ref_updates: fetch_log_all_ref_updates(request.config),
@@ -818,8 +944,26 @@ fn fetch_impl(
             // skip have-building, so this must run for every local fetch
             // (t5330 #4).
             crate::local::mark_complete_local_refs(request.git_dir, request.format)?;
-            let advertisements =
-                crate::local::local_fetch_advertisements(remote_git_dir, request.format)?;
+            // Protocol v2: real `ls-refs` with ref-prefix filtering so the
+            // packet log and advertised set match git (t5702 #24/#48/#49).
+            let advertisements = if request.config.get("protocol", None, "version") == Some("2") {
+                let mut prefixes =
+                    sley_protocol::refspec_ref_prefixes(&parsed_refspecs, request.format);
+                if options.auto_follow_tags || options.fetch_all_tags {
+                    prefixes.push("refs/tags/".into());
+                }
+                if prefixes.is_empty() {
+                    prefixes.push("HEAD".into());
+                }
+                crate::local::local_protocol_v2_ls_refs_advertisements(
+                    remote_git_dir,
+                    request.format,
+                    &prefixes,
+                    &[],
+                )?
+            } else {
+                crate::local::local_fetch_advertisements(remote_git_dir, request.format)?
+            };
             let remote_config =
                 sley_config::read_repo_config(remote_common_git_dir, None).unwrap_or_default();
             let mut promisor_decision = crate::PromisorRemoteDecision::default();
@@ -1111,6 +1255,16 @@ fn fetch_impl(
                 }
                 (Vec::new(), 0, 0, 0)
             } else {
+                // Protocol-v2 clients advertise `include-tag` when auto-following
+                // tags (t5702 #49). The in-process pack path already hydrates
+                // those tag objects; emit the matching request line so packet
+                // traces match a real v2 fetch-pack client.
+                if request.config.get("protocol", None, "version") == Some("2")
+                    && (options.auto_follow_tags || options.fetch_all_tags)
+                {
+                    sley_protocol::set_packet_trace_identity("fetch");
+                    sley_protocol::trace_packet_write_payload(b"include-tag\n");
+                }
                 let transfer = crate::local::install_fetch_pack_via_local_upload_pack_with_promisor_decision_into(
                     request.git_dir,
                     transfer_git_dir,
@@ -1146,12 +1300,31 @@ fn fetch_impl(
             {
                 services.progress.pack_generation(progress);
             }
+            // git prunes before applying updates so a D/F rename on the remote
+            // (dir/file deleted, dir created) resolves under --prune (t5510).
+            // Suppress the legacy "Pruning/URL" banners here: the CLI's
+            // print_fetch_status emits `From` then ` - [deleted]` rows.
+            if options.prune && !parsed_prune_refspecs.is_empty() {
+                outcome.pruned = prune_refs_from_advertisements(
+                    PruneRefsInput {
+                        config: request.config,
+                        store: &store,
+                        remote: request.remote_name,
+                        advertisements: &advertisements,
+                        refspecs: &parsed_prune_refspecs,
+                        dry_run: options.dry_run,
+                        quiet: true,
+                    },
+                    services.progress,
+                )?;
+            }
             finalize_fetch(
                 FetchFinalize {
                     git_dir: request.git_dir,
                     format: request.format,
                     store: &store,
                     options: &options,
+                    remote_name: request.remote_name,
                     fetch_head_source: &fetch_head_source,
                     default_head_fetch,
                     log_all_ref_updates: fetch_log_all_ref_updates(request.config),
@@ -1167,21 +1340,6 @@ fn fetch_impl(
             advertisements
         }
     };
-
-    if options.prune && !parsed_prune_refspecs.is_empty() {
-        outcome.pruned = prune_refs_from_advertisements(
-            PruneRefsInput {
-                config: request.config,
-                store: &store,
-                remote: request.remote_name,
-                advertisements: &advertisements,
-                refspecs: &parsed_prune_refspecs,
-                dry_run: options.dry_run,
-                quiet: options.quiet,
-            },
-            services.progress,
-        )?;
-    }
 
     Ok(outcome)
 }
@@ -1305,12 +1463,27 @@ pub fn finalize_remote_helper_fetch(
         ..FetchOutcome::default()
     };
     let mut quarantine = None;
+    if options.prune && !parsed_prune_refspecs.is_empty() {
+        outcome.pruned = prune_refs_from_advertisements(
+            PruneRefsInput {
+                config: request.config,
+                store: &store,
+                remote: request.remote_name,
+                advertisements: request.advertisements,
+                refspecs: &parsed_prune_refspecs,
+                dry_run: options.dry_run,
+                quiet: true,
+            },
+            services.progress,
+        )?;
+    }
     finalize_fetch(
         FetchFinalize {
             git_dir: request.git_dir,
             format: request.format,
             store: &store,
             options: &options,
+            remote_name: request.remote_name,
             fetch_head_source: &fetch_head_source,
             default_head_fetch,
             log_all_ref_updates: fetch_log_all_ref_updates(request.config),
@@ -1323,20 +1496,6 @@ pub fn finalize_remote_helper_fetch(
         &mut updates,
         &mut outcome,
     )?;
-    if options.prune && !parsed_prune_refspecs.is_empty() {
-        outcome.pruned = prune_refs_from_advertisements(
-            PruneRefsInput {
-                config: request.config,
-                store: &store,
-                remote: request.remote_name,
-                advertisements: request.advertisements,
-                refspecs: &parsed_prune_refspecs,
-                dry_run: options.dry_run,
-                quiet: options.quiet,
-            },
-            services.progress,
-        )?;
-    }
     Ok(outcome)
 }
 
@@ -1719,6 +1878,8 @@ struct FetchFinalize<'a> {
     format: ObjectFormat,
     store: &'a FileRefStore,
     options: &'a FetchOptions,
+    /// Remote name used for D/F conflict advice (`git remote prune <name>`).
+    remote_name: &'a str,
     fetch_head_source: &'a str,
     default_head_fetch: bool,
     log_all_ref_updates: bool,
@@ -1764,6 +1925,7 @@ fn finalize_fetch(
         format,
         store,
         options,
+        remote_name,
         fetch_head_source,
         default_head_fetch,
         log_all_ref_updates,
@@ -1773,6 +1935,12 @@ fn finalize_fetch(
         quarantine,
         shallow_info,
     } = finalize;
+    // git's do_fetch truncates FETCH_HEAD up front for atomic fetches (unless
+    // --append). Any later abort — non-ff rejection, hook, lock failure —
+    // leaves the file empty rather than the previous clone/fetch contents.
+    if options.atomic && options.write_fetch_head && !options.append && !options.dry_run {
+        fs::write(git_dir.join("FETCH_HEAD"), b"")?;
+    }
     // Incoming connectivity is defined against the boundary sent alongside
     // the pack. Stage that boundary only inside the quarantine first; a failed
     // validation then drops both objects and metadata without mutating the
@@ -1780,7 +1948,10 @@ fn finalize_fetch(
     if let Some(incoming) = quarantine.as_ref() {
         crate::shallow::apply_shallow_info(incoming.git_dir(), format, shallow_info)?;
     }
-    let main_db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let destination_config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    let destination_has_promisor = crate::config_has_promisor_remote(&destination_config);
+    let main_db = FileObjectDatabase::from_git_dir(git_dir, format)
+        .with_promisor_remote_present(destination_has_promisor);
     let quarantine_db = quarantine
         .as_ref()
         .map(sley_odb::IncomingPackQuarantine::database);
@@ -1797,6 +1968,7 @@ fn finalize_fetch(
         updates,
         validation,
         unshallow_received,
+        destination_has_promisor,
     )?;
     downgrade_non_commit_for_merge(validation_db, format, updates);
     // Once the incoming graph passes validation it is safe to expose the
@@ -1807,7 +1979,17 @@ fn finalize_fetch(
         incoming.promote()?;
     }
     if options.dry_run {
+        // Dry-run still classifies non-fast-forward rejections so porcelain
+        // output matches a real fetch (including `!` lines and exit status).
+        let (rejected, rejection) = classify_fetch_ref_rejections(git_dir, format, store, updates)?;
+        outcome.rejected_dsts = updates
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| rejected.contains(index))
+            .filter_map(|(_, update)| update.dst.clone())
+            .collect();
         outcome.ref_updates = std::mem::take(updates);
+        outcome.rejection = rejection;
         return Ok(());
     }
     // Commit shallow metadata only after the incoming object graph validates.
@@ -1819,16 +2001,23 @@ fn finalize_fetch(
     if options.atomic {
         // Atomic fetch (`do_fetch`/`store_updated_refs` with a transaction): a
         // single rejected update aborts the whole fetch and leaves `FETCH_HEAD`
-        // empty. git truncates `FETCH_HEAD` up front (unless `--append`) and
-        // only re-writes the buffered records once the transaction commits, so
-        // an abort leaves the truncated (empty) file. Reject non-fast-forward
-        // tracking updates first, then apply every update in one transaction
-        // (firing the `reference-transaction` hook, which may itself abort).
-        if let Some(reason) = atomic_non_fast_forward_rejection(git_dir, format, store, updates)? {
-            return Err(GitError::Command(reason));
-        }
-        if options.write_fetch_head && !options.append {
-            fs::write(git_dir.join("FETCH_HEAD"), b"")?;
+        // empty (already truncated above). Reject non-fast-forward / tag-clobber
+        // tracking updates first, then apply every *changing* update in one
+        // transaction (firing the `reference-transaction` hook).
+        //
+        // For porcelain display, still classify every update (including
+        // rejected ones) so the CLI can render `!` lines before exiting.
+        let (rejected, rejection) = classify_fetch_ref_rejections(git_dir, format, store, updates)?;
+        if let Some(reason) = rejection {
+            outcome.rejected_dsts = updates
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| rejected.contains(index))
+                .filter_map(|(_, update)| update.dst.clone())
+                .collect();
+            outcome.ref_updates = std::mem::take(updates);
+            outcome.rejection = Some(reason);
+            return Ok(());
         }
         apply_fetch_ref_updates(
             store,
@@ -1837,6 +2026,9 @@ fn finalize_fetch(
             log_all_ref_updates,
             updates,
             ref_hook,
+            true, // atomic: single transaction, fail closed
+            remote_name,
+            None,
         )?;
         if options.write_fetch_head {
             // Already truncated above when not appending, so always append the
@@ -1854,19 +2046,21 @@ fn finalize_fetch(
         outcome.ref_updates = std::mem::take(updates);
         return Ok(());
     }
-    let (rejected, rejection) =
-        non_atomic_non_fast_forward_rejections(git_dir, format, store, updates)?;
+    let (rejected, rejection) = classify_fetch_ref_rejections(git_dir, format, store, updates)?;
     let accepted = updates
         .iter()
         .enumerate()
         .filter(|(index, _)| !rejected.contains(index))
         .map(|(_, update)| update.clone())
         .collect::<Vec<_>>();
-    if accepted.is_empty()
-        && let Some(reason) = rejection.as_ref()
-    {
-        return Err(GitError::Command(reason.clone()));
-    }
+    outcome.rejected_dsts = updates
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| rejected.contains(index))
+        .filter_map(|(_, update)| update.dst.clone())
+        .collect();
+    // Non-atomic: write FETCH_HEAD before applying refs so a later lock/D/F
+    // failure still leaves the planned tips on disk (git's store_updated_refs).
     if options.write_fetch_head {
         write_finalized_fetch_head(
             git_dir,
@@ -1878,18 +2072,38 @@ fn finalize_fetch(
         )?;
         outcome.wrote_fetch_head = true;
     }
-    apply_fetch_ref_updates(
+    if accepted.is_empty()
+        && let Some(reason) = rejection.as_ref()
+    {
+        // Still surface the planned updates so porcelain output can render the
+        // rejected lines before the process exits non-zero.
+        outcome.ref_updates = std::mem::take(updates);
+        outcome.rejection = Some(reason.clone());
+        return Ok(());
+    }
+    let rejected_before = outcome.rejected_dsts.len();
+    let mut apply_rejection = rejection;
+    let apply_err = apply_fetch_ref_updates(
         store,
         format,
         fetch_head_source,
         log_all_ref_updates,
         &accepted,
         ref_hook,
-    )?;
-    if let Some(reason) = rejection {
-        return Err(GitError::Command(reason));
+        false, // non-atomic: continue after individual failures
+        remote_name,
+        Some(&mut outcome.rejected_dsts),
+    );
+    if let Err(err) = apply_err {
+        // Hard failure (e.g. hook abort) after partial apply — surface it.
+        apply_rejection = Some(err.to_string());
+    } else if apply_rejection.is_none() && outcome.rejected_dsts.len() > rejected_before {
+        // Soft rejections recorded during apply (lock / D/F). Use a generic
+        // non-zero marker so the CLI exits unsuccessfully after porcelain.
+        apply_rejection = Some("fetch failed to update some refs".into());
     }
     outcome.ref_updates = std::mem::take(updates);
+    outcome.rejection = apply_rejection;
     Ok(())
 }
 
@@ -1899,6 +2113,7 @@ fn validate_incoming_fetch_objects(
     updates: &[FetchRefUpdate],
     policy: Option<&sley_fsck::FsckPolicy>,
     require_connectivity: bool,
+    destination_has_promisor: bool,
 ) -> Result<()> {
     if policy.is_none() && !require_connectivity {
         return Ok(());
@@ -1910,6 +2125,49 @@ fn validate_incoming_fetch_objects(
         .filter(|oid| seen.insert(*oid))
         .collect::<Vec<_>>();
     if roots.is_empty() {
+        return Ok(());
+    }
+    // git's check_connected (connected.c): when the destination already has a
+    // promisor remote, a full rev-list walk is either short-circuited (tips in a
+    // promisor pack) or run with --exclude-promisor-objects, which does not fail
+    // merely because historical filtered-out blobs remain absent. Sley's full
+    // fsck connectivity re-walks that history and reports false broken links.
+    // For promisor destinations, require only that each wanted tip is present
+    // (the pack transfer already delivered the objects needed for those tips).
+    if destination_has_promisor {
+        for oid in &roots {
+            if !db.contains(oid)? {
+                // Match git's check_connected wording (clone.c / fetch-pack.c).
+                return Err(GitError::InvalidFormat(
+                    "fatal: remote did not send all necessary objects".into(),
+                ));
+            }
+        }
+        if policy.is_none_or(|policy| !policy.enabled) && !require_connectivity {
+            return Ok(());
+        }
+        // Strict fetch.fsckObjects still content-checks the tips without
+        // re-walking historical promised-missing blobs.
+        if policy.is_some_and(|policy| policy.enabled) {
+            let options = sley_fsck::FsckOptions {
+                connectivity_only: false,
+                check_content: true,
+                ..policy
+                    .map(|policy| policy.fsck_options(true))
+                    .unwrap_or_default()
+            };
+            // Content-only: pass tips as object_ids (no graph walk roots).
+            let report = sley_fsck::fsck_objects_with_options(db, format, [], roots, options);
+            for issue in &report.issues {
+                match issue.stream {
+                    sley_fsck::IssueStream::Stdout => println!("{}", issue.message),
+                    sley_fsck::IssueStream::Stderr => eprintln!("{}", issue.message),
+                }
+            }
+            if !report.is_ok() {
+                return Err(GitError::Exit(128));
+            }
+        }
         return Ok(());
     }
     let options = policy.map_or_else(
@@ -1930,7 +2188,11 @@ fn validate_incoming_fetch_objects(
     if report.is_ok() {
         Ok(())
     } else {
-        Err(GitError::Exit(128))
+        // Full connectivity failure for a non-promisor destination matches
+        // git's check_connected die message used by clone and fetch-pack.
+        Err(GitError::InvalidFormat(
+            "fatal: remote did not send all necessary objects".into(),
+        ))
     }
 }
 
@@ -1998,46 +2260,12 @@ fn write_finalized_fetch_head(
     write_fetch_head(git_dir, fetch_head_source, &records, append)
 }
 
-/// Reject the first non-fast-forward tracking update an `--atomic` fetch would
-/// make (a non-forced refspec whose destination already exists and whose new tip
-/// does not descend from the old). Returns the git-shaped `! [rejected]` line so
-/// the whole atomic transaction can be aborted before any ref is touched.
-fn atomic_non_fast_forward_rejection(
-    git_dir: &Path,
-    format: ObjectFormat,
-    store: &FileRefStore,
-    updates: &[FetchRefUpdate],
-) -> Result<Option<String>> {
-    let mut db: Option<FileObjectDatabase> = None;
-    for update in updates {
-        let Some(dst) = update.dst.as_deref() else {
-            continue;
-        };
-        if update.force {
-            continue;
-        }
-        let Some(RefTarget::Direct(old)) = store.read_ref(dst)? else {
-            continue;
-        };
-        if old == update.oid || dst.starts_with("refs/tags/") {
-            continue;
-        }
-        let db = db.get_or_insert_with(|| FileObjectDatabase::from_git_dir(git_dir, format));
-        if !crate::push::is_fast_forward(git_dir, db, format, &old, &update.oid)? {
-            return Ok(Some(format!(
-                "! [rejected]        {} -> {}  (non-fast-forward)",
-                update.src, dst
-            )));
-        }
-    }
-    Ok(None)
-}
-
-/// Find non-forced, non-fast-forward ref updates for a non-atomic fetch. Git
-/// still records the advertised tips in `FETCH_HEAD` and applies unrelated
-/// accepted updates, but leaves each rejected destination untouched and exits
+/// Classify per-ref rejections that do not hard-abort planning: non-fast-forward
+/// tracking updates (unless forced) and non-forced tag clobbers. Git still
+/// records the advertised tips in `FETCH_HEAD` and applies unrelated accepted
+/// updates, but leaves each rejected destination untouched and exits
 /// unsuccessfully. Return both the rejected indices and the first diagnostic.
-fn non_atomic_non_fast_forward_rejections(
+fn classify_fetch_ref_rejections(
     git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
@@ -2050,13 +2278,28 @@ fn non_atomic_non_fast_forward_rejections(
         let Some(dst) = update.dst.as_deref() else {
             continue;
         };
-        if update.force || dst.starts_with("refs/tags/") {
-            continue;
-        }
         let Some(RefTarget::Direct(old)) = store.read_ref(dst)? else {
             continue;
         };
         if old == update.oid {
+            continue;
+        }
+        if dst.starts_with("refs/tags/") {
+            if update.force {
+                continue;
+            }
+            // Tag clobber without force: soft-reject this destination only so
+            // sibling tags (and branches) still apply (t5510 --tags clobber).
+            rejected.insert(index);
+            reason.get_or_insert_with(|| {
+                format!(
+                    "! [rejected]        {} -> {}  (would clobber existing tag)",
+                    update.src, dst
+                )
+            });
+            continue;
+        }
+        if update.force {
             continue;
         }
         let db = db.get_or_insert_with(|| FileObjectDatabase::from_git_dir(git_dir, format));
@@ -2073,6 +2316,15 @@ fn non_atomic_non_fast_forward_rejections(
     Ok((rejected, reason))
 }
 
+/// Apply planned ref updates.
+///
+/// - `atomic = true`: one transaction for every *changing* update; any failure
+///   aborts the whole batch (git `--atomic`).
+/// - `atomic = false`: apply each changing update in its own transaction so a
+///   lock or D/F conflict on one ref does not roll back siblings (git's
+///   `REF_TRANSACTION_ALLOW_FAILURE` path). Soft failures are printed and
+///   recorded in `rejected_dsts` when provided.
+#[allow(clippy::too_many_arguments)]
 fn apply_fetch_ref_updates(
     store: &FileRefStore,
     format: ObjectFormat,
@@ -2080,12 +2332,12 @@ fn apply_fetch_ref_updates(
     log_all_ref_updates: bool,
     updates: &[FetchRefUpdate],
     ref_hook: Option<&dyn sley_refs::ReferenceTransactionHook>,
+    atomic: bool,
+    remote_name: &str,
+    mut rejected_dsts: Option<&mut Vec<String>>,
 ) -> Result<()> {
     let mut seen = BTreeSet::new();
-    let mut tx = store.transaction();
-    if let Some(hook) = ref_hook {
-        tx = tx.with_hook(hook);
-    }
+    let mut planned: Vec<(String, Option<ObjectId>, &FetchRefUpdate)> = Vec::new();
     for update in updates {
         let Some(dst) = update.dst.as_deref() else {
             continue;
@@ -2102,6 +2354,48 @@ fn apply_fetch_ref_updates(
             }
             None => None,
         };
+        // git's update_local_ref short-circuits when old == new (up to date);
+        // those no-ops must not enter the reference-transaction hook feed
+        // (t5510 atomic single-transaction test).
+        if old_oid == Some(update.oid) {
+            continue;
+        }
+        planned.push((dst.to_string(), old_oid, update));
+    }
+    if planned.is_empty() {
+        return Ok(());
+    }
+
+    if atomic {
+        let mut tx = store.transaction();
+        if let Some(hook) = ref_hook {
+            tx = tx.with_hook(hook);
+        }
+        for (dst, old_oid, update) in &planned {
+            let reflog = if log_all_ref_updates && fetch_should_write_reflog(dst) {
+                Some(ReflogEntry {
+                    old_oid: old_oid.unwrap_or_else(|| ObjectId::null(format)),
+                    new_oid: update.oid,
+                    committer: fetch_reflog_committer(),
+                    message: fetch_reflog_message(fetch_head_source, update, old_oid.is_some()),
+                })
+            } else {
+                None
+            };
+            tx.update(RefUpdate {
+                name: dst.clone(),
+                expected: old_oid.map(RefTarget::Direct),
+                new: RefTarget::Direct(update.oid),
+                reflog,
+            });
+        }
+        return tx.commit();
+    }
+
+    // Non-atomic: one transaction per ref so lock/D/F failures are isolated.
+    let mut conflict_msg_shown = false;
+    let mut any_soft_failure = false;
+    for (dst, old_oid, update) in &planned {
         let reflog = if log_all_ref_updates && fetch_should_write_reflog(dst) {
             Some(ReflogEntry {
                 old_oid: old_oid.unwrap_or_else(|| ObjectId::null(format)),
@@ -2112,14 +2406,71 @@ fn apply_fetch_ref_updates(
         } else {
             None
         };
+        let mut tx = store.transaction();
+        if let Some(hook) = ref_hook {
+            tx = tx.with_hook(hook);
+        }
         tx.update(RefUpdate {
-            name: dst.to_string(),
+            name: dst.clone(),
             expected: old_oid.map(RefTarget::Direct),
             new: RefTarget::Direct(update.oid),
             reflog,
         });
+        match tx.commit() {
+            Ok(()) => {}
+            Err(err) => {
+                any_soft_failure = true;
+                if let Some(rejected) = rejected_dsts.as_deref_mut() {
+                    rejected.push(dst.clone());
+                }
+                report_fetch_ref_apply_error(dst, remote_name, &err, &mut conflict_msg_shown);
+            }
+        }
     }
-    tx.commit()
+    let _ = any_soft_failure;
+    Ok(())
+}
+
+/// Emit git-shaped diagnostics for a per-ref apply failure (lock, D/F, case).
+/// For name conflicts, print the one-time "try running git remote prune" advice
+/// (t5510 D/F conflict error message).
+fn report_fetch_ref_apply_error(
+    dst: &str,
+    remote_name: &str,
+    err: &GitError,
+    conflict_msg_shown: &mut bool,
+) {
+    let msg = err.to_string();
+    // Strip sley Display prefixes so we can re-emit with git wording.
+    let detail = msg
+        .strip_prefix("transaction failed: ")
+        .or_else(|| msg.strip_prefix("io error: "))
+        .or_else(|| msg.strip_prefix("invalid format: "))
+        .unwrap_or(msg.as_str());
+
+    // Directory/file name conflicts: git batches these under a single advice
+    // line pointing at `git remote prune`.
+    let is_name_conflict = detail.contains("exists; cannot create")
+        || detail.contains("blocking reference")
+        || detail.contains("non-empty directory");
+    if is_name_conflict {
+        if !*conflict_msg_shown {
+            eprintln!(
+                "error: some local refs could not be updated; try running\n \
+                 'git remote prune {remote_name}' to remove any old, conflicting branches"
+            );
+            *conflict_msg_shown = true;
+        }
+        return;
+    }
+
+    // Lock failures already use git's `error: cannot lock ref '…': …` form when
+    // raised as InvalidFormat; print them as-is. Otherwise wrap.
+    if detail.starts_with("error: ") {
+        eprintln!("{detail}");
+    } else {
+        eprintln!("error: cannot lock ref '{dst}': {detail}");
+    }
 }
 
 /// Effective fetch pack input cap, mirroring git's `fetch.maxInputSize` with
@@ -2198,11 +2549,12 @@ fn fetch_reflog_short_ref(refname: &str) -> String {
 
 fn validate_fetch_ref_updates(
     git_dir: &Path,
-    _format: ObjectFormat,
+    format: ObjectFormat,
     store: &FileRefStore,
     update_head_ok: bool,
     updates: &[FetchRefUpdate],
 ) -> Result<()> {
+    let mut db: Option<FileObjectDatabase> = None;
     for update in updates {
         let Some(dst) = update.dst.as_deref() else {
             continue;
@@ -2226,16 +2578,26 @@ fn validate_fetch_ref_updates(
                 worktree.path.display()
             )));
         }
-        if old.is_some()
-            && old != Some(update.oid)
-            && dst.starts_with("refs/tags/")
-            && !update.force
-        {
-            return Err(GitError::Command(format!(
-                "! [rejected]        {} -> {}  (would clobber existing tag)",
-                update.src, dst
-            )));
+        // git refs.c: cannot write a non-commit to a branch ref
+        // (t5510 "fetch must not resolve short tag name" — short tag `anno`
+        // maps to refs/tags/anno while destination `five` DWIMs to
+        // refs/heads/five).
+        if dst.starts_with("refs/heads/") || dst == "HEAD" {
+            let database =
+                db.get_or_insert_with(|| FileObjectDatabase::from_git_dir(git_dir, format));
+            match database.read_object(&update.oid) {
+                Ok(object) if object.object_type != sley_object::ObjectType::Commit => {
+                    return Err(GitError::InvalidFormat(format!(
+                        "error: trying to write non-commit object {} to branch '{dst}'",
+                        update.oid
+                    )));
+                }
+                Ok(_) => {}
+                Err(err) => return Err(err),
+            }
         }
+        // Tag clobber without force is a soft per-ref rejection handled by
+        // `classify_fetch_ref_rejections` so sibling updates still apply.
     }
     Ok(())
 }
@@ -3123,6 +3485,7 @@ mod tests {
             atomic: false,
             negotiation_restrict: None,
             negotiation_include: None,
+            negotiate_only: false,
         }
     }
 
@@ -3226,7 +3589,7 @@ mod tests {
         let mut credentials = NoCredentials;
         let mut progress = SilentProgress;
 
-        let error = fetch(
+        let outcome = fetch(
             FetchRequest {
                 git_dir: &local,
                 format: ObjectFormat::Sha1,
@@ -3244,8 +3607,13 @@ mod tests {
                 cancel: sley_core::CancelFlag::never(),
             },
         )
-        .expect_err("divergent update must fail");
-        assert!(error.to_string().contains("non-fast-forward"));
+        .expect("soft rejection outcome");
+        assert!(
+            outcome
+                .rejection
+                .as_deref()
+                .is_some_and(|reason| reason.contains("non-fast-forward"))
+        );
         let refs = FileRefStore::new(&local, ObjectFormat::Sha1);
         assert_eq!(
             refs.read_ref("refs/heads/side").expect("read side"),
@@ -3767,6 +4135,7 @@ mod tests {
                 format: ObjectFormat::Sha1,
                 store: &store,
                 options: &options,
+                remote_name: "origin",
                 fetch_head_source: "origin",
                 default_head_fetch: false,
                 log_all_ref_updates: true,

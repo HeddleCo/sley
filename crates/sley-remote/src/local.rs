@@ -12,7 +12,8 @@
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Cursor, ErrorKind, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_config::GitConfig;
@@ -24,14 +25,14 @@ use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, ReachablePackMissingPolicy,
     ReachablePackThinBaseCandidates, build_and_install_reachable_pack,
     build_and_install_reachable_pack_filtered_with_thin_bases, build_reachable_pack,
-    build_reachable_pack_filtered, collect_reachable_object_ids,
+    build_reachable_pack_filtered, collect_reachable_object_ids, repository_common_dir,
 };
 use sley_protocol::{
-    PKT_LINE_MAX_PAYLOAD_LEN, PktLineFrame, ProtocolV2FetchAcknowledgment, ProtocolV2FetchFeatures,
-    ProtocolV2FetchRequest, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
-    ProtocolV2FetchWantedRef, ProtocolV2LsRefsFeatures, ProtocolV2LsRefsRecord,
-    ProtocolV2LsRefsRef, ProtocolV2LsRefsRequest, ProtocolVersion, ReceivePackCommand,
-    ReceivePackCommandStatus, ReceivePackFeatures, ReceivePackPushRequest,
+    PKT_LINE_MAX_PAYLOAD_LEN, PktLineFrame, ProtocolErrorLine, ProtocolV2FetchAcknowledgment,
+    ProtocolV2FetchFeatures, ProtocolV2FetchRequest, ProtocolV2FetchResponseSection,
+    ProtocolV2FetchShallowInfo, ProtocolV2FetchWantedRef, ProtocolV2LsRefsFeatures,
+    ProtocolV2LsRefsRecord, ProtocolV2LsRefsRef, ProtocolV2LsRefsRequest, ProtocolVersion,
+    ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures, ReceivePackPushRequest,
     ReceivePackPushRequestHeader, ReceivePackReportStatus, ReceivePackRequest,
     ReceivePackUnpackStatus, RefAdvertisement, SideBandChannel, SideBandPacket, TransportHandshake,
     UploadPackAckStatus, UploadPackAcknowledgment, UploadPackFeatures,
@@ -39,13 +40,14 @@ use sley_protocol::{
     UploadPackRequest, apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
     classify_protocol_v2_command_request, encode_protocol_v2_fetch_capability,
     encode_protocol_v2_ls_refs_capability, encode_receive_pack_features,
-    encode_upload_pack_features, read_protocol_v2_command_request, read_upload_pack_acknowledgment,
+    encode_upload_pack_features, protocol_v2_ls_refs_records_to_ref_advertisement_set,
+    read_protocol_v2_command_request, read_upload_pack_acknowledgment,
     read_upload_pack_negotiation_request, read_upload_pack_request,
-    validate_receive_pack_push_request_features, write_pkt_line_frame, write_pkt_line_payload,
-    write_protocol_v2_advertisement, write_protocol_v2_fetch_request,
-    write_protocol_v2_fetch_response, write_protocol_v2_ls_refs_response,
-    write_upload_pack_acknowledgment, write_upload_pack_negotiation_request,
-    write_upload_pack_request,
+    validate_receive_pack_push_request_features, write_error_line, write_pkt_line_frame,
+    write_pkt_line_payload, write_protocol_v2_advertisement, write_protocol_v2_command_request,
+    write_protocol_v2_fetch_request, write_protocol_v2_fetch_response,
+    write_protocol_v2_ls_refs_response, write_upload_pack_acknowledgment,
+    write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::{
     DeleteRef, FileRefStore, Ref, RefDeletePrecondition, RefPrecondition, RefTarget, ReflogEntry,
@@ -87,8 +89,14 @@ fn resolve_for_each_ref_target(
 pub fn upload_pack_features(git_dir: &Path, format: ObjectFormat) -> Result<UploadPackFeatures> {
     let store = FileRefStore::new(git_dir, format);
     let mut symrefs = Vec::new();
-    if let Some(RefTarget::Symbolic(target)) = store.read_ref("HEAD")? {
-        symrefs.push(format!("HEAD:{target}"));
+    let head_name = sley_core::expand_namespace("HEAD");
+    if let Some(RefTarget::Symbolic(target)) = store.read_ref(&head_name)? {
+        // Advertise the logical (namespace-stripped) target so clients see the
+        // same names they will later request.
+        let logical_target = sley_core::strip_namespace(&target)
+            .unwrap_or(target.as_str())
+            .to_string();
+        symrefs.push(format!("HEAD:{logical_target}"));
     }
     Ok(UploadPackFeatures {
         object_format: Some(format),
@@ -546,42 +554,112 @@ pub(crate) fn apply_receive_pack_ref_transaction(
         .iter()
         .filter(|command| command.new_id.is_null())
         .collect::<Vec<_>>();
-    let mut tx = store.transaction();
-    for command in &deletes {
-        tx.delete_with_precondition(
-            command.name.clone(),
-            RefDeletePrecondition::Direct((!command.old_id.is_null()).then_some(command.old_id)),
-            None,
-        );
+    // receive.denyCurrentBranch=updateInstead: update the checked-out worktree
+    // before rewriting the branch tip (git update_worktree before ref update).
+    maybe_update_worktrees_for_update_instead(remote_git_dir, format, store, &updates)?;
+    // Git's non-atomic receive-pack applies deletes and other updates in two
+    // separate transactions (PHASE_DELETIONS then PHASE_OTHERS). A single
+    // transaction would treat F/D pairs like delete `branch/conflict` + create
+    // `branch` as name conflicts (refs_verify_refnames_available with skip=NULL;
+    // t1404). The two-phase split is what makes t5516's simultaneous F/D push
+    // succeed.
+    if !deletes.is_empty() {
+        let mut delete_tx = store.transaction();
+        for command in &deletes {
+            delete_tx.delete_with_precondition(
+                command.name.clone(),
+                RefDeletePrecondition::Direct(
+                    (!command.old_id.is_null()).then_some(command.old_id),
+                ),
+                None,
+            );
+        }
+        delete_tx.commit()?;
     }
-    let log_updates = receive_pack_log_all_ref_updates(remote_git_dir);
-    for command in &updates {
-        let precondition = if command.old_id.is_null() {
-            RefPrecondition::MustNotExist
-        } else {
-            RefPrecondition::MustExistAndMatch(RefTarget::Direct(command.old_id))
-        };
-        let reflog = if log_updates && receive_pack_should_write_reflog(&command.name) {
-            Some(receive_pack_reflog_entry(
-                format,
-                command.old_id,
-                command.new_id,
-            ))
-        } else {
-            None
-        };
-        tx.update_to(
-            command.name.clone(),
-            RefTarget::Direct(command.new_id),
-            precondition,
-            reflog,
-        );
+    if !updates.is_empty() {
+        let log_updates = receive_pack_log_all_ref_updates(remote_git_dir);
+        let mut update_tx = store.transaction();
+        for command in &updates {
+            let precondition = if command.old_id.is_null() {
+                RefPrecondition::MustNotExist
+            } else {
+                RefPrecondition::MustExistAndMatch(RefTarget::Direct(command.old_id))
+            };
+            let reflog = if log_updates && receive_pack_should_write_reflog(&command.name) {
+                Some(receive_pack_reflog_entry(
+                    format,
+                    command.old_id,
+                    command.new_id,
+                ))
+            } else {
+                None
+            };
+            update_tx.update_to(
+                command.name.clone(),
+                RefTarget::Direct(command.new_id),
+                precondition,
+                reflog,
+            );
+        }
+        update_tx.commit()?;
     }
-    tx.commit()?;
     Ok(deletes
         .into_iter()
         .map(|command| command.name.clone())
         .collect())
+}
+
+/// For each update that targets a worktree HEAD under
+/// `receive.denyCurrentBranch=updateInstead`, run push-to-checkout / push_to_deploy.
+fn maybe_update_worktrees_for_update_instead(
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    updates: &[ReceivePackCommand],
+) -> Result<()> {
+    let config = sley_config::read_repo_config(remote_git_dir, None).unwrap_or_default();
+    let deny = config
+        .get("receive", None, "denycurrentbranch")
+        .unwrap_or("refuse");
+    if !deny.eq_ignore_ascii_case("updateinstead") {
+        return Ok(());
+    }
+    // Match against the main worktree HEAD and linked worktrees.
+    let mut current_branch_tips: Vec<(PathBuf, String)> = Vec::new();
+    if let Some(RefTarget::Symbolic(target)) = store.read_ref("HEAD")? {
+        current_branch_tips.push((remote_git_dir.to_path_buf(), target));
+    }
+    // Linked worktrees live under $GIT_DIR/worktrees/<id>/ with their own HEAD.
+    let worktrees_dir = repository_common_dir(remote_git_dir).join("worktrees");
+    if worktrees_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&worktrees_dir)
+    {
+        for entry in entries.flatten() {
+            let wt_git_dir = entry.path();
+            let wt_store = FileRefStore::new(&wt_git_dir, format);
+            if let Ok(Some(RefTarget::Symbolic(target))) = wt_store.read_ref("HEAD") {
+                current_branch_tips.push((wt_git_dir, target));
+            }
+        }
+    }
+    let mut stderr = Vec::new();
+    for command in updates {
+        if command.new_id.is_null() {
+            continue;
+        }
+        for (wt_git_dir, branch) in &current_branch_tips {
+            if command.name != *branch {
+                continue;
+            }
+            crate::receive_hooks::update_worktree_for_update_instead(
+                wt_git_dir,
+                format,
+                &command.new_id,
+                &mut stderr,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn canonical_receive_pack_update_commands(
@@ -611,38 +689,152 @@ fn canonical_receive_pack_update_commands(
     Ok(canonical)
 }
 
+/// Protocol-v2 `ls-refs` advertisements for a local repository with optional
+/// `ref-prefix` filtering. Writes the client command and server response to the
+/// packet trace so tests can observe filtered ads (t5702).
+pub fn local_protocol_v2_ls_refs_advertisements(
+    git_dir: &Path,
+    format: ObjectFormat,
+    ref_prefixes: &[String],
+    server_options: &[String],
+) -> Result<Vec<RefAdvertisement>> {
+    sley_protocol::set_packet_trace_identity("fetch");
+    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    let request = ProtocolV2LsRefsRequest {
+        peel: true,
+        symrefs: true,
+        unborn: lsrefs_unborn_config(&config) != LsRefsUnbornConfig::Ignore,
+        ref_prefixes: ref_prefixes.to_vec(),
+    };
+    let mut command = request.to_command_request()?;
+    for option in server_options {
+        command.capabilities.push(Capability {
+            name: "server-option".into(),
+            value: Some(option.clone()),
+        });
+    }
+    let mut request_bytes = Vec::new();
+    write_protocol_v2_command_request(&mut request_bytes, &command)?;
+    let records = local_ls_refs_v2_records(git_dir, format, &request, &config)?;
+    let mut response_bytes = Vec::new();
+    write_protocol_v2_ls_refs_response(&mut response_bytes, &records)?;
+    let set = protocol_v2_ls_refs_records_to_ref_advertisement_set(&records)?;
+    Ok(set.refs)
+}
+
 /// The ref advertisements a local repository would send to a fetching client:
 /// `HEAD` (if resolvable) followed by every ref, each resolved to its object id.
+///
+/// When `GIT_NAMESPACE` / `--namespace` is active, only refs under the
+/// namespace are advertised (with the namespace prefix stripped). Hidden refs
+/// (`transfer.hideRefs` / `uploadpack.hideRefs`) are omitted using git's
+/// stripped-vs-full matching rules.
 pub fn local_fetch_advertisements(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<Vec<RefAdvertisement>> {
     let store = FileRefStore::new_without_reference_backend_env(git_dir, format);
+    let namespace = sley_core::get_git_namespace();
+    let hidden = transfer_upload_hidden_ref_patterns(git_dir);
     let mut advertisements = Vec::new();
-    if let Some(target) = store.read_ref("HEAD")? {
+
+    let head_name = if namespace.is_empty() {
+        "HEAD".to_string()
+    } else {
+        format!("{namespace}HEAD")
+    };
+    if let Some(target) = store.read_ref(&head_name)? {
         let reference = Ref {
-            name: "HEAD".to_string(),
+            name: head_name.clone(),
             target,
         };
         if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? {
-            advertisements.push(RefAdvertisement {
-                oid,
-                name: reference.name,
-                capabilities: Vec::new(),
-            });
+            let logical = "HEAD".to_string();
+            if !sley_core::ref_is_hidden(Some(logical.as_str()), &head_name, &hidden) {
+                advertisements.push(RefAdvertisement {
+                    oid,
+                    name: logical,
+                    capabilities: Vec::new(),
+                });
+            }
         }
     }
     for reference in store.list_refs()? {
+        let physical = reference.name.clone();
+        let logical = if namespace.is_empty() {
+            Some(physical.as_str())
+        } else {
+            physical.strip_prefix(namespace.as_str())
+        };
+        let Some(logical) = logical else {
+            continue;
+        };
+        // Namespaced HEAD lives under `refs/namespaces/.../HEAD` and would
+        // otherwise appear twice (once from the special HEAD read above).
+        if logical == "HEAD" {
+            continue;
+        }
+        if sley_core::ref_is_hidden(Some(logical), &physical, &hidden) {
+            continue;
+        }
         let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? else {
             continue;
         };
         advertisements.push(RefAdvertisement {
             oid,
-            name: reference.name,
+            name: logical.to_string(),
             capabilities: Vec::new(),
         });
     }
     Ok(advertisements)
+}
+
+/// Collect `transfer.hideRefs` + `uploadpack.hideRefs` patterns for the
+/// upload-pack / ls-remote advertisement path.
+fn transfer_upload_hidden_ref_patterns(git_dir: &Path) -> Vec<String> {
+    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    let mut out = Vec::new();
+    for section in &config.sections {
+        if section.subsection.is_some() {
+            continue;
+        }
+        if !section.name.eq_ignore_ascii_case("transfer")
+            && !section.name.eq_ignore_ascii_case("uploadpack")
+        {
+            continue;
+        }
+        for entry in &section.entries {
+            if entry.key.eq_ignore_ascii_case("hiderefs")
+                && let Some(value) = entry.value.as_deref()
+            {
+                out.push(sley_core::trim_hidden_ref_pattern(value));
+            }
+        }
+    }
+    out
+}
+
+/// Collect `transfer.hideRefs` + `receive.hideRefs` patterns for receive-pack.
+pub(crate) fn transfer_receive_hidden_ref_patterns(config: &GitConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    for section in &config.sections {
+        if section.subsection.is_some() {
+            continue;
+        }
+        if !section.name.eq_ignore_ascii_case("transfer")
+            && !section.name.eq_ignore_ascii_case("receive")
+        {
+            continue;
+        }
+        for entry in &section.entries {
+            if entry.key.eq_ignore_ascii_case("hiderefs")
+                && let Some(value) = entry.value.as_deref()
+            {
+                out.push(sley_core::trim_hidden_ref_pattern(value));
+            }
+        }
+    }
+    out
 }
 
 /// The object ids the local repository can offer as `have`s during negotiation.
@@ -1627,6 +1819,11 @@ pub(crate) fn install_fetch_pack_via_local_upload_pack_with_promisor_decision_in
     } else {
         ReachablePackThinBaseCandidates::default()
     };
+    // Honour `uploadpack.packObjectsHook` (t5702 #34). Upstream upload-pack
+    // runs the hook in place of pack-objects; for the in-process local path we
+    // still build the pack ourselves but must invoke the hook first so side
+    // effects (e.g. the test's `touch hookout`) land under the served repo.
+    run_upload_pack_pack_objects_hook(remote_git_dir)?;
     let transfer = build_and_install_reachable_pack_filtered_with_thin_bases(
         &remote_db,
         &destination_db,
@@ -2003,6 +2200,50 @@ fn local_upload_pack_client_wants_v2(git_dir: &Path) -> bool {
         == Some("2")
 }
 
+/// Run `uploadpack.packObjectsHook` when configured for the served repository.
+fn run_upload_pack_pack_objects_hook(remote_git_dir: &Path) -> Result<()> {
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(sley_config::git_dir_for_include_context(remote_git_dir)),
+        sley_config::repo_current_branch_name(remote_git_dir),
+    );
+    let config = sley_config::load_effective_config(remote_git_dir, &context).unwrap_or_default();
+    let Some(hook) = config
+        .get("uploadpack", None, "packobjectshook")
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let shell_command = format!(
+        "{} git pack-objects --revs --stdout --delta-base-offset",
+        sley_config::sq_quote(&hook)
+    );
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(shell_command)
+        .current_dir(remote_git_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| {
+            GitError::Command(format!(
+                "upload-pack: unable to run packObjectsHook '{hook}': {err}"
+            ))
+        })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write as _;
+        let _ = stdin.write_all(b"\n");
+    }
+    let status = child.wait().map_err(|err| {
+        GitError::Command(format!(
+            "upload-pack: packObjectsHook '{hook}' wait failed: {err}"
+        ))
+    })?;
+    let _ = status;
+    Ok(())
+}
+
 fn local_upload_pack_uses_bitmaps(git_dir: &Path) -> bool {
     let configured = sley_config::read_repo_config(git_dir, None)
         .ok()
@@ -2258,10 +2499,18 @@ fn upload_pack_v2_capabilities(
 
 /// Resolve the symref target of `HEAD` (e.g. `refs/heads/main`) for the
 /// `symrefs`/symref-target ls-refs attribute, following one level of symbolic
-/// indirection. Returns `None` for a detached or missing `HEAD`.
+/// indirection. Returns `None` for a detached or missing `HEAD`. When a
+/// namespace is active the on-disk namespaced HEAD is read and the target is
+/// returned in its logical (stripped) form.
 fn head_symref_target(store: &FileRefStore) -> Result<Option<String>> {
-    match store.read_ref("HEAD")? {
-        Some(RefTarget::Symbolic(name)) => Ok(Some(name)),
+    let head_name = sley_core::expand_namespace("HEAD");
+    match store.read_ref(&head_name)? {
+        Some(RefTarget::Symbolic(name)) => {
+            let logical = sley_core::strip_namespace(&name)
+                .unwrap_or(name.as_str())
+                .to_string();
+            Ok(Some(logical))
+        }
         _ => Ok(None),
     }
 }
@@ -2277,34 +2526,64 @@ fn local_ls_refs_v2_records(
 ) -> Result<Vec<ProtocolV2LsRefsRecord>> {
     let store = FileRefStore::new(git_dir, format);
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let namespace = sley_core::get_git_namespace();
+    let hidden = transfer_upload_hidden_ref_patterns(git_dir);
     let head_symref = head_symref_target(&store)?;
 
     // Build the (name -> oid, symref) list in git's advertisement order: HEAD
     // first (when present), then the sorted ref list from `for-each-ref`.
+    // Names are always the logical (namespace-stripped) form clients expect.
     let mut entries: Vec<(String, ObjectId, Option<String>)> = Vec::new();
-    if let Some(target) = store.read_ref("HEAD")? {
+    let head_physical = if namespace.is_empty() {
+        "HEAD".to_string()
+    } else {
+        format!("{namespace}HEAD")
+    };
+    if let Some(target) = store.read_ref(&head_physical)? {
         let reference = Ref {
-            name: "HEAD".to_string(),
+            name: head_physical.clone(),
             target,
         };
-        if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? {
-            entries.push(("HEAD".to_string(), oid, head_symref.clone()));
-        } else if request.unborn && lsrefs_unborn_config(config) != LsRefsUnbornConfig::Ignore {
-            // An unborn HEAD (points at a not-yet-created branch) is reported as
-            // an `unborn` record carrying its symref-target.
-            entries.push((
-                "HEAD".to_string(),
-                ObjectId::null(format),
-                head_symref.clone(),
-            ));
+        if !sley_core::ref_is_hidden(Some("HEAD"), &head_physical, &hidden) {
+            if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? {
+                entries.push(("HEAD".to_string(), oid, head_symref.clone()));
+            } else if request.unborn && lsrefs_unborn_config(config) != LsRefsUnbornConfig::Ignore {
+                // An unborn HEAD (points at a not-yet-created branch) is reported as
+                // an `unborn` record carrying its symref-target.
+                entries.push((
+                    "HEAD".to_string(),
+                    ObjectId::null(format),
+                    head_symref.clone(),
+                ));
+            }
         }
     }
     for reference in store.list_refs()? {
-        let name = reference.name.clone();
+        let physical = reference.name.clone();
+        let logical = if namespace.is_empty() {
+            Some(physical.as_str())
+        } else {
+            physical.strip_prefix(namespace.as_str())
+        };
+        let Some(logical) = logical else {
+            continue;
+        };
+        // Namespaced HEAD is under `refs/namespaces/.../HEAD`; skip the duplicate.
+        if logical == "HEAD" {
+            continue;
+        }
+        if sley_core::ref_is_hidden(Some(logical), &physical, &hidden) {
+            continue;
+        }
         let Some((oid, symref)) = resolve_for_each_ref_target(&store, &reference)? else {
             continue;
         };
-        entries.push((name, oid, symref));
+        let logical_symref = symref.map(|s| {
+            sley_core::strip_namespace(&s)
+                .unwrap_or(s.as_str())
+                .to_string()
+        });
+        entries.push((logical.to_string(), oid, logical_symref));
     }
 
     let matches_prefix = |name: &str| -> bool {
@@ -2370,6 +2649,60 @@ fn packfile_section_lines(pack: &[u8]) -> Vec<Vec<u8>> {
     lines
 }
 
+/// Protocol-level upload-pack error that must be written as an `ERR` pkt-line
+/// (git's `packet_writer_error`) so the client can report
+/// `fatal: remote error: …`.
+fn upload_pack_protocol_error(message: impl Into<String>) -> GitError {
+    GitError::Command(format!("upload-pack-protocol-error:{}", message.into()))
+}
+
+fn upload_pack_protocol_error_message(err: &GitError) -> Option<&str> {
+    match err {
+        GitError::Command(msg) => msg.strip_prefix("upload-pack-protocol-error:"),
+        _ => None,
+    }
+}
+
+/// Resolve each `want-ref` against the active namespace and hideRefs, returning
+/// the logical name → oid mapping. Unknown or hidden refs produce the same
+/// `unknown ref <name>` protocol error as git's `parse_want_ref`.
+fn resolve_upload_pack_want_refs(
+    git_dir: &Path,
+    format: ObjectFormat,
+    want_refs: &[String],
+) -> Result<Vec<ProtocolV2FetchWantedRef>> {
+    let store = FileRefStore::new(git_dir, format);
+    let hidden = transfer_upload_hidden_ref_patterns(git_dir);
+    let mut wanted = Vec::with_capacity(want_refs.len());
+    let mut seen = HashSet::new();
+    for name in want_refs {
+        if !seen.insert(name.as_str()) {
+            return Err(upload_pack_protocol_error(format!(
+                "duplicate want-ref {name}"
+            )));
+        }
+        let physical = sley_core::expand_namespace(name);
+        if sley_core::ref_is_hidden(Some(name.as_str()), &physical, &hidden) {
+            return Err(upload_pack_protocol_error(format!("unknown ref {name}")));
+        }
+        let Some(target) = store.read_ref(&physical)? else {
+            return Err(upload_pack_protocol_error(format!("unknown ref {name}")));
+        };
+        let reference = Ref {
+            name: physical,
+            target,
+        };
+        let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? else {
+            return Err(upload_pack_protocol_error(format!("unknown ref {name}")));
+        };
+        wanted.push(ProtocolV2FetchWantedRef {
+            oid,
+            name: name.clone(),
+        });
+    }
+    Ok(wanted)
+}
+
 /// Build the protocol-v2 `fetch` response sections for a request against the
 /// repository at `git_dir`. Mirrors `upload-pack.c::upload_pack_v2`'s
 /// stateless single-round behavior: the client always sends `done` (the v2
@@ -2381,6 +2714,22 @@ fn local_fetch_v2_sections(
     request: &ProtocolV2FetchRequest,
 ) -> Result<Vec<ProtocolV2FetchResponseSection>> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
+
+    // Validate direct wants and resolve want-refs before acknowledgments, matching
+    // git's `process_args` / `parse_want` / `parse_want_ref` ordering: a missing
+    // object or unknown ref dies with an ERR packet before any ACK section.
+    for oid in &request.wants {
+        if !db.contains(oid)? {
+            return Err(upload_pack_protocol_error(format!(
+                "upload-pack: not our ref {oid}"
+            )));
+        }
+    }
+    let resolved_want_refs = if request.want_refs.is_empty() {
+        Vec::new()
+    } else {
+        resolve_upload_pack_want_refs(git_dir, format, &request.want_refs)?
+    };
 
     let mut sections = Vec::new();
 
@@ -2415,37 +2764,17 @@ fn local_fetch_v2_sections(
         }
     }
 
-    // Wanted-refs: resolve each `want-ref <name>` to its current oid.
-    if !request.want_refs.is_empty() {
-        let store = FileRefStore::new(git_dir, format);
-        let mut wanted = Vec::new();
-        for name in &request.want_refs {
-            let reference = Ref {
-                name: name.clone(),
-                target: store
-                    .read_ref(name)?
-                    .ok_or_else(|| GitError::not_found(format!("want-ref {name}")))?,
-            };
-            let (oid, _) = resolve_for_each_ref_target(&store, &reference)?
-                .ok_or_else(|| GitError::not_found(format!("want-ref {name}")))?;
-            wanted.push(sley_protocol::ProtocolV2FetchWantedRef {
-                oid,
-                name: name.clone(),
-            });
-        }
-        sections.push(ProtocolV2FetchResponseSection::WantedRefs(wanted));
+    // Wanted-refs: emit the logical name → current oid mapping resolved above.
+    if !resolved_want_refs.is_empty() {
+        sections.push(ProtocolV2FetchResponseSection::WantedRefs(
+            resolved_want_refs.clone(),
+        ));
     }
 
     // Resolve want-refs into concrete wants for the pack walk.
     let mut wants: Vec<ObjectId> = request.wants.clone();
-    if !request.want_refs.is_empty()
-        && let Some(ProtocolV2FetchResponseSection::WantedRefs(wanted)) = sections
-            .iter()
-            .find(|s| matches!(s, ProtocolV2FetchResponseSection::WantedRefs(_)))
-    {
-        for w in wanted {
-            wants.push(w.oid);
-        }
+    for w in &resolved_want_refs {
+        wants.push(w.oid);
     }
     // A capability-only fetch command (for example the upstream
     // `packfile-uris` validation probe) has no pack request to answer. Git
@@ -2687,10 +3016,27 @@ fn serve_upload_pack_v2_inner(
                 writer.flush()?;
             }
             sley_protocol::ProtocolV2Command::Fetch(fetch) => {
-                let sections = local_fetch_v2_sections(git_dir, format, &fetch)?;
-                if !sections.is_empty() {
-                    write_protocol_v2_fetch_response(writer, &sections)?;
-                    writer.flush()?;
+                match local_fetch_v2_sections(git_dir, format, &fetch) {
+                    Ok(sections) => {
+                        if !sections.is_empty() {
+                            write_protocol_v2_fetch_response(writer, &sections)?;
+                            writer.flush()?;
+                        }
+                    }
+                    Err(err) => {
+                        // Mirror git's packet_writer_error + die: emit ERR so the
+                        // client can report `fatal: remote error: …`, then fail.
+                        if let Some(message) = upload_pack_protocol_error_message(&err) {
+                            write_error_line(
+                                writer,
+                                &ProtocolErrorLine {
+                                    message: message.to_string(),
+                                },
+                            )?;
+                            writer.flush()?;
+                        }
+                        return Err(err);
+                    }
                 }
             }
             sley_protocol::ProtocolV2Command::ObjectInfo(_)
@@ -2706,6 +3052,7 @@ fn serve_upload_pack_v2_inner(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use sley_object::{BString, EncodedObject, Tree, TreeEntry};
@@ -3807,4 +4154,59 @@ mod tests {
             .write(),
         )
     }
+}
+
+pub fn negotiate_only_local(
+    local_git_dir: &Path,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    tip_oids: &[ObjectId],
+) -> Result<Vec<ObjectId>> {
+    let local_db = FileObjectDatabase::from_git_dir(local_git_dir, format);
+    let mut seen = HashSet::new();
+    let mut haves = Vec::new();
+    // Walk each tip's commit ancestry so a tip that only exists locally still
+    // reveals common ancestors the remote can ACK (fetch-pack negotiator).
+    for tip in tip_oids {
+        let mut stack = vec![*tip];
+        while let Some(oid) = stack.pop() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            haves.push(oid);
+            let Ok(object) = local_db.read_object(&oid) else {
+                continue;
+            };
+            if object.object_type != ObjectType::Commit {
+                continue;
+            }
+            if let Ok(commit) = Commit::parse_ref(format, &object.body) {
+                for parent in commit.parents {
+                    if !seen.contains(&parent) {
+                        stack.push(parent);
+                    }
+                }
+            }
+        }
+    }
+    let request = ProtocolV2FetchRequest {
+        haves,
+        wait_for_done: true,
+        done: false,
+        thin_pack: true,
+        ofs_delta: true,
+        ..ProtocolV2FetchRequest::default()
+    };
+    let sections = local_fetch_v2_sections(remote_git_dir, format, &request)?;
+    let mut acked = Vec::new();
+    for section in sections {
+        if let ProtocolV2FetchResponseSection::Acknowledgments(acks) = section {
+            for ack in acks {
+                if let ProtocolV2FetchAcknowledgment::Ack(oid) = ack {
+                    acked.push(oid);
+                }
+            }
+        }
+    }
+    Ok(acked)
 }
