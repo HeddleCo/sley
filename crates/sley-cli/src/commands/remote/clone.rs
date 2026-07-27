@@ -4131,12 +4131,30 @@ fn trace2_config_params_include(config: &GitConfig, key: &str) -> bool {
         .any(|pattern| trace2_config_param_matches(&pattern, key))
 }
 
-fn trace2_clone_remote_url(git_dir: &Path, name: &str, url: &str) {
+fn trace2_clone_remote_url(_git_dir: &Path, name: &str, url: &str) {
     if env::var_os("GIT_TRACE2").is_none() && env::var_os("GIT_TRACE2_PERF").is_none() {
         return;
     }
     let key = format!("remote.{name}.url");
-    let Ok(config) = read_repo_config(git_dir) else {
+    // Patterns come from env / early global config (`trace2.configParams`),
+    // matching git's `tr2_sysenv` / `tr2_cfg_set_fl` path — not from the
+    // newly-created clone repository (which has not inherited those keys).
+    let context = crate::sley_config::ConfigIncludeContext::new(None, None);
+    let Ok(config) = crate::sley_config::load_pre_dispatch_config(None, &context) else {
+        // Still honour GIT_TRACE2_CONFIG_PARAMS when global config is unreadable.
+        if env::var("GIT_TRACE2_CONFIG_PARAMS")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .is_some_and(|params| {
+                params
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|pattern| !pattern.is_empty())
+                    .any(|pattern| trace2_config_param_matches(pattern, &key))
+            })
+        {
+            sley_core::trace2::def_param(&key, url);
+        }
         return;
     };
     if trace2_config_params_include(&config, &key) {

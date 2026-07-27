@@ -3071,6 +3071,18 @@ fn try_straight_apply(
                 .map(|entry| (entry.path.as_bytes().to_vec(), (entry.mode, entry.oid))),
         );
     }
+    // git's `check_to_create` permits a create when another patch in the same
+    // batch removes the path first (`ok_if_exists` via `was_deleted` /
+    // `to_be_deleted`). format-patch always splits a type-change into delete +
+    // create (apply.c: "A type-change diff is always split…"), so file→gitlink
+    // lands as `deleted file mode 100644` + `new file mode 160000` for the same
+    // path. Without this, the still-present regular file makes the create arm
+    // reject and `am` aborts (t4255 "replace tracked file with submodule").
+    let deleted_paths: HashSet<&[u8]> = file_patches
+        .iter()
+        .filter(|p| p.is_delete || p.is_rename)
+        .filter_map(|p| p.old_path.as_deref())
+        .collect();
     for patch in file_patches {
         // git apply (`check_to_create` in apply.c) rejects a create patch when
         // the target already exists in the working tree — the whole patch fails
@@ -3080,9 +3092,11 @@ fn try_straight_apply(
         // A working-tree *directory* at the target is fine (git's check_to_create
         // returns 0 for S_ISDIR): an added gitlink populates an existing empty
         // submodule directory rather than conflicting. Any other existing entry
-        // still fails the create (→ conflict / `git am` aborts).
+        // still fails the create (→ conflict / `git am` aborts), unless another
+        // patch in this batch deletes the path first (type-change split above).
         if patch.is_new
             && let Some(target) = patch.new_path.as_deref().or(patch.old_path.as_deref())
+            && !deleted_paths.contains(target)
         {
             let sparse_target_exists = sparse_preimages.contains_key(target);
             let worktree_target_blocks = std::str::from_utf8(target)

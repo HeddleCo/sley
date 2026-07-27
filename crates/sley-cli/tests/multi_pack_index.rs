@@ -547,3 +547,222 @@ fn multi_pack_index_expire_quiet_baseline_matches_upstream_git() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+/// t5319 "expire removes repacked packs": after a batch-size midx repack that
+/// folds the smallest packs into a new one, expire must drop only the packs
+/// whose objects are fully covered by the new pack (leaving the four largest).
+/// Sensitive to pack-objects size parity (batch selection) and to midx
+/// preferred-copy attribution after the repack rewrite.
+#[test]
+fn multi_pack_index_expire_removes_repacked_packs() {
+    let root = unique_temp_dir("midx-expire-repacked");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
+        // Incompressible payload so pack-E (base history) stays among the
+        // largest packs, matching t5319's genrandom fixture shape.
+        let mut large = vec![0u8; 4096];
+        for (i, byte) in large.iter_mut().enumerate() {
+            *byte = (i.wrapping_mul(37).wrapping_add(91) % 251) as u8;
+        }
+        fs::write(root.join("large.txt"), &large).expect("write large");
+        run_success(sley_testkit::oracle_git(), &root, &["add", "large.txt"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &[
+                "-c",
+                "user.name=A U Thor",
+                "-c",
+                "user.email=author@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+        );
+        for i in 1..=20 {
+            let name = format!("f{i}.txt");
+            fs::write(root.join(&name), format!("content {i}\n")).expect("write file");
+            run_success(sley_testkit::oracle_git(), &root, &["add", &name]);
+            run_success(
+                sley_testkit::oracle_git(),
+                &root,
+                &[
+                    "-c",
+                    "user.name=A U Thor",
+                    "-c",
+                    "user.email=author@example.com",
+                    "commit",
+                    "-q",
+                    "-m",
+                    &format!("c{i}"),
+                ],
+            );
+        }
+        // Build five disjoint packs A..E (same topology as t5319 setup expire).
+        run_success(sley_testkit::oracle_git(), &root, &["branch", "A", "HEAD"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["branch", "B", "HEAD~8"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["branch", "C", "HEAD~13"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["branch", "D", "HEAD~16"],
+        );
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["branch", "E", "HEAD~18"],
+        );
+        let pack_prefix = root.join(".git").join("objects").join("pack").join("pack");
+        let pack_prefix = pack_prefix.to_str().expect("utf8 pack prefix");
+        for (name, stdin) in [
+            ("A", "refs/heads/A\n^refs/heads/B\n"),
+            ("B", "refs/heads/B\n^refs/heads/C\n"),
+            ("C", "refs/heads/C\n^refs/heads/D\n"),
+            ("D", "refs/heads/D\n^refs/heads/E\n"),
+            ("E", "refs/heads/E\n"),
+        ] {
+            let prefix = format!("{pack_prefix}-{name}");
+            // Use sley's pack-objects so sizes match what the upstream suite sees.
+            run_success_with_stdin(
+                sley_testkit::sley_bin!(),
+                &root,
+                &["pack-objects", "--revs", &prefix],
+                stdin.as_bytes(),
+            );
+        }
+        run_success(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["multi-pack-index", "write"],
+        );
+
+        let pack_dir = root.join(".git").join("objects").join("pack");
+        let mut packs: Vec<PathBuf> = fs::read_dir(&pack_dir)
+            .expect("read pack dir")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("pack"))
+            .collect();
+        assert_eq!(packs.len(), 5, "setup should leave five packs");
+        packs.sort_by_key(|path| {
+            // Prefer named pack-D..A order for aging; fall back to size.
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let rank = if name.contains("pack-D-") {
+                0
+            } else if name.contains("pack-C-") {
+                1
+            } else if name.contains("pack-B-") {
+                2
+            } else if name.contains("pack-A-") {
+                3
+            } else {
+                4
+            };
+            (rank, fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+        });
+        // Match t5319: age D,C,B,A so batch selection visits smallest/oldest first.
+        for (i, pack) in packs.iter().take(4).enumerate() {
+            let stamp = format!("20200101000{}", i + 1);
+            for path in [
+                pack.clone(),
+                pack.with_extension("idx"),
+                pack.with_extension("rev"),
+            ] {
+                if path.exists() {
+                    let status = Command::new("touch")
+                        .args(["-t", &stamp])
+                        .arg(&path)
+                        .status()
+                        .expect("touch pack");
+                    assert!(status.success(), "touch failed for {}", path.display());
+                }
+            }
+        }
+
+        let mut pack_sizes: Vec<u64> = packs
+            .iter()
+            .filter_map(|path| fs::metadata(path).ok().map(|m| m.len()))
+            .collect();
+        pack_sizes.sort_unstable();
+        let batch = pack_sizes[2] + 1;
+
+        run_success(
+            sley_testkit::sley_bin!(),
+            &root,
+            &[
+                "multi-pack-index",
+                "repack",
+                &format!("--batch-size={batch}"),
+            ],
+        );
+
+        let after_repack: Vec<PathBuf> = fs::read_dir(&pack_dir)
+            .expect("read pack dir")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("pack"))
+            .collect();
+        assert_eq!(
+            after_repack.len(),
+            6,
+            "batch repack should add exactly one pack"
+        );
+
+        // Four largest packs before expire are the expected survivors.
+        let mut sized: Vec<(u64, PathBuf)> = after_repack
+            .iter()
+            .filter_map(|path| fs::metadata(path).ok().map(|m| (m.len(), path.clone())))
+            .collect();
+        sized.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let expect: Vec<PathBuf> = sized.iter().take(4).map(|(_, p)| p.clone()).collect();
+
+        run_success(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["multi-pack-index", "expire"],
+        );
+
+        let mut actual: Vec<PathBuf> = fs::read_dir(&pack_dir)
+            .expect("read pack dir")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("pack"))
+            .collect();
+        actual.sort();
+        let mut expect_sorted = expect;
+        expect_sorted.sort();
+        assert_eq!(
+            actual, expect_sorted,
+            "expire should leave the four largest packs"
+        );
+
+        // MIDX must list the remaining packs only.
+        let midx = fs::read(pack_dir.join("multi-pack-index")).expect("read midx");
+        let idx_count = actual.len();
+        // Header: signature(4) version(1) oid_ver(1) chunks(1) base(1) num_packs(4)
+        assert!(midx.len() >= 12, "midx too short");
+        let num_packs = u32::from_be_bytes(midx[8..12].try_into().expect("4 bytes"));
+        assert_eq!(
+            num_packs as usize, idx_count,
+            "midx pack count should match remaining packs"
+        );
+
+        run_success(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["multi-pack-index", "verify"],
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}

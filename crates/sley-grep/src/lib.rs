@@ -150,7 +150,9 @@ pub fn report_regex_error(
 }
 
 pub struct GrepCompileConfig<'a> {
-    pub patterns: &'a [String],
+    /// Pattern bytes as the engine sees them (raw argv / file bytes, not the
+    /// UTF-8 encoding of any CLI sentinel form of non-UTF-8 arguments).
+    pub patterns: &'a [Vec<u8>],
     pub kind: PatternKind,
     pub ignore_case: bool,
     pub word: bool,
@@ -166,6 +168,10 @@ pub struct GrepMatcher {
     patterns: Vec<CompiledPattern>,
     line_regexp: bool,
     unicode_case_fold: bool,
+    /// Single-byte locale case fold (ISO-8859-1 tables), used when the process
+    /// locale is neither UTF-8 nor C/POSIX — matching git's `pcre2_maketables`
+    /// path under e.g. `is_IS.ISO8859-1`.
+    single_byte_case_fold: bool,
 }
 
 pub enum CompiledPattern {
@@ -183,6 +189,7 @@ impl GrepMatcher {
         error_context: &str,
     ) -> Result<Self> {
         let unicode_case_fold = locale_uses_utf8();
+        let single_byte_case_fold = !unicode_case_fold && locale_is_single_byte();
         let mut patterns = Vec::new();
         for raw in config.patterns {
             // With PCRE2 available, Git routes an otherwise-fixed default
@@ -190,12 +197,12 @@ impl GrepMatcher {
             // `(*NO_JIT)` remains a PCRE control verb in that path rather than
             // literal text (notably for invalid-UTF subject handling).
             let pcre_fixed = matches!(config.kind, PatternKind::Basic | PatternKind::Extended)
-                .then(|| raw.strip_prefix("(*NO_JIT)"))
+                .then(|| raw.strip_prefix(b"(*NO_JIT)"))
                 .flatten()
                 .filter(|pattern| is_plain_regex_literal(pattern));
             let compiled = match config.kind {
                 PatternKind::Fixed => CompiledPattern::Fixed {
-                    needle: raw.as_bytes().to_vec(),
+                    needle: raw.clone(),
                     ignore_case: config.ignore_case,
                 },
                 PatternKind::Basic | PatternKind::Extended | PatternKind::Perl => {
@@ -207,17 +214,24 @@ impl GrepMatcher {
                             PatternKind::Extended => RegexMode::Ere,
                             _ => RegexMode::Pcre,
                         };
-                        (raw.as_str(), mode)
+                        (raw.as_slice(), mode)
                     };
+                    let pattern_display = String::from_utf8_lossy(raw);
                     let regex = Regex::compile_bytes_with_locale(
-                        pattern.as_bytes(),
+                        pattern,
                         mode,
                         config.ignore_case,
                         config.word,
                         unicode_case_fold,
+                        single_byte_case_fold,
                     )
                     .map_err(|err| {
-                        report_regex_error(error_context, raw, config.diagnostic_verbosity, &err)
+                        report_regex_error(
+                            error_context,
+                            &pattern_display,
+                            config.diagnostic_verbosity,
+                            &err,
+                        )
                     })?;
                     CompiledPattern::Regex(regex)
                 }
@@ -228,6 +242,7 @@ impl GrepMatcher {
             patterns,
             line_regexp: config.line_regexp,
             unicode_case_fold,
+            single_byte_case_fold,
         })
     }
 
@@ -247,12 +262,23 @@ impl GrepMatcher {
     pub fn find_idx(&self, idx: usize, line: &[u8], from: usize) -> Option<(usize, usize)> {
         let pattern = &self.patterns[idx];
         if self.line_regexp {
-            if pattern.matches_line(line, true, self.unicode_case_fold) && from == 0 {
+            if pattern.matches_line(
+                line,
+                true,
+                self.unicode_case_fold,
+                self.single_byte_case_fold,
+            ) && from == 0
+            {
                 return Some((0, line.len()));
             }
             return None;
         }
-        pattern.find_from(line, from, self.unicode_case_fold)
+        pattern.find_from(
+            line,
+            from,
+            self.unicode_case_fold,
+            self.single_byte_case_fold,
+        )
     }
 
     /// Byte spans of (non-overlapping, left-most) matches on `line`, for `-o`.
@@ -317,10 +343,10 @@ impl GrepMatcher {
     }
 }
 
-fn is_plain_regex_literal(pattern: &str) -> bool {
-    !pattern.bytes().any(|byte| {
+fn is_plain_regex_literal(pattern: &[u8]) -> bool {
+    !pattern.iter().any(|byte| {
         matches!(
-            byte,
+            *byte,
             b'.' | b'['
                 | b']'
                 | b'\\'
@@ -354,16 +380,36 @@ fn collect_positive_atoms(expr: &Expr, negated: bool, out: &mut Vec<usize>) {
 }
 
 impl CompiledPattern {
-    fn matches_line(&self, line: &[u8], line_regexp: bool, unicode_case_fold: bool) -> bool {
+    fn matches_line(
+        &self,
+        line: &[u8],
+        line_regexp: bool,
+        unicode_case_fold: bool,
+        single_byte_case_fold: bool,
+    ) -> bool {
         match self {
             CompiledPattern::Fixed {
                 needle,
                 ignore_case,
             } => {
                 if line_regexp {
-                    return bytes_eq(line, needle, *ignore_case, unicode_case_fold);
+                    return bytes_eq(
+                        line,
+                        needle,
+                        *ignore_case,
+                        unicode_case_fold,
+                        single_byte_case_fold,
+                    );
                 }
-                find_substring(line, needle, *ignore_case, unicode_case_fold, 0).is_some()
+                find_substring(
+                    line,
+                    needle,
+                    *ignore_case,
+                    unicode_case_fold,
+                    single_byte_case_fold,
+                    0,
+                )
+                .is_some()
             }
             CompiledPattern::Regex(regex) => {
                 if line_regexp {
@@ -379,19 +425,33 @@ impl CompiledPattern {
         line: &[u8],
         from: usize,
         unicode_case_fold: bool,
+        single_byte_case_fold: bool,
     ) -> Option<(usize, usize)> {
         match self {
             CompiledPattern::Fixed {
                 needle,
                 ignore_case,
-            } => find_substring(line, needle, *ignore_case, unicode_case_fold, from)
-                .map(|s| (s, s + needle.len())),
+            } => find_substring(
+                line,
+                needle,
+                *ignore_case,
+                unicode_case_fold,
+                single_byte_case_fold,
+                from,
+            )
+            .map(|s| (s, s + needle.len())),
             CompiledPattern::Regex(regex) => regex.find_from(line, from),
         }
     }
 }
 
-fn bytes_eq(a: &[u8], b: &[u8], ignore_case: bool, unicode_case_fold: bool) -> bool {
+fn bytes_eq(
+    a: &[u8],
+    b: &[u8],
+    ignore_case: bool,
+    unicode_case_fold: bool,
+    single_byte_case_fold: bool,
+) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -404,6 +464,12 @@ fn bytes_eq(a: &[u8], b: &[u8], ignore_case: bool, unicode_case_fold: bool) -> b
                 .flat_map(char::to_lowercase)
                 .eq(b.chars().flat_map(char::to_lowercase));
         }
+        if single_byte_case_fold {
+            return a
+                .iter()
+                .zip(b)
+                .all(|(x, y)| iso8859_1_tolower(*x) == iso8859_1_tolower(*y));
+        }
         a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
     } else {
         a == b
@@ -414,18 +480,58 @@ fn bytes_eq(a: &[u8], b: &[u8], ignore_case: bool, unicode_case_fold: bool) -> b
 /// and PCRE matchers case-fold non-ASCII only under a multibyte locale; `C` and
 /// `POSIX` remain byte-oriented even when the pattern bytes form valid UTF-8.
 fn locale_uses_utf8() -> bool {
-    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
-        .into_iter()
-        .find_map(|key| std::env::var_os(key).filter(|value| !value.is_empty()));
-    let Some(locale) = locale else {
+    let Some(locale) = process_locale_name() else {
         return false;
     };
-    let locale = locale.to_string_lossy().to_ascii_lowercase();
+    let locale = locale.to_ascii_lowercase();
     locale.contains("utf-8") || locale.contains("utf8")
 }
 
+/// Non-UTF-8, non-C/POSIX locale: use single-byte (ISO-8859-1) case tables, as
+/// git does via `pcre2_maketables()` under e.g. `is_IS.ISO8859-1`.
+fn locale_is_single_byte() -> bool {
+    let Some(locale) = process_locale_name() else {
+        return false;
+    };
+    let locale = locale.to_ascii_lowercase();
+    if locale == "c"
+        || locale == "posix"
+        || locale.starts_with("c.")
+        || locale.starts_with("posix.")
+    {
+        return false;
+    }
+    !(locale.contains("utf-8") || locale.contains("utf8"))
+}
+
+fn process_locale_name() -> Option<String> {
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .find_map(|key| std::env::var_os(key).filter(|value| !value.is_empty()))
+        .map(|value| value.to_string_lossy().into_owned())
+}
+
+/// ISO-8859-1 / Latin-1 case fold for a single byte (covers the letters that
+/// `pcre2_maketables` exposes under ISO-8859-1 locales).
+fn iso8859_1_tolower(b: u8) -> u8 {
+    match b {
+        b'A'..=b'Z' => b + 32,
+        // À-Ö and Ø-Þ (skip × at 0xD7)
+        0xC0..=0xD6 | 0xD8..=0xDE => b + 0x20,
+        _ => b,
+    }
+}
+
 pub fn contains(haystack: &[u8], needle: &[u8], ignore_case: bool) -> bool {
-    find_substring(haystack, needle, ignore_case, locale_uses_utf8(), 0).is_some()
+    find_substring(
+        haystack,
+        needle,
+        ignore_case,
+        locale_uses_utf8(),
+        locale_is_single_byte(),
+        0,
+    )
+    .is_some()
 }
 
 fn find_substring(
@@ -433,6 +539,7 @@ fn find_substring(
     needle: &[u8],
     ignore_case: bool,
     unicode_case_fold: bool,
+    single_byte_case_fold: bool,
     from: usize,
 ) -> Option<usize> {
     if needle.is_empty() {
@@ -441,9 +548,18 @@ fn find_substring(
     if from > haystack.len() || needle.len() > haystack.len() - from {
         return None;
     }
+    // With single-byte case fold, Ó (0xD3) and ó (0xF3) are the same letter but
+    // different bytes, so windows must be compared by folded equality rather
+    // than fixed-length sliding alone only — lengths still match for Latin-1.
     for start in from..=haystack.len() - needle.len() {
         let window = &haystack[start..start + needle.len()];
-        if bytes_eq(window, needle, ignore_case, unicode_case_fold) {
+        if bytes_eq(
+            window,
+            needle,
+            ignore_case,
+            unicode_case_fold,
+            single_byte_case_fold,
+        ) {
             return Some(start);
         }
     }
@@ -554,6 +670,7 @@ pub struct Regex {
     root: Node,
     ignore_case: bool,
     unicode_case_fold: bool,
+    single_byte_case_fold: bool,
     /// Number of capturing groups (PCRE mode); sizes the backreference slots.
     num_groups: usize,
 }
@@ -572,7 +689,14 @@ impl Regex {
         ignore_case: bool,
         word: bool,
     ) -> Result<Self> {
-        Self::compile_bytes_with_locale(pattern, mode, ignore_case, word, locale_uses_utf8())
+        Self::compile_bytes_with_locale(
+            pattern,
+            mode,
+            ignore_case,
+            word,
+            locale_uses_utf8(),
+            locale_is_single_byte(),
+        )
     }
 
     fn compile_bytes_with_locale(
@@ -581,6 +705,7 @@ impl Regex {
         ignore_case: bool,
         word: bool,
         unicode_case_fold: bool,
+        single_byte_case_fold: bool,
     ) -> Result<Self> {
         let mut bytes = pattern;
         if mode == RegexMode::Pcre {
@@ -620,6 +745,7 @@ impl Regex {
             root,
             ignore_case,
             unicode_case_fold,
+            single_byte_case_fold,
             num_groups: parser.num_groups,
         })
     }
@@ -635,7 +761,12 @@ impl Regex {
         ignore_case: bool,
     ) -> Option<(usize, usize)> {
         for start in from..=text.len() {
-            let ctx = MatchCtx::new(text, self.num_groups, self.unicode_case_fold);
+            let ctx = MatchCtx::new(
+                text,
+                self.num_groups,
+                self.unicode_case_fold,
+                self.single_byte_case_fold,
+            );
             if let Some(end) = match_node(&self.root, &ctx, start, ignore_case) {
                 return Some((start, end));
             }
@@ -644,7 +775,12 @@ impl Regex {
     }
 
     fn matches_whole(&self, text: &[u8]) -> bool {
-        let ctx = MatchCtx::new(text, self.num_groups, self.unicode_case_fold);
+        let ctx = MatchCtx::new(
+            text,
+            self.num_groups,
+            self.unicode_case_fold,
+            self.single_byte_case_fold,
+        );
         match_anchored_full(&self.root, &ctx, self.ignore_case)
     }
 
@@ -661,7 +797,12 @@ impl Regex {
     /// `None` when the group did not participate in the match.
     pub fn find_captures(&self, text: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
         for start in 0..=text.len() {
-            let ctx = MatchCtx::new(text, self.num_groups, self.unicode_case_fold);
+            let ctx = MatchCtx::new(
+                text,
+                self.num_groups,
+                self.unicode_case_fold,
+                self.single_byte_case_fold,
+            );
             if let Some(end) = match_node(&self.root, &ctx, start, self.ignore_case) {
                 let mut spans = ctx.captures.into_inner();
                 spans[0] = Some((start, end));
@@ -685,7 +826,12 @@ impl Regex {
         for start in 0..=text.len() {
             let mut best: Option<usize> = None;
             for branch in &branches {
-                let ctx = MatchCtx::new(text, self.num_groups, self.unicode_case_fold);
+                let ctx = MatchCtx::new(
+                    text,
+                    self.num_groups,
+                    self.unicode_case_fold,
+                    self.single_byte_case_fold,
+                );
                 if let Some(end) = match_node(branch, &ctx, start, self.ignore_case)
                     && best.is_none_or(|current| end > current)
                 {
@@ -1301,14 +1447,21 @@ fn parse_usize(digits: &[u8]) -> Result<usize> {
 struct MatchCtx<'a> {
     text: &'a [u8],
     unicode_case_fold: bool,
+    single_byte_case_fold: bool,
     captures: std::cell::RefCell<Vec<Option<(usize, usize)>>>,
 }
 
 impl<'a> MatchCtx<'a> {
-    fn new(text: &'a [u8], num_groups: usize, unicode_case_fold: bool) -> Self {
+    fn new(
+        text: &'a [u8],
+        num_groups: usize,
+        unicode_case_fold: bool,
+        single_byte_case_fold: bool,
+    ) -> Self {
         Self {
             text,
             unicode_case_fold,
+            single_byte_case_fold,
             captures: std::cell::RefCell::new(vec![None; num_groups + 1]),
         }
     }
@@ -1335,10 +1488,15 @@ fn match_seq(
     let text = ctx.text;
     match node {
         Node::Empty => cont(pos),
-        Node::Literal(unit) => {
-            literal_match_len(text, pos, unit, ignore_case, ctx.unicode_case_fold)
-                .and_then(|width| cont(pos + width))
-        }
+        Node::Literal(unit) => literal_match_len(
+            text,
+            pos,
+            unit,
+            ignore_case,
+            ctx.unicode_case_fold,
+            ctx.single_byte_case_fold,
+        )
+        .and_then(|width| cont(pos + width)),
         Node::AnyChar => {
             let remaining = text.get(pos..)?;
             if remaining.is_empty() {
@@ -1352,7 +1510,14 @@ fn match_seq(
             cont(pos + width)
         }
         Node::Class { negate, items } => {
-            let matched = class_match_len(items, text, pos, ignore_case, ctx.unicode_case_fold);
+            let matched = class_match_len(
+                items,
+                text,
+                pos,
+                ignore_case,
+                ctx.unicode_case_fold,
+                ctx.single_byte_case_fold,
+            );
             if *negate {
                 if matched.is_none() {
                     let remaining = text.get(pos..)?;
@@ -1425,8 +1590,14 @@ fn match_seq(
             if pos + captured_len > text.len() {
                 return None;
             }
-            let matches =
-                (0..captured_len).all(|i| byte_eq(text[pos + i], text[start + i], ignore_case));
+            let matches = (0..captured_len).all(|i| {
+                byte_eq(
+                    text[pos + i],
+                    text[start + i],
+                    ignore_case,
+                    ctx.single_byte_case_fold,
+                )
+            });
             if matches {
                 cont(pos + captured_len)
             } else {
@@ -1573,12 +1744,14 @@ fn match_repeat(
     })
 }
 
-fn byte_eq(a: u8, b: u8, ignore_case: bool) -> bool {
-    if ignore_case {
-        a.eq_ignore_ascii_case(&b)
-    } else {
-        a == b
+fn byte_eq(a: u8, b: u8, ignore_case: bool, single_byte_case_fold: bool) -> bool {
+    if !ignore_case {
+        return a == b;
     }
+    if single_byte_case_fold {
+        return iso8859_1_tolower(a) == iso8859_1_tolower(b);
+    }
+    a.eq_ignore_ascii_case(&b)
 }
 
 fn utf8_scalar_width(bytes: &[u8]) -> usize {
@@ -1609,6 +1782,7 @@ fn literal_match_len(
     literal: &[u8],
     ignore_case: bool,
     unicode_case_fold: bool,
+    single_byte_case_fold: bool,
 ) -> Option<usize> {
     let text = text.get(pos..)?;
     if !ignore_case {
@@ -1633,7 +1807,7 @@ fn literal_match_len(
         && text[..literal.len()]
             .iter()
             .zip(literal)
-            .all(|(left, right)| byte_eq(*left, *right, true)))
+            .all(|(left, right)| byte_eq(*left, *right, true, single_byte_case_fold)))
     .then_some(literal.len())
 }
 
@@ -1643,14 +1817,20 @@ fn class_match_len(
     pos: usize,
     ignore_case: bool,
     unicode_case_fold: bool,
+    single_byte_case_fold: bool,
 ) -> Option<usize> {
     let ch = *text.get(pos)?;
     for item in items {
         match item {
             ClassItem::Single(unit) => {
-                if let Some(width) =
-                    literal_match_len(text, pos, unit, ignore_case, unicode_case_fold)
-                {
+                if let Some(width) = literal_match_len(
+                    text,
+                    pos,
+                    unit,
+                    ignore_case,
+                    unicode_case_fold,
+                    single_byte_case_fold,
+                ) {
                     return Some(width);
                 }
             }
@@ -1659,10 +1839,19 @@ fn class_match_len(
                     return Some(1);
                 }
                 if ignore_case {
-                    let lower = ch.to_ascii_lowercase();
-                    let upper = ch.to_ascii_uppercase();
-                    if (*lo..=*hi).contains(&lower) || (*lo..=*hi).contains(&upper) {
-                        return Some(1);
+                    if single_byte_case_fold {
+                        let folded = iso8859_1_tolower(ch);
+                        let lo_f = iso8859_1_tolower(*lo);
+                        let hi_f = iso8859_1_tolower(*hi);
+                        if (lo_f..=hi_f).contains(&folded) {
+                            return Some(1);
+                        }
+                    } else {
+                        let lower = ch.to_ascii_lowercase();
+                        let upper = ch.to_ascii_uppercase();
+                        if (*lo..=*hi).contains(&lower) || (*lo..=*hi).contains(&upper) {
+                            return Some(1);
+                        }
                     }
                 }
             }
@@ -1772,6 +1961,7 @@ mod tests {
             true,
             false,
             false,
+            false,
         )
         .expect("compile C-locale regex");
         assert_eq!(c_regex.find_from("æ\0ð".as_bytes(), 0), None);
@@ -1781,6 +1971,7 @@ mod tests {
             true,
             false,
             true,
+            false,
         )
         .expect("compile UTF-8-locale regex");
         assert_eq!(utf8_regex.find_from("æ\0ð".as_bytes(), 0), Some((0, 5)));
@@ -1790,14 +1981,41 @@ mod tests {
             "HALLÓ".as_bytes(),
             true,
             false,
+            false,
         ));
-        assert!(bytes_eq("Halló".as_bytes(), "HALLÓ".as_bytes(), true, true,));
-        assert!(bytes_eq(b"Hello", b"HELLO", true, false));
+        assert!(bytes_eq(
+            "Halló".as_bytes(),
+            "HALLÓ".as_bytes(),
+            true,
+            true,
+            false,
+        ));
+        assert!(bytes_eq(b"Hello", b"HELLO", true, false, false));
+        // ISO-8859-1 Ó (0xD3) folds to ó (0xF3) under single-byte locales.
+        assert!(bytes_eq(b"\xd3", b"\xf3", true, false, true));
+        assert!(!bytes_eq(b"\xd3", b"\xf3", true, false, false));
+    }
+
+    #[test]
+    fn iso8859_1_icase_pcre_matches_upper_pattern() {
+        let regex = Regex::compile_bytes_with_locale(
+            b"TILRAUN: H.LL\xd3 HEIMUR!",
+            RegexMode::Pcre,
+            true,
+            false,
+            false,
+            true,
+        )
+        .expect("compile ISO-8859-1 icase PCRE");
+        assert_eq!(
+            regex.find_from(b"TILRAUN: Hall\xf3 Heimur!", 0),
+            Some((0, b"TILRAUN: Hall\xf3 Heimur!".len()))
+        );
     }
 
     #[test]
     fn no_jit_fixed_fast_path_matches_invalid_utf8_subject() {
-        let patterns = vec!["(*NO_JIT)æ".to_string()];
+        let patterns = vec![b"(*NO_JIT)\xc3\xa6".to_vec()];
         let matcher = GrepMatcher::compile(GrepCompileConfig {
             patterns: &patterns,
             kind: PatternKind::Basic,

@@ -449,14 +449,58 @@ pub(crate) fn cmd_init(
     }
     if !quiet {
         let git_dir = fs::canonicalize(&layout.git_dir)?;
-        let action = if layout.reinitialized {
-            "Reinitialized existing"
-        } else {
-            "Initialized empty"
-        };
-        println!("{action} Git repository in {}/", git_dir.to_string_lossy());
+        print_init_repository_message(layout.reinitialized, false, &git_dir)?;
     }
     Ok(())
+}
+
+/// Emit the translated `Initialized empty Git repository in …` line.
+///
+/// Uses gettext when `git-compat-i18n` is enabled so upstream tests like
+/// `t0204-gettext-reencode-sanity` see Icelandic (and re-encoded ISO-8859-1)
+/// output under `LANGUAGE=is`. Falls back to English otherwise.
+fn print_init_repository_message(reinitialized: bool, shared: bool, git_dir: &Path) -> Result<()> {
+    let path = git_dir.to_string_lossy();
+    let slash = if path.ends_with('/') { "" } else { "/" };
+    let msgid = match (reinitialized, shared) {
+        (false, false) => "Initialized empty Git repository in %s%s\n",
+        (false, true) => "Initialized empty shared Git repository in %s%s\n",
+        (true, false) => "Reinitialized existing Git repository in %s%s\n",
+        (true, true) => "Reinitialized existing shared Git repository in %s%s\n",
+    };
+    let message = init_gettext_printf(msgid, &[&path, slash]);
+    let mut out = std::io::stdout().lock();
+    out.write_all(&message)?;
+    out.flush()?;
+    Ok(())
+}
+
+#[cfg(feature = "git-compat-i18n")]
+fn init_gettext_printf(msgid: &str, args: &[&str]) -> Vec<u8> {
+    sley_i18n::gettext_printf(msgid, args)
+}
+
+#[cfg(not(feature = "git-compat-i18n"))]
+fn init_gettext_printf(msgid: &str, args: &[&str]) -> Vec<u8> {
+    // Minimal English fallback: expand %s and keep UTF-8.
+    let mut out = String::new();
+    let mut arg_idx = 0;
+    let bytes = msgid.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 1 < bytes.len() && bytes[i + 1] == b's' {
+            if let Some(arg) = args.get(arg_idx) {
+                out.push_str(arg);
+                arg_idx += 1;
+            }
+            i += 2;
+            continue;
+        }
+        let ch = msgid[i..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out.into_bytes()
 }
 
 fn init_config_git_dir_for_lookup(

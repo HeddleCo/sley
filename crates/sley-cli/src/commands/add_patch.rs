@@ -2317,14 +2317,26 @@ fn gitlink_selected_oid<'a>(
     fallback.filter(|oid| oid.len() >= 40)
 }
 
-/// After staging hunks, refresh the index stat cache so `git diff-files` stays
-/// clean for paths whose worktree now matches the freshly-staged blob (t3701
-/// "index is refreshed after applying patch").
-fn refresh_index(paths: &[String]) {
+/// After applying selected hunks, refresh the index stat cache so
+/// `git diff-files` stays clean for paths whose worktree now matches the index
+/// (t3701 "index is refreshed after applying patch").
+///
+/// Must be invoked as `update-index -q --refresh` with **no path arguments**.
+/// Upstream `update-index` treats `--refresh` as an immediate whole-index
+/// refresh callback; any trailing paths are then processed as ordinary
+/// `update_one` stages from the worktree. Spawning
+/// `update-index --refresh -- <paths>` therefore re-stages those paths and
+/// clobbers selective / index-preserving patch modes:
+/// - `add -p` / `commit --interactive` partial stage (t3701, t0090 #10)
+/// - `restore -p --source=*` worktree-only (t2071 #6–#9, #13)
+/// - `checkout -p HEAD/@` when the hunk does not apply to the index (t2016 #5, #8)
+///
+/// `-q` must precede `--refresh` (git option-order: quiet is only armed if seen
+/// before the refresh callback fires).
+fn refresh_index(_paths: &[String]) {
     let mut command = Command::new(self_bin());
     command
-        .args(["update-index", "--refresh", "-q", "--"])
-        .args(paths)
+        .args(["update-index", "-q", "--refresh"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

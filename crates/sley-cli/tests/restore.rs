@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -29,6 +30,26 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
         .args(args)
         .output()
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+}
+
+fn run_with_input(program: &str, cwd: &Path, args: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("failed to spawn {program} {args:?}: {err}"));
+    child
+        .stdin
+        .take()
+        .expect("interactive stdin")
+        .write_all(input)
+        .expect("write interactive input");
+    child
+        .wait_with_output()
+        .unwrap_or_else(|err| panic!("failed to wait for {program} {args:?}: {err}"))
 }
 
 fn run_with_identity(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -698,6 +719,157 @@ fn restore_staged_and_worktree_paths_from_head_match_upstream_git() {
             git(&rust, &["status", "--short"]),
             git(&upstream, &["status", "--short"]),
             "status differed after restore --staged --worktree"
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t2071: `restore -p --source=HEAD` (and `@`) discards worktree hunks only.
+/// Post-apply index refresh must not re-stage the restored worktree content
+/// over a divergent staged blob (matrix regression: 15→10).
+#[test]
+fn restore_patch_source_head_preserves_divergent_index() {
+    let root = unique_temp_dir("restore-patch-source-head");
+    fs::create_dir_all(&root).expect("create root");
+    {
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        git(&repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("dir")).expect("mkdir dir");
+        fs::write(repo.join("dir/foo"), b"parent\n").expect("write parent");
+        fs::write(repo.join("bar"), b"dummy\n").expect("write bar");
+        git(&repo, &["add", "bar", "dir/foo"]);
+        run_with_identity(&repo, &["commit", "-m", "initial", "-q"]);
+        fs::write(repo.join("dir/foo"), b"head\n").expect("write head");
+        git(&repo, &["add", "dir/foo"]);
+        run_with_identity(&repo, &["commit", "-m", "second", "-q"]);
+
+        // worktree=work, index=index (divergent from HEAD=head)
+        fs::write(repo.join("dir/foo"), b"index\n").expect("stage index");
+        git(&repo, &["add", "dir/foo"]);
+        fs::write(repo.join("dir/foo"), b"work\n").expect("dirty worktree");
+        // bar also dirty so path ordering exercises skip+apply like upstream.
+        fs::write(repo.join("bar"), b"bar_index\n").expect("bar index");
+        git(&repo, &["add", "bar"]);
+        fs::write(repo.join("bar"), b"bar_work\n").expect("bar work");
+
+        for source in ["HEAD", "@"] {
+            fs::write(repo.join("dir/foo"), b"index\n").expect("reset index content");
+            git(&repo, &["add", "dir/foo"]);
+            fs::write(repo.join("dir/foo"), b"work\n").expect("reset work");
+            fs::write(repo.join("bar"), b"bar_index\n").expect("reset bar index");
+            git(&repo, &["add", "bar"]);
+            fs::write(repo.join("bar"), b"bar_work\n").expect("reset bar work");
+
+            let source_arg = format!("--source={source}");
+            let args = ["restore", "-p", source_arg.as_str()];
+            // n = skip bar, y = discard dir/foo worktree hunk; extra n if loop continues
+            let output = run_with_input(sley_testkit::sley_bin!(), &repo, &args, b"n\ny\nn\n");
+            assert!(
+                output.status.success(),
+                "restore -p {source_arg} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("Discard"),
+                "expected Discard prompt in stdout for {source_arg}, got:\n{stdout}"
+            );
+            assert_eq!(
+                fs::read(repo.join("dir/foo")).expect("read worktree"),
+                b"head\n",
+                "worktree should restore to HEAD content for {source_arg}"
+            );
+            assert_eq!(
+                git(&repo, &["show", ":dir/foo"]),
+                b"index\n",
+                "index must stay divergent (not re-staged) for {source_arg}"
+            );
+            assert_eq!(
+                fs::read(repo.join("bar")).expect("read bar"),
+                b"bar_work\n",
+                "skipped bar worktree must be unchanged for {source_arg}"
+            );
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// t2071 #8/#13 family: `restore -p --source=HEAD^` / path-limited source.
+#[test]
+fn restore_patch_source_parent_and_path_limit() {
+    let root = unique_temp_dir("restore-patch-source-parent");
+    fs::create_dir_all(&root).expect("create root");
+    {
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        git(&repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("dir")).expect("mkdir dir");
+        fs::write(repo.join("dir/foo"), b"parent\n").expect("write parent");
+        fs::write(repo.join("bar"), b"dummy\n").expect("write bar");
+        git(&repo, &["add", "bar", "dir/foo"]);
+        run_with_identity(&repo, &["commit", "-m", "initial", "-q"]);
+        fs::write(repo.join("dir/foo"), b"head\n").expect("write head");
+        git(&repo, &["add", "dir/foo"]);
+        run_with_identity(&repo, &["commit", "-m", "second", "-q"]);
+
+        // --source=HEAD^: worktree→parent, index stays index
+        fs::write(repo.join("dir/foo"), b"index\n").expect("stage index");
+        git(&repo, &["add", "dir/foo"]);
+        fs::write(repo.join("dir/foo"), b"work\n").expect("dirty worktree");
+        fs::write(repo.join("bar"), b"bar_index\n").expect("bar index");
+        git(&repo, &["add", "bar"]);
+        fs::write(repo.join("bar"), b"bar_work\n").expect("bar work");
+
+        let output = run_with_input(
+            sley_testkit::sley_bin!(),
+            &repo,
+            &["restore", "-p", "--source=HEAD^"],
+            b"n\ny\nn\n",
+        );
+        assert!(
+            output.status.success(),
+            "restore -p --source=HEAD^ failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(repo.join("dir/foo")).expect("read worktree"),
+            b"parent\n"
+        );
+        assert_eq!(git(&repo, &["show", ":dir/foo"]), b"index\n");
+
+        // path limiting: HEAD^ -- dir
+        fs::write(repo.join("dir/foo"), b"head\n").expect("reset index to head");
+        git(&repo, &["add", "dir/foo"]);
+        fs::write(repo.join("dir/foo"), b"work\n").expect("dirty worktree");
+        fs::write(repo.join("bar"), b"bar_index\n").expect("bar index");
+        git(&repo, &["add", "bar"]);
+        fs::write(repo.join("bar"), b"bar_work\n").expect("bar work");
+
+        let output = run_with_input(
+            sley_testkit::sley_bin!(),
+            &repo,
+            &["restore", "-p", "--source=HEAD^", "--", "dir"],
+            b"y\nn\nn\n",
+        );
+        assert!(
+            output.status.success(),
+            "restore -p --source=HEAD^ -- dir failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(repo.join("dir/foo")).expect("read worktree"),
+            b"parent\n"
+        );
+        assert_eq!(
+            git(&repo, &["show", ":dir/foo"]),
+            b"head\n",
+            "path-limited restore must not re-stage dir/foo"
+        );
+        assert_eq!(
+            fs::read(repo.join("bar")).expect("read bar"),
+            b"bar_work\n",
+            "path-limited restore must not touch bar"
         );
     };
     let _ = fs::remove_dir_all(&root);

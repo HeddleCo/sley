@@ -282,6 +282,13 @@ pub(crate) fn preferred_index_mode_for_untrusted_worktree(
 }
 
 pub(crate) fn file_mode_with_trust(metadata: &fs::Metadata, trust_filemode: bool) -> u32 {
+    // core.filemode only governs the executable bit on regular files. A real
+    // symlink must still stage as 120000 (t3700 "filemode=0 should not get
+    // confused by symlink"); collapsing it to 100644 would treat the link
+    // target bytes as a regular blob.
+    if metadata.file_type().is_symlink() {
+        return 0o120000;
+    }
     if trust_filemode {
         file_mode(metadata)
     } else {
@@ -1599,16 +1606,12 @@ pub(crate) fn git_path_push_component(path: &mut Vec<u8>, component: &std::ffi::
     original_len
 }
 
-#[cfg(unix)]
+/// Bytes for a single path component from readdir / OsStr.
+///
+/// When `core.precomposeunicode` is active, NFD names are converted to NFC so
+/// worktree walks match the precomposed index (git's `precompose_utf8_readdir`).
 pub(crate) fn os_str_component_bytes(component: &std::ffi::OsStr) -> Cow<'_, [u8]> {
-    use std::os::unix::ffi::OsStrExt;
-
-    Cow::Borrowed(component.as_bytes())
-}
-
-#[cfg(not(unix))]
-pub(crate) fn os_str_component_bytes(component: &std::ffi::OsStr) -> Cow<'_, [u8]> {
-    Cow::Owned(component.to_string_lossy().into_owned().into_bytes())
+    sley_core::precompose_os_str_bytes_if_needed(component)
 }
 
 pub(crate) fn collect_worktree_entries(
@@ -2124,6 +2127,9 @@ pub(crate) fn git_path_bytes(path: &Path) -> Result<Vec<u8>> {
             path.display()
         )));
     }
+    // Precompose each component when core.precomposeunicode is active so CLI
+    // NFD pathspecs land as NFC index paths (git's precompose_argv_prefix).
+    let path = sley_core::precompose_path_if_needed(path);
     Ok(path
         .components()
         .filter_map(|component| match component {

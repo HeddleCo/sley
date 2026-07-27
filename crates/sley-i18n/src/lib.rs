@@ -1,9 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const GIT_SH_I18N: &str = r#"# Git-compatible shell i18n fallback helpers for Sley.
 TEXTDOMAIN=git
@@ -518,6 +519,271 @@ fn is_variable_continue(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphanumeric()
 }
 
+// ---------------------------------------------------------------------------
+// gettext message catalogs (GNU MO) + locale re-encoding
+// ---------------------------------------------------------------------------
+
+const GIT_TEXTDOMAIN: &str = "git";
+const GIT_TEXTDOMAINDIR_ENV: &str = "GIT_TEXTDOMAINDIR";
+
+struct MessageCatalog {
+    /// UTF-8 msgid → UTF-8 msgstr (as stored in git's *.mo files).
+    messages: BTreeMap<String, String>,
+}
+
+static CATALOG: OnceLock<Option<MessageCatalog>> = OnceLock::new();
+
+/// Translate `msgid` and re-encode to the process locale codeset.
+///
+/// Mirrors git's `_()` + `bind_textdomain_codeset`: catalogs are UTF-8; output
+/// is converted to the codeset of `LC_ALL`/`LC_CTYPE`/`LANG` (e.g. ISO-8859-1).
+/// When no catalog is available the original English `msgid` is returned
+/// (re-encoded if the locale is not UTF-8).
+pub fn gettext(msgid: &str) -> Vec<u8> {
+    let translated = lookup_msgid(msgid).unwrap_or(msgid);
+    reencode_for_locale(translated)
+}
+
+/// `gettext` with sequential `%s` substitution (git's init-style formats).
+pub fn gettext_printf(msgid: &str, args: &[&str]) -> Vec<u8> {
+    let translated = lookup_msgid(msgid).unwrap_or(msgid);
+    let filled = substitute_percent_s(translated, args);
+    reencode_for_locale(&filled)
+}
+
+fn lookup_msgid(msgid: &str) -> Option<&'static str> {
+    let catalog = CATALOG.get_or_init(load_catalog);
+    catalog
+        .as_ref()
+        .and_then(|cat| cat.messages.get(msgid).map(String::as_str))
+}
+
+fn load_catalog() -> Option<MessageCatalog> {
+    let textdomaindir = env::var_os(GIT_TEXTDOMAINDIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)?;
+    if !textdomaindir.is_dir() {
+        return None;
+    }
+    for lang in preferred_languages() {
+        let mo_path = textdomaindir
+            .join(&lang)
+            .join("LC_MESSAGES")
+            .join(format!("{GIT_TEXTDOMAIN}.mo"));
+        if let Ok(bytes) = fs::read(&mo_path)
+            && let Some(messages) = parse_mo(&bytes)
+        {
+            return Some(MessageCatalog { messages });
+        }
+        // LANGUAGE=is → also try is_IS when only a full locale dir exists.
+        if !lang.contains('_') {
+            // Prefer any `is_*` directory that has a catalog.
+            if let Ok(entries) = fs::read_dir(&textdomaindir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with(&format!("{lang}_")) || name == lang {
+                        let mo_path = entry
+                            .path()
+                            .join("LC_MESSAGES")
+                            .join(format!("{GIT_TEXTDOMAIN}.mo"));
+                        if let Ok(bytes) = fs::read(&mo_path)
+                            && let Some(messages) = parse_mo(&bytes)
+                        {
+                            return Some(MessageCatalog { messages });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Preferred language tags from `LANGUAGE`, then `LC_ALL`/`LC_MESSAGES`/`LANG`.
+fn preferred_languages() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(language) = env::var("LANGUAGE") {
+        for part in language.split(':') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            push_language_variants(part, &mut out);
+        }
+    }
+    for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+        if let Ok(value) = env::var(key)
+            && !value.is_empty()
+            && !value.eq_ignore_ascii_case("C")
+            && !value.eq_ignore_ascii_case("POSIX")
+        {
+            push_language_variants(&value, &mut out);
+            break;
+        }
+    }
+    out
+}
+
+fn push_language_variants(raw: &str, out: &mut Vec<String>) {
+    // Strip encoding: `is_IS.UTF-8` → `is_IS`
+    let base = raw.split('.').next().unwrap_or(raw);
+    let base = base.split('@').next().unwrap_or(base);
+    if base.is_empty() || base.eq_ignore_ascii_case("C") || base.eq_ignore_ascii_case("POSIX") {
+        return;
+    }
+    if !out.iter().any(|existing| existing == base) {
+        out.push(base.to_string());
+    }
+    if let Some((lang, _)) = base.split_once('_')
+        && !lang.is_empty()
+        && !out.iter().any(|existing| existing == lang)
+    {
+        out.push(lang.to_string());
+    }
+}
+
+fn parse_mo(bytes: &[u8]) -> Option<BTreeMap<String, String>> {
+    if bytes.len() < 28 {
+        return None;
+    }
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let read_u32: fn(&[u8], usize) -> Option<u32> = if magic == 0x9504_12de {
+        read_u32_le
+    } else if magic == 0xde12_0495 {
+        read_u32_be
+    } else {
+        return None;
+    };
+    let _revision = read_u32(bytes, 4)?;
+    let n = read_u32(bytes, 8)? as usize;
+    let o_orig = read_u32(bytes, 12)? as usize;
+    let o_trans = read_u32(bytes, 16)? as usize;
+    let mut messages = BTreeMap::new();
+    for i in 0..n {
+        let orig_len = read_u32(bytes, o_orig + i * 8)? as usize;
+        let orig_off = read_u32(bytes, o_orig + i * 8 + 4)? as usize;
+        let trans_len = read_u32(bytes, o_trans + i * 8)? as usize;
+        let trans_off = read_u32(bytes, o_trans + i * 8 + 4)? as usize;
+        if orig_off + orig_len > bytes.len() || trans_off + trans_len > bytes.len() {
+            continue;
+        }
+        let msgid = match std::str::from_utf8(&bytes[orig_off..orig_off + orig_len]) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let msgstr = match std::str::from_utf8(&bytes[trans_off..trans_off + trans_len]) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Skip header (empty msgid).
+        if msgid.is_empty() {
+            continue;
+        }
+        // Plural forms store `\0`-separated variants; take the singular.
+        let msgid = msgid.split('\0').next().unwrap_or(msgid);
+        let msgstr = msgstr.split('\0').next().unwrap_or(msgstr);
+        messages.insert(msgid.to_string(), msgstr.to_string());
+    }
+    Some(messages)
+}
+
+fn read_u32_le(bytes: &[u8], off: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(off..off + 4)?.try_into().ok()?,
+    ))
+}
+
+fn read_u32_be(bytes: &[u8], off: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(
+        bytes.get(off..off + 4)?.try_into().ok()?,
+    ))
+}
+
+fn substitute_percent_s(template: &str, args: &[&str]) -> String {
+    let mut out =
+        String::with_capacity(template.len() + args.iter().map(|a| a.len()).sum::<usize>());
+    let mut arg_idx = 0;
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b's' => {
+                    if let Some(arg) = args.get(arg_idx) {
+                        out.push_str(arg);
+                        arg_idx += 1;
+                    }
+                    i += 2;
+                    continue;
+                }
+                b'%' => {
+                    out.push('%');
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        // Preserve UTF-8 by copying the char, not a single byte.
+        let ch = template[i..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn reencode_for_locale(utf8_text: &str) -> Vec<u8> {
+    let codeset = locale_codeset();
+    if codeset_is_utf8(&codeset) {
+        return utf8_text.as_bytes().to_vec();
+    }
+    let encoding = encoding_for_codeset(&codeset).unwrap_or(encoding_rs::UTF_8);
+    if encoding == encoding_rs::UTF_8 {
+        return utf8_text.as_bytes().to_vec();
+    }
+    let (encoded, _, _) = encoding.encode(utf8_text);
+    encoded.into_owned()
+}
+
+fn locale_codeset() -> String {
+    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        if let Ok(value) = env::var(key)
+            && !value.is_empty()
+        {
+            if let Some((_, codeset)) = value.split_once('.') {
+                let codeset = codeset.split('@').next().unwrap_or(codeset);
+                if !codeset.is_empty() {
+                    return codeset.to_string();
+                }
+            }
+            // Locale without explicit codeset (e.g. `is_IS`): treat as UTF-8
+            // when the name does not hint otherwise.
+            return "UTF-8".to_string();
+        }
+    }
+    "UTF-8".to_string()
+}
+
+fn codeset_is_utf8(codeset: &str) -> bool {
+    let c = codeset.to_ascii_lowercase();
+    c == "utf-8" || c == "utf8"
+}
+
+fn encoding_for_codeset(codeset: &str) -> Option<&'static encoding_rs::Encoding> {
+    let compact: String = codeset
+        .bytes()
+        .filter(|b| !matches!(*b, b'-' | b'_' | b' '))
+        .map(|b| b.to_ascii_uppercase() as char)
+        .collect();
+    match compact.as_str() {
+        "UTF8" => Some(encoding_rs::UTF_8),
+        "ISO88591" | "LATIN1" | "88591" => Some(encoding_rs::WINDOWS_1252),
+        "ISO885915" | "LATIN9" => encoding_rs::Encoding::for_label(b"iso-8859-15"),
+        _ => encoding_rs::Encoding::for_label(codeset.as_bytes()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,6 +826,43 @@ mod tests {
             envsubst_variables("a $one ${two} $one ${bad:-no} $9 $_ok"),
             vec!["one", "two", "_ok"]
         );
+    }
+
+    #[test]
+    fn substitute_percent_s_fills_in_order() {
+        assert_eq!(
+            substitute_percent_s("in %s%s\n", &["/tmp/repo/.git", "/"]),
+            "in /tmp/repo/.git/\n"
+        );
+        assert_eq!(substitute_percent_s("100%% done", &[]), "100% done");
+    }
+
+    #[test]
+    fn parse_mo_reads_utf8_msgstr() {
+        // Minimal little-endian MO with one entry: "hi" → "halló"
+        // Header (7 u32) + 2 string descriptor pairs + string table.
+        let msgid = b"hi";
+        let msgstr = "halló".as_bytes();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x9504_12deu32.to_le_bytes()); // magic
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // revision
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // nstrings
+        // orig table offset = 28, trans table offset = 36
+        bytes.extend_from_slice(&28u32.to_le_bytes());
+        bytes.extend_from_slice(&36u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // hash size
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // hash offset
+        // orig desc at 28: len, off
+        let strings_off = 44u32;
+        bytes.extend_from_slice(&(msgid.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&strings_off.to_le_bytes());
+        // trans desc at 36
+        bytes.extend_from_slice(&(msgstr.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(strings_off + msgid.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(msgid);
+        bytes.extend_from_slice(msgstr);
+        let map = parse_mo(&bytes).expect("parse mo");
+        assert_eq!(map.get("hi").map(String::as_str), Some("halló"));
     }
 
     #[test]

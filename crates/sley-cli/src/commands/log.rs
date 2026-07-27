@@ -2406,6 +2406,7 @@ fn cmd_log_impl(
             format,
             reader: &db,
             config: Some(&config),
+            assume_dashdash: false,
         },
     ) {
         Ok(setup) => setup,

@@ -3892,9 +3892,38 @@ fn patch_filename_suffix(options: &FormatPatchOptions, config: &GitConfig) -> St
 
 /// git's `format_sanitized_subject` over the commit subject (no length cap; the
 /// caller truncates the assembled filename).
+///
+/// git's `%f` placeholder (used by `fmt_output_commit` for patch filenames)
+/// sanitizes only the first line of the subject, up to the first newline —
+/// multi-line subjects like `one\ntwo\nthree` become filename slug `one`, not
+/// `one-two-three` (t4014). The email Subject: header still joins the paragraph.
 fn sanitize_patch_subject(message: &[u8]) -> String {
-    let subject = commit_subject(message);
-    sanitize_filename_component(subject.as_bytes())
+    // Skip leading blank lines, then take only the first non-blank line.
+    let text = message;
+    let mut idx = 0;
+    while idx < text.len() {
+        let nl = text[idx..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| idx + p)
+            .unwrap_or(text.len());
+        let mut line = &text[idx..nl];
+        while let Some(&last) = line.last() {
+            if last == b' ' || last == b'\t' || last == b'\r' {
+                line = &line[..line.len() - 1];
+            } else {
+                break;
+            }
+        }
+        if !line.is_empty() {
+            return sanitize_filename_component(line);
+        }
+        idx = if nl < text.len() { nl + 1 } else { nl };
+        if idx == nl {
+            break;
+        }
+    }
+    String::new()
 }
 
 /// git's `format_sanitized_subject`: keep alphanumerics, `.` and `_`; collapse

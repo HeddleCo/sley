@@ -492,7 +492,10 @@ fn repository_object_replacements(
 ) -> Result<ObjectReplacements> {
     let refs = FileRefStore::new(common_dir, format);
     let mut replacements = Vec::new();
-    for reference in refs.list_refs()? {
+    // Only walk `refs/replace/` — a full `list_refs()` would also warn about
+    // unrelated broken refs (empty / null-OID files under refs/heads/) and
+    // double those warnings with user-facing `for-each-ref` (t6301).
+    for reference in refs.list_refs_with_prefix("refs/replace/")? {
         let Some(source) = reference.name.strip_prefix("refs/replace/") else {
             continue;
         };

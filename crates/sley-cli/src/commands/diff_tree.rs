@@ -242,6 +242,7 @@ pub(crate) fn cmd_diff_tree(
                         format,
                         reader: &db,
                         config: Some(&config),
+                        assume_dashdash: false,
                     },
                 )?;
                 if setup.options.positives.len() != 1
@@ -578,6 +579,7 @@ pub(crate) fn cmd_diff_tree(
             format,
             reader: db,
             config: Some(repo.config()),
+            assume_dashdash: false,
         },
     )?;
     if let Some(leftover) = setup.leftovers.first() {
