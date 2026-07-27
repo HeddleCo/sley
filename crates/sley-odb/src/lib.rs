@@ -4,6 +4,8 @@
 
 use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 use sley_object::{EncodedObject, ObjectType};
+use sley_pack::PackIndexEntry;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,8 +36,35 @@ pub use sley_core::{AtomicCancel, CancelFlag, CancellableRead};
 
 static TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// One existing pack offered for transfer-pack entry reuse.
+///
+/// As with [`ObjectReader::read_object`], the reader guarantees that each oid
+/// maps to its canonical object. Reachable-pack generation independently
+/// verifies the pack checksum, header, entry boundaries, and every reused
+/// delta base before emitting any candidate bytes.
+#[derive(Debug, Clone)]
+pub struct ReusablePackCandidate {
+    pub pack: Arc<[u8]>,
+    pub entries: Vec<PackIndexEntry>,
+    pub pack_checksum: ObjectId,
+}
+
 pub trait ObjectReader {
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>>;
+
+    /// Return existing packs that may contain entries for `object_ids`.
+    ///
+    /// Pack-backed readers can override this to let transfer-pack generation
+    /// copy compressed entries and existing delta instructions instead of
+    /// recomputing them. The builder validates candidates and falls back to
+    /// ordinary generation for every unsafe entry. Readers without pack
+    /// provenance keep the default empty result.
+    fn reusable_pack_candidates(
+        &self,
+        _object_ids: &HashSet<ObjectId>,
+    ) -> Result<Vec<ReusablePackCandidate>> {
+        Ok(Vec::new())
+    }
 
     /// Return the immediate on-disk delta base for `oid`, when the reader can
     /// expose storage metadata without decoding the object body.

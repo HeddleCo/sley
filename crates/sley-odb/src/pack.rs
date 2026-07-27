@@ -31,7 +31,7 @@ use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 use std::{env, fs};
 
-use crate::{ObjectReader, ObjectWriter, implied_empty_tree_object};
+use crate::{ObjectReader, ObjectWriter, ReusablePackCandidate, implied_empty_tree_object};
 
 use crate::install::{ObjectPrefixResolution, ObjectStorageInfo};
 use crate::loose::LooseObjectStore;
@@ -1552,6 +1552,61 @@ impl FileObjectDatabase {
     }
 }
 impl ObjectReader for FileObjectDatabase {
+    fn reusable_pack_candidates(
+        &self,
+        object_ids: &HashSet<ObjectId>,
+    ) -> Result<Vec<ReusablePackCandidate>> {
+        // Replacement reads return the replacement object's body under the
+        // original oid. Raw entries from the underlying pack would therefore
+        // describe different content and are never reusable.
+        if object_ids.is_empty() || !self.replacements.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut object_dirs = Vec::with_capacity(self.alternates.len() + 1);
+        object_dirs.push(self.objects_dir.clone());
+        object_dirs.extend(self.alternates.iter().cloned());
+        let mut candidates = Vec::new();
+        for objects_dir in object_dirs {
+            let pack_dir = objects_dir.join("pack");
+            let Ok(entries) = fs::read_dir(pack_dir) else {
+                continue;
+            };
+            let mut index_paths = Vec::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("idx") {
+                    index_paths.push(path);
+                }
+            }
+            index_paths.sort();
+            for index_path in index_paths {
+                let Ok(index_bytes) = fs::read(&index_path) else {
+                    continue;
+                };
+                let Ok(index) = PackIndex::parse(&index_bytes, self.format) else {
+                    continue;
+                };
+                if !index
+                    .entries
+                    .iter()
+                    .any(|entry| object_ids.contains(&entry.oid))
+                {
+                    continue;
+                }
+                let Ok(pack) = fs::read(index_path.with_extension("pack")) else {
+                    continue;
+                };
+                candidates.push(ReusablePackCandidate {
+                    pack: Arc::from(pack),
+                    entries: index.entries,
+                    pack_checksum: index.pack_checksum,
+                });
+            }
+        }
+        Ok(candidates)
+    }
+
     fn reusable_delta_base(&self, oid: &ObjectId) -> Result<Option<ObjectId>> {
         let Some(pack_lookup) = self.find_pack_containing(oid)? else {
             return Ok(None);
