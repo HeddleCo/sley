@@ -84,12 +84,13 @@ mod http;
 #[cfg(feature = "http")]
 pub use http::{
     HttpFetchPackRequest, HttpOperationBatch, HttpServiceAdvertisements, HttpUploadPackDiscovery,
-    http_advertised_refs, http_advertised_refs_with_limits, http_authorization_headers,
-    http_check_status, http_discover_upload_pack, http_protocol_v2_fetch_response,
-    http_send_with_auth, http_service_advertisements, http_upload_pack_advertisements,
-    http_upload_pack_features, http_validate_content_type,
+    NegotiatedPackResponse, http_advertised_refs, http_advertised_refs_with_limits,
+    http_authorization_headers, http_check_status, http_discover_upload_pack,
+    http_protocol_v2_fetch_response, http_send_with_auth, http_service_advertisements,
+    http_upload_pack_advertisements, http_upload_pack_features, http_validate_content_type,
     install_fetch_pack_via_http_protocol_v2_fetch, install_fetch_pack_via_http_upload_pack,
-    new_http_client, new_http_client_with_config, remote_url_is_http, transport_limits_from_config,
+    negotiate_fetch_pack_via_http_protocol_v2, new_http_client, new_http_client_with_config,
+    remote_url_is_http, transport_limits_from_config,
 };
 // Re-export the smart-HTTP client seam so out-of-crate hosts (e.g. weft) can
 // implement [`HttpClient`] to enforce network policy on the dial without a

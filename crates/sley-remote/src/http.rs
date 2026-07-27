@@ -16,8 +16,7 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::install::{
-    ProgressInstaller, install_protocol_v2_fetch_promisor_response_from_reader_with_cancel,
-    install_protocol_v2_fetch_response_from_reader_with_cancel,
+    ProgressInstaller, install_protocol_v2_packfile_from_reader_with_cancel,
     install_upload_pack_packfile_promisor_response_from_reader_with_cancel,
     install_upload_pack_packfile_response_from_reader_with_cancel,
     install_upload_pack_shallow_packfile_promisor_response_from_reader_with_cancel,
@@ -37,7 +36,7 @@ use sley_protocol::{
     encode_protocol_v2_command_options, parse_protocol_v2_fetch_features,
     parse_upload_pack_features, protocol_v2_object_format,
     read_protocol_v2_fetch_negotiation_response, read_protocol_v2_fetch_response,
-    read_protocol_v2_fetch_sideband_all_response,
+    read_protocol_v2_fetch_response_header, read_protocol_v2_fetch_sideband_all_response,
     read_protocol_v2_ls_refs_response_as_ref_advertisement_set,
     smart_http_advertisement_content_type, smart_http_rpc_request_content_type,
     trace_protocol_v2_advertisement_read, validate_protocol_v2_fetch_command_request,
@@ -861,6 +860,23 @@ pub struct HttpFetchPackRequest<'a, C: HttpClient + ?Sized> {
     pub omit_haves: bool,
 }
 
+/// A negotiated protocol-v2 fetch response whose metadata header has been
+/// consumed.
+///
+/// When [`has_packfile`](Self::has_packfile) is true, [`body`](Self::body) is
+/// positioned immediately after the `packfile` section marker. The remaining
+/// bytes are a pure sideband stream; wrap the body in
+/// [`sley_protocol::StreamingSidebandReader`] to consume raw `PACK` bytes
+/// without installing them into a local repository.
+pub struct NegotiatedPackResponse {
+    /// Successful smart-HTTP response body positioned at the packfile payload.
+    pub body: Box<dyn Read + Send>,
+    /// Shallow-boundary updates parsed before the packfile section.
+    pub shallow_info: Vec<ProtocolV2FetchShallowInfo>,
+    /// Whether the response contains a packfile section.
+    pub has_packfile: bool,
+}
+
 pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
     request: HttpFetchPackRequest<'_, C>,
     credentials: &mut dyn CredentialProvider,
@@ -958,7 +974,7 @@ pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
 }
 
 pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
-    request: HttpFetchPackRequest<'_, C>,
+    mut request: HttpFetchPackRequest<'_, C>,
     handshake: &TransportHandshake,
     credentials: &mut dyn CredentialProvider,
     progress: &mut dyn ProgressSink,
@@ -981,7 +997,82 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
         request.omit_haves,
         request.haves.clone(),
     )?;
-    let mut fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
+    request.haves = Some(haves);
+    let promisor = request.promisor;
+    let max_input_size = request.max_input_size;
+    let mut negotiated = negotiate_fetch_pack_via_http_protocol_v2_after_trace(
+        request,
+        handshake,
+        credentials,
+        cancel,
+    )?;
+    if !negotiated.has_packfile {
+        return Ok(negotiated.shallow_info);
+    }
+    if promisor {
+        install_protocol_v2_packfile_from_reader_with_cancel(
+            &mut negotiated.body,
+            &local_db,
+            true,
+            max_input_size,
+            cancel,
+        )?;
+    } else {
+        install_protocol_v2_packfile_from_reader_with_cancel(
+            &mut negotiated.body,
+            &ProgressInstaller::new(&local_db, progress),
+            false,
+            max_input_size,
+            cancel,
+        )?;
+    }
+    Ok(negotiated.shallow_info)
+}
+
+/// Negotiate a multi-round protocol-v2 smart-HTTP fetch without accessing or
+/// installing into a local repository.
+///
+/// The caller must provide an explicit have set in
+/// [`HttpFetchPackRequest::haves`], including `Some(Vec::new())` when it has no
+/// haves. `git_dir`, `promisor`, and `max_input_size` are intentionally ignored:
+/// embedders can use this operation without a local `.git` repository and own
+/// the policy for consuming the returned pack stream.
+///
+/// The negotiation starts with 16 haves and doubles the advertised prefix each
+/// round. It sends `done` after the server reports `ready` or the have set is
+/// exhausted, matching the repository-installing HTTP fetch path.
+pub fn negotiate_fetch_pack_via_http_protocol_v2<C: HttpClient + ?Sized>(
+    request: HttpFetchPackRequest<'_, C>,
+    handshake: &TransportHandshake,
+    credentials: &mut dyn CredentialProvider,
+    cancel: CancelFlag<'_>,
+) -> Result<NegotiatedPackResponse> {
+    if request.wants.is_empty() {
+        return Err(GitError::InvalidFormat(
+            "protocol v2 fetch negotiation requires at least one want".into(),
+        ));
+    }
+    trace_protocol_v2_advertisement_read(handshake)?;
+    negotiate_fetch_pack_via_http_protocol_v2_after_trace(request, handshake, credentials, cancel)
+}
+
+fn negotiate_fetch_pack_via_http_protocol_v2_after_trace<C: HttpClient + ?Sized>(
+    mut request: HttpFetchPackRequest<'_, C>,
+    handshake: &TransportHandshake,
+    credentials: &mut dyn CredentialProvider,
+    cancel: CancelFlag<'_>,
+) -> Result<NegotiatedPackResponse> {
+    let haves = request.haves.take().ok_or_else(|| {
+        GitError::InvalidFormat(
+            "negotiation-only protocol v2 HTTP fetch requires explicit haves".into(),
+        )
+    })?;
+    let haves = if request.omit_haves {
+        Vec::new()
+    } else {
+        haves
+    };
+    let fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
         request.wants,
         haves,
         request.shallow,
@@ -992,6 +1083,40 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
         request.filter.as_ref(),
         handshake,
     )?;
+    let sideband_all = fetch.sideband_all;
+    let mut response = negotiate_protocol_v2_fetch_rounds(
+        request.client,
+        request.remote,
+        request.format,
+        handshake,
+        fetch,
+        credentials,
+        HttpRpcOptions {
+            git_protocol: request.git_protocol,
+            post_buffer: request.post_buffer,
+        },
+        cancel,
+    )?;
+    let header =
+        read_protocol_v2_fetch_response_header(request.format, &mut response.body, sideband_all)?;
+    Ok(NegotiatedPackResponse {
+        body: response.body,
+        shallow_info: shallow_info_from_protocol_v2_fetch_header(&header),
+        has_packfile: header.has_packfile,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn negotiate_protocol_v2_fetch_rounds<C: HttpClient + ?Sized>(
+    client: &C,
+    remote: &RemoteUrl,
+    format: ObjectFormat,
+    handshake: &TransportHandshake,
+    mut fetch: ProtocolV2FetchRequest,
+    credentials: &mut dyn CredentialProvider,
+    options: HttpRpcOptions<'_>,
+    cancel: CancelFlag<'_>,
+) -> Result<HttpResponse> {
     let sideband_all = fetch.sideband_all;
     let all_haves = std::mem::take(&mut fetch.haves);
     const INITIAL_HAVE_BATCH: usize = 16;
@@ -1005,23 +1130,20 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
         let sent_done = fetch.done;
         let wait_for_done = fetch.wait_for_done;
         let mut response = http_protocol_v2_fetch_post(
-            request.client,
-            request.remote,
-            request.format,
+            client,
+            remote,
+            format,
             handshake,
             fetch.clone(),
             credentials,
-            HttpRpcOptions {
-                git_protocol: request.git_protocol,
-                post_buffer: request.post_buffer,
-            },
+            options,
         )?;
 
         let has_packfile = if sent_done {
             true
         } else {
             let negotiation = read_protocol_v2_fetch_negotiation_response(
-                request.format,
+                format,
                 &mut response.body,
                 sideband_all,
                 wait_for_done,
@@ -1046,27 +1168,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch<C: HttpClient + ?Sized>(
         if !has_packfile {
             continue;
         }
-
-        let (header, _install) = if request.promisor {
-            install_protocol_v2_fetch_promisor_response_from_reader_with_cancel(
-                request.format,
-                &mut response.body,
-                sideband_all,
-                &local_db,
-                request.max_input_size,
-                cancel,
-            )?
-        } else {
-            install_protocol_v2_fetch_response_from_reader_with_cancel(
-                request.format,
-                &mut response.body,
-                sideband_all,
-                &ProgressInstaller::new(&local_db, progress),
-                request.max_input_size,
-                cancel,
-            )?
-        };
-        return Ok(shallow_info_from_protocol_v2_fetch_header(&header));
+        return Ok(response);
     }
 }
 
@@ -1188,9 +1290,12 @@ mod tests {
     use super::*;
     use sley_protocol::{
         ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRecord,
-        ProtocolVersion, RefAdvertisement, read_protocol_v2_fetch_response,
-        write_protocol_v2_fetch_response, write_protocol_v2_ls_refs_response,
+        ProtocolVersion, RefAdvertisement, StreamingSidebandReader,
+        read_protocol_v2_command_request, read_protocol_v2_fetch_response,
+        write_protocol_v2_fetch_response, write_protocol_v2_fetch_sideband_all_response,
+        write_protocol_v2_ls_refs_response,
     };
+    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     #[test]
@@ -1606,6 +1711,599 @@ mod tests {
                 },
             ],
         }
+    }
+
+    struct ScriptedFetchClient<'a> {
+        responses: Mutex<VecDeque<Vec<u8>>>,
+        requests: Mutex<Vec<Vec<u8>>>,
+        cancel_after_post: Option<&'a sley_core::AtomicCancel>,
+    }
+
+    impl ScriptedFetchClient<'_> {
+        fn new(responses: Vec<Vec<u8>>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
+                cancel_after_post: None,
+            }
+        }
+
+        fn requests(&self) -> Vec<ProtocolV2FetchRequest> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .iter()
+                .map(|body| {
+                    let command = read_protocol_v2_command_request(&mut body.as_slice())
+                        .expect("fetch command");
+                    ProtocolV2FetchRequest::from_command_request(ObjectFormat::Sha1, &command)
+                        .expect("fetch request")
+                })
+                .collect()
+        }
+    }
+
+    impl HttpClient for ScriptedFetchClient<'_> {
+        fn get(&self, _url: &str, _headers: &[(&str, &str)]) -> Result<HttpResponse> {
+            Err(GitError::Command(
+                "scripted fetch client received an unexpected GET".into(),
+            ))
+        }
+
+        fn post(
+            &self,
+            _url: &str,
+            _content_type: &str,
+            _headers: &[(&str, &str)],
+            body: &[u8],
+        ) -> Result<HttpResponse> {
+            self.requests.lock().expect("requests").push(body.to_vec());
+            let response = self
+                .responses
+                .lock()
+                .expect("responses")
+                .pop_front()
+                .expect("scripted response");
+            if let Some(cancel) = self.cancel_after_post {
+                cancel.cancel();
+            }
+            Ok(HttpResponse {
+                status: 200,
+                content_type: None,
+                body: Box::new(std::io::Cursor::new(response)),
+            })
+        }
+    }
+
+    fn fetch_response(sections: &[ProtocolV2FetchResponseSection], sideband_all: bool) -> Vec<u8> {
+        let mut response = Vec::new();
+        if sideband_all {
+            write_protocol_v2_fetch_sideband_all_response(&mut response, sections)
+                .expect("sideband-all fetch response");
+        } else {
+            write_protocol_v2_fetch_response(&mut response, sections).expect("fetch response");
+        }
+        response
+    }
+
+    fn test_negotiation_request<'a, C: HttpClient + ?Sized>(
+        client: &'a C,
+        remote: &'a RemoteUrl,
+        wants: Vec<ObjectId>,
+        haves: Vec<ObjectId>,
+    ) -> HttpFetchPackRequest<'a, C> {
+        HttpFetchPackRequest {
+            client,
+            git_dir: Path::new("/no/local/repository/exists"),
+            format: ObjectFormat::Sha1,
+            remote,
+            wants,
+            haves: Some(haves),
+            shallow: Vec::new(),
+            deepen: None,
+            promisor: false,
+            max_input_size: None,
+            filter: None,
+            deepen_since: None,
+            deepen_not: Vec::new(),
+            deepen_relative: false,
+            git_protocol: Some("version=2"),
+            post_buffer: usize::MAX,
+            omit_haves: false,
+        }
+    }
+
+    fn test_oid(value: usize) -> ObjectId {
+        ObjectId::from_hex(ObjectFormat::Sha1, &format!("{value:040x}")).expect("test oid")
+    }
+
+    #[test]
+    fn negotiation_only_have_exhaustion_keeps_doubling_and_terminal_done() {
+        let handshake = TransportHandshake {
+            protocol: ProtocolVersion::V2,
+            capabilities: vec![Capability {
+                name: "fetch".into(),
+                value: Some("shallow".into()),
+            }],
+        };
+        let nak = || {
+            fetch_response(
+                &[ProtocolV2FetchResponseSection::Acknowledgments(vec![
+                    ProtocolV2FetchAcknowledgment::Nak,
+                ])],
+                false,
+            )
+        };
+        let client = ScriptedFetchClient::new(vec![
+            nak(),
+            nak(),
+            nak(),
+            fetch_response(
+                &[ProtocolV2FetchResponseSection::Packfile(Vec::new())],
+                false,
+            ),
+        ]);
+        let remote = parse_remote_url("http://example.invalid/repo.git").expect("remote");
+        let haves = (100..133).map(test_oid).collect();
+        let mut credentials = crate::NoCredentials;
+        let response = negotiate_fetch_pack_via_http_protocol_v2(
+            test_negotiation_request(&client, &remote, vec![test_oid(1)], haves),
+            &handshake,
+            &mut credentials,
+            CancelFlag::never(),
+        )
+        .expect("negotiation");
+        assert!(response.has_packfile);
+
+        let requests = client.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| (request.haves.len(), request.done))
+                .collect::<Vec<_>>(),
+            vec![(16, false), (32, false), (33, false), (33, true)]
+        );
+        assert!(
+            requests.iter().all(|request| request.thin_pack),
+            "every negotiation round must request thin-pack"
+        );
+    }
+
+    #[test]
+    fn negotiation_only_ack_ready_parses_sideband_all_shallow_info() {
+        let handshake = sample_v2_fetch_handshake();
+        let shallow = test_oid(90);
+        let client = ScriptedFetchClient::new(vec![fetch_response(
+            &[
+                ProtocolV2FetchResponseSection::Acknowledgments(vec![
+                    ProtocolV2FetchAcknowledgment::Ack(test_oid(10)),
+                    ProtocolV2FetchAcknowledgment::Ready,
+                ]),
+                ProtocolV2FetchResponseSection::ShallowInfo(vec![
+                    ProtocolV2FetchShallowInfo::Shallow(shallow.clone()),
+                ]),
+                ProtocolV2FetchResponseSection::Packfile(Vec::new()),
+            ],
+            true,
+        )]);
+        let remote = parse_remote_url("http://example.invalid/repo.git").expect("remote");
+        let mut credentials = crate::NoCredentials;
+        let mut response = negotiate_fetch_pack_via_http_protocol_v2(
+            test_negotiation_request(
+                &client,
+                &remote,
+                vec![test_oid(1)],
+                (10..27).map(test_oid).collect(),
+            ),
+            &handshake,
+            &mut credentials,
+            CancelFlag::never(),
+        )
+        .expect("negotiation");
+        assert_eq!(
+            response.shallow_info,
+            vec![ProtocolV2FetchShallowInfo::Shallow(shallow)]
+        );
+        assert!(response.has_packfile);
+        let mut pack = Vec::new();
+        StreamingSidebandReader::new(&mut response.body, |_: &[u8]| {})
+            .read_to_end(&mut pack)
+            .expect("empty packfile sideband");
+        assert!(pack.is_empty());
+        assert_eq!(
+            client
+                .requests()
+                .iter()
+                .map(|request| (request.haves.len(), request.done))
+                .collect::<Vec<_>>(),
+            vec![(16, false)]
+        );
+    }
+
+    #[test]
+    fn negotiation_only_empty_haves_sends_done_immediately() {
+        let handshake = sample_v2_fetch_handshake();
+        let client = ScriptedFetchClient::new(vec![fetch_response(
+            &[ProtocolV2FetchResponseSection::Packfile(Vec::new())],
+            true,
+        )]);
+        let remote = parse_remote_url("http://example.invalid/repo.git").expect("remote");
+        let mut credentials = crate::NoCredentials;
+        let response = negotiate_fetch_pack_via_http_protocol_v2(
+            test_negotiation_request(&client, &remote, vec![test_oid(1)], Vec::new()),
+            &handshake,
+            &mut credentials,
+            CancelFlag::never(),
+        )
+        .expect("negotiation");
+        assert!(response.has_packfile);
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].haves.is_empty());
+        assert!(requests[0].done);
+    }
+
+    #[test]
+    fn negotiation_only_polls_cancellation_between_rounds() {
+        let handshake = TransportHandshake {
+            protocol: ProtocolVersion::V2,
+            capabilities: vec![Capability {
+                name: "fetch".into(),
+                value: Some("shallow".into()),
+            }],
+        };
+        let cancel = sley_core::AtomicCancel::new();
+        let mut client = ScriptedFetchClient::new(vec![fetch_response(
+            &[ProtocolV2FetchResponseSection::Acknowledgments(vec![
+                ProtocolV2FetchAcknowledgment::Nak,
+            ])],
+            false,
+        )]);
+        client.cancel_after_post = Some(&cancel);
+        let remote = parse_remote_url("http://example.invalid/repo.git").expect("remote");
+        let mut credentials = crate::NoCredentials;
+        let error = match negotiate_fetch_pack_via_http_protocol_v2(
+            test_negotiation_request(
+                &client,
+                &remote,
+                vec![test_oid(1)],
+                (100..117).map(test_oid).collect(),
+            ),
+            &handshake,
+            &mut credentials,
+            CancelFlag::new(&cancel),
+        ) {
+            Ok(_) => panic!("expected cancellation between negotiation rounds"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, GitError::Cancelled));
+        assert_eq!(client.requests().len(), 1);
+    }
+
+    struct GitHttpBackendClient {
+        executable: std::path::PathBuf,
+        project_root: std::path::PathBuf,
+        posted: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl GitHttpBackendClient {
+        fn request(
+            &self,
+            method: &str,
+            url: &str,
+            content_type: Option<&str>,
+            headers: &[(&str, &str)],
+            body: &[u8],
+        ) -> Result<HttpResponse> {
+            let target = url
+                .strip_prefix("http://example.test")
+                .ok_or_else(|| GitError::InvalidFormat(format!("unexpected test URL {url}")))?;
+            let (path_info, query_string) = target.split_once('?').unwrap_or((target, ""));
+            let mut command = std::process::Command::new(&self.executable);
+            command
+                .env("GIT_PROJECT_ROOT", &self.project_root)
+                .env("GIT_HTTP_EXPORT_ALL", "1")
+                .env("REQUEST_METHOD", method)
+                .env("PATH_INFO", path_info)
+                .env("QUERY_STRING", query_string)
+                .env("CONTENT_LENGTH", body.len().to_string())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            if let Some(content_type) = content_type {
+                command.env("CONTENT_TYPE", content_type);
+            }
+            if let Some((_, protocol)) = headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("Git-Protocol"))
+            {
+                command.env("HTTP_GIT_PROTOCOL", protocol);
+            }
+            let mut child = command
+                .spawn()
+                .map_err(|error| GitError::Command(format!("start git-http-backend: {error}")))?;
+            {
+                use std::io::Write;
+                child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| GitError::Command("git-http-backend stdin unavailable".into()))?
+                    .write_all(body)?;
+            }
+            let output = child.wait_with_output().map_err(|error| {
+                GitError::Command(format!("wait for git-http-backend: {error}"))
+            })?;
+            if !output.status.success() {
+                return Err(GitError::Command(format!(
+                    "git-http-backend failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+            let (header, response_body) = split_cgi_response(&output.stdout)?;
+            let mut status = 200;
+            let mut response_content_type = None;
+            for line in String::from_utf8_lossy(header).lines() {
+                let Some((name, value)) = line.trim_end_matches('\r').split_once(':') else {
+                    continue;
+                };
+                if name.eq_ignore_ascii_case("Status") {
+                    status = value
+                        .trim()
+                        .split_once(' ')
+                        .map(|(code, _)| code)
+                        .unwrap_or(value.trim())
+                        .parse()
+                        .map_err(|error| {
+                            GitError::InvalidFormat(format!(
+                                "invalid git-http-backend status: {error}"
+                            ))
+                        })?;
+                } else if name.eq_ignore_ascii_case("Content-Type") {
+                    response_content_type = Some(value.trim().to_string());
+                }
+            }
+            Ok(HttpResponse {
+                status,
+                content_type: response_content_type,
+                body: Box::new(std::io::Cursor::new(response_body.to_vec())),
+            })
+        }
+
+        fn take_posted_fetches(&self) -> Vec<ProtocolV2FetchRequest> {
+            std::mem::take(&mut *self.posted.lock().expect("posted requests"))
+                .into_iter()
+                .filter_map(|body| {
+                    let command = read_protocol_v2_command_request(&mut body.as_slice())
+                        .expect("real fetch command");
+                    if command.command == "fetch" {
+                        Some(
+                            ProtocolV2FetchRequest::from_command_request(
+                                ObjectFormat::Sha1,
+                                &command,
+                            )
+                            .expect("real fetch request"),
+                        )
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+    }
+
+    impl HttpClient for GitHttpBackendClient {
+        fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
+            self.request("GET", url, None, headers, &[])
+        }
+
+        fn post(
+            &self,
+            url: &str,
+            content_type: &str,
+            headers: &[(&str, &str)],
+            body: &[u8],
+        ) -> Result<HttpResponse> {
+            self.posted
+                .lock()
+                .expect("posted requests")
+                .push(body.to_vec());
+            self.request("POST", url, Some(content_type), headers, body)
+        }
+    }
+
+    fn split_cgi_response(output: &[u8]) -> Result<(&[u8], &[u8])> {
+        if let Some(offset) = output.windows(4).position(|window| window == b"\r\n\r\n") {
+            return Ok((&output[..offset], &output[offset + 4..]));
+        }
+        if let Some(offset) = output.windows(2).position(|window| window == b"\n\n") {
+            return Ok((&output[..offset], &output[offset + 2..]));
+        }
+        Err(GitError::InvalidFormat(
+            "git-http-backend response has no CGI header terminator".into(),
+        ))
+    }
+
+    fn git_http_backend_executable() -> Option<std::path::PathBuf> {
+        let output = std::process::Command::new("git")
+            .arg("--exec-path")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let exec_path = std::path::PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+        ["git-http-backend", "git-http-backend.exe"]
+            .into_iter()
+            .map(|name| exec_path.join(name))
+            .find(|path| path.is_file())
+    }
+
+    struct RealFetchRepository {
+        root: std::path::PathBuf,
+        commits: Vec<ObjectId>,
+    }
+
+    impl Drop for RealFetchRepository {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn git_command(cwd: &Path, args: &[&str]) -> Vec<u8> {
+        let output = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("run git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn real_fetch_repository(commit_count: usize) -> RealFetchRepository {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sley-http-negotiation-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("test root");
+        git_command(&root, &["init", "--quiet", "work"]);
+        let work = root.join("work");
+        git_command(&work, &["config", "user.name", "Sley Test"]);
+        git_command(&work, &["config", "user.email", "sley@example.invalid"]);
+        let mut commits = Vec::with_capacity(commit_count);
+        for index in 0..commit_count {
+            std::fs::write(work.join("history.txt"), format!("version {index}\n"))
+                .expect("history file");
+            git_command(&work, &["add", "history.txt"]);
+            git_command(
+                &work,
+                &["commit", "--quiet", "-m", &format!("commit {index}")],
+            );
+            let oid =
+                String::from_utf8(git_command(&work, &["rev-parse", "HEAD"])).expect("commit oid");
+            commits.push(
+                ObjectId::from_hex(ObjectFormat::Sha1, oid.trim()).expect("parsed commit oid"),
+            );
+        }
+        git_command(&root, &["clone", "--quiet", "--bare", "work", "repo.git"]);
+        RealFetchRepository { root, commits }
+    }
+
+    fn negotiated_pack_object_count(mut response: NegotiatedPackResponse) -> u32 {
+        assert!(
+            response.has_packfile,
+            "server must return a packfile section"
+        );
+        let mut pack = Vec::new();
+        StreamingSidebandReader::new(&mut response.body, |_: &[u8]| {})
+            .read_to_end(&mut pack)
+            .expect("read negotiated pack");
+        assert!(pack.len() >= 12, "pack header is truncated");
+        assert_eq!(&pack[..4], b"PACK");
+        u32::from_be_bytes(pack[8..12].try_into().expect("pack object count"))
+    }
+
+    #[test]
+    fn negotiation_only_real_incremental_fetch_is_delta_sized_and_multi_round() {
+        let Some(executable) = git_http_backend_executable() else {
+            eprintln!("skipping real HTTP negotiation test: git-http-backend unavailable");
+            return;
+        };
+        let repository = real_fetch_repository(40);
+        let client = GitHttpBackendClient {
+            executable,
+            project_root: repository.root.clone(),
+            posted: Mutex::new(Vec::new()),
+        };
+        let remote = parse_remote_url("http://example.test/repo.git").expect("remote");
+        let mut credentials = crate::NoCredentials;
+        let discovered = http_service_advertisements(
+            &client,
+            &remote,
+            ObjectFormat::Sha1,
+            GitService::UploadPack,
+            &mut credentials,
+            None,
+        )
+        .expect("protocol v2 discovery");
+        assert_eq!(discovered.set.protocol, ProtocolVersion::V2);
+        let handshake = discovered.handshake.as_ref().expect("v2 handshake");
+        let _ = client.take_posted_fetches();
+        let tip = repository.commits.last().expect("tip").clone();
+        let delta_base = repository.commits[37].clone();
+
+        let run_fetch = |haves: Vec<ObjectId>| {
+            let mut credentials = crate::NoCredentials;
+            negotiate_fetch_pack_via_http_protocol_v2(
+                test_negotiation_request(&client, &remote, vec![tip.clone()], haves),
+                handshake,
+                &mut credentials,
+                CancelFlag::never(),
+            )
+            .expect("real fetch negotiation")
+        };
+
+        let full_objects = negotiated_pack_object_count(run_fetch(Vec::new()));
+        let full_rounds = client.take_posted_fetches();
+        let delta_objects = negotiated_pack_object_count(run_fetch(vec![delta_base.clone()]));
+        let delta_rounds = client.take_posted_fetches();
+        let already_present_objects = negotiated_pack_object_count(run_fetch(vec![tip.clone()]));
+        let already_present_rounds = client.take_posted_fetches();
+
+        let mut delayed_have = (1_000..1_016).map(test_oid).collect::<Vec<_>>();
+        delayed_have.push(delta_base);
+        let delayed_objects = negotiated_pack_object_count(run_fetch(delayed_have));
+        let delayed_rounds = client.take_posted_fetches();
+
+        assert_eq!(full_rounds.len(), 1);
+        assert_eq!(delta_rounds.len(), 1);
+        assert_eq!(already_present_rounds.len(), 1);
+        assert_eq!(
+            delayed_rounds
+                .iter()
+                .map(|request| (request.haves.len(), request.done))
+                .collect::<Vec<_>>(),
+            vec![(16, false), (17, false)]
+        );
+        assert!(
+            full_rounds
+                .iter()
+                .chain(&delta_rounds)
+                .chain(&already_present_rounds)
+                .chain(&delayed_rounds)
+                .all(|request| request.thin_pack),
+            "real HTTP fetches must retain thin-pack"
+        );
+        assert_eq!(already_present_objects, 0);
+        assert!(
+            full_objects >= 100,
+            "40 commits should produce a history-sized pack, got {full_objects} objects"
+        );
+        assert!(
+            delta_objects <= 9,
+            "two commits should produce a delta-sized pack, got {delta_objects} objects"
+        );
+        assert!(
+            delta_objects * 10 < full_objects,
+            "delta pack ({delta_objects}) must be proportional to the delta, not full history ({full_objects})"
+        );
+        assert_eq!(delayed_objects, delta_objects);
+        eprintln!(
+            "real negotiation evidence: history_commits=40 full_objects={full_objects} \
+             delta_objects={delta_objects} already_present_objects={already_present_objects} \
+             immediate_have_rounds={} delayed_have_rounds={}",
+            delta_rounds.len(),
+            delayed_rounds.len()
+        );
     }
 
     #[test]
