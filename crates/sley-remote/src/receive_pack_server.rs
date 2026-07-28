@@ -257,7 +257,8 @@ pub fn serve_receive_pack(
     }
 
     if unpack_error.is_none()
-        && let Err(err) = apply_command_updates(request.git_dir, request.format, &command_states)
+        && let Err(err) =
+            apply_command_updates(request.git_dir, request.format, &command_states, use_atomic)
     {
         let message = err.to_string();
         for state in &mut command_states {
@@ -492,14 +493,12 @@ fn branch_checked_out_anywhere(git_dir: &Path, format: ObjectFormat, logical_ref
     if matches!(
         store.read_ref("HEAD").ok().flatten(),
         Some(RefTarget::Symbolic(target)) if target == logical_ref
-    ) {
-        if sley_worktree::worktree_root_for_git_dir(git_dir)
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            return true;
-        }
+    ) && sley_worktree::worktree_root_for_git_dir(git_dir)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return true;
     }
     let common = sley_odb::repository_common_dir(git_dir);
     let worktrees_dir = common.join("worktrees");
@@ -582,6 +581,7 @@ fn apply_command_updates(
     git_dir: &Path,
     format: ObjectFormat,
     states: &[ReceivePackCommandState],
+    use_atomic: bool,
 ) -> Result<()> {
     // Expand logical client-side names into the active namespace before writing
     // (git's receive-pack `namespaced_name = namespace + name`).
@@ -633,7 +633,14 @@ fn apply_command_updates(
         .filter(|c| !c.new_id.is_null())
         .cloned()
         .collect();
-    apply_receive_pack_ref_transaction(git_dir, format, &store, &updates, &applicable)?;
+    apply_receive_pack_ref_transaction(
+        git_dir,
+        format,
+        &store,
+        &updates,
+        &applicable,
+        use_atomic,
+    )?;
     Ok(())
 }
 

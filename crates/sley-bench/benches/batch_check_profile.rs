@@ -4,7 +4,7 @@
 //! cargo bench -p sley-bench --bench batch_check_profile -- --quick
 //! ```
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use sley_bench::{BenchFixture, FIXTURE_OBJECT_COUNT, create_fixture};
 use sley_core::ObjectId;
 use sley_object::ObjectType;
@@ -43,11 +43,11 @@ fn profile_find_and_header(c: &mut Criterion) {
                 .expect("benchmark input should be UTF-8")
                 .lines()
             {
-                if ObjectId::from_hex(format, black_box(line)).is_ok() {
+                if ObjectId::from_hex(format, std::hint::black_box(line)).is_ok() {
                     count += 1;
                 }
             }
-            black_box(count)
+            std::hint::black_box(count)
         });
     });
 
@@ -56,13 +56,13 @@ fn profile_find_and_header(c: &mut Criterion) {
             let mut total = 0u64;
             for oid in oids {
                 total = total.wrapping_add(
-                    db.read_object_header(black_box(oid))
+                    db.read_object_header(std::hint::black_box(oid))
                         .expect("read_object_header")
                         .expect("missing object")
                         .1,
                 );
             }
-            black_box(total)
+            std::hint::black_box(total)
         });
     });
 
@@ -71,13 +71,13 @@ fn profile_find_and_header(c: &mut Criterion) {
             let mut total = 0u64;
             for oid in oids {
                 total = total.wrapping_add(
-                    db.read_object(black_box(oid))
+                    db.read_object(std::hint::black_box(oid))
                         .expect("read_object")
                         .body
                         .len() as u64,
                 );
             }
-            black_box(total)
+            std::hint::black_box(total)
         });
     });
 
@@ -86,13 +86,13 @@ fn profile_find_and_header(c: &mut Criterion) {
             let mut out_len = 0usize;
             for oid in oids {
                 let (object_type, size) = db
-                    .read_object_header(black_box(oid))
+                    .read_object_header(std::hint::black_box(oid))
                     .expect("read_object_header")
                     .expect("missing object");
                 let line = format_batch_line(oid, object_type, size);
                 out_len = out_len.wrapping_add(line.len());
             }
-            black_box(out_len)
+            std::hint::black_box(out_len)
         });
     });
 

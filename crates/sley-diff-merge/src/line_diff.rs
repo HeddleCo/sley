@@ -1234,12 +1234,10 @@ fn change_compact_no_indent(
                 }
                 if groupsize == g.end - g.start {
                     // Slide done for this size.
-                    if g.end != earliest_end {
-                        if end_matching_other.is_some() {
-                            while go.end == go.start {
-                                let _ = slide_up(xdf, &mut g);
-                                let _ = group_previous(xdfo, &mut go);
-                            }
+                    if g.end != earliest_end && end_matching_other.is_some() {
+                        while go.end == go.start {
+                            let _ = slide_up(xdf, &mut g);
+                            let _ = group_previous(xdfo, &mut go);
                         }
                         // indent heuristic omitted (word-diff flags=0)
                     }
@@ -1277,6 +1275,7 @@ fn middle_snake_mark_changed(
     old_changed: &mut [bool],
     new_changed: &mut [bool],
 ) {
+    #[allow(clippy::too_many_arguments)]
     fn recs_cmp(
         old: &[DiffLine<'_>],
         new: &[DiffLine<'_>],
@@ -1296,14 +1295,14 @@ fn middle_snake_mark_changed(
             lim2 -= 1;
         }
         if off1 == lim1 {
-            for i in off2..lim2 {
-                new_changed[i] = true;
+            for flag in &mut new_changed[off2..lim2] {
+                *flag = true;
             }
             return;
         }
         if off2 == lim2 {
-            for i in off1..lim1 {
-                old_changed[i] = true;
+            for flag in &mut old_changed[off1..lim1] {
+                *flag = true;
             }
             return;
         }
@@ -1404,12 +1403,8 @@ fn xdl_split_middle(
                 i2 += 1;
             }
             kvdf.insert(d, i1);
-            if odd && bmin <= d && d <= bmax {
-                if let Some(&bd) = kvdb.get(&d) {
-                    if bd <= i1 {
-                        return (i1 as usize, i2 as usize);
-                    }
-                }
+            if odd && bmin <= d && d <= bmax && let Some(&bd) = kvdb.get(&d) && bd <= i1 {
+                return (i1 as usize, i2 as usize);
             }
             d -= 2;
         }
@@ -1447,12 +1442,8 @@ fn xdl_split_middle(
                 i2 -= 1;
             }
             kvdb.insert(d, i1);
-            if !odd && fmin <= d && d <= fmax {
-                if let Some(&fd) = kvdf.get(&d) {
-                    if i1 <= fd {
-                        return (i1 as usize, i2 as usize);
-                    }
-                }
+            if !odd && fmin <= d && d <= fmax && let Some(&fd) = kvdf.get(&d) && i1 <= fd {
+                return (i1 as usize, i2 as usize);
             }
             d -= 2;
         }

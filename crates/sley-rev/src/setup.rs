@@ -1021,10 +1021,10 @@ fn parse_date_cutoff(value: &str) -> Result<i64> {
         // `@<unix>` is a raw epoch timestamp. An optional timezone may follow
         // (`@123 +0000`); bare `@123` is accepted by git's approxidate/parse
         // path used by `--since`/`--until` (t5620 backfill --since=@N).
-        if let Some(timezone) = parts.next() {
-            if parts.next().is_some() || parse_timezone_offset_seconds(timezone).is_none() {
-                return invalid_date_format(value);
-            }
+        if let Some(timezone) = parts.next()
+            && (parts.next().is_some() || parse_timezone_offset_seconds(timezone).is_none())
+        {
+            return invalid_date_format(value);
         }
         return timestamp.parse::<i64>().map_err(|_| {
             eprintln!("fatal: invalid date format: {value}");

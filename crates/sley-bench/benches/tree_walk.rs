@@ -1,4 +1,4 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use sley_bench::{CommitBenchFixture, create_commit_fixture};
 use sley_core::{GitError, Result};
 use std::io::Write;
@@ -52,7 +52,7 @@ fn ls_tree_recursive_head(c: &mut Criterion) {
         b.iter(|| {
             let output = run_sley(&fixture.repo_root, &["ls-tree", "-r", "HEAD"], &[]);
             match output {
-                Ok(body) => black_box(body),
+                Ok(body) => std::hint::black_box(body),
                 Err(err) => panic!("sley ls-tree -r HEAD failed: {err}"),
             }
         });

@@ -1,4 +1,4 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use sley_bench::{BenchFixture, create_fixture};
 use sley_core::{GitError, Result};
 use std::io::Write;
@@ -53,7 +53,7 @@ fn count_objects_verbose_packed(c: &mut Criterion) {
         b.iter(|| {
             let output = run_sley(&fixture.repo_root, &["count-objects", "-v"], &[]);
             match output {
-                Ok(body) => black_box(body.len()),
+                Ok(body) => std::hint::black_box(body.len()),
                 Err(err) => panic!("sley count-objects -v failed: {err}"),
             }
         });

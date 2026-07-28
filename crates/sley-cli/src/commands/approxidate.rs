@@ -1174,9 +1174,9 @@ mod tests {
 
     #[test]
     fn asctime_with_tz() {
-        let r = parse_commit_date("Thu Apr 7 22:13:13 2005 +0000");
-        assert!(r.is_some(), "expected parse");
+        let r = parse_commit_date("Thu Apr 7 22:13:13 2005 +0000")
+            .expect("expected parse");
         // 1112911993 is 2005-04-07 22:13:13 UTC
-        assert_eq!(r.unwrap().0, 1_112_911_993);
+        assert_eq!(r.0, 1_112_911_993);
     }
 }

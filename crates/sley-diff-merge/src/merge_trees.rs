@@ -3731,11 +3731,11 @@ fn fold_virtual_ancestor_path(
     }
 
     // Textual content / rename content: persist conflict-marker bytes.
-    if let Some((mode, bytes)) = &entry.worktree {
-        if is_mergeable_file_mode(*mode) {
-            let oid = db.write_object(EncodedObject::new(ObjectType::Blob, bytes.clone()))?;
-            return Ok(Some((*mode, oid)));
-        }
+    if let Some((mode, bytes)) = &entry.worktree
+        && is_mergeable_file_mode(*mode)
+    {
+        let oid = db.write_object(EncodedObject::new(ObjectType::Blob, bytes.clone()))?;
+        return Ok(Some((*mode, oid)));
     }
 
     // Fallback: prefer base, then either side.

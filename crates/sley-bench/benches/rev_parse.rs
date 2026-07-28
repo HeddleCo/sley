@@ -1,6 +1,4 @@
-use criterion::{
-    BenchmarkId, Criterion, SamplingMode, Throughput, black_box, criterion_group, criterion_main,
-};
+use criterion::{BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use sley_bench::{
     BenchFixture, FIXTURE_OBJECT_COUNT, LARGE_FIXTURE_OBJECT_COUNT, MEDIUM_FIXTURE_OBJECT_COUNT,
     create_fixture, create_fixture_with_count,
@@ -92,7 +90,7 @@ fn rev_parse_oid_resolve(c: &mut Criterion) {
                 let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
                 let output = run_sley(&fixture.repo_root, &arg_refs, &[]);
                 match output {
-                    Ok(body) => black_box(body.len()),
+                    Ok(body) => std::hint::black_box(body.len()),
                     Err(err) => panic!("sley rev-parse failed: {err}"),
                 }
             });
@@ -109,7 +107,7 @@ fn rev_parse_oid_resolve(c: &mut Criterion) {
                         .expect("benchmark input should be UTF-8")
                         .lines()
                     {
-                        match db.resolve_prefix(black_box(line)) {
+                        match db.resolve_prefix(std::hint::black_box(line)) {
                             Ok(ObjectPrefixResolution::Unique(_)) => resolved += 1,
                             Ok(ObjectPrefixResolution::Ambiguous(_)) => {
                                 panic!("unexpected ambiguous oid prefix for {line}")
@@ -120,7 +118,7 @@ fn rev_parse_oid_resolve(c: &mut Criterion) {
                             Err(err) => panic!("resolve_prefix failed for {line}: {err}"),
                         }
                     }
-                    black_box(resolved)
+                    std::hint::black_box(resolved)
                 });
             },
         );
@@ -149,7 +147,7 @@ fn rev_parse_oid_resolve_1k(c: &mut Criterion) {
                     .expect("benchmark input should be UTF-8")
                     .lines()
                 {
-                    match db.resolve_prefix(black_box(line)) {
+                    match db.resolve_prefix(std::hint::black_box(line)) {
                         Ok(ObjectPrefixResolution::Unique(_)) => resolved += 1,
                         Ok(ObjectPrefixResolution::Ambiguous(_)) => {
                             panic!("unexpected ambiguous oid prefix for {line}")
@@ -160,7 +158,7 @@ fn rev_parse_oid_resolve_1k(c: &mut Criterion) {
                         Err(err) => panic!("resolve_prefix failed for {line}: {err}"),
                     }
                 }
-                black_box(resolved)
+                std::hint::black_box(resolved)
             });
         },
     );
@@ -192,7 +190,7 @@ fn rev_parse_oid_resolve_100k(c: &mut Criterion) {
                     .expect("benchmark input should be UTF-8")
                     .lines()
                 {
-                    match db.resolve_prefix(black_box(line)) {
+                    match db.resolve_prefix(std::hint::black_box(line)) {
                         Ok(ObjectPrefixResolution::Unique(_)) => resolved += 1,
                         Ok(ObjectPrefixResolution::Ambiguous(_)) => {
                             panic!("unexpected ambiguous oid prefix for {line}")
@@ -203,7 +201,7 @@ fn rev_parse_oid_resolve_100k(c: &mut Criterion) {
                         Err(err) => panic!("resolve_prefix failed for {line}: {err}"),
                     }
                 }
-                black_box(resolved)
+                std::hint::black_box(resolved)
             });
         },
     );

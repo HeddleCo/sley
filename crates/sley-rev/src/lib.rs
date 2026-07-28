@@ -2168,6 +2168,7 @@ impl GraphParents {
         }
     }
 
+    #[allow(dead_code)]
     fn grafted_vec<R: ObjectReader>(&self, reader: &R, oid: &ObjectId) -> Vec<ObjectId> {
         if reader.is_shallow_graft(oid) {
             Vec::new()
@@ -2243,6 +2244,7 @@ struct GraphCommit {
     commit_time: u64,
 }
 
+#[allow(dead_code)]
 struct GraphCommitMetadata<'a> {
     parents: &'a GraphParents,
     commit_time: i64,
@@ -2920,6 +2922,7 @@ impl<'a> CommitGraphContext<'a> {
 
     /// `oid`'s parents and committer time from the graph in one lookup, or `None`
     /// when the commit is not represented (the caller then reads the object).
+    #[allow(dead_code)]
     fn metadata(&mut self, oid: &ObjectId) -> Result<Option<GraphCommitMetadata<'_>>> {
         Ok(self.lookup(oid)?.map(|commit| GraphCommitMetadata {
             parents: &commit.parents,
@@ -2953,12 +2956,12 @@ impl<'a> CommitGraphContext<'a> {
                 if reader.is_shallow_graft(oid) {
                     metadata.parents.clear();
                 }
-                return Ok(Some(metadata));
+                Ok(Some(metadata))
             }
             // Damaged/missing graph: do not consult the map-load path (it would
             // re-parse and either re-print or, historically, hard-fail). Fall
             // straight through to the object-reading caller.
-            DirectCommitGraph::Invalid(_) | DirectCommitGraph::Missing => return Ok(None),
+            DirectCommitGraph::Invalid(_) | DirectCommitGraph::Missing => Ok(None),
         }
     }
 }
@@ -7037,7 +7040,7 @@ pub fn merge_bases<R: ObjectReader>(
         })?;
         dated.push((time, oid));
     }
-    dated.sort_by(|a, b| b.0.cmp(&a.0));
+    dated.sort_by_key(|(time, _)| std::cmp::Reverse(*time));
     Ok(dated.into_iter().map(|(_, oid)| oid).collect())
 }
 
@@ -9898,9 +9901,8 @@ mod tests {
         let now = parse_reflog_selector_date("now").expect("now should parse");
         assert!((nowish - now).abs() <= 2, "nowish={nowish} now={now}");
     }
-}
 
-#[test]
+    #[test]
     fn setup_revisions_skips_path_ambiguity_inside_git_dir() {
         let fixture = setup_revisions_fixture();
         // Ensure the git-dir-resident `HEAD` file exists (it always does).
@@ -9917,10 +9919,12 @@ mod tests {
                 format: ObjectFormat::Sha1,
                 reader: &fixture.db,
                 config: None,
-                        assume_dashdash: false,
-        },
+                assume_dashdash: false,
+            },
         )
         .expect("HEAD inside git dir must not be path-ambiguous");
         assert_eq!(setup.options.positives[0].oid, fixture.tip);
         assert!(setup.pathspecs.is_empty());
     }
+
+}

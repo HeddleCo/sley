@@ -1137,7 +1137,7 @@ impl FileObjectDatabase {
         &self,
         reader: &mut R,
         options: RawPackInstallOptions,
-        mut progress: F,
+        progress: F,
     ) -> Result<PackInstallResult>
     where
         R: Read,

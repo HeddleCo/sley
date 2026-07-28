@@ -10,7 +10,7 @@
 //! cargo bench -p sley-bench --bench pack_install -- --test
 //! ```
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use sley_bench::{FIXTURE_OBJECT_COUNT, build_blob_pack, create_pack_install_target};
 use sley_core::{AtomicCancel, CancelFlag, GitError};
 use sley_odb::{
@@ -38,8 +38,8 @@ fn install_pack_fresh_repo(c: &mut Criterion) {
         b.iter(|| {
             let target = create_pack_install_target().expect("pack install target");
             let db = FileObjectDatabase::from_git_dir(&target.git_dir, target.format);
-            let result = db.install_pack(black_box(pack)).expect("install_pack");
-            black_box(result.object_ids.len())
+            let result = db.install_pack(std::hint::black_box(pack)).expect("install_pack");
+            std::hint::black_box(result.object_ids.len())
         });
     });
 
@@ -47,11 +47,11 @@ fn install_pack_fresh_repo(c: &mut Criterion) {
         b.iter(|| {
             let target = create_pack_install_target().expect("pack install target");
             let db = FileObjectDatabase::from_git_dir(&target.git_dir, target.format);
-            let mut reader = black_box(pack.pack.as_slice());
+            let mut reader = std::hint::black_box(pack.pack.as_slice());
             let result = db
                 .install_raw_pack_from_reader(&mut reader)
                 .expect("install_raw_pack");
-            black_box(result.object_ids.len())
+            std::hint::black_box(result.object_ids.len())
         });
     });
 
@@ -61,7 +61,7 @@ fn install_pack_fresh_repo(c: &mut Criterion) {
         b.iter(|| {
             let target = create_pack_install_target().expect("pack install target");
             let db = FileObjectDatabase::from_git_dir(&target.git_dir, target.format);
-            let mut reader = black_box(pack.pack.as_slice());
+            let mut reader = std::hint::black_box(pack.pack.as_slice());
             let result = db
                 .install_raw_pack_from_reader_with_progress_and_cancel(
                     &mut reader,
@@ -70,7 +70,7 @@ fn install_pack_fresh_repo(c: &mut Criterion) {
                     |_| {},
                 )
                 .expect("install_raw_pack cancel never");
-            black_box(result.object_ids.len())
+            std::hint::black_box(result.object_ids.len())
         });
     });
 
@@ -97,7 +97,7 @@ fn cancel_mid_stream_install(c: &mut Criterion) {
                 source: &source,
                 saw_object: std::cell::Cell::new(false),
             };
-            let mut reader = black_box(pack.pack.as_slice());
+            let mut reader = std::hint::black_box(pack.pack.as_slice());
             let err = installer
                 .install_raw_pack_from_reader_with_progress_and_cancel(
                     &mut reader,
@@ -126,7 +126,7 @@ fn cancel_mid_stream_install(c: &mut Criterion) {
                 })
                 .unwrap_or_default();
             assert_eq!(installed, 0, "cancelled install must not leave pack files");
-            black_box(err);
+            std::hint::black_box(err);
         });
     });
     group.finish();

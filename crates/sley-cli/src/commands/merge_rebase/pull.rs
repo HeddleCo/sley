@@ -1141,6 +1141,11 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
             &fetch_outcome,
         )?;
     }
+    // Soft fetch ref-update rejections (e.g. non-fast-forward tracking) must
+    // abort pull before merge/rebase against a stale tip (PR #168 review A).
+    if let Some(reason) = fetch_outcome.rejection.as_ref() {
+        return Err(GitError::Command(reason.clone()));
+    }
     if dry_run {
         return Ok(());
     }

@@ -1975,11 +1975,7 @@ fn receive_denies_current_branch(
     }
     // Refuse when any worktree (main or linked) has this branch checked out
     // (git find_shared_symref) — t5516 denyCurrentBranch and worktrees.
-    Ok(branch_is_checked_out_in_any_worktree(
-        format,
-        remote_git_dir,
-        &command.name,
-    )?)
+    branch_is_checked_out_in_any_worktree(format, remote_git_dir, &command.name)
 }
 
 fn receive_targets_current_branch(

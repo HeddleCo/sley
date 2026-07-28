@@ -1422,8 +1422,14 @@ fn for_each_ref_sort_by_custom_date_format_matches_git() {
             assert_eq!(git_fmt, expected_fmt, "oracle format order ({cmd})");
             assert_eq!(sley_fmt, expected_fmt, "sley format order ({cmd})");
             assert_ne!(
-                expected_unix.lines().map(|l| l.split_once(' ').unwrap().1).collect::<Vec<_>>(),
-                expected_fmt.lines().map(|l| l.split_once(' ').unwrap().1).collect::<Vec<_>>(),
+                expected_unix
+                    .lines()
+                    .map(|l| l.split_once(' ').expect("unix line has space").1)
+                    .collect::<Vec<_>>(),
+                expected_fmt
+                    .lines()
+                    .map(|l| l.split_once(' ').expect("fmt line has space").1)
+                    .collect::<Vec<_>>(),
                 "fixture must distinguish timestamp vs format sort"
             );
         }

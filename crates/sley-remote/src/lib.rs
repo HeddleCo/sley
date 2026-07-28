@@ -187,7 +187,7 @@ pub use local::{
     install_fetch_pack_via_local_upload_pack, local_fetch_advertisements, local_have_oids,
     mark_complete_local_refs, receive_pack_features, receive_pack_into_local_repository,
     receive_pack_request_uses_push_options, receive_pack_stream_into_local_repository,
-    serve_upload_pack_v2, serve_upload_pack_v2_stateless_with_config,
+    negotiate_only_local, serve_upload_pack_v2, serve_upload_pack_v2_stateless_with_config,
     serve_upload_pack_v2_with_config, upload_pack_features, upload_pack_from_local_repository,
     upload_pack_request_uses_sideband, upload_pack_sideband_response,
 };
@@ -412,6 +412,9 @@ impl<'a> OperationContext<'a> {
         self.cancel.check()
     }
 }
+
+#[cfg(feature = "http")]
+pub use http::negotiate_only_http;
 
 #[cfg(test)]
 mod tests {
@@ -838,6 +841,7 @@ mod tests {
             ssh_options: None,
             upload_pack_command: None,
             reject_shallow: false,
+            sparse: false,
         };
         let mut clone_credentials = NoCredentials;
         let mut progress = SilentProgress;
@@ -864,7 +868,3 @@ mod tests {
         assert!(outcome.git_dir.join("shallow").exists());
     }
 }
-
-pub use local::negotiate_only_local;
-#[cfg(feature = "http")]
-pub use http::negotiate_only_http;

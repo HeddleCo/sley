@@ -1,6 +1,7 @@
-/target/
-/tmp-*/
+.DS_Store
+*.pyc
+**/__pycache__/
 /.heddle/
 /bench-results/
-**/__pycache__/
-*.pyc
+/target/
+/tmp-*/

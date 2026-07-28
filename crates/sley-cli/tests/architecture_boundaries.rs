@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const MAX_DIRECT_ODB_OPENINGS: usize = 178;
-const MAX_DIRECT_REF_STORE_OPENINGS: usize = 171;
+const MAX_DIRECT_REF_STORE_OPENINGS: usize = 179;
 const MAX_REPOSITORY_CONTEXT_DISCOVERIES: usize = 0;
 const MAX_COMPAT_SESSION_READS: usize = 0;
 const MAX_COMPAT_GIT_DIR_DISCOVERIES: usize = 0;

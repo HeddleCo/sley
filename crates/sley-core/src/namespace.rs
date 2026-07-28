@@ -55,7 +55,7 @@ pub fn get_git_namespace() -> String {
 /// Strip the active namespace prefix from `namespaced_ref`, returning the
 /// logical name. Returns `None` when the ref is outside the current namespace
 /// (or when no namespace is active and the name is not itself).
-pub fn strip_namespace<'a>(namespaced_ref: &'a str) -> Option<&'a str> {
+pub fn strip_namespace(namespaced_ref: &str) -> Option<&str> {
     let ns = get_git_namespace();
     if ns.is_empty() {
         return Some(namespaced_ref);
@@ -79,10 +79,10 @@ pub fn namespace_active() -> bool {
 }
 
 fn namespace_raw() -> String {
-    if let Ok(guard) = NAMESPACE_OVERRIDE.lock() {
-        if let Some(ref value) = *guard {
-            return value.clone();
-        }
+    if let Ok(guard) = NAMESPACE_OVERRIDE.lock()
+        && let Some(ref value) = *guard
+    {
+        return value.clone();
     }
     env::var("GIT_NAMESPACE").unwrap_or_default()
 }

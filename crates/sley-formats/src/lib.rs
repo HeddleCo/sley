@@ -3126,10 +3126,10 @@ impl RepositoryBootstrap {
         // safe_create_leading_directories, then mkdir()s the final directory
         // and applies shared mode only to the repository itself (t0001
         // "init creates a new deep directory (umask vs. shared)").
-        if let Some(parent) = git_dir.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = git_dir.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
         }
         create_shared_dir(&git_dir, options.shared_repository.as_deref())?;
         let object_dir = options

@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use sley_bench::{BenchFixture, FIXTURE_OBJECT_COUNT, create_fixture};
 use sley_core::{GitError, Result};
 use sley_odb::ObjectReader;
@@ -55,7 +55,7 @@ fn cat_file_p_single(c: &mut Criterion) {
         b.iter(|| {
             let output = run_sley(&fixture.repo_root, &["cat-file", "-p", oid.as_str()], &[]);
             match output {
-                Ok(body) => black_box(body),
+                Ok(body) => std::hint::black_box(body),
                 Err(err) => panic!("sley cat-file -p failed: {err}"),
             }
         });
@@ -64,8 +64,8 @@ fn cat_file_p_single(c: &mut Criterion) {
     group.bench_function("odb_read_object", |b| {
         let db = fixture.database();
         let oid = fixture.sample_oid.clone();
-        b.iter(|| match db.read_object(black_box(&oid)) {
-            Ok(object) => black_box(object.body.len()),
+        b.iter(|| match db.read_object(std::hint::black_box(&oid)) {
+            Ok(object) => std::hint::black_box(object.body.len()),
             Err(err) => panic!("read_object failed: {err}"),
         });
     });
@@ -83,7 +83,7 @@ fn cat_file_batch_check(c: &mut Criterion) {
             b.iter(|| {
                 let output = run_sley(&fixture.repo_root, &["cat-file", "--batch-check"], input);
                 match output {
-                    Ok(body) => black_box(body.len()),
+                    Ok(body) => std::hint::black_box(body.len()),
                     Err(err) => panic!("sley cat-file --batch-check failed: {err}"),
                 }
             });
@@ -104,7 +104,7 @@ fn cat_file_batch_with_content(c: &mut Criterion) {
             b.iter(|| {
                 let output = run_sley(&fixture.repo_root, &["cat-file", "--batch"], input);
                 match output {
-                    Ok(body) => black_box(body.len()),
+                    Ok(body) => std::hint::black_box(body.len()),
                     Err(err) => panic!("sley cat-file --batch failed: {err}"),
                 }
             });
@@ -130,13 +130,13 @@ fn odb_read_header_vs_read_object(c: &mut Criterion) {
                 b.iter(|| {
                     let mut total = 0u64;
                     for oid in oids {
-                        match db.read_object_header(black_box(oid)) {
+                        match db.read_object_header(std::hint::black_box(oid)) {
                             Ok(Some((_, size))) => total = total.wrapping_add(size),
                             Ok(None) => panic!("missing object {oid}"),
                             Err(err) => panic!("read_object_header failed: {err}"),
                         }
                     }
-                    black_box(total)
+                    std::hint::black_box(total)
                 });
             },
         );
@@ -145,12 +145,12 @@ fn odb_read_header_vs_read_object(c: &mut Criterion) {
             b.iter(|| {
                 let mut total = 0u64;
                 for oid in oids {
-                    match db.read_object(black_box(oid)) {
+                    match db.read_object(std::hint::black_box(oid)) {
                         Ok(object) => total = total.wrapping_add(object.body.len() as u64),
                         Err(err) => panic!("read_object failed: {err}"),
                     }
                 }
-                black_box(total)
+                std::hint::black_box(total)
             });
         });
     }

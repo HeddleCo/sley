@@ -11,7 +11,7 @@
 //! The reference `git` binary is taken from `GIT_BENCH_BIN` (falling back to
 //! `git` on `PATH`), matching the oracle harness's convention.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use sley_core::{GitError, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -142,7 +142,7 @@ fn add_update_10_dirty(c: &mut Criterion) {
         b.iter(|| {
             sley_wt.dirty().expect("dirty files");
             run_sley(&sley_wt.root, &["add", "-u"]).expect("sley add -u");
-            black_box(());
+            std::hint::black_box(());
         });
     });
 
@@ -151,7 +151,7 @@ fn add_update_10_dirty(c: &mut Criterion) {
         b.iter(|| {
             git_wt.dirty().expect("dirty files");
             run_git(&git_wt.root, &["add", "-u"]).expect("git add -u");
-            black_box(());
+            std::hint::black_box(());
         });
     });
 
@@ -166,7 +166,7 @@ fn status_porcelain(c: &mut Criterion) {
     group.bench_function("sley_cli", |b| {
         b.iter(|| {
             run_sley(&sley_wt.root, &["status", "--porcelain"]).expect("sley status");
-            black_box(());
+            std::hint::black_box(());
         });
     });
 
@@ -175,7 +175,7 @@ fn status_porcelain(c: &mut Criterion) {
     group.bench_function("git", |b| {
         b.iter(|| {
             run_git(&git_wt.root, &["status", "--porcelain"]).expect("git status");
-            black_box(());
+            std::hint::black_box(());
         });
     });
 
@@ -191,7 +191,7 @@ fn update_index_refresh(c: &mut Criterion) {
     group.bench_function("sley_cli", |b| {
         b.iter(|| {
             run_sley(&sley_wt.root, &["update-index", "--refresh", "-q"]).ok();
-            black_box(());
+            std::hint::black_box(());
         });
     });
 
@@ -199,7 +199,7 @@ fn update_index_refresh(c: &mut Criterion) {
     group.bench_function("git", |b| {
         b.iter(|| {
             run_git(&git_wt.root, &["update-index", "--refresh", "-q"]).ok();
-            black_box(());
+            std::hint::black_box(());
         });
     });
 

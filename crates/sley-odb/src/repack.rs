@@ -652,7 +652,17 @@ fn repack_reachable_objects_with_filter_to(
     }
 
     let inputs = pack_inputs(&objects);
-    let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
+    // `repack -f` must re-encode rather than return exact-reuse bytes: use a
+    // non-default compression level so the stream differs from the source pack.
+    let written = if options.force_rewrite {
+        PackFile::write_packed_with_known_ids_and_options(
+            &inputs,
+            format,
+            &PackWriteOptions::new().with_compression_level(1),
+        )?
+    } else {
+        PackFile::write_packed_with_known_ids(&inputs, format)?
+    };
     let object_count = written.entries.len();
 
     // Every pre-existing local pack is superseded under `-a` (their reachable
@@ -702,15 +712,6 @@ fn repack_reachable_objects_with_filter_to(
         bitmap_cache: bitmap_object_cache(&objects),
         loose_prune_outcome,
     }))
-}
-
-fn write_filtered_repack(
-    objects: &[ReachablePackObject],
-    format: ObjectFormat,
-    prefix: &Path,
-) -> Result<()> {
-    write_filtered_repack_with_size(objects, format, prefix, None)?;
-    Ok(())
 }
 
 /// Write one or more filtered packs under `prefix-<checksum>.{pack,idx}`.

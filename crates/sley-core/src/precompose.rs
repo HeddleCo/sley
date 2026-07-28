@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn path_components_are_precomposed() {
         set_precompose_unicode(true);
-        let nfd = PathBuf::from(format!("d.A\u{0308}/f.A\u{0308}"));
+        let nfd = PathBuf::from("d.A\u{0308}/f.A\u{0308}");
         let precomposed = precompose_path_if_needed(&nfd);
         assert_eq!(
             precomposed.to_string_lossy().as_ref(),

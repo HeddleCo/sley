@@ -257,6 +257,7 @@ pub fn receive_pack_into_local_repository(
                 &remote_store,
                 commands,
                 &request.commands.commands,
+                receive_pack_request_is_atomic(request),
             )?;
             deletes_applied_with_updates.borrow_mut().extend(applied);
             Ok(())
@@ -350,6 +351,7 @@ pub fn receive_pack_stream_into_local_repository<R: Read>(
             &remote_store,
             &updates,
             &header.commands.commands,
+            receive_pack_header_is_atomic(header),
         )?;
         deletes_applied_with_updates.borrow_mut().extend(applied);
     }
@@ -519,6 +521,7 @@ pub fn receive_pack_reachable_pack_into_local_repository(
                 &remote_store,
                 commands,
                 &request.commands.commands,
+                receive_pack_request_is_atomic(request),
             )?;
             deletes_applied_with_updates.borrow_mut().extend(applied);
             Ok(())
@@ -542,12 +545,29 @@ pub fn receive_pack_reachable_pack_into_local_repository(
     )
 }
 
+fn receive_pack_request_is_atomic(request: &ReceivePackPushRequest) -> bool {
+    request
+        .commands
+        .capabilities
+        .iter()
+        .any(|cap| cap.name == "atomic")
+}
+
+fn receive_pack_header_is_atomic(header: &ReceivePackPushRequestHeader) -> bool {
+    header
+        .commands
+        .capabilities
+        .iter()
+        .any(|cap| cap.name == "atomic")
+}
+
 pub(crate) fn apply_receive_pack_ref_transaction(
     remote_git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
     updates: &[ReceivePackCommand],
     all_commands: &[ReceivePackCommand],
+    atomic: bool,
 ) -> Result<HashSet<String>> {
     let updates = canonical_receive_pack_update_commands(store, updates)?;
     let deletes = all_commands
@@ -557,16 +577,11 @@ pub(crate) fn apply_receive_pack_ref_transaction(
     // receive.denyCurrentBranch=updateInstead: update the checked-out worktree
     // before rewriting the branch tip (git update_worktree before ref update).
     maybe_update_worktrees_for_update_instead(remote_git_dir, format, store, &updates)?;
-    // Git's non-atomic receive-pack applies deletes and other updates in two
-    // separate transactions (PHASE_DELETIONS then PHASE_OTHERS). A single
-    // transaction would treat F/D pairs like delete `branch/conflict` + create
-    // `branch` as name conflicts (refs_verify_refnames_available with skip=NULL;
-    // t1404). The two-phase split is what makes t5516's simultaneous F/D push
-    // succeed.
-    if !deletes.is_empty() {
-        let mut delete_tx = store.transaction();
+    let log_updates = receive_pack_log_all_ref_updates(remote_git_dir);
+
+    let apply_deletes = |tx: &mut sley_refs::FileRefTransaction| {
         for command in &deletes {
-            delete_tx.delete_with_precondition(
+            tx.delete_with_precondition(
                 command.name.clone(),
                 RefDeletePrecondition::Direct(
                     (!command.old_id.is_null()).then_some(command.old_id),
@@ -574,11 +589,8 @@ pub(crate) fn apply_receive_pack_ref_transaction(
                 None,
             );
         }
-        delete_tx.commit()?;
-    }
-    if !updates.is_empty() {
-        let log_updates = receive_pack_log_all_ref_updates(remote_git_dir);
-        let mut update_tx = store.transaction();
+    };
+    let apply_updates = |tx: &mut sley_refs::FileRefTransaction| {
         for command in &updates {
             let precondition = if command.old_id.is_null() {
                 RefPrecondition::MustNotExist
@@ -594,14 +606,41 @@ pub(crate) fn apply_receive_pack_ref_transaction(
             } else {
                 None
             };
-            update_tx.update_to(
+            tx.update_to(
                 command.name.clone(),
                 RefTarget::Direct(command.new_id),
                 precondition,
                 reflog,
             );
         }
-        update_tx.commit()?;
+    };
+
+    if atomic {
+        // Atomic receive-pack must land deletes and updates in one transaction
+        // so a failed update rolls back prior deletes (PR #168 review E).
+        if !deletes.is_empty() || !updates.is_empty() {
+            let mut tx = store.transaction();
+            apply_deletes(&mut tx);
+            apply_updates(&mut tx);
+            tx.commit()?;
+        }
+    } else {
+        // Git's non-atomic receive-pack applies deletes and other updates in two
+        // separate transactions (PHASE_DELETIONS then PHASE_OTHERS). A single
+        // transaction would treat F/D pairs like delete `branch/conflict` + create
+        // `branch` as name conflicts (refs_verify_refnames_available with skip=NULL;
+        // t1404). The two-phase split is what makes t5516's simultaneous F/D push
+        // succeed.
+        if !deletes.is_empty() {
+            let mut delete_tx = store.transaction();
+            apply_deletes(&mut delete_tx);
+            delete_tx.commit()?;
+        }
+        if !updates.is_empty() {
+            let mut update_tx = store.transaction();
+            apply_updates(&mut update_tx);
+            update_tx.commit()?;
+        }
     }
     Ok(deletes
         .into_iter()
@@ -631,14 +670,14 @@ fn maybe_update_worktrees_for_update_instead(
     }
     // Linked worktrees live under $GIT_DIR/worktrees/<id>/ with their own HEAD.
     let worktrees_dir = repository_common_dir(remote_git_dir).join("worktrees");
-    if worktrees_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&worktrees_dir) {
-            for entry in entries.flatten() {
-                let wt_git_dir = entry.path();
-                let wt_store = FileRefStore::new(&wt_git_dir, format);
-                if let Ok(Some(RefTarget::Symbolic(target))) = wt_store.read_ref("HEAD") {
-                    current_branch_tips.push((wt_git_dir, target));
-                }
+    if worktrees_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&worktrees_dir)
+    {
+        for entry in entries.flatten() {
+            let wt_git_dir = entry.path();
+            let wt_store = FileRefStore::new(&wt_git_dir, format);
+            if let Ok(Some(RefTarget::Symbolic(target))) = wt_store.read_ref("HEAD") {
+                current_branch_tips.push((wt_git_dir, target));
             }
         }
     }
@@ -749,11 +788,7 @@ pub fn local_fetch_advertisements(
             target,
         };
         if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? {
-            let logical = if namespace.is_empty() {
-                "HEAD".to_string()
-            } else {
-                "HEAD".to_string()
-            };
+            let logical = "HEAD".to_string();
             if !sley_core::ref_is_hidden(Some(logical.as_str()), &head_name, &hidden) {
                 advertisements.push(RefAdvertisement {
                     oid,
@@ -3057,6 +3092,61 @@ fn serve_upload_pack_v2_inner(
     Ok(())
 }
 
+pub fn negotiate_only_local(
+    local_git_dir: &Path,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    tip_oids: &[ObjectId],
+) -> Result<Vec<ObjectId>> {
+    let local_db = FileObjectDatabase::from_git_dir(local_git_dir, format);
+    let mut seen = HashSet::new();
+    let mut haves = Vec::new();
+    // Walk each tip's commit ancestry so a tip that only exists locally still
+    // reveals common ancestors the remote can ACK (fetch-pack negotiator).
+    for tip in tip_oids {
+        let mut stack = vec![*tip];
+        while let Some(oid) = stack.pop() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            haves.push(oid);
+            let Ok(object) = local_db.read_object(&oid) else {
+                continue;
+            };
+            if object.object_type != ObjectType::Commit {
+                continue;
+            }
+            if let Ok(commit) = Commit::parse_ref(format, &object.body) {
+                for parent in commit.parents {
+                    if !seen.contains(&parent) {
+                        stack.push(parent);
+                    }
+                }
+            }
+        }
+    }
+    let request = ProtocolV2FetchRequest {
+        haves,
+        wait_for_done: true,
+        done: false,
+        thin_pack: true,
+        ofs_delta: true,
+        ..ProtocolV2FetchRequest::default()
+    };
+    let sections = local_fetch_v2_sections(remote_git_dir, format, &request)?;
+    let mut acked = Vec::new();
+    for section in sections {
+        if let ProtocolV2FetchResponseSection::Acknowledgments(acks) = section {
+            for ack in acks {
+                if let ProtocolV2FetchAcknowledgment::Ack(oid) = ack {
+                    acked.push(oid);
+                }
+            }
+        }
+    }
+    Ok(acked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4159,59 +4249,4 @@ mod tests {
             .write(),
         )
     }
-}
-
-pub fn negotiate_only_local(
-    local_git_dir: &Path,
-    remote_git_dir: &Path,
-    format: ObjectFormat,
-    tip_oids: &[ObjectId],
-) -> Result<Vec<ObjectId>> {
-    let local_db = FileObjectDatabase::from_git_dir(local_git_dir, format);
-    let mut seen = HashSet::new();
-    let mut haves = Vec::new();
-    // Walk each tip's commit ancestry so a tip that only exists locally still
-    // reveals common ancestors the remote can ACK (fetch-pack negotiator).
-    for tip in tip_oids {
-        let mut stack = vec![*tip];
-        while let Some(oid) = stack.pop() {
-            if !seen.insert(oid) {
-                continue;
-            }
-            haves.push(oid);
-            let Ok(object) = local_db.read_object(&oid) else {
-                continue;
-            };
-            if object.object_type != ObjectType::Commit {
-                continue;
-            }
-            if let Ok(commit) = Commit::parse_ref(format, &object.body) {
-                for parent in commit.parents {
-                    if !seen.contains(&parent) {
-                        stack.push(parent);
-                    }
-                }
-            }
-        }
-    }
-    let request = ProtocolV2FetchRequest {
-        haves,
-        wait_for_done: true,
-        done: false,
-        thin_pack: true,
-        ofs_delta: true,
-        ..ProtocolV2FetchRequest::default()
-    };
-    let sections = local_fetch_v2_sections(remote_git_dir, format, &request)?;
-    let mut acked = Vec::new();
-    for section in sections {
-        if let ProtocolV2FetchResponseSection::Acknowledgments(acks) = section {
-            for ack in acks {
-                if let ProtocolV2FetchAcknowledgment::Ack(oid) = ack {
-                    acked.push(oid);
-                }
-            }
-        }
-    }
-    Ok(acked)
 }

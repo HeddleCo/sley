@@ -1,4 +1,4 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use sley_bench::{CommitBenchFixture, create_commit_fixture};
 use sley_core::{GitError, Result};
 use std::io::Write;
@@ -52,7 +52,7 @@ fn rev_list_count_head(c: &mut Criterion) {
         b.iter(|| {
             let output = run_sley(&fixture.repo_root, &["rev-list", "--count", "HEAD"], &[]);
             match output {
-                Ok(body) => black_box(body),
+                Ok(body) => std::hint::black_box(body),
                 Err(err) => panic!("sley rev-list --count HEAD failed: {err}"),
             }
         });
@@ -71,7 +71,7 @@ fn rev_list_oneline_head(c: &mut Criterion) {
                 &[],
             );
             match output {
-                Ok(body) => black_box(body),
+                Ok(body) => std::hint::black_box(body),
                 Err(err) => panic!("sley rev-list --oneline -100 HEAD failed: {err}"),
             }
         });

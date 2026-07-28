@@ -184,8 +184,10 @@ fn checkout_dash_c_default_remote_does_not_persist_into_repo_config() {
         run_with_identity(remote, &["commit", "-m", "shared", "-q"]);
     }
 
-    git(&repo, &["remote", "add", "repo_a", remote_a.to_str().unwrap()]);
-    git(&repo, &["remote", "add", "repo_b", remote_b.to_str().unwrap()]);
+    let remote_a_str = remote_a.to_str().expect("utf8 remote_a path");
+    let remote_b_str = remote_b.to_str().expect("utf8 remote_b path");
+    git(&repo, &["remote", "add", "repo_a", remote_a_str]);
+    git(&repo, &["remote", "add", "repo_b", remote_b_str]);
     git(&repo, &["fetch", "--all", "-q"]);
 
     // First DWIM with an explicit defaultRemote via `-c` should succeed and set

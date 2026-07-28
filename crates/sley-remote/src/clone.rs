@@ -799,6 +799,7 @@ fn collect_checkout_materialization_wants(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_tree_materialization_wants(
     remote_db: &FileObjectDatabase,
     local_db: &FileObjectDatabase,

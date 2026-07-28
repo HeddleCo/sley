@@ -2686,12 +2686,14 @@ fn hydrate_promisor_oid_via_http(
             handshake,
             &mut credentials,
             &mut progress,
+            sley_core::CancelFlag::never(),
         )?;
     } else {
         sley_remote::install_fetch_pack_via_http_upload_pack(
             pack_request,
             &mut credentials,
             &mut progress,
+            sley_core::CancelFlag::never(),
         )?;
     }
     Ok(())

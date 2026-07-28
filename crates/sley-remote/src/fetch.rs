@@ -2327,6 +2327,7 @@ fn classify_fetch_ref_rejections(
 ///   lock or D/F conflict on one ref does not roll back siblings (git's
 ///   `REF_TRANSACTION_ALLOW_FAILURE` path). Soft failures are printed and
 ///   recorded in `rejected_dsts` when provided.
+#[allow(clippy::too_many_arguments)]
 fn apply_fetch_ref_updates(
     store: &FileRefStore,
     format: ObjectFormat,

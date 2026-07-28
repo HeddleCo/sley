@@ -753,15 +753,14 @@ fn conflict_markers_need_cr(
             None
         }
     }
-    match (
-        side_is_crlf(ours),
-        side_is_crlf(theirs),
-        ancestor_first_is_crlf(base_blob),
-    ) {
-        (Some(true), Some(true), Some(true)) => true,
-        (Some(true), Some(true), None) => true,
-        _ => false,
-    }
+    matches!(
+        (
+            side_is_crlf(ours),
+            side_is_crlf(theirs),
+            ancestor_first_is_crlf(base_blob),
+        ),
+        (Some(true), Some(true), Some(true)) | (Some(true), Some(true), None)
+    )
 }
 
 fn common_prefix_len(a: &[DiffLine<'_>], b: &[DiffLine<'_>]) -> usize {
