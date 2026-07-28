@@ -91,6 +91,13 @@ pub struct UploadPackRawPackfileResponseHeader {
     pub acknowledgments: Vec<UploadPackAcknowledgment>,
     pub pack_prefix: Vec<u8>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadPackResponsePlan {
+    pub acknowledgments: Vec<UploadPackAcknowledgment>,
+    pub wants: Vec<ObjectId>,
+    pub known_haves: Vec<ObjectId>,
+}
 pub fn parse_upload_pack_request(
     format: ObjectFormat,
     frames: &[PktLineFrame],
@@ -635,6 +642,24 @@ where
     C: FnMut(&ObjectId) -> Result<bool>,
     B: FnMut(Vec<ObjectId>, Vec<ObjectId>) -> Result<Option<Vec<u8>>>,
 {
+    let plan = prepare_upload_pack_response(features, request, haves, &mut contains_object)?;
+    let packfile = build_pack(plan.wants, plan.known_haves)?
+        .ok_or_else(|| GitError::InvalidObject("upload-pack request produced empty pack".into()))?;
+    Ok(UploadPackRawPackfileResponse {
+        acknowledgments: plan.acknowledgments,
+        packfile,
+    })
+}
+
+pub fn prepare_upload_pack_response<C>(
+    features: &UploadPackFeatures,
+    request: UploadPackRequest,
+    haves: impl IntoIterator<Item = ObjectId>,
+    mut contains_object: C,
+) -> Result<UploadPackResponsePlan>
+where
+    C: FnMut(&ObjectId) -> Result<bool>,
+{
     validate_upload_pack_request_features(features, &request)?;
     for want in &request.wants {
         if !contains_object(want)? {
@@ -651,11 +676,10 @@ where
             Err(err) => Some(Err(err)),
         })
         .collect::<Result<Vec<_>>>()?;
-    let packfile = build_pack(request.wants, known_haves)?
-        .ok_or_else(|| GitError::InvalidObject("upload-pack request produced empty pack".into()))?;
-    Ok(UploadPackRawPackfileResponse {
+    Ok(UploadPackResponsePlan {
         acknowledgments: vec![UploadPackAcknowledgment::Nak],
-        packfile,
+        wants: request.wants,
+        known_haves,
     })
 }
 

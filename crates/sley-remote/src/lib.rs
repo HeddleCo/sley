@@ -192,6 +192,7 @@ pub use local::{
     serve_upload_pack_v2, serve_upload_pack_v2_stateless_with_config,
     serve_upload_pack_v2_with_config, upload_pack_features, upload_pack_from_local_repository,
     upload_pack_request_uses_sideband, upload_pack_sideband_response,
+    write_upload_pack_from_local_repository,
 };
 
 mod filter;

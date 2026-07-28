@@ -1,7 +1,7 @@
 use super::*;
 use crate::receive_pack::zero_object_id;
 use sley_core::{Capability, ObjectFormat, ObjectId};
-use std::io::Read;
+use std::io::{Read, Write};
 
 #[test]
 fn pkt_line_frame_encodes_data_and_control_frames() {
@@ -6580,6 +6580,33 @@ fn protocol_v2_fetch_sideband_all_response_streams_round_trip() {
         sections
     );
     assert_eq!(input, b"tail");
+}
+
+#[test]
+fn protocol_v2_fetch_packfile_writer_streams_sideband_without_response_buffer() {
+    let prefix = vec![ProtocolV2FetchResponseSection::Acknowledgments(vec![
+        ProtocolV2FetchAcknowledgment::Nak,
+    ])];
+    let pack = vec![b'p'; PKT_LINE_MAX_PAYLOAD_LEN * 2 + 17];
+    let mut encoded = Vec::new();
+    let marker =
+        write_protocol_v2_fetch_response_with_streaming_packfile(&mut encoded, &prefix, |writer| {
+            writer.write_all(&pack)?;
+            Ok(17usize)
+        })
+        .expect("stream fetch packfile");
+    assert_eq!(marker, 17);
+
+    let sections = read_protocol_v2_fetch_response(ObjectFormat::Sha1, &mut encoded.as_slice())
+        .expect("read streamed fetch response");
+    assert_eq!(sections[0], prefix[0]);
+    assert_eq!(
+        demux_protocol_v2_fetch_packfile(&sections)
+            .expect("demux streamed fetch packfile")
+            .expect("packfile section")
+            .data,
+        pack
+    );
 }
 
 #[test]

@@ -226,8 +226,9 @@ pub(crate) type PackHeaderTypeCaches = Arc<Mutex<HashMap<PathBuf, PackHeaderType
 /// hook threaded into the object database, so this constant is the default.
 const DEFAULT_OBJECT_CACHE_BYTES: usize = 96 * 1024 * 1024;
 
-/// Default approximate byte budget for each per-pack delta-base cache. Holds the
-/// decoded bases of the delta chains being walked so neighboring reads stay warm.
+/// Default aggregate byte budget for delta-base caches. The database divides
+/// this across the packs visible when it opens, preventing a many-pack closure
+/// from multiplying the per-process cache by the repository's pack count.
 /// Overridable via `SLEY_DELTA_BASE_CACHE_BYTES`.
 const DEFAULT_DELTA_BASE_CACHE_BYTES: usize = 96 * 1024 * 1024;
 
@@ -260,7 +261,7 @@ pub(crate) fn object_cache_budget() -> usize {
     })
 }
 
-/// Approximate byte budget for each per-pack delta-base cache (see
+/// Approximate aggregate byte budget for per-pack delta-base caches (see
 /// [`DEFAULT_DELTA_BASE_CACHE_BYTES`], `SLEY_DELTA_BASE_CACHE_BYTES`). Resolved
 /// once per process for the same reason as [`object_cache_budget`].
 pub(crate) fn delta_base_cache_budget() -> usize {
@@ -271,6 +272,23 @@ pub(crate) fn delta_base_cache_budget() -> usize {
             DEFAULT_DELTA_BASE_CACHE_BYTES,
         )
     })
+}
+
+fn per_pack_delta_base_cache_budget(objects_dir: &Path, alternates: &[PathBuf]) -> usize {
+    let pack_count = std::iter::once(objects_dir)
+        .chain(alternates.iter().map(PathBuf::as_path))
+        .map(|object_dir| {
+            fs::read_dir(object_dir.join("pack"))
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pack"))
+                .count()
+        })
+        .sum::<usize>()
+        .max(1);
+    delta_base_cache_budget() / pack_count
 }
 
 /// Whether to re-hash every object on read and compare it to the requested id.
@@ -579,6 +597,7 @@ pub struct FileObjectDatabase {
     pub(crate) pack_registry: PackRegistryCache,
     pub(crate) decoded: DecodedObjectCache,
     pub(crate) pack_deltas: PackDeltaCaches,
+    pub(crate) delta_base_cache_budget_per_pack: usize,
     pub(crate) pack_header_types: PackHeaderTypeCaches,
     pub(crate) promisor_objects: Arc<OnceLock<HashSet<ObjectId>>>,
     /// Whether the owning repository actually has a promisor remote configured
@@ -619,9 +638,12 @@ impl FileObjectDatabase {
 
     pub fn new(objects_dir: impl Into<PathBuf>, format: ObjectFormat) -> Self {
         let objects_dir = objects_dir.into();
+        let alternates = alternate_object_dirs(&objects_dir);
+        let delta_base_cache_budget_per_pack =
+            per_pack_delta_base_cache_budget(&objects_dir, &alternates);
         Self {
             loose: LooseObjectStore::new(objects_dir.clone(), format),
-            alternates: alternate_object_dirs(&objects_dir),
+            alternates,
             objects_dir,
             format,
             pack_bytes: Arc::new(RwLock::new(HashMap::new())),
@@ -632,6 +654,7 @@ impl FileObjectDatabase {
             pack_registry: Arc::new(Mutex::new(None)),
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
+            delta_base_cache_budget_per_pack,
             pack_header_types: Arc::new(Mutex::new(HashMap::new())),
             promisor_objects: Arc::new(OnceLock::new()),
             promisor_remote_present: false,
@@ -645,6 +668,7 @@ impl FileObjectDatabase {
         format: ObjectFormat,
     ) -> Self {
         let objects_dir = objects_dir.into();
+        let delta_base_cache_budget_per_pack = per_pack_delta_base_cache_budget(&objects_dir, &[]);
         Self {
             loose: LooseObjectStore::new(objects_dir.clone(), format),
             alternates: Vec::new(),
@@ -658,6 +682,7 @@ impl FileObjectDatabase {
             pack_registry: Arc::new(Mutex::new(None)),
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
+            delta_base_cache_budget_per_pack,
             pack_header_types: Arc::new(Mutex::new(HashMap::new())),
             promisor_objects: Arc::new(OnceLock::new()),
             promisor_remote_present: false,
@@ -988,7 +1013,9 @@ impl FileObjectDatabase {
     pub(crate) fn pack_delta_cache(&self, pack_path: &Path) -> Option<Arc<Mutex<LruOffsetCache>>> {
         let mut caches = self.pack_deltas.lock().ok()?;
         let cache = caches.entry(pack_path.to_path_buf()).or_insert_with(|| {
-            Arc::new(Mutex::new(LruOffsetCache::new(delta_base_cache_budget())))
+            Arc::new(Mutex::new(LruOffsetCache::new(
+                self.delta_base_cache_budget_per_pack,
+            )))
         });
         Some(Arc::clone(cache))
     }
@@ -1149,7 +1176,11 @@ impl FileObjectDatabase {
         if !force_rescan && let Some(registry) = self.cached_loaded_pack_registry(pack_dir)? {
             return Ok(registry);
         }
-        let scanned = Arc::new(scan_pack_registry(pack_dir, self.format)?);
+        let scanned = Arc::new(scan_pack_registry(
+            pack_dir,
+            self.format,
+            self.delta_base_cache_budget_per_pack,
+        )?);
         if let Ok(mut cache) = self.pack_registry.lock() {
             match cache.as_ref() {
                 Some(existing)
@@ -1594,11 +1625,9 @@ impl ObjectReader for FileObjectDatabase {
                 {
                     continue;
                 }
-                let Ok(pack) = fs::read(index_path.with_extension("pack")) else {
-                    continue;
-                };
                 candidates.push(ReusablePackCandidate {
-                    pack: Arc::from(pack),
+                    pack: Arc::from([]),
+                    pack_path: Some(index_path.with_extension("pack")),
                     entries: index.entries,
                     pack_checksum: index.pack_checksum,
                 });

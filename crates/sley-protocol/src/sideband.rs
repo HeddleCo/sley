@@ -77,7 +77,7 @@ pub fn write_sideband_packet(writer: &mut impl Write, packet: &SideBandPacket) -
     write_sideband_payload(writer, packet.channel, &packet.data)
 }
 
-pub(crate) fn write_sideband_payload(
+pub fn write_sideband_payload(
     writer: &mut impl Write,
     channel: SideBandChannel,
     data: &[u8],
@@ -99,6 +99,35 @@ pub(crate) fn write_sideband_payload(
     }])?;
     writer.write_all(data)?;
     Ok(())
+}
+
+/// A [`Write`] adapter that frames raw bytes as sideband channel-1 pkt-lines
+/// without retaining the complete payload. Each call accepts at most one
+/// pkt-line payload so `write_all` naturally advances through large streams.
+pub struct StreamingSidebandWriter<'a, W> {
+    writer: &'a mut W,
+}
+
+impl<'a, W> StreamingSidebandWriter<'a, W> {
+    pub fn new(writer: &'a mut W) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: Write> Write for StreamingSidebandWriter<'_, W> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let written = data.len().min(PKT_LINE_MAX_PAYLOAD_LEN - 1);
+        write_sideband_payload(self.writer, SideBandChannel::Data, &data[..written])
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
 }
 
 pub fn parse_sideband_packets(payloads: &[Vec<u8>]) -> Result<Vec<SideBandPacket>> {

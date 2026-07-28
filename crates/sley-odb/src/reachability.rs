@@ -1,14 +1,16 @@
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use flate2::{Decompress, FlushDecompress};
-use sley_core::{CancelFlag, GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
+use sley_core::{
+    CancelFlag, GitError, MissingObjectContext, ObjectFormat, ObjectId, Result, StreamingDigest,
+};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, tree_entry_object_type};
 use sley_pack::{
     MultiPackIndex, PackBitmapIndex, PackBitmapWriter, PackFile, PackIndex, PackIndexEntry,
     PackIndexViewData, PackInput, PackWrite, PackWriteOptions, PackWriteSummary,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{env, fs};
@@ -23,7 +25,7 @@ use crate::install::{
     RawPackInstallResult, RawPackInstaller, ReachablePackFile, ReachablePackWriteSummary,
 };
 use crate::loose::{LooseObjectStore, collect_loose_object_ids};
-use crate::pack::FileObjectDatabase;
+use crate::pack::{FileObjectDatabase, PackData, load_pack_data};
 use crate::registry::{read_incremental_midx_chain, repository_objects_dir};
 
 pub fn collect_reachable_object_ids<R, I>(
@@ -377,6 +379,14 @@ pub struct ReachablePackBuild {
     pub reuse: ReachablePackReuseStats,
 }
 
+/// A reachable pack written directly to a caller-owned stream, together with
+/// its checksum/object-count evidence and retained-entry reuse counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachablePackReuseWrite {
+    pub summary: ReachablePackWriteSummary,
+    pub reuse: ReachablePackReuseStats,
+}
+
 /// [`build_reachable_pack`] with explicit reuse counters.
 pub fn build_reachable_pack_with_reuse_stats<R, I>(
     reader: &R,
@@ -388,9 +398,11 @@ where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
 {
-    let objects = collect_reachable_pack_objects(reader, format, starts, excluded)?;
-    if objects.is_empty() {
-        return Ok(None);
+    let objects = collect_reachable_pack_objects_for_write(reader, format, starts, excluded)?;
+    match &objects {
+        ReachablePackObjectsForWrite::Buffered(objects) if objects.is_empty() => return Ok(None),
+        ReachablePackObjectsForWrite::Streaming(objects) if objects.is_empty() => return Ok(None),
+        ReachablePackObjectsForWrite::Buffered(_) | ReachablePackObjectsForWrite::Streaming(_) => {}
     }
     build_reachable_pack_objects_with_reuse(reader, format, objects).map(Some)
 }
@@ -729,12 +741,17 @@ where
     if objects.is_empty() {
         return Ok(None);
     }
-    build_reachable_pack_objects_with_reuse(reader, format, objects).map(Some)
+    build_reachable_pack_objects_with_reuse(
+        reader,
+        format,
+        ReachablePackObjectsForWrite::Buffered(objects),
+    )
+    .map(Some)
 }
 
 #[derive(Debug)]
 struct ValidatedReusablePack {
-    pack: Arc<[u8]>,
+    pack: Arc<ReusablePackData>,
     entries: Vec<ValidatedReusableEntry>,
     oids: HashSet<ObjectId>,
     checksum: ObjectId,
@@ -754,16 +771,40 @@ struct ValidatedReusableEntry {
 
 #[derive(Debug)]
 struct SelectedReusableEntry {
-    pack: Arc<[u8]>,
+    pack: Arc<ReusablePackData>,
     entry: ValidatedReusableEntry,
+}
+
+#[derive(Debug)]
+enum ReusablePackData {
+    Bytes(Arc<[u8]>),
+    File(Arc<PackData>),
+}
+
+impl std::ops::Deref for ReusablePackData {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::File(data) => data,
+        }
+    }
 }
 
 fn build_reachable_pack_objects_with_reuse<R: ObjectReader>(
     reader: &R,
     format: ObjectFormat,
-    objects: Vec<ReachablePackObject>,
+    objects: ReachablePackObjectsForWrite,
 ) -> Result<ReachablePackBuild> {
-    let selected: HashSet<ObjectId> = objects.iter().map(|entry| entry.oid).collect();
+    let selected: HashSet<ObjectId> = match &objects {
+        ReachablePackObjectsForWrite::Buffered(objects) => {
+            objects.iter().map(|entry| entry.oid).collect()
+        }
+        ReachablePackObjectsForWrite::Streaming(objects) => {
+            objects.iter().map(|entry| entry.oid).collect()
+        }
+    };
     let candidates = reader.reusable_pack_candidates(&selected)?;
     let mut validated = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -834,27 +875,55 @@ fn build_reachable_pack_objects_with_reuse<R: ObjectReader>(
         }
     }
 
-    let fresh_objects = objects
-        .iter()
-        .filter(|entry| !reused_oids.contains(&entry.oid))
-        .collect::<Vec<_>>();
-    let fresh_pack = if fresh_objects.is_empty() {
+    let fresh_oids = match &objects {
+        ReachablePackObjectsForWrite::Buffered(objects) => objects
+            .iter()
+            .filter_map(|entry| (!reused_oids.contains(&entry.oid)).then_some(entry.oid))
+            .collect::<Vec<_>>(),
+        ReachablePackObjectsForWrite::Streaming(objects) => objects
+            .iter()
+            .filter_map(|entry| (!reused_oids.contains(&entry.oid)).then_some(entry.oid))
+            .collect::<Vec<_>>(),
+    };
+    let fresh_pack = if fresh_oids.is_empty() {
         None
     } else {
-        let inputs = fresh_objects
-            .iter()
-            .map(|entry| PackInput {
-                oid: &entry.oid,
-                object: &entry.object,
-            })
-            .collect::<Vec<_>>();
-        Some(PackFile::write_packed_with_known_ids(&inputs, format)?)
+        match &objects {
+            ReachablePackObjectsForWrite::Buffered(objects) => {
+                let inputs = objects
+                    .iter()
+                    .filter(|entry| !reused_oids.contains(&entry.oid))
+                    .map(|entry| PackInput {
+                        oid: &entry.oid,
+                        object: &entry.object,
+                    })
+                    .collect::<Vec<_>>();
+                Some(PackFile::write_packed_with_known_ids(&inputs, format)?)
+            }
+            ReachablePackObjectsForWrite::Streaming(_) => {
+                let mut pack = Vec::new();
+                let summary = PackFile::write_packed_from_source_to_writer(
+                    &fresh_oids,
+                    format,
+                    &PackWriteOptions::new(),
+                    |oid| reader.read_object(oid),
+                    &mut pack,
+                )?;
+                Some(PackWrite {
+                    pack,
+                    index: summary.index,
+                    checksum: summary.checksum,
+                    entries: summary.entries,
+                    delta_count: summary.delta_count,
+                })
+            }
+        }
     };
     let pack = assemble_generated_and_reused_entries(format, fresh_pack, &reused_entries)?;
     let reuse = ReachablePackReuseStats {
         verbatim_entries: u32::try_from(reused_entries.len())
             .map_err(|_| GitError::InvalidFormat("too many reusable pack entries".into()))?,
-        redeltified_entries: u32::try_from(fresh_objects.len())
+        redeltified_entries: u32::try_from(fresh_oids.len())
             .map_err(|_| GitError::InvalidFormat("too many generated pack entries".into()))?,
         whole_pack: false,
     };
@@ -862,38 +931,206 @@ fn build_reachable_pack_objects_with_reuse<R: ObjectReader>(
     Ok(ReachablePackBuild { pack, reuse })
 }
 
+/// Write a reachable pack directly to `writer` while preserving retained-pack
+/// entries. Large walks retain object metadata rather than every decoded body;
+/// fresh objects are compressed through the pack writer's bounded window, and
+/// reused entries are copied to the destination as they are selected.
+pub fn write_reachable_pack_with_reuse_stats_to_writer<R, I, W>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    writer: &mut W,
+) -> Result<Option<ReachablePackReuseWrite>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+    W: Write,
+{
+    let objects = collect_reachable_pack_objects_for_write(reader, format, starts, excluded)?;
+    let selected: HashSet<ObjectId> = match &objects {
+        ReachablePackObjectsForWrite::Buffered(objects) => {
+            objects.iter().map(|entry| entry.oid).collect()
+        }
+        ReachablePackObjectsForWrite::Streaming(objects) => {
+            objects.iter().map(|entry| entry.oid).collect()
+        }
+    };
+    if selected.is_empty() {
+        return Ok(None);
+    }
+
+    let candidates = reader.reusable_pack_candidates(&selected)?;
+    let mut validated = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if let Some(candidate) = validate_reusable_pack_candidate(format, candidate)? {
+            validated.push(candidate);
+        }
+    }
+
+    for candidate in &validated {
+        if candidate.self_contained && candidate.oids == selected {
+            writer.write_all(&candidate.pack)?;
+            let entries = candidate
+                .entries
+                .iter()
+                .map(|entry| PackIndexEntry {
+                    oid: entry.oid,
+                    crc32: entry.crc32,
+                    offset: entry.start as u64,
+                })
+                .collect::<Vec<_>>();
+            let index = PackIndex::write_v2(format, &entries, &candidate.checksum)?;
+            let delta_count = candidate
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.kind, 6 | 7))
+                .count() as u32;
+            let reuse = ReachablePackReuseStats {
+                verbatim_entries: entries.len() as u32,
+                redeltified_entries: 0,
+                whole_pack: true,
+            };
+            trace_reachable_pack_reuse(reuse);
+            return Ok(Some(ReachablePackReuseWrite {
+                summary: ReachablePackWriteSummary {
+                    index,
+                    checksum: candidate.checksum,
+                    object_count: entries.len(),
+                    delta_count,
+                    pack_size: candidate.pack.len() as u64,
+                },
+                reuse,
+            }));
+        }
+    }
+
+    let mut reused_oids = HashSet::new();
+    let mut reused_entries = Vec::new();
+    for candidate in validated {
+        for entry in candidate.entries {
+            if !selected.contains(&entry.oid)
+                || entry
+                    .base_oid
+                    .is_some_and(|base_oid| !selected.contains(&base_oid))
+                || !reused_oids.insert(entry.oid)
+            {
+                continue;
+            }
+            reused_entries.push(SelectedReusableEntry {
+                pack: Arc::clone(&candidate.pack),
+                entry,
+            });
+        }
+    }
+
+    let fresh_oids = match &objects {
+        ReachablePackObjectsForWrite::Buffered(objects) => objects
+            .iter()
+            .filter_map(|entry| (!reused_oids.contains(&entry.oid)).then_some(entry.oid))
+            .collect::<Vec<_>>(),
+        ReachablePackObjectsForWrite::Streaming(objects) => objects
+            .iter()
+            .filter_map(|entry| (!reused_oids.contains(&entry.oid)).then_some(entry.oid))
+            .collect::<Vec<_>>(),
+    };
+    let object_count = fresh_oids
+        .len()
+        .checked_add(reused_entries.len())
+        .ok_or_else(|| GitError::InvalidFormat("too many pack objects".into()))?;
+    let declared_count = u32::try_from(object_count)
+        .map_err(|_| GitError::InvalidFormat("too many pack objects".into()))?;
+
+    let mut output = ReachablePackDigestWriter::new(writer, format);
+    output.write_pack_bytes(b"PACK")?;
+    output.write_pack_bytes(&2u32.to_be_bytes())?;
+    output.write_pack_bytes(&declared_count.to_be_bytes())?;
+
+    let mut entries = Vec::with_capacity(object_count);
+    let mut delta_count = 0u32;
+    if !fresh_oids.is_empty() {
+        let mut fresh_body = GeneratedPackBodyWriter::new(&mut output, format.raw_len());
+        let fresh = PackFile::write_packed_from_source_to_writer(
+            &fresh_oids,
+            format,
+            &PackWriteOptions::new(),
+            |oid| reader.read_object(oid),
+            &mut fresh_body,
+        )?;
+        fresh_body.finish(&fresh.checksum, fresh_oids.len())?;
+        delta_count = fresh.delta_count;
+        entries.extend(fresh.entries);
+    }
+
+    for reused in &reused_entries {
+        let offset = output.position();
+        let encoded = encode_selected_reusable_entry(reused)?;
+        let crc32 = crc32fast::hash(&encoded);
+        output.write_pack_bytes(&encoded)?;
+        entries.push(PackIndexEntry {
+            oid: reused.entry.oid,
+            crc32,
+            offset,
+        });
+        if matches!(reused.entry.kind, 6 | 7) {
+            delta_count = delta_count
+                .checked_add(1)
+                .ok_or_else(|| GitError::InvalidFormat("too many pack deltas".into()))?;
+        }
+    }
+
+    let (checksum, pack_size) = output.finish()?;
+    let index = PackIndex::write_v2(format, &entries, &checksum)?;
+    let reuse = ReachablePackReuseStats {
+        verbatim_entries: u32::try_from(reused_entries.len())
+            .map_err(|_| GitError::InvalidFormat("too many reusable pack entries".into()))?,
+        redeltified_entries: u32::try_from(fresh_oids.len())
+            .map_err(|_| GitError::InvalidFormat("too many generated pack entries".into()))?,
+        whole_pack: false,
+    };
+    trace_reachable_pack_reuse(reuse);
+    Ok(Some(ReachablePackReuseWrite {
+        summary: ReachablePackWriteSummary {
+            index,
+            checksum,
+            object_count,
+            delta_count,
+            pack_size,
+        },
+        reuse,
+    }))
+}
+
 fn validate_reusable_pack_candidate(
     format: ObjectFormat,
     candidate: ReusablePackCandidate,
 ) -> Result<Option<ValidatedReusablePack>> {
+    let pack = if let Some(path) = candidate.pack_path {
+        let Ok(data) = load_pack_data(&path) else {
+            return Ok(None);
+        };
+        Arc::new(ReusablePackData::File(Arc::new(data)))
+    } else {
+        Arc::new(ReusablePackData::Bytes(candidate.pack))
+    };
     let hash_len = format.raw_len();
-    if candidate.pack.len() < 12 + hash_len
-        || &candidate.pack[..4] != b"PACK"
+    if pack.len() < 12 + hash_len
+        || &pack[..4] != b"PACK"
         || candidate.pack_checksum.format() != format
     {
         return Ok(None);
     }
-    let version = u32::from_be_bytes([
-        candidate.pack[4],
-        candidate.pack[5],
-        candidate.pack[6],
-        candidate.pack[7],
-    ]);
+    let version = u32::from_be_bytes([pack[4], pack[5], pack[6], pack[7]]);
     if !matches!(version, 2 | 3) {
         return Ok(None);
     }
-    let declared_count = u32::from_be_bytes([
-        candidate.pack[8],
-        candidate.pack[9],
-        candidate.pack[10],
-        candidate.pack[11],
-    ]) as usize;
+    let declared_count = u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]) as usize;
     if declared_count != candidate.entries.len() {
         return Ok(None);
     }
-    let trailer_offset = candidate.pack.len() - hash_len;
-    let trailer = ObjectId::from_raw(format, &candidate.pack[trailer_offset..])?;
-    let actual = sley_core::digest_bytes(format, &candidate.pack[..trailer_offset])?;
+    let trailer_offset = pack.len() - hash_len;
+    let trailer = ObjectId::from_raw(format, &pack[trailer_offset..])?;
+    let actual = sley_core::digest_bytes(format, &pack[..trailer_offset])?;
     if actual != trailer || trailer != candidate.pack_checksum {
         return Ok(None);
     }
@@ -926,7 +1163,7 @@ fn validate_reusable_pack_candidate(
         if start < 12 || start >= end || end > trailer_offset {
             return Ok(None);
         }
-        let raw = &candidate.pack[start..end];
+        let raw = &pack[start..end];
         let Some((kind, payload_start, base_oid)) =
             reusable_entry_header(format, raw, index_entry.offset, &offset_oids)?
         else {
@@ -948,7 +1185,7 @@ fn validate_reusable_pack_candidate(
             .is_none_or(|base_oid| oids.contains(&base_oid))
     });
     Ok(Some(ValidatedReusablePack {
-        pack: candidate.pack,
+        pack,
         entries,
         oids,
         checksum: trailer,
@@ -1057,24 +1294,7 @@ fn assemble_generated_and_reused_entries(
 
     for reused in reused {
         let offset = out.len() as u64;
-        let raw = &reused.pack[reused.entry.start..reused.entry.end];
-        let encoded = if reused.entry.kind == 6 {
-            let base_oid = reused.entry.base_oid.ok_or_else(|| {
-                GitError::InvalidFormat("reused ofs-delta has no base oid".into())
-            })?;
-            let mut entry = raw[..reused.entry.payload_start].to_vec();
-            let mut header_end = 1usize;
-            while entry[header_end - 1] & 0x80 != 0 {
-                header_end += 1;
-            }
-            entry.truncate(header_end);
-            entry[0] = (entry[0] & 0x8f) | (7 << 4);
-            entry.extend_from_slice(base_oid.as_bytes());
-            entry.extend_from_slice(&raw[reused.entry.payload_start..]);
-            entry
-        } else {
-            raw.to_vec()
-        };
+        let encoded = encode_selected_reusable_entry(reused)?;
         let crc32 = crc32fast::hash(&encoded);
         out.extend_from_slice(&encoded);
         entries.push(PackIndexEntry {
@@ -1099,6 +1319,162 @@ fn assemble_generated_and_reused_entries(
         entries,
         delta_count,
     })
+}
+
+fn encode_selected_reusable_entry(reused: &SelectedReusableEntry) -> Result<Vec<u8>> {
+    let raw = &reused.pack[reused.entry.start..reused.entry.end];
+    if reused.entry.kind != 6 {
+        return Ok(raw.to_vec());
+    }
+    let base_oid = reused
+        .entry
+        .base_oid
+        .ok_or_else(|| GitError::InvalidFormat("reused ofs-delta has no base oid".into()))?;
+    let mut entry = raw[..reused.entry.payload_start].to_vec();
+    let mut header_end = 1usize;
+    while entry[header_end - 1] & 0x80 != 0 {
+        header_end += 1;
+    }
+    entry.truncate(header_end);
+    entry[0] = (entry[0] & 0x8f) | (7 << 4);
+    entry.extend_from_slice(base_oid.as_bytes());
+    entry.extend_from_slice(&raw[reused.entry.payload_start..]);
+    Ok(entry)
+}
+
+struct ReachablePackDigestWriter<'a, W> {
+    writer: &'a mut W,
+    digest: StreamingDigest,
+    position: u64,
+}
+
+impl<'a, W: Write> ReachablePackDigestWriter<'a, W> {
+    fn new(writer: &'a mut W, format: ObjectFormat) -> Self {
+        Self {
+            writer,
+            digest: StreamingDigest::new(format),
+            position: 0,
+        }
+    }
+
+    fn position(&self) -> u64 {
+        self.position
+    }
+
+    fn write_pack_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.writer.write_all(bytes)?;
+        self.digest.update(bytes);
+        self.position = self
+            .position
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| GitError::InvalidFormat("pack offset overflow".into()))?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(ObjectId, u64)> {
+        let checksum = self.digest.finalize()?;
+        self.writer.write_all(checksum.as_bytes())?;
+        self.position = self
+            .position
+            .checked_add(checksum.as_bytes().len() as u64)
+            .ok_or_else(|| GitError::InvalidFormat("pack offset overflow".into()))?;
+        Ok((checksum, self.position))
+    }
+}
+
+/// Strip a generated pack's header and trailer while forwarding its entry
+/// bytes into the combined output digest. `pending_trailer` never exceeds one
+/// object-id, so large compressed payload writes are not duplicated.
+struct GeneratedPackBodyWriter<'a, 'b, W> {
+    output: &'a mut ReachablePackDigestWriter<'b, W>,
+    prefix: Vec<u8>,
+    pending_trailer: Vec<u8>,
+    hash_len: usize,
+}
+
+impl<'a, 'b, W: Write> GeneratedPackBodyWriter<'a, 'b, W> {
+    fn new(output: &'a mut ReachablePackDigestWriter<'b, W>, hash_len: usize) -> Self {
+        Self {
+            output,
+            prefix: Vec::with_capacity(12),
+            pending_trailer: Vec::with_capacity(hash_len),
+            hash_len,
+        }
+    }
+
+    fn finish(self, checksum: &ObjectId, object_count: usize) -> Result<()> {
+        if self.prefix.len() != 12 || &self.prefix[..4] != b"PACK" {
+            return Err(GitError::InvalidFormat(
+                "generated pack is missing its header".into(),
+            ));
+        }
+        let declared_count = u32::from_be_bytes([
+            self.prefix[8],
+            self.prefix[9],
+            self.prefix[10],
+            self.prefix[11],
+        ]);
+        if declared_count as usize != object_count {
+            return Err(GitError::InvalidFormat(format!(
+                "generated pack declared {declared_count} objects, expected {object_count}"
+            )));
+        }
+        if self.pending_trailer.as_slice() != checksum.as_bytes() {
+            return Err(GitError::InvalidFormat(
+                "generated pack checksum trailer mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn forward_body(&mut self, mut bytes: &[u8]) -> Result<()> {
+        if self.pending_trailer.len() < self.hash_len {
+            let fill = (self.hash_len - self.pending_trailer.len()).min(bytes.len());
+            self.pending_trailer.extend_from_slice(&bytes[..fill]);
+            bytes = &bytes[fill..];
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        if bytes.len() >= self.hash_len {
+            self.output.write_pack_bytes(&self.pending_trailer)?;
+            let body_len = bytes.len() - self.hash_len;
+            self.output.write_pack_bytes(&bytes[..body_len])?;
+            self.pending_trailer.clear();
+            self.pending_trailer.extend_from_slice(&bytes[body_len..]);
+            return Ok(());
+        }
+
+        self.output
+            .write_pack_bytes(&self.pending_trailer[..bytes.len()])?;
+        self.pending_trailer.copy_within(bytes.len().., 0);
+        let retained = self.hash_len - bytes.len();
+        self.pending_trailer.truncate(retained);
+        self.pending_trailer.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for GeneratedPackBodyWriter<'_, '_, W> {
+    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
+        let input_len = bytes.len();
+        if self.prefix.len() < 12 {
+            let fill = (12 - self.prefix.len()).min(bytes.len());
+            self.prefix.extend_from_slice(&bytes[..fill]);
+            bytes = &bytes[fill..];
+        }
+        self.forward_body(bytes)
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        Ok(input_len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output
+            .writer
+            .flush()
+            .map_err(|err| io::Error::other(err.to_string()))
+    }
 }
 
 fn trace_reachable_pack_reuse(stats: ReachablePackReuseStats) {
@@ -1506,6 +1882,7 @@ mod pack_reuse_tests {
     fn reusable_candidate(pack: &PackWrite) -> ReusablePackCandidate {
         ReusablePackCandidate {
             pack: Arc::from(pack.pack.clone()),
+            pack_path: None,
             entries: pack.entries.clone(),
             pack_checksum: pack.checksum,
         }
@@ -1556,6 +1933,21 @@ mod pack_reuse_tests {
             );
             assert_eq!(build.pack.delta_count, 1);
             PackFile::parse(&build.pack.pack, format).expect("verbatim pack is self-contained");
+
+            let mut streamed = Vec::new();
+            let streamed_build = write_reachable_pack_with_reuse_stats_to_writer(
+                &source,
+                format,
+                [base_oid, target_oid],
+                &HashSet::new(),
+                &mut streamed,
+            )
+            .expect("stream reachable pack")
+            .expect("non-empty streamed pack");
+            assert_eq!(streamed, stored.pack);
+            assert_eq!(streamed_build.reuse, build.reuse);
+            assert_eq!(streamed_build.summary.checksum, stored.checksum);
+            assert_eq!(streamed_build.summary.object_count, 2);
             fs::remove_dir_all(root).expect("remove test repository");
         }
     }
@@ -1641,6 +2033,21 @@ mod pack_reuse_tests {
             PackFile::parse(&build.pack.pack, format).expect("fallback pack is self-contained");
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.entries[0].object, target);
+
+        let mut streamed = Vec::new();
+        let streamed_build = write_reachable_pack_with_reuse_stats_to_writer(
+            &reader,
+            format,
+            [target_oid],
+            &HashSet::new(),
+            &mut streamed,
+        )
+        .expect("stream regenerated pack")
+        .expect("non-empty streamed pack");
+        assert_eq!(streamed, build.pack.pack);
+        assert_eq!(streamed_build.reuse, build.reuse);
+        assert_eq!(streamed_build.summary.object_count, 1);
+        assert_eq!(streamed_build.summary.checksum, build.pack.checksum);
     }
 
     #[test]
@@ -1744,6 +2151,21 @@ mod pack_reuse_tests {
                 .iter()
                 .any(|entry| entry.entry.oid == commit_oid && entry.object == commit)
         );
+
+        let mut streamed = Vec::new();
+        let streamed_build = write_reachable_pack_with_reuse_stats_to_writer(
+            &source,
+            format,
+            [commit_oid],
+            &HashSet::new(),
+            &mut streamed,
+        )
+        .expect("stream multi-pack closure")
+        .expect("non-empty streamed pack");
+        assert_eq!(streamed, build.pack.pack);
+        assert_eq!(streamed_build.reuse, build.reuse);
+        assert_eq!(streamed_build.summary.object_count, 3);
+        assert_eq!(streamed_build.summary.checksum, build.pack.checksum);
         fs::remove_dir_all(root).expect("remove test repository");
     }
 }

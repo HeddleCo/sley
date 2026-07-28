@@ -361,17 +361,17 @@ pub(crate) fn cmd_upload_pack(
     }
 
     let sideband = sley_remote::upload_pack_request_uses_sideband(&request);
-    let response = sley_remote::upload_pack_from_local_repository(
-        &git_dir, format, &features, request, haves,
-    )?;
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    if sideband {
-        let response = sley_remote::upload_pack_sideband_response(response);
-        write_upload_pack_packfile_response(&mut stdout, &response)?;
-    } else {
-        write_upload_pack_raw_packfile_response(&mut stdout, &response)?;
-    }
+    sley_remote::write_upload_pack_from_local_repository(
+        &git_dir,
+        format,
+        &features,
+        request,
+        haves,
+        sideband,
+        &mut stdout,
+    )?;
     stdout.flush()?;
     Ok(())
 }
