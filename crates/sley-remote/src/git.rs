@@ -24,12 +24,12 @@ use sley_odb::FileObjectDatabase;
 use sley_protocol::{
     GitService, ProtocolV2CommandOptions, ProtocolV2FetchRequest, ProtocolV2FetchShallowInfo,
     ProtocolV2LsRefsRequest, ProtocolVersion, ReceivePackCommand, ReceivePackFeatures,
-    RefAdvertisement, TransportHandshake, UploadPackFeatures, UploadPackNegotiationRequest,
-    UploadPackRequest, parse_protocol_v2_fetch_features, parse_receive_pack_features,
-    parse_refspec, parse_upload_pack_features, plan_push_commands,
+    RefAdvertisement, TransportHandshake, TransportLimits, UploadPackFeatures,
+    UploadPackNegotiationRequest, UploadPackRequest, parse_protocol_v2_fetch_features,
+    parse_receive_pack_features, parse_refspec, parse_upload_pack_features, plan_push_commands,
     protocol_v2_ls_refs_records_to_ref_advertisement_set, protocol_v2_object_format,
     read_protocol_v2_advertisement, read_protocol_v2_ls_refs_response, read_ref_advertisement_set,
-    write_protocol_v2_command_request, write_protocol_v2_fetch_request,
+    read_to_end_bounded, write_protocol_v2_command_request, write_protocol_v2_fetch_request,
     write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::FileRefStore;
@@ -478,8 +478,10 @@ pub(crate) fn execute_push_git_plan(
         crate::push::validate_receive_pack_unpack(&report)?;
         Some(report)
     } else {
-        let mut sink = Vec::new();
-        stream.read_to_end(&mut sink)?;
+        drain_unreported_receive_pack_response(
+            &mut stream,
+            crate::transport_limits_from_config(Some(request.config)),
+        )?;
         None
     };
     Ok(PushOutcome {
@@ -487,6 +489,14 @@ pub(crate) fn execute_push_git_plan(
         report,
         remote_progress: Vec::new(),
     })
+}
+
+fn drain_unreported_receive_pack_response(
+    stream: &mut dyn Read,
+    limits: TransportLimits,
+) -> Result<()> {
+    read_to_end_bounded(stream, limits.receive_pack_response())?;
+    Ok(())
 }
 
 fn receive_pack_advertisements(
@@ -714,6 +724,35 @@ mod tests {
 
     use sley_protocol::{ProtocolVersion, RefAdvertisement, RefAdvertisementSet};
     use sley_transport::read_service_request;
+
+    fn response_limits(bytes: u64) -> TransportLimits {
+        TransportLimits {
+            max_ref_advertisement_bytes: bytes,
+            ..TransportLimits::default()
+        }
+    }
+
+    #[test]
+    fn oversized_git_receive_pack_stream_is_refused_cleanly() {
+        let exact = vec![b'x'; 64 * 1024];
+        drain_unreported_receive_pack_response(&mut exact.as_slice(), response_limits(64 * 1024))
+            .expect("git:// receive-pack output exactly at the ceiling must be admitted");
+
+        let oversized = vec![b'x'; exact.len() + 1];
+        let error = drain_unreported_receive_pack_response(
+            &mut oversized.as_slice(),
+            response_limits(64 * 1024),
+        )
+        .expect_err("git:// receive-pack output past the ceiling must be refused");
+        assert!(
+            error.to_string().contains("exceeds the configured ceiling"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("stopped at 65537 bytes"),
+            "the bounded read must stop one byte past the ceiling: {error}"
+        );
+    }
 
     #[test]
     fn configured_protocol_v1_is_added_to_git_daemon_requests() {
