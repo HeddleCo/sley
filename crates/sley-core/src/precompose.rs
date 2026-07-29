@@ -8,30 +8,30 @@
 //! 2. Converts NFD names from `readdir` to NFC (`precompose_utf8_readdir`)
 //!
 //! This module mirrors that behavior for Sley. Conversion is gated by a
-//! process-thread flag set from the effective repository config (same role as
-//! git's `precomposed_unicode` cache).
+//! process-wide flag set from the effective repository config (same role as
+//! git's `precomposed_unicode` cache). The flag is shared across threads so
+//! parallel worktree/status workers see the same value as the main thread.
 
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use unicode_normalization::UnicodeNormalization;
 
-thread_local! {
-    /// Whether the active repository has `core.precomposeunicode=true`.
-    /// Matches git's cached `repo_config_values::precomposed_unicode == 1`.
-    static PRECOMPOSE_UNICODE: Cell<bool> = const { Cell::new(false) };
-}
+/// Whether the active repository has `core.precomposeunicode=true`.
+/// Matches git's cached `repo_config_values::precomposed_unicode == 1`.
+/// Process-wide so status/worktree worker threads share the repo-open value.
+static PRECOMPOSE_UNICODE: AtomicBool = AtomicBool::new(false);
 
-/// Enable or disable NFD→NFC path conversion for this thread.
+/// Enable or disable NFD→NFC path conversion for this process.
 pub fn set_precompose_unicode(enabled: bool) {
-    PRECOMPOSE_UNICODE.with(|cell| cell.set(enabled));
+    PRECOMPOSE_UNICODE.store(enabled, Ordering::Relaxed);
 }
 
 /// Whether path precomposition is currently active.
 pub fn precompose_unicode_enabled() -> bool {
-    PRECOMPOSE_UNICODE.with(|cell| cell.get())
+    PRECOMPOSE_UNICODE.load(Ordering::Relaxed)
 }
 
 /// Activate precomposition from a config bool (or `None` → disabled).
@@ -157,9 +157,20 @@ pub fn precompose_argv_if_needed(args: &mut [String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serialize tests that mutate the process-wide precompose flag so they
+    /// do not race when cargo runs the suite with multiple threads.
+    fn lock_precompose_for_test() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn nfc_conversion_only_when_enabled() {
+        let _guard = lock_precompose_for_test();
         let nfd = "A\u{0308}"; // A + combining diaeresis
         let nfc = "\u{00C4}"; // Ä
 
@@ -176,6 +187,7 @@ mod tests {
 
     #[test]
     fn path_components_are_precomposed() {
+        let _guard = lock_precompose_for_test();
         set_precompose_unicode(true);
         let nfd = PathBuf::from("d.A\u{0308}/f.A\u{0308}");
         let precomposed = precompose_path_if_needed(&nfd);
@@ -184,5 +196,38 @@ mod tests {
             "d.\u{00C4}/f.\u{00C4}"
         );
         set_precompose_unicode(false);
+    }
+
+    /// Parallel status workers must observe the same flag the parent set at
+    /// repo open (no per-thread re-activation required).
+    #[test]
+    fn worker_thread_sees_parent_set_value() {
+        let _guard = lock_precompose_for_test();
+        set_precompose_unicode(true);
+        let nfd = "A\u{0308}";
+        let nfc = "\u{00C4}";
+
+        let enabled = std::thread::scope(|s| {
+            s.spawn(|| {
+                assert!(precompose_unicode_enabled());
+                assert_eq!(precompose_string_if_needed(nfd).as_ref(), nfc);
+                precompose_unicode_enabled()
+            })
+            .join()
+            .expect("worker join")
+        });
+        assert!(enabled);
+
+        set_precompose_unicode(false);
+        let disabled = std::thread::scope(|s| {
+            s.spawn(|| {
+                assert!(!precompose_unicode_enabled());
+                assert_eq!(precompose_string_if_needed(nfd).as_ref(), nfd);
+                precompose_unicode_enabled()
+            })
+            .join()
+            .expect("worker join")
+        });
+        assert!(!disabled);
     }
 }

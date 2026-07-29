@@ -2130,50 +2130,12 @@ fn validate_incoming_fetch_objects(
     if roots.is_empty() {
         return Ok(());
     }
-    // git's check_connected (connected.c): when the destination already has a
-    // promisor remote, a full rev-list walk is either short-circuited (tips in a
-    // promisor pack) or run with --exclude-promisor-objects, which does not fail
-    // merely because historical filtered-out blobs remain absent. Sley's full
-    // fsck connectivity re-walks that history and reports false broken links.
-    // For promisor destinations, require only that each wanted tip is present
-    // (the pack transfer already delivered the objects needed for those tips).
-    if destination_has_promisor {
-        for oid in &roots {
-            if !db.contains(oid)? {
-                // Match git's check_connected wording (clone.c / fetch-pack.c).
-                return Err(GitError::InvalidFormat(
-                    "fatal: remote did not send all necessary objects".into(),
-                ));
-            }
-        }
-        if policy.is_none_or(|policy| !policy.enabled) && !require_connectivity {
-            return Ok(());
-        }
-        // Strict fetch.fsckObjects still content-checks the tips without
-        // re-walking historical promised-missing blobs.
-        if policy.is_some_and(|policy| policy.enabled) {
-            let options = sley_fsck::FsckOptions {
-                connectivity_only: false,
-                check_content: true,
-                ..policy
-                    .map(|policy| policy.fsck_options(true))
-                    .unwrap_or_default()
-            };
-            // Content-only: pass tips as object_ids (no graph walk roots).
-            let report = sley_fsck::fsck_objects_with_options(db, format, [], roots, options);
-            for issue in &report.issues {
-                match issue.stream {
-                    sley_fsck::IssueStream::Stdout => println!("{}", issue.message),
-                    sley_fsck::IssueStream::Stderr => eprintln!("{}", issue.message),
-                }
-            }
-            if !report.is_ok() {
-                return Err(GitError::Exit(128));
-            }
-        }
-        return Ok(());
-    }
-    let options = policy.map_or_else(
+    // git's check_connected (connected.c) always walks from the wanted tips.
+    // With a promisor destination the walk is `rev-list --exclude-promisor-objects`:
+    // objects already known to be in promisor packs form a boundary, so
+    // historical filtered-out blobs do not fail connectivity, but a pack that
+    // delivers a tip commit while omitting its (non-promisor) tree still fails.
+    let mut options = policy.map_or_else(
         || sley_fsck::FsckOptions {
             connectivity_only: true,
             check_content: false,
@@ -2181,6 +2143,9 @@ fn validate_incoming_fetch_objects(
         },
         |policy| policy.fsck_options(policy.enabled),
     );
+    if destination_has_promisor {
+        options.exclude_promisor_objects = true;
+    }
     let report = sley_fsck::fsck_objects_with_options(db, format, roots, [], options);
     for issue in &report.issues {
         match issue.stream {
@@ -2191,8 +2156,7 @@ fn validate_incoming_fetch_objects(
     if report.is_ok() {
         Ok(())
     } else {
-        // Full connectivity failure for a non-promisor destination matches
-        // git's check_connected die message used by clone and fetch-pack.
+        // Match git's check_connected die message used by clone and fetch-pack.
         Err(GitError::InvalidFormat(
             "fatal: remote did not send all necessary objects".into(),
         ))
@@ -3592,7 +3556,8 @@ mod tests {
         let mut credentials = NoCredentials;
         let mut progress = SilentProgress;
 
-        let error = fetch(
+        // Soft non-ff rejections return Ok(outcome) with rejection set (CLI re-raises).
+        let outcome = fetch(
             FetchRequest {
                 git_dir: &local,
                 format: ObjectFormat::Sha1,
@@ -3610,8 +3575,14 @@ mod tests {
                 cancel: sley_core::CancelFlag::never(),
             },
         )
-        .expect_err("divergent update must fail");
-        assert!(error.to_string().contains("non-fast-forward"));
+        .expect("soft non-ff returns outcome");
+        let reason = outcome
+            .rejection
+            .expect("divergent update must set rejection");
+        assert!(
+            reason.contains("non-fast-forward"),
+            "unexpected rejection: {reason}"
+        );
         let refs = FileRefStore::new(&local, ObjectFormat::Sha1);
         assert_eq!(
             refs.read_ref("refs/heads/side").expect("read side"),
@@ -3619,7 +3590,7 @@ mod tests {
         );
 
         options.force = true;
-        fetch(
+        let forced = fetch(
             FetchRequest {
                 git_dir: &local,
                 format: ObjectFormat::Sha1,
@@ -3638,6 +3609,7 @@ mod tests {
             },
         )
         .expect("forced fetch should update");
+        assert!(forced.rejection.is_none());
         assert_eq!(
             refs.read_ref("refs/heads/side").expect("read forced side"),
             Some(RefTarget::Direct(remote_tip))

@@ -261,6 +261,7 @@ pub(crate) fn cmd_fsck(cli_session: &crate::session::CliSession, args: &[String]
             severity: policy.severity,
             skip_objects: policy.skip_objects,
             check_content: true,
+            exclude_promisor_objects: false,
         },
     );
     // Match builtin/fsck.c's stream split: notices (dangling/unreachable) and

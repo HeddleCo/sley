@@ -321,6 +321,13 @@ pub struct FsckOptions {
     /// Whether commit/tree/tag content rules run. Incoming packs always need
     /// identity/connectivity checks even when strict content fsck is disabled.
     pub check_content: bool,
+    /// Match `git rev-list --exclude-promisor-objects`: treat objects known to
+    /// be in promisor packs (and their promised-missing transitive links) as a
+    /// hard boundary. Roots and links that are promisor objects are not
+    /// expanded, so historical filtered-out blobs do not fail connectivity,
+    /// while a non-promisor tip whose tree is absent and not promised still
+    /// fails.
+    pub exclude_promisor_objects: bool,
 }
 
 impl Default for FsckOptions {
@@ -333,6 +340,7 @@ impl Default for FsckOptions {
             severity: SeverityConfig::default(),
             skip_objects: HashSet::new(),
             check_content: true,
+            exclude_promisor_objects: false,
         }
     }
 }
@@ -380,6 +388,7 @@ where
         skip_objects: options.skip_objects.clone(),
         check_content: options.check_content,
         connectivity_only: options.connectivity_only,
+        exclude_promisor_objects: options.exclude_promisor_objects,
         object_names: options.object_names.clone(),
         error_bits: 0,
         gitmodules_found: HashSet::new(),
@@ -433,6 +442,7 @@ struct FsckChecker<'a, R> {
     skip_objects: HashSet<ObjectId>,
     check_content: bool,
     connectivity_only: bool,
+    exclude_promisor_objects: bool,
     object_names: HashMap<ObjectId, String>,
     /// Accumulated git exit-code bits (`ERROR_REACHABLE`).
     error_bits: i32,
@@ -500,6 +510,11 @@ where
     }
 
     fn check_object_link(&mut self, source: Option<ObjectLink>, link: ObjectLink) {
+        // `--exclude-promisor-objects`: promisor oids are a hard boundary even
+        // when present — do not expand their graph (matches rev-list).
+        if self.exclude_promisor_objects && self.reader.is_promised_object(&link.oid) {
+            return;
+        }
         let object = match self.read_object_cached(link.oid) {
             ObjectRead::Fresh(object) => object,
             ObjectRead::Seen(object_type) => {
@@ -519,6 +534,11 @@ where
     }
 
     fn check_object(&mut self, oid: ObjectId) {
+        // A tip that is itself a promisor object is accepted without walking,
+        // matching git's check_connected short-circuit for tips in promisor packs.
+        if self.exclude_promisor_objects && self.reader.is_promised_object(&oid) {
+            return;
+        }
         let object = match self.read_object_cached(oid) {
             ObjectRead::Fresh(object) => object,
             ObjectRead::Seen(_) => return,
