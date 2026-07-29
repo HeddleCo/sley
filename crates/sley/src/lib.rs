@@ -1349,9 +1349,7 @@ fn filesystem_device(path: &Path) -> Option<u64> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path)
-            .ok()
-            .map(|metadata| metadata.dev())
+        std::fs::metadata(path).ok().map(|metadata| metadata.dev())
     }
     #[cfg(not(unix))]
     {
@@ -1995,15 +1993,11 @@ mod tests {
                 Some(1)
             }
         };
-        let outer_git_dir =
-            discover_git_dir_with_device(&start, true, simulated_device)
-                .expect("unbounded discovery reaches outer repository");
-        let unbounded_paths = sley_worktree::untracked_paths(
-            temp.path(),
-            &outer_git_dir,
-            ObjectFormat::Sha1,
-        )
-        .expect("walk outer worktree");
+        let outer_git_dir = discover_git_dir_with_device(&start, true, simulated_device)
+            .expect("unbounded discovery reaches outer repository");
+        let unbounded_paths =
+            sley_worktree::untracked_paths(temp.path(), &outer_git_dir, ObjectFormat::Sha1)
+                .expect("walk outer worktree");
         assert!(
             unbounded_paths.contains(&b"sibling/outside.txt".to_vec()),
             "fixture must prove an unbounded discovery includes the outer sibling"
