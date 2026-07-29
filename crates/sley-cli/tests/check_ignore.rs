@@ -1,7 +1,9 @@
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -70,6 +72,76 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
     );
 }
 
+fn assert_responses_before_stdin_eof(cwd: &Path, args: &[&str], exchanges: &[(&[u8], &[u8])]) {
+    let mut child = Command::new(sley_testkit::sley_bin!())
+        .current_dir(cwd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("failed to run sley {args:?}: {err}"));
+    let mut stdin = child.stdin.take().expect("stdin pipe");
+    let mut stdout = child.stdout.take().expect("stdout pipe");
+    let response_lengths = exchanges
+        .iter()
+        .map(|(_, response)| response.len())
+        .collect::<Vec<_>>();
+    let (response_tx, response_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for response_len in response_lengths {
+            let mut response = vec![0; response_len];
+            let result = stdout.read_exact(&mut response).map(|()| response);
+            let stop = result.is_err();
+            if response_tx.send(result).is_err() || stop {
+                break;
+            }
+        }
+    });
+
+    for (input_record, expected_response) in exchanges {
+        stdin
+            .write_all(input_record)
+            .expect("write one input record");
+        stdin.flush().expect("flush one input record");
+        let response = match response_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                let _ = child.kill();
+                drop(stdin);
+                let _ = child.wait();
+                reader.join().expect("join stdout reader");
+                panic!("sley {args:?} closed stdout before responding: {err}");
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                drop(stdin);
+                let _ = child.wait();
+                reader.join().expect("join stdout reader");
+                panic!("sley {args:?} did not respond while stdin remained open");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = child.kill();
+                drop(stdin);
+                let _ = child.wait();
+                reader.join().expect("join stdout reader");
+                panic!("stdout reader for sley {args:?} disconnected");
+            }
+        };
+        assert_eq!(
+            response, *expected_response,
+            "response differed for {args:?}"
+        );
+    }
+
+    drop(stdin);
+    assert!(
+        child.wait().expect("wait for streaming command").success(),
+        "sley {args:?} failed after stdin EOF"
+    );
+    reader.join().expect("join stdout reader");
+}
+
 fn fixture(root: &Path) {
     run(
         sley_testkit::oracle_git(),
@@ -110,6 +182,51 @@ fn write_fixture_contents(root: &Path) {
         root,
         &["add", "-f", "tracked.log"],
     );
+}
+
+#[test]
+fn stdin_path_protocols_respond_before_eof() {
+    let root = unique_temp_dir("stdin-path-streaming");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        fixture(&root);
+        fs::write(root.join(".gitattributes"), b"*.txt text\n").expect("write attributes fixture");
+
+        assert_responses_before_stdin_eof(
+            &root,
+            &["check-ignore", "--stdin"],
+            &[
+                (b"ignored.log\n".as_slice(), b"ignored.log\n".as_slice()),
+                (b"ignored.cache\n".as_slice(), b"ignored.cache\n".as_slice()),
+            ],
+        );
+        assert_responses_before_stdin_eof(
+            &root,
+            &["check-attr", "--stdin", "text"],
+            &[
+                (
+                    b"visible.txt\n".as_slice(),
+                    b"visible.txt: text: set\n".as_slice(),
+                ),
+                (
+                    b"important.log\n".as_slice(),
+                    b"important.log: text: unspecified\n".as_slice(),
+                ),
+            ],
+        );
+
+        let visible_hash = git(&root, &["hash-object", "visible.txt"], None).stdout;
+        let ignored_hash = git(&root, &["hash-object", "ignored.log"], None).stdout;
+        assert_responses_before_stdin_eof(
+            &root,
+            &["hash-object", "--stdin-paths"],
+            &[
+                (b"visible.txt\n".as_slice(), visible_hash.as_slice()),
+                (b"ignored.log\n".as_slice(), ignored_hash.as_slice()),
+            ],
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
