@@ -25,6 +25,8 @@ use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::ObjectType;
 use sley_odb::{FileObjectDatabase, ObjectReader};
 use sley_refs::{FileRefStore, Ref, RefTarget};
+#[cfg(feature = "http")]
+use sley_transport::HttpClient;
 use sley_transport::RemoteUrl;
 
 use crate::CredentialProvider;
@@ -134,6 +136,34 @@ pub fn ls_remote_with(
     matches: &dyn Fn(&str) -> bool,
     credentials: &mut dyn CredentialProvider,
 ) -> Result<LsRemoteOutcome> {
+    #[cfg(feature = "http")]
+    {
+        ls_remote_with_http_client(request, matches, credentials, None)
+    }
+    #[cfg(not(feature = "http"))]
+    {
+        ls_remote_with_impl(request, matches, credentials)
+    }
+}
+
+/// Like [`ls_remote_with`], but drives smart HTTP through a caller-provided
+/// client when `http_client` is `Some`.
+#[cfg(feature = "http")]
+pub fn ls_remote_with_http_client(
+    request: LsRemoteRequest<'_>,
+    matches: &dyn Fn(&str) -> bool,
+    credentials: &mut dyn CredentialProvider,
+    http_client: Option<&dyn HttpClient>,
+) -> Result<LsRemoteOutcome> {
+    ls_remote_with_impl(request, matches, credentials, http_client)
+}
+
+fn ls_remote_with_impl(
+    request: LsRemoteRequest<'_>,
+    matches: &dyn Fn(&str) -> bool,
+    credentials: &mut dyn CredentialProvider,
+    #[cfg(feature = "http")] http_client: Option<&dyn HttpClient>,
+) -> Result<LsRemoteOutcome> {
     let LsRemoteRequest {
         source,
         format,
@@ -144,9 +174,15 @@ pub fn ls_remote_with(
         .map_err(crate::protocol::transport_policy_git_error)?;
     let (records, format) = match source {
         #[cfg(feature = "http")]
-        LsRemoteSource::Http(remote) => {
-            ls_remote_http(remote, format, filter, matches, credentials, config)
-        }
+        LsRemoteSource::Http(remote) => ls_remote_http(
+            remote,
+            format,
+            filter,
+            matches,
+            credentials,
+            config,
+            http_client,
+        ),
         #[cfg(not(feature = "http"))]
         LsRemoteSource::Http(_) => Err(GitError::Unsupported(
             "HTTP transport is not enabled in this build".into(),
@@ -186,15 +222,18 @@ fn ls_remote_http(
     matches: &dyn Fn(&str) -> bool,
     credentials: &mut dyn CredentialProvider,
     config: Option<&GitConfig>,
+    http_client: Option<&dyn HttpClient>,
 ) -> Result<(Vec<LsRemoteRecord>, ObjectFormat)> {
-    let http_batch = crate::http::HttpOperationBatch::new();
-    let (refs, features) = crate::http::http_upload_pack_advertisements(
-        http_batch.client(),
-        remote,
-        format,
-        credentials,
-        config,
-    )?;
+    let default_client;
+    let client = match http_client {
+        Some(client) => client,
+        None => {
+            default_client = crate::http::HttpOperationBatch::new();
+            default_client.client()
+        }
+    };
+    let (refs, features) =
+        crate::http::http_upload_pack_advertisements(client, remote, format, credentials, config)?;
     let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
     if format != ObjectFormat::Sha1 {
         return Err(GitError::Unsupported(format!(
