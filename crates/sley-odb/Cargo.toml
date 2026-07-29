@@ -17,7 +17,7 @@ sley-core.workspace = true
 sley-formats.workspace = true
 sley-mmap = { workspace = true, optional = true }
 sley-object.workspace = true
-sley-pack = { path = "../sley-pack", version = "0.5.0", default-features = false } # inline: default-features override cant use workspace inherit
+sley-pack = { path = "../sley-pack", version = "0.5.1", default-features = false } # inline: default-features override cant use workspace inherit
 
 [features]
 default = ["zlib-rs"]
