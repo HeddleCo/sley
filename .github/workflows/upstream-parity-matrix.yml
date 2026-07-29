@@ -47,15 +47,26 @@ jobs:
 
       - name: Install Git build dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install pcre2 gettext || true
+        run: brew install pcre2 gettext
 
       - name: Build oracle Git and Sley
         run: |
           git clone --depth=1 --branch "$ORACLE_GIT_TAG" https://github.com/git/git /tmp/git-src
           echo "${ORACLE_GIT_TAG#v}" > /tmp/git-src/version
           jobs="$(command -v nproc >/dev/null && nproc || sysctl -n hw.ncpu)"
+          if [ "$RUNNER_OS" = macOS ]; then
+            pcre2_prefix="$(brew --prefix pcre2)"
+            gettext_prefix="$(brew --prefix gettext)"
+            export CPPFLAGS="-I$pcre2_prefix/include -I$gettext_prefix/include"
+            export LDFLAGS="-L$pcre2_prefix/lib -L$gettext_prefix/lib"
+          fi
           make -C /tmp/git-src -j"$jobs" prefix=/tmp/git-prefix USE_LIBPCRE2=1 NO_TCLTK=YesPlease install
-          cargo build --locked -p sley-cli --bin sley --release --features git-compat-i18n
+          cargo build --locked -p sley-cli --bins --release --features git-compat-i18n
+
+      - name: Verify native Sley binaries
+        run: |
+          test -x target/release/sley
+          test -x target/release/scalar
 
       - name: Validate local transport test environment
         run: python3 crates/sley-testkit/scripts/preflight_upstream_environment.py --tmpdir /tmp
@@ -79,9 +90,10 @@ jobs:
           SLEY_TIMINGS="$root/oracle-timings.csv" \
           SLEY_CELLS="$root/oracle-cells.csv" \
           SLEY_DETAILS="$root/oracle-details.csv" \
-            crates/sley-testkit/scripts/run-upstream-tests-waves.sh || true
+            crates/sley-testkit/scripts/run-upstream-tests-waves.sh
           SLEY_TEST_TARGET=sley \
           SLEY_BIN="$GITHUB_WORKSPACE/target/release/sley" \
+          SLEY_SCALAR_BIN="$GITHUB_WORKSPACE/target/release/scalar" \
           SLEY_REPORT="$root/sley-report.txt" \
           SLEY_SUMMARY="$root/sley-summary.csv" \
           SLEY_HISTORY="$root/sley-history.csv" \
@@ -92,10 +104,10 @@ jobs:
           SLEY_ORACLE_DETAILS="$root/oracle-details.csv" \
           SLEY_COMPARISON="$root/comparison.csv" \
           SLEY_COMPARISON_SUMMARY="$root/comparison-summary.csv" \
-            crates/sley-testkit/scripts/run-upstream-tests-waves.sh || true
+            crates/sley-testkit/scripts/run-upstream-tests-waves.sh
 
-      - name: Report matrix correctness readiness
-        continue-on-error: true
+      - name: Enforce matrix correctness
+        if: always()
         run: |
           root="matrix-artifacts/${{ matrix.os }}-${{ matrix.hash }}"
           python3 crates/sley-testkit/scripts/check_upstream_correctness.py \
@@ -151,10 +163,18 @@ jobs:
       - name: Build oracle Git and Sley
         shell: msys2 {0}
         run: |
+          export PATH="$(cygpath -u "$USERPROFILE")/.cargo/bin:$PATH"
+          command -v cargo
           git clone --depth=1 --branch "$ORACLE_GIT_TAG" https://github.com/git/git /tmp/git-src
           echo "${ORACLE_GIT_TAG#v}" > /tmp/git-src/version
           make -C /tmp/git-src -j"$(nproc)" prefix=/tmp/git-prefix USE_LIBPCRE2=1 NO_TCLTK=YesPlease install
-          cargo build --locked -p sley-cli --bin sley --release --features git-compat-i18n
+          cargo build --locked -p sley-cli --bins --release --features git-compat-i18n
+
+      - name: Verify native Sley binaries
+        shell: msys2 {0}
+        run: |
+          test -x target/release/sley.exe
+          test -x target/release/scalar.exe
 
       - name: Validate local transport test environment
         shell: msys2 {0}
@@ -176,8 +196,9 @@ jobs:
           SLEY_REPORT="$root/oracle-report.txt" SLEY_SUMMARY="$root/oracle-summary.csv" \
           SLEY_HISTORY="$root/oracle-history.csv" SLEY_TIMINGS="$root/oracle-timings.csv" \
           SLEY_CELLS="$root/oracle-cells.csv" SLEY_DETAILS="$root/oracle-details.csv" \
-            sh crates/sley-testkit/scripts/run-upstream-tests-waves.sh || true
+            sh crates/sley-testkit/scripts/run-upstream-tests-waves.sh
           SLEY_TEST_TARGET=sley SLEY_BIN="$(pwd)/target/release/sley.exe" \
+          SLEY_SCALAR_BIN="$(pwd)/target/release/scalar.exe" \
           SLEY_REPORT="$root/sley-report.txt" SLEY_SUMMARY="$root/sley-summary.csv" \
           SLEY_HISTORY="$root/sley-history.csv" SLEY_TIMINGS="$root/sley-timings.csv" \
           SLEY_CELLS="$root/sley-cells.csv" SLEY_DETAILS="$root/sley-details.csv" \
@@ -185,11 +206,11 @@ jobs:
           SLEY_ORACLE_DETAILS="$root/oracle-details.csv" \
           SLEY_COMPARISON="$root/comparison.csv" \
           SLEY_COMPARISON_SUMMARY="$root/comparison-summary.csv" \
-            sh crates/sley-testkit/scripts/run-upstream-tests-waves.sh || true
+            sh crates/sley-testkit/scripts/run-upstream-tests-waves.sh
 
-      - name: Report matrix correctness readiness
+      - name: Enforce matrix correctness
         shell: msys2 {0}
-        continue-on-error: true
+        if: always()
         run: |
           root="matrix-artifacts/windows-${{ matrix.hash }}"
           python3 crates/sley-testkit/scripts/check_upstream_correctness.py \
