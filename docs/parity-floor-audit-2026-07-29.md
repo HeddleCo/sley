@@ -80,18 +80,32 @@ complete 891-script runs. [Run 30474663771](https://github.com/HeddleCo/sley/act
 keeps `t1501` cell 26 failing at 38/39, so the discovery fix does not resolve
 that regression.
 
-#200 also moves four other cells from PASS to FAIL, with no compensating gains:
+#200's run initially differed from the current-main run at four other cells:
 
-| Script / cell | Current main | #200 | Assertion |
-|---|---:|---:|---|
-| `t0300-credentials.sh` #48 | PASS | FAIL | URL parser rejects embedded carriage returns |
-| `t5003-archive-zip.sh` #82 | PASS | FAIL | Archive remote HTTP repository |
-| `t5702-protocol-v2.sh` #59 | PASS | FAIL | Archive with a custom path does not request v2 |
-| `t7510-signed-commit.sh` #28 | PASS | FAIL | Custom `gpg.program` |
+| Script / cell | Current main | #200 | Independent PR repeat | Disposition |
+|---|---:|---:|---:|---|
+| `t0300-credentials.sh` #48 | PASS | FAIL | FAIL | Run-conditional; not attributable to #200 |
+| `t5003-archive-zip.sh` #82 | PASS | FAIL | PASS | #200-specific loss |
+| `t5702-protocol-v2.sh` #59 | PASS | FAIL | PASS | #200-specific loss |
+| `t7510-signed-commit.sh` #28 | PASS | FAIL | PASS | #200-specific loss |
 
 The aggregate moves from 625 passed / 257 failed scripts and 30,965 OK /
 1,430 not-OK assertions to 623 passed / 259 failed and 30,961 OK / 1,434
-not-OK. The oracle remains clean at 883 passed / 0 failed / 8 skipped.
-Because #200 is not merged and introduces this negative delta, these floors
-remain banked against current main; the #200 results are reported separately
-on [issue #200](https://github.com/HeddleCo/sley/issues/200#issuecomment-5121361757).
+not-OK in that direct pair. However, the later #201 PR run without #200 also
+loses `t0300` #48, while recovering the independently flaky `t6416` cells
+noted above. Comparing #200 with that repeat isolates three #200-specific
+PASS→FAIL cells: `t5003` #82, `t5702` #59, and `t7510` #28. The oracle remains
+clean at 883 passed / 0 failed / 8 skipped. Because #200 is not merged and
+introduces those losses, these floors remain banked against current main; the
+#200 results are reported separately on
+[issue #200](https://github.com/HeddleCo/sley/issues/200#issuecomment-5121361757).
+
+## Final gate verification
+
+PR-head [run 30476383650](https://github.com/HeddleCo/sley/actions/runs/30476383650)
+completed all 891 scripts at commit `25b8fd01`: 625 passed / 257 failed / 9
+skipped and 30,966 OK / 1,429 not-OK assertions. The floor gate passed with the
+seven genuine losses bounded by their open issues; no floor was lowered for
+them. Relative to the earlier current-main run, `t0300` cell 48 changed
+PASS→FAIL while the two flaky `t6416` cells recovered, for a net gain of one
+OK assertion.
