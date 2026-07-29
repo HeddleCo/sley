@@ -198,11 +198,12 @@ jobs:
             --comparison-summary crates/sley-testkit/upstream-cell-comparison-summary.csv \
             --expected-scripts 891
 
-      # Floor gate: each tracked t-file must keep at least its recorded ok
-      # count. Reads the per-script summary CSV the runner writes
-      # (script,command,result,ok,notok,total,plan_total). A net GAIN passes;
-      # only a DROP below floor fails. Floors recorded 2026-06-10 against
-      # base b069dbe + git 2.55.0.
+      # Floor gate: each tracked t-file must keep at least its platform-correct
+      # recorded ok count. Reads the per-script summary CSV the runner writes
+      # (script,command,result,ok,notok,total,plan_total). A net GAIN passes.
+      # A drop fails unless it is linked to an explicit open-regression waiver;
+      # each waiver has a measured minimum, preserves the higher floor, and
+      # becomes a stale failure on recovery.
       - name: Check parity floors
         run: |
           bash .github/workflows/scripts/check-parity-floors.sh \
