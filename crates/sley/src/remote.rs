@@ -156,9 +156,53 @@ impl Repository {
         progress: &mut dyn ProgressSink,
         cancel: sley_core::DynCancelFlag<'_>,
     ) -> Result<FetchOutcome> {
+        self.fetch_with_http_client_and_cancel(
+            remote,
+            refspecs,
+            options,
+            credentials,
+            progress,
+            None,
+            cancel,
+        )
+    }
+
+    /// Like [`Repository::fetch`], with a caller-provided smart-HTTP client.
+    pub fn fetch_with_http_client(
+        &self,
+        remote: impl Into<String>,
+        refspecs: &[String],
+        options: FetchOptions,
+        credentials: &mut dyn CredentialProvider,
+        progress: &mut dyn ProgressSink,
+        http_client: Option<&dyn HttpClient>,
+    ) -> Result<FetchOutcome> {
+        self.fetch_with_http_client_and_cancel(
+            remote,
+            refspecs,
+            options,
+            credentials,
+            progress,
+            http_client,
+            sley_core::CancelFlag::never(),
+        )
+    }
+
+    /// Like [`Repository::fetch_with_http_client`], with cooperative cancellation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fetch_with_http_client_and_cancel(
+        &self,
+        remote: impl Into<String>,
+        refspecs: &[String],
+        options: FetchOptions,
+        credentials: &mut dyn CredentialProvider,
+        progress: &mut dyn ProgressSink,
+        http_client: Option<&dyn HttpClient>,
+        cancel: sley_core::DynCancelFlag<'_>,
+    ) -> Result<FetchOutcome> {
         let ctx = self.remote(remote)?;
         let source = ctx.fetch_source(self)?;
-        let outcome = fetch(
+        let outcome = fetch_with_http_client(
             FetchRequest {
                 git_dir: self.git_dir(),
                 format: self.object_format(),
@@ -175,6 +219,7 @@ impl Repository {
                 ref_hook: None,
                 cancel,
             },
+            http_client,
         )?;
         self.refresh_objects();
         Ok(outcome)
@@ -260,9 +305,49 @@ impl Repository {
         progress: &mut dyn ProgressSink,
         cancel: sley_core::DynCancelFlag<'_>,
     ) -> Result<PushOutcome> {
+        self.push_actions_with_http_client_and_cancel(
+            remote,
+            plan,
+            credentials,
+            progress,
+            None,
+            cancel,
+        )
+    }
+
+    /// Like [`Repository::push_actions`], with a caller-provided smart-HTTP client.
+    pub fn push_actions_with_http_client(
+        &self,
+        remote: impl Into<String>,
+        plan: PushActionPlan,
+        credentials: &mut dyn CredentialProvider,
+        progress: &mut dyn ProgressSink,
+        http_client: Option<&dyn HttpClient>,
+    ) -> Result<PushOutcome> {
+        self.push_actions_with_http_client_and_cancel(
+            remote,
+            plan,
+            credentials,
+            progress,
+            http_client,
+            sley_core::CancelFlag::never(),
+        )
+    }
+
+    /// Like [`Repository::push_actions_with_http_client`], with cooperative cancellation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_actions_with_http_client_and_cancel(
+        &self,
+        remote: impl Into<String>,
+        plan: PushActionPlan,
+        credentials: &mut dyn CredentialProvider,
+        progress: &mut dyn ProgressSink,
+        http_client: Option<&dyn HttpClient>,
+        cancel: sley_core::DynCancelFlag<'_>,
+    ) -> Result<PushOutcome> {
         let ctx = self.remote(remote)?;
         let destination = ctx.push_destination(self)?;
-        push_actions(
+        push_actions_with_http_client(
             PushActionRequest {
                 git_dir: self.git_dir(),
                 common_git_dir: self.common_dir(),
@@ -277,6 +362,7 @@ impl Repository {
                 progress,
                 cancel,
             },
+            http_client,
         )
     }
 
@@ -288,6 +374,18 @@ impl Repository {
         matches: &dyn Fn(&str) -> bool,
         credentials: &mut dyn CredentialProvider,
     ) -> Result<Vec<LsRemoteRecord>> {
+        self.ls_remote_with_http_client(remote, filter, matches, credentials, None)
+    }
+
+    /// Like [`Repository::ls_remote`], with a caller-provided smart-HTTP client.
+    pub fn ls_remote_with_http_client(
+        &self,
+        remote: impl Into<String>,
+        filter: LsRemoteFilter,
+        matches: &dyn Fn(&str) -> bool,
+        credentials: &mut dyn CredentialProvider,
+        http_client: Option<&dyn HttpClient>,
+    ) -> Result<Vec<LsRemoteRecord>> {
         let ctx = self.remote(remote)?;
         let source = ctx.fetch_source(self)?;
         let ls_source = match source {
@@ -296,15 +394,18 @@ impl Repository {
             FetchSource::Git { remote, .. } => LsRemoteSource::Git(remote),
             FetchSource::Local { git_dir, .. } => LsRemoteSource::Local { git_dir },
         };
-        Ok(ls_remote(
-            &ls_source,
-            self.object_format(),
-            &filter,
+        Ok(ls_remote_with_http_client(
+            LsRemoteRequest {
+                source: &ls_source,
+                format: self.object_format(),
+                filter: &filter,
+                config: Some(ctx.config()),
+            },
             matches,
-            Some(ctx.config()),
             credentials,
+            http_client,
         )?
-        .0)
+        .records)
     }
 
     /// Directory relative local remote paths resolve against: working tree root,
