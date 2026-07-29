@@ -1310,7 +1310,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "sley"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-config",
  "sley-core",
@@ -1334,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "sley-archive"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "crc32fast",
  "flate2",
@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "sley-bench"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "criterion",
  "sley-cli",
@@ -1365,7 +1365,7 @@ dependencies = [
 
 [[package]]
 name = "sley-cli"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "ctrlc",
  "encoding_rs",
@@ -1397,14 +1397,14 @@ dependencies = [
 
 [[package]]
 name = "sley-config"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-core",
 ]
 
 [[package]]
 name = "sley-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sha1",
  "unicode-normalization",
@@ -1412,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "sley-diff-merge"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-config",
  "sley-core",
@@ -1427,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "sley-formats"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "flate2",
  "sley-config",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "sley-fsck"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-config",
  "sley-core",
@@ -1450,21 +1450,21 @@ dependencies = [
 
 [[package]]
 name = "sley-grep"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-core",
 ]
 
 [[package]]
 name = "sley-i18n"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "encoding_rs",
 ]
 
 [[package]]
 name = "sley-index"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-core",
  "sley-mmap",
@@ -1472,14 +1472,14 @@ dependencies = [
 
 [[package]]
 name = "sley-mmap"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "memmap2",
 ]
 
 [[package]]
 name = "sley-notes"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-config",
  "sley-core",
@@ -1492,14 +1492,14 @@ dependencies = [
 
 [[package]]
 name = "sley-object"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-core",
 ]
 
 [[package]]
 name = "sley-odb"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "crc32fast",
  "flate2",
@@ -1513,14 +1513,14 @@ dependencies = [
 
 [[package]]
 name = "sley-options"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-core",
 ]
 
 [[package]]
 name = "sley-pack"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "crc32fast",
  "flate2",
@@ -1531,14 +1531,14 @@ dependencies = [
 
 [[package]]
 name = "sley-pathspec"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-core",
 ]
 
 [[package]]
 name = "sley-pretty"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "encoding_rs",
  "sley-config",
@@ -1553,21 +1553,21 @@ dependencies = [
 
 [[package]]
 name = "sley-procinfo"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "sley-protocol"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-core",
 ]
 
 [[package]]
 name = "sley-ref-filter"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-core",
  "sley-strbuf-expand",
@@ -1575,7 +1575,7 @@ dependencies = [
 
 [[package]]
 name = "sley-refs"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-config",
  "sley-core",
@@ -1584,7 +1584,7 @@ dependencies = [
 
 [[package]]
 name = "sley-remote"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-config",
  "sley-core",
@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "sley-rev"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "regex",
  "sley-config",
@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "sley-sequencer"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-core",
  "sley-formats",
@@ -1634,14 +1634,14 @@ dependencies = [
 
 [[package]]
 name = "sley-strbuf-expand"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-core",
 ]
 
 [[package]]
 name = "sley-submodule"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-config",
  "sley-core",
@@ -1649,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "sley-testkit"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-config",
  "sley-core",
@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "sley-transport"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "rcgen",
  "rustls",
@@ -1680,7 +1680,7 @@ dependencies = [
 
 [[package]]
 name = "sley-unpack-trees"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "sley-core",
  "sley-index",
@@ -1688,7 +1688,7 @@ dependencies = [
 
 [[package]]
 name = "sley-worktree"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "encoding_rs",
  "same-file",
