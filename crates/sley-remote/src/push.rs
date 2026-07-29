@@ -647,24 +647,31 @@ fn plan_push_actions_impl(
     match request.destination {
         #[cfg(feature = "http")]
         PushDestination::Http(remote_url) => {
-            let http_batch = http_client
-                .is_none()
-                .then(crate::http::HttpOperationBatch::new);
-            let client = http_client
-                .or_else(|| {
-                    http_batch
-                        .as_ref()
-                        .map(|batch| batch.client() as &dyn HttpClient)
-                })
-                .expect("an injected or default HTTP client is always available");
-            let discovered = crate::http::http_service_advertisements(
-                client,
-                remote_url,
-                request.format,
-                GitService::ReceivePack,
-                services.credentials,
-                Some(request.config),
-            )?;
+            let (discovered, http_batch) = match http_client {
+                Some(client) => (
+                    crate::http::http_service_advertisements(
+                        client,
+                        remote_url,
+                        request.format,
+                        GitService::ReceivePack,
+                        services.credentials,
+                        Some(request.config),
+                    )?,
+                    None,
+                ),
+                None => {
+                    let batch = crate::http::HttpOperationBatch::new();
+                    let discovered = crate::http::http_service_advertisements(
+                        batch.client(),
+                        remote_url,
+                        request.format,
+                        GitService::ReceivePack,
+                        services.credentials,
+                        Some(request.config),
+                    )?;
+                    (discovered, Some(batch))
+                }
+            };
             let advertisement_set = discovered.set;
             let features = advertised_receive_pack_features(&advertisement_set.refs)?;
             verify_remote_object_format(&features, request.format)?;
@@ -3259,16 +3266,22 @@ fn resolve_for_each_ref_target(
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
+    use std::net::TcpListener;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use sley_formats::RepositoryLayout;
     use sley_object::{BString, Commit, EncodedObject, ObjectType, Tree, TreeEntry};
     use sley_odb::{FileObjectDatabase, ObjectReplacements, ObjectWriter};
     use sley_protocol::{
-        ReceivePackCommandStatus, ReceivePackUnpackStatus, SideBandChannel, SideBandPacket,
-        write_receive_pack_report_status, write_sideband_stream,
+        ProtocolVersion, ReceivePackCommandStatus, ReceivePackUnpackStatus, RefAdvertisementSet,
+        SideBandChannel, SideBandPacket, write_receive_pack_report_status, write_sideband_stream,
     };
     use sley_refs::{RefTarget, RefUpdate};
+    use sley_transport::{
+        ServiceAnnouncement, ServiceDiscoveryPayload, ServiceDiscoveryResponse, parse_remote_url,
+        write_service_discovery_response,
+    };
 
     use crate::{NoCredentials, SilentProgress};
 
@@ -3354,6 +3367,186 @@ mod tests {
             atomic: false,
             push_options: Vec::new(),
         }
+    }
+
+    fn http_delete_push_bodies(old: ObjectId) -> (Vec<u8>, Vec<u8>) {
+        let mut discovery = Vec::new();
+        write_service_discovery_response(
+            &mut discovery,
+            &ServiceDiscoveryResponse {
+                announcement: ServiceAnnouncement {
+                    service: GitService::ReceivePack,
+                },
+                payload: ServiceDiscoveryPayload::AdvertisedRefs(RefAdvertisementSet {
+                    protocol: ProtocolVersion::V0,
+                    refs: vec![RefAdvertisement {
+                        oid: old,
+                        name: "refs/heads/remove".into(),
+                        capabilities: vec![
+                            sley_core::Capability {
+                                name: "report-status".into(),
+                                value: None,
+                            },
+                            sley_core::Capability {
+                                name: "delete-refs".into(),
+                                value: None,
+                            },
+                        ],
+                    }],
+                    shallow: Vec::new(),
+                }),
+            },
+        )
+        .expect("discovery response should encode");
+
+        let mut result = Vec::new();
+        write_receive_pack_report_status(
+            &mut result,
+            &ReceivePackReportStatus {
+                unpack: ReceivePackUnpackStatus::Ok,
+                commands: vec![ReceivePackCommandStatus::Ok {
+                    name: "refs/heads/remove".into(),
+                }],
+            },
+        )
+        .expect("receive-pack result should encode");
+        (discovery, result)
+    }
+
+    fn run_http_delete_push(
+        git_dir: &Path,
+        remote: RemoteUrl,
+        old: ObjectId,
+        client: Option<&dyn HttpClient>,
+    ) -> PushOutcome {
+        let destination = PushDestination::Http(remote);
+        let plan = PushActionPlan::from_commands_and_infer_pack_roots(
+            vec![PushCommand {
+                src: None,
+                dst: "refs/heads/remove".into(),
+                expected_old: Some(old),
+                force: false,
+            }],
+            default_options(),
+        );
+        let config = GitConfig::default();
+        let mut credentials = NoCredentials;
+        let mut progress = SilentProgress;
+        push_actions_with_http_client(
+            PushActionRequest {
+                git_dir,
+                common_git_dir: git_dir,
+                format: ObjectFormat::Sha1,
+                config: &config,
+                remote: "origin",
+                destination: &destination,
+                plan: &plan,
+            },
+            PushServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+                cancel: sley_core::CancelFlag::never(),
+            },
+            client,
+        )
+        .expect("HTTP delete push should succeed")
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut buffer = [0; 1024];
+            let read = stream.read(&mut buffer).expect("request should read");
+            assert!(read > 0, "request headers ended early");
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).expect("headers should be UTF-8");
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("valid content length"))
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let mut buffer = [0; 1024];
+            let read = stream.read(&mut buffer).expect("request body should read");
+            assert!(read > 0, "request body ended early");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        request
+    }
+
+    fn serve_http_push(
+        discovery: Vec<u8>,
+        result: Vec<u8>,
+    ) -> (RemoteUrl, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server should have address");
+        let remote = parse_remote_url(&format!("http://{address}/repo.git"))
+            .expect("default-client remote should parse");
+        let server = std::thread::spawn(move || {
+            let responses = [
+                (
+                    "GET ",
+                    "application/x-git-receive-pack-advertisement",
+                    discovery,
+                ),
+                ("POST ", "application/x-git-receive-pack-result", result),
+            ];
+            for (method, content_type, body) in responses {
+                let (mut stream, _) = listener.accept().expect("request should connect");
+                let request = read_http_request(&mut stream);
+                assert!(
+                    request.starts_with(method.as_bytes()),
+                    "expected {method} request, got {}",
+                    String::from_utf8_lossy(&request[..request.len().min(16)])
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .expect("response headers should write");
+                stream.write_all(&body).expect("response body should write");
+            }
+        });
+        (remote, server)
+    }
+
+    #[test]
+    fn http_push_uses_injected_client_for_discovery_and_receive_pack() {
+        let git_dir = temp_repo("http-injected-client");
+        let old = write_commit(&git_dir, Vec::new(), "remote tip");
+        let (discovery, result) = http_delete_push_bodies(old);
+        let (remote, server) = serve_http_push(discovery, result);
+        let client = crate::http::new_http_client();
+
+        let outcome = run_http_delete_push(&git_dir, remote, old, Some(&client));
+
+        server.join().expect("test server should complete");
+        assert_eq!(outcome.commands.len(), 1);
+        assert!(outcome.report.is_some());
+    }
+
+    #[test]
+    fn http_push_uses_default_client_for_discovery_and_receive_pack() {
+        let git_dir = temp_repo("http-default-client");
+        let old = write_commit(&git_dir, Vec::new(), "remote tip");
+        let (discovery, result) = http_delete_push_bodies(old);
+        let (remote, server) = serve_http_push(discovery, result);
+
+        let outcome = run_http_delete_push(&git_dir, remote, old, None);
+
+        server.join().expect("test server should complete");
+        assert_eq!(outcome.commands.len(), 1);
+        assert!(outcome.report.is_some());
     }
 
     #[test]
