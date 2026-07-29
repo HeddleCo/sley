@@ -1150,49 +1150,76 @@ fn check_apply_path_safety(
         }
     }
 
-    // path_is_beyond_symlink: a symlink created (or already present) must not be
-    // an ancestor directory of any other affected file (e.g. `tmp -> ..` then
-    // `tmp/foo`). Pure renames/copies of existing symlinks often omit mode
-    // headers (t4115), so also treat a rename/copy whose source is a worktree
-    // or index symlink as creating a symlink at the new path.
-    let created_symlinks: Vec<&[u8]> = patches
-        .iter()
-        .filter(|p| !p.is_delete)
-        .filter(|p| {
-            p.new_mode == Some(0o120000)
-                || ((p.is_rename || p.is_copy)
-                    && (p.old_mode == Some(0o120000)
-                        || p.old_path.as_deref().is_some_and(|old| {
-                            worktree_component_is_symlink(worktree_root, old)
-                                || index_component_is_symlink(index, old)
-                        })))
-        })
-        .filter_map(|p| p.new_path.as_deref())
-        .collect();
-    // A symlink removed by the patch is no longer an obstacle: git applies the
-    // patches in order, so a `symlink → directory` typechange (delete the
-    // symlink, create files beneath the new directory) is allowed. Renames that
-    // move a symlink away also clear the old path.
+    // path_is_beyond_symlink (git apply.c): a symlink created (or already
+    // present) must not be an ancestor of any path a non-delete patch would
+    // deposit into (e.g. `tmp -> ..` then `tmp/foo`). Mirrors
+    // `prepare_symlink_changes` + `path_is_beyond_symlink_1`.
+    //
+    // Explicit `new mode 120000` → kept_symlinks: block *all* non-delete
+    // deposits under them (create/modify/rename/copy). Restricting that to
+    // `is_new` was a CVE-2023-23946-class hole: a rename/copy target under a
+    // just-created symlink would slip past the guard and write through it.
+    //
+    // Pure renames/copies of existing symlinks often omit mode headers
+    // (t4115). Treat those as inferred kept_symlinks so create-under-rename
+    // is refused with the same "beyond a symbolic link" message, but still
+    // let modify/delete under them fail later with ENOENT (t4115 #6/#7) —
+    // matching git, which only learns the mode at check_preimage time and
+    // therefore does not put mode-less renames into kept_symlinks either.
+    let mut explicit_created_symlinks: Vec<&[u8]> = Vec::new();
+    let mut inferred_created_symlinks: Vec<&[u8]> = Vec::new();
+    for p in patches {
+        if p.is_delete {
+            continue;
+        }
+        let Some(new_path) = p.new_path.as_deref() else {
+            continue;
+        };
+        if p.new_mode == Some(0o120000) {
+            explicit_created_symlinks.push(new_path);
+            continue;
+        }
+        // Inferred: rename/copy of a symlink whose new_mode was not spelled
+        // out in the patch header (git fills it from the preimage later).
+        if (p.is_rename || p.is_copy)
+            && (p.old_mode == Some(0o120000)
+                || p.old_path.as_deref().is_some_and(|old| {
+                    worktree_component_is_symlink(worktree_root, old)
+                        || index_component_is_symlink(index, old)
+                }))
+        {
+            inferred_created_symlinks.push(new_path);
+        }
+    }
+    // removed_symlinks: a symlink deleted or renamed away is no longer an
+    // obstacle at that path (typechange: delete symlink then create files
+    // under a real directory of the same name; or move the link aside).
+    // Matches git's prepare_symlink_changes for is_delete || is_rename when
+    // the source is a symlink (mode header, or worktree/index for mode-less
+    // renames).
     let deleted_symlinks: Vec<&[u8]> = patches
         .iter()
         .filter(|p| p.is_delete || p.is_rename)
-        .filter_map(|p| p.old_path.as_deref())
-        .filter(|path| {
-            worktree_component_is_symlink(worktree_root, path)
-                || index_component_is_symlink(index, path)
+        .filter(|p| {
+            p.old_mode == Some(0o120000)
+                || p.old_path.as_deref().is_some_and(|old| {
+                    worktree_component_is_symlink(worktree_root, old)
+                        || index_component_is_symlink(index, old)
+                })
         })
+        .filter_map(|p| p.old_path.as_deref())
         .collect();
     for patch in patches {
-        // git's `check_patch` only deposits results for non-deletes into
-        // `path_is_beyond_symlink`; deletes are blocked later when loading the
-        // preimage (or via an existing worktree/index symlink). In-patch
-        // symlink *creates* (including pure renames of existing symlinks) only
-        // gate *new* files: modify/delete under a rename-created symlink fails
-        // with "No such file or directory" instead (t4115 #6/#7).
+        // git's check_patch only calls path_is_beyond_symlink for non-deletes
+        // (deposit path = new_name). Deletes are refused later by
+        // load_patch_target when a *leading* symlink still exists
+        // ("reading from … beyond a symbolic link"). We still reject deletes
+        // whose ancestors are existing worktree/index symlinks here so
+        // --index/--cached report the guard before index preimage lookup.
         let name = if patch.is_delete {
             patch.old_path.as_deref()
         } else {
-            patch.new_path.as_deref().or(patch.old_path.as_deref())
+            patch.new_path.as_deref()
         };
         let Some(name) = name else {
             continue;
@@ -1203,12 +1230,22 @@ fn check_apply_path_safety(
             }
             let ancestor = &name[..i];
             if deleted_symlinks.iter().any(|s| *s == ancestor) {
+                // removed_symlinks: skip this component, keep scanning higher
+                // (a new symlink may still exist above it).
                 continue;
             }
-            let created_blocks = patch.is_new && created_symlinks.iter().any(|s| *s == ancestor);
             let existing_blocks = worktree_component_is_symlink(worktree_root, ancestor)
                 || index_component_is_symlink(index, ancestor);
-            if created_blocks || existing_blocks {
+            // Explicit kept_symlinks: any non-delete deposit is refused.
+            let explicit_blocks =
+                !patch.is_delete && explicit_created_symlinks.iter().any(|s| *s == ancestor);
+            // Inferred rename/copy kept_symlinks: refuse creates *and*
+            // rename/copy destinations under them (write-through escape), but
+            // not plain modify — those must surface as ENOENT like git/t4115.
+            let inferred_blocks = !patch.is_delete
+                && (patch.is_new || patch.is_rename || patch.is_copy)
+                && inferred_created_symlinks.iter().any(|s| *s == ancestor);
+            if explicit_blocks || inferred_blocks || existing_blocks {
                 eprintln!(
                     "error: affected file '{}' is beyond a symbolic link",
                     String::from_utf8_lossy(name)
