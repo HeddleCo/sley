@@ -104,7 +104,7 @@ pub(crate) fn discovery_filesystem_boundary(start: &Path) -> Option<PathBuf> {
         return None;
     }
 
-    let start_device = device_of(start);
+    let start_device = device_of(start)?;
     let ceilings = discovery_ceiling_directories();
     for candidate in start.ancestors() {
         if candidate != start
@@ -115,7 +115,7 @@ pub(crate) fn discovery_filesystem_boundary(start: &Path) -> Option<PathBuf> {
             return None;
         }
         let parent = candidate.parent()?;
-        if device_of(parent) != start_device {
+        if device_of(parent).is_some_and(|device| device != start_device) {
             return Some(parent.to_path_buf());
         }
     }
