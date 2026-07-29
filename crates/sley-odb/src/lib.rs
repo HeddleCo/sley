@@ -1595,6 +1595,43 @@ mod tests {
     }
 
     #[test]
+    fn file_database_seeds_promisor_objects_from_alternate_packs() {
+        let root = temp_root("sley-file-odb-alternate-promisor-pack");
+        let local_objects = root.join("local-objects");
+        let alternate_objects = root.join("alternate-objects");
+        fs::create_dir_all(local_objects.join("info")).expect("create local object directory");
+        fs::create_dir_all(&alternate_objects).expect("create alternate object directory");
+        fs::write(
+            local_objects.join("info").join("alternates"),
+            format!("{}\n", alternate_objects.display()),
+        )
+        .expect("write alternates file");
+
+        let format = ObjectFormat::Sha1;
+        let object = EncodedObject::new(ObjectType::Blob, b"alternate promisor object\n".to_vec());
+        let oid = object.object_id(format).expect("object id");
+        let pack =
+            PackFile::write_undeltified(std::slice::from_ref(&object), format).expect("write pack");
+        FileObjectDatabase::new(&alternate_objects, format)
+            .install_pack_with_options(
+                &pack,
+                RawPackInstallOptions {
+                    promisor: true,
+                    ..Default::default()
+                },
+            )
+            .expect("install alternate promisor pack");
+
+        let db = FileObjectDatabase::new(&local_objects, format).with_promisor_remote_present(true);
+        assert!(
+            db.is_promised_object(&oid),
+            "alternate .promisor packs must seed the promised-object boundary"
+        );
+
+        fs::remove_dir_all(root).expect("remove test repository");
+    }
+
+    #[test]
     fn repository_objects_dir_uses_linked_worktree_common_dir() {
         let root = temp_root("sley-odb-common-dir");
         let common = root.join(".git");
