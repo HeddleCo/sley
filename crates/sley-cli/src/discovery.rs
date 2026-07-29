@@ -59,9 +59,11 @@ pub(crate) fn resolve_git_dir_walk_only(start: impl AsRef<Path>) -> Result<PathB
 }
 
 fn resolve_git_dir_by_walk(start: impl AsRef<Path>) -> Result<PathBuf> {
+    let start = start.as_ref();
     let ceilings = discovery_ceiling_directories();
-    for candidate in start.as_ref().ancestors() {
-        if candidate != start.as_ref()
+    let filesystem_boundary = discovery_filesystem_boundary(start);
+    for candidate in start.ancestors() {
+        if candidate != start
             && ceilings
                 .iter()
                 .any(|ceiling| ceiling.matches_discovery_candidate(candidate))
@@ -85,8 +87,51 @@ fn resolve_git_dir_by_walk(start: impl AsRef<Path>) -> Result<PathBuf> {
             ownership::ensure_valid_ownership(None, candidate, None)?;
             return Ok(candidate.to_path_buf());
         }
+        if candidate.parent() == filesystem_boundary.as_deref() {
+            break;
+        }
     }
     Err(GitError::repository_not_found("not a git repository"))
+}
+
+/// The parent which upward discovery must not enter because it is on another
+/// filesystem. `None` means discovery may walk to the filesystem root.
+///
+/// A configured ceiling takes precedence over a later filesystem boundary, as
+/// it does in git's `setup_git_directory_gently_1`.
+pub(crate) fn discovery_filesystem_boundary(start: &Path) -> Option<PathBuf> {
+    if crate::git_env_bool("GIT_DISCOVERY_ACROSS_FILESYSTEM") {
+        return None;
+    }
+
+    let start_device = device_of(start);
+    let ceilings = discovery_ceiling_directories();
+    for candidate in start.ancestors() {
+        if candidate != start
+            && ceilings
+                .iter()
+                .any(|ceiling| ceiling.matches_discovery_candidate(candidate))
+        {
+            return None;
+        }
+        let parent = candidate.parent()?;
+        if device_of(parent) != start_device {
+            return Some(parent.to_path_buf());
+        }
+    }
+    None
+}
+
+/// The device id of a path (for the single-filesystem discovery boundary).
+#[cfg(unix)]
+fn device_of(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).ok().map(|meta| meta.dev())
+}
+
+#[cfg(not(unix))]
+fn device_of(_path: &Path) -> Option<u64> {
+    None
 }
 
 enum DotGitProbe {

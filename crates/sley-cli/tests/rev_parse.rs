@@ -714,6 +714,17 @@ fn rev_parse_local_env_vars_and_path_format_errors_match_upstream_git() {
                 );
             }
         }
+
+        for across_filesystem in ["0", "1"] {
+            let envs = [("GIT_DISCOVERY_ACROSS_FILESYSTEM", across_filesystem)];
+            let args = ["rev-parse", "--path-format=relative", "--local-env-vars"];
+            let expected = run_status_with_env(sley_testkit::oracle_git(), &outside, &args, &envs);
+            let actual = run_status_with_env(sley_testkit::sley_bin!(), &outside, &args, &envs);
+            assert_eq!(
+                actual, expected,
+                "sley result differed with GIT_DISCOVERY_ACROSS_FILESYSTEM={across_filesystem}"
+            );
+        }
     };
     let _ = fs::remove_dir_all(&root);
 }
