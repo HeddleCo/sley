@@ -370,6 +370,7 @@ pub struct OpenOptions {
     exact_path: bool,
     bare: bool,
     respect_environment: bool,
+    across_filesystem: bool,
     replace_objects: bool,
     effective_use_replace_refs: Option<bool>,
 }
@@ -380,6 +381,7 @@ impl OpenOptions {
             exact_path: false,
             bare: false,
             respect_environment: false,
+            across_filesystem: false,
             replace_objects: true,
             effective_use_replace_refs: None,
         }
@@ -404,6 +406,17 @@ impl OpenOptions {
     /// environment should enable this (see [`Repository::open_from_environment`]).
     pub fn respect_environment(mut self, respect_environment: bool) -> Self {
         self.respect_environment = respect_environment;
+        self
+    }
+
+    /// Allow parent discovery to cross filesystem boundaries.
+    ///
+    /// Discovery stays on the starting filesystem by default, matching git.
+    /// This explicit option is the environment-independent equivalent of
+    /// `GIT_DISCOVERY_ACROSS_FILESYSTEM`; when [`Self::respect_environment`] is
+    /// enabled, the environment variable supplies the policy instead.
+    pub fn across_filesystem(mut self, across_filesystem: bool) -> Self {
+        self.across_filesystem = across_filesystem;
         self
     }
 
@@ -543,7 +556,10 @@ impl Repository {
         } else if options.exact_path {
             (resolve_git_dir(path.as_ref())?, None)
         } else {
-            (discover_git_dir(path.as_ref())?, None)
+            (
+                discover_git_dir(path.as_ref(), options.across_filesystem)?,
+                None,
+            )
         };
         if !is_git_dir(&git_dir) {
             return Err(GitError::repository_not_found(format!(
@@ -580,9 +596,10 @@ impl Repository {
 
     /// Discover the repository containing `path` by walking up the directory
     /// tree, mirroring git's own discovery (`.git` directory, `.git` gitlink
-    /// file, or a bare repository at an ancestor).
+    /// file, or a bare repository at an ancestor). The walk stops at the first
+    /// filesystem boundary.
     pub fn discover(path: impl AsRef<Path>) -> Result<Self> {
-        let git_dir = discover_git_dir(path.as_ref())?;
+        let git_dir = discover_git_dir(path.as_ref(), false)?;
         Self::from_git_dir(git_dir, None, true, None)
     }
 
@@ -1277,7 +1294,15 @@ fn read_gitdir_link(path: &Path) -> Result<Option<PathBuf>> {
 
 /// Walk up from `start` looking for a repository, mirroring git's discovery
 /// rules: a `.git` directory, a `.git` gitlink file, or a bare repository.
-fn discover_git_dir(start: &Path) -> Result<PathBuf> {
+fn discover_git_dir(start: &Path, across_filesystem: bool) -> Result<PathBuf> {
+    discover_git_dir_with_device(start, across_filesystem, filesystem_device)
+}
+
+fn discover_git_dir_with_device(
+    start: &Path,
+    across_filesystem: bool,
+    device_of: impl Fn(&Path) -> Option<u64>,
+) -> Result<PathBuf> {
     let start = if start.as_os_str().is_empty() {
         Path::new(".")
     } else {
@@ -1287,6 +1312,11 @@ fn discover_git_dir(start: &Path) -> Result<PathBuf> {
         start.to_path_buf()
     } else {
         std::env::current_dir()?.join(start)
+    };
+    let start_device = if across_filesystem {
+        None
+    } else {
+        device_of(&absolute)
     };
     for candidate in absolute.ancestors() {
         let dot_git = candidate.join(".git");
@@ -1302,12 +1332,32 @@ fn discover_git_dir(start: &Path) -> Result<PathBuf> {
         if is_git_dir(candidate) {
             return Ok(candidate.to_path_buf());
         }
+        if let (Some(start_device), Some(parent)) = (start_device, candidate.parent())
+            && device_of(parent).is_some_and(|device| device != start_device)
+        {
+            break;
+        }
     }
     Err(GitError::repository_not_found(format!(
         "not a git repository (or any parent up to {}): {}",
         absolute.display(),
         start.display()
     )))
+}
+
+fn filesystem_device(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| metadata.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1923,6 +1973,56 @@ mod tests {
         assert_eq!(
             fs::canonicalize(discovered.git_dir()).expect("canon discovered"),
             fs::canonicalize(repo.git_dir()).expect("canon repo")
+        );
+    }
+
+    #[test]
+    fn filesystem_bound_discovery_never_reports_outer_worktree_sibling() {
+        let temp = TempDir::new();
+        Repository::init(temp.path()).expect("init outer repository");
+        let mounted_worktree = temp.path().join("mounted-worktree");
+        let start = mounted_worktree.join("nested");
+        let sibling_file = temp.path().join("sibling").join("outside.txt");
+        fs::create_dir_all(&start).expect("create discovery start");
+        fs::create_dir_all(sibling_file.parent().expect("sibling parent"))
+            .expect("create sibling directory");
+        fs::write(&sibling_file, b"outside\n").expect("write sibling file");
+
+        let simulated_device = |path: &Path| {
+            if path.starts_with(&mounted_worktree) {
+                Some(2)
+            } else {
+                Some(1)
+            }
+        };
+        let outer_git_dir =
+            discover_git_dir_with_device(&start, true, simulated_device)
+                .expect("unbounded discovery reaches outer repository");
+        let unbounded_paths = sley_worktree::untracked_paths(
+            temp.path(),
+            &outer_git_dir,
+            ObjectFormat::Sha1,
+        )
+        .expect("walk outer worktree");
+        assert!(
+            unbounded_paths.contains(&b"sibling/outside.txt".to_vec()),
+            "fixture must prove an unbounded discovery includes the outer sibling"
+        );
+
+        let bounded = discover_git_dir_with_device(&start, false, simulated_device);
+        let bounded_paths = match bounded {
+            Ok(git_dir) => sley_worktree::untracked_paths(
+                git_dir.parent().expect("worktree parent"),
+                &git_dir,
+                ObjectFormat::Sha1,
+            )
+            .expect("walk discovered worktree"),
+            Err(GitError::NotFound(_)) => Vec::new(),
+            Err(err) => panic!("unexpected discovery error: {err}"),
+        };
+        assert!(
+            !bounded_paths.contains(&b"sibling/outside.txt".to_vec()),
+            "filesystem-bound discovery must never report a sibling outside the mounted worktree"
         );
     }
 
