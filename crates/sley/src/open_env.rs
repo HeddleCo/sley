@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use sley_core::GitError;
 
-use super::{Result, discover_git_dir, is_git_dir, read_gitdir_link, resolve_git_dir};
+use super::{Result, is_git_dir, read_gitdir_link, resolve_git_dir};
 
 /// Resolved repository layout when environment overrides apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,7 +161,11 @@ fn discover_git_dir_with_ceilings(start: &Path) -> Result<PathBuf> {
         }
     }
 
-    discover_git_dir(start)
+    Err(GitError::repository_not_found(format!(
+        "not a git repository (or any parent up to {}): {}",
+        absolute.display(),
+        start.display()
+    )))
 }
 
 /// One `GIT_CEILING_DIRECTORIES` entry after git's `canonicalize_ceiling_entry`
