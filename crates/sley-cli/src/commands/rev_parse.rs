@@ -73,7 +73,7 @@ pub(crate) fn cmd_rev_parse(
             if args.is_empty() {
                 return Err(GitError::Command("rev-parse requires <rev>...".into()));
             }
-            return rev_parse_not_git_repository();
+            return rev_parse_not_git_repository(&cwd);
         }
         Err(err) => return Err(err),
     };
@@ -1893,8 +1893,19 @@ fn rev_parse_resolve_git_dir_requires_argument_error() -> GitError {
     GitError::Exit(128)
 }
 
-fn rev_parse_not_git_repository() -> Result<()> {
-    eprintln!("fatal: not a git repository (or any of the parent directories): .git");
+fn rev_parse_not_git_repository(cwd: &Path) -> Result<()> {
+    if let Some(boundary) = crate::discovery::discovery_filesystem_boundary(cwd) {
+        eprintln!(
+            "fatal: not a git repository (or any parent up to mount point {})",
+            boundary.display()
+        );
+        eprintln!(
+            "Stopping at filesystem boundary \
+             (GIT_DISCOVERY_ACROSS_FILESYSTEM not set)."
+        );
+    } else {
+        eprintln!("fatal: not a git repository (or any of the parent directories): .git");
+    }
     Err(GitError::Exit(128))
 }
 
