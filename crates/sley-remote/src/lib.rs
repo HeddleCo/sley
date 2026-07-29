@@ -219,6 +219,8 @@ pub use pack::{
 };
 
 mod push;
+#[cfg(feature = "http")]
+pub use push::push_actions_with_http_client;
 pub use push::{
     PushAction, PushActionPlan, PushActionRequest, PushCommand, PushDestination, PushOptions,
     PushOutcome, PushPlan, PushQuarantine, PushRefStatus, PushReportRef, PushReportRequest,
@@ -232,6 +234,8 @@ pub use push::{
 };
 
 mod ls_remote;
+#[cfg(feature = "http")]
+pub use ls_remote::ls_remote_with_http_client;
 pub use ls_remote::{
     LsRemoteFilter, LsRemoteOutcome, LsRemoteRecord, LsRemoteRequest, LsRemoteSource, ls_remote,
     ls_remote_with,

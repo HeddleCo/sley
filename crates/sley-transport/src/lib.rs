@@ -1638,7 +1638,10 @@ fn http_timeouts(limits: TransportLimits) -> ureq::config::Timeouts {
 }
 
 #[cfg(feature = "http-client")]
-fn ureq_agent(timeouts: ureq::config::Timeouts) -> ureq::Agent {
+fn ureq_agent(
+    timeouts: ureq::config::Timeouts,
+    tls_config: Option<ureq::tls::TlsConfig>,
+) -> ureq::Agent {
     // `http_status_as_error(false)` makes ureq deliver 4xx/5xx as a normal
     // response (carrying status + body) rather than an error, which is what
     // smart-HTTP callers need (e.g. inspecting 401 to prompt for creds).
@@ -1658,7 +1661,7 @@ fn ureq_agent(timeouts: ureq::config::Timeouts) -> ureq::Agent {
         .timeout_send_body(timeouts.send_body)
         .timeout_recv_response(timeouts.recv_response)
         .timeout_recv_body(timeouts.recv_body);
-    if let Some(tls_config) = ureq_tls_config() {
+    if let Some(tls_config) = tls_config {
         builder = builder.tls_config(tls_config);
     }
     builder.build().into()
@@ -1679,9 +1682,50 @@ impl UreqHttpClient {
     /// `limits` is clamped on the way in, so this cannot build a client with
     /// an unbounded read or an unbounded wait however it is called.
     pub fn with_limits(limits: TransportLimits) -> Self {
+        Self::with_limits_and_tls_config(limits, ureq_tls_config())
+    }
+
+    /// Build a rustls client that augments the bundled Mozilla roots with a PEM CA
+    /// certificate bundle supplied by the embedding application.
+    #[cfg(feature = "tls-rustls")]
+    pub fn with_extra_ca_certificate_pem(ca_pem: &[u8]) -> Result<Self> {
+        use ureq::tls::{PemItem, RootCerts, TlsConfig, TlsProvider};
+
+        let mut certificates = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .map(|certificate| ureq::tls::Certificate::from_der(certificate.as_ref()).to_owned())
+            .collect::<Vec<_>>();
+        let mut extra_certificate_count = 0;
+        for item in ureq::tls::parse_pem(ca_pem) {
+            if let PemItem::Certificate(certificate) = item.map_err(|error| {
+                GitError::InvalidFormat(format!("invalid TLS CA certificate bundle: {error}"))
+            })? {
+                extra_certificate_count += 1;
+                certificates.push(certificate);
+            }
+        }
+        if extra_certificate_count == 0 {
+            return Err(GitError::InvalidFormat(
+                "TLS CA certificate bundle contains no certificates".to_string(),
+            ));
+        }
+        let tls_config = TlsConfig::builder()
+            .provider(TlsProvider::Rustls)
+            .root_certs(RootCerts::from(certificates))
+            .build();
+        Ok(Self::with_limits_and_tls_config(
+            TransportLimits::default(),
+            Some(tls_config),
+        ))
+    }
+
+    fn with_limits_and_tls_config(
+        limits: TransportLimits,
+        tls_config: Option<ureq::tls::TlsConfig>,
+    ) -> Self {
         let limits = limits.clamped();
         Self {
-            agent: ureq_agent(http_timeouts(limits)),
+            agent: ureq_agent(http_timeouts(limits), tls_config),
             limits,
         }
     }
@@ -3323,13 +3367,27 @@ mod tests {
         assert!(!trace.contains("Authorization"));
         assert!(!trace.contains("secret"));
     }
+
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn extra_ca_bundle_requires_a_certificate() {
+        let error = UreqHttpClient::with_extra_ca_certificate_pem(b"not a certificate")
+            .err()
+            .expect("a bundle without certificates must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("TLS CA certificate bundle contains no certificates")
+        );
+    }
 }
 
 #[cfg(all(test, feature = "http-client"))]
 mod http_timeout_tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::mpsc;
+    use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
 
     /// sley#163: ureq 3.3.0's `Timeouts::default()` leaves every field `None`
@@ -3460,6 +3518,115 @@ mod http_timeout_tests {
             min_transfer_bytes_per_sec: 0,
         };
         assert_eq!(zeroed.clamped(), TransportLimits::default());
+    }
+
+    /// A caller-supplied private CA must change the result of a real TLS
+    /// handshake: the default Mozilla roots reject it, while the augmented
+    /// client reaches the same HTTPS server successfully.
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn private_ca_is_rejected_without_config_and_accepted_with_it() {
+        use rcgen::{
+            BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
+            KeyPair, KeyUsagePurpose,
+        };
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("CA parameters");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca = CertifiedIssuer::self_signed(
+            ca_params,
+            KeyPair::generate().expect("generate private CA key"),
+        )
+        .expect("generate private CA certificate");
+
+        let mut server_params =
+            CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("server parameters");
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server_key = KeyPair::generate().expect("generate server key");
+        let server_cert = server_params
+            .signed_by(&server_key, &ca)
+            .expect("sign server certificate with private CA");
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![server_cert.der().clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+                )
+                .expect("build TLS server configuration"),
+        );
+
+        let (default_url, default_server) = private_https_server(server_config.clone());
+        let default_error = UreqHttpClient::new()
+            .get(&default_url, &[])
+            .err()
+            .expect("the private CA must not be trusted without configuration");
+        assert!(
+            default_error.to_string().contains("UnknownIssuer"),
+            "unexpected unconfigured-client error: {default_error}"
+        );
+        println!("unconfigured client rejected private CA: {default_error}");
+        assert!(
+            default_server
+                .join()
+                .expect("default server thread")
+                .is_err(),
+            "the unconfigured TLS handshake should be rejected"
+        );
+
+        let client = UreqHttpClient::with_extra_ca_certificate_pem(ca.pem().as_bytes())
+            .expect("build client with private CA");
+        match client.agent.config().tls_config().root_certs() {
+            ureq::tls::RootCerts::Specific(certificates) => assert_eq!(
+                certificates.len(),
+                webpki_root_certs::TLS_SERVER_ROOT_CERTS.len() + 1,
+                "the extra CA must augment, not replace, the bundled Mozilla roots"
+            ),
+            roots => panic!("configured client used unexpected roots: {roots:?}"),
+        }
+        let (configured_url, configured_server) = private_https_server(server_config);
+        let mut response = client
+            .get(&configured_url, &[])
+            .expect("the configured private CA must be consulted");
+        let mut body = String::new();
+        response
+            .body
+            .read_to_string(&mut body)
+            .expect("read private HTTPS response");
+        assert_eq!(response.status, 200);
+        assert_eq!(body, "private-ca-ok");
+        configured_server
+            .join()
+            .expect("configured server thread")
+            .expect("configured TLS request");
+    }
+
+    #[cfg(feature = "tls-rustls")]
+    fn private_https_server(
+        config: Arc<rustls::ServerConfig>,
+    ) -> (String, std::thread::JoinHandle<std::io::Result<()>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind private HTTPS server");
+        let address = listener.local_addr().expect("private HTTPS address");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+            let connection = rustls::ServerConnection::new(config)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let mut stream = rustls::StreamOwned::new(connection, stream);
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request)?;
+            stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nprivate-ca-ok",
+            )?;
+            stream.flush()
+        });
+        (format!("https://{address}/"), server)
     }
 
     /// A peer that completes the TCP handshake and then says nothing must be

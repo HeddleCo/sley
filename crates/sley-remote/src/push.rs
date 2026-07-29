@@ -453,7 +453,7 @@ enum PushExecution {
     Noop,
     #[cfg(feature = "http")]
     Http {
-        http_batch: crate::http::HttpOperationBatch,
+        http_batch: Option<crate::http::HttpOperationBatch>,
         remote_url: RemoteUrl,
         features: ReceivePackFeatures,
         advertisements: Vec<RefAdvertisement>,
@@ -492,10 +492,30 @@ pub fn push(request: PushRequest<'_>, mut services: PushServices<'_>) -> Result<
 /// Push a caller-authored exact plan, preserving its old/new/delete command ids.
 pub fn push_actions(
     request: PushActionRequest<'_>,
-    mut services: PushServices<'_>,
+    services: PushServices<'_>,
 ) -> Result<PushOutcome> {
-    let plan = plan_push_actions(request, &mut services)?;
-    execute_push_action_plan(request, &mut services, plan)
+    #[cfg(feature = "http")]
+    {
+        push_actions_with_http_client(request, services, None)
+    }
+    #[cfg(not(feature = "http"))]
+    {
+        let mut services = services;
+        let plan = plan_push_actions(request, &mut services)?;
+        execute_push_action_plan(request, &mut services, plan)
+    }
+}
+
+/// Like [`push_actions`], but drives smart HTTP through a caller-provided
+/// client when `http_client` is `Some`.
+#[cfg(feature = "http")]
+pub fn push_actions_with_http_client(
+    request: PushActionRequest<'_>,
+    mut services: PushServices<'_>,
+    http_client: Option<&dyn HttpClient>,
+) -> Result<PushOutcome> {
+    let plan = plan_push_actions_impl(request, &mut services, http_client)?;
+    execute_push_action_plan_impl(request, &mut services, plan, http_client)
 }
 
 /// Negotiate with the remote and compute the receive-pack command list without
@@ -595,6 +615,21 @@ pub fn plan_push_actions(
     request: PushActionRequest<'_>,
     services: &mut PushServices<'_>,
 ) -> Result<PushPlan> {
+    #[cfg(feature = "http")]
+    {
+        plan_push_actions_impl(request, services, None)
+    }
+    #[cfg(not(feature = "http"))]
+    {
+        plan_push_actions_impl(request, services)
+    }
+}
+
+fn plan_push_actions_impl(
+    request: PushActionRequest<'_>,
+    services: &mut PushServices<'_>,
+    #[cfg(feature = "http")] http_client: Option<&dyn HttpClient>,
+) -> Result<PushPlan> {
     let _ = &mut services.progress;
     crate::protocol::check_transport_allowed(
         scheme_for_push_destination(request.destination),
@@ -612,9 +647,18 @@ pub fn plan_push_actions(
     match request.destination {
         #[cfg(feature = "http")]
         PushDestination::Http(remote_url) => {
-            let http_batch = crate::http::HttpOperationBatch::new();
+            let http_batch = http_client
+                .is_none()
+                .then(crate::http::HttpOperationBatch::new);
+            let client = http_client
+                .or_else(|| {
+                    http_batch
+                        .as_ref()
+                        .map(|batch| batch.client() as &dyn HttpClient)
+                })
+                .expect("an injected or default HTTP client is always available");
             let discovered = crate::http::http_service_advertisements(
-                http_batch.client(),
+                client,
                 remote_url,
                 request.format,
                 GitService::ReceivePack,
@@ -749,6 +793,22 @@ pub fn execute_push_plan(
     services: &mut PushServices<'_>,
     plan: PushPlan,
 ) -> Result<PushOutcome> {
+    #[cfg(feature = "http")]
+    {
+        execute_push_plan_impl(request, services, plan, None)
+    }
+    #[cfg(not(feature = "http"))]
+    {
+        execute_push_plan_impl(request, services, plan)
+    }
+}
+
+fn execute_push_plan_impl(
+    request: PushRequest<'_>,
+    services: &mut PushServices<'_>,
+    plan: PushPlan,
+    #[cfg(feature = "http")] http_client: Option<&dyn HttpClient>,
+) -> Result<PushOutcome> {
     let _ = (request.config, request.remote);
     if plan.commands.is_empty() {
         return Ok(PushOutcome::default());
@@ -764,18 +824,29 @@ pub fn execute_push_plan(
             features,
             advertisements,
             pack_objects,
-        } => execute_push_http(
-            request,
-            services.credentials,
-            ctx.progress,
-            ctx.cancel,
-            http_batch,
-            plan.commands,
-            remote_url,
-            features,
-            advertisements,
-            pack_objects,
-        ),
+        } => {
+            let fallback_batch;
+            let client = if let Some(client) = http_client {
+                client
+            } else if let Some(batch) = http_batch.as_ref() {
+                batch.client()
+            } else {
+                fallback_batch = crate::http::HttpOperationBatch::new();
+                fallback_batch.client()
+            };
+            execute_push_http(
+                request,
+                services.credentials,
+                ctx.progress,
+                ctx.cancel,
+                client,
+                plan.commands,
+                remote_url,
+                features,
+                advertisements,
+                pack_objects,
+            )
+        }
         PushExecution::Ssh(plan) => crate::ssh::execute_push_ssh_plan(request, plan, ctx.cancel),
         PushExecution::Git(plan) => crate::git::execute_push_git_plan(request, plan, ctx.cancel),
         PushExecution::Local {
@@ -803,8 +874,24 @@ pub fn execute_push_action_plan(
     services: &mut PushServices<'_>,
     plan: PushPlan,
 ) -> Result<PushOutcome> {
+    #[cfg(feature = "http")]
+    {
+        execute_push_action_plan_impl(request, services, plan, None)
+    }
+    #[cfg(not(feature = "http"))]
+    {
+        execute_push_action_plan_impl(request, services, plan)
+    }
+}
+
+fn execute_push_action_plan_impl(
+    request: PushActionRequest<'_>,
+    services: &mut PushServices<'_>,
+    plan: PushPlan,
+    #[cfg(feature = "http")] http_client: Option<&dyn HttpClient>,
+) -> Result<PushOutcome> {
     let refspecs: &[String] = &[];
-    execute_push_plan(
+    execute_push_plan_impl(
         PushRequest {
             git_dir: request.git_dir,
             common_git_dir: request.common_git_dir,
@@ -817,6 +904,8 @@ pub fn execute_push_action_plan(
         },
         services,
         plan,
+        #[cfg(feature = "http")]
+        http_client,
     )
 }
 
@@ -915,7 +1004,7 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
         PushExecution::Noop
     } else {
         PushExecution::Http {
-            http_batch,
+            http_batch: Some(http_batch),
             remote_url: remote_url.clone(),
             features,
             advertisements: advertisement_set.refs,
@@ -936,7 +1025,7 @@ fn execute_push_http(
     credentials: &mut dyn CredentialProvider,
     progress: &mut dyn ProgressSink,
     cancel: CancelFlag<'_>,
-    http_batch: crate::http::HttpOperationBatch,
+    client: &dyn HttpClient,
     commands: Vec<ReceivePackCommand>,
     remote_url: RemoteUrl,
     features: ReceivePackFeatures,
@@ -944,7 +1033,6 @@ fn execute_push_http(
     pack_objects: Vec<ObjectId>,
 ) -> Result<PushOutcome> {
     let _ = progress;
-    let client = http_batch.client();
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
     let pack_request = PushPackRequest {
         local_db: &local_db,
