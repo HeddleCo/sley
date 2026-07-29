@@ -45,9 +45,10 @@ use sley_odb::FileObjectDatabase;
 use sley_protocol::write_pkt_line_payload;
 use sley_protocol::{
     GitService, ProtocolV2FetchShallowInfo, ProtocolVersion, ReceivePackCommand,
-    ReceivePackFeatures, RefAdvertisement, UploadPackFeatures, UploadPackNegotiationRequest,
-    UploadPackRequest, parse_receive_pack_features, parse_upload_pack_features,
-    read_ref_advertisement_set, write_upload_pack_negotiation_request, write_upload_pack_request,
+    ReceivePackFeatures, RefAdvertisement, TransportLimits, UploadPackFeatures,
+    UploadPackNegotiationRequest, UploadPackRequest, parse_receive_pack_features,
+    parse_upload_pack_features, read_ref_advertisement_set, read_to_end_bounded,
+    write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::FileRefStore;
 use sley_transport::{
@@ -845,8 +846,10 @@ pub(crate) fn execute_push_ssh_plan(
         crate::push::validate_receive_pack_unpack(&report)?;
         Some(report)
     } else {
-        let mut sink = Vec::new();
-        plan.stdout.read_to_end(&mut sink)?;
+        drain_unreported_receive_pack_response(
+            &mut plan.stdout,
+            crate::transport_limits_from_config(Some(request.config)),
+        )?;
         None
     };
     let status = plan.child.wait()?; // Child::wait takes &mut self
@@ -864,6 +867,14 @@ pub(crate) fn execute_push_ssh_plan(
         report,
         remote_progress: Vec::new(),
     })
+}
+
+fn drain_unreported_receive_pack_response(
+    stream: &mut dyn Read,
+    limits: TransportLimits,
+) -> Result<()> {
+    read_to_end_bounded(stream, limits.receive_pack_response())?;
+    Ok(())
 }
 
 /// List the advertised refs for a resolved SSH `remote`, mirroring the records the
@@ -1325,6 +1336,35 @@ fn ssh_remote_display(remote: &RemoteUrl) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn response_limits(bytes: u64) -> TransportLimits {
+        TransportLimits {
+            max_ref_advertisement_bytes: bytes,
+            ..TransportLimits::default()
+        }
+    }
+
+    #[test]
+    fn oversized_ssh_receive_pack_stream_is_refused_cleanly() {
+        let exact = vec![b'x'; 64 * 1024];
+        drain_unreported_receive_pack_response(&mut exact.as_slice(), response_limits(64 * 1024))
+            .expect("ssh:// receive-pack output exactly at the ceiling must be admitted");
+
+        let oversized = vec![b'x'; exact.len() + 1];
+        let error = drain_unreported_receive_pack_response(
+            &mut oversized.as_slice(),
+            response_limits(64 * 1024),
+        )
+        .expect_err("ssh:// receive-pack output past the ceiling must be refused");
+        assert!(
+            error.to_string().contains("exceeds the configured ceiling"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("stopped at 65537 bytes"),
+            "the bounded read must stop one byte past the ceiling: {error}"
+        );
+    }
 
     #[test]
     fn protocol_v1_uses_openssh_send_env_metadata() {

@@ -247,6 +247,10 @@ pub fn run_proc_receive_hook(input: ProcReceiveHookInput<'_>) -> Result<ProcRece
     // may emit more than a pipe buffer before exiting, so waiting first can
     // deadlock.  We still append the completed hook stream before receive-pack
     // protocol diagnostics below, matching git's stderr mux ordering.
+    //
+    // This local hook diagnostic remains uncapped: stderr has no protocol
+    // relationship to ref or pack size, and imposing a defensible ceiling
+    // requires an explicit diagnostic truncation/error policy.
     let hook_stderr = if capture_stderr {
         child.stderr.take().map(|mut stderr| {
             thread::spawn(move || {

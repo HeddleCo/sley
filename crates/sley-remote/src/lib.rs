@@ -31,6 +31,9 @@ use sley_protocol::{
 };
 use sley_transport::GitCredential;
 
+mod limits;
+pub use limits::transport_limits_from_config;
+
 mod admin;
 mod install;
 pub use admin::{
@@ -91,7 +94,7 @@ pub use http::{
     install_fetch_pack_via_http_protocol_v2_fetch,
     install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs,
     install_fetch_pack_via_http_upload_pack, negotiate_fetch_pack_via_http_protocol_v2,
-    new_http_client, new_http_client_with_config, remote_url_is_http, transport_limits_from_config,
+    new_http_client, new_http_client_with_config, remote_url_is_http,
 };
 // Re-export the smart-HTTP client seam so out-of-crate hosts (e.g. weft) can
 // implement [`HttpClient`] to enforce network policy on the dial without a

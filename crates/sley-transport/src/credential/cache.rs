@@ -139,6 +139,10 @@ fn xdg_cache_socket_path() -> PathBuf {
 fn do_cache(socket: &Path, action: &str, timeout: i32, flags: u8) -> Result<()> {
     let mut buf = format!("action={action}\ntimeout={timeout}\n");
     if flags & FLAG_RELAY != 0 {
+        // This is local credential-helper input, not a remote response. The
+        // credential protocol specifies no maximum for secret or extension
+        // values, so a compatible ceiling needs a documented per-credential
+        // value limit rather than borrowing an unrelated transport budget.
         let mut relay = Vec::new();
         io::stdin()
             .read_to_end(&mut relay)

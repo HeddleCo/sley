@@ -1100,7 +1100,7 @@ fn execute_push_http(
         // legitimate one needs.
         read_to_end_bounded(
             &mut response.body,
-            crate::http::transport_limits_from_config(Some(request.config)).receive_pack_response(),
+            crate::transport_limits_from_config(Some(request.config)).receive_pack_response(),
         )?;
         None
     };

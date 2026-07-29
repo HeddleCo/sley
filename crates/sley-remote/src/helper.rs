@@ -545,6 +545,11 @@ impl RemoteHelperSession {
         }
         self.write_raw(b"\n")?;
         drop(self.stdin.take());
+        // Deliberately not capped by the pack-response ceiling: this is a
+        // locally spawned helper's expanded fast-import program, whose data
+        // can legitimately be much larger than the corresponding compressed
+        // pack. A defensible ceiling needs either a streaming import path or a
+        // separately configurable maximum expanded import size.
         let mut stream = Vec::new();
         self.stdout.read_to_end(&mut stream)?;
         let status = self.child.wait()?;

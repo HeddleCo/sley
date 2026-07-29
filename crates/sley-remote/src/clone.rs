@@ -706,9 +706,8 @@ fn fetch_http_partial_clone_checkout_blobs(
             // Built from config so the buffered-response ceilings and the body
             // deadlines derived from them follow the same settings the rest of
             // the request does.
-            default_client = UreqHttpClient::with_limits(
-                crate::http::transport_limits_from_config(Some(config)),
-            );
+            default_client =
+                UreqHttpClient::with_limits(crate::transport_limits_from_config(Some(config)));
             &default_client
         }
     };

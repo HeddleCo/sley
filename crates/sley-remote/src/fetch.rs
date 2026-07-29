@@ -531,7 +531,7 @@ fn fetch_impl(
                     // the body deadlines derived from them follow the same
                     // settings the rest of the request does.
                     default_client = UreqHttpClient::with_limits(
-                        crate::http::transport_limits_from_config(Some(request.config)),
+                        crate::transport_limits_from_config(Some(request.config)),
                     );
                     &default_client
                 }
