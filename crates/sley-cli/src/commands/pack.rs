@@ -1699,14 +1699,17 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             "option '--filter-to' can only be used along with '--filter'".into(),
         ));
     }
+    // `--name-hash-version` is accepted for CLI compatibility with git repack.
+    // Sley repacks in-process (no pack-objects child), and the pack writer
+    // does not implement version-specific delta name grouping. Bitmap
+    // name-hash caches always use version 1 (`pack_name_hash`). Do not emit a
+    // synthetic pack-objects TRACE2 child_start: that would claim a child argv
+    // that never ran. Version 2 with bitmaps only warns, matching pack-objects.
     if let Some(version) = name_hash_version {
-        // Emit a synthetic pack-objects child_start so tests that assert the
-        // option is forwarded (via GIT_TRACE2_EVENT) succeed under the
-        // in-process repack path.
-        let mut trace_args = vec!["pack-objects".to_string()];
-        trace_args.push(format!("--name-hash-version={version}"));
-        let argv_refs: Vec<&str> = trace_args.iter().map(String::as_str).collect();
-        trace2_child_start(&argv_refs);
+        if !(1..=2).contains(&version) {
+            eprintln!("fatal: invalid --name-hash-version option: {version}");
+            return Err(GitError::Exit(128));
+        }
     }
     let config = read_repo_config(&common_git_dir)?;
     let repack_roots = if all {
@@ -1759,6 +1762,12 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
     };
     let include_kept_objects =
         pack_kept_objects || (write_bitmaps && !write_midx && !auto_bare_bitmaps);
+
+    if write_bitmaps && name_hash_version.is_some_and(|version| version != 1) {
+        // Match pack-objects: bitmaps require name-hash version 1; sley always
+        // writes the v1 cache and continues after warning (git auto-switches).
+        eprintln!("warning: currently, --write-bitmap-index requires --name-hash-version=1");
+    }
 
     if write_bitmaps && local && object_dir_has_alternates(&common_git_dir) {
         eprintln!("warning: disabling bitmap writing, as some objects are not being packed");

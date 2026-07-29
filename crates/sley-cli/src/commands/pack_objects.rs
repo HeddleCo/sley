@@ -84,6 +84,10 @@ struct PackObjectsOptions {
     /// defaults this setting to false when it is not configured.
     write_reverse_index: bool,
     write_bitmap_index: bool,
+    /// `--name-hash-version=<n>`: validated (1 or 2) and used for the
+    /// `--write-bitmap-index` compatibility warning. Sley's pack writer does
+    /// not implement version-specific delta name grouping; bitmap name-hash
+    /// caches (when written) always use version 1.
     name_hash_version: Option<i32>,
     max_pack_size: Option<u64>,
     object_filter: PackObjectFilter,
@@ -295,10 +299,6 @@ pub(crate) fn cmd_pack_objects(
             // recomputes its own deltas (so reuse toggles are moot), only ever
             // writes non-empty packs unless there is nothing to write, and the
             // reflog/index inclusion knobs only matter alongside `--revs`.
-            //
-            // `--shallow` / `--uri-protocol=*` are emitted by upload-pack's
-            // pack-objects child; shallow boundaries and packfile URIs are
-            // negotiated outside pack-objects on the sley server path.
             "--no-reuse-delta"
             | "--no-reuse-object"
             | "--non-empty"
@@ -306,16 +306,27 @@ pub(crate) fn cmd_pack_objects(
             | "--reflog"
             | "--indexed-objects"
             | "--delta-islands"
-            | "--shallow"
-            // `--unpack-unreachable` loosens unused packed objects after writing
-            // the pack. Sley leaves that as a no-op today: we never loosen by
-            // default, and alternate/nonlocal objects must not be loosened
-            // (t7700 "packed unreachable obs in alternate ODB are not loosened").
-            | "--unpack-unreachable"
                 if !saw_dashdash => {}
-            value if !saw_dashdash && value.starts_with("--unpack-unreachable=") => {}
+            // `--shallow`: git optimizes packs for shallow clients (with
+            // `--thin`). Sley accepts the flag (upload-pack may emit it) but
+            // does not change packing heuristics — same objects, not thinner.
+            "--shallow" if !saw_dashdash => {}
+            // Retention-affecting: must not be silently ignored next to
+            // `repack -d`. Loosening is implemented on the in-process
+            // `repack -A` path (`repack_reachable_objects_unpack_unreachable`);
+            // pack-objects itself does not loosen unused packed objects.
+            "--unpack-unreachable" if !saw_dashdash => {
+                return reject_unsupported_unpack_unreachable();
+            }
+            value if !saw_dashdash && value.starts_with("--unpack-unreachable=") => {
+                return reject_unsupported_unpack_unreachable();
+            }
             "--include-tag" if !saw_dashdash => options.include_tag = true,
             "--no-include-tag" if !saw_dashdash => options.include_tag = false,
+            // `--uri-protocol=<proto>`: git excludes uploadpack.blobpackfileuri
+            // entries for that protocol. Sley has no packfile-URI emission, so
+            // accepting is equivalent to git with no matching config (no-op).
+            // upload-pack may still pass the flag through.
             value if !saw_dashdash && value.starts_with("--uri-protocol=") => {}
             "--progress" | "--all-progress" | "--all-progress-implied" if !saw_dashdash => {
                 options.progress = Some(true)
@@ -790,8 +801,14 @@ fn validate_pack_objects_options(options: &PackObjectsOptions) -> Result<()> {
             return Err(GitError::Exit(128));
         }
     }
+    // name-hash-version is accepted and range-checked only: the pack writer
+    // does not switch delta-grouping algorithms, and any bitmap name-hash
+    // cache sley emits is always version 1. Version 2 is allowed for CLI
+    // parity but does not change bytes; with --write-bitmap-index we warn
+    // (git auto-switches to version 1). Git's sentinel `-1` means "use the
+    // default", which is version 1.
     if let Some(version) = options.name_hash_version {
-        if version == 0 || version > 2 {
+        if version != -1 && !(1..=2).contains(&version) {
             eprintln!("fatal: invalid --name-hash-version option: {version}");
             return Err(GitError::Exit(128));
         }
@@ -800,6 +817,14 @@ fn validate_pack_objects_options(options: &PackObjectsOptions) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `--unpack-unreachable` keeps packed-but-unselected objects loose so a later
+/// pack delete cannot drop them. That retention path is not implemented in
+/// pack-objects; callers that need it must use `repack -A` (in-process).
+fn reject_unsupported_unpack_unreachable() -> Result<()> {
+    eprintln!("fatal: pack-objects --unpack-unreachable is not supported; use `git repack -A`");
+    Err(GitError::Exit(128))
 }
 
 /// `kind` bitflags for a pack named on `--stdin-packs` input.
@@ -3170,5 +3195,51 @@ mod tests {
 
         assert_eq!(mtimes, HashMap::from([(rescued, 1)]));
         fs::remove_dir_all(objects_dir).ok();
+    }
+
+    #[test]
+    fn name_hash_version_accepts_default_1_and_2_rejects_out_of_range() {
+        for version in [-1, 1, 2] {
+            let options = PackObjectsOptions {
+                name_hash_version: Some(version),
+                ..PackObjectsOptions::default()
+            };
+            assert!(
+                validate_pack_objects_options(&options).is_ok(),
+                "version {version} should be accepted"
+            );
+        }
+        for version in [0, 3, 99] {
+            let options = PackObjectsOptions {
+                name_hash_version: Some(version),
+                ..PackObjectsOptions::default()
+            };
+            assert!(
+                matches!(
+                    validate_pack_objects_options(&options),
+                    Err(GitError::Exit(128))
+                ),
+                "version {version} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn name_hash_version_2_with_bitmap_is_allowed_with_warning_only() {
+        let options = PackObjectsOptions {
+            name_hash_version: Some(2),
+            write_bitmap_index: true,
+            ..PackObjectsOptions::default()
+        };
+        // Git warns and continues (auto-switch to v1); sley matches that exit path.
+        assert!(validate_pack_objects_options(&options).is_ok());
+    }
+
+    #[test]
+    fn unpack_unreachable_is_rejected_not_silently_ignored() {
+        assert!(matches!(
+            reject_unsupported_unpack_unreachable(),
+            Err(GitError::Exit(128))
+        ));
     }
 }

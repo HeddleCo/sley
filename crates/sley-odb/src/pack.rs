@@ -1787,8 +1787,19 @@ impl FileObjectDatabase {
 impl FileObjectDatabase {
     fn promisor_objects(&self) -> &HashSet<ObjectId> {
         self.promisor_objects.get_or_init(|| {
+            // Seed from local and alternate `.promisor` packs. Quarantine
+            // validation uses the destination object directory as an alternate,
+            // so historical promisor packs must be visible here — otherwise
+            // `is_promised_object` would not recognize destination-promised
+            // missing blobs and connectivity walks would report false broken
+            // links (git's packed_git list includes alternate promisor packs).
             let mut promised =
                 promisor_pack_object_ids(&self.objects_dir, self.format).unwrap_or_default();
+            for alternate in &self.alternates {
+                if let Ok(oids) = promisor_pack_object_ids(alternate, self.format) {
+                    promised.extend(oids);
+                }
+            }
             let mut pending = promised.iter().copied().collect::<Vec<_>>();
             while let Some(oid) = pending.pop() {
                 let Ok(object) = self.read_object(&oid) else {
