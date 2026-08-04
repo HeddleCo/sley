@@ -333,10 +333,15 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
         prefix: prefix.clone(),
     };
     let inputs = read_apply_inputs(&files)?;
-    let mut patches = Vec::new();
+    // Keep file-patches grouped by input file. Git applies one input atomically:
+    // only later *input files* observe earlier inputs' postimages (via
+    // result_overlay). Later file-patches inside the same input must still see
+    // the original preimage (copy/rename of a just-modified path, reverse
+    // typechange, etc.).
+    let mut patch_groups: Vec<(String, Vec<sley_diff_merge::FilePatch>)> = Vec::new();
     for (name, input) in &inputs {
         validate_apply_input(input, name)?;
-        patches.extend(
+        let group =
             sley_diff_merge::parse_unified_patch_with_options(input, recount, &path_options)
                 .map_err(|err| match err {
                     GitError::InvalidFormat(message)
@@ -385,47 +390,61 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
                         GitError::Exit(128)
                     }
                     other => other,
-                })?,
-        );
+                })?;
+        patch_groups.push((name.clone(), group));
     }
-    if !recount && patches.iter().any(apply_patch_is_noop) {
+    if !recount
+        && patch_groups
+            .iter()
+            .flat_map(|(_, group)| group.iter())
+            .any(apply_patch_is_noop)
+    {
         return Err(GitError::Exit(1));
     }
     // `-R`/`--reverse`: undo the patch by reversing each file patch before any
     // whitespace handling or application (git reverses the parsed patches up
     // front).
     if reverse {
-        patches = patches
-            .iter()
-            .map(sley_diff_merge::reverse_file_patch)
-            .collect();
+        for (_, group) in &mut patch_groups {
+            *group = group
+                .iter()
+                .map(sley_diff_merge::reverse_file_patch)
+                .collect();
+        }
     }
     // git's `prefix_patch` + `use_patch`: prepend the cwd prefix to every
     // non-toplevel-relative (traditional) patch, then drop any patch whose
     // resolved name does not live under the prefix.
     if !prefix.is_empty() {
-        for patch in &mut patches {
-            if patch.is_toplevel_relative {
-                continue;
+        for (_, group) in &mut patch_groups {
+            for patch in group.iter_mut() {
+                if patch.is_toplevel_relative {
+                    continue;
+                }
+                for name in [patch.old_path.as_mut(), patch.new_path.as_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let mut prefixed = prefix.clone();
+                    prefixed.extend_from_slice(name);
+                    *name = prefixed;
+                }
             }
-            for name in [patch.old_path.as_mut(), patch.new_path.as_mut()]
-                .into_iter()
-                .flatten()
-            {
-                let mut prefixed = prefix.clone();
-                prefixed.extend_from_slice(name);
-                *name = prefixed;
-            }
+            group.retain(|patch| {
+                let name = patch
+                    .new_path
+                    .as_deref()
+                    .or(patch.old_path.as_deref())
+                    .unwrap_or(b"");
+                name.starts_with(&prefix) && name.len() > prefix.len()
+            });
         }
-        patches.retain(|patch| {
-            let name = patch
-                .new_path
-                .as_deref()
-                .or(patch.old_path.as_deref())
-                .unwrap_or(b"");
-            name.starts_with(&prefix) && name.len() > prefix.len()
-        });
     }
+    // Flat view for pre-apply checks that scan every file-patch once.
+    let patches: Vec<sley_diff_merge::FilePatch> = patch_groups
+        .iter()
+        .flat_map(|(_, group)| group.iter().cloned())
+        .collect();
     if let Some(path) = build_fake_ancestor {
         write_apply_fake_ancestor_index(git_dir, format, &patches, &inputs, &path)?;
         return Ok(());
@@ -436,10 +455,6 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
             return Ok(());
         }
     }
-    let patch_input_file = inputs
-        .first()
-        .map(|(name, _)| name.as_str())
-        .unwrap_or("<stdin>");
 
     // When `--index`/`--cached` is in effect, read the current index once: it
     // supplies the preimage for every patch (`git apply` reads the staged blob,
@@ -502,9 +517,9 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
     let unsafe_paths = unsafe_paths && !touch_index;
     check_apply_path_safety(&worktree_base, &patches, unsafe_paths, index.as_ref())?;
 
-    // Whitespace errors are counted during the sequential apply loop below so a
-    // later patch in the same batch can see the result of an earlier one (git's
-    // `previous_patch` / multi-input `write_out_results` between files).
+    // Whitespace errors are counted during the sequential apply loop below.
+    // Cross-input overlay visibility (git's multi-input `write_out_results`)
+    // is published only at input-file boundaries.
     let mut ws_error_count = 0usize;
     let mut ws_squelched = 0usize;
     let squelch_limit = if matches!(ws_action, WsAction::ErrorAll) {
@@ -551,13 +566,15 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
         return Ok(());
     }
 
-    // Phase 1: compute every result first (git applies a patch atomically within
-    // one input file; across multiple inputs it materializes between them). We
-    // keep an in-memory overlay of prior results in this batch so a later patch
-    // (e.g. t4110's multi-file apply scan) can read the postimage of an earlier
-    // create/modify without requiring intermediate disk writes.
+    // Phase 1: compute every result first. Git applies one input file
+    // atomically; across multiple inputs it materializes between them. The
+    // in-memory `result_overlay` stands in for that materialization so a later
+    // *input* (e.g. t4110's multi-file apply scan) can read an earlier input's
+    // postimage without intermediate disk writes. Updates are staged per input
+    // and only published to the overlay at the input-file boundary — later
+    // file-patches inside the same input still read the original preimage.
     let mut actions = Vec::new();
-    // path -> content after earlier patches in this batch; tombstones via deleted.
+    // path -> content after earlier *inputs* in this batch; tombstones via deleted.
     let mut result_overlay: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let mut result_deleted: HashSet<Vec<u8>> = HashSet::new();
     // `--reject`: rejected-hunk `.rej` writeouts collected here (path, bytes), and
@@ -565,23 +582,88 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
     let mut reject_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut had_reject = false;
     let apply_file_options = sley_diff_merge::ApplyFileOptions { unidiff_zero };
-    for patch in &mut patches {
-        // Gitlink (submodule) patch: mode 160000 + `Subproject commit <sha>` body.
-        // git updates the index gitlink entry from the recorded commit oid (no
-        // blob is written) and, in the working tree, just ensures an (empty)
-        // directory exists; a removal drops the index entry but leaves the
-        // submodule directory in place.
-        if apply_patch_is_gitlink(patch) {
-            if patch.is_delete {
-                if let Some(old) = &patch.old_path {
+    for (patch_input_file, group) in &mut patch_groups {
+        // Pending postimages for this input only — not visible to later
+        // file-patches until the input completes.
+        let mut pending_overlay: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut pending_deleted: HashSet<Vec<u8>> = HashSet::new();
+        for patch in group.iter_mut() {
+            // Gitlink (submodule) patch: mode 160000 + `Subproject commit <sha>` body.
+            // git updates the index gitlink entry from the recorded commit oid (no
+            // blob is written) and, in the working tree, just ensures an (empty)
+            // directory exists; a removal drops the index entry but leaves the
+            // submodule directory in place.
+            if apply_patch_is_gitlink(patch) {
+                if patch.is_delete {
+                    if let Some(old) = &patch.old_path {
+                        record_apply_result_overlay(
+                            &mut pending_overlay,
+                            &mut pending_deleted,
+                            old,
+                            None,
+                        );
+                        actions.push(ApplyAction::GitlinkRemove { path: old.clone() });
+                    }
+                    continue;
+                }
+                let base = read_patch_base(
+                    &worktree_base,
+                    worktree_root,
+                    git_dir,
+                    format,
+                    repo_config,
+                    patch,
+                    index.as_ref(),
+                    db,
+                    verify_worktree_match,
+                    &result_overlay,
+                    &result_deleted,
+                )?;
+                let content = match sley_diff_merge::apply_file_patch_with_options(
+                    &base,
+                    patch,
+                    &apply_file_options,
+                ) {
+                    sley_diff_merge::ApplyOutcome::Applied(content) => content,
+                    sley_diff_merge::ApplyOutcome::Rejected => {
+                        let name = patch
+                            .new_path
+                            .as_deref()
+                            .or(patch.old_path.as_deref())
+                            .unwrap_or(b"");
+                        eprintln!("error: patch failed: {}", String::from_utf8_lossy(name));
+                        return Err(GitError::Exit(1));
+                    }
+                };
+                let Some(target) = patch.new_path.clone().or_else(|| patch.old_path.clone()) else {
+                    return Err(GitError::InvalidFormat("patch missing target path".into()));
+                };
+                let oid = apply_gitlink_oid_from_content(&content, format, &target)?;
+                // file→gitlink type-change: git splits this into a delete (of the
+                // regular file) followed by a gitlink create; sley's own diff may
+                // instead emit one mode-change patch. Remove the old working-tree
+                // file first so the gitlink directory can be created in its place.
+                // Skipped when the old side is itself a gitlink (a normal modify) or
+                // when the path is newly added.
+                if !patch.is_new
+                    && patch.old_mode.is_some_and(|mode| mode != 0o160000)
+                    && let Some(old) = &patch.old_path
+                {
                     record_apply_result_overlay(
-                        &mut result_overlay,
-                        &mut result_deleted,
+                        &mut pending_overlay,
+                        &mut pending_deleted,
                         old,
                         None,
                     );
-                    actions.push(ApplyAction::GitlinkRemove { path: old.clone() });
+                    actions.push(ApplyAction::Remove { path: old.clone() });
                 }
+                record_apply_result_overlay(
+                    &mut pending_overlay,
+                    &mut pending_deleted,
+                    &target,
+                    Some(content),
+                );
+                actions.push(ApplyAction::Gitlink { path: target, oid });
                 continue;
             }
             let base = read_patch_base(
@@ -597,248 +679,232 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
                 &result_overlay,
                 &result_deleted,
             )?;
-            let content = match sley_diff_merge::apply_file_patch_with_options(
-                &base,
-                patch,
-                &apply_file_options,
-            ) {
-                sley_diff_merge::ApplyOutcome::Applied(content) => content,
-                sley_diff_merge::ApplyOutcome::Rejected => {
-                    let name = patch
-                        .new_path
-                        .as_deref()
-                        .or(patch.old_path.as_deref())
-                        .unwrap_or(b"");
-                    eprintln!("error: patch failed: {}", String::from_utf8_lossy(name));
-                    return Err(GitError::Exit(1));
+            // Whitespace handling (git's check_patch path): warn/error/fix on the
+            // introduced `+` lines. Preimage is the cross-input overlay only.
+            if !matches!(ws_action, WsAction::Nowarn) && !patch.is_binary {
+                let target = patch
+                    .new_path
+                    .as_deref()
+                    .or(patch.old_path.as_deref())
+                    .unwrap_or(b"");
+                let mut rule = ws_resolver.rule_for_path(target)?;
+                if patch.new_mode.or(patch.old_mode) == Some(0o120000) {
+                    rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
+                }
+                apply_patch_whitespace(
+                    patch,
+                    &base,
+                    rule,
+                    ws_action,
+                    patch_input_file,
+                    squelch_limit,
+                    &mut ws_error_count,
+                    &mut ws_squelched,
+                );
+            }
+            // Binary patches reconstruct the postimage from the recorded blob OIDs
+            // (and the `GIT binary patch` payload), not from textual hunks.
+            if patch.is_binary {
+                match apply_binary_outcome(db, format, patch, &base)? {
+                    BinaryApply::Deletion => {
+                        if let Some(old) = &patch.old_path {
+                            record_apply_result_overlay(
+                                &mut pending_overlay,
+                                &mut pending_deleted,
+                                old,
+                                None,
+                            );
+                            actions.push(ApplyAction::Remove { path: old.clone() });
+                        }
+                    }
+                    BinaryApply::Content(content) => {
+                        let Some(target) =
+                            patch.new_path.clone().or_else(|| patch.old_path.clone())
+                        else {
+                            return Err(GitError::InvalidFormat(
+                                "patch missing target path".into(),
+                            ));
+                        };
+                        let mode =
+                            apply_write_mode(&worktree_base, patch, &target, trust_filemode)?;
+                        let index_mode =
+                            apply_index_mode_and_warn(patch, &target, mode, &index_modes);
+                        let mode = apply_worktree_mode_for_index_apply(
+                            mode,
+                            index_mode,
+                            patch,
+                            update_index,
+                            cached,
+                        );
+                        record_apply_result_overlay(
+                            &mut pending_overlay,
+                            &mut pending_deleted,
+                            &target,
+                            Some(content.clone()),
+                        );
+                        actions.push(ApplyAction::Write {
+                            path: target,
+                            mode,
+                            index_mode,
+                            content,
+                        });
+                        if patch.is_rename
+                            && let Some(old) = &patch.old_path
+                        {
+                            record_apply_result_overlay(
+                                &mut pending_overlay,
+                                &mut pending_deleted,
+                                old,
+                                None,
+                            );
+                            actions.push(ApplyAction::Remove { path: old.clone() });
+                        }
+                    }
+                }
+                continue;
+            }
+            // `--reject` applies hunk-by-hunk and keeps going past a failing hunk,
+            // writing the rejects to `<file>.rej`; the default path is all-or-nothing.
+            let (content, rejected_hunks) = if reject {
+                let result =
+                    sley_diff_merge::apply_file_patch_rejecting(&base, patch, &apply_file_options);
+                (result.content, result.rejected)
+            } else if matches!(ws_action, WsAction::Fix) || ignore_space_change {
+                // `--whitespace=fix` / `--ignore-space-change`: match (and, in fix
+                // mode, whitespace-correct) context lines and trim blank lines at EOF.
+                let target = patch
+                    .new_path
+                    .as_deref()
+                    .or(patch.old_path.as_deref())
+                    .unwrap_or(b"");
+                let mut rule = ws_resolver.rule_for_path(target)?;
+                if patch.new_mode.or(patch.old_mode) == Some(0o120000) {
+                    rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
+                }
+                let ws_opts = sley_diff_merge::WsApplyOptions {
+                    unidiff_zero,
+                    ws_rule: rule,
+                    ws_fix: matches!(ws_action, WsAction::Fix),
+                    ws_ignore_change: ignore_space_change,
+                };
+                match sley_diff_merge::apply_file_patch_ws(&base, patch, &ws_opts) {
+                    sley_diff_merge::WsApplyOutcome::Applied { content, .. } => {
+                        (content, Vec::new())
+                    }
+                    sley_diff_merge::WsApplyOutcome::Rejected => {
+                        let name = patch
+                            .new_path
+                            .as_deref()
+                            .or(patch.old_path.as_deref())
+                            .unwrap_or(b"");
+                        eprintln!("error: patch failed: {}", String::from_utf8_lossy(name));
+                        return Err(GitError::Exit(1));
+                    }
+                }
+            } else {
+                match sley_diff_merge::apply_file_patch_with_options(
+                    &base,
+                    patch,
+                    &apply_file_options,
+                ) {
+                    sley_diff_merge::ApplyOutcome::Applied(content) => (content, Vec::new()),
+                    sley_diff_merge::ApplyOutcome::Rejected => {
+                        let name = patch
+                            .new_path
+                            .as_deref()
+                            .or(patch.old_path.as_deref())
+                            .unwrap_or(b"");
+                        eprintln!("error: patch failed: {}", String::from_utf8_lossy(name));
+                        return Err(GitError::Exit(1));
+                    }
                 }
             };
-            let Some(target) = patch.new_path.clone().or_else(|| patch.old_path.clone()) else {
-                return Err(GitError::InvalidFormat("patch missing target path".into()));
-            };
-            let oid = apply_gitlink_oid_from_content(&content, format, &target)?;
-            // file→gitlink type-change: git splits this into a delete (of the
-            // regular file) followed by a gitlink create; sley's own diff may
-            // instead emit one mode-change patch. Remove the old working-tree
-            // file first so the gitlink directory can be created in its place.
-            // Skipped when the old side is itself a gitlink (a normal modify) or
-            // when the path is newly added.
-            if !patch.is_new
-                && patch.old_mode.is_some_and(|mode| mode != 0o160000)
-                && let Some(old) = &patch.old_path
-            {
-                record_apply_result_overlay(&mut result_overlay, &mut result_deleted, old, None);
-                actions.push(ApplyAction::Remove { path: old.clone() });
+            if !rejected_hunks.is_empty() {
+                had_reject = true;
+                let rej_target = patch
+                    .new_path
+                    .as_deref()
+                    .or(patch.old_path.as_deref())
+                    .unwrap_or(b"")
+                    .to_vec();
+                // git's `write_out_one_reject`: a deliberately non-`--git` header
+                // (`diff a/X b/X\t(rejected hunks)`) followed by each rejected hunk's
+                // raw unified text.
+                let mut rej = Vec::new();
+                rej.extend_from_slice(b"diff a/");
+                rej.extend_from_slice(&rej_target);
+                rej.extend_from_slice(b" b/");
+                rej.extend_from_slice(&rej_target);
+                rej.extend_from_slice(b"\t(rejected hunks)\n");
+                for &index in &rejected_hunks {
+                    rej.extend_from_slice(&sley_diff_merge::render_reject_hunk(
+                        &patch.hunks[index],
+                    ));
+                }
+                reject_writes.push((rej_target, rej));
+                apply_say_reject(patch, &rejected_hunks, patch.hunks.len());
             }
+            // A clean deletion removes the file; otherwise (modify/rename/new, or a
+            // partial `--reject` apply) write the resulting bytes.
+            if patch.is_delete && rejected_hunks.is_empty() {
+                if let Some(old) = &patch.old_path {
+                    record_apply_result_overlay(
+                        &mut pending_overlay,
+                        &mut pending_deleted,
+                        old,
+                        None,
+                    );
+                    actions.push(ApplyAction::Remove { path: old.clone() });
+                }
+            } else {
+                let Some(target) = patch.new_path.clone().or_else(|| patch.old_path.clone()) else {
+                    return Err(GitError::InvalidFormat("patch missing target path".into()));
+                };
+                let mode = apply_write_mode(&worktree_base, patch, &target, trust_filemode)?;
+                let index_mode = apply_index_mode_and_warn(patch, &target, mode, &index_modes);
+                let mode = apply_worktree_mode_for_index_apply(
+                    mode,
+                    index_mode,
+                    patch,
+                    update_index,
+                    cached,
+                );
+                record_apply_result_overlay(
+                    &mut pending_overlay,
+                    &mut pending_deleted,
+                    &target,
+                    Some(content.clone()),
+                );
+                actions.push(ApplyAction::Write {
+                    path: target,
+                    mode,
+                    index_mode,
+                    content,
+                });
+                if patch.is_rename
+                    && let Some(old) = &patch.old_path
+                {
+                    record_apply_result_overlay(
+                        &mut pending_overlay,
+                        &mut pending_deleted,
+                        old,
+                        None,
+                    );
+                    actions.push(ApplyAction::Remove { path: old.clone() });
+                }
+            }
+        }
+        // Input boundary: publish this input's postimages for subsequent inputs.
+        for path in pending_deleted {
+            record_apply_result_overlay(&mut result_overlay, &mut result_deleted, &path, None);
+        }
+        for (path, content) in pending_overlay {
             record_apply_result_overlay(
                 &mut result_overlay,
                 &mut result_deleted,
-                &target,
+                &path,
                 Some(content),
             );
-            actions.push(ApplyAction::Gitlink { path: target, oid });
-            continue;
-        }
-        let base = read_patch_base(
-            &worktree_base,
-            worktree_root,
-            git_dir,
-            format,
-            repo_config,
-            patch,
-            index.as_ref(),
-            db,
-            verify_worktree_match,
-            &result_overlay,
-            &result_deleted,
-        )?;
-        // Whitespace handling (git's check_patch path): warn/error/fix on the
-        // introduced `+` lines. Runs per-patch so later patches see earlier
-        // postimages via the overlay.
-        if !matches!(ws_action, WsAction::Nowarn) && !patch.is_binary {
-            let target = patch
-                .new_path
-                .as_deref()
-                .or(patch.old_path.as_deref())
-                .unwrap_or(b"");
-            let mut rule = ws_resolver.rule_for_path(target)?;
-            if patch.new_mode.or(patch.old_mode) == Some(0o120000) {
-                rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
-            }
-            apply_patch_whitespace(
-                patch,
-                &base,
-                rule,
-                ws_action,
-                patch_input_file,
-                squelch_limit,
-                &mut ws_error_count,
-                &mut ws_squelched,
-            );
-        }
-        // Binary patches reconstruct the postimage from the recorded blob OIDs
-        // (and the `GIT binary patch` payload), not from textual hunks.
-        if patch.is_binary {
-            match apply_binary_outcome(db, format, patch, &base)? {
-                BinaryApply::Deletion => {
-                    if let Some(old) = &patch.old_path {
-                        record_apply_result_overlay(
-                            &mut result_overlay,
-                            &mut result_deleted,
-                            old,
-                            None,
-                        );
-                        actions.push(ApplyAction::Remove { path: old.clone() });
-                    }
-                }
-                BinaryApply::Content(content) => {
-                    let Some(target) = patch.new_path.clone().or_else(|| patch.old_path.clone())
-                    else {
-                        return Err(GitError::InvalidFormat("patch missing target path".into()));
-                    };
-                    let mode = apply_write_mode(&worktree_base, patch, &target, trust_filemode)?;
-                    let index_mode = apply_index_mode_and_warn(patch, &target, mode, &index_modes);
-                    let mode = apply_worktree_mode_for_index_apply(
-                        mode,
-                        index_mode,
-                        patch,
-                        update_index,
-                        cached,
-                    );
-                    record_apply_result_overlay(
-                        &mut result_overlay,
-                        &mut result_deleted,
-                        &target,
-                        Some(content.clone()),
-                    );
-                    actions.push(ApplyAction::Write {
-                        path: target,
-                        mode,
-                        index_mode,
-                        content,
-                    });
-                    if patch.is_rename
-                        && let Some(old) = &patch.old_path
-                    {
-                        record_apply_result_overlay(
-                            &mut result_overlay,
-                            &mut result_deleted,
-                            old,
-                            None,
-                        );
-                        actions.push(ApplyAction::Remove { path: old.clone() });
-                    }
-                }
-            }
-            continue;
-        }
-        // `--reject` applies hunk-by-hunk and keeps going past a failing hunk,
-        // writing the rejects to `<file>.rej`; the default path is all-or-nothing.
-        let (content, rejected_hunks) = if reject {
-            let result =
-                sley_diff_merge::apply_file_patch_rejecting(&base, patch, &apply_file_options);
-            (result.content, result.rejected)
-        } else if matches!(ws_action, WsAction::Fix) || ignore_space_change {
-            // `--whitespace=fix` / `--ignore-space-change`: match (and, in fix mode,
-            // whitespace-correct) context lines and trim blank lines added at EOF.
-            let target = patch
-                .new_path
-                .as_deref()
-                .or(patch.old_path.as_deref())
-                .unwrap_or(b"");
-            let mut rule = ws_resolver.rule_for_path(target)?;
-            if patch.new_mode.or(patch.old_mode) == Some(0o120000) {
-                rule &= !sley_diff_merge::ws::WS_INCOMPLETE_LINE;
-            }
-            let ws_opts = sley_diff_merge::WsApplyOptions {
-                unidiff_zero,
-                ws_rule: rule,
-                ws_fix: matches!(ws_action, WsAction::Fix),
-                ws_ignore_change: ignore_space_change,
-            };
-            match sley_diff_merge::apply_file_patch_ws(&base, patch, &ws_opts) {
-                sley_diff_merge::WsApplyOutcome::Applied { content, .. } => (content, Vec::new()),
-                sley_diff_merge::WsApplyOutcome::Rejected => {
-                    let name = patch
-                        .new_path
-                        .as_deref()
-                        .or(patch.old_path.as_deref())
-                        .unwrap_or(b"");
-                    eprintln!("error: patch failed: {}", String::from_utf8_lossy(name));
-                    return Err(GitError::Exit(1));
-                }
-            }
-        } else {
-            match sley_diff_merge::apply_file_patch_with_options(&base, patch, &apply_file_options)
-            {
-                sley_diff_merge::ApplyOutcome::Applied(content) => (content, Vec::new()),
-                sley_diff_merge::ApplyOutcome::Rejected => {
-                    let name = patch
-                        .new_path
-                        .as_deref()
-                        .or(patch.old_path.as_deref())
-                        .unwrap_or(b"");
-                    eprintln!("error: patch failed: {}", String::from_utf8_lossy(name));
-                    return Err(GitError::Exit(1));
-                }
-            }
-        };
-        if !rejected_hunks.is_empty() {
-            had_reject = true;
-            let rej_target = patch
-                .new_path
-                .as_deref()
-                .or(patch.old_path.as_deref())
-                .unwrap_or(b"")
-                .to_vec();
-            // git's `write_out_one_reject`: a deliberately non-`--git` header
-            // (`diff a/X b/X\t(rejected hunks)`) followed by each rejected hunk's
-            // raw unified text.
-            let mut rej = Vec::new();
-            rej.extend_from_slice(b"diff a/");
-            rej.extend_from_slice(&rej_target);
-            rej.extend_from_slice(b" b/");
-            rej.extend_from_slice(&rej_target);
-            rej.extend_from_slice(b"\t(rejected hunks)\n");
-            for &index in &rejected_hunks {
-                rej.extend_from_slice(&sley_diff_merge::render_reject_hunk(&patch.hunks[index]));
-            }
-            reject_writes.push((rej_target, rej));
-            apply_say_reject(patch, &rejected_hunks, patch.hunks.len());
-        }
-        // A clean deletion removes the file; otherwise (modify/rename/new, or a
-        // partial `--reject` apply) write the resulting bytes.
-        if patch.is_delete && rejected_hunks.is_empty() {
-            if let Some(old) = &patch.old_path {
-                record_apply_result_overlay(&mut result_overlay, &mut result_deleted, old, None);
-                actions.push(ApplyAction::Remove { path: old.clone() });
-            }
-        } else {
-            let Some(target) = patch.new_path.clone().or_else(|| patch.old_path.clone()) else {
-                return Err(GitError::InvalidFormat("patch missing target path".into()));
-            };
-            let mode = apply_write_mode(&worktree_base, patch, &target, trust_filemode)?;
-            let index_mode = apply_index_mode_and_warn(patch, &target, mode, &index_modes);
-            let mode =
-                apply_worktree_mode_for_index_apply(mode, index_mode, patch, update_index, cached);
-            record_apply_result_overlay(
-                &mut result_overlay,
-                &mut result_deleted,
-                &target,
-                Some(content.clone()),
-            );
-            actions.push(ApplyAction::Write {
-                path: target,
-                mode,
-                index_mode,
-                content,
-            });
-            if patch.is_rename
-                && let Some(old) = &patch.old_path
-            {
-                record_apply_result_overlay(&mut result_overlay, &mut result_deleted, old, None);
-                actions.push(ApplyAction::Remove { path: old.clone() });
-            }
         }
     }
 
@@ -2088,9 +2154,10 @@ impl ApplyAction {
 /// Read the worktree base content a patch applies against (empty for a new
 /// file). Shared by the whitespace pass and the apply pass.
 ///
-/// `result_overlay` / `result_deleted` carry postimages of earlier patches in
-/// the same batch (git's `previous_patch` / materialize-between-inputs), so a
-/// later patch can see a just-created or just-modified file.
+/// `result_overlay` / `result_deleted` carry postimages of earlier *input
+/// files* in the same `git apply` invocation (git materializes between
+/// inputs). Later file-patches inside the current input do not see these
+/// until the input boundary is crossed.
 fn read_patch_base(
     worktree_base: &Path,
     filter_worktree_root: &Path,
@@ -2194,7 +2261,9 @@ fn read_patch_base(
     Ok(blob)
 }
 
-/// Record a postimage (or deletion) for later patches in the same apply batch.
+/// Record a postimage (or deletion). Callers stage updates into a pending map
+/// for the current input, then publish into the cross-input overlay at the
+/// input-file boundary.
 fn record_apply_result_overlay(
     overlay: &mut HashMap<Vec<u8>, Vec<u8>>,
     deleted: &mut HashSet<Vec<u8>>,
