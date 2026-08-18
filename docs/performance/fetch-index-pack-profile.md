@@ -96,13 +96,12 @@ default `fast-sha1` feature, not SHA-1DC.
 The sideband reader does allocate a payload vector and copy band-1 data into
 the caller buffer, but its measured 0.27% makes it immaterial to this gap.
 
-## SIGPROF flamegraph
+## SIGPROF sampled stacks
 
 The reusable `fetch-profile` binary uses `pprof-rs`'s SIGPROF sampler and needs
 no `perf_event_open` privileges. The rust-lang/rust run sampled the complete
-fetch at 100 Hz:
-
-![rust-lang/rust protocol-v2 fetch flamegraph](rust-fetch-flamegraph.svg)
+fetch at 100 Hz. Its [collapsed stacks](rust-fetch-profile.folded.txt) use the
+standard folded format and can be rendered by an offline flamegraph tool.
 
 The wide receive/index stack terminates in `inflate_entry_from_stream` and
 `zlib_rs::inflate`; the post-receive tail is `resolve_pack_entries`/delta apply
@@ -118,7 +117,7 @@ CARGO_HOME=/path/to/writable/cargo-home \
 
 target/fetch-profile/fetch-profile \
   --report docs/performance/rust-fetch-profile.txt \
-  --flamegraph docs/performance/rust-fetch-flamegraph.svg \
+  --folded docs/performance/rust-fetch-profile.folded.txt \
   --checkpoint-seconds 60 \
   -- clone -n https://github.com/rust-lang/rust /path/to/empty/destination
 ```

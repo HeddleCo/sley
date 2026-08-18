@@ -11,7 +11,7 @@ sha1_backend=RustCrypto sha1 (hardware-dispatched; not SHA-1DC)
 index_pack_threads=1
 object_storage=packfile_plus_v2_idx
 fsync_count=2
-flamegraph=docs/performance/rust-fetch-flamegraph.svg
+folded_stacks=docs/performance/rust-fetch-profile.folded.txt
 
 stage	wall_seconds	percent_total	count	bytes
 socket read	8.114038	3.53	321036	974913138

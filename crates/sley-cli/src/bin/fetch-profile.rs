@@ -1,18 +1,18 @@
 use sley::plumbing::sley_core::fetch_profile::{self, Stage};
 use std::error::Error;
 use std::fmt::Write as _;
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: fetch-profile [--report <path>] [--flamegraph <path>] \
+const USAGE: &str = "usage: fetch-profile [--report <path>] [--folded <path>] \
     [--frequency <hz>] [--checkpoint-seconds <seconds>] -- <sley command> [args...]";
 
 struct Options {
     report: PathBuf,
-    flamegraph: PathBuf,
+    folded: PathBuf,
     frequency: i32,
     checkpoint: Option<Duration>,
     command: Vec<String>,
@@ -31,7 +31,7 @@ fn main() -> ExitCode {
 fn run() -> Result<u8, Box<dyn Error>> {
     let options = parse_options(std::env::args().skip(1))?;
     ensure_parent(&options.report)?;
-    ensure_parent(&options.flamegraph)?;
+    ensure_parent(&options.folded)?;
 
     fetch_profile::reset();
     let guard = pprof::ProfilerGuard::new(options.frequency)?;
@@ -46,7 +46,7 @@ fn run() -> Result<u8, Box<dyn Error>> {
     write_outputs(&options, &guard, elapsed)?;
 
     eprintln!("fetch profile report: {}", options.report.display());
-    eprintln!("fetch profile flamegraph: {}", options.flamegraph.display());
+    eprintln!("fetch profile folded stacks: {}", options.folded.display());
     match command_result {
         Ok(()) => Ok(0),
         Err(err) => {
@@ -58,7 +58,7 @@ fn run() -> Result<u8, Box<dyn Error>> {
 
 fn parse_options(args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut report = PathBuf::from("fetch-profile.txt");
-    let mut flamegraph = PathBuf::from("fetch-profile.svg");
+    let mut folded = PathBuf::from("fetch-profile.folded.txt");
     let mut frequency = 100i32;
     let mut checkpoint = None;
     let mut command = Vec::new();
@@ -75,10 +75,10 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Options, String> 
                         .ok_or_else(|| format!("--report requires a path\n{USAGE}"))?,
                 );
             }
-            "--flamegraph" => {
-                flamegraph = PathBuf::from(
+            "--folded" => {
+                folded = PathBuf::from(
                     args.next()
-                        .ok_or_else(|| format!("--flamegraph requires a path\n{USAGE}"))?,
+                        .ok_or_else(|| format!("--folded requires a path\n{USAGE}"))?,
                 );
             }
             "--frequency" => {
@@ -113,7 +113,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Options, String> 
     }
     Ok(Options {
         report,
-        flamegraph,
+        folded,
         frequency,
         checkpoint,
         command,
@@ -164,13 +164,33 @@ fn write_outputs(
     elapsed: Duration,
 ) -> Result<(), Box<dyn Error>> {
     let snapshot = fetch_profile::snapshot();
-    let rendered = render_report(elapsed, &snapshot, &options.flamegraph);
+    let rendered = render_report(elapsed, &snapshot, &options.folded);
     fs::write(&options.report, rendered)?;
     let profile = guard.report().build()?;
-    let temporary = options.flamegraph.with_extension("svg.tmp");
-    profile.flamegraph(File::create(&temporary)?)?;
-    fs::rename(temporary, &options.flamegraph)?;
+    let temporary = options.folded.with_extension("txt.tmp");
+    fs::write(&temporary, render_folded_stacks(&profile))?;
+    fs::rename(temporary, &options.folded)?;
     Ok(())
+}
+
+fn render_folded_stacks(profile: &pprof::Report) -> String {
+    let mut lines = profile
+        .data
+        .iter()
+        .map(|(frames, count)| {
+            let mut stack = frames.thread_name_or_id();
+            for frame in frames.frames.iter().rev() {
+                for symbol in frame.iter().rev() {
+                    stack.push(';');
+                    stack.push_str(&symbol.name().replace(';', ":"));
+                }
+            }
+            format!("{stack} {count}")
+        })
+        .collect::<Vec<_>>();
+    lines.sort_unstable();
+    lines.push(String::new());
+    lines.join("\n")
 }
 
 fn ensure_parent(path: &Path) -> std::io::Result<()> {
@@ -182,11 +202,7 @@ fn ensure_parent(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn render_report(
-    elapsed: Duration,
-    snapshot: &fetch_profile::Snapshot,
-    flamegraph: &Path,
-) -> String {
+fn render_report(elapsed: Duration, snapshot: &fetch_profile::Snapshot, folded: &Path) -> String {
     let mut out = String::new();
     let profiled = snapshot
         .stages
@@ -222,7 +238,7 @@ fn render_report(
     let _ = writeln!(out, "index_pack_threads=1");
     let _ = writeln!(out, "object_storage=packfile_plus_v2_idx");
     let _ = writeln!(out, "fsync_count={}", snapshot.fsyncs);
-    let _ = writeln!(out, "flamegraph={}", flamegraph.display());
+    let _ = writeln!(out, "folded_stacks={}", folded.display());
     let _ = writeln!(out);
     let _ = writeln!(out, "stage\twall_seconds\tpercent_total\tcount\tbytes");
     for sample in &snapshot.stages {
@@ -270,8 +286,8 @@ mod tests {
             [
                 "--report",
                 "out.txt",
-                "--flamegraph",
-                "out.svg",
+                "--folded",
+                "out.folded.txt",
                 "--",
                 "clone",
                 "-n",
@@ -282,8 +298,44 @@ mod tests {
         )
         .expect("profile arguments");
         assert_eq!(options.report, PathBuf::from("out.txt"));
-        assert_eq!(options.flamegraph, PathBuf::from("out.svg"));
+        assert_eq!(options.folded, PathBuf::from("out.folded.txt"));
         assert_eq!(options.command[0], "clone");
         assert_eq!(options.command[1], "-n");
+    }
+
+    #[test]
+    fn folded_stack_output_uses_public_sample_data() {
+        use pprof::{Frames, Report, Symbol};
+        use std::collections::HashMap;
+        use std::time::SystemTime;
+
+        let frames = Frames {
+            frames: vec![
+                vec![Symbol {
+                    name: Some(b"leaf;detail".to_vec()),
+                    addr: None,
+                    lineno: None,
+                    filename: None,
+                }],
+                vec![Symbol {
+                    name: Some(b"root".to_vec()),
+                    addr: None,
+                    lineno: None,
+                    filename: None,
+                }],
+            ],
+            thread_name: "worker".into(),
+            thread_id: 1,
+            sample_timestamp: SystemTime::now(),
+        };
+        let profile = Report {
+            data: HashMap::from([(frames, 7)]),
+            timing: Default::default(),
+        };
+
+        assert_eq!(
+            render_folded_stacks(&profile),
+            "worker;root;leaf:detail 7\n"
+        );
     }
 }
