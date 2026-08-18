@@ -2671,6 +2671,7 @@ fn hydrate_promisor_oid_via_http(
         // and exact-object hydration only needs the named wants (t0410 #39).
         // Local promisor fetches keep their blob:none filter separately.
         filter: None,
+        packfile_uri_protocols: None,
         deepen_since: None,
         deepen_not: Vec::new(),
         deepen_relative: false,

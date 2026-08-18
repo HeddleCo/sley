@@ -11,6 +11,7 @@ mod index;
 mod init;
 mod objects;
 mod refs;
+mod remote;
 mod resolve_path;
 mod rev_graph;
 mod rev_parse;

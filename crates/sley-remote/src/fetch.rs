@@ -638,6 +638,9 @@ fn fetch_impl(
                 promisor: promisor_remote,
                 max_input_size,
                 filter: options.filter.clone(),
+                packfile_uri_protocols: crate::http::http_packfile_uri_protocols(Some(
+                    request.config,
+                )),
                 deepen_since: options.deepen_since,
                 deepen_not,
                 deepen_relative: options.deepen_relative,
@@ -3776,6 +3779,8 @@ mod tests {
             Ok(sley_transport::HttpResponse {
                 status: 200,
                 content_type: Some(self.content_type.clone()),
+                content_length: None,
+                content_range: None,
                 body: Box::new(std::io::Cursor::new(self.advertisement.clone())),
             })
         }

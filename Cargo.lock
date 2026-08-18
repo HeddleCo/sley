@@ -1635,6 +1635,7 @@ dependencies = [
  "sley-rev",
  "sley-transport",
  "sley-worktree",
+ "tempfile",
 ]
 
 [[package]]
@@ -1710,6 +1711,7 @@ dependencies = [
  "sley-config",
  "sley-core",
  "sley-protocol",
+ "tempfile",
  "ureq",
  "webpki-root-certs",
 ]

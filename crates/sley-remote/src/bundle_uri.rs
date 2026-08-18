@@ -540,6 +540,8 @@ mod tests {
             Ok(sley_transport::HttpResponse {
                 status: self.status,
                 content_type: Some("application/octet-stream".into()),
+                content_length: None,
+                content_range: None,
                 body: Box::new(std::io::Cursor::new(self.body)),
             })
         }

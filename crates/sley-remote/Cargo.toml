@@ -30,6 +30,7 @@ sley-refs.workspace = true
 sley-rev.workspace = true
 sley-transport = { path = "../sley-transport", version = "0.5.2", default-features = false } # inline: default-features override cant use workspace inherit
 sley-worktree.workspace = true
+tempfile = "3"
 
 [lints]
 workspace = true
