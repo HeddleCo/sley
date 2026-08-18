@@ -10,6 +10,9 @@ use std::sync::OnceLock;
 
 mod cancel;
 
+#[cfg(feature = "fetch-profile")]
+pub mod fetch_profile;
+
 pub use cancel::{
     AtomicCancel, CancelFlag, CancellableRead, DynCancelFlag, OperationCancelled, StreamControl,
     cancel_flag_from_arc, cancelled_io_error, is_cancelled_error, is_cancelled_io,
@@ -1935,6 +1938,10 @@ impl StreamingDigest {
     }
 
     pub fn update(&mut self, data: &[u8]) {
+        #[cfg(feature = "fetch-profile")]
+        let _profile_span = fetch_profile::Span::enter(fetch_profile::Stage::OidHash);
+        #[cfg(feature = "fetch-profile")]
+        fetch_profile::add_bytes(fetch_profile::Stage::OidHash, data.len() as u64);
         match &mut self.inner {
             #[cfg(not(feature = "fast-sha1"))]
             StreamingDigestInner::Sha1(hasher) => hasher.update(data),
@@ -1948,6 +1955,8 @@ impl StreamingDigest {
     }
 
     pub fn finalize(self) -> Result<ObjectId> {
+        #[cfg(feature = "fetch-profile")]
+        let _profile_span = fetch_profile::Span::enter(fetch_profile::Stage::OidHash);
         match self.inner {
             #[cfg(not(feature = "fast-sha1"))]
             StreamingDigestInner::Sha1(hasher) => {

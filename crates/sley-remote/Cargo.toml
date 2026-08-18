@@ -15,6 +15,12 @@ ssh = []
 tls-rustls = ["sley-transport/tls-rustls"]
 tls-native-tls = ["sley-transport/tls-native-tls"]
 tls-platform-verifier = ["sley-transport/tls-platform-verifier"]
+fetch-profile = [
+    "sley-core/fetch-profile",
+    "sley-odb/fetch-profile",
+    "sley-pack/fetch-profile",
+    "sley-protocol/fetch-profile",
+]
 
 [dependencies]
 sley-config.workspace = true

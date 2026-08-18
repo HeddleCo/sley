@@ -31,6 +31,7 @@ zlib-rs = ["flate2/zlib-rs"]
 pure-rust = ["flate2/rust_backend"]
 # Forward the hardware-accelerated SHA-1 backend (see sley-core).
 fast-sha1 = ["sley-core/fast-sha1"]
+fetch-profile = ["sley-core/fetch-profile"]
 
 [lints]
 workspace = true

@@ -55,6 +55,33 @@ use sley_protocol::{TransportLimits, read_to_end_bounded};
 use crate::credentials::{credential_request_for_url, http_url_credential};
 use crate::{CredentialProvider, ProgressSink, transport_limits_from_config};
 
+#[cfg(feature = "fetch-profile")]
+struct FetchProfileSocketReader<'a, R: ?Sized> {
+    inner: &'a mut R,
+}
+
+#[cfg(feature = "fetch-profile")]
+impl<'a, R: ?Sized> FetchProfileSocketReader<'a, R> {
+    fn new(inner: &'a mut R) -> Self {
+        Self { inner }
+    }
+}
+
+#[cfg(feature = "fetch-profile")]
+impl<R: Read + ?Sized> Read for FetchProfileSocketReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let _profile_span =
+            sley_core::fetch_profile::Span::enter(sley_core::fetch_profile::Stage::SocketRead);
+        let read = self.inner.read(buf)?;
+        sley_core::fetch_profile::add_count(sley_core::fetch_profile::Stage::SocketRead, 1);
+        sley_core::fetch_profile::add_bytes(
+            sley_core::fetch_profile::Stage::SocketRead,
+            read as u64,
+        );
+        Ok(read)
+    }
+}
+
 /// Whether an already-resolved remote `url` uses HTTP(S) transport.
 ///
 /// Callers that start from a configured remote name or relative source resolve
@@ -1153,9 +1180,15 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs<C: HttpClien
             wanted_refs: negotiated.wanted_refs,
         });
     }
+    #[cfg(feature = "fetch-profile")]
+    let mut profiled_body = FetchProfileSocketReader::new(&mut negotiated.body);
+    #[cfg(feature = "fetch-profile")]
+    let pack_body = &mut profiled_body;
+    #[cfg(not(feature = "fetch-profile"))]
+    let pack_body = &mut negotiated.body;
     if promisor {
         install_protocol_v2_packfile_from_reader_with_cancel(
-            &mut negotiated.body,
+            pack_body,
             &local_db,
             true,
             max_input_size,
@@ -1163,7 +1196,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs<C: HttpClien
         )?;
     } else {
         install_protocol_v2_packfile_from_reader_with_cancel(
-            &mut negotiated.body,
+            pack_body,
             &ProgressInstaller::new(&local_db, progress),
             false,
             max_input_size,

@@ -37,6 +37,10 @@ members = [
 ]
 resolver = "3"
 
+[profile.fetch-profile]
+inherits = "release"
+debug = 1
+
 [workspace.dependencies]
 sley-archive = { path = "crates/sley-archive", version = "0.5.2" }
 sley-bench = { path = "crates/sley-bench", version = "0.5.2" }

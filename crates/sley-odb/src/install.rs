@@ -277,7 +277,22 @@ where
                     format!("pack exceeds maximum allowed size ({limit})"),
                 ));
             }
+            #[cfg(feature = "fetch-profile")]
+            let _profile_span = sley_core::fetch_profile::Span::enter(
+                sley_core::fetch_profile::Stage::ObjectStoreWrite,
+            );
             self.writer.write_all(&buf[..len])?;
+            #[cfg(feature = "fetch-profile")]
+            {
+                sley_core::fetch_profile::add_count(
+                    sley_core::fetch_profile::Stage::ObjectStoreWrite,
+                    1,
+                );
+                sley_core::fetch_profile::add_bytes(
+                    sley_core::fetch_profile::Stage::ObjectStoreWrite,
+                    len as u64,
+                );
+            }
             self.written = next_written;
         }
         Ok(len)
@@ -492,8 +507,14 @@ impl RawPackStreamingInstall {
             let mut file = self.file.take().ok_or_else(|| {
                 GitError::InvalidFormat("raw pack stream already finished".into())
             })?;
+            #[cfg(feature = "fetch-profile")]
+            let _profile_span = sley_core::fetch_profile::Span::enter(
+                sley_core::fetch_profile::Stage::ObjectStoreWrite,
+            );
             file.flush()?;
             file.sync_all()?;
+            #[cfg(feature = "fetch-profile")]
+            sley_core::fetch_profile::add_fsync();
             drop(file);
 
             if self.written != self.expected_pack_size {
@@ -1200,8 +1221,14 @@ impl FileObjectDatabase {
                 )
                 .map_err(map_install_cancel_error)?
             };
+            #[cfg(feature = "fetch-profile")]
+            let _profile_span = sley_core::fetch_profile::Span::enter(
+                sley_core::fetch_profile::Stage::ObjectStoreWrite,
+            );
             file.flush()?;
             file.sync_all()?;
+            #[cfg(feature = "fetch-profile")]
+            sley_core::fetch_profile::add_fsync();
             drop(file);
 
             self.install_pack_file_from_temp(
@@ -1234,8 +1261,24 @@ pub(crate) fn write_pack_component(path: &Path, bytes: &[u8]) -> Result<()> {
                 .write(true)
                 .create_new(true)
                 .open(&temp_path)?;
+            #[cfg(feature = "fetch-profile")]
+            let _profile_span = sley_core::fetch_profile::Span::enter(
+                sley_core::fetch_profile::Stage::ObjectStoreWrite,
+            );
             file.write_all(bytes)?;
             file.sync_all()?;
+            #[cfg(feature = "fetch-profile")]
+            {
+                sley_core::fetch_profile::add_count(
+                    sley_core::fetch_profile::Stage::ObjectStoreWrite,
+                    1,
+                );
+                sley_core::fetch_profile::add_bytes(
+                    sley_core::fetch_profile::Stage::ObjectStoreWrite,
+                    bytes.len() as u64,
+                );
+                sley_core::fetch_profile::add_fsync();
+            }
         }
         match fs::rename(&temp_path, path) {
             Ok(()) => Ok(()),

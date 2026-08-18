@@ -18,6 +18,11 @@ path = "src/main.rs"
 name = "scalar"
 path = "src/scalar_main.rs"
 
+[[bin]]
+name = "fetch-profile"
+path = "src/bin/fetch-profile.rs"
+required-features = ["fetch-profile"]
+
 [dependencies]
 # SIGINT/Ctrl-C → cooperative AtomicCancel for fetch/clone/push (no unsafe in sley).
 ctrlc = "3.5"
@@ -27,6 +32,7 @@ filetime = "0.2"
 # the backend is unified to zlib-rs by the transitive sley-odb default feature.
 flate2 = { version = "1", default-features = false }
 regex = "1"
+pprof = { version = "0.15", optional = true }
 sley.workspace = true
 sley-archive.workspace = true
 sley-grep.workspace = true
@@ -72,6 +78,7 @@ tls-platform-verifier = ["sley-transport/tls-platform-verifier"]
 # `git-sh-i18n` before command dispatch, so an otherwise ordinary CLI build
 # must not depend on a separately selected feature or an installed Git.
 git-compat-i18n = ["dep:sley-i18n"]
+fetch-profile = ["dep:pprof", "sley/fetch-profile", "sley-protocol/fetch-profile"]
 
 # Integration tests build low-level fixtures (commit-graph parsing, raw ODB
 # writes, object-format constants) directly. These are dev-only and do NOT
