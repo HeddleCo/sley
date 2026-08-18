@@ -47,6 +47,13 @@ mmap = ["sley-odb/mmap"]
 tls-rustls = ["sley-remote/tls-rustls"]
 tls-native-tls = ["sley-remote/tls-native-tls"]
 tls-platform-verifier = ["sley-remote/tls-platform-verifier"]
+fetch-profile = [
+    "sley-core/fetch-profile",
+    "sley-odb/fetch-profile",
+    "sley-pack/fetch-profile",
+    "sley-protocol/fetch-profile",
+    "sley-remote/fetch-profile",
+]
 
 # Path-only (no version) so `cargo publish` strips this test-only helper from the
 # published manifest — sley-testkit is publish=false and not on crates.io.

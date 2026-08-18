@@ -349,6 +349,9 @@ impl<R, F> StreamingSidebandReader<R, F> {
 
 impl<R: Read, F: FnMut(&[u8])> Read for StreamingSidebandReader<R, F> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(feature = "fetch-profile")]
+        let _profile_span =
+            sley_core::fetch_profile::Span::enter(sley_core::fetch_profile::Stage::PktLineSideband);
         if buf.is_empty() {
             return Ok(0);
         }
@@ -454,6 +457,17 @@ impl<R: Read, F: FnMut(&[u8])> Read for StreamingSidebandReader<R, F> {
                     return Err(err);
                 }
             }
+        }
+        #[cfg(feature = "fetch-profile")]
+        {
+            sley_core::fetch_profile::add_count(
+                sley_core::fetch_profile::Stage::PktLineSideband,
+                1,
+            );
+            sley_core::fetch_profile::add_bytes(
+                sley_core::fetch_profile::Stage::PktLineSideband,
+                written as u64,
+            );
         }
         Ok(written)
     }

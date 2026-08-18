@@ -1054,7 +1054,18 @@ where
             }
             let body = apply_pack_delta(base_object.body(), delta)?;
             let object = EncodedObject::new(base_object.object_type(), body);
+            #[cfg(feature = "fetch-profile")]
+            let _oid_span =
+                sley_core::fetch_profile::Span::enter(sley_core::fetch_profile::Stage::OidHash);
             let oid = object.object_id(format)?;
+            #[cfg(feature = "fetch-profile")]
+            {
+                sley_core::fetch_profile::add_count(sley_core::fetch_profile::Stage::OidHash, 1);
+                sley_core::fetch_profile::add_bytes(
+                    sley_core::fetch_profile::Stage::OidHash,
+                    object.body.len() as u64,
+                );
+            }
             let pack_object = PackObject {
                 entry: PackEntry {
                     oid,

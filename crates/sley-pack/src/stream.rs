@@ -420,11 +420,24 @@ where
             }
             _ => None,
         };
+        #[cfg(feature = "fetch-profile")]
+        let _inflate_span =
+            sley_core::fetch_profile::Span::enter(sley_core::fetch_profile::Stage::Inflate);
         let (body, consumed) = inflate_entry_from_stream(
             &mut stream,
             &mut entry_crc,
             header.size.min(usize::MAX as u64) as usize,
         )?;
+        #[cfg(feature = "fetch-profile")]
+        {
+            sley_core::fetch_profile::add_count(sley_core::fetch_profile::Stage::Inflate, 1);
+            sley_core::fetch_profile::add_bytes(
+                sley_core::fetch_profile::Stage::Inflate,
+                body.len() as u64,
+            );
+        }
+        #[cfg(feature = "fetch-profile")]
+        drop(_inflate_span);
         if body.len() as u64 != header.size {
             return Err(GitError::InvalidObject(format!(
                 "pack object declared {} bytes, decoded {}",
@@ -449,7 +462,18 @@ where
         } else {
             let object_type = pack_object_kind_to_object_type(header.kind)?;
             let object = EncodedObject::new(object_type, body);
+            #[cfg(feature = "fetch-profile")]
+            let _oid_span =
+                sley_core::fetch_profile::Span::enter(sley_core::fetch_profile::Stage::OidHash);
             let oid = object.object_id(format)?;
+            #[cfg(feature = "fetch-profile")]
+            {
+                sley_core::fetch_profile::add_count(sley_core::fetch_profile::Stage::OidHash, 1);
+                sley_core::fetch_profile::add_bytes(
+                    sley_core::fetch_profile::Stage::OidHash,
+                    object.body.len() as u64,
+                );
+            }
             parsed_entries.push(ParsedPackEntry::Resolved(PackObject {
                 entry: PackEntry {
                     oid,
@@ -490,7 +514,23 @@ where
         )));
     }
 
+    #[cfg(feature = "fetch-profile")]
+    let delta_count = parsed_entries
+        .iter()
+        .filter(|entry| matches!(entry, ParsedPackEntry::Delta { .. }))
+        .count() as u64;
+    #[cfg(feature = "fetch-profile")]
+    let _delta_span =
+        sley_core::fetch_profile::Span::enter(sley_core::fetch_profile::Stage::DeltaResolution);
     let resolved = resolve_pack_entries(parsed_entries, format, &mut external_base, limits)?;
+    #[cfg(feature = "fetch-profile")]
+    {
+        sley_core::fetch_profile::add_count(
+            sley_core::fetch_profile::Stage::DeltaResolution,
+            delta_count,
+        );
+        drop(_delta_span);
+    }
     let entries = resolved
         .iter()
         .zip(raw_entries)

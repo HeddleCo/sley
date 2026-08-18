@@ -1,0 +1,23 @@
+sley protocol-v2 fetch/index-pack profile
+total_wall_seconds=229.653241
+profiled_wall_seconds=222.327193
+unattributed_wall_seconds=7.326048
+pack_bytes=974387947
+socket_body_bytes=974913138
+end_to_end_MB_per_second=4.243
+active_socket_MB_per_second=120.151
+inflate_backend=zlib-rs (flate2)
+sha1_backend=RustCrypto sha1 (hardware-dispatched; not SHA-1DC)
+index_pack_threads=1
+object_storage=packfile_plus_v2_idx
+fsync_count=2
+flamegraph=docs/performance/rust-fetch-flamegraph.svg
+
+stage	wall_seconds	percent_total	count	bytes
+socket read	8.114038	3.53	321036	974913138
+pkt-line / sideband-64k demux	0.629874	0.27	3459385	974387947
+inflate (zlib-rs)	169.763519	73.92	3457840	2179595639
+delta resolution	22.025558	9.59	2675241	0
+OID / SHA hashing	16.949175	7.38	3457840	39573652922
+object-store write	4.845029	2.11	3459322	1071208539
+unattributed / orchestration	7.326048	3.19	0	0
