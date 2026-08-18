@@ -18,6 +18,7 @@ tls-platform-verifier = ["http-client", "ureq/rustls", "ureq/platform-verifier"]
 sley-config.workspace = true
 sley-core.workspace = true
 sley-protocol.workspace = true
+tempfile = "3"
 # gzip is required for smart-HTTP; TLS features are forwarded separately above.
 ureq = { version = "3.3.0", optional = true, default-features = false, features = ["gzip"] }
 webpki-root-certs = { version = "1.0", optional = true }

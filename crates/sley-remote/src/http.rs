@@ -12,7 +12,7 @@
 //! [`read_service_discovery_response`]), and the RPC POST response goes straight
 //! to the packfile/report (no re-advertised refs to skip).
 
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::install::{
@@ -21,20 +21,20 @@ use crate::install::{
     install_upload_pack_packfile_response_from_reader_with_cancel,
     install_upload_pack_shallow_packfile_promisor_response_from_reader_with_cancel,
     install_upload_pack_shallow_packfile_response_from_reader_with_cancel,
-    shallow_info_from_protocol_v2_fetch_header,
+    shallow_info_from_protocol_v2_fetch_header, transfer_from_pack,
 };
 use sley_config::GitConfig;
 use sley_core::{
     CancelFlag, Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
 };
-use sley_odb::{FileObjectDatabase, ObjectReader};
+use sley_odb::{FileObjectDatabase, ObjectReader, RawPackInstallOptions};
 use sley_protocol::{
     GitService, ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchAcknowledgment,
-    ProtocolV2FetchRequest, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
-    ProtocolV2FetchWantedRef, ProtocolV2LsRefsRequest, ProtocolVersion, RefAdvertisement,
-    RefAdvertisementSet, TransportHandshake, UploadPackFeatures, UploadPackNegotiationRequest,
-    UploadPackRequest, encode_protocol_v2_command_options, parse_protocol_v2_fetch_features,
-    parse_upload_pack_features, protocol_v2_object_format,
+    ProtocolV2FetchPackfileUri, ProtocolV2FetchRequest, ProtocolV2FetchResponseSection,
+    ProtocolV2FetchShallowInfo, ProtocolV2FetchWantedRef, ProtocolV2LsRefsRequest, ProtocolVersion,
+    RefAdvertisement, RefAdvertisementSet, TransportHandshake, UploadPackFeatures,
+    UploadPackNegotiationRequest, UploadPackRequest, encode_protocol_v2_command_options,
+    parse_protocol_v2_fetch_features, parse_upload_pack_features, protocol_v2_object_format,
     read_protocol_v2_fetch_negotiation_response, read_protocol_v2_fetch_response,
     read_protocol_v2_fetch_response_header, read_protocol_v2_fetch_sideband_all_response,
     read_protocol_v2_ls_refs_response_as_ref_advertisement_set,
@@ -365,6 +365,7 @@ fn protocol_v2_fetch_request_from_upload_pack_semantics(
     deepen_not: Vec<String>,
     deepen_relative: bool,
     filter: Option<&sley_odb::PackObjectFilter>,
+    packfile_uri_protocols: Option<&str>,
     handshake: &TransportHandshake,
 ) -> Result<ProtocolV2FetchRequest> {
     let v2_features =
@@ -379,6 +380,11 @@ fn protocol_v2_fetch_request_from_upload_pack_semantics(
         deepen_not,
         deepen_relative,
         filter: filter.and_then(crate::local::upload_pack_filter_protocol_spec),
+        packfile_uris: if v2_features.packfile_uris {
+            packfile_uri_protocols.map(str::to_owned)
+        } else {
+            None
+        },
         thin_pack: true,
         include_tag: true,
         ofs_delta: true,
@@ -847,6 +853,8 @@ pub struct HttpFetchPackRequest<'a, C: HttpClient + ?Sized> {
     /// `transfer.maxSize`). `None` means unlimited.
     pub max_input_size: Option<u64>,
     pub filter: Option<sley_odb::PackObjectFilter>,
+    /// Comma-separated HTTP schemes enabled by `fetch.uriProtocols`.
+    pub packfile_uri_protocols: Option<String>,
     pub deepen_since: Option<i64>,
     pub deepen_not: Vec<String>,
     pub deepen_relative: bool,
@@ -877,6 +885,8 @@ pub struct NegotiatedPackResponse {
     pub shallow_info: Vec<ProtocolV2FetchShallowInfo>,
     /// Ref names and object ids resolved by protocol-v2 `want-ref`.
     pub wanted_refs: Vec<ProtocolV2FetchWantedRef>,
+    /// CDN-hosted packfiles listed before the inline packfile section.
+    pub packfile_uris: Vec<ProtocolV2FetchPackfileUri>,
     /// Whether the response contains a packfile section.
     pub has_packfile: bool,
 }
@@ -1126,6 +1136,8 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs<C: HttpClien
         request.haves.clone(),
     )?;
     request.haves = Some(haves);
+    let client = request.client;
+    let packfile_uri_protocols = request.packfile_uri_protocols.clone();
     let promisor = request.promisor;
     let max_input_size = request.max_input_size;
     let mut negotiated = negotiate_fetch_pack_via_http_protocol_v2_after_trace(
@@ -1158,10 +1170,131 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs<C: HttpClien
             cancel,
         )?;
     }
+    install_protocol_v2_packfile_uris(
+        client,
+        &local_db,
+        &negotiated.packfile_uris,
+        packfile_uri_protocols.as_deref(),
+        promisor,
+        max_input_size,
+        progress,
+        cancel,
+    )?;
     Ok(HttpProtocolV2FetchOutcome {
         shallow_info: negotiated.shallow_info,
         wanted_refs: negotiated.wanted_refs,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_protocol_v2_packfile_uris<C: HttpClient + ?Sized>(
+    client: &C,
+    destination: &FileObjectDatabase,
+    uris: &[ProtocolV2FetchPackfileUri],
+    requested_protocols: Option<&str>,
+    promisor: bool,
+    max_input_size: Option<u64>,
+    progress: &mut dyn ProgressSink,
+    cancel: CancelFlag<'_>,
+) -> Result<()> {
+    for packfile_uri in uris {
+        cancel.check()?;
+        validate_packfile_uri_protocol(&packfile_uri.uri, requested_protocols)?;
+        let mut response = client.get_packfile(&packfile_uri.uri)?;
+        http_check_status(&response, &packfile_uri.uri)?;
+        if let (Some(length), Some(limit)) = (response.content_length, max_input_size)
+            && length > limit
+        {
+            return Err(GitError::InvalidFormat(format!(
+                "pack exceeds maximum allowed size ({limit})"
+            )));
+        }
+
+        let mut pack = tempfile::tempfile()?;
+        copy_packfile_uri_body(&mut response.body, &mut pack, max_input_size, cancel)?;
+        drop(response);
+        verify_packfile_uri_trailer(&mut pack, destination.object_format(), packfile_uri)?;
+        pack.seek(SeekFrom::Start(0))?;
+        destination.install_raw_pack_from_reader_with_progress_and_cancel(
+            &mut pack,
+            RawPackInstallOptions {
+                promisor,
+                max_input_size,
+            },
+            cancel,
+            |pack_progress| progress.transfer(transfer_from_pack(pack_progress)),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_packfile_uri_protocol(uri: &str, requested_protocols: Option<&str>) -> Result<()> {
+    let scheme = uri
+        .split_once("://")
+        .map(|(scheme, _)| scheme)
+        .unwrap_or_default();
+    if requested_protocols.is_some_and(|protocols| protocols.split(',').any(|p| p == scheme)) {
+        return Ok(());
+    }
+    Err(GitError::InvalidFormat(format!(
+        "packfile URI uses unrequested protocol {scheme}"
+    )))
+}
+
+fn copy_packfile_uri_body(
+    reader: &mut dyn Read,
+    writer: &mut impl Write,
+    max_input_size: Option<u64>,
+    cancel: CancelFlag<'_>,
+) -> Result<u64> {
+    let mut reader = sley_core::CancellableRead::new(reader, cancel.as_ref());
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut written = 0_u64;
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        written = written
+            .checked_add(count as u64)
+            .ok_or_else(|| GitError::InvalidFormat("packfile URI size overflow".into()))?;
+        if let Some(limit) = max_input_size
+            && written > limit
+        {
+            return Err(GitError::InvalidFormat(format!(
+                "pack exceeds maximum allowed size ({limit})"
+            )));
+        }
+        writer.write_all(&buffer[..count])?;
+    }
+    Ok(written)
+}
+
+fn verify_packfile_uri_trailer(
+    pack: &mut (impl Read + Seek),
+    format: ObjectFormat,
+    packfile_uri: &ProtocolV2FetchPackfileUri,
+) -> Result<()> {
+    let length = pack.seek(SeekFrom::End(0))?;
+    let hash_len = format.raw_len() as u64;
+    if length < 12 + hash_len {
+        return Err(GitError::InvalidFormat(format!(
+            "pack downloaded from {} is shorter than a pack header and checksum",
+            sley_core::redact_url_for_display(&packfile_uri.uri)
+        )));
+    }
+    pack.seek(SeekFrom::End(-(hash_len as i64)))?;
+    let mut trailer = vec![0_u8; hash_len as usize];
+    pack.read_exact(&mut trailer)?;
+    let actual = ObjectId::from_raw(format, &trailer)?;
+    if actual != packfile_uri.pack_hash {
+        return Err(GitError::InvalidFormat(format!(
+            "pack downloaded from {} does not match expected hash {}",
+            sley_core::redact_url_for_display(&packfile_uri.uri),
+            packfile_uri.pack_hash
+        )));
+    }
+    Ok(())
 }
 
 /// Negotiate a multi-round protocol-v2 smart-HTTP fetch without accessing or
@@ -1224,6 +1357,7 @@ fn negotiate_fetch_pack_via_http_protocol_v2_after_trace<C: HttpClient + ?Sized>
         request.deepen_not,
         request.deepen_relative,
         request.filter.as_ref(),
+        request.packfile_uri_protocols.as_deref(),
         handshake,
     )?;
     let sideband_all = fetch.sideband_all;
@@ -1243,15 +1377,28 @@ fn negotiate_fetch_pack_via_http_protocol_v2_after_trace<C: HttpClient + ?Sized>
     let header =
         read_protocol_v2_fetch_response_header(request.format, &mut response.body, sideband_all)?;
     let mut wanted_refs = Vec::new();
+    let mut packfile_uris = Vec::new();
     for section in &header.sections {
-        if let ProtocolV2FetchResponseSection::WantedRefs(wanted) = section {
-            wanted_refs.extend(wanted.iter().cloned());
+        match section {
+            ProtocolV2FetchResponseSection::WantedRefs(wanted) => {
+                wanted_refs.extend(wanted.iter().cloned());
+            }
+            ProtocolV2FetchResponseSection::PackfileUris(uris) => {
+                packfile_uris.extend(uris.iter().cloned());
+            }
+            _ => {}
         }
+    }
+    if !packfile_uris.is_empty() && !header.has_packfile {
+        return Err(GitError::InvalidFormat(
+            "protocol v2 packfile-uris section must be followed by packfile".into(),
+        ));
     }
     Ok(NegotiatedPackResponse {
         body: response.body,
         shallow_info: shallow_info_from_protocol_v2_fetch_header(&header),
         wanted_refs,
+        packfile_uris,
         has_packfile: header.has_packfile,
     })
 }
@@ -1332,6 +1479,18 @@ pub(crate) fn http_post_buffer(config: Option<&GitConfig>) -> usize {
         .unwrap_or(DEFAULT_HTTP_POST_BUFFER)
 }
 
+/// Return the `fetch.uriProtocols` values this HTTP client can honor, preserving
+/// upstream Git's opt-in default and configured order.
+pub(crate) fn http_packfile_uri_protocols(config: Option<&GitConfig>) -> Option<String> {
+    let configured = config?.get("fetch", None, "uriProtocols")?;
+    let supported = configured
+        .split(',')
+        .filter(|protocol| matches!(*protocol, "http" | "https"))
+        .collect::<Vec<_>>()
+        .join(",");
+    (!supported.is_empty()).then_some(supported)
+}
+
 fn http_post_rpc_body<C: HttpClient + ?Sized>(
     client: &C,
     url: &str,
@@ -1390,6 +1549,8 @@ fn request_negotiation_haves(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sley_object::{EncodedObject, ObjectType};
+    use sley_pack::PackFile;
     use sley_protocol::{
         ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRecord,
         ProtocolVersion, RefAdvertisement, StreamingSidebandReader,
@@ -1399,6 +1560,7 @@ mod tests {
     };
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn protocol_v1_header_is_sent_for_upload_and_receive_discovery() {
@@ -1433,6 +1595,8 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 content_type: None,
+                content_length: None,
+                content_range: None,
                 body: Box::new(std::io::empty()),
             })
         }
@@ -1577,6 +1741,8 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 content_type: Some(self.result_content_type.clone()),
+                content_length: None,
+                content_range: None,
                 body: Box::new(std::io::Cursor::new(Vec::new())),
             })
         }
@@ -1801,7 +1967,7 @@ mod tests {
             capabilities: vec![
                 Capability {
                     name: "fetch".into(),
-                    value: Some("shallow sideband-all".into()),
+                    value: Some("shallow sideband-all packfile-uris".into()),
                 },
                 Capability {
                     name: "agent".into(),
@@ -1818,6 +1984,8 @@ mod tests {
     struct ScriptedFetchClient<'a> {
         responses: Mutex<VecDeque<Vec<u8>>>,
         requests: Mutex<Vec<Vec<u8>>>,
+        packfile: Mutex<Option<Vec<u8>>>,
+        packfile_gets: AtomicUsize,
         cancel_after_post: Option<&'a sley_core::AtomicCancel>,
     }
 
@@ -1826,8 +1994,15 @@ mod tests {
             Self {
                 responses: Mutex::new(responses.into()),
                 requests: Mutex::new(Vec::new()),
+                packfile: Mutex::new(None),
+                packfile_gets: AtomicUsize::new(0),
                 cancel_after_post: None,
             }
+        }
+
+        fn with_packfile(self, packfile: Vec<u8>) -> Self {
+            *self.packfile.lock().expect("packfile") = Some(packfile);
+            self
         }
 
         fn requests(&self) -> Vec<ProtocolV2FetchRequest> {
@@ -1847,9 +2022,22 @@ mod tests {
 
     impl HttpClient for ScriptedFetchClient<'_> {
         fn get(&self, _url: &str, _headers: &[(&str, &str)]) -> Result<HttpResponse> {
-            Err(GitError::Command(
-                "scripted fetch client received an unexpected GET".into(),
-            ))
+            let body = self
+                .packfile
+                .lock()
+                .expect("packfile")
+                .clone()
+                .ok_or_else(|| {
+                    GitError::Command("scripted fetch client received an unexpected GET".into())
+                })?;
+            self.packfile_gets.fetch_add(1, Ordering::Relaxed);
+            Ok(HttpResponse {
+                status: 200,
+                content_type: Some("application/x-git-packed-objects".into()),
+                content_length: Some(body.len() as u64),
+                content_range: None,
+                body: Box::new(std::io::Cursor::new(body)),
+            })
         }
 
         fn post(
@@ -1872,6 +2060,8 @@ mod tests {
             Ok(HttpResponse {
                 status: 200,
                 content_type: None,
+                content_length: None,
+                content_range: None,
                 body: Box::new(std::io::Cursor::new(response)),
             })
         }
@@ -1906,6 +2096,7 @@ mod tests {
             promisor: false,
             max_input_size: None,
             filter: None,
+            packfile_uri_protocols: None,
             deepen_since: None,
             deepen_not: Vec::new(),
             deepen_relative: false,
@@ -1917,6 +2108,221 @@ mod tests {
 
     fn test_oid(value: usize) -> ObjectId {
         ObjectId::from_hex(ObjectFormat::Sha1, &format!("{value:040x}")).expect("test oid")
+    }
+
+    fn packfile_test_git_dir(name: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let git_dir = std::env::temp_dir().join(format!(
+            "sley-packfile-uri-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(git_dir.join("objects")).expect("test object directory");
+        git_dir
+    }
+
+    fn one_object_pack(body: &[u8]) -> (ObjectId, sley_pack::PackWrite) {
+        let object = EncodedObject::new(ObjectType::Blob, body.to_vec());
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test object id");
+        let pack =
+            PackFile::write_undeltified(&[object], ObjectFormat::Sha1).expect("test packfile");
+        (oid, pack)
+    }
+
+    fn packfile_uri_handshake() -> TransportHandshake {
+        TransportHandshake {
+            protocol: ProtocolVersion::V2,
+            capabilities: vec![Capability {
+                name: "fetch".into(),
+                value: Some("packfile-uris".into()),
+            }],
+        }
+    }
+
+    fn packfile_uri_request<'a>(
+        client: &'a ScriptedFetchClient<'a>,
+        git_dir: &'a Path,
+        remote: &'a RemoteUrl,
+        want: ObjectId,
+    ) -> HttpFetchPackRequest<'a, ScriptedFetchClient<'a>> {
+        let mut request = test_negotiation_request(client, remote, vec![want], Vec::new());
+        request.git_dir = git_dir;
+        request.packfile_uri_protocols = Some("http,https".into());
+        request
+    }
+
+    #[test]
+    fn protocol_v2_packfile_uris_installs_uri_and_inline_packs() {
+        let (inline_oid, inline_pack) = one_object_pack(b"inline object\n");
+        let (uri_oid, uri_pack) = one_object_pack(b"cdn object\n");
+        let mut inline_sideband = vec![1];
+        inline_sideband.extend_from_slice(&inline_pack.pack);
+        let response = fetch_response(
+            &[
+                ProtocolV2FetchResponseSection::PackfileUris(vec![ProtocolV2FetchPackfileUri {
+                    pack_hash: uri_pack.checksum,
+                    uri: "https://cdn.example.invalid/object.pack".into(),
+                }]),
+                ProtocolV2FetchResponseSection::Packfile(vec![inline_sideband]),
+            ],
+            false,
+        );
+        let client = ScriptedFetchClient::new(vec![response]).with_packfile(uri_pack.pack);
+        let git_dir = packfile_test_git_dir("mixed");
+        let remote = parse_remote_url("http://example.invalid/repo.git").expect("remote");
+        let mut credentials = crate::NoCredentials;
+        let mut progress = crate::SilentProgress;
+
+        install_fetch_pack_via_http_protocol_v2_fetch(
+            packfile_uri_request(&client, &git_dir, &remote, inline_oid),
+            &packfile_uri_handshake(),
+            &mut credentials,
+            &mut progress,
+            CancelFlag::never(),
+        )
+        .expect("mixed packfile-uri fetch");
+
+        let database = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        assert!(
+            database
+                .contains(&inline_oid)
+                .expect("inline object lookup")
+        );
+        assert!(database.contains(&uri_oid).expect("URI object lookup"));
+        assert_eq!(client.packfile_gets.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            client.requests()[0].packfile_uris.as_deref(),
+            Some("http,https")
+        );
+        std::fs::remove_dir_all(git_dir).expect("remove test repository");
+    }
+
+    #[test]
+    fn protocol_v2_packfile_uri_hash_mismatch_does_not_install_uri_pack() {
+        let (inline_oid, inline_pack) = one_object_pack(b"inline object\n");
+        let (uri_oid, uri_pack) = one_object_pack(b"cdn object\n");
+        let mut inline_sideband = vec![1];
+        inline_sideband.extend_from_slice(&inline_pack.pack);
+        let response = fetch_response(
+            &[
+                ProtocolV2FetchResponseSection::PackfileUris(vec![ProtocolV2FetchPackfileUri {
+                    pack_hash: test_oid(999),
+                    uri: "https://cdn.example.invalid/object.pack".into(),
+                }]),
+                ProtocolV2FetchResponseSection::Packfile(vec![inline_sideband]),
+            ],
+            false,
+        );
+        let client = ScriptedFetchClient::new(vec![response]).with_packfile(uri_pack.pack);
+        let git_dir = packfile_test_git_dir("bad-hash");
+        let remote = parse_remote_url("http://example.invalid/repo.git").expect("remote");
+        let mut credentials = crate::NoCredentials;
+        let mut progress = crate::SilentProgress;
+
+        let error = install_fetch_pack_via_http_protocol_v2_fetch(
+            packfile_uri_request(&client, &git_dir, &remote, inline_oid),
+            &packfile_uri_handshake(),
+            &mut credentials,
+            &mut progress,
+            CancelFlag::never(),
+        )
+        .expect_err("mismatched pack hash must fail");
+
+        assert!(error.to_string().contains("does not match expected hash"));
+        let database = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        assert!(
+            database
+                .contains(&inline_oid)
+                .expect("inline object lookup")
+        );
+        assert!(!database.contains(&uri_oid).expect("URI object lookup"));
+        std::fs::remove_dir_all(git_dir).expect("remove test repository");
+    }
+
+    #[test]
+    fn protocol_v2_packfile_uri_download_failure_does_not_install_uri_pack() {
+        let (inline_oid, inline_pack) = one_object_pack(b"inline object\n");
+        let (uri_oid, uri_pack) = one_object_pack(b"cdn object\n");
+        let mut inline_sideband = vec![1];
+        inline_sideband.extend_from_slice(&inline_pack.pack);
+        let response = fetch_response(
+            &[
+                ProtocolV2FetchResponseSection::PackfileUris(vec![ProtocolV2FetchPackfileUri {
+                    pack_hash: uri_pack.checksum,
+                    uri: "https://cdn.example.invalid/unavailable.pack".into(),
+                }]),
+                ProtocolV2FetchResponseSection::Packfile(vec![inline_sideband]),
+            ],
+            false,
+        );
+        let client = ScriptedFetchClient::new(vec![response]);
+        let git_dir = packfile_test_git_dir("download-failure");
+        let remote = parse_remote_url("http://example.invalid/repo.git").expect("remote");
+        let mut credentials = crate::NoCredentials;
+        let mut progress = crate::SilentProgress;
+
+        let error = install_fetch_pack_via_http_protocol_v2_fetch(
+            packfile_uri_request(&client, &git_dir, &remote, inline_oid),
+            &packfile_uri_handshake(),
+            &mut credentials,
+            &mut progress,
+            CancelFlag::never(),
+        )
+        .expect_err("packfile URI download must fail");
+
+        assert!(error.to_string().contains("unexpected GET"));
+        let database = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        assert!(
+            database
+                .contains(&inline_oid)
+                .expect("inline object lookup")
+        );
+        assert!(!database.contains(&uri_oid).expect("URI object lookup"));
+        std::fs::remove_dir_all(git_dir).expect("remove test repository");
+    }
+
+    #[test]
+    fn protocol_v2_server_without_packfile_uris_uses_inline_pack_only() {
+        let (inline_oid, inline_pack) = one_object_pack(b"inline object\n");
+        let mut inline_sideband = vec![1];
+        inline_sideband.extend_from_slice(&inline_pack.pack);
+        let response = fetch_response(
+            &[ProtocolV2FetchResponseSection::Packfile(vec![
+                inline_sideband,
+            ])],
+            false,
+        );
+        let client = ScriptedFetchClient::new(vec![response]);
+        let git_dir = packfile_test_git_dir("inline-fallback");
+        let remote = parse_remote_url("http://example.invalid/repo.git").expect("remote");
+        let handshake = TransportHandshake {
+            protocol: ProtocolVersion::V2,
+            capabilities: vec![Capability {
+                name: "fetch".into(),
+                value: None,
+            }],
+        };
+        let mut credentials = crate::NoCredentials;
+        let mut progress = crate::SilentProgress;
+
+        install_fetch_pack_via_http_protocol_v2_fetch(
+            packfile_uri_request(&client, &git_dir, &remote, inline_oid),
+            &handshake,
+            &mut credentials,
+            &mut progress,
+            CancelFlag::never(),
+        )
+        .expect("inline fallback fetch");
+
+        assert_eq!(client.packfile_gets.load(Ordering::Relaxed), 0);
+        assert_eq!(client.requests()[0].packfile_uris, None);
+        std::fs::remove_dir_all(git_dir).expect("remove test repository");
     }
 
     #[test]
@@ -2167,6 +2573,8 @@ mod tests {
             Ok(HttpResponse {
                 status,
                 content_type: response_content_type,
+                content_length: None,
+                content_range: None,
                 body: Box::new(std::io::Cursor::new(response_body.to_vec())),
             })
         }
@@ -2436,6 +2844,7 @@ mod tests {
             Vec::new(),
             false,
             None,
+            None,
             &handshake,
         )
         .expect("test operation should succeed");
@@ -2497,6 +2906,7 @@ mod tests {
             None,
             Vec::new(),
             false,
+            None,
             None,
             &handshake,
         )

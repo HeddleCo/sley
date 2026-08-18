@@ -467,6 +467,7 @@ fn hydrate_oids_via_http(
         promisor: true,
         max_input_size: None,
         filter: None,
+        packfile_uri_protocols: None,
         deepen_since: None,
         deepen_not: Vec::new(),
         deepen_relative: false,

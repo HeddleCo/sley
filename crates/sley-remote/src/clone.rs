@@ -735,6 +735,7 @@ fn fetch_http_partial_clone_checkout_blobs(
         promisor: true,
         max_input_size,
         filter: None,
+        packfile_uri_protocols: crate::http::http_packfile_uri_protocols(Some(config)),
         deepen_since: None,
         deepen_not: Vec::new(),
         deepen_relative: false,

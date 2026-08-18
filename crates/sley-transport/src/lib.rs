@@ -1464,6 +1464,8 @@ pub const HTTP_USER_AGENT: &str = "git/2.54.0 (sley)";
 pub struct HttpResponse {
     pub status: u16,
     pub content_type: Option<String>,
+    pub content_length: Option<u64>,
+    pub content_range: Option<String>,
     pub body: Box<dyn std::io::Read + Send>,
 }
 
@@ -1484,6 +1486,13 @@ pub struct HttpResponse {
 pub trait HttpClient {
     /// Issue a `GET` for `url`, sending the additional `headers`.
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse>;
+
+    /// Download a protocol-v2 packfile URI. The default is a normal streaming
+    /// GET; the built-in client overrides this to use parallel byte ranges when
+    /// the origin supports them.
+    fn get_packfile(&self, url: &str) -> Result<HttpResponse> {
+        self.get(url, &[])
+    }
 
     /// Issue a `POST` for `url` with `body`, sending `content_type` and the
     /// additional `headers`.
@@ -1780,6 +1789,73 @@ impl HttpClient for UreqHttpClient {
         self.request_with_redirects("GET", url, headers, None)
     }
 
+    fn get_packfile(&self, url: &str) -> Result<HttpResponse> {
+        const MIN_PARALLEL_BYTES: u64 = 4 * 1024 * 1024;
+        const RANGE_CONNECTIONS: u64 = 8;
+
+        let probe = self.get(url, &[("Range", "bytes=0-0")])?;
+        if probe.status != 206 {
+            // A server that ignores Range normally returns the complete body as
+            // 200, so preserve that already-open streaming response.
+            return Ok(probe);
+        }
+        let Some(total) = probe
+            .content_range
+            .as_deref()
+            .and_then(parse_content_range_total)
+        else {
+            return self.get(url, &[]);
+        };
+        if total < MIN_PARALLEL_BYTES {
+            return self.get(url, &[]);
+        }
+        drop(probe);
+
+        let range_count = RANGE_CONNECTIONS.min(total);
+        let range_size = total.div_ceil(range_count);
+        let mut ranges = Vec::new();
+        let mut start = 0_u64;
+        while start < total {
+            let end = start.saturating_add(range_size).min(total) - 1;
+            ranges.push((start, end));
+            start = end + 1;
+        }
+
+        let mut parts = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(ranges.len());
+            for (index, (start, end)) in ranges.into_iter().enumerate() {
+                let client = UreqHttpClient {
+                    agent: self.agent.clone(),
+                    limits: self.limits,
+                };
+                handles.push(
+                    scope.spawn(move || download_packfile_range(client, url, index, start, end)),
+                );
+            }
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().map_err(|_| {
+                        GitError::Io(format!(
+                            "HTTP range request to {url} failed: worker panicked"
+                        ))
+                    })?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        parts.sort_by_key(|(index, _)| *index);
+        Ok(HttpResponse {
+            status: 200,
+            content_type: Some("application/x-git-packed-objects".into()),
+            content_length: Some(total),
+            content_range: None,
+            body: Box::new(RangePartsReader {
+                parts: parts.into_iter().map(|(_, file)| file).collect(),
+                current: 0,
+            }),
+        })
+    }
+
     fn post(
         &self,
         url: &str,
@@ -1816,20 +1892,81 @@ impl HttpClient for UreqHttpClient {
         let response = request
             .send(ureq::SendBody::from_reader(body))
             .map_err(|err| http_transport_error(url, &err))?;
-        let (status, content_type_hdr, location, body_reader) =
-            http_response_parts_from_ureq(response);
-        if (300..400).contains(&status) {
-            let next = resolve_redirect_url(url, location.as_deref())?;
+        let parts = http_response_parts_from_ureq(response);
+        if (300..400).contains(&parts.status) {
+            let next = resolve_redirect_url(url, parts.location.as_deref())?;
             // Subsequent hops are GETs without a body (body already consumed)
             // and are not from-user (CURLOPT_REDIR_PROTOCOLS).
             check_http_layer_scheme_allowed(&next, false)?;
             return self.request_with_redirects_from_user("GET", &next, headers, None, false);
         }
         Ok(HttpResponse {
-            status,
-            content_type: content_type_hdr,
-            body: body_reader,
+            status: parts.status,
+            content_type: parts.content_type,
+            content_length: parts.content_length,
+            content_range: parts.content_range,
+            body: parts.body,
         })
+    }
+}
+
+#[cfg(feature = "http-client")]
+fn parse_content_range_total(value: &str) -> Option<u64> {
+    let (range, total) = value.strip_prefix("bytes ")?.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    if start != "0" || end != "0" {
+        return None;
+    }
+    total.parse().ok().filter(|total| *total > 0)
+}
+
+#[cfg(feature = "http-client")]
+fn download_packfile_range(
+    client: UreqHttpClient,
+    url: &str,
+    index: usize,
+    start: u64,
+    end: u64,
+) -> Result<(usize, std::fs::File)> {
+    use std::io::{Seek, SeekFrom};
+
+    let range = format!("bytes={start}-{end}");
+    let mut response = client.get(url, &[("Range", &range)])?;
+    if response.status != 206 {
+        return Err(GitError::Io(format!(
+            "HTTP range request to {url} returned status {}",
+            response.status
+        )));
+    }
+    let expected = end - start + 1;
+    let mut file = tempfile::tempfile()?;
+    let written = std::io::copy(&mut response.body.by_ref().take(expected + 1), &mut file)?;
+    if written != expected {
+        return Err(GitError::Io(format!(
+            "HTTP range request to {url} returned {written} bytes, expected {expected}"
+        )));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok((index, file))
+}
+
+#[cfg(feature = "http-client")]
+struct RangePartsReader {
+    parts: Vec<std::fs::File>,
+    current: usize,
+}
+
+#[cfg(feature = "http-client")]
+impl Read for RangePartsReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        while let Some(part) = self.parts.get_mut(self.current) {
+            let count = part.read(buffer)?;
+            if count != 0 {
+                return Ok(count);
+            }
+            self.current += 1;
+        }
+        Ok(0)
     }
 }
 
@@ -1898,12 +2035,11 @@ impl UreqHttpClient {
                     )));
                 }
             };
-            let (status, content_type, location, body_reader) =
-                http_response_parts_from_ureq(response);
-            if (300..400).contains(&status) {
-                let next = resolve_redirect_url(&current, location.as_deref())?;
+            let parts = http_response_parts_from_ureq(response);
+            if (300..400).contains(&parts.status) {
+                let next = resolve_redirect_url(&current, parts.location.as_deref())?;
                 // 303 and (for POST) 302 become GET without body, matching curl.
-                if method == "POST" && (status == 302 || status == 303) {
+                if method == "POST" && (parts.status == 302 || parts.status == 303) {
                     method = "GET".to_string();
                     body = None;
                 }
@@ -1912,9 +2048,11 @@ impl UreqHttpClient {
                 continue;
             }
             return Ok(HttpResponse {
-                status,
-                content_type,
-                body: body_reader,
+                status: parts.status,
+                content_type: parts.content_type,
+                content_length: parts.content_length,
+                content_range: parts.content_range,
+                body: parts.body,
             });
         }
         Err(GitError::Io(format!(
@@ -1925,14 +2063,17 @@ impl UreqHttpClient {
 
 /// Split a ureq response into status / content-type / Location / body reader.
 #[cfg(feature = "http-client")]
-fn http_response_parts_from_ureq(
-    response: ureq::http::Response<ureq::Body>,
-) -> (
-    u16,
-    Option<String>,
-    Option<String>,
-    Box<dyn std::io::Read + Send>,
-) {
+struct HttpResponseParts {
+    status: u16,
+    content_type: Option<String>,
+    content_length: Option<u64>,
+    content_range: Option<String>,
+    location: Option<String>,
+    body: Box<dyn std::io::Read + Send>,
+}
+
+#[cfg(feature = "http-client")]
+fn http_response_parts_from_ureq(response: ureq::http::Response<ureq::Body>) -> HttpResponseParts {
     let status = response.status().as_u16();
     let content_type = response
         .headers()
@@ -1944,8 +2085,25 @@ fn http_response_parts_from_ureq(
         .get(ureq::http::header::LOCATION)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_string());
+    let content_length = response
+        .headers()
+        .get(ureq::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    let content_range = response
+        .headers()
+        .get(ureq::http::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let body = response.into_body().into_reader();
-    (status, content_type, location, Box::new(body))
+    HttpResponseParts {
+        status,
+        content_type,
+        content_length,
+        content_range,
+        location,
+        body: Box::new(body),
+    }
 }
 
 /// Resolve a (possibly relative) Location header against the request URL.
@@ -2129,11 +2287,13 @@ fn curl_trace_sink() -> Option<Box<dyn Write>> {
 #[cfg(feature = "http-client")]
 #[allow(dead_code)] // retained for unit tests / alternate call sites
 fn http_response_from_ureq(response: ureq::http::Response<ureq::Body>) -> HttpResponse {
-    let (status, content_type, _location, body) = http_response_parts_from_ureq(response);
+    let parts = http_response_parts_from_ureq(response);
     HttpResponse {
-        status,
-        content_type,
-        body,
+        status: parts.status,
+        content_type: parts.content_type,
+        content_length: parts.content_length,
+        content_range: parts.content_range,
+        body: parts.body,
     }
 }
 
@@ -3389,6 +3549,82 @@ mod http_timeout_tests {
     use std::net::TcpListener;
     use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn packfile_get_uses_parallel_ranges_and_reassembles_bytes() {
+        let body = Arc::new(
+            (0..(5 * 1024 * 1024 + 37))
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind range server");
+        let address = listener.local_addr().expect("range server address");
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_body = Arc::clone(&body);
+        let server_ranges = Arc::clone(&ranges);
+        let server = std::thread::spawn(move || {
+            let mut workers = Vec::new();
+            for _ in 0..9 {
+                let (mut stream, _) = listener.accept().expect("accept range request");
+                let body = Arc::clone(&server_body);
+                let ranges = Arc::clone(&server_ranges);
+                workers.push(std::thread::spawn(move || {
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 4096];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let count = stream.read(&mut buffer).expect("read range request");
+                        assert!(count != 0, "range request ended before headers");
+                        request.extend_from_slice(&buffer[..count]);
+                    }
+                    let request = String::from_utf8(request).expect("HTTP request text");
+                    let range = request
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("range")
+                                .then(|| value.trim().strip_prefix("bytes="))
+                                .flatten()
+                        })
+                        .expect("Range header");
+                    let (start, end) = range.split_once('-').expect("byte range");
+                    let start = start.parse::<usize>().expect("range start");
+                    let end = end.parse::<usize>().expect("range end");
+                    ranges.lock().expect("ranges").push((start, end));
+                    let response_body = &body[start..=end];
+                    write!(
+                        stream,
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n",
+                        response_body.len(),
+                        body.len()
+                    )
+                    .expect("write range headers");
+                    stream
+                        .write_all(response_body)
+                        .expect("write range response");
+                }));
+            }
+            for worker in workers {
+                worker.join().expect("range worker");
+            }
+        });
+
+        let client = UreqHttpClient::new();
+        let mut response = client
+            .get_packfile(&format!("http://{address}/pack"))
+            .expect("parallel packfile GET");
+        let mut actual = Vec::new();
+        response
+            .body
+            .read_to_end(&mut actual)
+            .expect("read reassembled body");
+        server.join().expect("range server");
+
+        assert_eq!(actual, *body);
+        let observed = ranges.lock().expect("ranges");
+        assert_eq!(observed.len(), 9);
+        assert!(observed.contains(&(0, 0)), "missing range probe");
+        assert!(observed.iter().any(|(start, _)| *start > 0));
+    }
 
     /// sley#163: ureq 3.3.0's `Timeouts::default()` leaves every field `None`
     /// except `await_100`, and an unset field is an unbounded phase. Name them

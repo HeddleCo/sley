@@ -83,7 +83,7 @@ where
     }
 }
 
-fn transfer_from_pack(progress: PackStreamProgress) -> TransferProgress {
+pub(crate) fn transfer_from_pack(progress: PackStreamProgress) -> TransferProgress {
     TransferProgress {
         received_bytes: progress.received_bytes,
         received_objects: progress.received_objects,
