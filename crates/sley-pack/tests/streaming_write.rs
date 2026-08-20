@@ -422,7 +422,7 @@ fn leftover_lookahead_is_charged_to_peak_working_set() {
     let first_oid = first.object_id(format).expect("oid");
     let second_oid = second.object_id(format).expect("oid");
     let map = HashMap::from([(first_oid, Arc::new(first)), (second_oid, Arc::new(second))]);
-    let object_cost = 100 + 64;
+    let object_cost = 100u64 + 64;
     let limits = PackWriteLimits::new()
         .with_compression_working_set(ByteBudget::new(200))
         .with_delta_base(ByteBudget::ZERO)
@@ -534,7 +534,7 @@ fn empty_delta_bases_charge_metadata_against_horizon() {
         "empty retained bases must still charge metadata, peak {}",
         summary.peak_working_set_bytes
     );
-    let unpaid_horizon = 8 * 64;
+    let unpaid_horizon = 8u64 * 64;
     assert!(
         summary.peak_working_set_bytes < unpaid_horizon.saturating_add(8 * 64),
         "horizon must evict empty bases once metadata exceeds delta_base, peak {}",
