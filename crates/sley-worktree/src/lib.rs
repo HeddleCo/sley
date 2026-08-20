@@ -2185,13 +2185,15 @@ mod tests {
         let root = temp_root();
         fs::create_dir_all(root.join(".git").join("info")).expect("test operation should succeed");
         fs::create_dir_all(root.join("src")).expect("test operation should succeed");
-        fs::write(root.join(".gitattributes"), b"* text\n")
-            .expect("test operation should succeed");
-        fs::write(root.join("src").join(".gitattributes"), b"*.txt text eol=lf\n")
-            .expect("test operation should succeed");
+        fs::write(root.join(".gitattributes"), b"* text\n").expect("test operation should succeed");
+        fs::write(
+            root.join("src").join(".gitattributes"),
+            b"*.txt text eol=lf\n",
+        )
+        .expect("test operation should succeed");
         let config = GitConfig::default();
-        let attributes = WorktreeAttributes::from_worktree_root(&root)
-            .expect("test operation should succeed");
+        let attributes =
+            WorktreeAttributes::from_worktree_root(&root).expect("test operation should succeed");
         for (path, input) in [
             (b"top.txt".as_slice(), b"a\r\nb\r\n".as_slice()),
             (b"src/a.txt".as_slice(), b"a\r\nb\r\n".as_slice()),
@@ -2203,7 +2205,8 @@ mod tests {
             let per_path = apply_clean_filter(&root, root.join(".git"), &config, path, input)
                 .expect("per-path clean filter");
             assert_eq!(
-                cached, per_path,
+                cached,
+                per_path,
                 "cached clean filter must match per-path lookup for {}",
                 String::from_utf8_lossy(path)
             );

@@ -265,8 +265,8 @@ impl HashObjectInvocation {
         if !self.read_stdin && !self.read_stdin_paths && self.paths.is_empty() {
             return Ok(());
         }
-        let cwd = fs::canonicalize(cli_session.cwd())
-            .unwrap_or_else(|_| cli_session.cwd().to_path_buf());
+        let cwd =
+            fs::canonicalize(cli_session.cwd()).unwrap_or_else(|_| cli_session.cwd().to_path_buf());
         // Repository discovery belongs to the invocation session. Once open,
         // the embeddable facade is the source of repository layout, format,
         // and object-store state for the rest of this command.
