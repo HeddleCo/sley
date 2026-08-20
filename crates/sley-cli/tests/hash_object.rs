@@ -427,6 +427,31 @@ fn hash_object_stdin_paths_matches_upstream_git() {
 }
 
 #[test]
+fn hash_object_stdin_paths_parent_dir_matches_upstream_git() {
+    let root = unique_temp_dir("hash-object-stdin-paths-dotdot");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
+        fs::create_dir_all(root.join("dir")).expect("create dir");
+        fs::write(root.join("file.txt"), b"payload\n").expect("write file");
+        let args = ["hash-object", "--stdin-paths"];
+        let stdin = b"dir/../file.txt\n";
+        let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, stdin);
+        let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, stdin);
+        assert_same_output(actual, expected, &args);
+        assert!(
+            expected.status.success(),
+            "oracle git should hash dir/../file.txt"
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn hash_object_stdin_paths_nested_attributes_match_upstream_git() {
     let root = unique_temp_dir("hash-object-stdin-paths-attrs");
     fs::create_dir_all(&root).expect("create temp repo");

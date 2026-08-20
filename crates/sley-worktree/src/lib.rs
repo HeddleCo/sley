@@ -72,7 +72,6 @@ mod tests {
     use crate::attributes::*;
     use crate::index_io::*;
     use sley_odb::ObjectReader;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2214,8 +2213,11 @@ mod tests {
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
+    #[cfg(unix)]
     #[test]
     fn worktree_attributes_skips_unreadable_unrelated_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = temp_root();
         fs::create_dir_all(root.join(".git")).expect("test operation should succeed");
         fs::create_dir_all(root.join("ok")).expect("test operation should succeed");

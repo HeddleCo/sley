@@ -492,22 +492,14 @@ fn hash_object_filter_git_path(
         };
     }
     if let Some(path) = source_path {
-        let absolute = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            cwd.join(path)
+        // Same lexical prefix resolution as `--path` (`prefix_filename` +
+        // `normalize_lexical_path`): collapse `dir/../file.txt` to `file.txt`
+        // without realpath. A raw `strip_prefix` would leave `..` in the
+        // relative path and `RepoPathBuf` would reject it (sley#25).
+        return match hash_object_worktree_relative_lexical(cwd, worktree_root, path) {
+            Some(relative) => Ok(Some(hash_object_repo_path_bytes(&relative)?)),
+            None => Ok(None),
         };
-        // Prefer a lexical strip so `--stdin-paths` does not realpath every
-        // file. Canonicalize only when the spelling differs from the
-        // already-canonical worktree root (symlinks, `..`, different cwd).
-        if let Ok(relative) = absolute.strip_prefix(worktree_root) {
-            return Ok(Some(hash_object_repo_path_bytes(relative)?));
-        }
-        let absolute = fs::canonicalize(&absolute).unwrap_or(absolute);
-        let Ok(relative) = absolute.strip_prefix(worktree_root) else {
-            return Ok(None);
-        };
-        return Ok(Some(hash_object_repo_path_bytes(relative)?));
     }
     if policy.forced() {
         return Ok(Some(Vec::new()));
@@ -665,5 +657,23 @@ mod tests {
             HashObjectInvocation::parse(&args),
             Err(GitError::Exit(129))
         ));
+    }
+
+    #[test]
+    fn source_path_with_parent_dir_normalizes_lexically() {
+        let cwd = Path::new("/worktree");
+        let worktree_root = Path::new("/worktree");
+        let policy = HashObjectFilterPolicy::Enabled {
+            forced: false,
+            path: None,
+        };
+        let git_path = hash_object_filter_git_path(
+            cwd,
+            worktree_root,
+            Some(Path::new("dir/../file.txt")),
+            &policy,
+        )
+        .expect("resolve in-tree source path");
+        assert_eq!(git_path, Some(b"file.txt".to_vec()));
     }
 }
