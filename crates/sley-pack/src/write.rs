@@ -235,100 +235,125 @@ struct PendingSourceObject {
     object: Arc<EncodedObject>,
 }
 
-fn check_decoded_object_limit(object: &EncodedObject, limits: PackWriteLimits) -> Result<()> {
-    let attempted = object.body.len() as u64;
-    let limit = limits.decoded_object.as_u64();
-    if attempted > limit {
-        return Err(GitError::resource_limit(
-            ResourceLimitKind::DecodedObject,
-            limit,
-            attempted,
-        ));
-    }
-    Ok(())
-}
-
-fn pull_source_object<I, F>(
-    selected: &mut I,
-    leftover: &mut Option<PendingSourceObject>,
-    yielded: &mut u64,
+struct SourcePackStream<I, F> {
+    selected: I,
+    leftover: Option<PendingSourceObject>,
+    yielded: u64,
     object_count: u32,
     format: ObjectFormat,
     limits: PackWriteLimits,
-    read_object: &mut F,
-) -> Result<Option<PendingSourceObject>>
+    read_object: F,
+    index_entries: Vec<PackIndexEntry>,
+    delta_count: u32,
+    peak_working_set_bytes: u64,
+}
+
+impl<I, F> SourcePackStream<I, F>
 where
     I: Iterator<Item = ObjectId>,
     F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
 {
-    if let Some(pending) = leftover.take() {
-        return Ok(Some(pending));
-    }
-    let Some(oid) = selected.next() else {
-        return Ok(None);
-    };
-    if *yielded >= u64::from(object_count) {
-        return Err(GitError::count_mismatch(
-            u64::from(object_count),
-            yielded.saturating_add(1),
-        ));
-    }
-    *yielded = yielded.saturating_add(1);
-    if oid.format() != format {
-        return Err(GitError::InvalidObjectId(
-            "pack object id format does not match pack format".into(),
-        ));
-    }
-    let object = read_object(&oid)?;
-    check_decoded_object_limit(&object, limits)?;
-    Ok(Some(PendingSourceObject { oid, object }))
-}
-
-fn fill_source_window<I, F>(
-    selected: &mut I,
-    leftover: &mut Option<PendingSourceObject>,
-    yielded: &mut u64,
-    object_count: u32,
-    format: ObjectFormat,
-    limits: PackWriteLimits,
-    read_object: &mut F,
-) -> Result<(Vec<PendingSourceObject>, u64)>
-where
-    I: Iterator<Item = ObjectId>,
-    F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
-{
-    let mut window = Vec::new();
-    let mut used = 0u64;
-    loop {
-        let Some(pending) = pull_source_object(
+    fn new(
+        selected: I,
+        object_count: u32,
+        format: ObjectFormat,
+        limits: PackWriteLimits,
+        read_object: F,
+    ) -> Self {
+        Self {
             selected,
-            leftover,
-            yielded,
+            leftover: None,
+            yielded: 0,
             object_count,
             format,
             limits,
             read_object,
-        )?
-        else {
-            break;
+            index_entries: Vec::with_capacity(object_count as usize),
+            delta_count: 0,
+            peak_working_set_bytes: 0,
+        }
+    }
+
+    fn pull(&mut self) -> Result<Option<PendingSourceObject>> {
+        if let Some(pending) = self.leftover.take() {
+            return Ok(Some(pending));
+        }
+        let Some(oid) = self.selected.next() else {
+            return Ok(None);
         };
-        let cost = pack_object_window_cost(&pending.object);
-        if window.is_empty() {
-            window.push(pending);
-            used = cost;
-            if cost > limits.compression_working_set.as_u64() {
+        if self.yielded >= u64::from(self.object_count) {
+            return Err(GitError::count_mismatch(
+                u64::from(self.object_count),
+                self.yielded.saturating_add(1),
+            ));
+        }
+        self.yielded = self.yielded.saturating_add(1);
+        if oid.format() != self.format {
+            return Err(GitError::InvalidObjectId(
+                "pack object id format does not match pack format".into(),
+            ));
+        }
+        let object = (self.read_object)(&oid)?;
+        let attempted = object.body.len() as u64;
+        let limit = self.limits.decoded_object.as_u64();
+        if attempted > limit {
+            return Err(GitError::resource_limit(
+                ResourceLimitKind::DecodedObject,
+                limit,
+                attempted,
+            ));
+        }
+        Ok(Some(PendingSourceObject { oid, object }))
+    }
+
+    fn fill_window(&mut self) -> Result<(Vec<PendingSourceObject>, u64)> {
+        let mut window = Vec::new();
+        let mut used = 0u64;
+        while let Some(pending) = self.pull()? {
+            let cost = pack_object_window_cost(&pending.object);
+            if window.is_empty() {
+                window.push(pending);
+                used = cost;
+                if cost > self.limits.compression_working_set.as_u64() {
+                    break;
+                }
+                continue;
+            }
+            if !self.limits.compression_working_set.allows(used, cost) {
+                self.leftover = Some(pending);
                 break;
             }
-            continue;
+            used = used.saturating_add(cost);
+            window.push(pending);
         }
-        if !limits.compression_working_set.allows(used, cost) {
-            *leftover = Some(pending);
-            break;
-        }
-        used = used.saturating_add(cost);
-        window.push(pending);
+        Ok((window, used))
     }
-    Ok((window, used))
+
+    fn note_peak(&mut self, window_bytes: u64, horizon_bytes: u64) {
+        let now = window_bytes.saturating_add(horizon_bytes);
+        if now > self.peak_working_set_bytes {
+            self.peak_working_set_bytes = now;
+        }
+    }
+
+    fn finish(self, output: PackDigestWriter<'_, impl Write>) -> Result<PackWriteSummary> {
+        if self.leftover.is_some() || self.yielded != u64::from(self.object_count) {
+            return Err(GitError::count_mismatch(
+                u64::from(self.object_count),
+                self.yielded,
+            ));
+        }
+        let (checksum, pack_size) = output.finish()?;
+        let index = PackIndex::write_v2(self.format, &self.index_entries, &checksum)?;
+        Ok(PackWriteSummary {
+            index,
+            checksum,
+            entries: self.index_entries,
+            delta_count: self.delta_count,
+            pack_size,
+            peak_working_set_bytes: self.peak_working_set_bytes,
+        })
+    }
 }
 
 fn retain_streaming_delta_base(
@@ -356,13 +381,6 @@ fn retain_streaming_delta_base(
     }
 }
 
-fn note_working_set_peak(peak: &mut u64, window_bytes: u64, horizon_bytes: u64) {
-    let now = window_bytes.saturating_add(horizon_bytes);
-    if now > *peak {
-        *peak = now;
-    }
-}
-
 fn validate_thin_base_formats(options: &PackWriteOptions, format: ObjectFormat) -> Result<()> {
     for oid in options.thin_bases.keys() {
         if oid.format() != format {
@@ -372,31 +390,6 @@ fn validate_thin_base_formats(options: &PackWriteOptions, format: ObjectFormat) 
         }
     }
     Ok(())
-}
-
-fn finish_source_pack_write(
-    leftover: Option<PendingSourceObject>,
-    yielded: u64,
-    object_count: u32,
-    output: PackDigestWriter<'_, impl Write>,
-    index_entries: Vec<PackIndexEntry>,
-    delta_count: u32,
-    peak_working_set_bytes: u64,
-    format: ObjectFormat,
-) -> Result<PackWriteSummary> {
-    if leftover.is_some() || yielded != u64::from(object_count) {
-        return Err(GitError::count_mismatch(u64::from(object_count), yielded));
-    }
-    let (checksum, pack_size) = output.finish()?;
-    let index = PackIndex::write_v2(format, &index_entries, &checksum)?;
-    Ok(PackWriteSummary {
-        index,
-        checksum,
-        entries: index_entries,
-        delta_count,
-        pack_size,
-        peak_working_set_bytes,
-    })
 }
 
 impl PackFile {
@@ -810,13 +803,14 @@ impl PackFile {
     /// ids is [`GitError::CountMismatch`] and never a successful pack.
     /// Compression windows are admitted by [`PackWriteLimits`]. Polls `cancel`
     /// between windows.
+    #[allow(clippy::too_many_arguments)]
     pub fn write_undeltified_from_source_to_writer_with_cancel<W, I, F>(
         selected_objects: I,
         object_count: u32,
         format: ObjectFormat,
         options: &PackWriteOptions,
         limits: PackWriteLimits,
-        mut read_object: F,
+        read_object: F,
         writer: &mut W,
         cancel: CancelFlag<'_>,
     ) -> Result<PackWriteSummary>
@@ -826,31 +820,25 @@ impl PackFile {
         F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
     {
         cancel.check()?;
-        let mut selected = selected_objects.into_iter();
-        let mut leftover = None;
-        let mut yielded = 0u64;
+        let mut stream = SourcePackStream::new(
+            selected_objects.into_iter(),
+            object_count,
+            format,
+            limits,
+            read_object,
+        );
         let mut output = PackDigestWriter::new(writer, format);
         output.write_pack_bytes(b"PACK")?;
         output.write_pack_bytes(&2u32.to_be_bytes())?;
         output.write_pack_bytes(&object_count.to_be_bytes())?;
 
-        let mut index_entries = Vec::with_capacity(object_count as usize);
-        let mut peak_working_set_bytes = 0u64;
         loop {
             cancel.check()?;
-            let (window, window_bytes) = fill_source_window(
-                &mut selected,
-                &mut leftover,
-                &mut yielded,
-                object_count,
-                format,
-                limits,
-                &mut read_object,
-            )?;
+            let (window, window_bytes) = stream.fill_window()?;
             if window.is_empty() {
                 break;
             }
-            note_working_set_peak(&mut peak_working_set_bytes, window_bytes, 0);
+            stream.note_peak(window_bytes, 0);
             let objects = window
                 .iter()
                 .map(|entry| Arc::clone(&entry.object))
@@ -870,7 +858,7 @@ impl PackFile {
                 crc32.update(compressed_payload);
                 output.write_pack_bytes(&entry_header)?;
                 output.write_pack_bytes(compressed_payload)?;
-                index_entries.push(PackIndexEntry {
+                stream.index_entries.push(PackIndexEntry {
                     oid: entry.oid,
                     crc32: crc32.finalize(),
                     offset,
@@ -878,16 +866,7 @@ impl PackFile {
             }
         }
 
-        finish_source_pack_write(
-            leftover,
-            yielded,
-            object_count,
-            output,
-            index_entries,
-            0,
-            peak_working_set_bytes,
-            format,
-        )
+        stream.finish(output)
     }
 
     pub fn write_packed_from_source_to_writer<W, I, F>(
@@ -931,13 +910,14 @@ impl PackFile {
     /// [`PackWriteLimits::delta_base`]. Output-writer backpressure and
     /// `read_object` failures stop further enumeration. Polls `cancel`
     /// between windows and returns [`GitError::Cancelled`] when the flag trips.
+    #[allow(clippy::too_many_arguments)]
     pub fn write_packed_from_source_to_writer_with_cancel<W, I, F>(
         selected_objects: I,
         object_count: u32,
         format: ObjectFormat,
         options: &PackWriteOptions,
         limits: PackWriteLimits,
-        mut read_object: F,
+        read_object: F,
         writer: &mut W,
         cancel: CancelFlag<'_>,
     ) -> Result<PackWriteSummary>
@@ -948,35 +928,28 @@ impl PackFile {
     {
         validate_thin_base_formats(options, format)?;
         cancel.check()?;
-        let mut selected = selected_objects.into_iter();
-        let mut leftover = None;
-        let mut yielded = 0u64;
+        let mut stream = SourcePackStream::new(
+            selected_objects.into_iter(),
+            object_count,
+            format,
+            limits,
+            read_object,
+        );
         let mut output = PackDigestWriter::new(writer, format);
         output.write_pack_bytes(b"PACK")?;
         output.write_pack_bytes(&2u32.to_be_bytes())?;
         output.write_pack_bytes(&object_count.to_be_bytes())?;
 
-        let mut index_entries = Vec::with_capacity(object_count as usize);
-        let mut delta_count = 0u32;
         let mut base_horizon: VecDeque<StreamingDeltaBase> = VecDeque::new();
         let mut horizon_bytes = 0u64;
-        let mut peak_working_set_bytes = 0u64;
 
         loop {
             cancel.check()?;
-            let (window, window_bytes) = fill_source_window(
-                &mut selected,
-                &mut leftover,
-                &mut yielded,
-                object_count,
-                format,
-                limits,
-                &mut read_object,
-            )?;
+            let (window, window_bytes) = stream.fill_window()?;
             if window.is_empty() {
                 break;
             }
-            note_working_set_peak(&mut peak_working_set_bytes, window_bytes, horizon_bytes);
+            stream.note_peak(window_bytes, horizon_bytes);
 
             let objects = window
                 .iter()
@@ -1005,7 +978,7 @@ impl PackFile {
                         );
                     }
                     StreamingPlannedBase::Current { base_idx, delta } => {
-                        delta_count += 1;
+                        stream.delta_count += 1;
                         let base_offset = written_offsets[*base_idx].ok_or_else(|| {
                             GitError::InvalidFormat(
                                 "in-pack delta base emitted after dependent object".into(),
@@ -1029,7 +1002,7 @@ impl PackFile {
                         base_offset,
                         delta,
                     } => {
-                        delta_count += 1;
+                        stream.delta_count += 1;
                         if options.prefer_ofs_delta {
                             write_pack_entry_header_kind(&mut entry_header, 6, delta.len() as u64);
                             let relative = offset.checked_sub(*base_offset).ok_or_else(|| {
@@ -1044,7 +1017,7 @@ impl PackFile {
                         }
                     }
                     StreamingPlannedBase::External { base_oid, delta } => {
-                        delta_count += 1;
+                        stream.delta_count += 1;
                         write_pack_entry_header_kind(&mut entry_header, 7, delta.len() as u64);
                         entry_header.extend_from_slice(base_oid.as_bytes());
                     }
@@ -1056,7 +1029,7 @@ impl PackFile {
                 output.write_pack_bytes(&entry_header)?;
                 output.write_pack_bytes(compressed_payload)?;
                 written_offsets[idx] = Some(offset);
-                index_entries.push(PackIndexEntry {
+                stream.index_entries.push(PackIndexEntry {
                     oid: object_ids[idx],
                     crc32: crc32.finalize(),
                     offset,
@@ -1074,20 +1047,11 @@ impl PackFile {
                     options,
                     limits,
                 );
-                note_working_set_peak(&mut peak_working_set_bytes, window_bytes, horizon_bytes);
+                stream.note_peak(window_bytes, horizon_bytes);
             }
         }
 
-        finish_source_pack_write(
-            leftover,
-            yielded,
-            object_count,
-            output,
-            index_entries,
-            delta_count,
-            peak_working_set_bytes,
-            format,
-        )
+        stream.finish(output)
     }
 }
 

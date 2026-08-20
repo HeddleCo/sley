@@ -6,6 +6,7 @@ use sley_pack::{PackFile, PackWriteLimits, PackWriteOptions};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// One-shot paging iterator: holds at most `page_size` unread ids.
@@ -53,7 +54,7 @@ impl Iterator for PageIter {
 
 struct CountingIter<I> {
     inner: I,
-    pulled: Arc<Cell<usize>>,
+    pulled: Rc<Cell<usize>>,
 }
 
 impl<I> Iterator for CountingIter<I>
@@ -157,7 +158,7 @@ fn count_too_few_is_typed_error_and_not_success() {
     let format = ObjectFormat::Sha1;
     let (ids, map) = blob_objects(format, 3, b"short");
     let err = write_from_map(
-        ids.into_iter(),
+        ids,
         5,
         format,
         &PackWriteOptions::new(),
@@ -178,13 +179,13 @@ fn count_too_few_is_typed_error_and_not_success() {
 fn count_too_many_is_typed_error_before_extra_source_read() {
     let format = ObjectFormat::Sha1;
     let (ids, map) = blob_objects(format, 4, b"long");
-    let reads = Arc::new(Cell::new(0usize));
-    let pulled = Arc::new(Cell::new(0usize));
+    let reads = Rc::new(Cell::new(0usize));
+    let pulled = Rc::new(Cell::new(0usize));
     let mut written = Vec::new();
     let err = PackFile::write_packed_from_source_to_writer(
         CountingIter {
             inner: ids.into_iter(),
-            pulled: Arc::clone(&pulled),
+            pulled: Rc::clone(&pulled),
         },
         2,
         format,
@@ -218,14 +219,14 @@ fn count_too_many_is_typed_error_before_extra_source_read() {
 fn writer_failure_stops_enumeration() {
     let format = ObjectFormat::Sha1;
     let (ids, map) = blob_objects(format, 8, b"backpressure");
-    let pulled = Arc::new(Cell::new(0usize));
-    let reads = Arc::new(Cell::new(0usize));
+    let pulled = Rc::new(Cell::new(0usize));
+    let reads = Rc::new(Cell::new(0usize));
     let limits = PackWriteLimits::new().with_compression_working_set(ByteBudget::new(80));
     let mut writer = FailAfter { remaining: 16 };
     let err = PackFile::write_packed_from_source_to_writer(
         CountingIter {
             inner: ids.into_iter(),
-            pulled: Arc::clone(&pulled),
+            pulled: Rc::clone(&pulled),
         },
         8,
         format,
@@ -257,13 +258,13 @@ fn writer_failure_stops_enumeration() {
 fn source_failure_stops_enumeration() {
     let format = ObjectFormat::Sha1;
     let (ids, map) = blob_objects(format, 6, b"source fail");
-    let pulled = Arc::new(Cell::new(0usize));
-    let reads = Arc::new(Cell::new(0usize));
+    let pulled = Rc::new(Cell::new(0usize));
+    let reads = Rc::new(Cell::new(0usize));
     let mut written = Vec::new();
     let err = PackFile::write_packed_from_source_to_writer(
         CountingIter {
             inner: ids.into_iter(),
-            pulled: Arc::clone(&pulled),
+            pulled: Rc::clone(&pulled),
         },
         6,
         format,
