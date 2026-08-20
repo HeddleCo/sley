@@ -675,9 +675,7 @@ impl RawConfigEditor {
         while i < seen.len() {
             let j = seen[i];
             let mut new_line = false;
-            let copy_end;
-            let replace_end;
-            if !key_seen {
+            let (copy_end, replace_end) = if !key_seen {
                 // Inserting a fresh key after the speculative slot (section header
                 // or last entry of the section). Copy up to its end; include the
                 // trailing '\n' when present.
@@ -686,8 +684,7 @@ impl RawConfigEditor {
                 {
                     ce += 1;
                 }
-                copy_end = ce;
-                replace_end = ce;
+                (ce, ce)
             } else {
                 let mut re = self.events[j].end;
                 let mut ce = self.events[j].begin;
@@ -706,9 +703,8 @@ impl RawConfigEditor {
                         break;
                     }
                 }
-                copy_end = ce;
-                replace_end = re;
-            }
+                (ce, re)
+            };
 
             if copy_end > 0 && contents[copy_end - 1] != b'\n' {
                 new_line = true;
