@@ -759,7 +759,7 @@ fn reflog_write_refname_is_valid(reference: &str) -> bool {
 
 fn normalize_reflog_write_message(message: &str) -> Vec<u8> {
     message
-        .split(|ch: char| ch == '\n' || ch == '\r')
+        .split(['\n', '\r'])
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
@@ -1187,13 +1187,12 @@ fn reflog_reachable_oids(
     }
     let mut reachable = HashSet::new();
     for start in starts {
-        if !context.reachable_by_tip.contains_key(&start) {
-            let tip_reachable = match sley_rev::ancestor_depths(git_dir, format, db, &start) {
+        context.reachable_by_tip.entry(start).or_insert_with(|| {
+            match sley_rev::ancestor_depths(git_dir, format, db, &start) {
                 Ok(depths) => depths.into_keys().collect(),
                 Err(_) => HashSet::new(),
-            };
-            context.reachable_by_tip.insert(start, tip_reachable);
-        }
+            }
+        });
         if let Some(tip_reachable) = context.reachable_by_tip.get(&start) {
             reachable.extend(tip_reachable.iter().copied());
         }
@@ -2112,6 +2111,9 @@ fn update_ref_stdin_z(context: &UpdateRefStdinContext<'_>, deref: bool) -> Resul
         // same shape git's `input` strbuf has after the appends.
         let mut stitched = first[arg_start..].to_vec();
         let mut early_eof = false;
+        // Each NUL belongs before a different record, so it cannot be replaced
+        // by a single repeated-item extension without changing the wire shape.
+        #[allow(clippy::same_item_push)]
         for _ in 1..cmd.args {
             stitched.push(b'\0');
             match reader.read_record()? {
@@ -2886,14 +2888,6 @@ impl UpdateRefStdinTransaction {
 
     fn is_closed(&self) -> bool {
         self.closed
-    }
-
-    fn is_implicit(&self) -> bool {
-        self.active && !self.explicit && !self.prepared
-    }
-
-    fn is_explicit(&self) -> bool {
-        self.active && self.explicit
     }
 
     fn is_active(&self) -> bool {
@@ -3825,10 +3819,10 @@ fn update_ref_stdin_symref_update(
         reflog,
     });
     tx.commit()?;
-    if requested != name {
-        if let Some(reflog) = update_ref_stdin_symref_reflog(context, name, target)? {
-            context.store.append_reflog(requested, &reflog)?;
-        }
+    if requested != name
+        && let Some(reflog) = update_ref_stdin_symref_reflog(context, name, target)?
+    {
+        context.store.append_reflog(requested, &reflog)?;
     }
     Ok(())
 }

@@ -4038,59 +4038,6 @@ fn format_patch_diff_options_with<'a>(
 /// Number of unchanged lines of context git keeps around each change in a hunk.
 const HUNK_CONTEXT: usize = 3;
 
-/// Emit the unified-diff hunks for a single file change into `out`, grouping
-/// changes with [`HUNK_CONTEXT`] lines of surrounding context (merging nearby
-/// groups), and prefixing each `@@` header with git's default section heading.
-pub(crate) fn write_patch_hunks(
-    out: &mut Vec<u8>,
-    old_content: Option<&[u8]>,
-    new_content: Option<&[u8]>,
-    options: &crate::DiffRenderOptions<'_>,
-) {
-    write_patch_hunks_with(out, old_content, new_content, options);
-}
-
-/// [`write_patch_hunks`] with explicit hunk shaping options.
-///
-/// Thin adapter over the shared renderer
-/// [`sley_diff_merge::render::render_hunks`]: it translates the sley-cli
-/// option bundle (userdiff funcname, `DiffColors`, word-diff config) into the
-/// engine's seams and delegates all hunk byte-shaping to the engine.
-pub(crate) fn write_patch_hunks_with(
-    out: &mut Vec<u8>,
-    old_content: Option<&[u8]>,
-    new_content: Option<&[u8]>,
-    options: &crate::DiffRenderOptions<'_>,
-) {
-    let mut heading = sley_diff_merge::format::heading_classifier(options.funcname);
-    let mut word_diff: Option<sley_diff_merge::format::WordDiffAdapter> = None;
-    let default_colors = commands::diff_words::DiffColors::default();
-    let mut word_diff_config: Option<commands::diff_words::WordDiffConfig> = None;
-    if let Some(word_request) = options.word_diff {
-        word_diff_config = Some(commands::diff_words::WordDiffConfig {
-            mode: word_request.mode,
-            regex: None,
-            colors: options.colors.unwrap_or(&default_colors),
-        });
-    }
-    word_diff = word_diff_config
-        .as_ref()
-        .map(sley_diff_merge::format::WordDiffAdapter::new);
-    let mut render_options = sley_diff_merge::render::HunkRenderOptions {
-        context: options.context,
-        interhunk: options.interhunk,
-        heading: Some(&mut heading),
-        colors: options.colors.map(sley_diff_merge::format::render_colors),
-        word_diff: word_diff
-            .as_mut()
-            .map(|adapter| adapter as &mut dyn sley_diff_merge::render::HunkWordDiff),
-        ws_error: None,
-        color_moved: None,
-        ..Default::default()
-    };
-    sley_diff_merge::render::render_hunks(out, old_content, new_content, &mut render_options);
-}
-
 /// The diffstat block (`--stat`) written into `out`, via the shared
 /// `show_stats` port. format-patch wraps mails at 72 columns: a zero
 /// stat-width becomes `MAIL_DEFAULT_WRAP` exactly like `cmd_format_patch`,

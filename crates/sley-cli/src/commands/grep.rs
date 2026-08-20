@@ -260,7 +260,7 @@ pub(crate) fn cmd_grep(cli_session: &crate::session::CliSession, args: &[String]
     // Command-line pattern-type override: `-E/-G/-F/-P` set this (last wins).
     let mut cli_pattern_type: Option<PatternTypeOption> = None;
     let mut no_index = false;
-    let mut iter = args.iter().peekable();
+    let mut iter = args.iter();
 
     while let Some(arg) = iter.next() {
         if saw_double_dash {
@@ -2381,10 +2381,7 @@ fn function_bounds(
     funcname: Option<&commands::userdiff::CompiledFuncname>,
 ) -> (usize, usize, Option<usize>) {
     let func_header = enclosing_function(lines, from, funcname);
-    let mut start = match func_header {
-        Some(h) => h,
-        None => 0,
-    };
+    let mut start = func_header.unwrap_or_default();
     if funcname.is_some() && func_header.is_some() {
         while start > 0 && !lines[start - 1].is_empty() {
             start -= 1;
@@ -2393,8 +2390,8 @@ fn function_bounds(
     // The function ends just before the next function header.
     let mut end = lines.len() - 1;
     let search_start = func_header.map_or(start + 1, |header| header + 1);
-    for i in search_start..lines.len() {
-        if is_funcline(lines[i], funcname) {
+    for (i, line) in lines.iter().enumerate().skip(search_start) {
+        if is_funcline(line, funcname) {
             end = i - 1;
             break;
         }
@@ -3156,8 +3153,7 @@ mod tests {
         assert_eq!(lines, vec![b"a".as_slice(), b"b".as_slice()]);
         let no_nl: Vec<&[u8]> = split_lines(b"a\nb", b'\n').collect();
         assert_eq!(no_nl, vec![b"a".as_slice(), b"b".as_slice()]);
-        let empty: Vec<&[u8]> = split_lines(b"", b'\n').collect();
-        assert!(empty.is_empty());
+        assert!(split_lines(b"", b'\n').next().is_none());
     }
 
     #[test]

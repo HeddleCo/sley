@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, BufRead};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use sley::plumbing::sley_object::{Commit, ObjectType, TreeEntries, tree_entry_object_type};
 use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
@@ -505,7 +505,7 @@ fn parse_backfill_options(args: &[String]) -> Result<BackfillOptions> {
         stdin: false,
         remaining: Vec::new(),
     };
-    let mut iter = args.iter().peekable();
+    let mut iter = args.iter();
     let mut saw_dashdash = false;
     while let Some(arg) = iter.next() {
         if saw_dashdash {
@@ -609,58 +609,20 @@ fn reject_unsupported_options(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn is_known_rev_list_option(arg: &str) -> bool {
-    matches!(
-        arg.split('=').next().unwrap_or(arg),
-        "--all"
-            | "--branches"
-            | "--tags"
-            | "--remotes"
-            | "--glob"
-            | "--first-parent"
-            | "--no-first-parent"
-            | "--stdin"
-            | "--objects"
-            | "--since"
-            | "--until"
-            | "--max-age"
-            | "--min-age"
-            | "--max-count"
-            | "--skip"
-            | "--reverse"
-            | "--topo-order"
-            | "--date-order"
-            | "--author-date-order"
-            | "--filter"
-            | "--sparse"
-            | "--no-sparse"
-            | "--include-edges"
-            | "--no-include-edges"
-            | "--min-batch-size"
-    ) || arg.starts_with("--since=")
-        || arg.starts_with("--until=")
-        || arg.starts_with("--max-age=")
-        || arg.starts_with("--min-age=")
-        || arg.starts_with("--filter=")
-        || arg.starts_with("--min-batch-size=")
-}
-
 fn map_setup_error(err: GitError, args: &[String]) -> GitError {
     let msg = err.to_string();
-    if msg.contains("unknown revision")
+    if (msg.contains("unknown revision")
         || msg.contains("bad revision")
         || msg.contains("ambiguous")
         || msg.contains("Needed a single revision")
-        || msg.contains("not a valid object")
-    {
-        if let Some(arg) = args
+        || msg.contains("not a valid object"))
+        && let Some(arg) = args
             .iter()
             .find(|a| !a.starts_with('-') && a.as_str() != "--")
-        {
-            return GitError::Command(format!(
-                "ambiguous argument '{arg}': unknown revision or path not in the working tree."
-            ));
-        }
+    {
+        return GitError::Command(format!(
+            "ambiguous argument '{arg}': unknown revision or path not in the working tree."
+        ));
     }
     err
 }

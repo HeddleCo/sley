@@ -69,12 +69,6 @@ impl PatchMode {
     fn applies_for_checkout(self) -> bool {
         matches!(self, PatchMode::CheckoutHead | PatchMode::CheckoutNothead)
     }
-
-    /// True for the new patch modes that reassemble a patch and pipe it to
-    /// `apply`, rather than reconstructing the index blob directly.
-    fn applies_via_patch(self) -> bool {
-        !matches!(self, PatchMode::Add | PatchMode::Stash | PatchMode::Reset)
-    }
 }
 
 /// The `Stage/Discard/Apply ... [hunk]` prompt verb for a given mode + noun,
@@ -316,10 +310,10 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
                         old_oid = Some(old.to_string());
                         new_oid = Some(new.to_string());
                     }
-                    if let Some(sp) = rest.rfind(' ') {
-                        if let Ok(m) = u32::from_str_radix(rest[sp + 1..].trim(), 8) {
-                            mode = m;
-                        }
+                    if let Some(sp) = rest.rfind(' ')
+                        && let Ok(m) = u32::from_str_radix(rest[sp + 1..].trim(), 8)
+                    {
+                        mode = m;
                     }
                     header.push(h.to_string());
                 } else {
@@ -598,10 +592,10 @@ fn print_colored_line(color: &str, reset: &str, text: &str) {
 
 /// Extract the path from a `diff --git a/<p> b/<p>` line.
 fn parse_git_header_path(line: &str) -> String {
-    if let Some(rest) = line.strip_prefix("diff --git a/") {
-        if let Some(sp) = rest.find(" b/") {
-            return rest[..sp].to_string();
-        }
+    if let Some(rest) = line.strip_prefix("diff --git a/")
+        && let Some(sp) = rest.find(" b/")
+    {
+        return rest[..sp].to_string();
     }
     String::new()
 }
@@ -1063,8 +1057,6 @@ fn patch_update_file(
     // decided — it keeps prompting (so the user can revisit decisions), and the
     // `?` help then shows a HUNKS SUMMARY. In the default auto-advance mode the
     // loop breaks as soon as everything is decided.
-    let mut all_decided = false;
-
     // The file's diff header (`diff --git ...`) is printed exactly once on entry.
     render_file_header(fd, cfg);
 
@@ -1096,20 +1088,15 @@ fn patch_update_file(
         let undecided_prev = prev_undecided(fd, hunk_index);
 
         // Everything decided?
-        if undecided_next.is_none()
+        let all_decided = undecided_next.is_none()
             && undecided_prev.is_none()
-            && fd.hunks[hunk_index].use_hunk != HunkUse::Undecided
-        {
-            if cfg.auto_advance {
-                // Default mode: done with this file.
-                break;
-            }
-            // `--no-auto-advance`: stay on the prompt; the `?` help shows the
-            // HUNKS SUMMARY while all_decided.
-            all_decided = true;
-        } else {
-            all_decided = false;
+            && fd.hunks[hunk_index].use_hunk != HunkUse::Undecided;
+        if all_decided && cfg.auto_advance {
+            // Default mode: done with this file.
+            break;
         }
+        // `--no-auto-advance`: stay on the prompt; the `?` help shows the
+        // HUNKS SUMMARY while all_decided.
 
         // Render the hunk if newly arrived at.
         if rendered != Some(hunk_index) {
@@ -1314,7 +1301,7 @@ fn patch_update_file(
                         // Edit is disallowed on the mode-change pseudo-hunk and on
                         // deletions (matches build_suffix's `,e` gating).
                         let mode_change_count = if fd.mode_change.is_some() { 1 } else { 0 };
-                        if fd.deleted || hunk_index + 1 <= mode_change_count {
+                        if fd.deleted || hunk_index < mode_change_count {
                             pending_err =
                                 Some(format!("Unknown command '{answer}' (use '?' for help)\n"));
                         } else {
@@ -1488,7 +1475,6 @@ fn parse_goto(
     let response = if arg.is_empty() {
         // Display a window centered on the current hunk, then prompt.
         let mut start = cur.saturating_sub(DISPLAY_HUNKS_LINES / 2);
-        let mut got = String::new();
         loop {
             let end = display_hunks(fd, start);
             if end < fd.hunks.len() {
@@ -1497,20 +1483,16 @@ fn parse_goto(
                 print!("go to which hunk? ");
             }
             let _ = io::stdout().flush();
-            match read_line(stdin) {
-                Some(l) => {
-                    let t = l.trim().to_string();
-                    if t.is_empty() {
-                        start = end;
-                        continue;
-                    }
-                    got = t;
-                    break;
+            {
+                let l = read_line(stdin)?;
+                let t = l.trim().to_string();
+                if t.is_empty() {
+                    start = end;
+                    continue;
                 }
-                None => return None,
+                break t;
             }
         }
-        got
     } else {
         arg
     };
@@ -1540,9 +1522,9 @@ fn parse_search(
     if pat.is_empty() {
         print!("search for regex? ");
         let _ = io::stdout().flush();
-        match read_line(stdin) {
-            Some(l) => pat = l.trim().to_string(),
-            None => return None,
+        {
+            let l = read_line(stdin)?;
+            pat = l.trim().to_string()
         }
         if pat.is_empty() {
             // Empty pattern: git just continues the loop (no move).
@@ -1670,7 +1652,7 @@ fn edit_hunk_loop(
         if std::fs::write(&edit_path, buf.as_bytes()).is_err() {
             return EditResult::Abandoned;
         }
-        if super::replay::launch_editor(&git_dir, &edit_path).is_err() {
+        if super::replay::launch_editor(git_dir, &edit_path).is_err() {
             let _ = std::fs::remove_file(&edit_path);
             return EditResult::Abandoned;
         }
@@ -1923,13 +1905,14 @@ fn split_hunk(fd: &mut FileDiff, hunk_index: usize) -> usize {
         // A new change line after a recorded trailing-context block: close the
         // current piece (it already contains the full shared context), and start
         // the next piece seeded with that shared context block.
-        if (norm == b'-' || norm == b'+') && seen_change_in_current {
-            if let Some(cut) = ctx_start_in_current.take() {
-                let shared: Vec<String> = current[cut..].to_vec();
-                pieces.push(std::mem::take(&mut current));
-                current = shared;
-                seen_change_in_current = false;
-            }
+        if (norm == b'-' || norm == b'+')
+            && seen_change_in_current
+            && let Some(cut) = ctx_start_in_current.take()
+        {
+            let shared: Vec<String> = current[cut..].to_vec();
+            pieces.push(std::mem::take(&mut current));
+            current = shared;
+            seen_change_in_current = false;
         }
         if norm == b'-' || norm == b'+' {
             seen_change_in_current = true;
@@ -2073,7 +2056,7 @@ fn apply_file_via_patch(fd: &FileDiff, mode: PatchMode, stdin: &mut impl BufRead
         return apply_for_checkout(patch, false, stdin);
     }
     // Worktree-only modes: a single forward `apply` against the working tree.
-    let mut args: Vec<&str> = vec!["apply"];
+    let args: Vec<&str> = vec!["apply"];
     let (_out, ok) =
         run_capture_status(&args, Some(patch)).map_err(|e| GitError::Io(e.to_string()))?;
     if !ok {
@@ -2400,10 +2383,8 @@ fn apply_hunks(base: &str, fd: &FileDiff) -> String {
                 b'+' => {
                     out.push(rest.to_string());
                 }
-                b'\\' => {
-                    if previous_marker != b'-' {
-                        result_had_final_nl = false;
-                    }
+                b'\\' if previous_marker != b'-' => {
+                    result_had_final_nl = false;
                 }
                 _ => {}
             }

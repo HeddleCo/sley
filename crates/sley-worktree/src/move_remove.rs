@@ -207,7 +207,7 @@ pub fn remove_index_and_worktree_paths(
                     only_match_sparse.push(spec.display.clone());
                 }
             } else if !options.ignore_unmatch && !spec.matched {
-                // require_matched_includes will report these
+                // The final unmatched-pathspec check below will report these.
             }
         }
         // Select only dense matches.
@@ -706,20 +706,6 @@ impl RemoveCompiledPathspecs {
             } else {
                 remove_path_under_prefix(path, &self.implicit_prefix)
             }
-    }
-
-    #[allow(dead_code)] // kept for non-sparse magic pathspec callers
-    fn require_matched_includes(&self, ignore_unmatch: bool) -> Result<()> {
-        if ignore_unmatch {
-            return Ok(());
-        }
-        for spec in &self.specs {
-            if !spec.element.is_exclude() && !spec.matched {
-                eprintln!("fatal: pathspec '{}' did not match any files", spec.display);
-                return Err(GitError::Exit(128));
-            }
-        }
-        Ok(())
     }
 }
 

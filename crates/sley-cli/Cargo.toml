@@ -25,13 +25,13 @@ required-features = ["fetch-profile"]
 
 [dependencies]
 # SIGINT/Ctrl-C → cooperative AtomicCancel for fetch/clone/push (no unsafe in sley).
-ctrlc = "3.5"
-encoding_rs = "0.8"
-filetime = "0.2"
+ctrlc = "3.5.2"
+encoding_rs = "0.8.35"
+filetime = "0.2.29"
 # Binary patch payloads (`git apply` of a `GIT binary patch`) are zlib-deflated;
 # the backend is unified to zlib-rs by the transitive sley-odb default feature.
-flate2 = { version = "1", default-features = false }
-regex = "1"
+flate2 = { version = "1.1.9", default-features = false }
+regex = "1.13.1"
 pprof = { version = "0.15", optional = true }
 sley.workspace = true
 sley-archive.workspace = true

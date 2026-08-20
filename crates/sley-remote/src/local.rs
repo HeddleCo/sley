@@ -907,6 +907,7 @@ pub fn local_have_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<Objec
 /// trees and blobs: Git's negotiator advances through commit history in
 /// bounded batches, allowing the server to distinguish an immediately common
 /// tip from a common ancestor reached only in a later round.
+#[cfg(feature = "http")]
 pub(crate) fn local_negotiation_have_oids(
     git_dir: &Path,
     format: ObjectFormat,
@@ -2586,15 +2587,11 @@ fn local_ls_refs_v2_records(
         };
         if !sley_core::ref_is_hidden(Some("HEAD"), &head_physical, &hidden) {
             if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? {
-                entries.push(("HEAD".to_string(), oid, head_symref.clone()));
+                entries.push(("HEAD".to_string(), oid, head_symref));
             } else if request.unborn && lsrefs_unborn_config(config) != LsRefsUnbornConfig::Ignore {
                 // An unborn HEAD (points at a not-yet-created branch) is reported as
                 // an `unborn` record carrying its symref-target.
-                entries.push((
-                    "HEAD".to_string(),
-                    ObjectId::null(format),
-                    head_symref.clone(),
-                ));
+                entries.push(("HEAD".to_string(), ObjectId::null(format), head_symref));
             }
         }
     }

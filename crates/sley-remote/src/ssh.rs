@@ -440,7 +440,7 @@ fn ssh_program_and_prefix_args() -> Result<(String, Vec<String>)> {
 fn split_shell_words(command: &str) -> Result<Vec<String>> {
     let mut words = Vec::new();
     let mut current = String::new();
-    let mut chars = command.chars().peekable();
+    let mut chars = command.chars();
     let mut quote = None::<char>;
     while let Some(ch) = chars.next() {
         if let Some(quote_ch) = quote {

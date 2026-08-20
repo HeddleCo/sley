@@ -18,14 +18,14 @@ tls-platform-verifier = ["http-client", "ureq/rustls", "ureq/platform-verifier"]
 sley-config.workspace = true
 sley-core.workspace = true
 sley-protocol.workspace = true
-tempfile = "3"
+tempfile = "3.27.0"
 # gzip is required for smart-HTTP; TLS features are forwarded separately above.
-ureq = { version = "3.3.0", optional = true, default-features = false, features = ["gzip"] }
-webpki-root-certs = { version = "1.0", optional = true }
+ureq = { version = "3.4.0", optional = true, default-features = false, features = ["gzip"] }
+webpki-root-certs = { version = "1.0.9", optional = true }
 
 [dev-dependencies]
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.14.9", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 
 [lints]
 workspace = true

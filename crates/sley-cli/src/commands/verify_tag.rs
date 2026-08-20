@@ -33,7 +33,6 @@
 //! follows the same glob-import + private-helper structure as the other
 //! self-contained command modules (`commands::branch`, `commands::stash`).
 
-use sley::plumbing::sley_core;
 // Glob the crate root for shared CLI rendering and diagnostics (ObjectType,
 // GitError, io, etc.); see commands::stash for the rationale behind the
 // wildcard import.
@@ -252,26 +251,6 @@ fn verify_one_tag(
     }
 }
 
-fn tag_signature_is_valid(format: ObjectFormat, body: &[u8]) -> Result<bool> {
-    let marker = b"-----BEGIN PGP SIGNATURE-----";
-    let Some(start) = body
-        .windows(marker.len())
-        .position(|window| window == marker)
-    else {
-        return Ok(true);
-    };
-    let unsigned = &body[..start];
-    let signature = &body[start..];
-    let signature_text = String::from_utf8_lossy(signature);
-    let Some(line) = signature_text
-        .lines()
-        .find_map(|line| line.strip_prefix("sley-signature "))
-    else {
-        return Ok(true);
-    };
-    Ok(line == sley_core::digest_bytes(format, unsigned)?.to_hex())
-}
-
 fn write_verify_tag_format(format: &str, body: &[u8]) -> Result<()> {
     if format.contains("%(rest)") {
         eprintln!("fatal: unknown field name: rest");
@@ -295,6 +274,7 @@ fn verify_tag_name(body: &[u8]) -> String {
 /// byte of the line carrying a recognized armor marker), or `None` when the tag
 /// carries no signature. Matching git, a marker is only honored at the start of a
 /// line, so a marker embedded inside the tag message is ignored.
+#[cfg(test)]
 fn tag_signature_offset(body: &[u8]) -> Option<usize> {
     let mut line_start = 0;
     while line_start < body.len() {

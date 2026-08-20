@@ -20,7 +20,7 @@ use sley_protocol::{
     smart_http_rpc_result_content_type, write_protocol_v2_command_request,
 };
 use sley_refs::{FileRefStore, RefTarget, RefUpdate};
-use sley_transport::{HttpClient, RemoteUrl, UreqHttpClient, http_smart_rpc_url, parse_remote_url};
+use sley_transport::{HttpClient, RemoteUrl, UreqHttpClient, http_smart_rpc_url};
 
 use crate::CredentialProvider;
 use crate::http::{
@@ -361,7 +361,7 @@ pub fn prefetch_advertised_bundle_uris_with_client(
     loop {
         let mut progressed = false;
         let mut still_pending: Vec<(String, PathBuf)> = Vec::new();
-        for (id, temp) in pending.drain(..) {
+        for (id, temp) in pending {
             match apply_bundle_file(&temp, format, &db, &ref_store) {
                 Ok(true) => {
                     progressed = true;
@@ -511,15 +511,6 @@ fn download_http_bundle_uri(client: &dyn HttpClient, uri: &str, dest: &Path) -> 
         let _ = fs::remove_file(dest);
     }
     result
-}
-
-/// Parse a bundle URI through the transport's standard remote URL parser.
-///
-/// Kept as the bundle-specific facade for embedders even though the in-crate
-/// fetch path currently accepts URI strings directly.
-#[allow(dead_code)]
-pub fn remote_url_from_bundle_uri(uri: &str) -> Result<RemoteUrl> {
-    parse_remote_url(uri)
 }
 
 #[cfg(test)]

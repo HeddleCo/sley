@@ -15,7 +15,9 @@ use crate::commands::merge_rebase::{
     print_commit_shortstat_between_trees, three_way_merge_trees,
     three_way_merge_trees_inner_with_info_opts_and_path_favor, three_way_merge_trees_with_favor,
 };
-use crate::commands::replay::{comment_char, launch_editor, strip_comment_lines};
+use crate::commands::replay::{
+    comment_char, launch_editor, strip_comment_lines, strip_comment_string_lines,
+};
 use crate::*;
 use sley_sequencer::rebase as seq;
 use sley_sequencer::rebase::{RebaseTodoItem, TodoCommand};
@@ -901,11 +903,10 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     // the merge backend, but it does NOT by itself force a backend (it is honoured
     // on whichever one is selected). So compute merge-implication ignoring that
     // single auto-added opt.
-    let other_strategy_opts: Vec<&String> = args
+    let has_other_strategy_opts = args
         .strategy_opts
         .iter()
-        .filter(|opt| !(args.ignore_whitespace && opt.as_str() == "ignore-space-change"))
-        .collect();
+        .any(|opt| !(args.ignore_whitespace && opt.as_str() == "ignore-space-change"));
     let implied_merge = interactive_explicit
         || args.merge_backend
         || !args.exec.is_empty()
@@ -917,7 +918,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         || rebase_merges.is_some()
         || config_update_refs
         || args.strategy.is_some()
-        || !other_strategy_opts.is_empty();
+        || has_other_strategy_opts;
 
     // The apply backend (`git rebase --apply` / `git-rebase--am`) is selected by
     // an explicit `--apply` and by apply-only knobs. It is incompatible with
@@ -960,10 +961,10 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             // `git rebase -` is shorthand for the previous branch, like checkout.
             Some(name) if name == "-" => "@{-1}".to_string(),
             Some(name) => name.clone(),
-            None => match default_upstream_name(ctx, &refs) {
+            None => match default_upstream_name(ctx, refs) {
                 Some(name) => name,
                 None => {
-                    print_missing_upstream_advice(ctx, &refs);
+                    print_missing_upstream_advice(ctx, refs);
                     return Err(GitError::Exit(1));
                 }
             },
@@ -1237,7 +1238,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
                     // HEAD onto its commit (RESET_HEAD_DETACH path).
                     reset_index_and_worktree_to_commit_for_rebase(ctx, &orig_head)?;
                     let refs = ctx.refs();
-                    let old = head_commit_oid(&refs)?.unwrap_or_else(|| ObjectId::null(ctx.format));
+                    let old = head_commit_oid(refs)?.unwrap_or_else(|| ObjectId::null(ctx.format));
                     let committer = committer_identity_for_reflog(&ctx.config)?;
                     detach_head_with_reflog(
                         ctx,
@@ -1294,7 +1295,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
     // The apply backend's explicit fast-forward case.
     if allow_preemptive_ff && !force && branch_base.as_ref() == Some(&orig_head) {
         // onto is a descendant of orig_head: fast-forward.
-        reset_index_and_worktree_to_commit_for_rebase(&ctx, &onto)?;
+        reset_index_and_worktree_to_commit_for_rebase(ctx, &onto)?;
         let committer = committer_identity_for_reflog(&ctx.config)?;
         detach_head_with_reflog(
             ctx,
@@ -1345,7 +1346,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         strategy: args.strategy.clone(),
         strategy_opts: args.strategy_opts.clone(),
         rerere_autoupdate: args.rerere_autoupdate,
-        head_name: head_name.clone(),
+        head_name,
         onto,
         orig_head,
         squash_onto,
@@ -1367,9 +1368,7 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
         // For `--root --onto <newbase>` there is no upstream to exclude, but git
         // still drops commits already present in the onto (cherry-pick
         // detection against the new base). Use the onto as the patch-id base.
-        let cherry_base = if args.root && args.onto_name.is_some() {
-            Some(&onto)
-        } else if fork_point {
+        let cherry_base = if (args.root && args.onto_name.is_some()) || fork_point {
             Some(&onto)
         } else {
             upstream.as_ref()
@@ -1632,7 +1631,7 @@ fn checkout_onto_for_apply(
     orig_head: &ObjectId,
 ) -> Result<()> {
     let refs = ctx.refs();
-    let old = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
+    let old = head_commit_oid(refs)?.unwrap_or(ObjectId::null(ctx.format));
     let base_tree = commit_tree_oid(db, ctx.format, base)?;
     let overwritten = checkout_would_overwrite_untracked(ctx, db, &base_tree)?;
     if !overwritten.is_empty() {
@@ -1799,7 +1798,7 @@ fn checkout_up_to_date(
     )?;
     let refs = ctx.refs();
     let committer = committer_identity_for_reflog(&ctx.config)?;
-    let old = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
+    let old = head_commit_oid(refs)?.unwrap_or(ObjectId::null(ctx.format));
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
         name: "HEAD".into(),
@@ -2011,7 +2010,7 @@ fn make_script_commits(
         // base, so every onto commit's patch-id is considered.
         let bases = merge_bases(&ctx.common_git_dir, db, ctx.format, cherry_base, orig_head)?;
         let mut base_reachable = std::collections::HashSet::new();
-        let mut bq: Vec<ObjectId> = bases.clone();
+        let mut bq: Vec<ObjectId> = bases;
         while let Some(oid) = bq.pop() {
             if !base_reachable.insert(oid) {
                 continue;
@@ -2151,7 +2150,7 @@ fn make_script_with_merges(
     } else if let Some(upstream) = upstream {
         let bases = merge_bases(&ctx.common_git_dir, db, ctx.format, upstream, orig_head)?;
         let mut base_reachable = std::collections::HashSet::new();
-        let mut bq: Vec<ObjectId> = bases.clone();
+        let mut bq: Vec<ObjectId> = bases;
         while let Some(oid) = bq.pop() {
             if !base_reachable.insert(oid) {
                 continue;
@@ -2846,7 +2845,7 @@ fn add_update_ref_commands(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<Vec<Re
         if protected.contains(&reference.name) {
             continue;
         }
-        let Some(oid) = sley_refs::resolve_ref_peeled(&store, &reference.name)? else {
+        let Some(oid) = sley_refs::resolve_ref_peeled(store, &reference.name)? else {
             continue;
         };
         if wanted_oids.contains(&oid) {
@@ -2906,7 +2905,7 @@ fn write_rebase_update_refs_state(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result
     let zero = ObjectId::null(ctx.format);
     let mut text = String::new();
     for refname in refs {
-        let old = sley_refs::resolve_ref_peeled(&store, &refname)?.unwrap_or(zero);
+        let old = sley_refs::resolve_ref_peeled(store, &refname)?.unwrap_or(zero);
         text.push_str(&refname);
         text.push('\n');
         text.push_str(&old.to_hex());
@@ -2978,7 +2977,7 @@ fn do_update_ref(ctx: &Ctx, refname: &str) -> Result<()> {
         return Ok(());
     }
     let refs = ctx.refs();
-    let head = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
+    let head = head_commit_oid(refs)?.unwrap_or(ObjectId::null(ctx.format));
     for rec in &mut records {
         if rec.refname == refname {
             rec.after = head;
@@ -3008,7 +3007,7 @@ fn do_update_refs(ctx: &Ctx, quiet: bool) -> Result<()> {
         if rec.after == zero {
             continue;
         }
-        let current = sley_refs::resolve_ref_peeled(&refs, &rec.refname)?.unwrap_or(zero);
+        let current = sley_refs::resolve_ref_peeled(refs, &rec.refname)?.unwrap_or(zero);
         if current != rec.before {
             eprintln!("error: update_ref failed for ref '{}': ", rec.refname);
             failed.push(rec.refname.clone());
@@ -3040,12 +3039,12 @@ fn do_update_refs(ctx: &Ctx, quiet: bool) -> Result<()> {
         }
     }
     if !quiet && (!updated.is_empty() || !failed.is_empty()) {
-        eprint!("Updated the following refs with --update-refs:\n");
+        eprintln!("Updated the following refs with --update-refs:");
         for refname in &updated {
             eprintln!("\t{refname}");
         }
         if !failed.is_empty() {
-            eprint!("Failed to update the following refs with --update-refs:\n");
+            eprintln!("Failed to update the following refs with --update-refs:");
             for refname in &failed {
                 eprintln!("\t{refname}");
             }
@@ -3079,7 +3078,7 @@ fn filter_update_refs(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result<()> {
     let store = &ctx.common_refs;
     for refname in &todo_refs {
         if !records.iter().any(|rec| rec.refname == *refname) {
-            let before = sley_refs::resolve_ref_peeled(&store, refname)?.unwrap_or(zero);
+            let before = sley_refs::resolve_ref_peeled(store, refname)?.unwrap_or(zero);
             records.push(UpdateRefRecord {
                 refname: (*refname).to_string(),
                 before,
@@ -3236,7 +3235,7 @@ fn complete_action(
         }
     }
 
-    let already_on_rebased_head = head_commit_oid(&ctx.refs())? == Some(opts.orig_head);
+    let already_on_rebased_head = head_commit_oid(ctx.refs())? == Some(opts.orig_head);
     if todo.items.is_empty() && already_on_rebased_head && base == opts.orig_head {
         fs::write(ctx.state_path("git-rebase-todo"), b"")?;
         fs::write(ctx.state_path("end"), format!("{}\n", todo.done_nr))?;
@@ -3444,7 +3443,7 @@ fn checkout_onto_base(
     base: &ObjectId,
 ) -> Result<()> {
     let refs = ctx.refs();
-    let old = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
+    let old = head_commit_oid(refs)?.unwrap_or(ObjectId::null(ctx.format));
     let db = ctx.db();
     let base_tree = commit_tree_oid(&db, ctx.format, base)?;
     let overwritten = checkout_would_overwrite_untracked(ctx, &db, &base_tree)?;
@@ -3662,7 +3661,7 @@ fn reread_todo_if_changed(ctx: &Ctx, db: &FileObjectDatabase, todo: &mut TodoLis
 
 fn stopped_at_head(ctx: &Ctx, db: &FileObjectDatabase) {
     let refs = ctx.refs();
-    match head_commit_oid(&refs) {
+    match head_commit_oid(refs) {
         Ok(Some(oid)) => match read_rev_list_commit_record(db, ctx.format, oid) {
             Ok(record) => {
                 eprintln!(
@@ -3716,12 +3715,12 @@ fn do_exec(ctx: &Ctx, command: &str, quiet: bool) -> Result<i32> {
 fn do_label(ctx: &Ctx, name: &str) -> Result<()> {
     let refs = ctx.refs();
     let head =
-        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("could not read HEAD".into()))?;
+        head_commit_oid(refs)?.ok_or_else(|| GitError::Command("could not read HEAD".into()))?;
     let refname = format!("refs/rewritten/{name}");
     let committer = committer_identity_for_reflog(&ctx.config)?;
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
-        name: refname.clone(),
+        name: refname,
         expected: None,
         new: RefTarget::Direct(head),
         reflog: Some(ReflogEntry {
@@ -3778,7 +3777,7 @@ fn do_reset(ctx: &Ctx, db: &FileObjectDatabase, opts: &MachineOpts, name: &str) 
     }
     reset_index_and_worktree_to_commit_for_rebase(ctx, &target)?;
     let refs = ctx.refs();
-    let old = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
+    let old = head_commit_oid(refs)?.unwrap_or(ObjectId::null(ctx.format));
     let committer = committer_identity_for_reflog(&ctx.config)?;
     detach_head_with_reflog(ctx, old, target, ctx.reflog("reset", Some(name)), committer)
 }
@@ -3819,7 +3818,7 @@ fn do_merge(
     }
 
     let refs = ctx.refs();
-    let head = head_commit_oid(&refs)?
+    let head = head_commit_oid(refs)?
         .ok_or_else(|| GitError::Command("cannot merge without HEAD".into()))?;
     let original = match item.oid {
         Some(oid) => Some(read_rev_list_commit_record(db, ctx.format, oid)?),
@@ -4137,9 +4136,7 @@ fn pick_one_commit_with_custom_strategy(
     let originally_empty = record.commit.tree == parent_tree;
     let mut allow_empty = false;
     if index_unchanged {
-        if originally_empty {
-            allow_empty = true;
-        } else if opts.keep_redundant_commits {
+        if originally_empty || opts.keep_redundant_commits {
             allow_empty = true;
         } else if opts.drop_redundant_commits {
             eprintln!(
@@ -4295,10 +4292,7 @@ fn looks_like_object_name(name: &str) -> bool {
 }
 
 fn resolve_reset_target(ctx: &Ctx, db: &FileObjectDatabase, name: &str) -> Result<ObjectId> {
-    let oid = match resolve_revision(&ctx.git_dir, ctx.format, name, ctx.replace_objects) {
-        Ok(oid) => oid,
-        Err(err) => return Err(err),
-    };
+    let oid = resolve_revision(&ctx.git_dir, ctx.format, name, ctx.replace_objects)?;
     match sley_rev::peel_to_commit(db, ctx.format, &oid) {
         Ok(commit) => Ok(commit),
         Err(_) => {
@@ -4383,7 +4377,7 @@ fn create_merge_commit_from_index(
 ) -> Result<()> {
     let refs = ctx.refs();
     let head =
-        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+        head_commit_oid(refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     let target_encoding = commit_encoding_config(&ctx.git_dir);
     let author = match read_author_script_identity(ctx)? {
         Some(identity) => identity,
@@ -4439,7 +4433,7 @@ fn do_octopus_merge_commit(
     oneline: Option<String>,
 ) -> Result<PickOutcome> {
     let refs = ctx.refs();
-    let head = head_commit_oid(&refs)?
+    let head = head_commit_oid(refs)?
         .ok_or_else(|| GitError::Command("cannot merge without HEAD".into()))?;
     let mut merged_tree = commit_tree_oid(db, ctx.format, &head)?;
     let mut parents = vec![head];
@@ -4510,7 +4504,7 @@ fn pick_one_commit(
     let record = read_rev_list_commit_record(db, ctx.format, oid)?;
     let refs = ctx.refs();
     let head =
-        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+        head_commit_oid(refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
 
     let is_fixup = item.command.is_fixup();
     let final_fixup = is_fixup && !next_is_fixup(todo);
@@ -4729,7 +4723,7 @@ fn pick_one_commit(
         }
 
         // MERGE_MSG with the conflicts comment block.
-        let mut merge_msg = message.clone();
+        let mut merge_msg = message;
         if !merge_msg.ends_with(b"\n") {
             merge_msg.push(b'\n');
         }
@@ -4837,7 +4831,7 @@ fn pick_one_commit(
                 cleanup_message: true,
                 allow_empty,
                 create_root,
-                message_file: commit_message_file.clone(),
+                message_file: commit_message_file,
                 reflog_sub: command_reflog_name(item.command),
                 original: Some(&record),
             },
@@ -4908,7 +4902,7 @@ fn pick_one_commit(
     }
 
     if item.command == TodoCommand::Edit {
-        let new_head = head_commit_oid(&ctx.refs())?.expect("just committed");
+        let new_head = head_commit_oid(ctx.refs())?.expect("just committed");
         eprintln!(
             "Stopped at {}...  {}",
             find_unique_abbrev_hex(ctx, db, &oid),
@@ -5128,7 +5122,7 @@ fn print_conflict_hints() {
 fn intend_to_amend(ctx: &Ctx) -> Result<()> {
     let refs = ctx.refs();
     let head =
-        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+        head_commit_oid(refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     fs::write(ctx.state_path("amend"), format!("{head}\n"))?;
     Ok(())
 }
@@ -5169,7 +5163,7 @@ fn stop_with_patch(
         // saving `record.commit.message` here made the subsequent `--continue`
         // silently discard the trailer.  Reading HEAD also preserves any
         // editor-driven message change made by the commit step itself.
-        let head = head_commit_oid(&ctx.refs())?
+        let head = head_commit_oid(ctx.refs())?
             .ok_or_else(|| GitError::Command("cannot read HEAD after edit".into()))?;
         let head_record = read_rev_list_commit_record(db, ctx.format, head)?;
         let mut message = head_record.commit.message;
@@ -5227,7 +5221,7 @@ fn current_fixup_count(ctx: &Ctx) -> usize {
         .unwrap_or(0)
 }
 
-fn commented_lines(text: &[u8], comment: u8) -> Vec<u8> {
+fn commented_lines(text: &[u8], comment: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     for line in text.split_inclusive(|&b| b == b'\n') {
         let content = if line.ends_with(b"\n") {
@@ -5236,9 +5230,9 @@ fn commented_lines(text: &[u8], comment: u8) -> Vec<u8> {
             line
         };
         if content.is_empty() {
-            out.push(comment);
+            out.extend_from_slice(comment);
         } else {
-            out.push(comment);
+            out.extend_from_slice(comment);
             out.push(b' ');
             out.extend_from_slice(content);
         }
@@ -5304,8 +5298,8 @@ fn is_fixup_flag(command: TodoCommand, flags: u8) -> bool {
 /// replacing message survives. Mirrors sequencer.c by rewriting the
 /// "This is the …th commit message:" headers to their "will be skipped" form
 /// and commenting the bodies they introduce.
-fn update_squash_message_for_fixup(msg: &[u8], comment: u8) -> Vec<u8> {
-    let comment_str = (comment as char).to_string();
+fn update_squash_message_for_fixup(msg: &[u8], comment: &str) -> Vec<u8> {
+    let comment_str = comment;
     // The header markers (kept) and their skipped variants, both already
     // carrying the comment prefix.
     let kept_first = format!("{comment_str} This is the 1st commit message:");
@@ -5350,10 +5344,10 @@ fn update_squash_message_for_fixup(msg: &[u8], comment: u8) -> Vec<u8> {
             // Comment out the message body, but leave blank lines untouched.
             if body.is_empty() {
                 out.push(b'\n');
-            } else if body.first() == Some(&comment) {
+            } else if body.starts_with(comment.as_bytes()) {
                 out.extend_from_slice(line);
             } else {
-                out.push(comment);
+                out.extend_from_slice(comment.as_bytes());
                 out.push(b' ');
                 out.extend_from_slice(line);
             }
@@ -5367,9 +5361,9 @@ fn update_squash_message_for_fixup(msg: &[u8], comment: u8) -> Vec<u8> {
 fn remove_last_squash_message_section(
     msg: &[u8],
     remaining_messages: usize,
-    comment: u8,
+    comment: &str,
 ) -> Vec<u8> {
-    let comment_str = (comment as char).to_string();
+    let comment_str = comment;
     let mut text = String::from_utf8_lossy(msg).into_owned();
 
     if let Some(first_newline) = text.find('\n') {
@@ -5401,10 +5395,10 @@ fn append_squash_message(
     body: &[u8],
     command: TodoCommand,
     flags: u8,
-    comment: u8,
+    comment: &str,
     count: usize,
 ) -> Result<()> {
-    let comment_str = (comment as char).to_string();
+    let comment_str = comment;
     // `amend!` subjects (and fixup!/squash! when squashing) get their subject
     // commented out.
     let commented_len = if body.starts_with(b"amend!")
@@ -5423,7 +5417,7 @@ fn append_squash_message(
         )
         .as_bytes(),
     );
-    buf.extend_from_slice(&commented_lines(&body[..commented_len], comment));
+    buf.extend_from_slice(&commented_lines(&body[..commented_len], comment.as_bytes()));
     let fixup_off = buf.len();
     buf.extend_from_slice(&body[commented_len..]);
 
@@ -5452,8 +5446,8 @@ fn update_squash_messages(
     item: &RebaseTodoItem,
     record: &sley_rev::CommitRecord,
 ) -> Result<()> {
-    let comment = comment_char(&ctx.git_dir);
-    let comment_str = (comment as char).to_string();
+    let comment = commands::status::commit_comment_string(&ctx.git_dir);
+    let comment_str = comment.as_str();
     let target_encoding = commit_encoding_config(&ctx.git_dir);
     let count = current_fixup_count(ctx);
     let flagged = is_fixup_flag(item.command, item.flags);
@@ -5461,7 +5455,7 @@ fn update_squash_messages(
     if count > 0 {
         let existing = fs::read(ctx.state_path("message-squash"))?;
         // Replace the first line (the combination header).
-        let eol = if existing.first() == Some(&comment) {
+        let eol = if existing.starts_with(comment.as_bytes()) {
             existing
                 .iter()
                 .position(|&b| b == b'\n')
@@ -5476,11 +5470,11 @@ fn update_squash_messages(
         .into_bytes();
         buf.extend_from_slice(&existing[eol..]);
         if flagged && !seen_squash(ctx) {
-            buf = update_squash_message_for_fixup(&buf, comment);
+            buf = update_squash_message_for_fixup(&buf, &comment);
         }
     } else {
         let refs = ctx.refs();
-        let head = head_commit_oid(&refs)?
+        let head = head_commit_oid(refs)?
             .ok_or_else(|| GitError::Command("need a HEAD to fixup".into()))?;
         let head_record = read_rev_list_commit_record(db, ctx.format, head)?;
         let head_body =
@@ -5494,7 +5488,7 @@ fn update_squash_messages(
             buf.extend_from_slice(
                 format!("{comment_str} The 1st commit message will be skipped:\n\n").as_bytes(),
             );
-            buf.extend_from_slice(&commented_lines(&head_body, comment));
+            buf.extend_from_slice(&commented_lines(&head_body, comment.as_bytes()));
         } else {
             buf.extend_from_slice(
                 format!("{comment_str} This is the 1st commit message:\n\n").as_bytes(),
@@ -5511,7 +5505,7 @@ fn update_squash_messages(
             &body,
             item.command,
             item.flags,
-            comment,
+            &comment,
             count,
         )?;
     } else {
@@ -5524,7 +5518,7 @@ fn update_squash_messages(
             )
             .as_bytes(),
         );
-        buf.extend_from_slice(&commented_lines(&body, comment));
+        buf.extend_from_slice(&commented_lines(&body, comment.as_bytes()));
     }
     fs::write(ctx.state_path("message-squash"), &buf)?;
 
@@ -5575,7 +5569,7 @@ fn machine_commit(
 ) -> Result<CommitOutcome> {
     let refs = ctx.refs();
     let head =
-        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+        head_commit_oid(refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     let head_record = read_rev_list_commit_record(db, ctx.format, head)?;
 
     let mut message = match &commit.message_file {
@@ -5584,8 +5578,8 @@ fn machine_commit(
     };
 
     let editmsg = ctx.git_dir.join("COMMIT_EDITMSG");
+    let comment_string = commands::status::commit_comment_string(&ctx.git_dir);
     if commit.edit {
-        let comment_string = commands::status::commit_comment_string(&ctx.git_dir);
         let mut template = message.clone();
         if !template.ends_with(b"\n") {
             template.push(b'\n');
@@ -5635,7 +5629,7 @@ fn machine_commit(
         message = fs::read(&editmsg)?;
     }
     if commit.edit {
-        message = strip_comment_lines(&message, comment_char(&ctx.git_dir));
+        message = strip_comment_string_lines(&message, comment_string.as_bytes());
         if message.iter().all(|b| b.is_ascii_whitespace()) {
             eprintln!("Aborting commit due to empty commit message.");
             return Ok(CommitOutcome::Failed(1));
@@ -5670,7 +5664,7 @@ fn machine_commit(
         (Vec::new(), author)
     } else if commit.amend {
         let author = head_record.commit.author.clone();
-        (head_record.commit.parents.clone(), author)
+        (head_record.commit.parents, author)
     } else {
         let author = match read_author_script_identity(ctx)? {
             Some(identity) => identity,
@@ -5852,7 +5846,7 @@ fn read_author_script_identity(ctx: &Ctx) -> Result<Option<Vec<u8>>> {
 fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
     let refs = ctx.refs();
     let head =
-        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+        head_commit_oid(refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     let head_name_display;
     if let Some(head_name) = &opts.head_name {
         let committer = committer_identity_for_reflog(&ctx.config)?;
@@ -5878,7 +5872,7 @@ fn finish_rebase(ctx: &Ctx, opts: &MachineOpts) -> Result<()> {
             reflog: Some(ReflogEntry {
                 old_oid: head,
                 new_oid: head,
-                committer: committer.clone(),
+                committer,
                 message: ctx.reflog("finish", Some(&format!("returning to {head_name}"))),
             }),
         });
@@ -5935,7 +5929,7 @@ fn flush_rewritten_pending(ctx: &Ctx) -> Result<()> {
     }
     let refs = ctx.refs();
     let head =
-        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+        head_commit_oid(refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     let mut list = fs::read_to_string(rewritten_list_path(ctx)).unwrap_or_default();
     for line in pending.lines().filter(|line| !line.trim().is_empty()) {
         list.push_str(line.trim());
@@ -6074,12 +6068,12 @@ fn copy_notes_for_rewrite(ctx: &Ctx, rewritten: &[(ObjectId, ObjectId)]) -> Resu
         let notes_ref = sley_notes::NotesRef::expand(&reference.name);
         for (old, new) in rewritten {
             let Some(source_blob) =
-                sley_notes::read_note_for(&ctx.git_dir, ctx.format, &store, &notes_ref, old)?
+                sley_notes::read_note_for(&ctx.git_dir, ctx.format, store, &notes_ref, old)?
             else {
                 continue;
             };
             let dest_blob =
-                sley_notes::read_note_for(&ctx.git_dir, ctx.format, &store, &notes_ref, new)?;
+                sley_notes::read_note_for(&ctx.git_dir, ctx.format, store, &notes_ref, new)?;
             // git's note_tree_insert skips when source and destination notes are
             // the same blob (avoids doubling when a commit is re-rebased to the
             // same id that already carries the copied note).
@@ -6087,7 +6081,7 @@ fn copy_notes_for_rewrite(ctx: &Ctx, rewritten: &[(ObjectId, ObjectId)]) -> Resu
                 continue;
             }
             let source =
-                sley_notes::read_note_bytes(&ctx.git_dir, ctx.format, &store, &notes_ref, old)?
+                sley_notes::read_note_bytes(&ctx.git_dir, ctx.format, store, &notes_ref, old)?
                     .unwrap_or_default();
             // `overwrite` replaces; concatenate/cat_sort_uniq append to any note
             // already on the replacement commit, separated by a blank line
@@ -6096,7 +6090,7 @@ fn copy_notes_for_rewrite(ctx: &Ctx, rewritten: &[(ObjectId, ObjectId)]) -> Resu
                 source
             } else {
                 let mut cur =
-                    sley_notes::read_note_bytes(&ctx.git_dir, ctx.format, &store, &notes_ref, new)?
+                    sley_notes::read_note_bytes(&ctx.git_dir, ctx.format, store, &notes_ref, new)?
                         .unwrap_or_default();
                 if cur.last() == Some(&b'\n') {
                     cur.pop();
@@ -6105,11 +6099,11 @@ fn copy_notes_for_rewrite(ctx: &Ctx, rewritten: &[(ObjectId, ObjectId)]) -> Resu
                 cur.extend_from_slice(&source);
                 cur
             };
-            let expected = sley_notes::notes_ref_expected(&store, &notes_ref)?;
+            let expected = sley_notes::notes_ref_expected(store, &notes_ref)?;
             sley_notes::upsert_note_bytes_for(
                 &ctx.git_dir,
                 ctx.format,
-                &store,
+                store,
                 &notes_ref,
                 new,
                 &combined,
@@ -6208,7 +6202,7 @@ fn commit_staged_changes(
 ) -> Result<bool> {
     let refs = ctx.refs();
     let head =
-        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+        head_commit_oid(refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     let head_tree = commit_tree_oid(db, ctx.format, &head)?;
     let index_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
     let is_clean = index_tree == head_tree;
@@ -6267,7 +6261,7 @@ fn commit_staged_changes(
                         let pruned = remove_last_squash_message_section(
                             &message_squash,
                             remaining_messages,
-                            comment_char(&ctx.git_dir),
+                            &commands::status::commit_comment_string(&ctx.git_dir),
                         );
                         fs::write(ctx.state_path("message-squash"), pruned)?;
                     }
@@ -6346,7 +6340,7 @@ fn rebase_skip(ctx: &Ctx) -> Result<()> {
     let opts = seq::read_rebase_state(&ctx.git_dir, ctx.format)?;
     let refs = ctx.refs();
     let head =
-        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+        head_commit_oid(refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     reset_index_and_worktree_to_commit_for_rebase(ctx, &head)?;
     let _ = fs::remove_file(ctx.git_dir.join("CHERRY_PICK_HEAD"));
     let _ = fs::remove_file(ctx.git_dir.join("MERGE_MSG"));
@@ -6368,7 +6362,7 @@ fn rebase_abort(ctx: &Ctx) -> Result<()> {
     reset_index_and_worktree_to_commit_for_rebase(ctx, &target)?;
     let refs = ctx.refs();
     let committer = committer_identity_for_reflog(&ctx.config)?;
-    let old_head = head_commit_oid(&refs)?.unwrap_or(ObjectId::null(ctx.format));
+    let old_head = head_commit_oid(refs)?.unwrap_or(ObjectId::null(ctx.format));
     let returning_to = match &opts.head_name {
         Some(head_name) => head_name.clone(),
         None => opts.orig_head.to_hex(),
@@ -6547,7 +6541,7 @@ fn create_autostash(ctx: &Ctx, use_apply_backend: bool) -> Result<()> {
     );
     let refs = ctx.refs();
     let head =
-        head_commit_oid(&refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
+        head_commit_oid(refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     reset_index_and_worktree_to_commit_for_rebase(ctx, &head)?;
     Ok(())
 }

@@ -770,6 +770,8 @@ fn common_prefix_len(a: &[DiffLine<'_>], b: &[DiffLine<'_>]) -> usize {
         .count()
 }
 
+// The suffix offsets intentionally use each input's independent length.
+#[allow(clippy::suspicious_operation_groupings)]
 fn common_suffix_len(a: &[DiffLine<'_>], b: &[DiffLine<'_>], prefix: usize) -> usize {
     let max = a.len().min(b.len()).saturating_sub(prefix);
     let mut len = 0;

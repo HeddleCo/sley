@@ -177,9 +177,7 @@ fn handle_inetd_connection(opts: &DaemonOptions) -> Result<()> {
         return Ok(());
     };
     let request = parse_daemon_request(&payload)?;
-    if let Some((repo, receive)) =
-        prepare_daemon_request(opts, &request, |msg| write_error_stdio(msg))?
-    {
+    if let Some((repo, receive)) = prepare_daemon_request(opts, &request, write_error_stdio)? {
         run_service_stdio(&repo, receive, request.git_protocol.as_deref())?;
     }
     Ok(())
@@ -360,6 +358,7 @@ fn receive_pack_enabled(opts: &DaemonOptions, repo: &Path) -> bool {
 /// (`sley upload-pack <repo>` / `sley receive-pack <repo>`) with the connection
 /// as the child's stdio and `GIT_PROTOCOL` set. Re-exec keeps the daemon free
 /// of the service's refs/odb state and reuses the already-tested command paths.
+#[cfg(unix)]
 fn run_service(
     repo: &Path,
     receive: bool,
@@ -401,6 +400,18 @@ fn run_service(
         .map_err(|err| GitError::Command(format!("daemon: cannot spawn {service}: {err}")))?;
     let _ = child.wait();
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn run_service(
+    _repo: &Path,
+    _receive: bool,
+    _git_protocol: Option<&str>,
+    _stream: TcpStream,
+) -> Result<()> {
+    Err(GitError::Unsupported(
+        "git daemon socket handoff is not supported on this platform".into(),
+    ))
 }
 
 fn run_service_stdio(repo: &Path, receive: bool, git_protocol: Option<&str>) -> Result<()> {

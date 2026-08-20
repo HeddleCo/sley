@@ -173,7 +173,7 @@ fn filter_mergetool_paths(
 }
 
 fn order_mergetool_paths(
-    conflicts: &mut Vec<UnmergedPath>,
+    conflicts: &mut [UnmergedPath],
     worktree_root: &Path,
     config: &GitConfig,
     options: &MergetoolOptions,
@@ -459,7 +459,7 @@ fn stage_worktree_path(repo: &RepositoryContext, path: &[u8]) -> Result<()> {
     let config = read_repo_config(repo.git_dir())?;
     sley_worktree::update_index_ordered_paths_filtered(
         repo.worktree_root()?,
-        repo.git_dir().to_path_buf(),
+        repo.git_dir(),
         repo.format(),
         &[sley_worktree::UpdateIndexPath {
             path: repo_path_to_path(path),

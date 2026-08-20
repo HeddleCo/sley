@@ -81,13 +81,13 @@ impl RangeSet {
             if r.start == r.end {
                 continue;
             }
-            if let Some(last) = out.last_mut() {
-                if r.start <= last.end {
-                    if r.end > last.end {
-                        last.end = r.end;
-                    }
-                    continue;
+            if let Some(last) = out.last_mut()
+                && r.start <= last.end
+            {
+                if r.end > last.end {
+                    last.end = r.end;
                 }
+                continue;
             }
             out.push(r);
         }
@@ -100,14 +100,14 @@ impl RangeSet {
         let mut i = 0usize;
         let mut j = 0usize;
         // git interleaves by start, appending and coalescing.
-        let mut push = |out: &mut RangeSet, r: Range| {
-            if let Some(last) = out.ranges.last_mut() {
-                if r.start <= last.end {
-                    if r.end > last.end {
-                        last.end = r.end;
-                    }
-                    return;
+        let push = |out: &mut RangeSet, r: Range| {
+            if let Some(last) = out.ranges.last_mut()
+                && r.start <= last.end
+            {
+                if r.end > last.end {
+                    last.end = r.end;
                 }
+                return;
             }
             out.ranges.push(r);
         };
@@ -286,14 +286,6 @@ fn line_ends(data: &[u8]) -> (Vec<usize>, i64) {
         ends.len() as i64
     };
     (ends, lines)
-}
-
-/// `nth_line(n)` for the parse-loc regex search: the start of line `n`
-/// (0-based). Returns the slice from that offset to end.
-fn nth_line<'a>(data: &'a [u8], ends: &[usize], n: i64) -> &'a [u8] {
-    let n = n.max(0) as usize;
-    let off = ends.get(n).copied().unwrap_or(data.len());
-    &data[off.min(data.len())..]
 }
 
 /// Default funcname-line classifier (`def_ff` / `match_funcname` with no

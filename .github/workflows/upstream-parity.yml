@@ -16,6 +16,7 @@ name: Upstream Git Parity Tests
 # baseline out from under the floors).
 
 on:
+  pull_request:
   workflow_dispatch:
     inputs:
       git_version:
@@ -103,6 +104,18 @@ jobs:
           GIT_SRC_DIR: /tmp/git-src
         run: crates/sley-testkit/scripts/run-upstream-tests.sh --validate-manifest
 
+      - name: Select parity surface
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            selection="$(sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' \
+              .github/workflows/parity-pr-scripts.txt | tr '\n' ' ')"
+            echo "SLEY_TESTS=$selection" >> "$GITHUB_ENV"
+            echo "SLEY_PARITY_REQUIRED=.github/workflows/parity-pr-scripts.txt" >> "$GITHUB_ENV"
+          else
+            echo "SLEY_TESTS=curated" >> "$GITHUB_ENV"
+            echo "SLEY_PARITY_REQUIRED=" >> "$GITHUB_ENV"
+          fi
+
       - name: Validate local transport test environment
         run: python3 crates/sley-testkit/scripts/preflight_upstream_environment.py --tmpdir /tmp
 
@@ -126,7 +139,7 @@ jobs:
         env:
           GIT_SRC_DIR: /tmp/git-src
           GIT_TEST_DEFAULT_HASH: sha1
-          SLEY_TESTS: curated
+          SLEY_TESTS: ${{ env.SLEY_TESTS }}
           SLEY_TEST_TIMEOUT: "900"
           SLEY_UPSTREAM_WAVES: "8"
           SLEY_TEST_TARGET: oracle
@@ -154,7 +167,7 @@ jobs:
         env:
           GIT_SRC_DIR: /tmp/git-src
           GIT_TEST_DEFAULT_HASH: sha1
-          SLEY_TESTS: curated
+          SLEY_TESTS: ${{ env.SLEY_TESTS }}
           SLEY_TEST_TIMEOUT: "900"
           SLEY_UPSTREAM_WAVES: "8"
           SLEY_TEST_TARGET: sley
@@ -206,8 +219,14 @@ jobs:
       # becomes a stale failure on recovery.
       - name: Check parity floors
         run: |
-          bash .github/workflows/scripts/check-parity-floors.sh \
-            crates/sley-testkit/upstream-report-summary.csv
+          if [ -n "$SLEY_PARITY_REQUIRED" ]; then
+            bash .github/workflows/scripts/check-parity-floors.sh \
+              crates/sley-testkit/upstream-report-summary.csv \
+              "$SLEY_PARITY_REQUIRED"
+          else
+            bash .github/workflows/scripts/check-parity-floors.sh \
+              crates/sley-testkit/upstream-report-summary.csv
+          fi
 
       - name: Archive upstream test results
         if: always()

@@ -894,7 +894,7 @@ fn write_unique_abbrev(out: &mut Vec<u8>, db: &FileObjectDatabase, oid: &ObjectI
             _ => break,
         }
     }
-    out.extend_from_slice(hex[..len].as_bytes());
+    out.extend_from_slice(&hex.as_bytes()[..len]);
 }
 
 fn decimal_width(value: usize) -> usize {

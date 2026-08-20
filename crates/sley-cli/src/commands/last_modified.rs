@@ -237,10 +237,8 @@ fn resolve_last_modified_revs(options: &LastModifiedOptions) -> Result<(String, 
             if !left.is_empty() {
                 excluded.push(left.to_string());
             }
-            if !right.is_empty() {
-                if start.replace(right.to_string()).is_some() {
-                    return Err(last_modified_two_commits());
-                }
+            if !right.is_empty() && start.replace(right.to_string()).is_some() {
+                return Err(last_modified_two_commits());
             }
         } else if let Some(stripped) = rev.strip_prefix('^') {
             excluded.push(stripped.to_string());

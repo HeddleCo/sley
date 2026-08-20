@@ -2414,7 +2414,7 @@ fn fetch_file_url_and_rewritten_url_match_upstream_git() {
                 vec![
                     "fetch".to_string(),
                     "-q".to_string(),
-                    source_file_url.clone(),
+                    source_file_url,
                     "refs/heads/feature/topic:refs/remotes/file/feature/topic".to_string(),
                 ],
             ),

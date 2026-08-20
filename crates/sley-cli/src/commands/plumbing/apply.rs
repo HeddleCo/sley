@@ -280,15 +280,15 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
     // traditional patch resolve relative to the top level (so an index entry is
     // `file`, not `.git/file`), but a plain (non-`--cached`/`--index`) apply still
     // reads/writes the *worktree* file relative to the actual cwd (`.git/file`).
-    let canonical_cwd = fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
-    let canonical_git_dir = fs::canonicalize(&git_dir).unwrap_or_else(|_| git_dir.clone());
+    let canonical_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.clone());
+    let canonical_git_dir = fs::canonicalize(git_dir).unwrap_or_else(|_| git_dir.clone());
     let cwd_in_git_dir =
         canonical_cwd == canonical_git_dir || canonical_cwd.starts_with(&canonical_git_dir);
     let prefix: Vec<u8> = if cwd_in_git_dir {
         Vec::new()
     } else {
         let canonical_root =
-            fs::canonicalize(&worktree_root).unwrap_or_else(|_| worktree_root.clone());
+            fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.clone());
         canonical_cwd
             .strip_prefix(&canonical_root)
             .ok()
@@ -329,7 +329,7 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
     let path_options = sley_diff_merge::PatchPathOptions {
         p_value,
         p_value_known,
-        root: directory_root.clone(),
+        root: directory_root,
         prefix: prefix.clone(),
     };
     let inputs = read_apply_inputs(&files)?;
@@ -1067,13 +1067,7 @@ pub(crate) fn cmd_apply(cli_session: &crate::session::CliSession, args: &[String
             )?;
         }
     } else if intent_to_add && !index_paths.is_empty() {
-        add_intent_to_add(
-            &worktree_root,
-            &worktree_root,
-            &git_dir,
-            format,
-            &index_paths,
-        )?;
+        add_intent_to_add(worktree_root, worktree_root, git_dir, format, &index_paths)?;
     }
     // `--reject`: write each `<file>.rej` (git opens it `O_CREAT|O_EXCL`, unlinking
     // a stale one first), then exit 1 because the patch did not fully apply.
@@ -1295,7 +1289,7 @@ fn check_apply_path_safety(
                 continue;
             }
             let ancestor = &name[..i];
-            if deleted_symlinks.iter().any(|s| *s == ancestor) {
+            if deleted_symlinks.contains(&ancestor) {
                 // removed_symlinks: skip this component, keep scanning higher
                 // (a new symlink may still exist above it).
                 continue;
@@ -1303,14 +1297,13 @@ fn check_apply_path_safety(
             let existing_blocks = worktree_component_is_symlink(worktree_root, ancestor)
                 || index_component_is_symlink(index, ancestor);
             // Explicit kept_symlinks: any non-delete deposit is refused.
-            let explicit_blocks =
-                !patch.is_delete && explicit_created_symlinks.iter().any(|s| *s == ancestor);
+            let explicit_blocks = !patch.is_delete && explicit_created_symlinks.contains(&ancestor);
             // Inferred rename/copy kept_symlinks: refuse creates *and*
             // rename/copy destinations under them (write-through escape), but
             // not plain modify — those must surface as ENOENT like git/t4115.
             let inferred_blocks = !patch.is_delete
                 && (patch.is_new || patch.is_rename || patch.is_copy)
-                && inferred_created_symlinks.iter().any(|s| *s == ancestor);
+                && inferred_created_symlinks.contains(&ancestor);
             if explicit_blocks || inferred_blocks || existing_blocks {
                 eprintln!(
                     "error: affected file '{}' is beyond a symbolic link",
@@ -1634,24 +1627,23 @@ fn write_apply_summary_entry(
                 writeln!(stdout, " delete {path}")?;
             }
         }
-    } else if let Some(score) = patch.dissimilarity {
-        if let Some(path) = patch.new_path.as_ref().or(patch.old_path.as_ref()) {
-            let path = status_quote_path(path, false);
-            writeln!(stdout, " rewrite {path} ({score}%)")?;
-        }
+    } else if let Some(score) = patch.dissimilarity
+        && let Some(path) = patch.new_path.as_ref().or(patch.old_path.as_ref())
+    {
+        let path = status_quote_path(path, false);
+        writeln!(stdout, " rewrite {path} ({score}%)")?;
     }
     if let (Some(old_mode), Some(new_mode)) = (patch.old_mode, patch.new_mode)
         && old_mode != new_mode
         && !patch.is_new
         && !patch.is_delete
+        && let Some(path) = patch.new_path.as_ref().or(patch.old_path.as_ref())
     {
-        if let Some(path) = patch.new_path.as_ref().or(patch.old_path.as_ref()) {
-            let path = status_quote_path(path, false);
-            writeln!(
-                stdout,
-                " mode change {old_mode:06o} => {new_mode:06o} {path}"
-            )?;
-        }
+        let path = status_quote_path(path, false);
+        writeln!(
+            stdout,
+            " mode change {old_mode:06o} => {new_mode:06o} {path}"
+        )?;
     }
     Ok(())
 }
@@ -2162,7 +2154,7 @@ fn read_patch_base(
     worktree_base: &Path,
     filter_worktree_root: &Path,
     git_dir: &Path,
-    format: ObjectFormat,
+    _format: ObjectFormat,
     config: &GitConfig,
     patch: &sley_diff_merge::FilePatch,
     index: Option<&Index>,

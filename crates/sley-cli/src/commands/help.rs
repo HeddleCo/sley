@@ -684,12 +684,6 @@ pub(crate) fn print_common_help() {
     println!("See 'git help git' for an overview of the system.");
 }
 
-pub(crate) fn print_builtin_commands() {
-    for command in COMMAND_REGISTRY.names_with(GIT_BUILTIN) {
-        println!("{command}");
-    }
-}
-
 pub(crate) fn print_list_cmds(
     cli_session: &crate::session::CliSession,
     groups: &str,

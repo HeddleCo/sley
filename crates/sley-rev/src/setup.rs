@@ -212,7 +212,7 @@ where
         // revision, even if it happens to carry pathspec magic. This decision
         // must be known before parsing the earlier tokens.
         let has_pathspec_separator = self.ctx.assume_dashdash || args.iter().any(|arg| arg == "--");
-        let mut iter = args.iter().peekable();
+        let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             if positional_only {
                 self.setup.pathspecs.push(arg.clone());

@@ -2,7 +2,7 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, BufRead};
+use std::io::{self};
 use std::path::{Path, PathBuf};
 
 use sley::plumbing::sley_config;
@@ -111,7 +111,7 @@ fn credential_include_context(
     cli_session: &crate::session::CliSession,
 ) -> sley_config::ConfigIncludeContext {
     let cwd = cli_session.cwd();
-    let start = logical_cwd_for_include_context(cwd);
+    let _start = logical_cwd_for_include_context(cwd);
     match cli_session.git_dir() {
         Ok(git_dir) => sley_config::ConfigIncludeContext::new(
             Some(sley_config::git_dir_for_include_context(&git_dir)),
@@ -134,7 +134,7 @@ fn logical_cwd_for_include_context(cwd: &Path) -> PathBuf {
     }
 }
 
-fn repo_current_branch_name(git_dir: &PathBuf) -> Option<String> {
+fn repo_current_branch_name(git_dir: &Path) -> Option<String> {
     let head = git_dir.join("HEAD");
     let contents = fs::read_to_string(head).ok()?;
     let reference = contents.trim();
@@ -143,7 +143,7 @@ fn repo_current_branch_name(git_dir: &PathBuf) -> Option<String> {
         .map(str::to_string)
 }
 
-fn worktree_config_extension_enabled(common_git_dir: &PathBuf) -> bool {
+fn worktree_config_extension_enabled(common_git_dir: &Path) -> bool {
     let config_path = common_git_dir.join("config");
     let Ok(bytes) = fs::read(&config_path) else {
         return false;

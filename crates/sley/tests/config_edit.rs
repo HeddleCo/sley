@@ -47,12 +47,7 @@ fn repository_config_with_sources_reports_local_config_path() {
         .filter(|value| value.value.as_deref() == Some("Local Person"))
         .expect("local user.name");
 
-    assert_eq!(
-        value.source,
-        ConfigSource::Local {
-            path: config_path.clone()
-        }
-    );
+    assert_eq!(value.source, ConfigSource::Local { path: config_path });
 }
 
 #[test]
@@ -238,9 +233,7 @@ fn repository_remote_config_with_sources_reports_external_include_refusal() {
     assert!(!origin.sources[0].editable);
     assert_eq!(
         origin.sources[0].refusal,
-        Some(RemoteConfigRefusal::ExternalInclude {
-            path: outside.clone()
-        })
+        Some(RemoteConfigRefusal::ExternalInclude { path: outside })
     );
 }
 

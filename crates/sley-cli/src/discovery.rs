@@ -76,7 +76,7 @@ fn resolve_git_dir_by_walk(start: impl AsRef<Path>) -> Result<PathBuf> {
                 git_dir,
                 via_gitfile,
             } => {
-                let gitfile = via_gitfile.then(|| dot_git.as_path());
+                let gitfile = via_gitfile.then_some(dot_git.as_path());
                 ownership::ensure_valid_ownership(Some(candidate), &git_dir, gitfile)?;
                 return Ok(git_dir);
             }

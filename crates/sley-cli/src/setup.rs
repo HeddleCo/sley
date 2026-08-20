@@ -171,7 +171,7 @@ fn setup_explicit(
             _ => return None,
         }
     } else {
-        (gitdirenv.to_string(), gitdir_path.clone())
+        (gitdirenv.to_string(), gitdir_path)
     };
 
     if !is_git_dir_candidate(&gitdir_dir) {
@@ -299,7 +299,7 @@ fn setup_discovered(
             _ => (gitdir.to_string(), gitdir_dir.clone()),
         }
     } else {
-        (gitdir.to_string(), gitdir_dir.clone())
+        (gitdir.to_string(), gitdir_dir)
     };
 
     let has_common_dir = effective_gitdir_dir.join("commondir").is_file();
@@ -329,7 +329,7 @@ fn setup_discovered(
     // Bare (core.bare=true), no explicit worktree.
     if is_bare {
         let git_dir = if dir == cwd {
-            effective_gitdir_text.clone()
+            effective_gitdir_text
         } else {
             // set_git_dir(gitdir, offset != cwd->len): realpath.
             path_to_string(&effective_gitdir_dir)
@@ -356,7 +356,7 @@ fn setup_discovered(
     let git_dir_text = if effective_gitdir_text == ".git" {
         ".git".to_string()
     } else {
-        effective_gitdir_text.clone()
+        effective_gitdir_text
     };
     let worktree = canonicalize_or(dir);
     let prefix = relative_inside(&worktree, &canonicalize_or(cwd));
@@ -389,7 +389,7 @@ fn setup_explicit_from_discovered(
     let gitdir_text_resolved = if dir == cwd {
         gitdir_text.to_string()
     } else {
-        abs_text.clone()
+        abs_text
     };
 
     let worktree: Option<PathBuf>;

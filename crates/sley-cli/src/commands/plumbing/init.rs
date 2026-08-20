@@ -300,16 +300,16 @@ pub(crate) fn cmd_init(
     if bare_explicit {
         // `--bare` without a directory argument leaves an existing GIT_DIR in
         // charge of where the (bare) repository lives.
-        if !path_given && let Some(raw) = env_git_dir.clone() {
+        if !path_given && let Some(raw) = env_git_dir {
             git_dir_override = Some(resolve_cli_path(&worktree, raw.to_string_lossy().as_ref()));
         }
-    } else if let Some(raw) = env_git_dir.clone()
+    } else if let Some(raw) = env_git_dir
         && separate_git_dir.is_none()
         && !bare
     {
         let git_dir_abs = resolve_cli_path(&worktree, raw.to_string_lossy().as_ref());
         if guess_repository_type(&raw, &worktree) {
-            match env_work_tree.clone() {
+            match env_work_tree {
                 // Guessed-bare git dir + GIT_WORK_TREE: the repository is
                 // *non*-bare after all; record `core.worktree` (init-db.c sets
                 // the work tree, so `create_default_files` writes it).
@@ -337,7 +337,7 @@ pub(crate) fn cmd_init(
             // Non-bare guess (".git" or "…/.git"): the work tree is the git
             // dir's parent (or the target directory), unless GIT_WORK_TREE
             // overrides it.
-            let work_tree_abs = match env_work_tree.clone() {
+            let work_tree_abs = match env_work_tree {
                 Some(raw_work_tree) => {
                     let resolved =
                         resolve_cli_path(&worktree, raw_work_tree.to_string_lossy().as_ref());
@@ -611,10 +611,10 @@ fn resolve_init_object_format(
     if let Some(value) = cli_format {
         return Ok((parse_init_object_format(&value)?, true));
     }
-    if let Ok(hash) = env::var("GIT_DEFAULT_HASH") {
-        if !hash.is_empty() {
-            return Ok((parse_init_object_format(&hash)?, false));
-        }
+    if let Ok(hash) = env::var("GIT_DEFAULT_HASH")
+        && !hash.is_empty()
+    {
+        return Ok((parse_init_object_format(&hash)?, false));
     }
     if let Some(format) = config_format {
         return Ok((format, false));
@@ -650,10 +650,7 @@ fn resolve_init_ref_storage(
             None => None,
         };
     if let Some(value) = cli_ref_format {
-        let value = match value.as_deref() {
-            Some(value) => value,
-            None => "",
-        };
+        let value: &str = value.as_deref().unwrap_or_default();
         return Ok((parse_init_ref_storage(value)?, true));
     }
     if let Ok(value) = env::var("GIT_DEFAULT_REF_FORMAT") {

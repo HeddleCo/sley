@@ -78,6 +78,46 @@ fn ls_files_expands_only_sparse_directories_relevant_to_pathspec() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn ls_files_modified_expands_materialized_sparse_directory() {
+    let root = unique_temp_dir("ls-files-modified-materialized-sparse-directory");
+    fs::create_dir_all(root.join("inside")).expect("create in-cone directory");
+    fs::create_dir_all(root.join("outside")).expect("create out-of-cone directory");
+    git(&root, &["init", "-q", "-b", "main"]);
+    fs::write(root.join("inside/file"), b"inside\n").expect("write in-cone file");
+    fs::write(root.join("outside/file"), b"outside\n").expect("write out-of-cone file");
+    git(&root, &["add", "."]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=Example User",
+            "-c",
+            "user.email=example@example.invalid",
+            "commit",
+            "-m",
+            "base",
+            "-q",
+        ],
+    );
+    git(
+        &root,
+        &["sparse-checkout", "init", "--cone", "--sparse-index"],
+    );
+    git(&root, &["sparse-checkout", "set", "inside"]);
+    fs::create_dir_all(root.join("outside")).expect("materialize out-of-cone directory");
+    fs::write(root.join("outside/file"), b"modified outside\n").expect("modify out-of-cone file");
+
+    for args in [
+        ["ls-files", "--modified"].as_slice(),
+        ["ls-files", "--stage", "--modified"].as_slice(),
+    ] {
+        assert_eq!(sley(&root, args), git(&root, args), "mismatch for {args:?}");
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn run(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
     let output = Command::new(program)
         .current_dir(cwd)

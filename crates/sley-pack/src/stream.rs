@@ -764,7 +764,7 @@ where
             STREAM_INFLATE_CHUNK,
         ));
         let mut compressed_total = 0usize;
-        let mut input = [0u8; STREAM_INFLATE_CHUNK];
+        let mut input = vec![0u8; STREAM_INFLATE_CHUNK];
         loop {
             let read = stream.read_compressed_chunk(&mut input)?;
             if read == 0 {

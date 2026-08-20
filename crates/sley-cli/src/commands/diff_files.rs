@@ -574,21 +574,12 @@ fn run_diff_files(cli_session: &crate::session::CliSession, o: DiffFilesOptions)
     // dedicated diff-files engine layers that stat-based selection over the
     // content diff; porcelain `git diff` (which refreshes first) keeps the plain
     // content engine.
-    let entries = if o.inexact_renames {
-        sley_diff_merge::diff_name_status_index_worktree_for_diff_files_with_options(
-            worktree_root,
-            git_dir,
-            format,
-            options,
-        )?
-    } else {
-        sley_diff_merge::diff_name_status_index_worktree_for_diff_files_with_options(
-            worktree_root,
-            git_dir,
-            format,
-            options,
-        )?
-    };
+    let entries = sley_diff_merge::diff_name_status_index_worktree_for_diff_files_with_options(
+        worktree_root,
+        git_dir,
+        format,
+        options,
+    )?;
 
     let config = read_repo_config(git_dir).unwrap_or_default();
     let entries = filter_racy_clean_equivalent_worktree_entries(

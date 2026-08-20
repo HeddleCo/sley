@@ -451,15 +451,15 @@ fn strip_host_brackets(host: &str) -> (String, usize) {
         Some(position) => position + 1,
         None => 0,
     };
-    if host[start..].starts_with('[') {
-        if let Some(close) = host[start + 1..].find(']') {
-            let inner_end = start + 1 + close;
-            let mut rewritten = String::with_capacity(host.len() - 2);
-            rewritten.push_str(&host[..start]);
-            rewritten.push_str(&host[start + 1..inner_end]);
-            rewritten.push_str(&host[inner_end + 1..]);
-            return (rewritten, inner_end - 1);
-        }
+    if host[start..].starts_with('[')
+        && let Some(close) = host[start + 1..].find(']')
+    {
+        let inner_end = start + 1 + close;
+        let mut rewritten = String::with_capacity(host.len() - 2);
+        rewritten.push_str(&host[..start]);
+        rewritten.push_str(&host[start + 1..inner_end]);
+        rewritten.push_str(&host[inner_end + 1..]);
+        return (rewritten, inner_end - 1);
     }
     (host.to_string(), 0)
 }

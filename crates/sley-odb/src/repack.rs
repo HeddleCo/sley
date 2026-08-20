@@ -706,16 +706,6 @@ fn repack_reachable_objects_with_filter_to(
     }))
 }
 
-#[allow(dead_code)]
-fn write_filtered_repack(
-    objects: &[ReachablePackObject],
-    format: ObjectFormat,
-    prefix: &Path,
-) -> Result<()> {
-    write_filtered_repack_with_size(objects, format, prefix, None)?;
-    Ok(())
-}
-
 /// Write one or more filtered packs under `prefix-<checksum>.{pack,idx}`.
 /// Returns the pack stems written (e.g. `pack-<checksum>`) so the caller can
 /// retain them when they land in the local pack directory.
@@ -3304,7 +3294,7 @@ mod tests {
         let last = bad_mtimes.mtimes.len() - 1;
         bad_mtimes.mtimes[last] ^= 1;
         invalid.push(("mtimes", bad_mtimes));
-        let mut bad_oids = valid.clone();
+        let mut bad_oids = valid;
         bad_oids.oids.clear();
         invalid.push(("oids", bad_oids));
 

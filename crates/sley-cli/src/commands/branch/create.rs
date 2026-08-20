@@ -379,10 +379,9 @@ fn submodule_config_for_commit(
     if let Some(worktree) = sley_worktree::worktree_root_for_git_dir(git_dir)
         .ok()
         .flatten()
+        && let Ok(cfg) = GitConfig::read(worktree.join(".gitmodules"))
     {
-        if let Ok(cfg) = GitConfig::read(worktree.join(".gitmodules")) {
-            return Some(sley_submodule::SubmoduleConfigSet::parse(&cfg));
-        }
+        return Some(sley_submodule::SubmoduleConfigSet::parse(&cfg));
     }
     // Fall back to the start commit's tree (needed when creating a branch
     // whose start introduces a submodule not in the current worktree).
@@ -553,7 +552,7 @@ fn create_branch_in_submodule_at(
         force,
         dry_run,
     )
-    .map_err(|err| {
+    .inspect_err(|_err| {
         if dry_run {
             eprintln!(
                 "submodule '{}': cannot create branch '{branch}'",
@@ -565,7 +564,6 @@ fn create_branch_in_submodule_at(
                 child.name
             );
         }
-        err
     })
 }
 

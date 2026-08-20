@@ -1,7 +1,6 @@
 //! Tree-construction plumbing commands.
 
 use sley::plumbing::sley_worktree;
-use std::env;
 
 use sley::{GitError, Result};
 

@@ -2,8 +2,8 @@
 //! commit-graph, bundles, and repository layout.
 //!
 //! The object model, configuration system, and index format that used to live
-//! here now have dedicated crates: [`sley_object`], [`sley_config`], and
-//! [`sley_index`].
+//! here now have dedicated crates: `sley-object`, [`sley_config`], and
+//! `sley-index`.
 
 // sley#7: untrusted-input parsing crate — fallible ops propagate errors;
 // the only retained `expect`s would be documented compile-time invariants.
@@ -3027,7 +3027,7 @@ impl RepositoryBootstrap {
         let git_link = if dot_git_is_symlink {
             fs::canonicalize(&dot_git).unwrap_or_else(|_| dot_git.clone())
         } else {
-            dot_git.clone()
+            dot_git
         };
         let mut write_git_link = false;
         let git_dir = if let Some(git_dir_override) = options.git_dir_override.clone() {
@@ -5058,7 +5058,7 @@ mod tests {
             git_dir_override: None,
             core_worktree: None,
             object_dir: None,
-            worktree: repo.clone(),
+            worktree: repo,
             object_format: ObjectFormat::Sha1,
             object_format_explicit: false,
             bare: false,

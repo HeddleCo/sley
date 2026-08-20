@@ -102,7 +102,7 @@ pub mod notes {
 pub mod pack {
     pub use sley_pack::{
         PackIndexEntry, PackIndexedObject, PackReadLimits, PackReadStream, PackStreamIndexBuild,
-        PackStreamProgress, PackWrite, index_pack_from_reader, index_pack_from_reader_to_trailer,
+        PackStreamProgress, index_pack_from_reader, index_pack_from_reader_to_trailer,
         index_pack_from_reader_to_trailer_with_limits,
         index_pack_from_reader_to_trailer_with_progress,
         index_pack_from_reader_to_trailer_with_progress_and_limits,

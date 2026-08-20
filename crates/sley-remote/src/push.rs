@@ -47,6 +47,7 @@ use sley_protocol::{
     read_receive_pack_report_status, read_receive_pack_report_status_v2,
 };
 
+#[cfg(feature = "http")]
 use sley_protocol::read_to_end_bounded;
 
 use crate::pack::push_pack_roots;
@@ -708,7 +709,7 @@ fn plan_push_actions_impl(
                 common_git_dir: request.common_git_dir,
                 format: request.format,
                 remote: remote_url,
-                command_forces: command_forces.clone(),
+                command_forces,
                 pack_objects: request.plan.pack_objects.clone(),
             })?;
             let commands = plan.commands.clone();
@@ -729,7 +730,7 @@ fn plan_push_actions_impl(
                 format: request.format,
                 remote: remote_url,
                 config: Some(request.config),
-                command_forces: command_forces.clone(),
+                command_forces,
                 pack_objects: request.plan.pack_objects.clone(),
             })?;
             let commands = plan.commands.clone();
@@ -1001,8 +1002,8 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
             .any(|(_, status)| !matches!(status, PushRefStatus::UpToDate))
     {
         preflight_rejections.extend(
-            accepted
-                .drain(..)
+            std::mem::take(&mut accepted)
+                .into_iter()
                 .map(|(command, _)| (command, PushRefStatus::AtomicPushFailed)),
         );
     }
@@ -1766,7 +1767,7 @@ pub fn push_local_with_report_and_objects(
                 let receive_request = ReceivePackPushRequest {
                     commands: ReceivePackRequest {
                         shallow: Vec::new(),
-                        commands: send.clone(),
+                        commands: send,
                         capabilities: Vec::new(),
                     },
                     push_options: None,
@@ -3266,18 +3267,23 @@ fn resolve_for_each_ref_target(
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(feature = "http")]
     use std::io::Write;
+    #[cfg(feature = "http")]
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use sley_formats::RepositoryLayout;
     use sley_object::{BString, Commit, EncodedObject, ObjectType, Tree, TreeEntry};
     use sley_odb::{FileObjectDatabase, ObjectReplacements, ObjectWriter};
+    #[cfg(feature = "http")]
+    use sley_protocol::{GitService, ProtocolVersion, RefAdvertisementSet};
     use sley_protocol::{
-        ProtocolVersion, ReceivePackCommandStatus, ReceivePackUnpackStatus, RefAdvertisementSet,
-        SideBandChannel, SideBandPacket, write_receive_pack_report_status, write_sideband_stream,
+        ReceivePackCommandStatus, ReceivePackUnpackStatus, SideBandChannel, SideBandPacket,
+        write_receive_pack_report_status, write_sideband_stream,
     };
     use sley_refs::{RefTarget, RefUpdate};
+    #[cfg(feature = "http")]
     use sley_transport::{
         ServiceAnnouncement, ServiceDiscoveryPayload, ServiceDiscoveryResponse, parse_remote_url,
         write_service_discovery_response,
@@ -3369,6 +3375,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "http")]
     fn http_delete_push_bodies(old: ObjectId) -> (Vec<u8>, Vec<u8>) {
         let mut discovery = Vec::new();
         write_service_discovery_response(
@@ -3413,6 +3420,7 @@ mod tests {
         (discovery, result)
     }
 
+    #[cfg(feature = "http")]
     fn run_http_delete_push(
         git_dir: &Path,
         remote: RemoteUrl,
@@ -3452,6 +3460,7 @@ mod tests {
         .expect("HTTP delete push should succeed")
     }
 
+    #[cfg(feature = "http")]
     fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
         let mut request = Vec::new();
         let header_end = loop {
@@ -3481,6 +3490,7 @@ mod tests {
         request
     }
 
+    #[cfg(feature = "http")]
     fn serve_http_push(
         discovery: Vec<u8>,
         result: Vec<u8>,
@@ -3520,6 +3530,7 @@ mod tests {
         (remote, server)
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn http_push_uses_injected_client_for_discovery_and_receive_pack() {
         let git_dir = temp_repo("http-injected-client");
@@ -3535,6 +3546,7 @@ mod tests {
         assert!(outcome.report.is_some());
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn http_push_uses_default_client_for_discovery_and_receive_pack() {
         let git_dir = temp_repo("http-default-client");
@@ -3687,11 +3699,13 @@ mod tests {
     /// Records the last send and which `HttpClient` method delivered it, so the
     /// streaming-vs-buffered gate can be asserted along with byte-for-byte body
     /// equality across both paths.
+    #[cfg(feature = "http")]
     #[derive(Default)]
     struct RecordingClient {
         last: std::sync::Mutex<Option<(&'static str, Vec<u8>)>>,
     }
 
+    #[cfg(feature = "http")]
     impl RecordingClient {
         fn take(&self) -> (&'static str, Vec<u8>) {
             self.last
@@ -3712,6 +3726,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "http")]
     impl HttpClient for RecordingClient {
         fn get(&self, _url: &str, _headers: &[(&str, &str)]) -> Result<HttpResponse> {
             Self::ok_response()
@@ -3743,6 +3758,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "http")]
     fn receive_pack_request<'a>(
         db: &'a FileObjectDatabase,
         commands: &'a [ReceivePackCommand],
@@ -3765,6 +3781,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn send_receive_pack_body_gates_on_post_buffer_and_preserves_bytes() {
         let git_dir = temp_repo("send-receive-pack-gate");
@@ -3825,6 +3842,7 @@ mod tests {
         let _ = fs::remove_dir_all(git_dir.parent().unwrap_or(&git_dir));
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn parse_post_buffer_reads_git_size_values() {
         assert_eq!(parse_post_buffer("1048576"), Some(1 << 20));

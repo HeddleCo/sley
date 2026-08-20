@@ -70,5 +70,5 @@ use list::{
 use move_::{BranchMoveKind, BranchMoveOptions};
 use upstream::{BranchUpstreamAction, BranchUpstreamOptions};
 
-pub(crate) use create::{BranchTrackMode, branch_create_set_tracking, create_branch_from_start};
+pub(crate) use create::{BranchTrackMode, branch_create_set_tracking};
 pub(crate) use dispatch::cmd_branch;

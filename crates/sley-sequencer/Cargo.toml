@@ -9,14 +9,13 @@ license.workspace = true
 
 [dependencies]
 sley-core.workspace = true
-sley-formats.workspace = true
 sley-object.workspace = true
 sley-odb.workspace = true
 sley-refs.workspace = true
 sley-worktree.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.27.0"
 
 [lints]
 workspace = true

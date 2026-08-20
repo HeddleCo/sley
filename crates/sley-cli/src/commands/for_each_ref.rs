@@ -1294,14 +1294,6 @@ impl ForEachRefNeeds {
     }
 }
 
-/// Render `%(trailers)` for `message` under `options`.
-pub(crate) fn for_each_ref_format_trailers(
-    message: &[u8],
-    options: &sley_pretty::ForEachRefTrailerOptions,
-) -> Vec<u8> {
-    sley_pretty::format_trailers_from_commit(message, options)
-}
-
 /// Whether the format contains a bare `%(raw)` / `%(*raw)` atom (not
 /// `raw:size`), which git forbids under `--python`/`--shell`/`--tcl`.
 fn for_each_ref_format_has_bare_raw(format_spec: &ForEachRefFormat) -> bool {

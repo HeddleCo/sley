@@ -580,13 +580,13 @@ fn cached_object_mode(
     }
     let index = sley_index::Index::parse(&fs::read(index_path)?, format)?;
     for entry in index.entries {
-        if entry.path.as_bytes() == path && index_entry_stage(&entry) == 0 {
-            if tree_entry_object_type(entry.mode) == sley_object::ObjectType::Blob
+        if entry.path.as_bytes() == path
+            && index_entry_stage(&entry) == 0
+            && (tree_entry_object_type(entry.mode) == sley_object::ObjectType::Blob
                 || tree_entry_object_type(entry.mode) == sley_object::ObjectType::Tree
-                || sley_index::is_gitlink(entry.mode)
-            {
-                return Ok(Some(format!("{:06o}", entry.mode).into_bytes()));
-            }
+                || sley_index::is_gitlink(entry.mode))
+        {
+            return Ok(Some(format!("{:06o}", entry.mode).into_bytes()));
         }
     }
     Ok(None)

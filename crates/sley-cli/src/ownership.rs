@@ -285,10 +285,10 @@ fn expand_tilde(value: &str) -> String {
         if let Some(home) = std::env::var_os("HOME") {
             return home.to_string_lossy().into_owned();
         }
-    } else if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return Path::new(&home).join(rest).to_string_lossy().into_owned();
-        }
+    } else if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return Path::new(&home).join(rest).to_string_lossy().into_owned();
     }
     value.to_string()
 }

@@ -1,32 +1,25 @@
 //! receive-pack, upload-pack, send-pack, and push.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use super::clone::{
-    trace_index_pack_fsck_objects_if_configured, trace_pack_objects_filter,
-    validate_upload_pack_filter_config,
-};
+use super::clone::validate_upload_pack_filter_config;
 use super::config::read_repo_config_on_disk;
 use super::config::{read_repo_config, write_repo_config};
 use super::fetch::StdoutProgress;
 use super::fetch::{
-    check_transport_allowed_url, configured_server_options, repo_config_with_transport_policy,
+    check_transport_allowed_url, repo_config_with_transport_policy,
     transport_policy_config_for_context,
 };
 use super::resolve::{RemoteCommandContext, ls_remote_git_dir};
-use crate::commands::config_cmd::{
-    ConfigKey, SimpleConfigRegex, config_set_value, parse_config_key,
-};
-use crate::remote::{
-    remote_config_values, resolve_remote_fetch_url, resolve_remote_push_url,
-    rewrite_url_with_config,
-};
+use crate::commands::config_cmd::{ConfigKey, config_set_value};
+use crate::remote::{remote_config_values, resolve_remote_push_url, rewrite_url_with_config};
 use crate::*;
 use sley::plumbing::sley_odb::ObjectReader;
-use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord};
+#[cfg(test)]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 
+#[cfg(test)]
 fn receive_max_input_size(config: &GitConfig) -> Option<u64> {
     let raw = config.get("receive", None, "maxInputSize")?;
     match sley_config::parse_config_int(raw) {
@@ -40,6 +33,7 @@ fn receive_max_input_size(config: &GitConfig) -> Option<u64> {
 /// whole pack to validate it). With no cap this is a plain `read_to_end`; with a
 /// cap it bounds the read at `limit + 1` and refuses anything larger, mirroring
 /// index-pack's `pack exceeds maximum allowed size` die (exit 128).
+#[cfg(test)]
 fn read_capped_packfile<R: Read>(reader: &mut R, max_input_size: Option<u64>) -> Result<Vec<u8>> {
     let mut packfile = Vec::new();
     match max_input_size {
@@ -395,7 +389,7 @@ pub(crate) fn cmd_send_pack(
     }
 
     let remote_context = RemoteCommandContext::require_repository(cli_session)?;
-    let cwd = remote_context.cwd().to_path_buf();
+    let _cwd = remote_context.cwd().to_path_buf();
     let git_dir = remote_context.required_git_dir()?.to_path_buf();
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
@@ -610,7 +604,7 @@ fn reject_duplicate_push_destinations(refspecs: &[String]) -> Result<()> {
 
 pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let remote_context = RemoteCommandContext::require_repository(cli_session)?;
-    let cwd = remote_context.cwd().to_path_buf();
+    let _cwd = remote_context.cwd().to_path_buf();
     let git_dir = remote_context.required_git_dir()?.to_path_buf();
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
@@ -910,7 +904,7 @@ pub(crate) fn cmd_push(cli_session: &crate::session::CliSession, args: &[String]
                         }
                     }
                 } else {
-                    append_push_prune_refspecs(&mut refspecs, &remote_advertisements, &local_names);
+                    append_push_prune_refspecs(&mut refspecs, remote_advertisements, &local_names);
                 }
             }
             if follow_tags {
@@ -3519,10 +3513,10 @@ fn update_push_remote_tracking_refs(
                 tracking_names.push(name);
             }
         }
-        if tracking_names.is_empty() {
-            if let Some(branch) = command.name.strip_prefix("refs/heads/") {
-                tracking_names.push(format!("refs/remotes/{remote}/{branch}"));
-            }
+        if tracking_names.is_empty()
+            && let Some(branch) = command.name.strip_prefix("refs/heads/")
+        {
+            tracking_names.push(format!("refs/remotes/{remote}/{branch}"));
         }
         for name in tracking_names {
             if command.new_id.is_null() {
@@ -3942,11 +3936,6 @@ fn pre_push_local_ref(
     Some(src.to_string())
 }
 
-/// Remote name or URL argument with embedded credentials stripped for display.
-fn push_display_remote(remote: &str) -> String {
-    sley_remote::push_url_for_display(remote)
-}
-
 struct PushRemoteAndRefspecs {
     remote: String,
     refspecs: Vec<String>,
@@ -4055,13 +4044,13 @@ fn explicit_push_refspecs_with_refmap(
     refspecs
         .iter()
         .map(|refspec| {
-            let upstream_ref = if configured_push.is_empty()
+            let upstream_ref = if let Some(branch) = branch
+                && configured_push.is_empty()
                 && matches!(push_default_mode(config), PushDefaultMode::Upstream)
-                && branch.is_some()
-                && explicit_refspec_uses_upstream_refmap(store, branch.unwrap(), refspec)
-                && default_fetch_remote_for_branch(config, branch.unwrap()) == remote
+                && explicit_refspec_uses_upstream_refmap(store, branch, refspec)
+                && default_fetch_remote_for_branch(config, branch) == remote
             {
-                Some(push_upstream_ref(config, branch.unwrap(), remote, false)?)
+                Some(push_upstream_ref(config, branch, remote, false)?)
             } else {
                 None
             };
@@ -4349,32 +4338,6 @@ To push to the branch of the same name on the remote, use\n\n\
     Err(GitError::Exit(128))
 }
 
-fn configure_push_upstreams(
-    git_dir: &Path,
-    remote: &str,
-    commands: &[ReceivePackCommand],
-) -> Result<()> {
-    let mut config = read_repo_config(git_dir)?;
-    for command in commands {
-        let Some(branch) = command.name.strip_prefix("refs/heads/") else {
-            continue;
-        };
-        let remote_key = ConfigKey {
-            section: "branch".into(),
-            subsection: Some(branch.to_string()),
-            key: "remote".into(),
-        };
-        config_set_value(&mut config, &remote_key, remote, false);
-        let merge_key = ConfigKey {
-            section: "branch".into(),
-            subsection: Some(branch.to_string()),
-            key: "merge".into(),
-        };
-        config_set_value(&mut config, &merge_key, &command.name, false);
-    }
-    write_repo_config(git_dir, &config)
-}
-
 fn configure_push_upstreams_from_report(
     git_dir: &Path,
     remote: &str,
@@ -4492,7 +4455,7 @@ mod receive_max_input_size_tests {
     fn over_cap_errors_with_exit_128() {
         // A buffered input one byte past the cap must be refused, not slurped —
         // this is the B5 hardening: the fsck path no longer buffers unbounded.
-        let data = vec![0x42u8; 17];
+        let data = [0x42u8; 17];
         let err = read_capped_packfile(&mut &data[..], Some(16))
             .expect_err("over the cap must error rather than buffer it all");
         match err {

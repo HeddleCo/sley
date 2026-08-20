@@ -1,5 +1,5 @@
 use super::*;
-use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_worktree};
+use sley::plumbing::{sley_core, sley_diff_merge, sley_index};
 
 // ===== git merge (3-way) =====
 
@@ -373,6 +373,9 @@ fn path_from_git_bytes_lossy(path: &[u8]) -> PathBuf {
 }
 
 /// Per-path outcome of a 3-way tree merge.
+// Conflict data is intentionally inline so the merge hot path avoids one heap
+// allocation per conflicted path.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum MergePathResult {
     /// Cleanly resolved; `None` means the path is deleted in the result.
     Resolved(Option<(u32, ObjectId)>),

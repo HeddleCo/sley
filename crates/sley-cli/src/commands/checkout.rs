@@ -44,6 +44,9 @@ impl CheckoutContext {
     }
 }
 
+// These clones preserve one reflog label across several independent checkout
+// branches. Removing any one moves the shared value before later branches use it.
+#[allow(clippy::redundant_clone)]
 pub(crate) fn cmd_checkout(
     cli_session: &crate::session::CliSession,
     args: &[String],
@@ -65,7 +68,6 @@ pub(crate) fn cmd_checkout(
     let mut ignore_other_worktrees = false;
     let mut track = None::<crate::commands::branch::BranchTrackMode>;
     let mut overlay_mode: Option<bool> = None;
-    let mut overwrite_ignore = true;
     let mut pathspec_from_file: Option<PathBuf> = None;
     let mut pathspec_file_nul = false;
     let mut ignore_skip_worktree_bits = false;
@@ -153,8 +155,7 @@ pub(crate) fn cmd_checkout(
             "-l" | "--log" => create_reflog = true,
             "--overlay" => overlay_mode = Some(true),
             "--no-overlay" => overlay_mode = Some(false),
-            "--overwrite-ignore" => overwrite_ignore = true,
-            "--no-overwrite-ignore" => overwrite_ignore = false,
+            "--overwrite-ignore" | "--no-overwrite-ignore" => {}
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
             "--ignore-skip-worktree-bits" => ignore_skip_worktree_bits = true,
@@ -315,7 +316,7 @@ pub(crate) fn cmd_checkout(
     if patch {
         return checkout_run_patch(
             cli_session,
-            &git_dir,
+            git_dir,
             format,
             &positional,
             dashdash_index,
@@ -343,13 +344,13 @@ pub(crate) fn cmd_checkout(
         && positional.len() == 1
     {
         if positional[0] == "-" {
-            if let Some(name) = checkout_expand_previous_branch_arg(&git_dir, format, store, 1)? {
+            if let Some(name) = checkout_expand_previous_branch_arg(git_dir, format, store, 1)? {
                 positional[0] = name;
             } else {
                 positional[0] = "@{-1}".to_string();
             }
         } else if let Some(n) = checkout_previous_selector_n(&positional[0])
-            && let Some(name) = checkout_expand_previous_branch_arg(&git_dir, format, store, n)?
+            && let Some(name) = checkout_expand_previous_branch_arg(git_dir, format, store, n)?
         {
             positional[0] = name;
         }
@@ -418,7 +419,7 @@ pub(crate) fn cmd_checkout(
                     // revision, every positional is a pathspec (git's
                     // disambiguation for `checkout <path> <path>...`).
                     if checkout_resolve_start_oid(
-                        &git_dir,
+                        git_dir,
                         format,
                         &positional[0],
                         context.replace_objects,
@@ -440,24 +441,18 @@ pub(crate) fn cmd_checkout(
                         .is_some();
                     if !is_branch
                         && checkout_resolve_start_oid(
-                            &git_dir,
+                            git_dir,
                             format,
                             value,
                             context.replace_objects,
                         )
                         .is_err()
                         && (cwd.join(value).exists()
-                            || checkout_index_has_path(
-                                &git_dir,
-                                &worktree_root,
-                                &cwd,
-                                format,
-                                value,
-                            )?)
+                            || checkout_index_has_path(git_dir, worktree_root, cwd, format, value)?)
                     {
                         if guess {
                             let _ = checkout_dwim_remote_branch(
-                                &git_dir,
+                                git_dir,
                                 format,
                                 store,
                                 checkout_config,
@@ -494,7 +489,7 @@ pub(crate) fn cmd_checkout(
                         return Err(GitError::Exit(128));
                     }
                     let oid =
-                        checkout_resolve_start_oid(&git_dir, format, rev, context.replace_objects)?;
+                        checkout_resolve_start_oid(git_dir, format, rev, context.replace_objects)?;
                     let tree = sley_rev::peel_to_tree(db, format, &oid)?;
                     // Path-limited checkout still materializes blobs. In a
                     // partial clone batch-prefetch the selected tree leaves so
@@ -538,7 +533,7 @@ pub(crate) fn cmd_checkout(
                     };
                     let outcome = sley_worktree::checkout_index_paths_with_database_outcome_sparse(
                         worktree_root,
-                        &git_dir,
+                        git_dir,
                         format,
                         &resolved_paths,
                         db,
@@ -559,7 +554,7 @@ pub(crate) fn cmd_checkout(
                     if recurse_submodules {
                         commands::read_tree::checkout_submodules_for_paths(
                             worktree_root,
-                            &git_dir,
+                            git_dir,
                             format,
                             &resolved_paths,
                         )?;
@@ -584,7 +579,7 @@ pub(crate) fn cmd_checkout(
         let target = positional.first().map(String::as_str).unwrap_or("HEAD");
         let head_commit = resolve_ref_peeled(store, "HEAD")?;
         if let Ok(target_oid) =
-            checkout_resolve_start_oid(&git_dir, format, target, context.replace_objects)
+            checkout_resolve_start_oid(git_dir, format, target, context.replace_objects)
             && head_commit == Some(target_oid)
         {
             let switches_to_other_branch = branch_ref_name(target)
@@ -604,21 +599,21 @@ pub(crate) fn cmd_checkout(
             if !switches_to_other_branch {
                 if recurse_submodules {
                     commands::read_tree::reset_index_and_worktree_to_commit(
-                        &worktree_root,
-                        &git_dir,
+                        worktree_root,
+                        git_dir,
                         format,
                         &target_oid,
                         true,
                     )?;
                 } else {
                     sley_worktree::reset_index_and_worktree_to_commit(
-                        &worktree_root,
-                        &git_dir,
+                        worktree_root,
+                        git_dir,
                         format,
                         &target_oid,
                     )?;
                 }
-                sley_sequencer::replay::remove_branch_state(&git_dir);
+                sley_sequencer::replay::remove_branch_state(git_dir);
                 return Ok(());
             }
         }
@@ -637,14 +632,14 @@ pub(crate) fn cmd_checkout(
     if force {
         if let Ok(Some(head_oid)) = resolve_ref_peeled(store, "HEAD") {
             sley_worktree::reset_index_and_worktree_to_commit(
-                &worktree_root,
-                &git_dir,
+                worktree_root,
+                git_dir,
                 format,
                 &head_oid,
             )?;
         } else {
             // Unborn HEAD: discard the staged state entirely.
-            let index_path = sley_worktree::repository_index_path(&git_dir);
+            let index_path = sley_worktree::repository_index_path(git_dir);
             if index_path.exists() {
                 let index = Index::parse(&fs::read(&index_path)?, format)?;
                 for entry in &index.entries {
@@ -677,21 +672,21 @@ pub(crate) fn cmd_checkout(
             }
             let target = positional.first().map(String::as_str).unwrap_or("HEAD");
             let target_oid =
-                checkout_resolve_start_oid(&git_dir, format, target, context.replace_objects)?;
+                checkout_resolve_start_oid(git_dir, format, target, context.replace_objects)?;
             let target_oid = sley_rev::peel_to_commit(db, format, &target_oid)?;
             let from = checkout_reflog_from_name(store);
             let config = checkout_config;
             prefetch_local_promisor_checkout_blobs(cwd, git_dir, format, db, config, &target_oid)?;
             let old_head_direct = checkout_direct_head(store)?;
-            let subject = detached_checkout_subject(&git_dir, format, &target_oid);
+            let subject = detached_checkout_subject(git_dir, format, &target_oid);
             let message = format!("checkout: moving from {from} to {target}").into_bytes();
             if recurse_submodules {
                 checkout_twoway_dirty(&context, Some(&target_oid), recurse_submodules, force)?;
-                detach_head_with_reflog(&git_dir, format, &target_oid, message, checkout_config)?;
+                detach_head_with_reflog(git_dir, format, &target_oid, message, checkout_config)?;
             } else {
                 match sley_worktree::checkout_detached_filtered(
-                    &worktree_root,
-                    &git_dir,
+                    worktree_root,
+                    git_dir,
                     format,
                     &target_oid,
                     committer_identity_for_reflog(config)?,
@@ -707,7 +702,7 @@ pub(crate) fn cmd_checkout(
                             force,
                         )?;
                         detach_head_with_reflog(
-                            &git_dir,
+                            git_dir,
                             format,
                             &target_oid,
                             message,
@@ -718,10 +713,10 @@ pub(crate) fn cmd_checkout(
                 }
             }
             commands::hooks::run_post_index_change_hook(cli_session, true, false)?;
-            sley_sequencer::replay::remove_branch_state(&git_dir);
+            sley_sequencer::replay::remove_branch_state(git_dir);
             if !quiet {
                 checkout_print_previous_detached_head(
-                    &git_dir,
+                    git_dir,
                     format,
                     store,
                     config,
@@ -740,7 +735,7 @@ pub(crate) fn cmd_checkout(
                 "reference-transaction",
                 commands::hooks::HookRun::default(),
             )?;
-            checkout_show_local_changes(cli_session, &git_dir, &target_oid, quiet, force)?;
+            checkout_show_local_changes(cli_session, git_dir, &target_oid, quiet, force)?;
             return Ok(());
         }
         CheckoutBranchMode::Existing => {
@@ -757,8 +752,8 @@ pub(crate) fn cmd_checkout(
                         eprintln!("fatal: You are on a branch yet to be born");
                         return Err(GitError::Exit(128));
                     };
-                    sley_worktree::reapply_active_sparse_checkout(worktree_root, &git_dir, format)?;
-                    let _ = checkout_show_local_changes(cli_session, &git_dir, &head, quiet, force);
+                    sley_worktree::reapply_active_sparse_checkout(worktree_root, git_dir, format)?;
+                    let _ = checkout_show_local_changes(cli_session, git_dir, &head, quiet, force);
                     return Ok(());
                 }
                 return Err(GitError::Command(
@@ -790,7 +785,7 @@ pub(crate) fn cmd_checkout(
             } else if !is_branch
                 && branch.contains("@{")
                 && let Ok(Some(refname)) =
-                    sley_rev::resolve_revision_symbolic_full_name(&git_dir, format, branch)
+                    sley_rev::resolve_revision_symbolic_full_name(git_dir, format, branch)
                 && let Some(local_branch) = refname.strip_prefix("refs/heads/")
                 && store.read_ref(&refname)?.is_some()
             {
@@ -800,7 +795,7 @@ pub(crate) fn cmd_checkout(
                 }
             } else if !is_branch
                 && let Ok(target_oid) =
-                    checkout_resolve_start_oid(&git_dir, format, branch, context.replace_objects)
+                    checkout_resolve_start_oid(git_dir, format, branch, context.replace_objects)
             {
                 // A tag (or other peelable object) detaches HEAD at the *commit*
                 // it points to; `resolve_revision` yields the tag object itself,
@@ -816,13 +811,13 @@ pub(crate) fn cmd_checkout(
                     &target_oid,
                 )?;
                 let old_head_direct = checkout_direct_head(store)?;
-                let subject = detached_checkout_subject(&git_dir, format, &target_oid);
+                let subject = detached_checkout_subject(git_dir, format, &target_oid);
                 let from = checkout_reflog_from_name(store);
                 let message = format!("checkout: moving from {from} to {branch}").into_bytes();
                 if recurse_submodules {
                     checkout_twoway_dirty(&context, Some(&target_oid), recurse_submodules, force)?;
                     detach_head_with_reflog(
-                        &git_dir,
+                        git_dir,
                         format,
                         &target_oid,
                         message,
@@ -830,8 +825,8 @@ pub(crate) fn cmd_checkout(
                     )?;
                 } else {
                     match sley_worktree::checkout_detached_filtered(
-                        &worktree_root,
-                        &git_dir,
+                        worktree_root,
+                        git_dir,
                         format,
                         &target_oid,
                         committer_identity_for_reflog(checkout_config)?,
@@ -847,7 +842,7 @@ pub(crate) fn cmd_checkout(
                                 force,
                             )?;
                             detach_head_with_reflog(
-                                &git_dir,
+                                git_dir,
                                 format,
                                 &target_oid,
                                 message,
@@ -857,13 +852,13 @@ pub(crate) fn cmd_checkout(
                         Err(err) => return Err(err),
                     }
                 }
-                sley_sequencer::replay::remove_branch_state(&git_dir);
+                sley_sequencer::replay::remove_branch_state(git_dir);
                 if !quiet {
                     if old_head_direct.is_none() {
                         checkout_print_detached_head_advice(config, branch);
                     } else {
                         checkout_print_previous_detached_head(
-                            &git_dir,
+                            git_dir,
                             format,
                             store,
                             config,
@@ -884,13 +879,13 @@ pub(crate) fn cmd_checkout(
                     "reference-transaction",
                     commands::hooks::HookRun::default(),
                 )?;
-                checkout_show_local_changes(cli_session, &git_dir, &target_oid, quiet, force)?;
+                checkout_show_local_changes(cli_session, git_dir, &target_oid, quiet, force)?;
                 return Ok(());
             } else if !is_branch {
                 let branch_name = branch.clone();
                 if guess
                     && let Some(dwim) = checkout_dwim_remote_branch(
-                        &git_dir,
+                        git_dir,
                         format,
                         store,
                         checkout_config,
@@ -902,8 +897,8 @@ pub(crate) fn cmd_checkout(
                     branch_update_rollback =
                         Some((branch_ref.clone(), store.read_ref(&branch_ref)?));
                     let was_reset = checkout_create_or_reset_branch(
-                        &git_dir,
-                        &git_dir,
+                        git_dir,
+                        git_dir,
                         format,
                         context.replace_objects,
                         &branch_name,
@@ -914,7 +909,7 @@ pub(crate) fn cmd_checkout(
                     )?;
                     let tracking_start = Some(dwim.remote_ref);
                     crate::commands::branch::branch_create_set_tracking(
-                        &git_dir,
+                        git_dir,
                         store,
                         &branch_name,
                         tracking_start.as_ref(),
@@ -946,7 +941,7 @@ pub(crate) fn cmd_checkout(
             force,
             orphan,
         } => {
-            let branch = checkout_expand_creation_branch_name(&git_dir, format, store, branch)?;
+            let branch = checkout_expand_creation_branch_name(git_dir, format, store, branch)?;
             if orphan {
                 if positional.len() > 1 {
                     eprintln!(
@@ -963,7 +958,7 @@ pub(crate) fn cmd_checkout(
                 }
                 if let Some(start) = positional.first().map(String::as_str) {
                     let Some(start_oid) = resolve_checkout_start_oid(
-                        &git_dir,
+                        git_dir,
                         format,
                         start,
                         context.replace_objects,
@@ -980,11 +975,11 @@ pub(crate) fn cmd_checkout(
                     // and leave HEAD on the current branch.
                     checkout_twoway_dirty(&context, Some(&start_oid), recurse_submodules, force)?;
                 }
-                checkout_switch_to_unborn_branch(&git_dir, &branch)?;
+                checkout_switch_to_unborn_branch(git_dir, &branch)?;
                 if create_reflog {
                     store.write_reflog(&branch_ref, &[])?;
                 }
-                sley_sequencer::replay::remove_branch_state(&git_dir);
+                sley_sequencer::replay::remove_branch_state(git_dir);
                 if !quiet {
                     eprintln!("Switched to a new branch '{branch}'");
                 }
@@ -1007,7 +1002,7 @@ pub(crate) fn cmd_checkout(
                 );
                 return Err(GitError::Exit(128));
             }
-            if resolve_checkout_start_oid(&git_dir, format, start, context.replace_objects).is_err()
+            if resolve_checkout_start_oid(git_dir, format, start, context.replace_objects).is_err()
             {
                 eprintln!(
                     "fatal: '{start}' is not a commit and a branch '{branch}' cannot be created from it"
@@ -1017,8 +1012,8 @@ pub(crate) fn cmd_checkout(
             let branch_ref = branch_ref_name(&branch)?;
             branch_update_rollback = Some((branch_ref.clone(), store.read_ref(&branch_ref)?));
             let was_reset = checkout_create_or_reset_branch(
-                &git_dir,
-                &git_dir,
+                git_dir,
+                git_dir,
                 format,
                 context.replace_objects,
                 &branch,
@@ -1029,7 +1024,7 @@ pub(crate) fn cmd_checkout(
             )?;
             let tracking_start = positional.first().map(|start| {
                 if start.contains("@{") {
-                    sley_rev::resolve_revision_symbolic_full_name(&git_dir, format, start)
+                    sley_rev::resolve_revision_symbolic_full_name(git_dir, format, start)
                         .ok()
                         .flatten()
                         .or_else(|| checkout_tracking_start_ref(store, start))
@@ -1039,7 +1034,7 @@ pub(crate) fn cmd_checkout(
                 }
             });
             crate::commands::branch::branch_create_set_tracking(
-                &git_dir,
+                git_dir,
                 store,
                 &branch,
                 tracking_start.as_ref(),
@@ -1055,7 +1050,7 @@ pub(crate) fn cmd_checkout(
     };
     let branch = checkout_message.branch();
 
-    let config = read_repo_config(&git_dir)?;
+    let config = read_repo_config(git_dir)?;
     let branch_ref = branch_ref_name(branch)?;
     let checkout_reflog_from = checkout_reflog_from_name(store);
     if !ignore_other_worktrees
@@ -1063,15 +1058,15 @@ pub(crate) fn cmd_checkout(
             store.read_ref("HEAD"),
             Ok(Some(RefTarget::Symbolic(current))) if current == branch_ref
         )
-        && let Some(worktree) = sley_worktree::find_shared_symref(&git_dir, "HEAD", &branch_ref)?
-        && !checkout_worktree_is_current(&worktree.path, &worktree_root)
+        && let Some(worktree) = sley_worktree::find_shared_symref(git_dir, "HEAD", &branch_ref)?
+        && !checkout_worktree_is_current(&worktree.path, worktree_root)
     {
         eprintln!(
             "fatal: '{}' is already used by worktree at '{}'",
             branch,
             worktree.path.display()
         );
-        checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+        checkout_rollback_branch_update(git_dir, format, &branch_update_rollback);
         return Err(GitError::Exit(128));
     }
     let branch_target = if store.read_ref(&branch_ref)?.is_some() {
@@ -1082,10 +1077,10 @@ pub(crate) fn cmd_checkout(
     if let Some(target) = branch_target {
         prefetch_local_promisor_checkout_blobs(cwd, git_dir, format, db, &config, &target)?;
         let head_at_target = resolve_ref_peeled(store, "HEAD")? == Some(target);
-        if head_at_target && checkout_index_empty(&git_dir, format)? {
+        if head_at_target && checkout_index_empty(git_dir, format)? {
             sley_worktree::reset_index_and_worktree_to_commit(
-                &worktree_root,
-                &git_dir,
+                worktree_root,
+                git_dir,
                 format,
                 &target,
             )?;
@@ -1100,8 +1095,8 @@ pub(crate) fn cmd_checkout(
             let old_tree = commands::merge_rebase::commit_tree_oid(db, format, &checkout_old_head)?;
             let target_tree = commands::merge_rebase::commit_tree_oid(db, format, &target)?;
             if let Err(err) = commands::read_tree::checkout_two_way_engine(
-                &git_dir,
-                &worktree_root,
+                git_dir,
+                worktree_root,
                 format,
                 db,
                 Some(&old_tree),
@@ -1110,13 +1105,13 @@ pub(crate) fn cmd_checkout(
                 recurse_submodules,
                 force,
             ) {
-                checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+                checkout_rollback_branch_update(git_dir, format, &branch_update_rollback);
                 return Err(err);
             }
         }
     }
     if branch_target.is_none() {
-        sley_sequencer::replay::remove_branch_state(&git_dir);
+        sley_sequencer::replay::remove_branch_state(git_dir);
         if !quiet {
             checkout_message.print();
         }
@@ -1133,13 +1128,13 @@ pub(crate) fn cmd_checkout(
             recurse_submodules,
             quiet,
         ) {
-            checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+            checkout_rollback_branch_update(git_dir, format, &branch_update_rollback);
             return Err(err);
         }
         if let Err(err) =
-            switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from, &config)
+            switch_head_symbolic_with_reflog(git_dir, format, branch, &target, &from, &config)
         {
-            checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+            checkout_rollback_branch_update(git_dir, format, &branch_update_rollback);
             return Err(err);
         }
     // Creating a branch at the commit already checked out does not need a
@@ -1174,21 +1169,21 @@ pub(crate) fn cmd_checkout(
             if let Err(err) =
                 checkout_twoway_dirty(&context, Some(&target), recurse_submodules, force)
             {
-                checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+                checkout_rollback_branch_update(git_dir, format, &branch_update_rollback);
                 return Err(err);
             }
         }
         if let Err(err) =
-            switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from, &config)
+            switch_head_symbolic_with_reflog(git_dir, format, branch, &target, &from, &config)
         {
-            checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+            checkout_rollback_branch_update(git_dir, format, &branch_update_rollback);
             return Err(err);
         }
     } else {
         // Same-HEAD, no force, no recurse: preserve index extensions (UNTR) via
         // the lightweight path — `checkout -b new` at the current tip.
         match sley_worktree::checkout_branch_filtered(
-            &worktree_root,
+            worktree_root,
             git_dir.clone(),
             format,
             branch,
@@ -1203,18 +1198,18 @@ pub(crate) fn cmd_checkout(
                 if let Err(err) =
                     checkout_twoway_dirty(&context, Some(&target), recurse_submodules, force)
                 {
-                    checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+                    checkout_rollback_branch_update(git_dir, format, &branch_update_rollback);
                     return Err(err);
                 }
                 if let Err(err) = switch_head_symbolic_with_reflog(
-                    &git_dir, format, branch, &target, &from, &config,
+                    git_dir, format, branch, &target, &from, &config,
                 ) {
-                    checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+                    checkout_rollback_branch_update(git_dir, format, &branch_update_rollback);
                     return Err(err);
                 }
             }
             Err(err) => {
-                checkout_rollback_branch_update(&git_dir, format, &branch_update_rollback);
+                checkout_rollback_branch_update(git_dir, format, &branch_update_rollback);
                 return Err(err);
             }
         }
@@ -1227,7 +1222,7 @@ pub(crate) fn cmd_checkout(
         format!("checkout: moving from {checkout_reflog_from} to {branch}").into_bytes(),
         &config,
     )?;
-    sley_sequencer::replay::remove_branch_state(&git_dir);
+    sley_sequencer::replay::remove_branch_state(git_dir);
     let checkout_new_head = resolve_ref_peeled(store, "HEAD")?.unwrap_or(checkout_old_head);
     commands::hooks::run_post_index_change_hook(cli_session, true, false)?;
     run_post_checkout_hook(cli_session, &checkout_old_head, &checkout_new_head, true)?;
@@ -1238,7 +1233,7 @@ pub(crate) fn cmd_checkout(
     )?;
     if !quiet {
         checkout_print_previous_detached_head(
-            &git_dir,
+            git_dir,
             format,
             store,
             &config,
@@ -1248,11 +1243,11 @@ pub(crate) fn cmd_checkout(
         checkout_message.print();
     }
     if checkout_message.announces() {
-        checkout_show_branch_tracking(&git_dir, format, branch, quiet)?;
+        checkout_show_branch_tracking(git_dir, format, branch, quiet)?;
     }
     // git's `show_local_changes`: report carried-forward worktree modifications
     // relative to the newly checked-out commit (`M\t<path>`, etc.).
-    checkout_show_local_changes(cli_session, &git_dir, &checkout_new_head, quiet, force)?;
+    checkout_show_local_changes(cli_session, git_dir, &checkout_new_head, quiet, force)?;
     Ok(())
 }
 
@@ -2657,7 +2652,7 @@ fn switch_head_symbolic_with_reflog(
 
 fn ensure_head_checkout_reflog_entry(
     refs: &FileRefStore,
-    format: ObjectFormat,
+    _format: ObjectFormat,
     target: &ObjectId,
     message: Vec<u8>,
     config: &GitConfig,

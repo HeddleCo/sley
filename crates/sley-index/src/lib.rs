@@ -3297,7 +3297,7 @@ mod tests {
             Some(cache_tree)
         );
         // Removing it clears the chunk.
-        let mut without = parsed.clone();
+        let mut without = parsed;
         without
             .set_cache_tree(None)
             .expect("test operation should succeed");
@@ -3338,7 +3338,7 @@ mod tests {
             Some(&b"\x00\x01\x02opaque"[..])
         );
         // Setting a cache tree leaves the unknown chunk intact.
-        let mut updated = parsed.clone();
+        let mut updated = parsed;
         updated
             .set_cache_tree(Some(&CacheTree {
                 entry_count: -1,

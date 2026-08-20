@@ -221,7 +221,7 @@ fn collect_combined_subtrees(
                 path.extend_from_slice(prefix);
                 path.push(b'/');
             }
-            path.extend_from_slice(&entry.name);
+            path.extend_from_slice(entry.name);
             out.insert(
                 path.clone(),
                 TreePathEntry {

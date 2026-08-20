@@ -50,7 +50,7 @@ fn rerere_option_specs() -> &'static [OptionSpec<'static>] {
 
 pub(crate) fn cmd_rerere(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let options = setup_rerere_options(args)?;
-    let cwd = env::current_dir()?;
+    let _cwd = env::current_dir()?;
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
@@ -96,10 +96,10 @@ fn setup_rerere_options(args: &[String]) -> Result<RerereOptions> {
     };
     let mut autoupdate = None;
     for option in &parsed.options {
-        if option.long == Some("rerere-autoupdate") {
-            if let sley_options::ParsedValue::Bool(value) = option.value {
-                autoupdate = Some(value);
-            }
+        if option.long == Some("rerere-autoupdate")
+            && let sley_options::ParsedValue::Bool(value) = option.value
+        {
+            autoupdate = Some(value);
         }
     }
     let mut subcommand = None;
@@ -232,7 +232,7 @@ pub(crate) fn repo_rerere(
             &config,
             git_dir,
             format,
-            &worktree_root,
+            worktree_root,
             &mut entry,
             &normalized,
             autoupdate_override,
@@ -277,7 +277,7 @@ fn do_rerere_one_path(
     let cache_dir = rr_cache.join(&entry.hash);
     scan_variant_status(&cache_dir, entry.variant)?;
     if try_replay_resolution(git_dir, format, worktree_root, entry)? {
-        if rerere_autoupdate_with_config(&config, autoupdate_override) {
+        if rerere_autoupdate_with_config(config, autoupdate_override) {
             stage_resolved_path(git_dir, format, worktree_root, &entry.path)?;
             eprintln!("Staged '{}' using previous resolution.", entry.path);
             entry.variant = u32::MAX;
@@ -996,12 +996,12 @@ fn rerere_diff_payload(rendered: &[u8]) -> Vec<u8> {
         if line.starts_with(b"diff --git ") || line.starts_with(b"index ") {
             continue;
         }
-        if line.starts_with(b"@@ ") {
-            if let Some(end) = second_hunk_marker_end(line) {
-                out.extend_from_slice(&line[..end]);
-                out.push(b'\n');
-                continue;
-            }
+        if line.starts_with(b"@@ ")
+            && let Some(end) = second_hunk_marker_end(line)
+        {
+            out.extend_from_slice(&line[..end]);
+            out.push(b'\n');
+            continue;
         }
         out.extend_from_slice(line);
     }

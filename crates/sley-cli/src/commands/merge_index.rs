@@ -199,9 +199,9 @@ fn run_merge_program(
 /// turns that into the same non-zero exit git's `run_command` failure would).
 fn merge_one_file(
     db: &FileObjectDatabase,
-    git_dir: &Path,
+    _git_dir: &Path,
     worktree_root: &Path,
-    format: ObjectFormat,
+    _format: ObjectFormat,
     index: &mut sley_index::Index,
     path: &[u8],
     stages: &MergeIndexStages,

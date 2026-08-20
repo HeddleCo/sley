@@ -11,8 +11,6 @@ use crate::effective_config_parameters_env;
 use crate::global_config_value;
 use crate::session;
 use crate::sley_config;
-use sley_sequencer;
-
 pub(crate) fn commit_identity_from_env(
     role: &str,
     effective_config: &GitConfig,

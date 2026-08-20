@@ -9,7 +9,7 @@ use crate::*;
 use sley_options::{OptFlags, OptionName, ParsedValue, parse_options};
 
 pub(super) fn setup_worktree_list_options(args: &[String]) -> Result<WorktreeListOptions> {
-    let parsed = parse_options(args, worktree_list_option_specs(), &WORKTREE_LIST_USAGE)
+    let parsed = parse_options(args, worktree_list_option_specs(), WORKTREE_LIST_USAGE)
         .map_err(cli_usage_error)?;
     if !parsed.positionals.is_empty() {
         return worktree_list_usage();
@@ -43,7 +43,7 @@ pub(super) fn setup_worktree_list_options(args: &[String]) -> Result<WorktreeLis
 }
 
 pub(super) fn setup_worktree_prune_options(args: &[String]) -> Result<WorktreePruneOptions> {
-    let parsed = parse_options(args, worktree_prune_option_specs(), &WORKTREE_PRUNE_USAGE)
+    let parsed = parse_options(args, worktree_prune_option_specs(), WORKTREE_PRUNE_USAGE)
         .map_err(cli_usage_error)?;
     if !parsed.positionals.is_empty() {
         return worktree_prune_usage();
@@ -69,7 +69,7 @@ pub(super) fn setup_worktree_prune_options(args: &[String]) -> Result<WorktreePr
 }
 
 pub(super) fn setup_worktree_lock_options(args: &[String]) -> Result<WorktreeLockOptions> {
-    let parsed = parse_options(args, worktree_lock_option_specs(), &WORKTREE_LOCK_USAGE)
+    let parsed = parse_options(args, worktree_lock_option_specs(), WORKTREE_LOCK_USAGE)
         .map_err(cli_usage_error)?;
     let mut reason = None;
     for option in &parsed.options {
@@ -92,7 +92,7 @@ pub(super) fn setup_worktree_lock_options(args: &[String]) -> Result<WorktreeLoc
 }
 
 pub(super) fn setup_worktree_remove_options(args: &[String]) -> Result<WorktreeRemoveOptions> {
-    let parsed = parse_options(args, worktree_remove_option_specs(), &WORKTREE_REMOVE_USAGE)
+    let parsed = parse_options(args, worktree_remove_option_specs(), WORKTREE_REMOVE_USAGE)
         .map_err(cli_usage_error)?;
     match parsed.positionals.as_slice() {
         [path] => Ok(WorktreeRemoveOptions {
@@ -104,7 +104,7 @@ pub(super) fn setup_worktree_remove_options(args: &[String]) -> Result<WorktreeR
 }
 
 pub(super) fn setup_worktree_move_options(args: &[String]) -> Result<WorktreeMoveOptions> {
-    let parsed = parse_options(args, worktree_move_option_specs(), &WORKTREE_MOVE_USAGE)
+    let parsed = parse_options(args, worktree_move_option_specs(), WORKTREE_MOVE_USAGE)
         .map_err(cli_usage_error)?;
     match parsed.positionals.as_slice() {
         [source, destination] => Ok(WorktreeMoveOptions {
@@ -118,7 +118,7 @@ pub(super) fn setup_worktree_move_options(args: &[String]) -> Result<WorktreeMov
 }
 
 pub(super) fn setup_worktree_repair_options(args: &[String]) -> Result<WorktreeRepairOptions> {
-    let parsed = parse_options(args, worktree_repair_option_specs(), &WORKTREE_REPAIR_USAGE)
+    let parsed = parse_options(args, worktree_repair_option_specs(), WORKTREE_REPAIR_USAGE)
         .map_err(cli_usage_error)?;
     Ok(WorktreeRepairOptions {
         relative_paths: last_tri_state_bool(&parsed, "relative-paths"),
@@ -131,7 +131,7 @@ pub(super) fn setup_worktree_repair_options(args: &[String]) -> Result<WorktreeR
 }
 
 pub(super) fn setup_worktree_unlock_options(args: &[String]) -> Result<String> {
-    let parsed = parse_options(args, &[], &WORKTREE_UNLOCK_USAGE).map_err(cli_usage_error)?;
+    let parsed = parse_options(args, &[], WORKTREE_UNLOCK_USAGE).map_err(cli_usage_error)?;
     if !parsed.options.is_empty() {
         return worktree_unlock_usage();
     }
@@ -142,7 +142,7 @@ pub(super) fn setup_worktree_unlock_options(args: &[String]) -> Result<String> {
 }
 
 pub(super) fn setup_worktree_add_options(args: &[String]) -> Result<WorktreeAddOptions> {
-    let parsed = parse_options(args, worktree_add_option_specs(), &WORKTREE_ADD_USAGE)
+    let parsed = parse_options(args, worktree_add_option_specs(), WORKTREE_ADD_USAGE)
         .map_err(cli_usage_error)?;
     let force = count_force_occurrences(&parsed);
     let quiet = parsed.last_bool("quiet", false);
@@ -484,14 +484,6 @@ fn worktree_move_usage<T>() -> Result<T> {
     eprintln!("usage: git worktree move <worktree> <new-path>");
     eprintln!();
     eprintln!("    -f, --[no-]force      force move even if worktree is dirty or locked");
-    eprintln!("    --[no-]relative-paths use relative paths for worktrees");
-    eprintln!();
-    Err(GitError::Exit(129))
-}
-
-fn worktree_repair_usage<T>() -> Result<T> {
-    eprintln!("usage: git worktree repair [<path>...]");
-    eprintln!();
     eprintln!("    --[no-]relative-paths use relative paths for worktrees");
     eprintln!();
     Err(GitError::Exit(129))

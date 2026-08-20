@@ -18,19 +18,13 @@ use super::pack::{
     trace_configured_local_protocol_version, trace_protocol_v2_ls_refs_request,
 };
 use super::resolve::{RemoteCommandContext, local_repository_git_dir_path, ls_remote_git_dir};
-use crate::commands::config_cmd::{
-    ConfigKey, SimpleConfigRegex, config_set_value, parse_config_key,
-};
-use crate::remote::{
-    remote_config_values, resolve_remote_fetch_url, resolve_remote_push_url,
-    rewrite_url_with_config,
-};
+use crate::commands::config_cmd::{config_set_value, parse_config_key};
+use crate::remote::rewrite_url_with_config;
 use crate::*;
 use sley::plumbing::sley_odb::ObjectReader;
-use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord};
+use sley::plumbing::sley_remote::FetchOptions;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::process::Command as Proc;
 
 pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut quiet = false;
@@ -582,7 +576,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
     // `/var/...` instead of becoming `/private/var/...` on macOS.
     let repository = absolutize_local_clone_source(&cwd, &rewritten_repository);
     let remote_config_url = if rewrite_applied {
-        repository_arg.clone()
+        repository_arg
     } else if let Some(bundle_path) = bundle_source_path.as_deref() {
         bundle_path.to_string_lossy().into_owned()
     } else {
@@ -628,8 +622,6 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
 
     if let Some(bundle_path) = bundle_source_path.as_deref() {
         clone_bundle_repository(CloneBundleOptions {
-            cli_session,
-            repository: &repository,
             remote_url: &remote_config_url,
             bundle_path,
             destination: &checkout_destination,
@@ -697,7 +689,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
             checkout,
             sparse,
             single_branch,
-            branch: branch.clone(),
+            branch,
             tag_opt: tag_opt.as_deref(),
             partial_clone_filter: partial_clone_filter.as_deref(),
             template: template.as_deref(),
@@ -745,7 +737,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
             checkout,
             sparse,
             single_branch,
-            branch: branch.clone(),
+            branch,
             tag_opt: tag_opt.as_deref(),
             partial_clone_filter: partial_clone_filter.as_deref(),
             template: template.as_deref(),
@@ -793,7 +785,7 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
             checkout,
             sparse,
             single_branch,
-            branch: branch.clone(),
+            branch,
             tag_opt: tag_opt.as_deref(),
             partial_clone_filter: partial_clone_filter.as_deref(),
             template: template.as_deref(),
@@ -1119,8 +1111,8 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
         // `--revision` copies the object closure directly and checks out detached;
         // it never fetches or creates a branch, so it keeps its own init here.
         let layout = RepositoryBootstrap::init(InitOptions {
-            git_dir_override: clone_git_dir_override.clone(),
-            core_worktree: clone_core_worktree.clone(),
+            git_dir_override: clone_git_dir_override,
+            core_worktree: clone_core_worktree,
             object_dir: None,
             worktree: checkout_destination.clone(),
             object_format: format,
@@ -1341,8 +1333,6 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
 }
 
 struct CloneBundleOptions<'a> {
-    cli_session: &'a crate::session::CliSession,
-    repository: &'a str,
     remote_url: &'a str,
     bundle_path: &'a Path,
     destination: &'a Path,
@@ -1446,7 +1436,7 @@ fn clone_remote_helper_repository(options: CloneRemoteHelperOptions<'_>) -> Resu
         object_format_explicit: false,
         bare: options.bare,
         initial_branch: if options.bare {
-            initial_branch.clone()
+            initial_branch
         } else {
             CLONE_UNBORN_BRANCH.to_string()
         },
@@ -1732,7 +1722,7 @@ fn clone_bundle_repository(options: CloneBundleOptions<'_>) -> Result<()> {
         bare: false,
         initial_branch: head_branch
             .clone()
-            .unwrap_or_else(|| clone_default_branch_name()),
+            .unwrap_or_else(clone_default_branch_name),
         template_dir: None,
         copy_template_config: false,
         separate_git_dir: None,
@@ -2139,7 +2129,7 @@ fn clone_network_repository(
 
     let single_branch = options.single_branch;
     let origin = options.origin;
-    let repository = options.repository;
+    let _repository = options.repository;
     let remote_url = options.remote_url;
     let template = options.template;
     let template_config = options.template_config;
@@ -2148,7 +2138,7 @@ fn clone_network_repository(
     let submodule_active = options.submodule_active;
     let http_remote = matches!(transport, CloneNetworkTransport::Http).then(|| remote.clone());
     let remote_source = match transport {
-        CloneNetworkTransport::Http => sley_remote::CloneSource::Http(remote.clone()),
+        CloneNetworkTransport::Http => sley_remote::CloneSource::Http(remote),
         CloneNetworkTransport::Ssh => sley_remote::CloneSource::Ssh(remote),
         CloneNetworkTransport::Git => sley_remote::CloneSource::Git {
             remote,
@@ -2185,7 +2175,7 @@ fn clone_network_repository(
     let mut progress = StdoutProgress::new(options.quiet);
     let http_client =
         matches!(transport, CloneNetworkTransport::Http).then(sley_remote::new_http_client);
-    let prefetch_handshake = v2_handshake.clone();
+    let prefetch_handshake = v2_handshake;
     // Junk-directory cleanup: upstream builtin/clone.c registers `remove_junk`
     // (atexit + signal) that removes the working tree / gitdir it created when the
     // clone dies, unless the destination pre-existed (in which case only its
@@ -2582,10 +2572,6 @@ fn validate_clone_jobs(value: &str) -> Result<()> {
     } else {
         Err(GitError::Command(clone_jobs_error().into()))
     }
-}
-
-fn validate_clone_filter(value: &str) -> Result<()> {
-    normalize_clone_filter(value).map(|_| ())
 }
 
 pub(super) fn normalize_clone_filter(value: &str) -> Result<String> {
@@ -4020,19 +4006,6 @@ fn peel_clone_revision_to_commit<R: ObjectReader>(
         other => {
             eprintln!("error: object {oid} is a {}, not a commit", other.as_str());
             Err(GitError::Exit(128))
-        }
-    }
-}
-
-fn remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Result<String> {
-    let remote_store = FileRefStore::new_without_reference_backend_env(remote_git_dir, format);
-    match remote_store.read_ref("HEAD")? {
-        Some(RefTarget::Symbolic(target)) => target
-            .strip_prefix("refs/heads/")
-            .map(str::to_string)
-            .ok_or_else(|| GitError::reference_not_found("remote HEAD branch")),
-        Some(RefTarget::Direct(_)) | None => {
-            Err(GitError::reference_not_found("remote HEAD branch"))
         }
     }
 }

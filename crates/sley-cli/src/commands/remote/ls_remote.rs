@@ -15,12 +15,9 @@ use super::pack::{
     trace_protocol_v2_upload_pack_capabilities,
 };
 use super::resolve::{RemoteCommandContext, ls_remote_git_dir};
-use crate::commands::config_cmd::{
-    ConfigKey, SimpleConfigRegex, config_set_value, parse_config_key,
-};
 use crate::*;
 use sley::plumbing::sley_odb::ObjectReader;
-use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord};
+use sley::plumbing::sley_remote::LsRemoteRecord;
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 
@@ -246,7 +243,7 @@ fn configured_refspec_valid(refspec: &str, fetch: bool) -> bool {
             // No RHS: the LHS must be a valid-looking ref.
             None => return refspec_refname_ok(src, true, is_glob),
             // Empty RHS (`src:`) is never allowed for push.
-            Some(d) if d.is_empty() => return false,
+            Some("") => return false,
             Some(d) if !refspec_refname_ok(d, true, is_glob) => return false,
             Some(_) => {}
         }

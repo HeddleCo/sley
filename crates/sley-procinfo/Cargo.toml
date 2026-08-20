@@ -8,7 +8,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-libc = "0.2"
+libc = "0.2.189"
 
 # Keep process-inspection unsafe isolated from the rest of the workspace. The
 # public API returns owned process names and has no unsafe contract for callers.
@@ -19,4 +19,10 @@ unsafe_code = "allow"
 unwrap_used = "deny"
 dbg_macro = "deny"
 todo = "deny"
+redundant_clone = "deny"
+unused_peekable = "deny"
+iter_with_drain = "deny"
+suspicious_operation_groupings = "deny"
+large_stack_arrays = "deny"
+needless_collect = "deny"
 clone_on_copy = "allow"

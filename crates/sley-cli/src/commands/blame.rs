@@ -631,6 +631,8 @@ fn blame_author_time(
 }
 
 /// Either run with parsed options or print help and exit successfully.
+// Boxing the overwhelmingly common `Run` state would add an allocation to blame.
+#[allow(clippy::large_enum_variant)]
 enum BlameArgs {
     Run(BlameOptions),
     Help,
@@ -1432,7 +1434,7 @@ fn read_worktree_image(
                         bytes
                     } else {
                         sley_worktree::apply_clean_filter(
-                            &root,
+                            root,
                             repo.git_dir(),
                             repo.config(),
                             repo_path.as_bytes(),
@@ -2346,7 +2348,7 @@ fn collect_tree_blob_paths(
         if !path.is_empty() {
             path.push(b'/');
         }
-        path.extend_from_slice(&entry.name);
+        path.extend_from_slice(entry.name);
         match sley_object::tree_entry_object_type(entry.mode) {
             ObjectType::Tree => collect_tree_blob_paths(db, format, &entry.oid, path, out)?,
             ObjectType::Blob => out.push(String::from_utf8_lossy(&path).into_owned()),
@@ -2796,8 +2798,8 @@ fn scan_parent_range(
     const FINGERPRINT_FILE_THRESHOLD: i32 = 10;
     let mut best_sim_val = FINGERPRINT_FILE_THRESHOLD;
     let mut best_sim_idx: i32 = -1;
-    for p_idx in from..(from + nr_lines) {
-        let sim = fingerprint_similarity(&target_fps[t_idx], &parent_fps[p_idx]);
+    for (p_idx, parent_fp) in parent_fps.iter().enumerate().skip(from).take(nr_lines) {
+        let sim = fingerprint_similarity(&target_fps[t_idx], parent_fp);
         if sim < best_sim_val {
             continue;
         }
@@ -3115,7 +3117,7 @@ fn pop_newest_origin(
     }
     // Ensure every queued commit has a cached date.
     for oid in queue.iter().map(|origin| origin.commit) {
-        if !date_cache.contains_key(&oid) {
+        if let std::collections::hash_map::Entry::Vacant(e) = date_cache.entry(oid) {
             let object = db.read_object(&oid)?;
             if object.object_type != ObjectType::Commit {
                 return Err(GitError::InvalidObject(format!(
@@ -3125,7 +3127,7 @@ fn pop_newest_origin(
             }
             let commit = Commit::parse(format, &object.body)?;
             let ts = for_each_ref_identity_timestamp(&commit.committer).unwrap_or(0);
-            date_cache.insert(oid, ts);
+            e.insert(ts);
         }
     }
     let mut best = 0usize;

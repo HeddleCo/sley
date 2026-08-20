@@ -126,6 +126,9 @@ pub fn myers_diff_lines(old: &[DiffLine<'_>], new: &[DiffLine<'_>]) -> Vec<DiffO
 /// ops are appended to `out` in order; they are coalesced by the caller. This
 /// is the algorithm from Myers' 1986 paper, which yields a shortest edit script
 /// (minimal number of insertions + deletions).
+// Myers' diagonal coordinates intentionally index the old and new inputs with
+// different offsets.
+#[allow(clippy::suspicious_operation_groupings)]
 fn myers_core(old: &[DiffLine<'_>], new: &[DiffLine<'_>], out: &mut Vec<DiffOp>) {
     let n = old.len() as isize;
     let m = new.len() as isize;
@@ -572,6 +575,8 @@ fn emit_trivial_range(a0: usize, a1: usize, b0: usize, b1: usize, out: &mut Vec<
 /// can emit its `Equal` *after* it has processed the inner range. This keeps
 /// the per-range work proportional to the actual edit, mirroring the prefix /
 /// suffix trim in [`myers_diff_lines`].
+// The two ranges have independent bounds and offsets by design.
+#[allow(clippy::suspicious_operation_groupings)]
 fn trim_common(
     old: &[DiffLine<'_>],
     new: &[DiffLine<'_>],
@@ -908,6 +913,8 @@ struct HistogramRegion {
 /// length, then by earliest position). This is the JGit/`git --histogram`
 /// heuristic: rare lines make the most reliable anchors. Returns `None` if no
 /// `new` line appears in the `old` range.
+// Candidate runs intentionally compare independently offset input ranges.
+#[allow(clippy::suspicious_operation_groupings)]
 fn histogram_region(
     old: &[DiffLine<'_>],
     new: &[DiffLine<'_>],
@@ -1280,7 +1287,7 @@ fn middle_snake_mark_changed(
     old_changed: &mut [bool],
     new_changed: &mut [bool],
 ) {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::suspicious_operation_groupings)]
     fn recs_cmp(
         old: &[DiffLine<'_>],
         new: &[DiffLine<'_>],

@@ -7,7 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-sley-cli.workspace = true
 sley-core.workspace = true
 sley-formats.workspace = true
 sley-object.workspace = true
@@ -18,7 +17,7 @@ sley-rev.workspace = true
 sley-worktree.workspace = true
 
 [dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 
 [[bench]]
 name = "cat_file"

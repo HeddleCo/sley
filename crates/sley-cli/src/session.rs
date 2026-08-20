@@ -585,21 +585,6 @@ pub(crate) fn cli_remote_git_dir_from(start: impl AsRef<Path>) -> Result<PathBuf
     discovery::resolve_git_dir_walk_only(start)
 }
 
-/// Convenience for commands that already have a loaded config snapshot.
-impl CliSession {
-    pub(crate) fn with_config<'a>(&'a self, config: &'a GitConfig) -> CliSessionView<'a> {
-        CliSessionView {
-            session: self,
-            config,
-        }
-    }
-}
-
-pub(crate) struct CliSessionView<'a> {
-    pub session: &'a CliSession,
-    pub config: &'a GitConfig,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,7 +693,7 @@ mod tests {
         let second_root = root.join("second");
         Repository::init(&first_root).expect("initialize first repository");
         let second = Repository::init(&second_root).expect("initialize second repository");
-        let mut session = session(first_root.clone(), None);
+        let mut session = session(first_root, None);
 
         let first = session.repository_snapshot().expect("first snapshot");
         merge_global_overrides(

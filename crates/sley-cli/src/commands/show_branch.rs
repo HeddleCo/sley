@@ -115,7 +115,7 @@ pub(crate) fn cmd_show_branch(
 ) -> Result<()> {
     let options = parse_args(args)?;
 
-    let cwd = env::current_dir()?;
+    let _cwd = env::current_dir()?;
     let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let db =

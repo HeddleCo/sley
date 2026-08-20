@@ -1342,10 +1342,7 @@ pub(super) fn verify_commit_graph_bytes(
     bytes: &[u8],
     progress: bool,
 ) -> Result<()> {
-    let parsed = match parse_commit_graph_for_verify(bytes, format) {
-        Ok(parsed) => parsed,
-        Err(exit) => return Err(exit),
-    };
+    let parsed = parse_commit_graph_for_verify(bytes, format)?;
 
     let db = FileObjectDatabase::new(object_dir, format);
     let mut had_error = false;

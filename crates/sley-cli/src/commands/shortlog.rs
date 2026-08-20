@@ -110,7 +110,7 @@ pub(crate) fn cmd_shortlog(
 /// emitting git-compatible diagnostics.
 fn parse_shortlog_args(args: &[String]) -> Result<ShortlogOptions> {
     let mut options = ShortlogOptions::default();
-    let mut iter = args.iter().peekable();
+    let mut iter = args.iter();
     let mut no_more_options = false;
     while let Some(arg) = iter.next() {
         if no_more_options {
@@ -668,7 +668,6 @@ fn wrap_shortlog_bytes(text: &[u8], width: usize, indent1: usize, indent2: usize
             lines.push(current);
             current = Vec::new();
             current_indent = indent2;
-            column = indent2;
             first_word_on_line = true;
         }
         if first_word_on_line {
@@ -906,15 +905,6 @@ fn shortlog_stdin_identity_key(
     } else {
         Some(name)
     }
-}
-
-/// Fold a commit message into its summary subject (revision-walk path). Mirrors
-/// git's `format_subject`: skip leading blank lines, then join message lines up to
-/// the first blank line with single spaces (trailing whitespace stripped per
-/// line, the first line's leading whitespace trimmed off the joined result).
-fn shortlog_subject(message: &[u8]) -> String {
-    let text = String::from_utf8_lossy(message);
-    shortlog_subject_from_text(&text)
 }
 
 fn shortlog_subject_bytes(message: &[u8]) -> Vec<u8> {

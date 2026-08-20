@@ -10,15 +10,15 @@ license.workspace = true
 [dependencies]
 # Backend selected by the mutually-exclusive zlib-rs/pure-rust features below;
 # no backend baked into the dep line (see sley-pack for the cfg-cascade rationale).
-crc32fast = "1"
-flate2 = { version = "1", default-features = false }
-parking_lot = "0.12"
-smallvec = "1"
+crc32fast = "1.5.0"
+flate2 = { version = "1.1.9", default-features = false }
+parking_lot = "0.12.5"
+smallvec = "1.15.2"
 sley-core.workspace = true
 sley-formats.workspace = true
 sley-mmap = { workspace = true, optional = true }
 sley-object.workspace = true
-sley-pack = { path = "../sley-pack", version = "0.5.2", default-features = false } # inline: default-features override cant use workspace inherit
+sley-pack = { path = "../sley-pack", version = "0.6.0", default-features = false } # inline: default-features override cant use workspace inherit
 
 [features]
 default = ["zlib-rs"]

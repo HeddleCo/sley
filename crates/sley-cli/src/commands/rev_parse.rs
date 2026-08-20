@@ -741,20 +741,6 @@ fn rev_parse_resolve_commitish(repository: &RevParseRepository<'_>, rev: &str) -
     )
 }
 
-fn rev_parse_split_range(rev: &str) -> Option<(&str, &str, bool)> {
-    if let Some(colon) = rev.find(':') {
-        let dots = rev.find("..")?;
-        if colon < dots {
-            return None;
-        }
-    }
-    if let Some(pos) = rev.find("...") {
-        return Some((&rev[..pos], &rev[pos + 3..], true));
-    }
-    rev.find("..")
-        .map(|pos| (&rev[..pos], &rev[pos + 2..], false))
-}
-
 fn rev_parse_normalize_revision_arg(
     cli_session: &crate::session::CliSession,
     cwd: &Path,
@@ -992,7 +978,7 @@ fn rev_parse_maybe_print_ambiguity(
 }
 
 fn rev_parse_ambiguity_context(
-    format: ObjectFormat,
+    _format: ObjectFormat,
     rev: &str,
     err: &GitError,
 ) -> Option<(String, sley_rev::ObjectDisambiguation)> {
@@ -1526,9 +1512,9 @@ fn parse_rev_parse_parseopt_args<'a>(
     Ok((parsed, positionals))
 }
 
-fn parse_rev_parse_parseopt_short_bundle<'a>(
+fn parse_rev_parse_parseopt_short_bundle(
     parsed: &mut String,
-    args: &'a [String],
+    args: &[String],
     idx: &mut usize,
     specs: &[RevParseParseOptSpec],
     flags: RevParseParseOptFlags,
@@ -1982,7 +1968,7 @@ fn rev_parse_bisect(repository: &RevParseRepository<'_>, symbolic_full_name: boo
         let rendered = if symbolic_full_name {
             reference.name.clone()
         } else {
-            match resolve_ref_peeled(&store, &reference.name)? {
+            match resolve_ref_peeled(store, &reference.name)? {
                 Some(oid) => oid.to_hex(),
                 None => return Ok(()),
             }
@@ -2547,7 +2533,7 @@ fn verify_repository_format(
         return Ok(ObjectFormat::Sha1);
     };
     let Some(version_value) = config.get("core", None, "repositoryformatversion") else {
-        return Ok(config.repository_object_format()?);
+        return config.repository_object_format();
     };
     let version: i64 = version_value.trim().parse().unwrap_or(0);
     if version > 1 {
@@ -2737,10 +2723,9 @@ fn superproject_working_tree(git_dir: &Path) -> Result<Option<PathBuf>> {
         };
         if super_git_dir.file_name().and_then(|name| name.to_str()) == Some(".git")
             && is_git_dir_candidate(super_git_dir)
+            && let Some(worktree_root) = sley_worktree::worktree_root_for_git_dir(super_git_dir)?
         {
-            if let Some(worktree_root) = sley_worktree::worktree_root_for_git_dir(super_git_dir)? {
-                return Ok(Some(fs::canonicalize(worktree_root)?));
-            }
+            return Ok(Some(fs::canonicalize(worktree_root)?));
         }
     }
     Ok(None)

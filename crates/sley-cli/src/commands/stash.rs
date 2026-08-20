@@ -2889,6 +2889,7 @@ fn cmd_stash_store(cli_session: &crate::session::CliSession, args: &[String]) ->
 ///   * a bare number `n` → `stash@{n}`;
 ///   * anything else → resolved as a general revision (a raw oid, `stash@{n}`,
 ///     any commit-ish), then validated to be stash-like (a merge commit).
+///
 /// This is what lets `stash show <oid>` / `stash branch <name> <oid>` accept a
 /// "stash-like argument" produced by `git stash create`.
 fn resolve_stash_argument(
@@ -4272,7 +4273,7 @@ fn write_stash_export_chain(
             tree: empty_tree,
             parents: Vec::new(),
             author: ident.clone(),
-            committer: ident.clone(),
+            committer: ident,
             message: Vec::new(),
             encoding: None,
             signature: None,
@@ -4338,7 +4339,7 @@ fn read_stash_export_chain(
     format: ObjectFormat,
     chain: &ObjectId,
 ) -> Result<Vec<ObjectId>> {
-    let empty_tree = empty_tree_oid(db, format)?;
+    let empty_tree = empty_tree_oid(format)?;
     let mut current = *chain;
     let mut stashes = Vec::new();
     loop {
@@ -4374,14 +4375,8 @@ fn read_stash_export_chain(
     Ok(stashes)
 }
 
-fn empty_tree_oid(db: &FileObjectDatabase, format: ObjectFormat) -> Result<ObjectId> {
-    sley_core::object_id_for_bytes(format, "tree", &[]).and_then(|oid| {
-        if db.read_object(&oid).is_ok() {
-            Ok(oid)
-        } else {
-            Ok(oid)
-        }
-    })
+fn empty_tree_oid(format: ObjectFormat) -> Result<ObjectId> {
+    sley_core::object_id_for_bytes(format, "tree", &[])
 }
 
 fn stash_export_identity() -> Vec<u8> {
@@ -4393,13 +4388,6 @@ fn stash_export_identity() -> Vec<u8> {
 /// `git stash create autostash` for the rebase autostash machinery: returns
 /// the stash commit oid without touching `refs/stash`, `None` when the tree
 /// is clean.
-pub(crate) fn create_stash_for_autostash(
-    cli_session: &crate::session::CliSession,
-) -> Result<Option<ObjectId>> {
-    let git_dir = cli_session.git_dir()?;
-    create_stash_for_autostash_at(&git_dir, cli_session.cwd())
-}
-
 pub(crate) fn create_stash_for_autostash_at(
     git_dir: &Path,
     cwd: &Path,
@@ -4434,7 +4422,7 @@ pub(crate) fn store_stash_commit_at(
     stash_oid: &ObjectId,
     message: &str,
 ) -> Result<()> {
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     validate_stash_like_commit(&db, format, stash_oid)?;
@@ -4450,27 +4438,13 @@ pub(crate) fn store_stash_commit_at(
 
 /// `git stash apply <oid>` with all output suppressed; `Ok(false)` when the
 /// stash cannot be applied cleanly (the caller stores it instead).
-pub(crate) fn apply_stash_commit_quietly(
-    cli_session: &crate::session::CliSession,
-    stash_oid: &ObjectId,
-) -> Result<bool> {
-    let git_dir = cli_session.git_dir()?;
-    let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
-    apply_stash_commit_quietly_at(
-        &git_dir,
-        &worktree_root,
-        stash_oid,
-        cli_session.lazy_fetch(),
-    )
-}
-
 pub(crate) fn apply_stash_commit_quietly_at(
     git_dir: &Path,
     worktree_root: &Path,
     stash_oid: &ObjectId,
     lazy_fetch: bool,
 ) -> Result<bool> {
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -4483,7 +4457,7 @@ pub(crate) fn apply_stash_commit_quietly_at(
     let Ok(stash_commit) = Commit::parse(format, &stash_object.body) else {
         return Ok(false);
     };
-    let head_store = FileRefStore::new(&git_dir, format);
+    let head_store = FileRefStore::new(git_dir, format);
     let Some((head_oid, head_commit)) = stash_head_commit(&head_store, &db, format)? else {
         return Ok(false);
     };
@@ -4507,8 +4481,8 @@ pub(crate) fn apply_stash_commit_quietly_at(
     };
     let _ = (&head_oid, &head_commit);
     let stash_state = StashApplyState {
-        worktree_root: &worktree_root,
-        git_dir: &git_dir,
+        worktree_root,
+        git_dir,
         base_tree: &base_commit.tree,
         stash_tree: &stash_commit.tree,
         index_tree: &index_commit.tree,
@@ -4519,7 +4493,7 @@ pub(crate) fn apply_stash_commit_quietly_at(
         ours: "Updated upstream",
         theirs: "Stashed changes",
         base: "Stash base",
-        style: stash_apply_conflict_style(&git_dir),
+        style: stash_apply_conflict_style(git_dir),
     };
     match apply_stash_via_merge(
         &db,
@@ -4541,7 +4515,7 @@ pub(crate) fn apply_stash_commit_quietly_at(
         let Ok(untracked_commit) = Commit::parse(format, &untracked_object.body) else {
             return Ok(false);
         };
-        restore_stash_tree_to_worktree(&worktree_root, &db, format, &untracked_commit.tree)?;
+        restore_stash_tree_to_worktree(worktree_root, &db, format, &untracked_commit.tree)?;
     }
     Ok(true)
 }

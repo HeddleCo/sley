@@ -128,10 +128,10 @@ fn is_root_ref(name: &str) -> bool {
 /// Strip a leading `worktrees/<id>/` segment (refs.c `parse_worktree_ref`),
 /// yielding the stripped refname used for HEAD classification.
 fn strip_worktree_prefix(refname: &str) -> &str {
-    if let Some(rest) = refname.strip_prefix("worktrees/") {
-        if let Some((_id, tail)) = rest.split_once('/') {
-            return tail;
-        }
+    if let Some(rest) = refname.strip_prefix("worktrees/")
+        && let Some((_id, tail)) = rest.split_once('/')
+    {
+        return tail;
     }
     refname
 }
@@ -191,9 +191,8 @@ fn files_fsck_symref_target(
     symbolic_link: bool,
 ) -> bool {
     let mut had_error = false;
-    let target;
-    if symbolic_link {
-        target = referent;
+    let target = if symbolic_link {
+        referent
     } else {
         let orig_len = referent.len();
         let trimmed = referent.trim_end_matches(is_c_space);
@@ -210,8 +209,8 @@ fn files_fsck_symref_target(
                 "has trailing whitespaces or newlines",
             );
         }
-        target = trimmed;
-    }
+        trimmed
+    };
     had_error |= refs_fsck_symref(opts, refname, target);
     had_error
 }
@@ -719,14 +718,14 @@ fn packed_fsck_sorted(opts: &RefsVerifyOptions, format: ObjectFormat, buf: &[u8]
         } else {
             String::new()
         };
-        if let Some(prev) = &former {
-            if prev.as_bytes() >= current.as_bytes() {
-                return opts.report(
-                    &format!("packed-refs line {line_number}"),
-                    MsgId::PackedRefUnsorted,
-                    &format!("refname '{current}' is less than previous refname '{prev}'"),
-                );
-            }
+        if let Some(prev) = &former
+            && prev.as_bytes() >= current.as_bytes()
+        {
+            return opts.report(
+                &format!("packed-refs line {line_number}"),
+                MsgId::PackedRefUnsorted,
+                &format!("refname '{current}' is less than previous refname '{prev}'"),
+            );
         }
         former = Some(current);
         pos = eol + 1;

@@ -57,6 +57,54 @@ fn utf8_trimmed(bytes: Vec<u8>) -> String {
 }
 
 #[test]
+fn diff_respects_explicit_worktree_nested_below_git_dir() {
+    let root = unique_temp_dir("diff-worktree-below-git-dir");
+    fs::create_dir_all(root.join("work/sub/dir")).expect("create nested worktree");
+    git(&root, &["init", "-q", "-b", "main"]);
+    fs::rename(root.join(".git"), root.join("repo.git")).expect("move git directory");
+    fs::rename(root.join("work"), root.join("repo.git/work")).expect("nest worktree");
+    fs::write(root.join("repo.git/work/sub/dir/tracked"), b"").expect("write empty fixture");
+
+    let run_with_layout = |program: &str, args: &[&str]| {
+        let output = Command::new(program)
+            .current_dir(&root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env("GIT_DIR", "repo.git")
+            .env("GIT_WORK_TREE", "repo.git/work")
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"));
+        assert!(
+            output.status.success(),
+            "{program} {args:?} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+
+    run_with_layout(sley_testkit::oracle_git(), &["add", "sub/dir/tracked"]);
+    fs::write(root.join("repo.git/work/sub/dir/tracked"), b"changed\n")
+        .expect("modify tracked fixture");
+    git(
+        &root,
+        &[
+            "--git-dir=repo.git",
+            "config",
+            "core.worktree",
+            "non-existent",
+        ],
+    );
+
+    assert_eq!(
+        run_with_layout(sley_testkit::sley_bin!(), &["diff"]),
+        run_with_layout(sley_testkit::oracle_git(), &["diff"]),
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn diff_name_only_matches_upstream_git() {
     let root = unique_temp_dir("diff-name-only");
     fs::create_dir_all(&root).expect("create temp repo");

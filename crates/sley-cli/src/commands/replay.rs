@@ -198,7 +198,6 @@ fn run_git_replay(cli_session: &crate::session::CliSession, args: &[String]) -> 
             ReplayAction::Pick
         },
         git_dir,
-        common_git_dir,
         worktree_root,
         format,
         config,
@@ -601,7 +600,7 @@ fn replay_one_commit_to(
             author,
             committer: commit_identity_from_env("COMMITTER", &ctx.config)?,
             message,
-            encoding: commit.encoding.clone(),
+            encoding: commit.encoding,
             signature: None,
         },
     )
@@ -789,7 +788,7 @@ fn parse_replay_args(action: ReplayAction, args: &[String]) -> Result<ParsedRepl
         *current = Some(mode);
         Ok(())
     };
-    let mut iter = args.iter().peekable();
+    let mut iter = args.iter();
     let mut seen_dashdash = false;
     while let Some(arg) = iter.next() {
         if seen_dashdash {
@@ -927,7 +926,6 @@ fn parse_mainline(value: &str) -> Result<u32> {
 struct ReplayCtx {
     action: ReplayAction,
     git_dir: PathBuf,
-    common_git_dir: PathBuf,
     worktree_root: PathBuf,
     format: ObjectFormat,
     config: GitConfig,
@@ -964,7 +962,6 @@ fn run_replay(
     let ctx = ReplayCtx {
         action,
         git_dir,
-        common_git_dir,
         worktree_root,
         format,
         config,
@@ -1525,7 +1522,7 @@ fn do_pick_commit(
             };
             let theirs = sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree)
                 .map_err(print_fatal_error)?;
-            (base, theirs, label.clone(), parent_label.clone())
+            (base, theirs, label, parent_label)
         }
         ReplayAction::Revert => {
             let base = sley_diff_merge::flatten_tree(&db, ctx.format, &commit.tree)
@@ -1534,7 +1531,7 @@ fn do_pick_commit(
                 Some(parent) => tree_map_of_commit(ctx, &db, parent)?,
                 None => MergeTreeMap::new(),
             };
-            (base, theirs, parent_label.clone(), label.clone())
+            (base, theirs, parent_label, label)
         }
     };
     let ours_map =
@@ -1595,7 +1592,7 @@ fn do_pick_commit(
             fs::write(ctx.git_dir.join("REVERT_HEAD"), format!("{}\n", item.oid))
                 .map_err(|err| print_fatal_error(GitError::from(err)))?;
         }
-        let mut merge_msg = message.clone();
+        let mut merge_msg = message;
         append_conflicts_hint(&mut merge_msg, &conflicts, cleanup_mode.as_deref());
         fs::write(ctx.git_dir.join("MERGE_MSG"), merge_msg)
             .map_err(|err| print_fatal_error(GitError::from(err)))?;
@@ -1882,10 +1879,14 @@ pub(crate) fn comment_char(git_dir: &Path) -> u8 {
 }
 
 pub(crate) fn strip_comment_lines(message: &[u8], comment: u8) -> Vec<u8> {
+    strip_comment_string_lines(message, &[comment])
+}
+
+pub(crate) fn strip_comment_string_lines(message: &[u8], comment: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(message.len());
     let mut blank_pending = false;
     for line in message.split_inclusive(|&b| b == b'\n') {
-        if line.first() == Some(&comment) {
+        if !comment.is_empty() && line.starts_with(comment) {
             continue;
         }
         let body = line.strip_suffix(b"\n").unwrap_or(line);
@@ -1915,6 +1916,20 @@ pub(crate) fn strip_comment_lines(message: &[u8], comment: u8) -> Vec<u8> {
         cleaned.push(b'\n');
     }
     cleaned
+}
+
+#[cfg(test)]
+mod comment_cleanup_tests {
+    use super::strip_comment_string_lines;
+
+    #[test]
+    fn strips_the_complete_multibyte_comment_prefix() {
+        let message = b"A3\n\nCOMMENT generated help\nCOMMENT status\n\nedited\n";
+        assert_eq!(
+            strip_comment_string_lines(message, b"COMMENT"),
+            b"A3\n\nedited\n"
+        );
+    }
 }
 
 /// `has_conforming_footer` (approximation): the last paragraph consists of
@@ -2000,9 +2015,7 @@ pub(crate) fn append_signoff_before_comments_with_config(
         let len = out.len();
         if len == 0 {
             out.extend_from_slice(b"\n\n");
-        } else if len == 1 {
-            out.push(b'\n');
-        } else if out[len - 2] != b'\n' {
+        } else if len == 1 || out[len - 2] != b'\n' {
             out.push(b'\n');
         }
         // else: already ends with two newlines — nothing to add.
@@ -2652,16 +2665,16 @@ fn continue_single_pick(ctx: &ReplayCtx, opts: &ReplayOpts) -> Result<()> {
     let index_path = sley_worktree::repository_index_path(&ctx.git_dir);
     if let Ok(bytes) = fs::read(&index_path) {
         let index = Index::parse(&bytes, ctx.format)?;
-        let unmerged: Vec<String> = index
+        let mut has_unmerged = false;
+        for entry in index
             .entries
             .iter()
             .filter(|entry| index_entry_stage(entry) > 0)
-            .map(|entry| entry.path.to_string())
-            .collect();
-        if !unmerged.is_empty() {
-            for path in unmerged.iter().collect::<BTreeSet<_>>() {
-                println!("U\t{path}");
-            }
+        {
+            has_unmerged = true;
+            println!("U\t{}", entry.path);
+        }
+        if has_unmerged {
             eprintln!("error: Committing is not possible because you have unmerged files.");
             eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
             eprintln!("hint: as appropriate to mark resolution and make a commit.");

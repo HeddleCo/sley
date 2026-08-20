@@ -283,7 +283,7 @@ pub fn execute_history_reword(
     )?;
 
     let refs = FileRefStore::new(git_dir, format);
-    let mut tips = reference_tips(&refs, request.scope)?;
+    let tips = reference_tips(&refs, request.scope)?;
     let mut memo = HashMap::from([(request.analysis.original_oid, replacement)]);
     let mut updated = Vec::new();
     let mut rewriter = DescendantRewriter {
@@ -294,7 +294,7 @@ pub fn execute_history_reword(
         committer: &request.committer,
         memo: &mut memo,
     };
-    for (name, old) in tips.drain(..) {
+    for (name, old) in tips {
         let mut visiting = HashSet::new();
         if let Some(new) = rewriter.rewrite(old, &mut visiting)? {
             updated.push((name, old, new));
@@ -374,7 +374,7 @@ pub fn execute_history_split(
 
     let refs = FileRefStore::new(git_dir, format);
     validate_history_split_targets(git_dir, format, db, &request.analysis, request.scope)?;
-    let mut tips = reference_tips(&refs, request.scope)?;
+    let tips = reference_tips(&refs, request.scope)?;
 
     let mut memo = HashMap::from([(request.analysis.original_oid, second)]);
     let mut updated = Vec::new();
@@ -386,7 +386,7 @@ pub fn execute_history_split(
         committer: &request.committer,
         memo: &mut memo,
     };
-    for (name, old) in tips.drain(..) {
+    for (name, old) in tips {
         let mut visiting = HashSet::new();
         if let Some(new) = rewriter.rewrite(old, &mut visiting)? {
             updated.push((name, old, new));

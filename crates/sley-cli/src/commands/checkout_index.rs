@@ -1060,18 +1060,6 @@ fn read_checkout_index_stdin(nul: bool) -> Result<Vec<Vec<u8>>> {
         .collect())
 }
 
-fn checkout_index_option_requires_value(name: &str) -> GitError {
-    eprintln!("error: option `{name}' requires a value");
-    GitError::Exit(129)
-}
-
-fn checkout_index_unknown_option(value: &str) -> GitError {
-    let display = value.strip_prefix("--").unwrap_or(value);
-    eprintln!("error: unknown option `{display}'");
-    print_checkout_index_usage();
-    GitError::Exit(129)
-}
-
 fn checkout_index_help() -> GitError {
     print_checkout_index_usage_to_stdout();
     GitError::Exit(129)

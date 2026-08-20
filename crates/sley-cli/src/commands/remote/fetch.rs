@@ -12,22 +12,14 @@ use super::pack::{
     trace2_local_transfer_negotiation, unique_abbrev,
 };
 use super::resolve::{RemoteCommandContext, local_remote_git_dir, ls_remote_git_dir};
-use crate::commands::config_cmd::{
-    ConfigKey, SimpleConfigRegex, config_set_value, parse_config_key,
-};
-use crate::remote::{
-    remote_config_values, resolve_remote_fetch_url, resolve_remote_push_url,
-    rewrite_url_with_config,
-};
+use crate::commands::config_cmd::{ConfigKey, config_set_value};
+use crate::remote::{remote_config_values, resolve_remote_fetch_url, rewrite_url_with_config};
 use crate::*;
 use sley::plumbing::sley_odb::ObjectReader;
-use sley::plumbing::sley_remote::{
-    FetchOptions, LsRemoteRecord, PackGenerationProgress, TransferProgress,
-};
+use sley::plumbing::sley_remote::{FetchOptions, PackGenerationProgress, TransferProgress};
 use std::env;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::process::Command as Proc;
 
 fn fetch_repository_plan(
     git_dir: &Path,
@@ -41,12 +33,6 @@ fn fetch_repository_plan(
         current_branch.as_deref(),
         requested_remote,
     ))
-}
-
-pub(super) fn default_fetch_remote(context: &RemoteCommandContext) -> Result<String> {
-    let git_dir = context.required_git_dir()?;
-    let format = repository_object_format(git_dir)?;
-    Ok(fetch_repository_plan(git_dir, format, context.required_config()?, None)?.remote)
 }
 
 pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
@@ -425,7 +411,7 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
     // worktree branch could be overwritten by fetch (t5516 #120).
     let config = context.required_config()?;
     // Resolve display format early so invalid `fetch.output` fails before work.
-    let display = resolve_fetch_display(&config, porcelain, show_forced_updates)?;
+    let display = resolve_fetch_display(config, porcelain, show_forced_updates)?;
     if display.format == FetchDisplayFormat::Porcelain {
         match recurse_submodules_cli {
             FetchRecurseSubmodules::Default | FetchRecurseSubmodules::Off => {}
@@ -463,7 +449,7 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
             eprintln!("fatal: fetch --all does not make sense with refspecs");
             return Err(GitError::Exit(128));
         }
-        let remotes = fetch_all_remote_names(&config);
+        let remotes = fetch_all_remote_names(config);
         fetch_multiple_remotes(FetchMultipleRequest {
             git_dir,
             format,
@@ -496,8 +482,8 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
     if fetch_multiple {
         let mut names = Vec::new();
         names.push(source.take().unwrap());
-        names.extend(refspecs.drain(..));
-        let remotes = resolve_remote_or_group_names(&config, &names)?;
+        names.append(&mut refspecs);
+        let remotes = resolve_remote_or_group_names(config, &names)?;
         fetch_multiple_remotes(FetchMultipleRequest {
             git_dir,
             format,
@@ -649,7 +635,7 @@ pub(crate) fn cmd_fetch(cli_session: &crate::session::CliSession, args: &[String
     let config = refreshed_config.as_ref().unwrap_or(config);
     trace2_local_transfer_negotiation(config, upload_pack_command.as_deref());
     let recurse_submodules = resolve_fetch_recurse_submodules(
-        &config,
+        config,
         recurse_submodules_cli,
         recurse_submodules_default,
     );
@@ -909,9 +895,9 @@ fn parse_fetch_jobs(value: &str) -> Result<Option<usize>> {
         .parse::<isize>()
         .map_err(|_| GitError::Command(format!("invalid number of parallel jobs: {value}")))?;
     if parsed < 0 {
-        return Err(GitError::Command(format!(
-            "negative values not allowed for submodule.fetchJobs"
-        )));
+        return Err(GitError::Command(
+            "negative values not allowed for submodule.fetchJobs".to_string(),
+        ));
     }
     if parsed == 0 {
         Ok(None)
@@ -1376,14 +1362,13 @@ fn fetch_recurse_mode_for_submodule(
             return mode;
         }
     }
-    if let Ok(gitmodules) = GitConfig::read(worktree_root.join(".gitmodules")) {
-        if let Some(value) =
+    if let Ok(gitmodules) = GitConfig::read(worktree_root.join(".gitmodules"))
+        && let Some(value) =
             gitmodules.get("submodule", Some(&submodule.path), "fetchrecursesubmodules")
-        {
-            let mode = FetchRecurseSubmodules::from_config(value);
-            if mode != FetchRecurseSubmodules::Default {
-                return mode;
-            }
+    {
+        let mode = FetchRecurseSubmodules::from_config(value);
+        if mode != FetchRecurseSubmodules::Default {
+            return mode;
         }
     }
     inherited
@@ -1707,10 +1692,10 @@ fn exact_oid_sources_from_refspecs(format: ObjectFormat, refspecs: &[String]) ->
         if src.is_empty() || src.contains('*') {
             continue;
         }
-        if let Ok(oid) = ObjectId::from_hex(format, src) {
-            if seen.insert(oid) {
-                wants.push(oid);
-            }
+        if let Ok(oid) = ObjectId::from_hex(format, src)
+            && seen.insert(oid)
+        {
+            wants.push(oid);
         }
     }
     wants
@@ -1749,7 +1734,7 @@ fn reject_raw_oid_wants_if_disallowed(
 ) -> Result<()> {
     let protocol_v0 = env::var("GIT_TEST_PROTOCOL_VERSION").ok().as_deref() == Some("0")
         || matches!(
-            client_config.get("protocol", None, "version").as_deref(),
+            client_config.get("protocol", None, "version"),
             Some("0") | Some("1")
         );
     if !protocol_v0 {
@@ -2633,7 +2618,7 @@ fn print_fetch_status(
         let remote = prettify_refname(&update.src);
         let local_pretty = prettify_refname(dst);
         let old_oid = old.unwrap_or(zero);
-        let new_oid = if is_rejected { update.oid } else { update.oid };
+        let new_oid = update.oid;
 
         let (code, summary, error) = if is_rejected {
             (
@@ -2770,11 +2755,11 @@ fn find_and_replace_compact(haystack: &mut String, needle: &str, placeholder: &s
         return true;
     }
     // Prefer end-anchored match (`foo/bar` vs `bar` → `foo/*`).
-    if let Some(prefix) = haystack.strip_suffix(needle) {
-        if prefix.is_empty() || prefix.ends_with('/') {
-            *haystack = format!("{prefix}{placeholder}");
-            return true;
-        }
+    if let Some(prefix) = haystack.strip_suffix(needle)
+        && (prefix.is_empty() || prefix.ends_with('/'))
+    {
+        *haystack = format!("{prefix}{placeholder}");
+        return true;
     }
     if let Some(idx) = haystack.find(needle) {
         let before = &haystack[..idx];
@@ -2859,7 +2844,7 @@ fn maybe_set_remote_head_on_fetch(
         let hook_updates = [sley_refs::RefTransactionHookUpdate {
             old_value: zero,
             new_value: format!("ref:{target}"),
-            refname: head_ref.clone(),
+            refname: head_ref,
         }];
         let _ = sley_refs::ReferenceTransactionHook::run(
             &hook,
@@ -2870,10 +2855,8 @@ fn maybe_set_remote_head_on_fetch(
         // family git additionally reports when the local HEAD disagrees with the
         // remote's advertised default branch (builtin/fetch.c `report_set_head`).
         // The message goes to stdout and only when not quiet (`verbosity >= 0`).
-        if !quiet {
-            if let Some(existing) = existing.as_ref() {
-                report_followremotehead_warn(follow, source, head_name, existing);
-            }
+        if !quiet && let Some(existing) = existing.as_ref() {
+            report_followremotehead_warn(follow, source, head_name, existing);
         }
         return Ok(());
     }
@@ -2902,7 +2885,7 @@ fn report_followremotehead_warn(follow: &str, remote: &str, head_name: &str, exi
     } else if let Some(rest) = follow_lower.strip_prefix("warn-if-not-") {
         // Match git's case-sensitive `strcmp` on the branch name; recover the
         // original (non-lowercased) suffix to compare.
-        Some(follow["warn-if-not-".len()..].to_string()).filter(|_| !rest.is_empty())
+        (!rest.is_empty()).then(|| follow["warn-if-not-".len()..].to_string())
     } else {
         return;
     };
@@ -2946,18 +2929,6 @@ pub(crate) fn fetch_source_is_git(context: &RemoteCommandContext, source: &str) 
 /// dispatch. URL resolution and output formatting stay here; the fetch
 /// orchestration (ref-map, pack install over `ssh`, `FETCH_HEAD`, prune) lives in
 /// the library, shared with the HTTP and local transports.
-pub(crate) fn fetch_ssh_repository(
-    context: &RemoteCommandContext,
-    git_dir: &Path,
-    format: ObjectFormat,
-    source: &str,
-    refspecs: &[String],
-    options: FetchOptions,
-) -> Result<()> {
-    fetch_ssh_repository_with_outcome(context, git_dir, format, source, refspecs, options)
-        .map(|_| ())
-}
-
 pub(crate) fn fetch_ssh_repository_with_outcome(
     context: &RemoteCommandContext,
     git_dir: &Path,
@@ -2980,18 +2951,6 @@ pub(crate) fn fetch_ssh_repository_with_outcome(
         options,
         &[],
     )
-}
-
-pub(crate) fn fetch_git_repository(
-    context: &RemoteCommandContext,
-    git_dir: &Path,
-    format: ObjectFormat,
-    source: &str,
-    refspecs: &[String],
-    options: FetchOptions,
-) -> Result<()> {
-    fetch_git_repository_with_outcome(context, git_dir, format, source, refspecs, options)
-        .map(|_| ())
 }
 
 pub(crate) fn fetch_git_repository_with_outcome(
@@ -3036,18 +2995,6 @@ pub(crate) fn fetch_source_is_http(context: &RemoteCommandContext, source: &str)
 /// Resolve the repository context and delegate a smart-HTTP(S) fetch to
 /// [`sley_remote::fetch`]. URL resolution and output formatting stay here; the
 /// fetch orchestration lives in the library.
-pub(super) fn fetch_http_repository(
-    context: &RemoteCommandContext,
-    git_dir: &Path,
-    format: ObjectFormat,
-    source: &str,
-    refspecs: &[String],
-    options: FetchOptions,
-) -> Result<()> {
-    fetch_http_repository_with_outcome(context, git_dir, format, source, refspecs, options)
-        .map(|_| ())
-}
-
 pub(crate) fn fetch_http_repository_with_outcome(
     context: &RemoteCommandContext,
     git_dir: &Path,
@@ -3084,7 +3031,7 @@ pub(super) fn transport_policy_config_for_clone(cwd: &Path) -> Result<GitConfig>
         &mut config,
         &parameters,
         &context,
-        &cwd,
+        cwd,
     )
     .map_err(report_config_setup_error)?;
     Ok(config)
@@ -3116,7 +3063,7 @@ fn transport_policy_config_for_paths(cwd: &Path, git_dir: Option<&Path>) -> Resu
         &mut config,
         &parameters,
         &context,
-        &cwd,
+        cwd,
     )
     .map_err(report_config_setup_error)?;
     Ok(config)
@@ -3139,7 +3086,7 @@ pub(super) fn repo_config_with_transport_policy(
     let mut config = transport_policy_config_for_context(context)?;
     let repo_config = read_repo_config(git_dir)?;
     if let Some(current_git_dir) = context.git_dir() {
-        let current_common = common_git_dir_for_git_dir(&current_git_dir)?;
+        let current_common = common_git_dir_for_git_dir(current_git_dir)?;
         let requested_common = common_git_dir_for_git_dir(git_dir)?;
         if current_common == requested_common {
             for section in repo_config.sections {

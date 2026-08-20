@@ -380,9 +380,7 @@ fn verify_ssh_payload(
     };
     if !allowed_signers.is_file() {
         return Ok(ssh_error_verification(
-            format!(
-                "error: gpg.ssh.allowedSignersFile needs to be configured and exist for ssh signature verification\n"
-            )
+            "error: gpg.ssh.allowedSignersFile needs to be configured and exist for ssh signature verification\n".to_string()
             .as_bytes(),
         ));
     }
@@ -425,7 +423,7 @@ fn verify_ssh_payload(
         let output =
             ssh_check_novalidate(&program, &temp.signature, verify_time.as_deref(), payload)?;
         let good_output = output.stdout;
-        human_output = good_output.clone();
+        human_output = good_output;
         human_output.extend_from_slice(&find.stderr);
         human_output.extend_from_slice(&output.stderr);
     }

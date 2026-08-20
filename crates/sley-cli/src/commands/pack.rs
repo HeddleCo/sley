@@ -11,9 +11,7 @@ use sley::PackWriteOptions;
 use sley::plumbing::sley_formats::ReftableWriteOptions;
 use sley::plumbing::sley_object::EncodedObject;
 use sley::plumbing::sley_odb::{ObjectReader, ObjectWriter};
-use sley::plumbing::sley_pack::{
-    PackBitmapWriter, PackInput, PackReverseIndex, pack_order_index_positions,
-};
+use sley::plumbing::sley_pack::{PackInput, PackReverseIndex, pack_order_index_positions};
 use sley_options::{OptFlags, OptionName, ParsedValue, parse_options};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -70,7 +68,7 @@ pub(crate) fn cmd_index_pack(
                 };
                 Some((common_git_dir, format))
             }
-            Err(err) if !options.stdin && options.object_format.is_some() => None,
+            Err(_err) if !options.stdin && options.object_format.is_some() => None,
             Err(err) => return Err(err),
         },
         Err(err) => {
@@ -233,7 +231,7 @@ pub(crate) fn cmd_index_pack(
 }
 
 fn setup_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
-    let parsed = parse_options(args, index_pack_option_specs(), &INDEX_PACK_USAGE)
+    let parsed = parse_options(args, index_pack_option_specs(), INDEX_PACK_USAGE)
         .map_err(cli_usage_error)?;
     let mut options = IndexPackOptions {
         verbose: false,
@@ -724,7 +722,7 @@ pub(crate) fn cmd_verify_pack(
 }
 
 fn setup_verify_pack_options(args: &[String]) -> Result<VerifyPackOptions> {
-    let parsed = parse_options(args, verify_pack_option_specs(), &VERIFY_PACK_USAGE)
+    let parsed = parse_options(args, verify_pack_option_specs(), VERIFY_PACK_USAGE)
         .map_err(cli_usage_error)?;
     let mut format = None;
     for option in &parsed.options {
@@ -1529,7 +1527,7 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
     let mut filter_to: Option<String> = None;
     let mut name_hash_version: Option<i32> = None;
     let mut path_walk = false;
-    let mut iter = expand_repack_short_clusters(args).into_iter().peekable();
+    let mut iter = expand_repack_short_clusters(args).into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-d" => prune = true,
@@ -1705,11 +1703,11 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
     // name-hash caches always use version 1 (`pack_name_hash`). Do not emit a
     // synthetic pack-objects TRACE2 child_start: that would claim a child argv
     // that never ran. Version 2 with bitmaps only warns, matching pack-objects.
-    if let Some(version) = name_hash_version {
-        if !(1..=2).contains(&version) {
-            eprintln!("fatal: invalid --name-hash-version option: {version}");
-            return Err(GitError::Exit(128));
-        }
+    if let Some(version) = name_hash_version
+        && !(1..=2).contains(&version)
+    {
+        eprintln!("fatal: invalid --name-hash-version option: {version}");
+        return Err(GitError::Exit(128));
     }
     let config = read_repo_config(&common_git_dir)?;
     let repack_roots = if all {
@@ -1944,7 +1942,7 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             Some(filter) => sley_odb::repack_reachable_objects_with_object_filter(
                 &common_git_dir,
                 format,
-                &roots,
+                roots,
                 &options,
                 filter,
                 filter_to.as_deref().map(Path::new),
@@ -1953,7 +1951,7 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
             None => sley_odb::repack_reachable_objects_with_options(
                 &common_git_dir,
                 format,
-                &roots,
+                roots,
                 &options,
             )?,
         }
@@ -2576,8 +2574,8 @@ fn gc_run_locked(
     }
 
     let roots = repack_traversal_roots(
-        &git_dir,
-        &common_git_dir,
+        git_dir,
+        common_git_dir,
         format,
         cli_session.replace_objects(),
     )?;
@@ -2606,8 +2604,8 @@ fn gc_run_locked(
     trace_gc_repack(&trace_args);
     match gc_plan.mode {
         sley_odb::GcRepackMode::Incremental => {
-            if let Some(result) = sley_odb::repack_loose_objects(&common_git_dir, format)? {
-                sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+            if let Some(result) = sley_odb::repack_loose_objects(common_git_dir, format)? {
+                sley_odb::install_repack_result(common_git_dir, format, &result, true)?;
             }
         }
         sley_odb::GcRepackMode::Immediate => {
@@ -2619,17 +2617,17 @@ fn gc_run_locked(
                 keep_pack_stems,
             };
             if let Some(result) = sley_odb::repack_reachable_objects_with_options(
-                &common_git_dir,
+                common_git_dir,
                 format,
                 &roots,
                 &repack_options,
             )? {
-                sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+                sley_odb::install_repack_result(common_git_dir, format, &result, true)?;
             }
-            gc_remove_cruft_packs(&common_git_dir)?;
+            gc_remove_cruft_packs(common_git_dir)?;
             if let Some(spec) = prune_expire.as_deref() {
                 let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
-                gc_prune_expired_loose(&common_git_dir, format, &roots, expire)?;
+                gc_prune_expired_loose(common_git_dir, format, &roots, expire)?;
             }
         }
         sley_odb::GcRepackMode::Cruft => {
@@ -2645,7 +2643,7 @@ fn gc_run_locked(
                 keep_pack_stems,
             };
             let result = repack_cruft_with_lazy_recent_hooks(
-                &common_git_dir,
+                common_git_dir,
                 format,
                 &roots,
                 cruft_expiration,
@@ -2656,7 +2654,7 @@ fn gc_run_locked(
                 },
             )?;
             sley_odb::install_cruft_repack_result_with_expire_to(
-                &common_git_dir,
+                common_git_dir,
                 format,
                 &result,
                 true,
@@ -2669,7 +2667,7 @@ fn gc_run_locked(
             let filtered_repack = config.get("gc", None, "repackFilter") == Some("blob:none");
             if filtered_repack {
                 gc_repack_blob_none_filter(
-                    &common_git_dir,
+                    common_git_dir,
                     format,
                     &roots,
                     options.expire_to.as_deref(),
@@ -2683,19 +2681,19 @@ fn gc_run_locked(
                     keep_pack_stems,
                 };
                 if let Some(result) = sley_odb::repack_reachable_objects_with_options(
-                    &common_git_dir,
+                    common_git_dir,
                     format,
                     &roots,
                     &repack_options,
                 )? {
                     gc_unpack_recent_unreachable_from_repack(
-                        &common_git_dir,
+                        common_git_dir,
                         format,
                         &roots,
                         prune_expire.as_deref(),
                         &result,
                     )?;
-                    sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+                    sley_odb::install_repack_result(common_git_dir, format, &result, true)?;
                 }
             }
             if filtered_repack {
@@ -2703,7 +2701,7 @@ fn gc_run_locked(
             }
             if let Some(spec) = prune_expire.as_deref() {
                 let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
-                gc_prune_expired_loose(&common_git_dir, format, &roots, expire)?;
+                gc_prune_expired_loose(common_git_dir, format, &roots, expire)?;
             } else {
                 let expire = parse_prune_expire(
                     config
@@ -2711,21 +2709,21 @@ fn gc_run_locked(
                         .unwrap_or("2.weeks.ago"),
                     "gc.pruneExpire",
                 )?;
-                gc_pack_recent_unreachable_loose(&common_git_dir, format, &roots, expire)?;
+                gc_pack_recent_unreachable_loose(common_git_dir, format, &roots, expire)?;
             }
         }
     }
 
-    let store = FileRefStore::new(&common_git_dir, format)
+    let store = FileRefStore::new(common_git_dir, format)
         .with_reftable_lock_timeout_millis(reftable_lock_timeout_override()?);
     if options.auto && store.uses_reftable()? && store.reftable_table_count()? > 2 {
         store.compact_reftable_stack()?;
     }
-    if let Some(result) = sley_odb::repack_promisor_objects(&common_git_dir, format)? {
-        sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+    if let Some(result) = sley_odb::repack_promisor_objects(common_git_dir, format)? {
+        sley_odb::install_repack_result(common_git_dir, format, &result, true)?;
     }
-    gc_clean_pack_garbage(&repository_objects_dir(&common_git_dir).join("pack"))?;
-    crate::commands::refs::update_server_info_at(&common_git_dir, &[])?;
+    gc_clean_pack_garbage(&repository_objects_dir(common_git_dir).join("pack"))?;
+    crate::commands::refs::update_server_info_at(common_git_dir, &[])?;
     if gc_write_commit_graph(config) {
         let progress = if gc_progress_requested(options) {
             "--progress"
@@ -2742,7 +2740,7 @@ fn gc_run_locked(
             ],
         )?;
     }
-    if options.auto && gc_too_many_loose_objects(&common_git_dir, format, config)? {
+    if options.auto && gc_too_many_loose_objects(common_git_dir, format, config)? {
         eprintln!(
             "warning: There are too many unreachable loose objects; run 'git prune' to remove them."
         );
@@ -2752,7 +2750,7 @@ fn gc_run_locked(
 }
 
 fn setup_gc_options(args: &[String]) -> Result<GcOptions> {
-    let parsed = parse_options(args, gc_option_specs(), &GC_USAGE).map_err(cli_usage_error)?;
+    let parsed = parse_options(args, gc_option_specs(), GC_USAGE).map_err(cli_usage_error)?;
     if !parsed.positionals.is_empty() {
         return gc_usage();
     }
@@ -2990,10 +2988,10 @@ fn gc_before_repack(
 }
 
 fn gc_pack_refs(config: &GitConfig, common_git_dir: &Path) -> Result<bool> {
-    if let Some(value) = config.get("gc", None, "packRefs") {
-        if value.eq_ignore_ascii_case("notbare") {
-            return Ok(sley_worktree::worktree_root_for_git_dir(common_git_dir)?.is_some());
-        }
+    if let Some(value) = config.get("gc", None, "packRefs")
+        && value.eq_ignore_ascii_case("notbare")
+    {
+        return Ok(sley_worktree::worktree_root_for_git_dir(common_git_dir)?.is_some());
     }
     Ok(config.get_bool("gc", None, "packRefs").unwrap_or(true))
 }
@@ -3012,7 +3010,7 @@ fn gc_keep_pack_stems(
     let Some(threshold) = gc_config_u64(config, "bigPackThreshold") else {
         return Ok(HashSet::new());
     };
-    Ok(gc_pack_stems_at_least(common_git_dir, threshold)?)
+    gc_pack_stems_at_least(common_git_dir, threshold)
 }
 
 fn gc_repack_blob_none_filter(
@@ -3101,7 +3099,7 @@ fn gc_unpack_recent_unreachable_from_repack(
         return Ok(());
     };
     let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
-    if expire <= i64::MIN {
+    if expire == i64::MIN {
         return Ok(());
     }
 
@@ -4991,7 +4989,7 @@ pub(crate) fn cmd_unpack_objects(
         }
     }
     let repository = cli_session.open_repository()?;
-    let git_dir = repository.git_dir();
+    let _git_dir = repository.git_dir();
     let format = repository.object_format();
     let mut pack_bytes = Vec::new();
     io::Read::read_to_end(&mut io::stdin().lock(), &mut pack_bytes)?;
@@ -5186,7 +5184,7 @@ fn setup_pack_refs_options(args: &[String]) -> Result<PackRefsOptions> {
         return pack_refs_help();
     }
     let parsed =
-        parse_options(args, pack_refs_option_specs(), &PACK_REFS_USAGE).map_err(cli_usage_error)?;
+        parse_options(args, pack_refs_option_specs(), PACK_REFS_USAGE).map_err(cli_usage_error)?;
     if !parsed.positionals.is_empty() {
         return pack_refs_usage();
     }
@@ -5897,8 +5895,8 @@ pub(crate) fn cmd_prune(cli_session: &crate::session::CliSession, args: &[String
     let format = repository.object_format();
     let db = repository.object_database();
     let mut roots = prune_roots(
-        &git_dir,
-        &common_git_dir,
+        git_dir,
+        common_git_dir,
         format,
         cli_session.replace_objects(),
         &options.heads,
@@ -5957,7 +5955,7 @@ pub(crate) fn cmd_prune(cli_session: &crate::session::CliSession, args: &[String
         options.dry_run,
         options.verbose,
     )?;
-    prune_packed_loose_objects(&common_git_dir, format, options.dry_run)?;
+    prune_packed_loose_objects(common_git_dir, format, options.dry_run)?;
     if !options.dry_run {
         prune_empty_loose_object_dirs(&common_git_dir.join("objects"))?;
     }
@@ -5968,8 +5966,7 @@ fn setup_prune_options(args: &[String]) -> Result<PruneOptions> {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         return prune_help();
     }
-    let parsed =
-        parse_options(args, prune_option_specs(), &PRUNE_USAGE).map_err(cli_usage_error)?;
+    let parsed = parse_options(args, prune_option_specs(), PRUNE_USAGE).map_err(cli_usage_error)?;
     let mut expire = i64::MAX;
     for option in &parsed.options {
         if option.long != Some("expire") {
@@ -6187,7 +6184,7 @@ fn prune_recent_object_roots(
     format: ObjectFormat,
     expire: i64,
 ) -> Result<Vec<ObjectId>> {
-    if expire <= i64::MIN {
+    if expire == i64::MIN {
         return Ok(Vec::new());
     }
     let mut roots = Vec::new();
@@ -6221,7 +6218,7 @@ fn gc_prune_expired_loose(
     roots: &[ObjectId],
     expire: i64,
 ) -> Result<()> {
-    if expire <= i64::MIN {
+    if expire == i64::MIN {
         return Ok(());
     }
     let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
@@ -6263,7 +6260,7 @@ fn gc_pack_recent_unreachable_loose(
     roots: &[ObjectId],
     expire: i64,
 ) -> Result<()> {
-    if expire <= i64::MIN {
+    if expire == i64::MIN {
         return Ok(());
     }
     let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
@@ -6599,20 +6596,6 @@ fn prune_shallow_file(
     Ok(())
 }
 
-fn prune_usage<T>() -> Result<T> {
-    eprintln!("usage: git prune [-n] [-v] [--progress] [--expire <time>] [--] [<head>...]");
-    eprintln!();
-    eprintln!("    -n, --[no-]dry-run    do not remove, show only");
-    eprintln!("    -v, --[no-]verbose    report pruned objects");
-    eprintln!("    --[no-]progress       show progress");
-    eprintln!("    --[no-]expire <expiry-date>");
-    eprintln!("                          expire objects older than <time>");
-    eprintln!("    --[no-]exclude-promisor-objects");
-    eprintln!("                          limit traversal to objects outside promisor packfiles");
-    eprintln!();
-    Err(GitError::Exit(129))
-}
-
 /// `git prune -h`: the same usage text as `prune_usage`, but printed to stdout
 /// (git's parse-options `-h` writes to stdout and exits 129).
 fn prune_help<T>() -> Result<T> {
@@ -6912,7 +6895,7 @@ fn cmd_multi_pack_index_write_with_pack_names(
         && env::var("GIT_TEST_MIDX_WRITE_REV").is_ok_and(|value| value == "1" || value == "true");
     let layer = build_midx_layer(
         sley_odb::MultiPackIndexLayerOptions {
-            object_dir: object_dir.clone(),
+            object_dir,
             format,
             version: 1,
             pack_names,
@@ -7037,7 +7020,6 @@ struct MidxWriteIncremental<'a> {
 
 #[derive(Clone)]
 struct IncrementalMidxLayer {
-    checksum: String,
     midx: MultiPackIndex,
 }
 
@@ -7294,10 +7276,7 @@ fn read_incremental_midx_layers(
     for checksum in chain {
         let path = midx_dir.join(format!("multi-pack-index-{checksum}.midx"));
         let midx = MultiPackIndex::parse(&fs::read(path)?, format)?;
-        layers.push(IncrementalMidxLayer {
-            checksum: checksum.clone(),
-            midx,
-        });
+        layers.push(IncrementalMidxLayer { midx });
     }
     Ok(layers)
 }
@@ -7494,7 +7473,7 @@ fn cmd_multi_pack_index_compact(
         && env::var("GIT_TEST_MIDX_WRITE_REV").is_ok_and(|value| value == "1" || value == "true");
     let compacted = sley_odb::build_multi_pack_index_layer_from_entries(
         sley_odb::MultiPackIndexEntryLayerOptions {
-            object_dir: object_dir.clone(),
+            object_dir,
             format,
             version: 2,
             pack_names,
@@ -7524,10 +7503,7 @@ fn cmd_multi_pack_index_compact(
     install_incremental_midx_layer(&pack_dir, format, &compacted)?;
 
     let old: HashSet<String> = chain[from_idx..=to_idx].iter().cloned().collect();
-    chain.splice(
-        from_idx..=to_idx,
-        std::iter::once(compacted.checksum.clone()),
-    );
+    chain.splice(from_idx..=to_idx, std::iter::once(compacted.checksum));
     write_midx_chain(&pack_dir, &chain)?;
 
     let retained: HashSet<String> = chain.iter().cloned().collect();
@@ -8432,21 +8408,21 @@ pub(crate) fn cmd_pack_redundant(
         pack_redundant_scan_dir(&objects_dir.join("pack"), format, true, &mut packs)?;
         // Alternate packs are only loaded when they can matter — `--alt-odb`
         // subtracts them, `--verbose` reports their count (add_pack's veto).
-        if alt_odb || verbose {
-            if let Ok(alternates) = fs::read_to_string(objects_dir.join("info/alternates")) {
-                for raw in alternates.lines() {
-                    let raw = raw.trim();
-                    if raw.is_empty() || raw.starts_with('#') {
-                        continue;
-                    }
-                    let path = PathBuf::from(raw);
-                    let alt = if path.is_absolute() {
-                        path
-                    } else {
-                        objects_dir.join(path)
-                    };
-                    pack_redundant_scan_dir(&alt.join("pack"), format, false, &mut packs)?;
+        if (alt_odb || verbose)
+            && let Ok(alternates) = fs::read_to_string(objects_dir.join("info/alternates"))
+        {
+            for raw in alternates.lines() {
+                let raw = raw.trim();
+                if raw.is_empty() || raw.starts_with('#') {
+                    continue;
                 }
+                let path = PathBuf::from(raw);
+                let alt = if path.is_absolute() {
+                    path
+                } else {
+                    objects_dir.join(path)
+                };
+                pack_redundant_scan_dir(&alt.join("pack"), format, false, &mut packs)?;
             }
         }
     } else {

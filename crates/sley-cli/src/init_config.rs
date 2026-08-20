@@ -23,10 +23,8 @@ use crate::global_options::{
 /// path not ending in `/.git` as bare, and `.git` / `*/.git` as non-bare; for a bare
 /// clone behind a worktree (e.g. `git clone --bare` + `git worktree add`) the common
 /// dir is `…/bare.git`, which `guess_repository_type` already reports as bare.
-
 /// Mirror of git's `guess_repository_type()` (builtin/init-db.c): decide whether a
 /// git directory path implies a bare repository.
-
 /// git's `default_branch_name_advice` (refs.c, non-WITH_BREAKING_CHANGES build),
 /// emitted through `advise_if_enabled(ADVICE_DEFAULT_BRANCH_NAME, ...)` when an
 /// unconfigured `git init` falls back to "master".
@@ -48,7 +46,6 @@ Disable this message with \"git config set advice.defaultBranchName false\"";
 /// gated on the `GIT_ADVICE` env bool and `advice.defaultBranchName`, rendered
 /// line-by-line as `hint: <line>` on stderr, coloured per `color.advice`
 /// (advice.c `vadvise`; the hint colour is yellow).
-
 /// Resolve the object format for a *fresh* init, returning the chosen format and
 /// whether it was specified explicitly on the command line.
 ///
@@ -58,10 +55,8 @@ Disable this message with \"git config set advice.defaultBranchName false\"";
 /// config default is used (a bad value here only warns and falls back to sha1). The
 /// reinitialize-with-different-hash guard is applied later in
 /// [`RepositoryBootstrap::init`], once the existing repository format is known.
-
 /// Parse an object-format name the way git's `init` does: an unrecognised value is a
 /// `fatal: unknown hash algorithm '<value>'` with exit status 128.
-
 /// Resolve the ref storage format for a *fresh* init, returning the chosen format and
 /// whether it was specified explicitly on the command line.
 ///
@@ -72,7 +67,6 @@ Disable this message with \"git config set advice.defaultBranchName false\"";
 /// `feature.experimental` selecting reftable as the last resort. The
 /// reinitialize-with-different-format guard is applied later in
 /// [`RepositoryBootstrap::init`], once the existing repository format is known.
-
 pub(crate) fn init_config_value(
     key: &str,
     global_config: &[GlobalConfigOverride],

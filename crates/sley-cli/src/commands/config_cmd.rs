@@ -931,23 +931,21 @@ pub(crate) fn cmd_config(cli_session: &crate::session::CliSession, args: &[Strin
     }
     let entries = entries;
     if is_subcommand_get {
-        if subcommand_color_default_only {
-            if let Some(default) = default_value.as_deref() {
-                let formatted = format_config_value(default, value_type)?;
-                let mut stdout = io::stdout();
-                write_config_metadata(
-                    &mut stdout,
-                    &ConfigValueMeta::command_line(),
-                    display,
-                    null_terminate,
-                )?;
-                if null_terminate {
-                    write!(stdout, "{formatted}\0")?;
-                } else {
-                    write!(stdout, "{formatted}")?;
-                }
-                return Ok(());
+        if subcommand_color_default_only && let Some(default) = default_value.as_deref() {
+            let formatted = format_config_value(default, value_type)?;
+            let mut stdout = io::stdout();
+            write_config_metadata(
+                &mut stdout,
+                &ConfigValueMeta::command_line(),
+                display,
+                null_terminate,
+            )?;
+            if null_terminate {
+                write!(stdout, "{formatted}\0")?;
+            } else {
+                write!(stdout, "{formatted}")?;
             }
+            return Ok(());
         }
         // `git config get --url=<url>` routes through the urlmatch lookup,
         // exactly like the classic `--get-urlmatch`.
@@ -3242,22 +3240,6 @@ fn entries_get_all<'a>(
         .iter()
         .filter(|entry| entry.matches(&key.section, key.subsection.as_deref(), &key.key))
         .collect()
-}
-
-fn write_config_value(
-    stdout: &mut impl Write,
-    meta: &ConfigValueMeta,
-    display: ConfigDisplayOptions,
-    value: &str,
-    null_terminate: bool,
-) -> Result<()> {
-    write_config_metadata(stdout, meta, display, null_terminate)?;
-    if null_terminate {
-        write!(stdout, "{value}\0")?;
-    } else {
-        writeln!(stdout, "{value}")?;
-    }
-    Ok(())
 }
 
 fn write_config_formatted_entry(

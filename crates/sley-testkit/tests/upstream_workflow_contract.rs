@@ -1,7 +1,15 @@
 //! Contracts for the native binaries used by upstream parity CI.
 
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 const WORKFLOW: &str = include_str!("../../../.github/workflows/upstream-parity.yml");
 const MATRIX_WORKFLOW: &str = include_str!("../../../.github/workflows/upstream-parity-matrix.yml");
+const PR_SCRIPTS: &str = include_str!("../../../.github/workflows/parity-pr-scripts.txt");
+const FLOOR_CHECKER: &str =
+    include_str!("../../../.github/workflows/scripts/check-parity-floors.sh");
 
 #[test]
 fn builds_all_native_cli_binaries() {
@@ -39,21 +47,158 @@ fn passes_verified_scalar_path_to_runner() {
 }
 
 #[test]
-fn matrix_propagates_runner_and_correctness_failures() {
+fn pull_requests_run_a_required_fast_floor_surface() {
+    assert!(WORKFLOW.contains("  pull_request:"));
+    assert!(WORKFLOW.contains("- name: Select parity surface"));
+    assert!(WORKFLOW.contains(".github/workflows/parity-pr-scripts.txt"));
+    assert!(WORKFLOW.contains("\"$SLEY_PARITY_REQUIRED\""));
     assert!(
-        !MATRIX_WORKFLOW.contains("|| true"),
-        "matrix failures must not be discarded"
+        PR_SCRIPTS
+            .lines()
+            .filter(|line| line.ends_with(".sh"))
+            .count()
+            >= 10
+    );
+}
+
+#[test]
+fn matrix_propagates_oracle_failures_and_gates_sley_on_floors() {
+    assert_eq!(
+        MATRIX_WORKFLOW
+            .matches("run-upstream-tests-waves.sh || true")
+            .count(),
+        2
     );
     assert_eq!(
         MATRIX_WORKFLOW
-            .matches("- name: Enforce matrix correctness")
+            .matches("- name: Check parity floors")
+            .count(),
+        2
+    );
+    assert!(!MATRIX_WORKFLOW.contains("- name: Enforce matrix correctness"));
+    assert_eq!(
+        MATRIX_WORKFLOW
+            .matches("- name: Enforce release correctness")
             .count(),
         2
     );
     assert!(
         !MATRIX_WORKFLOW.contains("continue-on-error"),
-        "the matrix correctness gate must be able to fail each cell"
+        "the floor gate must be able to fail each cell"
     );
+}
+
+#[test]
+fn full_floor_catalog_cannot_shrink_below_the_legacy_matrix_surface() {
+    let floor_count = FLOOR_CHECKER
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("[t") && line.contains("]="))
+        .count();
+
+    assert!(
+        floor_count >= 891,
+        "full floor catalog shrank from 891 scripts to {floor_count}"
+    );
+    assert!(FLOOR_CHECKER.contains("MIN_FULL_FLOOR_SCRIPTS=891"));
+}
+
+#[test]
+fn floor_gate_refuses_an_unmeasured_windows_profile() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_nanos();
+    let temp = std::env::temp_dir().join(format!(
+        "sley-windows-floor-contract-{}-{nanos}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp).expect("create Windows floor test directory");
+    let summary = temp.join("summary.csv");
+    fs::write(
+        &summary,
+        "script,command,result,ok,notok,total,plan_total\n",
+    )
+    .expect("write Windows floor summary");
+
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let checker = repo.join(".github/workflows/scripts/check-parity-floors.sh");
+    let output = Command::new("bash")
+        .current_dir(&repo)
+        .env("SLEY_PARITY_PLATFORM", "windows")
+        .arg(checker)
+        .arg(summary)
+        .output()
+        .expect("run floor checker");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Windows parity floors have not been measured")
+    );
+
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn partial_floor_gate_demonstrates_regression_and_zero_script_failures() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_nanos();
+    let temp = std::env::temp_dir().join(format!(
+        "sley-parity-floor-contract-{}-{nanos}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp).expect("create floor test directory");
+    let required = temp.join("required.txt");
+    let summary = temp.join("summary.csv");
+    fs::write(&required, "t0001-init.sh\n").expect("write required scripts");
+
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let checker = repo.join(".github/workflows/scripts/check-parity-floors.sh");
+    let run = || {
+        Command::new("bash")
+            .current_dir(&repo)
+            .env("SLEY_PARITY_PLATFORM", "macos")
+            .arg(&checker)
+            .arg(&summary)
+            .arg(&required)
+            .output()
+            .expect("run floor checker")
+    };
+
+    fs::write(
+        &summary,
+        "script,command,result,ok,notok,total,plan_total\n\
+         t0001-init.sh,t0001-init.sh,PASS,102,0,102,102\n",
+    )
+    .expect("write passing summary");
+    assert!(run().status.success(), "recorded floor must pass");
+
+    fs::write(
+        &summary,
+        "script,command,result,ok,notok,total,plan_total\n\
+         t0001-init.sh,t0001-init.sh,FAIL,101,1,102,102\n",
+    )
+    .expect("write regressed summary");
+    let regressed = run();
+    assert!(
+        !regressed.status.success(),
+        "a deliberate floor drop must fail"
+    );
+    assert!(String::from_utf8_lossy(&regressed.stderr).contains("dropped below floor"));
+
+    fs::write(
+        &summary,
+        "script,command,result,ok,notok,total,plan_total\n",
+    )
+    .expect("write zero-script summary");
+    let empty = run();
+    assert!(!empty.status.success(), "a zero-script result must fail");
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("absent from summary"));
+
+    let _ = fs::remove_dir_all(temp);
 }
 
 #[test]
@@ -74,7 +219,7 @@ fn matrix_builds_and_passes_the_native_scalar_binary() {
 
 #[test]
 fn matrix_exposes_platform_build_dependencies() {
-    assert!(MATRIX_WORKFLOW.contains("brew install pcre2 gettext"));
+    assert!(MATRIX_WORKFLOW.contains("brew install pcre2 gettext bash"));
     assert!(MATRIX_WORKFLOW.contains("pcre2_prefix=\"$(brew --prefix pcre2)\""));
     assert!(MATRIX_WORKFLOW.contains("export CPPFLAGS=\"-I$pcre2_prefix/include"));
     assert!(

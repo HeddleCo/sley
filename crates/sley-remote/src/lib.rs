@@ -251,7 +251,9 @@ pub use clone::{CloneOptions, CloneOutcome, CloneRequest, CloneServices, CloneSo
 
 mod bundle;
 pub use bundle::{FetchBundleRequest, fetch_bundle};
+#[cfg(feature = "http")]
 mod bundle_uri;
+#[cfg(feature = "http")]
 pub use bundle_uri::{
     BundleUriEntry, BundleUriList, bundle_uri_fetch_order, handshake_advertises_bundle_uri,
     http_remote_bundle_uri_list, parse_bundle_uri_line, prefetch_advertised_bundle_uris,

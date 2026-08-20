@@ -12,12 +12,14 @@ enum ColumnEnable {
 
 pub(crate) fn cmd_column(args: &[String]) -> Result<()> {
     let mut enable = ColumnEnable::Never;
-    let mut options = sley::plumbing::sley_pretty::ColumnOptions::default();
-    options.width = env::var("COLUMNS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(80usize)
-        .saturating_sub(1);
+    let mut options = sley::plumbing::sley_pretty::ColumnOptions {
+        width: env::var("COLUMNS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(80usize)
+            .saturating_sub(1),
+        ..Default::default()
+    };
 
     let mut arguments = args.iter();
     while let Some(arg) = arguments.next() {

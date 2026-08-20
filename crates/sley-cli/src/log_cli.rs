@@ -12,8 +12,6 @@ use sley::plumbing::sley_core::DateMode;
 use sley::plumbing::sley_object::{Commit, ObjectType};
 use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
 use sley::plumbing::sley_refs::FileRefStore;
-use sley::plumbing::sley_rev::CommitRecord;
-use sley_grep;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
@@ -482,16 +480,12 @@ pub(crate) fn commit_identity_mailmapped(
 #[derive(Debug)]
 pub(crate) struct SimpleLogRegex {
     alternatives: Vec<SimpleLogRegexAlternative>,
-    /// `--perl-regexp` patterns compile through the full grep regex engine in
-    /// PCRE mode instead of the simple BRE subset above.
-    perl: Option<sley_grep::Regex>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SimpleLogRegexMode {
     Basic,
     Fixed,
-    Perl,
 }
 
 #[derive(Debug)]
@@ -537,15 +531,6 @@ enum SimpleLogRegexClassItem {
 }
 
 impl SimpleLogRegex {
-    fn parse(pattern: &str, error_context: &'static str, mode: SimpleLogRegexMode) -> Result<Self> {
-        Self::parse_with_diagnostic_verbosity(
-            pattern,
-            error_context,
-            mode,
-            sley_grep::RegexDiagnosticVerbosity::from_env(),
-        )
-    }
-
     fn parse_with_diagnostic_verbosity(
         pattern: &str,
         error_context: &'static str,
@@ -559,15 +544,6 @@ impl SimpleLogRegex {
                     anchor_end: false,
                     tokens: Vec::new(),
                 }],
-                perl: None,
-            });
-        }
-        if let SimpleLogRegexMode::Perl = mode {
-            let regex =
-                sley_grep::Regex::compile(pattern, sley_grep::RegexMode::Pcre, false, false)?;
-            return Ok(Self {
-                alternatives: Vec::new(),
-                perl: Some(regex),
             });
         }
         let alternatives = match mode {
@@ -582,18 +558,11 @@ impl SimpleLogRegex {
                 })
                 .collect::<Result<Vec<_>>>()?,
             SimpleLogRegexMode::Fixed => vec![SimpleLogRegexAlternative::parse_fixed(pattern)],
-            SimpleLogRegexMode::Perl => unreachable!("handled above"),
         };
-        Ok(Self {
-            alternatives,
-            perl: None,
-        })
+        Ok(Self { alternatives })
     }
 
     pub(crate) fn is_match(&self, value: &str, ignore_case: bool) -> bool {
-        if let Some(perl) = &self.perl {
-            return perl.is_match_with_case(value.as_bytes(), ignore_case);
-        }
         self.alternatives
             .iter()
             .any(|alternative| alternative.is_match(value, ignore_case))

@@ -12,7 +12,6 @@ pub(crate) struct ToolCommand {
     pub name: String,
     pub command: String,
     pub trust_exit_code: bool,
-    pub is_builtin: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -46,7 +45,6 @@ pub(crate) fn resolve_tool_command(
         .get(mode_section, Some(name), "cmd")
         .or_else(|| fallback_section.and_then(|section| config.get(section, Some(name), "cmd")))
         .map(str::to_owned);
-    let mut is_builtin = false;
     let command = match command {
         Some(command) => command,
         None => {
@@ -69,7 +67,6 @@ pub(crate) fn resolve_tool_command(
                 );
                 return Err(GitError::Exit(1));
             };
-            is_builtin = true;
             match mode {
                 ToolMode::Diff => format!("\"{path}\" \"$LOCAL\" \"$REMOTE\""),
                 ToolMode::Merge => format!("\"{path}\" \"$LOCAL\" \"$REMOTE\" \"$MERGED\""),
@@ -92,7 +89,6 @@ pub(crate) fn resolve_tool_command(
         name: name.to_string(),
         command,
         trust_exit_code,
-        is_builtin,
     })
 }
 

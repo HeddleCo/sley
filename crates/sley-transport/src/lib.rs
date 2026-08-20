@@ -2282,21 +2282,6 @@ fn curl_trace_sink() -> Option<Box<dyn Write>> {
     }
 }
 
-/// Convert a successful ureq response into an [`HttpResponse`] that streams its
-/// body from the connection (the body is never buffered into memory here).
-#[cfg(feature = "http-client")]
-#[allow(dead_code)] // retained for unit tests / alternate call sites
-fn http_response_from_ureq(response: ureq::http::Response<ureq::Body>) -> HttpResponse {
-    let parts = http_response_parts_from_ureq(response);
-    HttpResponse {
-        status: parts.status,
-        content_type: parts.content_type,
-        content_length: parts.content_length,
-        content_range: parts.content_range,
-        body: parts.body,
-    }
-}
-
 /// Map a genuine ureq transport/protocol failure to a [`GitError`], always
 /// including the offending `url` in the message.
 #[cfg(feature = "http-client")]

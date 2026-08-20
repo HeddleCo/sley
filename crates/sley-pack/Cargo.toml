@@ -8,14 +8,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-crc32fast = "1"
+crc32fast = "1.5.0"
 # No backend baked into the dep line: the backend is picked by exactly one of
 # the mutually-exclusive `zlib-rs`/`pure-rust` crate features below. flate2's
 # backend cfg cascade ranks zlib-rs above miniz_oxide, so an additive feature
 # can't *unselect* zlib-rs once it's on — hence default-on zlib-rs + a
 # `--no-default-features` swap to `pure-rust`, which is the only way Cargo's
 # additive features express mutual exclusion.
-flate2 = { version = "1", default-features = false }
+flate2 = { version = "1.1.9", default-features = false }
 sley-core.workspace = true
 sley-formats.workspace = true
 sley-object.workspace = true

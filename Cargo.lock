@@ -491,9 +491,9 @@ dependencies = [
 
 [[package]]
 name = "either"
-version = "1.17.0"
+version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
+checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "encoding_rs"
@@ -531,7 +531,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1262,7 +1262,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1319,7 +1319,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1488,7 +1488,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "sley"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-config",
  "sley-core",
@@ -1512,13 +1512,12 @@ dependencies = [
 
 [[package]]
 name = "sley-archive"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "crc32fast",
  "flate2",
  "sley-config",
  "sley-core",
- "sley-formats",
  "sley-object",
  "sley-odb",
  "sley-pathspec",
@@ -1527,10 +1526,9 @@ dependencies = [
 
 [[package]]
 name = "sley-bench"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "criterion",
- "sley-cli",
  "sley-core",
  "sley-formats",
  "sley-object",
@@ -1543,7 +1541,7 @@ dependencies = [
 
 [[package]]
 name = "sley-cli"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "ctrlc",
  "encoding_rs",
@@ -1576,14 +1574,14 @@ dependencies = [
 
 [[package]]
 name = "sley-config"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-core",
 ]
 
 [[package]]
 name = "sley-core"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sha1",
  "unicode-normalization",
@@ -1591,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "sley-diff-merge"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-config",
  "sley-core",
@@ -1606,22 +1604,19 @@ dependencies = [
 
 [[package]]
 name = "sley-formats"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "flate2",
  "sley-config",
  "sley-core",
- "sley-index",
- "sley-object",
 ]
 
 [[package]]
 name = "sley-fsck"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-config",
  "sley-core",
- "sley-formats",
  "sley-object",
  "sley-odb",
  "sley-submodule",
@@ -1629,21 +1624,21 @@ dependencies = [
 
 [[package]]
 name = "sley-grep"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-core",
 ]
 
 [[package]]
 name = "sley-i18n"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "encoding_rs",
 ]
 
 [[package]]
 name = "sley-index"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-core",
  "sley-mmap",
@@ -1651,14 +1646,14 @@ dependencies = [
 
 [[package]]
 name = "sley-mmap"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "memmap2",
 ]
 
 [[package]]
 name = "sley-notes"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-config",
  "sley-core",
@@ -1671,14 +1666,14 @@ dependencies = [
 
 [[package]]
 name = "sley-object"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-core",
 ]
 
 [[package]]
 name = "sley-odb"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "crc32fast",
  "flate2",
@@ -1693,14 +1688,14 @@ dependencies = [
 
 [[package]]
 name = "sley-options"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-core",
 ]
 
 [[package]]
 name = "sley-pack"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "crc32fast",
  "flate2",
@@ -1711,14 +1706,14 @@ dependencies = [
 
 [[package]]
 name = "sley-pathspec"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-core",
 ]
 
 [[package]]
 name = "sley-pretty"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "encoding_rs",
  "sley-config",
@@ -1733,21 +1728,21 @@ dependencies = [
 
 [[package]]
 name = "sley-procinfo"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "sley-protocol"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-core",
 ]
 
 [[package]]
 name = "sley-ref-filter"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-core",
  "sley-strbuf-expand",
@@ -1755,7 +1750,7 @@ dependencies = [
 
 [[package]]
 name = "sley-refs"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-config",
  "sley-core",
@@ -1764,7 +1759,7 @@ dependencies = [
 
 [[package]]
 name = "sley-remote"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-config",
  "sley-core",
@@ -1784,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "sley-rev"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "regex",
  "sley-config",
@@ -1802,10 +1797,9 @@ dependencies = [
 
 [[package]]
 name = "sley-sequencer"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-core",
- "sley-formats",
  "sley-object",
  "sley-odb",
  "sley-refs",
@@ -1815,14 +1809,14 @@ dependencies = [
 
 [[package]]
 name = "sley-strbuf-expand"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-core",
 ]
 
 [[package]]
 name = "sley-submodule"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-config",
  "sley-core",
@@ -1830,7 +1824,7 @@ dependencies = [
 
 [[package]]
 name = "sley-testkit"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-config",
  "sley-core",
@@ -1848,7 +1842,7 @@ dependencies = [
 
 [[package]]
 name = "sley-transport"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "rcgen",
  "rustls",
@@ -1862,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "sley-unpack-trees"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "sley-core",
  "sley-index",
@@ -1870,14 +1864,13 @@ dependencies = [
 
 [[package]]
 name = "sley-worktree"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "encoding_rs",
  "same-file",
  "sley-config",
  "sley-core",
  "sley-diff-merge",
- "sley-formats",
  "sley-index",
  "sley-mmap",
  "sley-object",
@@ -1983,7 +1976,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2254,7 +2247,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

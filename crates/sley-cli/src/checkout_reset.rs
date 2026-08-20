@@ -104,7 +104,6 @@ pub(crate) fn print_reset_hard_head(
 /// always eligible; a file in a subdirectory is eligible only when its immediate
 /// parent directory contains tracked content (otherwise the file lives in a
 /// wholly-untracked directory that Git would only remove under `-d`). This holds
-
 pub(crate) fn checkout_create_or_reset_branch(
     git_dir: &Path,
     start_git_dir: &Path,
