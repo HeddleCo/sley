@@ -754,9 +754,9 @@ pub fn read_object_header_at<F>(
     format: ObjectFormat,
     initial_delta_depth: usize,
     mut resolve_ref_base_type: F,
-) -> Result<(ObjectType, u64)>
+) -> Result<PackObjectHeader>
 where
-    F: FnMut(&ObjectId, usize) -> Result<Option<ObjectType>>,
+    F: FnMut(&ObjectId, usize) -> Result<Option<PackObjectHeader>>,
 {
     read_object_header_at_inner(
         pack_bytes,
@@ -768,7 +768,31 @@ where
     )
 }
 
-/// Memo of `pack offset -> resolved header (end-of-chain type, result size)` for
+/// A header resolved through its complete delta chain without materializing the
+/// object's body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackObjectHeader {
+    pub object_type: ObjectType,
+    pub size: u64,
+    /// Delta links below this entry (`0` for an undeltified object).
+    pub delta_depth: usize,
+}
+
+impl PackObjectHeader {
+    pub const fn undeltified(object_type: ObjectType, size: u64) -> Self {
+        Self {
+            object_type,
+            size,
+            delta_depth: 0,
+        }
+    }
+
+    pub const fn type_and_size(self) -> (ObjectType, u64) {
+        (self.object_type, self.size)
+    }
+}
+
+/// Memo of `pack offset -> resolved header` for
 /// the `cat-file --batch-check` header fast path.
 ///
 /// Without it, resolving the *type* of an ofs-delta walks the whole delta chain
@@ -786,18 +810,18 @@ where
 /// own pack/delta header, never by materializing the body.
 pub trait HeaderTypeCache {
     /// The previously resolved header at `pack_offset`, if any.
-    fn get(&self, pack_offset: u64) -> Option<(ObjectType, u64)>;
+    fn get(&self, pack_offset: u64) -> Option<PackObjectHeader>;
     /// Record the resolved header at `pack_offset` for reuse by later reads.
-    fn put(&mut self, pack_offset: u64, header: (ObjectType, u64));
+    fn put(&mut self, pack_offset: u64, header: PackObjectHeader);
 }
 
 pub(crate) struct NoopHeaderTypeCache;
 
 impl HeaderTypeCache for NoopHeaderTypeCache {
-    fn get(&self, _pack_offset: u64) -> Option<(ObjectType, u64)> {
+    fn get(&self, _pack_offset: u64) -> Option<PackObjectHeader> {
         None
     }
-    fn put(&mut self, _pack_offset: u64, _header: (ObjectType, u64)) {}
+    fn put(&mut self, _pack_offset: u64, _header: PackObjectHeader) {}
 }
 
 /// Like [`read_object_header_at`] but threads a caller-owned [`HeaderTypeCache`]
@@ -813,12 +837,13 @@ pub fn read_object_header_at_with_cache<F, C>(
     initial_delta_depth: usize,
     mut resolve_ref_base_type: F,
     type_cache: &mut C,
-) -> Result<(ObjectType, u64)>
+) -> Result<PackObjectHeader>
 where
-    F: FnMut(&ObjectId, usize) -> Result<Option<ObjectType>>,
+    F: FnMut(&ObjectId, usize) -> Result<Option<PackObjectHeader>>,
     C: HeaderTypeCache + ?Sized,
 {
     if let Some(header) = type_cache.get(offset) {
+        checked_cached_header_depth(offset, initial_delta_depth, header.delta_depth)?;
         return Ok(header);
     }
     read_object_header_at_inner(
@@ -838,9 +863,9 @@ pub(crate) fn read_object_header_at_inner<F, C>(
     delta_depth: usize,
     resolve_ref_base_type: &mut F,
     type_cache: &mut C,
-) -> Result<(ObjectType, u64)>
+) -> Result<PackObjectHeader>
 where
-    F: FnMut(&ObjectId, usize) -> Result<Option<ObjectType>>,
+    F: FnMut(&ObjectId, usize) -> Result<Option<PackObjectHeader>>,
     C: HeaderTypeCache + ?Sized,
 {
     let trailer_offset = pack_bytes
@@ -854,31 +879,40 @@ where
         .ok_or_else(|| GitError::InvalidFormat("pack object offset out of range".into()))?;
     let header = parse_entry_header(entry_region, &mut cursor)?;
     let resolved = match header.kind {
-        PackObjectKind::Commit => (ObjectType::Commit, header.size),
-        PackObjectKind::Tree => (ObjectType::Tree, header.size),
-        PackObjectKind::Blob => (ObjectType::Blob, header.size),
-        PackObjectKind::Tag => (ObjectType::Tag, header.size),
+        PackObjectKind::Commit => PackObjectHeader::undeltified(ObjectType::Commit, header.size),
+        PackObjectKind::Tree => PackObjectHeader::undeltified(ObjectType::Tree, header.size),
+        PackObjectKind::Blob => PackObjectHeader::undeltified(ObjectType::Blob, header.size),
+        PackObjectKind::Tag => PackObjectHeader::undeltified(ObjectType::Tag, header.size),
         PackObjectKind::OfsDelta => {
             let next_delta_depth = checked_header_delta_depth(offset, delta_depth)?;
             let base_offset = parse_ofs_delta_base_offset(entry_region, &mut cursor, offset)?;
             let size = delta_result_size_from_stream(&entry_region[cursor..])?;
             // The end-of-chain type only depends on the base, so reuse it across
             // reads instead of re-walking the chain per object (sley#26).
-            let base_type = match type_cache.get(base_offset) {
-                Some((base_type, _)) => base_type,
-                None => {
-                    let (base_type, _) = read_object_header_at_inner(
-                        pack_bytes,
+            let base_header = match type_cache.get(base_offset) {
+                Some(base_header) => {
+                    checked_cached_header_depth(
                         base_offset,
-                        format,
                         next_delta_depth,
-                        resolve_ref_base_type,
-                        type_cache,
+                        base_header.delta_depth,
                     )?;
-                    base_type
+                    base_header
                 }
+                None => read_object_header_at_inner(
+                    pack_bytes,
+                    base_offset,
+                    format,
+                    next_delta_depth,
+                    resolve_ref_base_type,
+                    type_cache,
+                )?,
             };
-            (base_type, size)
+            let resolved_delta_depth = checked_header_delta_depth(offset, base_header.delta_depth)?;
+            PackObjectHeader {
+                object_type: base_header.object_type,
+                size,
+                delta_depth: resolved_delta_depth,
+            }
         }
         PackObjectKind::RefDelta => {
             let next_delta_depth = checked_header_delta_depth(offset, delta_depth)?;
@@ -891,9 +925,15 @@ where
             let oid = ObjectId::from_raw(format, &entry_region[cursor..cursor + hash_len])?;
             cursor += hash_len;
             let size = delta_result_size_from_stream(&entry_region[cursor..])?;
-            let base_type = resolve_ref_base_type(&oid, next_delta_depth)?
+            let base_header = resolve_ref_base_type(&oid, next_delta_depth)?
                 .ok_or_else(|| GitError::not_found(format!("ref-delta base object {oid}")))?;
-            (base_type, size)
+            let resolved_delta_depth = checked_header_delta_depth(offset, base_header.delta_depth)?;
+            checked_cached_header_depth(offset, delta_depth, resolved_delta_depth)?;
+            PackObjectHeader {
+                object_type: base_header.object_type,
+                size,
+                delta_depth: resolved_delta_depth,
+            }
         }
     };
     // Memoize the fully resolved header so a repeated lookup of this offset (or a
@@ -915,6 +955,27 @@ fn checked_header_delta_depth(offset: u64, delta_depth: usize) -> Result<usize> 
         )));
     }
     Ok(observed_depth)
+}
+
+fn checked_cached_header_depth(
+    offset: u64,
+    initial_delta_depth: usize,
+    cached_delta_depth: usize,
+) -> Result<()> {
+    let observed_depth = initial_delta_depth
+        .checked_add(cached_delta_depth)
+        .ok_or_else(|| {
+            GitError::InvalidFormat(format!(
+                "pack delta chain depth overflows at offset {offset}"
+            ))
+        })?;
+    if observed_depth > MAX_READ_DELTA_CHAIN_DEPTH {
+        return Err(GitError::InvalidFormat(format!(
+            "pack delta chain at offset {offset} has observed depth {observed_depth}, which \
+             exceeds maximum depth (configured limit {MAX_READ_DELTA_CHAIN_DEPTH})"
+        )));
+    }
+    Ok(())
 }
 
 /// Number of inflated delta-stream bytes to read when only the leading base-size

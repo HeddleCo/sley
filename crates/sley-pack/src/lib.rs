@@ -903,13 +903,13 @@ mod tests {
     /// A [`HeaderTypeCache`] over a plain map, for asserting the cached header
     /// read is byte-identical to the uncached one cold and warm (sley#26).
     #[derive(Default)]
-    struct MapHeaderTypeCache(HashMap<u64, (ObjectType, u64)>);
+    struct MapHeaderTypeCache(HashMap<u64, PackObjectHeader>);
 
     impl HeaderTypeCache for MapHeaderTypeCache {
-        fn get(&self, pack_offset: u64) -> Option<(ObjectType, u64)> {
+        fn get(&self, pack_offset: u64) -> Option<PackObjectHeader> {
             self.0.get(&pack_offset).copied()
         }
-        fn put(&mut self, pack_offset: u64, header: (ObjectType, u64)) {
+        fn put(&mut self, pack_offset: u64, header: PackObjectHeader) {
             self.0.insert(pack_offset, header);
         }
     }
@@ -943,7 +943,7 @@ mod tests {
             .expect("test operation should succeed");
             // Type inherited from the chain base; size is the inflated body length.
             assert_eq!(
-                uncached,
+                uncached.type_and_size(),
                 (po.object.object_type, po.object.body.len() as u64),
                 "uncached header at offset {}",
                 po.entry.offset
@@ -973,7 +973,7 @@ mod tests {
             )
             .expect("test operation should succeed");
             assert_eq!(
-                warm,
+                warm.type_and_size(),
                 (po.object.object_type, po.object.body.len() as u64),
                 "warm cache at offset {}",
                 po.entry.offset
@@ -4227,7 +4227,7 @@ mod tests {
             |_, _| Ok(None),
         )
         .expect("a header chain at the ceiling must resolve");
-        assert_eq!(header, (ObjectType::Blob, 8));
+        assert_eq!(header.type_and_size(), (ObjectType::Blob, 8));
 
         let over_ceiling = ofs_delta_chain_pack(ObjectFormat::Sha1, 5_000);
         let over_ceiling_offset = pack_entry_descriptors(&over_ceiling, ObjectFormat::Sha1)
@@ -4279,6 +4279,68 @@ mod tests {
                 .to_string()
                 .contains(&format!("observed depth {rejected_depth}")),
             "expected the combined depth in the error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn header_cache_preserves_the_cumulative_depth_limit() {
+        let pack = ofs_delta_chain_pack(ObjectFormat::Sha1, 3);
+        let descriptors = pack_entry_descriptors(&pack, ObjectFormat::Sha1);
+        let target_offset = descriptors[3].offset;
+        let cached_base_offset = descriptors[2].offset;
+        let initial_depth = MAX_READ_DELTA_CHAIN_DEPTH - 2;
+        let rejected_depth = MAX_READ_DELTA_CHAIN_DEPTH + 1;
+
+        let mut direct_cache = MapHeaderTypeCache::default();
+        read_object_header_at_with_cache(
+            &pack,
+            target_offset,
+            ObjectFormat::Sha1,
+            0,
+            |_, _| Ok(None),
+            &mut direct_cache,
+        )
+        .expect("the top-level read should warm the target header");
+        let direct_error = read_object_header_at_with_cache(
+            &pack,
+            target_offset,
+            ObjectFormat::Sha1,
+            initial_depth,
+            |_, _| Ok(None),
+            &mut direct_cache,
+        )
+        .expect_err("a direct cache hit must include its represented chain depth");
+        assert!(
+            direct_error
+                .to_string()
+                .contains(&format!("observed depth {rejected_depth}")),
+            "expected the direct cached depth in the error, got: {direct_error}"
+        );
+
+        let mut base_cache = MapHeaderTypeCache::default();
+        read_object_header_at_with_cache(
+            &pack,
+            cached_base_offset,
+            ObjectFormat::Sha1,
+            0,
+            |_, _| Ok(None),
+            &mut base_cache,
+        )
+        .expect("the top-level read should warm the target's immediate base");
+        let base_error = read_object_header_at_with_cache(
+            &pack,
+            target_offset,
+            ObjectFormat::Sha1,
+            initial_depth,
+            |_, _| Ok(None),
+            &mut base_cache,
+        )
+        .expect_err("an internal base-cache hit must include its represented chain depth");
+        assert!(
+            base_error
+                .to_string()
+                .contains(&format!("observed depth {rejected_depth}")),
+            "expected the cached base depth in the error, got: {base_error}"
         );
     }
 

@@ -207,16 +207,15 @@ pub(crate) type DecodedObjectCache = Arc<Mutex<LruObjectCache>>;
 /// decoded bases instead of re-inflating the whole chain on every read.
 pub(crate) type PackDeltaCaches = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<LruOffsetCache>>>>>;
 
-/// Per-pack memo of `in-pack offset -> end-of-chain object type` for the
-/// `cat-file --batch-check` header fast path. Resolving a packed delta's *type*
-/// walks the delta chain to its base; without this memo every header read
-/// re-walks (and re-inflates) the whole chain, so reading every object in a
-/// deeply-deltified pack is super-linear (sley#26). The type only depends on the
-/// chain base, so memoizing `offset -> type` lets each chain be walked at most
-/// once across a batch. Keyed by pack path so an offset key is never applied to
-/// the wrong pack's bytes; shared across cloned handles.
+/// Per-pack memo of `in-pack offset -> resolved header` for the
+/// `cat-file --batch-check` fast path. Resolving a packed delta's type walks the
+/// chain to its base; without this memo every header read re-walks (and
+/// re-inflates) the whole chain, so reading every object in a deeply-deltified
+/// pack is super-linear (sley#26). The memo includes chain depth so a warm hit
+/// enforces the same cumulative limit as a cold walk. Keyed by pack path so an
+/// offset key is never applied to the wrong pack's bytes; shared across clones.
 /// One pack's offset-keyed header memo (see [`PackHeaderTypeCaches`]).
-pub(crate) type PackHeaderTypeCache = Arc<Mutex<HashMap<u64, (ObjectType, u64)>>>;
+pub(crate) type PackHeaderTypeCache = Arc<Mutex<HashMap<u64, sley_pack::PackObjectHeader>>>;
 
 pub(crate) type PackHeaderTypeCaches = Arc<Mutex<HashMap<PathBuf, PackHeaderTypeCache>>>;
 
@@ -490,17 +489,17 @@ impl sley_pack::PackDeltaCache for PackDeltaCacheAdapter<'_> {
     }
 }
 
-/// Bridges a per-pack `offset -> ObjectType` memo into the header fast path so
+/// Bridges a per-pack `offset -> resolved header` memo into the header fast path so
 /// the ofs-delta chain walk is performed at most once per chain across a batch
 /// of `read_object_header` calls (sley#26).
 struct PackHeaderTypeCacheAdapter<'a>(&'a PackHeaderTypeCache);
 
 impl sley_pack::HeaderTypeCache for PackHeaderTypeCacheAdapter<'_> {
-    fn get(&self, pack_offset: u64) -> Option<(ObjectType, u64)> {
+    fn get(&self, pack_offset: u64) -> Option<sley_pack::PackObjectHeader> {
         self.0.lock().ok()?.get(&pack_offset).copied()
     }
 
-    fn put(&mut self, pack_offset: u64, header: (ObjectType, u64)) {
+    fn put(&mut self, pack_offset: u64, header: sley_pack::PackObjectHeader) {
         if let Ok(mut cache) = self.0.lock() {
             cache.insert(pack_offset, header);
         }
@@ -810,6 +809,7 @@ impl FileObjectDatabase {
         oid: &ObjectId,
     ) -> Result<Option<(ObjectType, u64)>> {
         self.read_object_header_raw(oid)
+            .map(|header| header.map(sley_pack::PackObjectHeader::type_and_size))
     }
 
     /// Declare whether the owning repository has a promisor remote configured.
@@ -958,9 +958,13 @@ impl FileObjectDatabase {
     pub fn read_object_header(&self, oid: &ObjectId) -> Result<Option<(ObjectType, u64)>> {
         let read_oid = self.replacements.resolve(oid)?;
         self.read_object_header_raw(&read_oid)
+            .map(|header| header.map(sley_pack::PackObjectHeader::type_and_size))
     }
 
-    fn read_object_header_raw(&self, oid: &ObjectId) -> Result<Option<(ObjectType, u64)>> {
+    fn read_object_header_raw(
+        &self,
+        oid: &ObjectId,
+    ) -> Result<Option<sley_pack::PackObjectHeader>> {
         let mut context = HeaderReadContext::new();
         self.read_object_header_raw_with_context(oid, &mut context)
     }
@@ -969,14 +973,24 @@ impl FileObjectDatabase {
         &self,
         oid: &ObjectId,
         context: &mut HeaderReadContext,
-    ) -> Result<Option<(ObjectType, u64)>> {
+    ) -> Result<Option<sley_pack::PackObjectHeader>> {
         if implied_empty_tree_object(self.format, oid).is_some() {
-            return Ok(Some((ObjectType::Tree, 0)));
+            return Ok(Some(sley_pack::PackObjectHeader::undeltified(
+                ObjectType::Tree,
+                0,
+            )));
         }
-        if let Ok(mut cache) = self.decoded.lock()
+        // A decoded body does not retain the chain depth that produced it. It is
+        // safe as a top-level header hit, but a ref-delta base must be resolved
+        // through storage so its depth participates in the cumulative limit.
+        if context.delta_depth == 0
+            && let Ok(mut cache) = self.decoded.lock()
             && let Some(object) = cache.get(oid)
         {
-            return Ok(Some((object.object_type, object.body.len() as u64)));
+            return Ok(Some(sley_pack::PackObjectHeader::undeltified(
+                object.object_type,
+                object.body.len() as u64,
+            )));
         }
         // Same source order as `read_object_raw`: pack first. The header path used
         // to probe loose storage on every call, which defeated the packed fast path
@@ -1009,7 +1023,12 @@ impl FileObjectDatabase {
         }
 
         match self.loose.read_header(oid) {
-            Ok(Some(header)) => return Ok(Some(header)),
+            Ok(Some((object_type, size))) => {
+                return Ok(Some(sley_pack::PackObjectHeader::undeltified(
+                    object_type,
+                    size,
+                )));
+            }
             Ok(None) => {}
             Err(err) if first_error.is_none() => first_error = Some(err),
             Err(_) => {}
@@ -1028,7 +1047,12 @@ impl FileObjectDatabase {
         // exact path probe once before reporting absence (see `read_object`).
         self.loose.invalidate_cache();
         match self.loose.read_header(oid) {
-            Ok(Some(header)) => return Ok(Some(header)),
+            Ok(Some((object_type, size))) => {
+                return Ok(Some(sley_pack::PackObjectHeader::undeltified(
+                    object_type,
+                    size,
+                )));
+            }
             Ok(None) => {}
             Err(err) if first_error.is_none() => first_error = Some(err),
             Err(_) => {}
@@ -1044,7 +1068,7 @@ impl FileObjectDatabase {
         oid: &ObjectId,
         pack_lookup: &PackLookup,
         context: &mut HeaderReadContext,
-    ) -> Result<(ObjectType, u64)> {
+    ) -> Result<sley_pack::PackObjectHeader> {
         context.enter_pack(oid)?;
         let result = (|| {
             let bytes = pack_lookup.pack_bytes(self)?;
@@ -1059,9 +1083,7 @@ impl FileObjectDatabase {
                 context.check_ref_base(base)?;
                 let previous_delta_depth = context.delta_depth;
                 context.delta_depth = delta_depth;
-                let result = self
-                    .read_object_header_raw_with_context(base, context)
-                    .map(|header| header.map(|(object_type, _)| object_type));
+                let result = self.read_object_header_raw_with_context(base, context);
                 context.delta_depth = previous_delta_depth;
                 result
             };
@@ -1095,7 +1117,7 @@ impl FileObjectDatabase {
         oid: &ObjectId,
         exclude: Option<&PackLookup>,
         context: &mut HeaderReadContext,
-    ) -> Result<Option<(ObjectType, u64)>> {
+    ) -> Result<Option<sley_pack::PackObjectHeader>> {
         let Ok(entries) = fs::read_dir(&self.pack_dir) else {
             return Ok(None);
         };
