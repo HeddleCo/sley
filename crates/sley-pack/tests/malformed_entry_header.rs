@@ -93,7 +93,7 @@ fn targeted_read_rejects_entry_header_running_past_trailer() {
 #[test]
 fn header_read_rejects_ofs_delta_base_running_past_trailer() {
     let (pack, offset) = runaway_ofs_delta_base_pack(ObjectFormat::Sha1);
-    let error = read_object_header_at(&pack, offset, ObjectFormat::Sha1, |_| Ok(None))
+    let error = read_object_header_at(&pack, offset, ObjectFormat::Sha1, 0, |_, _| Ok(None))
         .expect_err("ofs-delta base offset running into the trailer must not decode");
     println!("read_object_header_at: {error}");
 }

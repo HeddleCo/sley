@@ -520,12 +520,14 @@ const HEADER_READ_MAX_ACTIVE: usize = sley_pack::MAX_READ_DELTA_CHAIN_DEPTH + 1;
 
 struct HeaderReadContext {
     active_oids: SmallVec<[ObjectId; HEADER_READ_STACK_CAPACITY]>,
+    delta_depth: usize,
 }
 
 impl HeaderReadContext {
     fn new() -> Self {
         Self {
             active_oids: SmallVec::new(),
+            delta_depth: 0,
         }
     }
 
@@ -1052,10 +1054,16 @@ impl FileObjectDatabase {
             // varints) on every header read — the sley#26 super-linear
             // `cat-file --batch-check`.
             let type_cache = pack_lookup.header_type_cache(self);
-            let resolve_ref_base = |base: &ObjectId| {
+            let initial_delta_depth = context.delta_depth;
+            let resolve_ref_base = |base: &ObjectId, delta_depth: usize| {
                 context.check_ref_base(base)?;
-                self.read_object_header_raw_with_context(base, context)
-                    .map(|header| header.map(|(object_type, _)| object_type))
+                let previous_delta_depth = context.delta_depth;
+                context.delta_depth = delta_depth;
+                let result = self
+                    .read_object_header_raw_with_context(base, context)
+                    .map(|header| header.map(|(object_type, _)| object_type));
+                context.delta_depth = previous_delta_depth;
+                result
             };
             match &type_cache {
                 Some(cache) => {
@@ -1064,6 +1072,7 @@ impl FileObjectDatabase {
                         &bytes,
                         pack_lookup.offset,
                         self.format,
+                        initial_delta_depth,
                         resolve_ref_base,
                         &mut adapter,
                     )
@@ -1072,6 +1081,7 @@ impl FileObjectDatabase {
                     &bytes,
                     pack_lookup.offset,
                     self.format,
+                    initial_delta_depth,
                     resolve_ref_base,
                 ),
             }

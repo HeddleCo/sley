@@ -933,11 +933,14 @@ mod tests {
         let parsed = PackFile::parse_sha1(&written.pack).expect("test operation should succeed");
         let mut cache = MapHeaderTypeCache::default();
         for po in &parsed.entries {
-            let uncached =
-                read_object_header_at(&written.pack, po.entry.offset, ObjectFormat::Sha1, |_| {
-                    Ok(None)
-                })
-                .expect("test operation should succeed");
+            let uncached = read_object_header_at(
+                &written.pack,
+                po.entry.offset,
+                ObjectFormat::Sha1,
+                0,
+                |_, _| Ok(None),
+            )
+            .expect("test operation should succeed");
             // Type inherited from the chain base; size is the inflated body length.
             assert_eq!(
                 uncached,
@@ -950,7 +953,8 @@ mod tests {
                 &written.pack,
                 po.entry.offset,
                 ObjectFormat::Sha1,
-                |_| Ok(None),
+                0,
+                |_, _| Ok(None),
                 &mut cache,
             )
             .expect("test operation should succeed");
@@ -963,7 +967,8 @@ mod tests {
                 &written.pack,
                 po.entry.offset,
                 ObjectFormat::Sha1,
-                |_| panic!("warm cache must not re-walk the chain"),
+                0,
+                |_, _| panic!("warm cache must not re-walk the chain"),
                 &mut cache,
             )
             .expect("test operation should succeed");
@@ -4205,6 +4210,76 @@ mod tests {
             sley_core::digest_bytes(format, &pack).expect("test operation should succeed");
         pack.extend_from_slice(checksum.as_bytes());
         pack
+    }
+
+    #[test]
+    fn header_read_bounds_ofs_delta_recursion_at_the_shared_ceiling() {
+        let at_ceiling = ofs_delta_chain_pack(ObjectFormat::Sha1, MAX_READ_DELTA_CHAIN_DEPTH);
+        let at_ceiling_offset = pack_entry_descriptors(&at_ceiling, ObjectFormat::Sha1)
+            .last()
+            .expect("the pack has entries")
+            .offset;
+        let header = read_object_header_at(
+            &at_ceiling,
+            at_ceiling_offset,
+            ObjectFormat::Sha1,
+            0,
+            |_, _| Ok(None),
+        )
+        .expect("a header chain at the ceiling must resolve");
+        assert_eq!(header, (ObjectType::Blob, 8));
+
+        let over_ceiling = ofs_delta_chain_pack(ObjectFormat::Sha1, 5_000);
+        let over_ceiling_offset = pack_entry_descriptors(&over_ceiling, ObjectFormat::Sha1)
+            .last()
+            .expect("the pack has entries")
+            .offset;
+        let error = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                read_object_header_at(
+                    &over_ceiling,
+                    over_ceiling_offset,
+                    ObjectFormat::Sha1,
+                    0,
+                    |_, _| Ok(None),
+                )
+                .expect_err("a header chain past the ceiling must be rejected")
+            })
+            .expect("spawn small-stack thread")
+            .join()
+            .expect("the bounded header walk must not overflow its stack");
+        let rejected_depth = MAX_READ_DELTA_CHAIN_DEPTH + 1;
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("observed depth {rejected_depth}")),
+            "expected an actionable depth error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn header_read_combines_prior_and_local_delta_depth() {
+        let pack = ofs_delta_chain_pack(ObjectFormat::Sha1, 2);
+        let offset = pack_entry_descriptors(&pack, ObjectFormat::Sha1)
+            .last()
+            .expect("the pack has entries")
+            .offset;
+        let error = read_object_header_at(
+            &pack,
+            offset,
+            ObjectFormat::Sha1,
+            MAX_READ_DELTA_CHAIN_DEPTH - 1,
+            |_, _| Ok(None),
+        )
+        .expect_err("local ofs-deltas must count prior cross-pack delta links");
+        let rejected_depth = MAX_READ_DELTA_CHAIN_DEPTH + 1;
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("observed depth {rejected_depth}")),
+            "expected the combined depth in the error, got: {error}"
+        );
     }
 
     /// A chain exactly at the ceiling still resolves: the bound must not reject

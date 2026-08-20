@@ -744,20 +744,25 @@ where
 /// inflates the full content. The reported type is the type at the end of the
 /// delta chain (deltas inherit their base's type). `resolve_ref_base_type` supplies
 /// the type of a ref-delta base that lives outside this pack (resolved through the
-/// wider object store); ofs-delta bases are followed within `pack_bytes` directly.
+/// wider object store) and receives the cumulative depth after following that
+/// ref-delta. `initial_delta_depth` carries depth already traversed in another
+/// pack so mixed ref/ofs chains share the same finite recursion bound; top-level
+/// callers pass zero. Ofs-delta bases are followed within `pack_bytes` directly.
 pub fn read_object_header_at<F>(
     pack_bytes: &[u8],
     offset: u64,
     format: ObjectFormat,
+    initial_delta_depth: usize,
     mut resolve_ref_base_type: F,
 ) -> Result<(ObjectType, u64)>
 where
-    F: FnMut(&ObjectId) -> Result<Option<ObjectType>>,
+    F: FnMut(&ObjectId, usize) -> Result<Option<ObjectType>>,
 {
     read_object_header_at_inner(
         pack_bytes,
         offset,
         format,
+        initial_delta_depth,
         &mut resolve_ref_base_type,
         &mut NoopHeaderTypeCache,
     )
@@ -799,16 +804,18 @@ impl HeaderTypeCache for NoopHeaderTypeCache {
 /// through the read so (a) the ofs-delta chain's end-of-chain type is resolved at
 /// most once per chain and (b) a repeated lookup of the same offset returns from
 /// the memo without re-inflating (sley#26). The cache is keyed by in-pack offset,
-/// so it must be scoped to a single pack's bytes by the caller.
+/// so it must be scoped to a single pack's bytes by the caller. Depth semantics
+/// match [`read_object_header_at`].
 pub fn read_object_header_at_with_cache<F, C>(
     pack_bytes: &[u8],
     offset: u64,
     format: ObjectFormat,
+    initial_delta_depth: usize,
     mut resolve_ref_base_type: F,
     type_cache: &mut C,
 ) -> Result<(ObjectType, u64)>
 where
-    F: FnMut(&ObjectId) -> Result<Option<ObjectType>>,
+    F: FnMut(&ObjectId, usize) -> Result<Option<ObjectType>>,
     C: HeaderTypeCache + ?Sized,
 {
     if let Some(header) = type_cache.get(offset) {
@@ -818,6 +825,7 @@ where
         pack_bytes,
         offset,
         format,
+        initial_delta_depth,
         &mut resolve_ref_base_type,
         type_cache,
     )
@@ -827,11 +835,12 @@ pub(crate) fn read_object_header_at_inner<F, C>(
     pack_bytes: &[u8],
     offset: u64,
     format: ObjectFormat,
+    delta_depth: usize,
     resolve_ref_base_type: &mut F,
     type_cache: &mut C,
 ) -> Result<(ObjectType, u64)>
 where
-    F: FnMut(&ObjectId) -> Result<Option<ObjectType>>,
+    F: FnMut(&ObjectId, usize) -> Result<Option<ObjectType>>,
     C: HeaderTypeCache + ?Sized,
 {
     let trailer_offset = pack_bytes
@@ -850,6 +859,7 @@ where
         PackObjectKind::Blob => (ObjectType::Blob, header.size),
         PackObjectKind::Tag => (ObjectType::Tag, header.size),
         PackObjectKind::OfsDelta => {
+            let next_delta_depth = checked_header_delta_depth(offset, delta_depth)?;
             let base_offset = parse_ofs_delta_base_offset(entry_region, &mut cursor, offset)?;
             let size = delta_result_size_from_stream(&entry_region[cursor..])?;
             // The end-of-chain type only depends on the base, so reuse it across
@@ -861,6 +871,7 @@ where
                         pack_bytes,
                         base_offset,
                         format,
+                        next_delta_depth,
                         resolve_ref_base_type,
                         type_cache,
                     )?;
@@ -870,6 +881,7 @@ where
             (base_type, size)
         }
         PackObjectKind::RefDelta => {
+            let next_delta_depth = checked_header_delta_depth(offset, delta_depth)?;
             let hash_len = format.raw_len();
             if cursor + hash_len > trailer_offset {
                 return Err(GitError::InvalidFormat(
@@ -879,7 +891,7 @@ where
             let oid = ObjectId::from_raw(format, &entry_region[cursor..cursor + hash_len])?;
             cursor += hash_len;
             let size = delta_result_size_from_stream(&entry_region[cursor..])?;
-            let base_type = resolve_ref_base_type(&oid)?
+            let base_type = resolve_ref_base_type(&oid, next_delta_depth)?
                 .ok_or_else(|| GitError::not_found(format!("ref-delta base object {oid}")))?;
             (base_type, size)
         }
@@ -888,6 +900,21 @@ where
     // chain that bases on it) returns without re-inflating (sley#26).
     type_cache.put(offset, resolved);
     Ok(resolved)
+}
+
+fn checked_header_delta_depth(offset: u64, delta_depth: usize) -> Result<usize> {
+    let observed_depth = delta_depth.checked_add(1).ok_or_else(|| {
+        GitError::InvalidFormat(format!(
+            "pack delta chain depth overflows at offset {offset}"
+        ))
+    })?;
+    if observed_depth > MAX_READ_DELTA_CHAIN_DEPTH {
+        return Err(GitError::InvalidFormat(format!(
+            "pack delta chain at offset {offset} has observed depth {observed_depth}, which \
+             exceeds maximum depth (configured limit {MAX_READ_DELTA_CHAIN_DEPTH})"
+        )));
+    }
+    Ok(observed_depth)
 }
 
 /// Number of inflated delta-stream bytes to read when only the leading base-size
