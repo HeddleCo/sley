@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use sley_object::ObjectType;
 use sley_odb::ObjectReader;
-use sley_pack::{PackFile, PackWriteOptions, PackWriteSummary};
+use sley_pack::{PackFile, PackWriteLimits, PackWriteOptions, PackWriteSummary};
 
 use crate::{GitError, ObjectFormat, ObjectId, Repository, Result};
 
@@ -165,19 +165,7 @@ impl ReachablePackPlan<'_> {
     where
         W: Write,
     {
-        if self.object_ids.is_empty() {
-            return Err(GitError::Unsupported(
-                "empty reachable pack plan cannot be streamed".into(),
-            ));
-        }
-        let objects = self.repo.objects();
-        let summary = PackFile::write_packed_from_source_to_writer(
-            &self.object_ids,
-            self.format,
-            &self.options,
-            |oid| objects.read_object(oid),
-            writer,
-        )?;
+        let summary = self.write_from_source(writer, PackWriteLimits::default())?;
         Ok(reachable_pack_summary(&summary))
     }
 
@@ -185,14 +173,7 @@ impl ReachablePackPlan<'_> {
     /// second compression pass.
     pub fn prepare_to_memory(&self) -> Result<PreparedReachablePack> {
         let mut pack = Vec::new();
-        let objects = self.repo.objects();
-        let summary = PackFile::write_packed_from_source_to_writer(
-            &self.object_ids,
-            self.format,
-            &self.options,
-            |oid| objects.read_object(oid),
-            &mut pack,
-        )?;
+        let summary = self.write_from_source(&mut pack, PackWriteLimits::default())?;
         Ok(PreparedReachablePack {
             pack,
             index: summary.index.clone(),
@@ -215,20 +196,40 @@ impl ReachablePackPlan<'_> {
             .create(true)
             .truncate(true)
             .open(pack_path)?;
-        let objects = self.repo.objects();
-        let summary = PackFile::write_packed_from_source_to_writer(
-            &self.object_ids,
-            self.format,
-            &self.options,
-            |oid| objects.read_object(oid),
-            &mut file,
-        )?;
+        let summary = self.write_from_source(&mut file, PackWriteLimits::default())?;
         file.sync_all()?;
         Ok(PreparedReachablePackFile {
             pack_path: pack_path.to_path_buf(),
             index: summary.index.clone(),
             summary: reachable_pack_summary(&summary),
         })
+    }
+
+    fn write_from_source<W>(
+        &self,
+        writer: &mut W,
+        limits: PackWriteLimits,
+    ) -> Result<PackWriteSummary>
+    where
+        W: Write,
+    {
+        if self.object_ids.is_empty() {
+            return Err(GitError::Unsupported(
+                "empty reachable pack plan cannot be streamed".into(),
+            ));
+        }
+        let object_count = u32::try_from(self.object_ids.len())
+            .map_err(|_| GitError::InvalidFormat("too many pack objects".into()))?;
+        let objects = self.repo.objects();
+        PackFile::write_packed_from_source_to_writer(
+            self.object_ids.iter().copied(),
+            object_count,
+            self.format,
+            &self.options,
+            limits,
+            |oid| objects.read_object(oid),
+            writer,
+        )
     }
 }
 

@@ -28,10 +28,9 @@ pub(crate) const PACK_PARALLEL_COMPRESSION_MIN_OBJECTS: usize = 64;
 /// planning and inflate peak memory on large packs.
 pub(crate) const PACK_PARALLEL_COMPRESSION_MAX_THREADS: usize = 4;
 
-/// Streaming pack writes pre-compress only this many ordered entries at a time.
-/// This restores CPU parallelism without holding every compressed payload for a
-/// large pack in memory at once.
-pub(crate) const PACK_STREAM_COMPRESSION_WINDOW_OBJECTS: usize = 256;
+/// Per-object metadata charged against [`PackWriteLimits::compression_working_set`]
+/// so a flood of empty blobs cannot form an unbounded compression window.
+const PACK_OBJECT_WINDOW_OVERHEAD: u64 = 64;
 
 /// Options controlling sliding-window delta selection during pack generation.
 ///
@@ -137,6 +136,283 @@ impl PackWriteOptions {
         self.compression_level = level.min(9);
         self
     }
+}
+
+/// Memory budgets for streaming pack generation.
+///
+/// Compression windows are admitted by these byte budgets, not by a fixed
+/// object count. A single object larger than [`Self::compression_working_set`]
+/// but within [`Self::decoded_object`] is written as an explicit one-object
+/// quantum. A single retained delta base may likewise exceed
+/// [`Self::delta_base`] and is kept alone. Either case is documented by the
+/// resulting working-set high-water mark; nothing else may silently exceed
+/// the configured budgets.
+///
+/// Peak charged memory is at most `compression_working_set + delta_base` plus
+/// one leftover lookahead object that did not fit the current window, and one
+/// oversized one-object quantum or retained base. The leftover is charged so
+/// decoded RAM cannot silently approach twice the working-set budget.
+/// Zlib output buffers and allocator slack are not included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackWriteLimits {
+    /// Decoded bodies plus per-object overhead admitted into one compression
+    /// quantum.
+    pub compression_working_set: ByteBudget,
+    /// Hard cap on one decoded object body. Exceeding this is a typed limit
+    /// error; the object is not treated as a one-object quantum.
+    pub decoded_object: ByteBudget,
+    /// Retained sliding-window delta-base bodies. Charged separately from the
+    /// compression working set.
+    pub delta_base: ByteBudget,
+}
+
+impl Default for PackWriteLimits {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PackWriteLimits {
+    /// Fail-closed defaults: 32 MiB compression working set, 512 MiB single
+    /// decoded object, 32 MiB retained delta bases.
+    pub fn new() -> Self {
+        Self {
+            compression_working_set: ByteBudget::new(32 * 1024 * 1024),
+            decoded_object: ByteBudget::new(512 * 1024 * 1024),
+            delta_base: ByteBudget::new(32 * 1024 * 1024),
+        }
+    }
+
+    pub fn with_compression_working_set(mut self, budget: ByteBudget) -> Self {
+        self.compression_working_set = budget;
+        self
+    }
+
+    pub fn with_decoded_object(mut self, budget: ByteBudget) -> Self {
+        self.decoded_object = budget;
+        self
+    }
+
+    pub fn with_delta_base(mut self, budget: ByteBudget) -> Self {
+        self.delta_base = budget;
+        self
+    }
+}
+
+fn pack_object_window_cost(object: &EncodedObject) -> u64 {
+    (object.body.len() as u64).saturating_add(PACK_OBJECT_WINDOW_OVERHEAD)
+}
+
+fn pack_delta_base_cost(object: &EncodedObject) -> u64 {
+    pack_object_window_cost(object)
+}
+
+fn duplicate_pack_object_id(oid: ObjectId) -> GitError {
+    GitError::InvalidFormat(format!("pack contains duplicate object id {oid}"))
+}
+
+fn next_compression_window_end(
+    objects: &[&EncodedObject],
+    order: &[usize],
+    start: usize,
+    budget: ByteBudget,
+) -> usize {
+    if start >= order.len() {
+        return start;
+    }
+    let mut end = start + 1;
+    let mut used = pack_object_window_cost(objects[order[start]]);
+    if used > budget.as_u64() {
+        return end;
+    }
+    while end < order.len() {
+        let additional = pack_object_window_cost(objects[order[end]]);
+        if !budget.allows(used, additional) {
+            break;
+        }
+        used = used.saturating_add(additional);
+        end += 1;
+    }
+    end
+}
+
+struct PendingSourceObject {
+    oid: ObjectId,
+    object: Arc<EncodedObject>,
+}
+
+fn leftover_window_cost(leftover: Option<&PendingSourceObject>) -> u64 {
+    leftover
+        .map(|pending| pack_object_window_cost(&pending.object))
+        .unwrap_or(0)
+}
+
+struct SourcePackStream<I, F> {
+    selected: I,
+    leftover: Option<PendingSourceObject>,
+    seen: HashSet<ObjectId>,
+    yielded: u64,
+    object_count: u32,
+    format: ObjectFormat,
+    limits: PackWriteLimits,
+    read_object: F,
+    index_entries: Vec<PackIndexEntry>,
+    delta_count: u32,
+    peak_working_set_bytes: u64,
+}
+
+impl<I, F> SourcePackStream<I, F>
+where
+    I: Iterator<Item = ObjectId>,
+    F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
+{
+    fn new(
+        selected: I,
+        object_count: u32,
+        format: ObjectFormat,
+        limits: PackWriteLimits,
+        read_object: F,
+    ) -> Self {
+        Self {
+            selected,
+            leftover: None,
+            seen: HashSet::new(),
+            yielded: 0,
+            object_count,
+            format,
+            limits,
+            read_object,
+            index_entries: Vec::new(),
+            delta_count: 0,
+            peak_working_set_bytes: 0,
+        }
+    }
+
+    fn pull(&mut self) -> Result<Option<PendingSourceObject>> {
+        if let Some(pending) = self.leftover.take() {
+            return Ok(Some(pending));
+        }
+        let Some(oid) = self.selected.next() else {
+            return Ok(None);
+        };
+        if self.yielded >= u64::from(self.object_count) {
+            return Err(GitError::count_mismatch(
+                u64::from(self.object_count),
+                self.yielded.saturating_add(1),
+            ));
+        }
+        self.yielded = self.yielded.saturating_add(1);
+        if oid.format() != self.format {
+            return Err(GitError::InvalidObjectId(
+                "pack object id format does not match pack format".into(),
+            ));
+        }
+        if !self.seen.insert(oid) {
+            return Err(duplicate_pack_object_id(oid));
+        }
+        let object = (self.read_object)(&oid)?;
+        let attempted = object.body.len() as u64;
+        let limit = self.limits.decoded_object.as_u64();
+        if attempted > limit {
+            return Err(GitError::resource_limit(
+                ResourceLimitKind::DecodedObject,
+                limit,
+                attempted,
+            ));
+        }
+        Ok(Some(PendingSourceObject { oid, object }))
+    }
+
+    fn fill_window(&mut self, cancel: CancelFlag<'_>) -> Result<(Vec<PendingSourceObject>, u64)> {
+        let mut window = Vec::new();
+        let mut used = 0u64;
+        loop {
+            cancel.check()?;
+            let Some(pending) = self.pull()? else {
+                break;
+            };
+            let cost = pack_object_window_cost(&pending.object);
+            if window.is_empty() {
+                window.push(pending);
+                used = cost;
+                if cost > self.limits.compression_working_set.as_u64() {
+                    break;
+                }
+                continue;
+            }
+            if !self.limits.compression_working_set.allows(used, cost) {
+                self.leftover = Some(pending);
+                break;
+            }
+            used = used.saturating_add(cost);
+            window.push(pending);
+        }
+        Ok((window, used))
+    }
+
+    fn note_peak(&mut self, window_bytes: u64, horizon_bytes: u64) {
+        let now = window_bytes
+            .saturating_add(horizon_bytes)
+            .saturating_add(leftover_window_cost(self.leftover.as_ref()));
+        if now > self.peak_working_set_bytes {
+            self.peak_working_set_bytes = now;
+        }
+    }
+
+    fn finish(self, output: PackDigestWriter<'_, impl Write>) -> Result<PackWriteSummary> {
+        if self.leftover.is_some() || self.yielded != u64::from(self.object_count) {
+            return Err(GitError::count_mismatch(
+                u64::from(self.object_count),
+                self.yielded,
+            ));
+        }
+        let (checksum, pack_size) = output.finish()?;
+        let index = PackIndex::write_v2(self.format, &self.index_entries, &checksum)?;
+        Ok(PackWriteSummary {
+            index,
+            checksum,
+            entries: self.index_entries,
+            delta_count: self.delta_count,
+            pack_size,
+            peak_working_set_bytes: self.peak_working_set_bytes,
+        })
+    }
+}
+
+fn retain_streaming_delta_base(
+    horizon: &mut VecDeque<StreamingDeltaBase>,
+    horizon_bytes: &mut u64,
+    base: StreamingDeltaBase,
+    options: &PackWriteOptions,
+    limits: PackWriteLimits,
+) {
+    if options.depth == 0 || options.window == 0 {
+        return;
+    }
+    let cost = pack_delta_base_cost(&base.object);
+    horizon.push_back(base);
+    *horizon_bytes = horizon_bytes.saturating_add(cost);
+    while horizon.len() > options.window {
+        if let Some(evicted) = horizon.pop_front() {
+            *horizon_bytes = horizon_bytes.saturating_sub(pack_delta_base_cost(&evicted.object));
+        }
+    }
+    while horizon.len() > 1 && *horizon_bytes > limits.delta_base.as_u64() {
+        if let Some(evicted) = horizon.pop_front() {
+            *horizon_bytes = horizon_bytes.saturating_sub(pack_delta_base_cost(&evicted.object));
+        }
+    }
+}
+
+fn validate_thin_base_formats(options: &PackWriteOptions, format: ObjectFormat) -> Result<()> {
+    for oid in options.thin_bases.keys() {
+        if oid.format() != format {
+            return Err(GitError::InvalidObjectId(
+                "thin pack base object id format does not match pack format".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl PackFile {
@@ -311,9 +587,7 @@ impl PackFile {
         let mut seen = HashSet::with_capacity(object_ids.len());
         for oid in &object_ids {
             if !seen.insert(oid) {
-                return Err(GitError::InvalidFormat(format!(
-                    "pack contains duplicate object id {oid}"
-                )));
+                return Err(duplicate_pack_object_id(*oid));
             }
         }
 
@@ -418,9 +692,7 @@ impl PackFile {
         let mut seen = HashSet::with_capacity(object_ids.len());
         for oid in &object_ids {
             if !seen.insert(oid) {
-                return Err(GitError::InvalidFormat(format!(
-                    "pack contains duplicate object id {oid}"
-                )));
+                return Err(duplicate_pack_object_id(*oid));
             }
         }
 
@@ -442,7 +714,12 @@ impl PackFile {
         let mut delta_count = 0u32;
         let mut written_offsets: Vec<Option<u64>> = vec![None; objects.len()];
 
-        for order_window in order.chunks(PACK_STREAM_COMPRESSION_WINDOW_OBJECTS) {
+        let compression_budget = PackWriteLimits::new().compression_working_set;
+        let mut window_start = 0;
+        while window_start < order.len() {
+            let window_end =
+                next_compression_window_end(&objects, &order, window_start, compression_budget);
+            let order_window = &order[window_start..window_end];
             let compressed_payloads = compress_planned_payloads(
                 &objects,
                 &plan,
@@ -498,6 +775,7 @@ impl PackFile {
                     offset,
                 });
             }
+            window_start = window_end;
         }
 
         let (checksum, pack_size) = output.finish()?;
@@ -508,184 +786,201 @@ impl PackFile {
             entries: index_entries,
             delta_count,
             pack_size,
+            peak_working_set_bytes: 0,
         })
     }
 
-    pub fn write_undeltified_from_source_to_writer<W, F>(
-        object_ids: &[ObjectId],
+    pub fn write_undeltified_from_source_to_writer<W, I, F>(
+        selected_objects: I,
+        object_count: u32,
         format: ObjectFormat,
         options: &PackWriteOptions,
+        limits: PackWriteLimits,
         read_object: F,
         writer: &mut W,
     ) -> Result<PackWriteSummary>
     where
         W: Write,
+        I: IntoIterator<Item = ObjectId>,
         F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
     {
         Self::write_undeltified_from_source_to_writer_with_cancel(
-            object_ids,
+            selected_objects,
+            object_count,
             format,
             options,
+            limits,
             read_object,
             writer,
             CancelFlag::never(),
         )
     }
 
-    /// Undeltified pack write that polls `cancel` between compression windows.
-    pub fn write_undeltified_from_source_to_writer_with_cancel<W, F>(
-        object_ids: &[ObjectId],
+    /// Undeltified pack write from a one-shot object-id iterator.
+    ///
+    /// `object_count` is written into the pack header. Yielding fewer or more
+    /// ids is [`GitError::CountMismatch`] and never a successful pack.
+    /// Repeated ids are rejected as they are consumed. Compression windows are
+    /// admitted by [`PackWriteLimits`]. Polls `cancel` between windows and
+    /// while filling a window.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_undeltified_from_source_to_writer_with_cancel<W, I, F>(
+        selected_objects: I,
+        object_count: u32,
         format: ObjectFormat,
         options: &PackWriteOptions,
-        mut read_object: F,
+        limits: PackWriteLimits,
+        read_object: F,
         writer: &mut W,
         cancel: CancelFlag<'_>,
     ) -> Result<PackWriteSummary>
     where
         W: Write,
+        I: IntoIterator<Item = ObjectId>,
         F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
     {
-        let mut seen = HashSet::with_capacity(object_ids.len());
-        for oid in object_ids {
-            if oid.format() != format {
-                return Err(GitError::InvalidObjectId(
-                    "pack object id format does not match pack format".into(),
-                ));
-            }
-            if !seen.insert(oid) {
-                return Err(GitError::InvalidFormat(format!(
-                    "pack contains duplicate object id {oid}"
-                )));
-            }
-        }
-
+        cancel.check()?;
+        let mut stream = SourcePackStream::new(
+            selected_objects.into_iter(),
+            object_count,
+            format,
+            limits,
+            read_object,
+        );
         let mut output = PackDigestWriter::new(writer, format);
         output.write_pack_bytes(b"PACK")?;
         output.write_pack_bytes(&2u32.to_be_bytes())?;
-        output.write_pack_bytes(&(object_ids.len() as u32).to_be_bytes())?;
+        output.write_pack_bytes(&object_count.to_be_bytes())?;
 
-        let mut index_entries = Vec::with_capacity(object_ids.len());
-        for oid_window in object_ids.chunks(PACK_STREAM_COMPRESSION_WINDOW_OBJECTS) {
+        loop {
             cancel.check()?;
-            let mut objects = Vec::with_capacity(oid_window.len());
-            for oid in oid_window {
-                objects.push(read_object(oid)?);
+            let (window, window_bytes) = stream.fill_window(cancel)?;
+            if window.is_empty() {
+                break;
             }
+            stream.note_peak(window_bytes, 0);
+            let objects = window
+                .iter()
+                .map(|entry| Arc::clone(&entry.object))
+                .collect::<Vec<_>>();
             let compressed_payloads =
                 compress_undeltified_payloads(&objects, options.compression_level)?;
-            for ((oid, object), compressed_payload) in
-                oid_window.iter().zip(&objects).zip(&compressed_payloads)
-            {
+            for (entry, compressed_payload) in window.iter().zip(&compressed_payloads) {
                 let offset = output.position();
                 let mut entry_header = Vec::new();
                 write_entry_header(
                     &mut entry_header,
-                    object.object_type,
-                    object.body.len() as u64,
+                    entry.object.object_type,
+                    entry.object.body.len() as u64,
                 );
                 let mut crc32 = crc32fast::Hasher::new();
                 crc32.update(&entry_header);
                 crc32.update(compressed_payload);
                 output.write_pack_bytes(&entry_header)?;
                 output.write_pack_bytes(compressed_payload)?;
-                index_entries.push(PackIndexEntry {
-                    oid: *oid,
+                stream.index_entries.push(PackIndexEntry {
+                    oid: entry.oid,
                     crc32: crc32.finalize(),
                     offset,
                 });
             }
         }
 
-        let (checksum, pack_size) = output.finish()?;
-        let index = PackIndex::write_v2(format, &index_entries, &checksum)?;
-        Ok(PackWriteSummary {
-            index,
-            checksum,
-            entries: index_entries,
-            delta_count: 0,
-            pack_size,
-        })
+        stream.finish(output)
     }
 
-    pub fn write_packed_from_source_to_writer<W, F>(
-        object_ids: &[ObjectId],
+    pub fn write_packed_from_source_to_writer<W, I, F>(
+        selected_objects: I,
+        object_count: u32,
         format: ObjectFormat,
         options: &PackWriteOptions,
+        limits: PackWriteLimits,
         read_object: F,
         writer: &mut W,
     ) -> Result<PackWriteSummary>
     where
         W: Write,
+        I: IntoIterator<Item = ObjectId>,
         F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
     {
         Self::write_packed_from_source_to_writer_with_cancel(
-            object_ids,
+            selected_objects,
+            object_count,
             format,
             options,
+            limits,
             read_object,
             writer,
             CancelFlag::never(),
         )
     }
 
-    /// Streaming deltified pack write that polls `cancel` between compression
-    /// windows. Returns [`GitError::Cancelled`] when the flag trips.
-    pub fn write_packed_from_source_to_writer_with_cancel<W, F>(
-        object_ids: &[ObjectId],
+    /// Streaming deltified pack write from a one-shot object-id iterator.
+    ///
+    /// Separates the pack header's required `object_count` from enumeration:
+    /// `selected_objects` is consumed once and does not need `ExactSizeIterator`,
+    /// `Clone`, or collection conversion. Yielding fewer or more ids than
+    /// `object_count` is [`GitError::CountMismatch`] and never a successful pack.
+    ///
+    /// Compression windows are admitted by [`PackWriteLimits`], not a fixed
+    /// object count. A single object larger than the ordinary working-set
+    /// budget is written as a one-object quantum when it still fits
+    /// [`PackWriteLimits::decoded_object`]; otherwise it is a typed
+    /// [`GitError::ResourceLimit`]. Delta-base retention is charged to
+    /// [`PackWriteLimits::delta_base`]. A leftover lookahead object that does
+    /// not fit the current window is charged against the working-set peak.
+    /// Repeated ids are rejected as they are consumed. Output-writer
+    /// backpressure and `read_object` failures stop further enumeration. Polls
+    /// `cancel` between windows and while filling a window, and returns
+    /// [`GitError::Cancelled`] when the flag trips.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_packed_from_source_to_writer_with_cancel<W, I, F>(
+        selected_objects: I,
+        object_count: u32,
         format: ObjectFormat,
         options: &PackWriteOptions,
-        mut read_object: F,
+        limits: PackWriteLimits,
+        read_object: F,
         writer: &mut W,
         cancel: CancelFlag<'_>,
     ) -> Result<PackWriteSummary>
     where
         W: Write,
+        I: IntoIterator<Item = ObjectId>,
         F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
     {
-        if object_ids.len() > u32::MAX as usize {
-            return Err(GitError::InvalidFormat("too many pack objects".into()));
-        }
-
-        let mut seen = HashSet::with_capacity(object_ids.len());
-        for oid in object_ids {
-            if oid.format() != format {
-                return Err(GitError::InvalidObjectId(
-                    "pack object id format does not match pack format".into(),
-                ));
-            }
-            if !seen.insert(*oid) {
-                return Err(GitError::InvalidFormat(format!(
-                    "pack contains duplicate object id {oid}"
-                )));
-            }
-        }
-
-        for oid in options.thin_bases.keys() {
-            if oid.format() != format {
-                return Err(GitError::InvalidObjectId(
-                    "thin pack base object id format does not match pack format".into(),
-                ));
-            }
-        }
-
+        validate_thin_base_formats(options, format)?;
+        cancel.check()?;
+        let mut stream = SourcePackStream::new(
+            selected_objects.into_iter(),
+            object_count,
+            format,
+            limits,
+            read_object,
+        );
         let mut output = PackDigestWriter::new(writer, format);
         output.write_pack_bytes(b"PACK")?;
         output.write_pack_bytes(&2u32.to_be_bytes())?;
-        output.write_pack_bytes(&(object_ids.len() as u32).to_be_bytes())?;
+        output.write_pack_bytes(&object_count.to_be_bytes())?;
 
-        let mut index_entries = Vec::with_capacity(object_ids.len());
-        let mut delta_count = 0u32;
         let mut base_horizon: VecDeque<StreamingDeltaBase> = VecDeque::new();
+        let mut horizon_bytes = 0u64;
 
-        for oid_window in object_ids.chunks(PACK_STREAM_COMPRESSION_WINDOW_OBJECTS) {
+        loop {
             cancel.check()?;
-            let mut objects = Vec::with_capacity(oid_window.len());
-            for oid in oid_window {
-                objects.push(read_object(oid)?);
+            let (window, window_bytes) = stream.fill_window(cancel)?;
+            if window.is_empty() {
+                break;
             }
+            stream.note_peak(window_bytes, horizon_bytes);
 
+            let objects = window
+                .iter()
+                .map(|entry| Arc::clone(&entry.object))
+                .collect::<Vec<_>>();
+            let object_ids = window.iter().map(|entry| entry.oid).collect::<Vec<_>>();
             let (plan, order) =
-                plan_streaming_window_deltas(&objects, oid_window, &base_horizon, options);
+                plan_streaming_window_deltas(&objects, &object_ids, &base_horizon, options);
             let compressed_payloads = compress_streaming_planned_payloads(
                 &objects,
                 &plan,
@@ -706,7 +1001,7 @@ impl PackFile {
                         );
                     }
                     StreamingPlannedBase::Current { base_idx, delta } => {
-                        delta_count += 1;
+                        stream.delta_count += 1;
                         let base_offset = written_offsets[*base_idx].ok_or_else(|| {
                             GitError::InvalidFormat(
                                 "in-pack delta base emitted after dependent object".into(),
@@ -722,7 +1017,7 @@ impl PackFile {
                             write_ofs_delta_offset(&mut entry_header, relative)?;
                         } else {
                             write_pack_entry_header_kind(&mut entry_header, 7, delta.len() as u64);
-                            entry_header.extend_from_slice(oid_window[*base_idx].as_bytes());
+                            entry_header.extend_from_slice(object_ids[*base_idx].as_bytes());
                         }
                     }
                     StreamingPlannedBase::Previous {
@@ -730,7 +1025,7 @@ impl PackFile {
                         base_offset,
                         delta,
                     } => {
-                        delta_count += 1;
+                        stream.delta_count += 1;
                         if options.prefer_ofs_delta {
                             write_pack_entry_header_kind(&mut entry_header, 6, delta.len() as u64);
                             let relative = offset.checked_sub(*base_offset).ok_or_else(|| {
@@ -745,7 +1040,7 @@ impl PackFile {
                         }
                     }
                     StreamingPlannedBase::External { base_oid, delta } => {
-                        delta_count += 1;
+                        stream.delta_count += 1;
                         write_pack_entry_header_kind(&mut entry_header, 7, delta.len() as u64);
                         entry_header.extend_from_slice(base_oid.as_bytes());
                     }
@@ -757,35 +1052,29 @@ impl PackFile {
                 output.write_pack_bytes(&entry_header)?;
                 output.write_pack_bytes(compressed_payload)?;
                 written_offsets[idx] = Some(offset);
-                index_entries.push(PackIndexEntry {
-                    oid: oid_window[idx],
+                stream.index_entries.push(PackIndexEntry {
+                    oid: object_ids[idx],
                     crc32: crc32.finalize(),
                     offset,
                 });
 
-                if options.depth > 0 && options.window > 0 {
-                    base_horizon.push_back(StreamingDeltaBase {
-                        oid: oid_window[idx],
+                retain_streaming_delta_base(
+                    &mut base_horizon,
+                    &mut horizon_bytes,
+                    StreamingDeltaBase {
+                        oid: object_ids[idx],
                         object: Arc::clone(&objects[idx]),
                         offset,
                         depth: plan[idx].depth,
-                    });
-                    while base_horizon.len() > options.window {
-                        base_horizon.pop_front();
-                    }
-                }
+                    },
+                    options,
+                    limits,
+                );
+                stream.note_peak(window_bytes, horizon_bytes);
             }
         }
 
-        let (checksum, pack_size) = output.finish()?;
-        let index = PackIndex::write_v2(format, &index_entries, &checksum)?;
-        Ok(PackWriteSummary {
-            index,
-            checksum,
-            entries: index_entries,
-            delta_count,
-            pack_size,
-        })
+        stream.finish(output)
     }
 }
 
