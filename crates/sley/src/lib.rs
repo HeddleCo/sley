@@ -83,7 +83,7 @@ pub use remote::clone_repository;
 pub use remote::OperationContext;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeBuilder};
 use sley_odb::{
@@ -462,6 +462,25 @@ impl Default for OpenOptions {
     }
 }
 
+/// A repository layout and config policy already resolved by an invocation
+/// layer.
+///
+/// CLI callers have additional inputs (`--git-dir`, `--work-tree`, injected
+/// config, and environment-hiding rules) which the embeddable repository facade
+/// deliberately does not interpret. Passing the resolved state as one typed
+/// value prevents the facade from rediscovering `commondir`, worktree state, or
+/// replacement policy after the caller has already done so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRepositoryOpen {
+    pub git_dir: PathBuf,
+    pub common_dir: PathBuf,
+    pub work_tree: Option<PathBuf>,
+    /// Format read from the repository's physical config layer. Invocation
+    /// injections must not change repository format metadata.
+    pub format: ObjectFormat,
+    pub use_replace_refs: bool,
+}
+
 /// An ergonomic handle to a git repository.
 ///
 /// Construct one with [`Repository::open`] (when you already know the git
@@ -478,13 +497,15 @@ impl Default for OpenOptions {
 ///
 /// The handle is cheap to clone and shares a session-scoped object database
 /// ([`Repository::objects`]) whose read caches survive across calls until
-/// [`Repository::refresh_objects`] (automatic after `fetch` / pack copy).
+/// [`Repository::refresh_objects`] (automatic after `fetch` / pack copy). Raw,
+/// replacement-free opens defer constructing that database until the first
+/// object operation.
 #[derive(Debug, Clone)]
 pub struct Repository {
     git_dir: PathBuf,
     common_dir: PathBuf,
     format: ObjectFormat,
-    objects: Arc<FileObjectDatabase>,
+    objects: Arc<OnceLock<Arc<FileObjectDatabase>>>,
     work_tree_override: Option<PathBuf>,
 }
 
@@ -523,6 +544,40 @@ fn repository_object_replacements(
 }
 
 impl Repository {
+    /// Open an already-resolved repository layout.
+    ///
+    /// `replace_objects` is the caller's upper gate (for example
+    /// `GIT_NO_REPLACE_OBJECTS`). The resolved config policy remains the lower
+    /// gate. Write-only callers should pass `false`: replacement refs affect
+    /// object reads, never object-id computation or object storage. When
+    /// replacements are disabled, object-database construction is deferred
+    /// until the first object operation.
+    pub fn open_resolved(resolved: ResolvedRepositoryOpen, replace_objects: bool) -> Result<Self> {
+        if !is_git_dir(&resolved.git_dir) {
+            return Err(GitError::repository_not_found(format!(
+                "not a git repository: {}",
+                resolved.git_dir.display()
+            )));
+        }
+        let format = resolved.format;
+        let objects = if replace_objects && resolved.use_replace_refs {
+            let replacements = repository_object_replacements(&resolved.common_dir, format)?;
+            Arc::new(OnceLock::from(Arc::new(
+                FileObjectDatabase::from_git_dir(&resolved.common_dir, format)
+                    .with_replacements(replacements),
+            )))
+        } else {
+            Arc::new(OnceLock::new())
+        };
+        Ok(Self {
+            git_dir: resolved.git_dir,
+            common_dir: resolved.common_dir,
+            format,
+            objects,
+            work_tree_override: resolved.work_tree,
+        })
+    }
+
     /// Open the repository whose git directory is exactly `git_dir`.
     ///
     /// `git_dir` must be a git directory itself (the `.git` directory of a
@@ -653,14 +708,15 @@ impl Repository {
                 .unwrap_or(true),
         };
         let use_replace_refs = replace_objects && configured_use_replace_refs;
-        let replacements = if use_replace_refs {
-            repository_object_replacements(&common_dir, format)?
+        let objects = if use_replace_refs {
+            let replacements = repository_object_replacements(&common_dir, format)?;
+            Arc::new(OnceLock::from(Arc::new(
+                FileObjectDatabase::from_git_dir(&common_dir, format)
+                    .with_replacements(replacements),
+            )))
         } else {
-            ObjectReplacements::default()
+            Arc::new(OnceLock::new())
         };
-        let objects = Arc::new(
-            FileObjectDatabase::from_git_dir(&common_dir, format).with_replacements(replacements),
-        );
         Ok(Self {
             git_dir,
             common_dir,
@@ -991,7 +1047,7 @@ impl Repository {
 
     /// Peel an object id to the commit it ultimately names.
     pub fn peel_to_commit_oid(&self, oid: ObjectId) -> Result<ObjectId> {
-        sley_rev::peel_to_commit(self.objects.as_ref(), self.format, &oid).map_err(|err| {
+        sley_rev::peel_to_commit(self.object_database(), self.format, &oid).map_err(|err| {
             expect_missing_object_kind(
                 err,
                 oid,
@@ -1022,7 +1078,7 @@ impl Repository {
         sley_rev::resolve_rev_path_entry(
             &self.git_dir,
             self.format,
-            self.objects.as_ref(),
+            self.object_database(),
             rev,
             path,
         )
@@ -1070,7 +1126,7 @@ impl Repository {
 
     /// Read a raw object (any type) from the object database.
     pub fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
-        ObjectReader::read_object(self.objects.as_ref(), oid)
+        ObjectReader::read_object(self.object_database(), oid)
     }
 
     /// Read a commit object, parsing it into a [`Commit`]. Returns an error if
@@ -1207,7 +1263,7 @@ impl Repository {
     /// Build a fresh index mirroring `tree_oid` (stage-0 entries with a zeroed
     /// stat), the way `git read-tree <tree>` would. Does not touch `.git/index`.
     pub fn index_from_tree(&self, tree_oid: &ObjectId) -> Result<Index> {
-        sley_worktree::index_from_tree(self.objects.as_ref(), self.format, tree_oid)
+        sley_worktree::index_from_tree(self.object_database(), self.format, tree_oid)
     }
 
     /// Follow a symbolic ref chain (e.g. `HEAD` -> `refs/heads/main`) to the
@@ -1508,6 +1564,34 @@ mod tests {
         let reopened = Repository::open(temp.path().join(".git")).expect("open");
         assert_eq!(reopened.git_dir(), repo.git_dir());
         assert_eq!(reopened.object_format(), ObjectFormat::Sha1);
+    }
+
+    #[test]
+    fn resolved_raw_open_defers_and_shares_object_database() {
+        let temp = TempDir::new();
+        let initialized = Repository::init(temp.path()).expect("init");
+        let repo = Repository::open_resolved(
+            ResolvedRepositoryOpen {
+                git_dir: initialized.git_dir().to_path_buf(),
+                common_dir: initialized.common_dir().to_path_buf(),
+                work_tree: initialized.workdir(),
+                format: initialized.object_format(),
+                use_replace_refs: true,
+            },
+            false,
+        )
+        .expect("open resolved repository without replacement reads");
+        let clone = repo.clone();
+
+        assert!(repo.objects.get().is_none());
+        let _refs = repo.references();
+        assert!(repo.objects.get().is_none());
+
+        repo.write_blob(b"initialize lazily")
+            .expect("write through lazy object database");
+        let repo_objects = repo.objects.get().expect("initialized object database");
+        let clone_objects = clone.objects.get().expect("shared initialization");
+        assert!(Arc::ptr_eq(repo_objects, clone_objects));
     }
 
     #[test]

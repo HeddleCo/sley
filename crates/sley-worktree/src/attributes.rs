@@ -904,7 +904,7 @@ pub(crate) fn wildcard_class_matches(
     Some((if negated { !matched } else { matched }, end + 1))
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct AttributeMatcher {
     pub(crate) patterns: Vec<AttributePattern>,
     pub(crate) attribute_order: BTreeMap<Vec<u8>, usize>,
@@ -912,7 +912,7 @@ pub(crate) struct AttributeMatcher {
     pub(crate) ignore_case: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct AttributePattern {
     base: Vec<u8>,
     pattern: Vec<u8>,
@@ -932,10 +932,7 @@ impl AttributeMatcher {
     pub(crate) fn from_worktree_root(root: &Path) -> Result<Self> {
         let mut matcher = Self::default();
         let git_dir = root.join(".git");
-        matcher.configure_case_sensitivity(&git_dir);
-        if !matcher.read_configured_attributes(root, &git_dir) {
-            matcher.read_default_global_attributes();
-        }
+        matcher.configure_from_repo(root, &git_dir);
         collect_attribute_patterns(root, root, &mut matcher)?;
         read_attribute_patterns(
             git_dir.join("info").join("attributes"),
@@ -945,6 +942,22 @@ impl AttributeMatcher {
             false,
         );
         Ok(matcher)
+    }
+
+    /// Global / `core.attributesFile` sources only — no in-tree `.gitattributes`
+    /// and no `$GIT_COMMON_DIR/info/attributes`. Callers that resolve one path
+    /// at a time fold those higher-precedence frames themselves so they can
+    /// avoid a full-worktree walk.
+    pub(crate) fn from_global_sources(root: &Path, git_dir: &Path) -> Self {
+        let mut matcher = Self::default();
+        matcher.configure_from_repo(root, git_dir);
+        matcher
+    }
+
+    pub(crate) fn from_global_config(root: &Path, config: &GitConfig) -> Self {
+        let mut matcher = Self::default();
+        matcher.configure_from_config(root, config);
+        matcher
     }
 
     /// Builds only the repository-wide attribute sources — `core.attributesFile`
@@ -958,10 +971,7 @@ impl AttributeMatcher {
     pub(crate) fn from_worktree_base(root: &Path) -> Self {
         let mut matcher = Self::default();
         let git_dir = root.join(".git");
-        matcher.configure_case_sensitivity(&git_dir);
-        if !matcher.read_configured_attributes(root, &git_dir) {
-            matcher.read_default_global_attributes();
-        }
+        matcher.configure_from_repo(root, &git_dir);
         read_attribute_patterns(
             git_dir.join("info").join("attributes"),
             &mut matcher,
@@ -978,16 +988,58 @@ impl AttributeMatcher {
         requested: &[Vec<u8>],
         all: bool,
     ) -> Vec<AttributeCheck> {
+        Self::attributes_for_path_in_frames(std::iter::once(self), path, requested, all)
+    }
+
+    /// Resolve attributes across independently parsed source frames.
+    ///
+    /// Frames must be supplied from lowest to highest precedence. Keeping the
+    /// sources separate lets path-oriented callers share an ancestor chain
+    /// without cloning all accumulated patterns for every directory. Attribute
+    /// state (including an explicit `!attribute` reset) is still folded across
+    /// the entire chain exactly as it is for a single flat matcher.
+    pub(crate) fn attributes_for_path_in_frames<'a>(
+        frames: impl IntoIterator<Item = &'a AttributeMatcher>,
+        path: &[u8],
+        requested: &[Vec<u8>],
+        all: bool,
+    ) -> Vec<AttributeCheck> {
+        let frames = frames.into_iter().collect::<Vec<_>>();
+        let owned_macros;
+        let macros = if frames.iter().any(|frame| !frame.macros.is_empty()) {
+            owned_macros = {
+                let mut macros = builtin_attribute_macros().clone();
+                for frame in &frames {
+                    macros.extend(frame.macros.clone());
+                }
+                macros
+            };
+            &owned_macros
+        } else {
+            builtin_attribute_macros()
+        };
+
         let mut states = BTreeMap::<Vec<u8>, Option<AttributeState>>::new();
-        for pattern in &self.patterns {
-            if !pattern.matches(path, self.ignore_case) {
-                continue;
-            }
-            for assignment in &pattern.assignments {
-                self.apply_attribute_assignment(&mut states, assignment);
+        for frame in &frames {
+            for pattern in &frame.patterns {
+                if !pattern.matches(path, frame.ignore_case) {
+                    continue;
+                }
+                for assignment in &pattern.assignments {
+                    Self::apply_attribute_assignment_with_macros(macros, &mut states, assignment);
+                }
             }
         }
         if all {
+            let mut attribute_order = BTreeMap::new();
+            for frame in &frames {
+                let mut ordered = frame.attribute_order.iter().collect::<Vec<_>>();
+                ordered.sort_by_key(|(_, order)| **order);
+                for (attribute, _) in ordered {
+                    let next = attribute_order.len();
+                    attribute_order.entry(attribute.clone()).or_insert(next);
+                }
+            }
             let mut checks = states
                 .into_iter()
                 .filter_map(|(attribute, state)| {
@@ -998,8 +1050,8 @@ impl AttributeMatcher {
                 })
                 .collect::<Vec<_>>();
             checks.sort_by(|left, right| {
-                attribute_all_rank(&left.attribute, &self.attribute_order)
-                    .cmp(&attribute_all_rank(&right.attribute, &self.attribute_order))
+                attribute_all_rank(&left.attribute, &attribute_order)
+                    .cmp(&attribute_all_rank(&right.attribute, &attribute_order))
                     .then_with(|| left.attribute.cmp(&right.attribute))
             });
             return checks;
@@ -1020,8 +1072,8 @@ impl AttributeMatcher {
             .or_insert(next);
     }
 
-    fn apply_attribute_assignment(
-        &self,
+    fn apply_attribute_assignment_with_macros(
+        macros: &BTreeMap<Vec<u8>, Vec<AttributeAssignment>>,
         states: &mut BTreeMap<Vec<u8>, Option<AttributeState>>,
         assignment: &AttributeAssignment,
     ) {
@@ -1032,7 +1084,7 @@ impl AttributeMatcher {
             if assignment.state != Some(AttributeState::Set) {
                 continue;
             }
-            let Some(macro_assignments) = self.macros.get(&assignment.attribute) else {
+            let Some(macro_assignments) = macros.get(&assignment.attribute) else {
                 continue;
             };
             expanded += 1;
@@ -1043,6 +1095,28 @@ impl AttributeMatcher {
                 stack.push(macro_assignment.clone());
             }
         }
+    }
+
+    /// Read repository config once to set `core.ignoreCase` and load
+    /// `core.attributesFile` (or the default global file). Previously
+    /// [`Self::configure_case_sensitivity`] and [`Self::read_configured_attributes`]
+    /// each parsed the same config document.
+    pub(crate) fn configure_from_repo(&mut self, root: &Path, git_dir: &Path) {
+        let Ok(config) = sley_config::read_repo_config(git_dir, None) else {
+            self.read_default_global_attributes();
+            return;
+        };
+        self.configure_from_config(root, &config);
+    }
+
+    pub(crate) fn configure_from_config(&mut self, root: &Path, config: &GitConfig) {
+        self.ignore_case = config.get_bool("core", None, "ignorecase").unwrap_or(false);
+        let Some(value) = config.get("core", None, "attributesFile") else {
+            self.read_default_global_attributes();
+            return;
+        };
+        let path = expand_core_excludes_file(root, value);
+        read_attribute_patterns(path, self, &[], value.as_bytes(), false);
     }
 
     pub(crate) fn configure_case_sensitivity(&mut self, git_dir: &Path) {
@@ -1082,6 +1156,32 @@ impl AttributeMatcher {
             read_attribute_patterns(path, self, &[], source.as_bytes(), false);
         }
     }
+}
+
+/// Git's built-in `binary` macro is the lowest-precedence macro definition.
+/// User definitions from global, root, or info attribute sources replace it,
+/// including for patterns parsed from lower-precedence sources.
+fn builtin_attribute_macros() -> &'static BTreeMap<Vec<u8>, Vec<AttributeAssignment>> {
+    static MACROS: OnceLock<BTreeMap<Vec<u8>, Vec<AttributeAssignment>>> = OnceLock::new();
+    MACROS.get_or_init(|| {
+        BTreeMap::from([(
+            b"binary".to_vec(),
+            vec![
+                AttributeAssignment {
+                    attribute: b"diff".to_vec(),
+                    state: Some(AttributeState::Unset),
+                },
+                AttributeAssignment {
+                    attribute: b"merge".to_vec(),
+                    state: Some(AttributeState::Unset),
+                },
+                AttributeAssignment {
+                    attribute: b"text".to_vec(),
+                    state: Some(AttributeState::Unset),
+                },
+            ],
+        )])
+    })
 }
 
 pub(crate) fn read_dir_ignore_patterns_for_base(
@@ -1292,6 +1392,20 @@ pub(crate) fn push_attribute_pattern(
         return;
     };
     if let Some(macro_name) = raw_pattern.strip_prefix(b"[attr]") {
+        // Git only permits macro definitions in top-level attribute sources:
+        // global files, the worktree root, and info/attributes. A non-empty
+        // base identifies a per-directory .gitattributes frame; ignore its
+        // definition but keep parsing later rules so inherited macros remain
+        // available there.
+        if !base.is_empty() {
+            eprintln!(
+                "{} not allowed: {}:{}",
+                String::from_utf8_lossy(line),
+                String::from_utf8_lossy(source),
+                line_number
+            );
+            return;
+        }
         if macro_name.is_empty() {
             return;
         }
@@ -1301,13 +1415,7 @@ pub(crate) fn push_attribute_pattern(
         }
         let mut assignments = Vec::new();
         for field in fields {
-            push_attribute_assignments(
-                &mut assignments,
-                &field,
-                &matcher.macros,
-                source,
-                line_number,
-            );
+            push_attribute_assignments(&mut assignments, &field, source, line_number);
         }
         matcher.push_attribute_order(macro_name);
         for assignment in &assignments {
@@ -1318,13 +1426,7 @@ pub(crate) fn push_attribute_pattern(
     }
     let mut assignments = Vec::new();
     for field in fields {
-        push_attribute_assignments(
-            &mut assignments,
-            &field,
-            &matcher.macros,
-            source,
-            line_number,
-        );
+        push_attribute_assignments(&mut assignments, &field, source, line_number);
     }
     if assignments.is_empty() {
         return;
@@ -1368,37 +1470,9 @@ pub(crate) fn push_attribute_pattern(
 pub(crate) fn push_attribute_assignments(
     assignments: &mut Vec<AttributeAssignment>,
     field: &[u8],
-    macros: &BTreeMap<Vec<u8>, Vec<AttributeAssignment>>,
     source: &[u8],
     line_number: usize,
 ) {
-    if let Some(macro_assignments) = macros.get(field) {
-        assignments.push(AttributeAssignment {
-            attribute: field.to_vec(),
-            state: Some(AttributeState::Set),
-        });
-        assignments.extend(macro_assignments.iter().cloned());
-        return;
-    }
-    if field == b"binary" {
-        assignments.push(AttributeAssignment {
-            attribute: b"binary".to_vec(),
-            state: Some(AttributeState::Set),
-        });
-        assignments.push(AttributeAssignment {
-            attribute: b"diff".to_vec(),
-            state: Some(AttributeState::Unset),
-        });
-        assignments.push(AttributeAssignment {
-            attribute: b"merge".to_vec(),
-            state: Some(AttributeState::Unset),
-        });
-        assignments.push(AttributeAssignment {
-            attribute: b"text".to_vec(),
-            state: Some(AttributeState::Unset),
-        });
-        return;
-    }
     if let Some(attribute) = field.strip_prefix(b"-") {
         if !attribute.is_empty() {
             if is_reserved_attribute_name(attribute) {

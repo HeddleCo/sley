@@ -704,7 +704,7 @@ fn prepare_checkout_entry(
     let body = if (entry.mode & 0o170000) == 0o120000 {
         object.body.clone()
     } else if let (Some(config), Some(matcher)) = (smudge_config, attributes) {
-        let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
+        let checks = matcher.attributes_for_path(path, filter_attribute_names(), false);
         match apply_smudge_filter_with_attributes_maybe_delayed(
             config,
             &checks,
@@ -1294,7 +1294,7 @@ pub(crate) fn materialize_tree_entry_with_optional_smudge(
         return materialize_tree_entry(db, worktree_root, path, entry);
     };
     let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
-    let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
+    let checks = matcher.attributes_for_path(path, filter_attribute_names(), false);
     let body = match apply_smudge_filter_with_attributes_maybe_delayed(
         config,
         &checks,

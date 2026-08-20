@@ -1999,7 +1999,7 @@ mod tests {
                 Some(line) => {
                     let mut matcher = AttributeMatcher::default();
                     read_attribute_patterns_from_bytes(line, &mut matcher, &[], b".gitattributes");
-                    matcher.attributes_for_path(b"f.txt", &filter_attribute_names(), false)
+                    matcher.attributes_for_path(b"f.txt", filter_attribute_names(), false)
                 }
                 None => Vec::new(),
             };
@@ -2169,12 +2169,75 @@ mod tests {
         .expect("test operation should succeed");
 
         let path = b"src/nested/file.txt";
-        let full = standard_attributes_for_path(&root, path, &filter_attribute_names(), false)
+        let full = standard_attributes_for_path(&root, path, filter_attribute_names(), false)
             .expect("test operation should succeed");
         assert_eq!(
             filter_attribute_checks(&root, path).expect("attribute checks should load"),
             full
         );
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn worktree_attributes_matches_per_path_clean_filter() {
+        let root = temp_root();
+        fs::create_dir_all(root.join(".git").join("info")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("src")).expect("test operation should succeed");
+        fs::write(root.join(".gitattributes"), b"* text\n").expect("test operation should succeed");
+        fs::write(
+            root.join("src").join(".gitattributes"),
+            b"*.txt text eol=lf\n",
+        )
+        .expect("test operation should succeed");
+        let config = GitConfig::default();
+        let attributes =
+            WorktreeAttributes::from_worktree_root(&root).expect("test operation should succeed");
+        for (path, input) in [
+            (b"top.txt".as_slice(), b"a\r\nb\r\n".as_slice()),
+            (b"src/a.txt".as_slice(), b"a\r\nb\r\n".as_slice()),
+            (b"src/b.txt".as_slice(), b"x\r\ny\r\n".as_slice()),
+        ] {
+            let cached = attributes
+                .apply_clean_filter(&config, path, input)
+                .expect("cached clean filter");
+            let per_path = apply_clean_filter(&root, root.join(".git"), &config, path, input)
+                .expect("per-path clean filter");
+            assert_eq!(
+                cached,
+                per_path,
+                "cached clean filter must match per-path lookup for {}",
+                String::from_utf8_lossy(path)
+            );
+        }
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_attributes_skips_unreadable_unrelated_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root();
+        fs::create_dir_all(root.join(".git")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("ok")).expect("test operation should succeed");
+        let secret = root.join("secret");
+        fs::create_dir_all(&secret).expect("test operation should succeed");
+        fs::write(secret.join("hidden.txt"), b"nope\n").expect("test operation should succeed");
+        let mut permissions = fs::metadata(&secret)
+            .expect("secret metadata")
+            .permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&secret, permissions.clone()).expect("lock secret dir");
+
+        let constructed = WorktreeAttributes::from_worktree_root(&root);
+        permissions.set_mode(0o755);
+        fs::set_permissions(&secret, permissions).expect("unlock secret dir");
+        let attributes = constructed.expect("must not walk unrelated directories");
+        let blob = attributes
+            .apply_clean_filter(&GitConfig::default(), b"ok/file.txt", b"hello\n")
+            .expect("path-chain lookup must ignore unreadable siblings");
+        assert_eq!(blob, b"hello\n");
 
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
@@ -2232,7 +2295,7 @@ mod tests {
             &[],
             b".gitattributes",
         );
-        let checks = matcher.attributes_for_path(b"test.utf16", &filter_attribute_names(), false);
+        let checks = matcher.attributes_for_path(b"test.utf16", filter_attribute_names(), false);
 
         let restored = apply_smudge_filter_with_attributes(&config, &checks, b"test.utf16", b"A\n")
             .expect("smudge must encode UTF-16");
@@ -2252,7 +2315,7 @@ mod tests {
             &[],
             b".gitattributes",
         );
-        let checks = matcher.attributes_for_path(b"eol.utf32", &filter_attribute_names(), false);
+        let checks = matcher.attributes_for_path(b"eol.utf32", filter_attribute_names(), false);
 
         let restored =
             apply_smudge_filter_with_attributes(&config, &checks, b"eol.utf32", b"one\ntwo\n")
@@ -2273,7 +2336,7 @@ mod tests {
             b".gitattributes",
         );
         let checks =
-            matcher.attributes_for_path(b"roundtrip.shift", &filter_attribute_names(), false);
+            matcher.attributes_for_path(b"roundtrip.shift", filter_attribute_names(), false);
         let (shift_jis, _, had_errors) = encoding_rs::SHIFT_JIS.encode("hallo\n");
         assert!(!had_errors);
 
@@ -2299,7 +2362,7 @@ mod tests {
             b".gitattributes",
         );
         let checks =
-            matcher.attributes_for_path(b"nonsense.utf16", &filter_attribute_names(), false);
+            matcher.attributes_for_path(b"nonsense.utf16", filter_attribute_names(), false);
 
         let err = apply_clean_filter_cow_inner(
             &config,

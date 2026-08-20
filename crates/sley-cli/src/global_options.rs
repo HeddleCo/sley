@@ -330,9 +330,10 @@ pub(crate) fn core_big_file_threshold(git_dir: Option<&Path>) -> Result<u64> {
         &base,
     )
     .map_err(crate::report_config_setup_error)?;
-    let Some(value) = config.get("core", None, "bigfilethreshold") else {
+    let Some(value) = config.get_entry("core", None, "bigfilethreshold") else {
         return Ok(DEFAULT_BIG_FILE_THRESHOLD);
     };
+    let value = value.unwrap_or("");
     match crate::sley_config::parse_config_int(value) {
         Some(value) if value >= 0 => Ok(value as u64),
         _ => {

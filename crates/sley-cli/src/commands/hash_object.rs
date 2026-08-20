@@ -4,7 +4,7 @@
 
 use sley::plumbing::sley_worktree;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use sley::GitConfig;
@@ -265,92 +265,118 @@ impl HashObjectInvocation {
         if !self.read_stdin && !self.read_stdin_paths && self.paths.is_empty() {
             return Ok(());
         }
-        let cwd = cli_session.cwd().to_path_buf();
-        // Repository discovery belongs to the invocation session. Once open,
-        // the embeddable facade is the source of repository layout, format,
-        // and object-store state for the rest of this command.
-        let repository = cli_session.open_repository().ok();
-        let repo_git_dir = repository.as_ref().map(sley::Repository::git_dir);
-        let _big_file_threshold = core_big_file_threshold(repo_git_dir.as_deref())?;
+        let cwd =
+            fs::canonicalize(cli_session.cwd()).unwrap_or_else(|_| cli_session.cwd().to_path_buf());
+        // Resolve repository layout, HEAD/include context, effective config,
+        // worktree, format, and (when requested) the write store once. A
+        // write-only hash-object invocation never enumerates replacement refs;
+        // replacements affect reads, not object ids or raw object writes.
+        let access = if self.write {
+            crate::repository::ObjectAccess::WriteOnly
+        } else {
+            crate::repository::ObjectAccess::None
+        };
+        let repository = match crate::RepositoryContext::from_session_with_access(
+            cli_session,
+            access,
+            crate::repository::WorktreePolicy::HashAttributes,
+        ) {
+            Ok(repository) => Some(repository),
+            Err(GitError::NotFound(_)) => None,
+            Err(err) => return Err(err),
+        };
         let store = if self.write {
             let repository = repository
                 .as_ref()
                 .ok_or_else(|| GitError::repository_not_found("not a git repository"))?;
             if !self.explicit_format {
-                self.format = repository.object_format();
+                self.format = repository.format();
             }
-            Some(repository)
+            Some(repository.repository())
         } else if !self.explicit_format
             && let Some(repository) = repository.as_ref()
         {
-            self.format = repository.object_format();
+            self.format = repository.format();
             None
         } else {
             None
         };
-        // Caching the worktree `.gitattributes` chain pays for itself whenever
-        // more than one path is hashed in this process — `--stdin-paths` (many,
-        // count unknown up front) OR multiple positional paths. Gating only on
-        // `--stdin-paths` regressed `hash-object -w file1 file2 …` back to the
-        // per-path attribute re-walk this cache was added to avoid (sley#25).
-        let cache_attributes = self.read_stdin_paths || self.paths.len() > 1;
-        let filter_context = HashObjectFilterContext::new(
-            cli_session,
-            self.object_type,
-            &self.filters,
-            repo_git_dir.as_deref(),
-            cache_attributes,
-        )?;
-        let mut stdout = io::stdout().lock();
-
-        if self.read_stdin {
-            let mut body = Vec::new();
-            io::stdin().read_to_end(&mut body)?;
-            self.hash_one(
-                body,
-                &cwd,
-                None,
-                filter_context.as_ref(),
-                store,
-                &mut stdout,
-            )?;
-        }
-        if self.read_stdin_paths {
-            crate::commands::stdin_stream::stream_stdin_records(
-                b'\n',
-                &mut stdout,
-                |mut path, stdout| {
+        // Filters are Enabled by default. Without a process-lifetime attribute
+        // handle, each path re-parsed repo config and re-read global
+        // attributes (sley#25: ~163x slower than git for 200 `--stdin-paths`).
+        let filter_context =
+            HashObjectFilterContext::new(self.object_type, &self.filters, repository.as_ref())?;
+        let stdout = io::stdout();
+        let mut stdout = BufWriter::with_capacity(128 * 1024, stdout.lock());
+        let mut big_file_threshold_validated = false;
+        let result = (|| -> Result<()> {
+            if self.read_stdin {
+                let mut body = Vec::new();
+                io::stdin().read_to_end(&mut body)?;
+                self.hash_one(
+                    body,
+                    &cwd,
+                    None,
+                    filter_context.as_ref(),
+                    store,
+                    &mut stdout,
+                )?;
+            }
+            if self.read_stdin_paths {
+                let stdin = io::stdin();
+                let mut records =
+                    crate::commands::stdin_stream::StdinRecordReader::new(stdin.lock(), b'\n');
+                while let Some(mut path) = records.read_record()? {
                     if path.is_empty() {
-                        return Ok(());
+                        continue;
                     }
                     crate::commands::stdin_stream::strip_trailing_cr(&mut path);
-                    let path = String::from_utf8_lossy(&path);
-                    let path = Path::new(path.as_ref());
-                    let body = read_hash_object_path(path)?;
+                    let path = hash_object_stdin_path(path);
+                    ensure_hash_object_big_file_threshold(
+                        &mut big_file_threshold_validated,
+                        repository.as_ref(),
+                    )?;
+                    let body = read_hash_object_path(&path)?;
                     self.hash_one(
                         body,
                         &cwd,
-                        Some(path),
+                        Some(&path),
                         filter_context.as_ref(),
                         store,
-                        stdout,
+                        &mut stdout,
                     )?;
-                    Ok(())
-                },
-            )?;
-        }
-        for path in &self.paths {
-            let body = read_hash_object_path(path)?;
-            self.hash_one(
-                body,
-                &cwd,
-                Some(path),
-                filter_context.as_ref(),
-                store,
-                &mut stdout,
-            )?;
-        }
-        Ok(())
+                    // `--stdin-paths` is a request/response protocol: callers
+                    // may wait for this oid before sending the next path. Make
+                    // each successful record observable while stdin remains
+                    // open. The unconditional flush below still preserves any
+                    // earlier responses when a later record fails.
+                    stdout.flush()?;
+                }
+            }
+            for path in &self.paths {
+                ensure_hash_object_big_file_threshold(
+                    &mut big_file_threshold_validated,
+                    repository.as_ref(),
+                )?;
+                let body = read_hash_object_path(path)?;
+                self.hash_one(
+                    body,
+                    &cwd,
+                    Some(path),
+                    filter_context.as_ref(),
+                    store,
+                    &mut stdout,
+                )?;
+            }
+            Ok(())
+        })();
+
+        // A buffered writer must be flushed even when a later input fails so
+        // the object ids for earlier inputs remain observable, as they are in
+        // git. A flush failure is itself an output failure and takes precedence;
+        // otherwise preserve the result of processing the inputs.
+        let flush_result = stdout.flush().map_err(GitError::from);
+        flush_result.and(result)
     }
 
     fn hash_one(
@@ -358,7 +384,7 @@ impl HashObjectInvocation {
         body: Vec<u8>,
         cwd: &Path,
         source_path: Option<&Path>,
-        filter_context: Option<&HashObjectFilterContext>,
+        filter_context: Option<&HashObjectFilterContext<'_>>,
         store: Option<&Repository>,
         stdout: &mut dyn Write,
     ) -> Result<()> {
@@ -418,7 +444,7 @@ impl HashObjectFilterPolicy {
         body: Vec<u8>,
         cwd: &Path,
         source_path: Option<&Path>,
-        filter_context: Option<&HashObjectFilterContext>,
+        filter_context: Option<&HashObjectFilterContext<'_>>,
     ) -> Result<Vec<u8>> {
         let Some(context) = filter_context else {
             return Ok(body);
@@ -432,56 +458,51 @@ impl HashObjectFilterPolicy {
     }
 }
 
-struct HashObjectFilterContext {
-    git_dir: PathBuf,
+struct HashObjectFilterContext<'config> {
     worktree_root: PathBuf,
-    config: GitConfig,
-    // The worktree's `.gitattributes` chain, scanned once. `hash-object
-    // --stdin-paths` hashes many paths in one process; without this the clean
-    // filter re-walked the entire worktree and re-read every `.gitattributes`
-    // per path (sley#25: ~163x slower than git for 200 paths).
-    attributes: Option<sley_worktree::WorktreeAttributes>,
+    config: &'config GitConfig,
+    // Process-lifetime attribute handle. `hash-object --stdin-paths` hashes
+    // many paths in one process; without this the clean filter re-parsed
+    // repo config and re-read global attributes per path (sley#25: ~163x
+    // slower than git for 200 paths). In-tree `.gitattributes` are folded
+    // per directory chain, matching git — not by walking the whole worktree.
+    attributes: sley_worktree::WorktreeAttributes,
 }
 
-impl HashObjectFilterContext {
+impl<'config> HashObjectFilterContext<'config> {
     fn new(
-        cli_session: &crate::session::CliSession,
         object_type: ObjectType,
         policy: &HashObjectFilterPolicy,
-        git_dir: Option<&Path>,
-        cache_attributes: bool,
+        repository: Option<&'config crate::RepositoryContext>,
     ) -> Result<Option<Self>> {
         if object_type != ObjectType::Blob || !policy.enabled() {
             return Ok(None);
         }
-        let Some(git_dir) = git_dir else {
+        let Some(repository) = repository else {
             return Ok(None);
         };
-        let Ok(worktree_root) = worktree_root_for_git_dir(cli_session, git_dir) else {
+        let Ok(worktree_root) = repository.worktree_root() else {
             return Ok(None);
         };
-        let attributes = cache_attributes
-            .then(|| sley_worktree::WorktreeAttributes::from_worktree_root(&worktree_root))
-            .transpose()?;
+        let worktree_root =
+            fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
+        let config = repository.config();
+        let attributes =
+            sley_worktree::WorktreeAttributes::from_worktree_and_common_git_dir_with_config(
+                &worktree_root,
+                repository.common_git_dir().to_path_buf(),
+                config,
+            )?;
         Ok(Some(Self {
-            git_dir: git_dir.to_path_buf(),
             worktree_root,
-            config: read_repo_config(git_dir)?,
+            config,
             attributes,
         }))
     }
 
     fn apply_clean_filter(&self, path: &[u8], content: &[u8]) -> Result<Vec<u8>> {
-        match &self.attributes {
-            Some(attributes) => attributes.apply_clean_filter(&self.config, path, content),
-            None => sley_worktree::apply_clean_filter(
-                &self.worktree_root,
-                &self.git_dir,
-                &self.config,
-                path,
-                content,
-            ),
-        }
+        self.attributes
+            .apply_clean_filter(self.config, path, content)
     }
 }
 
@@ -504,21 +525,49 @@ fn hash_object_filter_git_path(
         };
     }
     if let Some(path) = source_path {
-        let absolute = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            cwd.join(path)
+        // Ordinary in-tree paths stay on the allocation-light lexical fast
+        // path. A source spelling containing `..` needs filesystem-aware
+        // resolution, however: `link/../file` traverses through `link` before
+        // moving to its parent, so collapsing it lexically can select a
+        // different `.gitattributes` chain from the file that was read.
+        return match hash_object_worktree_relative_source(cwd, worktree_root, path)? {
+            Some(relative) => Ok(Some(hash_object_repo_path_bytes(&relative)?)),
+            None => Ok(None),
         };
-        let absolute = fs::canonicalize(&absolute).unwrap_or(absolute);
-        let Ok(relative) = absolute.strip_prefix(worktree_root) else {
-            return Ok(None);
-        };
-        return Ok(Some(hash_object_repo_path_bytes(relative)?));
     }
     if policy.forced() {
         return Ok(Some(Vec::new()));
     }
     Ok(None)
+}
+
+/// Resolve a real input path to its worktree-relative attribute path.
+///
+/// Most inputs can be normalized lexically, avoiding one `realpath` per file on
+/// the `--stdin-paths` hot path. Parent components are the exception because
+/// filesystem traversal gives them symlink-sensitive semantics.
+fn hash_object_worktree_relative_source(
+    cwd: &Path,
+    worktree_root: &Path,
+    path: &Path,
+) -> Result<Option<PathBuf>> {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let resolved = if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        fs::canonicalize(joined)?
+    } else {
+        normalize_lexical_path(&joined)
+    };
+    Ok(resolved
+        .strip_prefix(worktree_root)
+        .ok()
+        .map(Path::to_path_buf))
 }
 
 /// Resolve `path` (possibly relative to `cwd`, possibly containing `..`) into a
@@ -554,9 +603,58 @@ fn hash_object_repo_path_bytes(path: &Path) -> Result<Vec<u8>> {
         })
 }
 
+fn hash_object_stdin_path(path: Vec<u8>) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        PathBuf::from(OsString::from_vec(path))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(&path).into_owned())
+    }
+}
+
+fn validate_hash_object_big_file_threshold(config: &GitConfig) -> Result<()> {
+    let Some(value) = config.get_entry("core", None, "bigfilethreshold") else {
+        return Ok(());
+    };
+    let value = value.unwrap_or("");
+    match crate::sley_config::parse_config_int(value) {
+        Some(value) if value >= 0 => Ok(()),
+        _ => {
+            eprintln!(
+                "fatal: bad numeric config value '{value}' for 'core.bigfilethreshold': invalid unit"
+            );
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn ensure_hash_object_big_file_threshold(
+    validated: &mut bool,
+    repository: Option<&crate::RepositoryContext>,
+) -> Result<()> {
+    if *validated {
+        return Ok(());
+    }
+    match repository {
+        Some(repository) => validate_hash_object_big_file_threshold(repository.config())?,
+        None => {
+            // Outside a repository, global and command-scoped config still
+            // participates when Git opens a path input.
+            let _ = core_big_file_threshold(None)?;
+        }
+    }
+    *validated = true;
+    Ok(())
+}
+
 fn read_hash_object_path(path: impl AsRef<Path>) -> Result<Vec<u8>> {
     let path = path.as_ref();
-    match fs::read(path) {
+    match read_hash_object_file(path) {
         Ok(body) => Ok(body),
         Err(err) => {
             let reason = if err.kind() == io::ErrorKind::NotFound {
@@ -571,6 +669,44 @@ fn read_hash_object_path(path: impl AsRef<Path>) -> Result<Vec<u8>> {
             Err(GitError::Exit(128))
         }
     }
+}
+
+fn read_hash_object_file(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    if let Ok(metadata) = file.metadata()
+        && metadata.is_file()
+        && metadata.len() > 0
+        && let Ok(len) = usize::try_from(metadata.len())
+    {
+        // Treat the initial stat as the input snapshot, like git does. `Take`
+        // avoids both zero-filling the allocation and the extra EOF read that
+        // plain `read_to_end` performs. A concurrent shrink is a short read,
+        // not a reason to silently hash a different version of the file.
+        return read_hash_object_known_size(&mut file, metadata.len(), len);
+    }
+
+    // A reported zero length can still describe a non-empty virtual file (for
+    // example procfs), and non-regular, unrepresentably large, or unstatable
+    // inputs have no usable allocation size. Stream those cases to EOF.
+    let mut body = Vec::new();
+    file.read_to_end(&mut body)?;
+    Ok(body)
+}
+
+fn read_hash_object_known_size(
+    reader: &mut impl Read,
+    sampled_len: u64,
+    len: usize,
+) -> io::Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(len);
+    let read = reader.take(sampled_len).read_to_end(&mut body)?;
+    if read != len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short read while hashing object",
+        ));
+    }
+    Ok(body)
 }
 
 fn print_hash_object(
@@ -671,5 +807,26 @@ mod tests {
             HashObjectInvocation::parse(&args),
             Err(GitError::Exit(129))
         ));
+    }
+
+    #[test]
+    fn virtual_path_with_parent_dir_normalizes_lexically() {
+        let cwd = Path::new("/worktree");
+        let worktree_root = Path::new("/worktree");
+        let policy = HashObjectFilterPolicy::Enabled {
+            forced: false,
+            path: Some(PathBuf::from("dir/../file.txt")),
+        };
+        let git_path = hash_object_filter_git_path(cwd, worktree_root, None, &policy)
+            .expect("resolve in-tree virtual path");
+        assert_eq!(git_path, Some(b"file.txt".to_vec()));
+    }
+
+    #[test]
+    fn known_size_reader_rejects_a_short_read() {
+        let mut input = io::Cursor::new(b"short".as_slice());
+        let err = read_hash_object_known_size(&mut input, 10, 10)
+            .expect_err("sampled size must remain authoritative");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

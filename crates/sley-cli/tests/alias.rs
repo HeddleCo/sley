@@ -316,3 +316,81 @@ fn alias_missing_value_reports_line_and_file_matches_upstream_git() {
     }
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn malformed_local_config_does_not_fall_back_to_global_alias() {
+    let root = unique_temp_dir("alias-malformed-local");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    let upstream_global = root.join("upstream.gitconfig");
+    let rust_global = root.join("rust.gitconfig");
+    fs::create_dir_all(&upstream).expect("create upstream dir");
+    fs::create_dir_all(&rust).expect("create rust dir");
+    {
+        for dir in [&upstream, &rust] {
+            let output = Command::new(sley_testkit::oracle_git())
+                .current_dir(dir)
+                .args(["init", "-q"])
+                .output()
+                .expect("git init");
+            assert!(output.status.success());
+            fs::write(dir.join(".git/config"), b"[broken\n").expect("write malformed local config");
+        }
+        fs::write(&upstream_global, b"[alias]\n\tfromglobal = version\n")
+            .expect("write upstream global alias");
+        fs::write(&rust_global, b"[alias]\n\tfromglobal = version\n")
+            .expect("write rust global alias");
+
+        let run = |program: &str, cwd: &Path, global: &Path| {
+            Command::new(program)
+                .current_dir(cwd)
+                .env("GIT_CONFIG_GLOBAL", global)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["fromglobal"])
+                .output()
+                .unwrap_or_else(|err| panic!("failed to run malformed-config alias: {err}"))
+        };
+        let expected = run(sley_testkit::oracle_git(), &upstream, &upstream_global);
+        let actual = run(sley_testkit::sley_bin!(), &rust, &rust_global);
+        assert_eq!(actual.status.code(), expected.status.code());
+        assert!(actual.stdout.is_empty(), "global alias must not execute");
+        assert!(!actual.stderr.is_empty(), "malformed config must be fatal");
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn alias_repository_switch_reapplies_precompose_to_expanded_tail() {
+    let root = unique_temp_dir("alias-precompose-switch");
+    let source = root.join("source");
+    let target = root.join("target");
+    fs::create_dir_all(&source).expect("create source dir");
+    fs::create_dir_all(&target).expect("create target dir");
+    {
+        for dir in [&source, &target] {
+            let output = Command::new(sley_testkit::oracle_git())
+                .current_dir(dir)
+                .args(["init", "-q"])
+                .output()
+                .expect("git init");
+            assert!(output.status.success());
+        }
+        let alias = "-C ../target -c core.precomposeunicode=true hash-object";
+        let output = Command::new(sley_testkit::oracle_git())
+            .current_dir(&source)
+            .args(["config", "alias.hop", alias])
+            .output()
+            .expect("configure alias");
+        assert!(output.status.success());
+
+        let nfc = "caf\u{e9}.txt";
+        let nfd = "cafe\u{301}.txt";
+        fs::write(target.join(nfc), b"payload\n").expect("write NFC target");
+        let expected = run_output(sley_testkit::oracle_git(), &target, &["hash-object", nfc]);
+        let actual = run_output(sley_testkit::sley_bin!(), &source, &["hop", nfd]);
+        assert_eq!(actual.status.code(), Some(0));
+        assert_eq!(actual.stdout, expected.stdout);
+        assert!(actual.stderr.is_empty());
+    }
+    let _ = fs::remove_dir_all(&root);
+}
