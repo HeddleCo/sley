@@ -2114,7 +2114,8 @@ fn commit_graph_bloom_murmur3_seeded(seed: u32, data: &[u8], version: u32) -> u3
     let m = 5u32;
     let n = 0xe654_6b64u32;
     let mut seed = seed;
-    for chunk in data.chunks_exact(4) {
+    let (chunks, tail) = data.as_chunks::<4>();
+    for chunk in chunks {
         let mut k = if version == 2 {
             u32::from(chunk[0])
                 | (u32::from(chunk[1]) << 8)
@@ -2133,7 +2134,6 @@ fn commit_graph_bloom_murmur3_seeded(seed: u32, data: &[u8], version: u32) -> u3
         seed = seed.rotate_left(r2).wrapping_mul(m).wrapping_add(n);
     }
 
-    let tail = data.chunks_exact(4).remainder();
     let mut k1 = 0u32;
     let tail_byte = |idx: usize| -> u32 {
         if version == 2 {

@@ -164,7 +164,7 @@ fn multi_pack_index_object_count(path: &Path, format: ObjectFormat) -> Result<Op
         ))
     })?;
     let mut oid_fanout_offset = None;
-    for chunk in lookup.chunks_exact(12).take(chunk_count) {
+    for chunk in lookup.as_chunks::<12>().0.iter().take(chunk_count) {
         if &chunk[..4] == b"OIDF" {
             oid_fanout_offset = Some(u64::from_be_bytes([
                 chunk[4], chunk[5], chunk[6], chunk[7], chunk[8], chunk[9], chunk[10], chunk[11],
