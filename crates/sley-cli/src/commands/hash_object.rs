@@ -458,11 +458,16 @@ impl HashObjectFilterContext {
         };
         let worktree_root =
             fs::canonicalize(&worktree_root).unwrap_or_else(|_| worktree_root.clone());
-        let attributes =
-            sley_worktree::WorktreeAttributes::from_worktree_and_git_dir(&worktree_root, git_dir)?;
+        let config =
+            crate::commands::remote::read_effective_repo_config(git_dir, cli_session.cwd())?;
+        let attributes = sley_worktree::WorktreeAttributes::from_worktree_and_git_dir_with_config(
+            &worktree_root,
+            git_dir,
+            &config,
+        )?;
         Ok(Some(Self {
             worktree_root,
-            config: read_repo_config(git_dir)?,
+            config,
             attributes,
         }))
     }
@@ -492,11 +497,12 @@ fn hash_object_filter_git_path(
         };
     }
     if let Some(path) = source_path {
-        // Same lexical prefix resolution as `--path` (`prefix_filename` +
-        // `normalize_lexical_path`): collapse `dir/../file.txt` to `file.txt`
-        // without realpath. A raw `strip_prefix` would leave `..` in the
-        // relative path and `RepoPathBuf` would reject it (sley#25).
-        return match hash_object_worktree_relative_lexical(cwd, worktree_root, path) {
+        // Ordinary in-tree paths stay on the allocation-light lexical fast
+        // path. A source spelling containing `..` needs filesystem-aware
+        // resolution, however: `link/../file` traverses through `link` before
+        // moving to its parent, so collapsing it lexically can select a
+        // different `.gitattributes` chain from the file that was read.
+        return match hash_object_worktree_relative_source(cwd, worktree_root, path)? {
             Some(relative) => Ok(Some(hash_object_repo_path_bytes(&relative)?)),
             None => Ok(None),
         };
@@ -505,6 +511,35 @@ fn hash_object_filter_git_path(
         return Ok(Some(Vec::new()));
     }
     Ok(None)
+}
+
+/// Resolve a real input path to its worktree-relative attribute path.
+///
+/// Most inputs can be normalized lexically, avoiding one `realpath` per file on
+/// the `--stdin-paths` hot path. Parent components are the exception because
+/// filesystem traversal gives them symlink-sensitive semantics.
+fn hash_object_worktree_relative_source(
+    cwd: &Path,
+    worktree_root: &Path,
+    path: &Path,
+) -> Result<Option<PathBuf>> {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let resolved = if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        fs::canonicalize(joined)?
+    } else {
+        normalize_lexical_path(&joined)
+    };
+    Ok(resolved
+        .strip_prefix(worktree_root)
+        .ok()
+        .map(Path::to_path_buf))
 }
 
 /// Resolve `path` (possibly relative to `cwd`, possibly containing `..`) into a
@@ -660,20 +695,15 @@ mod tests {
     }
 
     #[test]
-    fn source_path_with_parent_dir_normalizes_lexically() {
+    fn virtual_path_with_parent_dir_normalizes_lexically() {
         let cwd = Path::new("/worktree");
         let worktree_root = Path::new("/worktree");
         let policy = HashObjectFilterPolicy::Enabled {
             forced: false,
-            path: None,
+            path: Some(PathBuf::from("dir/../file.txt")),
         };
-        let git_path = hash_object_filter_git_path(
-            cwd,
-            worktree_root,
-            Some(Path::new("dir/../file.txt")),
-            &policy,
-        )
-        .expect("resolve in-tree source path");
+        let git_path = hash_object_filter_git_path(cwd, worktree_root, None, &policy)
+            .expect("resolve in-tree virtual path");
         assert_eq!(git_path, Some(b"file.txt".to_vec()));
     }
 }

@@ -945,12 +945,18 @@ impl AttributeMatcher {
     }
 
     /// Global / `core.attributesFile` sources only — no in-tree `.gitattributes`
-    /// and no `$GIT_DIR/info/attributes`. Callers that resolve one path at a
-    /// time fold those higher-precedence frames themselves so they can avoid a
-    /// full-worktree walk.
+    /// and no `$GIT_COMMON_DIR/info/attributes`. Callers that resolve one path
+    /// at a time fold those higher-precedence frames themselves so they can
+    /// avoid a full-worktree walk.
     pub(crate) fn from_global_sources(root: &Path, git_dir: &Path) -> Self {
         let mut matcher = Self::default();
         matcher.configure_from_repo(root, git_dir);
+        matcher
+    }
+
+    pub(crate) fn from_global_config(root: &Path, config: &GitConfig) -> Self {
+        let mut matcher = Self::default();
+        matcher.configure_from_config(root, config);
         matcher
     }
 
@@ -1058,6 +1064,10 @@ impl AttributeMatcher {
             self.read_default_global_attributes();
             return;
         };
+        self.configure_from_config(root, &config);
+    }
+
+    pub(crate) fn configure_from_config(&mut self, root: &Path, config: &GitConfig) {
         self.ignore_case = config.get_bool("core", None, "ignorecase").unwrap_or(false);
         let Some(value) = config.get("core", None, "attributesFile") else {
             self.read_default_global_attributes();

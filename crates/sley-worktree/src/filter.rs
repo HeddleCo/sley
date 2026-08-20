@@ -1602,9 +1602,9 @@ pub fn apply_clean_filter_keep_crlf(
 /// Git only consults `.gitattributes` on the path's directory chain, not the
 /// rest of the worktree. This handle matches that: construction reads
 /// `core.attributesFile` (or the default global) once, then each path folds
-/// only its ancestor `.gitattributes` plus `$GIT_DIR/info/attributes`. Matchers
-/// are cached per parent directory so sibling files in the same folder reuse
-/// the folded chain.
+/// only its ancestor `.gitattributes` plus
+/// `$GIT_COMMON_DIR/info/attributes`. Matchers are cached per parent directory
+/// so sibling files in the same folder reuse the folded chain.
 ///
 /// Build it once with [`WorktreeAttributes::from_worktree_root`] (or
 /// [`WorktreeAttributes::from_worktree_and_git_dir`]), then call
@@ -1612,31 +1612,55 @@ pub fn apply_clean_filter_keep_crlf(
 /// [`apply_clean_filter`] except the expensive config parse is amortized.
 pub struct WorktreeAttributes {
     worktree_root: PathBuf,
-    git_dir: PathBuf,
+    common_git_dir: PathBuf,
     base: AttributeMatcher,
     dir_matchers: RefCell<HashMap<Vec<u8>, AttributeMatcher>>,
 }
 
 impl WorktreeAttributes {
     /// Read the worktree's global attribute sources. In-tree `.gitattributes`
-    /// and `$GIT_DIR/info/attributes` are folded on first use of each directory.
+    /// and `$GIT_COMMON_DIR/info/attributes` are folded on first use of each
+    /// directory.
     pub fn from_worktree_root(worktree_root: impl AsRef<Path>) -> Result<Self> {
         let root = worktree_root.as_ref();
-        Self::from_worktree_and_git_dir(root, &root.join(".git"))
+        Self::from_worktree_and_git_dir(root, root.join(".git"))
     }
 
-    /// Like [`Self::from_worktree_root`] but uses the already-resolved git
+    /// Like [`Self::from_worktree_root`] but starts from the repository's git
     /// directory (linked worktrees, `GIT_DIR`, etc.) instead of `root/.git`.
+    /// The shared common directory is resolved once here, including
+    /// `commondir` and `GIT_COMMON_DIR` overrides.
     pub fn from_worktree_and_git_dir(
         worktree_root: impl AsRef<Path>,
         git_dir: impl AsRef<Path>,
     ) -> Result<Self> {
         let worktree_root = worktree_root.as_ref();
         let git_dir = git_dir.as_ref();
+        let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+        let base = AttributeMatcher::from_global_sources(worktree_root, &common_git_dir);
         Ok(Self {
             worktree_root: worktree_root.to_path_buf(),
-            git_dir: git_dir.to_path_buf(),
-            base: AttributeMatcher::from_global_sources(worktree_root, git_dir),
+            common_git_dir,
+            base,
+            dir_matchers: RefCell::new(HashMap::new()),
+        })
+    }
+
+    /// Construct from the command's already-loaded effective config. This is
+    /// the preferred path for multi-file commands: attribute lookup and clean
+    /// filtering share one config snapshot, including global settings,
+    /// command-line overrides, and linked-worktree include context.
+    pub fn from_worktree_and_git_dir_with_config(
+        worktree_root: impl AsRef<Path>,
+        git_dir: impl AsRef<Path>,
+        config: &GitConfig,
+    ) -> Result<Self> {
+        let worktree_root = worktree_root.as_ref();
+        let common_git_dir = common_git_dir_for_git_dir(git_dir.as_ref())?;
+        Ok(Self {
+            worktree_root: worktree_root.to_path_buf(),
+            common_git_dir,
+            base: AttributeMatcher::from_global_config(worktree_root, config),
             dir_matchers: RefCell::new(HashMap::new()),
         })
     }
@@ -1648,7 +1672,7 @@ impl WorktreeAttributes {
         }
         let mut matcher = self.base.clone();
         fold_in_tree_attribute_frames(&self.worktree_root, path, &mut matcher)?;
-        fold_info_attributes(&self.git_dir, &mut matcher);
+        fold_info_attributes(&self.common_git_dir, &mut matcher);
         let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
         self.dir_matchers.borrow_mut().insert(dir_key, matcher);
         Ok(checks)

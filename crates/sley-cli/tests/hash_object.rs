@@ -451,6 +451,140 @@ fn hash_object_stdin_paths_parent_dir_matches_upstream_git() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[cfg(unix)]
+#[test]
+fn hash_object_parent_dir_through_symlink_matches_upstream_git() {
+    use std::os::unix::fs::symlink;
+
+    let root = unique_temp_dir("hash-object-symlink-dotdot");
+    fs::create_dir_all(root.join("real").join("sub")).expect("create target directories");
+    {
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
+        fs::write(root.join(".gitattributes"), b"* -text\n").expect("write root attributes");
+        fs::write(
+            root.join("real").join(".gitattributes"),
+            b"*.txt text eol=lf\n",
+        )
+        .expect("write target attributes");
+        fs::write(root.join("real").join("f2.txt"), b"line\r\n").expect("write target file");
+        symlink("real/sub", root.join("link")).expect("create directory symlink");
+
+        let args = ["hash-object", "link/../f2.txt"];
+        let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, &[]);
+        let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, &[]);
+        assert_same_output(actual, expected, &args);
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hash_object_linked_worktree_uses_common_info_attributes() {
+    let root = unique_temp_dir("hash-object-linked-info-attributes");
+    let main = root.join("main");
+    let linked = root.join("linked");
+    fs::create_dir_all(&main).expect("create main worktree");
+    {
+        let git = sley_testkit::oracle_git();
+        run(git, &main, &["init", "-q", "-b", "main"]);
+        run(
+            git,
+            &main,
+            &[
+                "-c",
+                "user.name=Sley Tests",
+                "-c",
+                "user.email=sley@example.com",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "base",
+            ],
+        );
+        run(
+            git,
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().expect("linked path is utf-8"),
+            ],
+        );
+
+        fs::create_dir_all(main.join(".git").join("info")).expect("create common info dir");
+        fs::write(
+            main.join(".git").join("info").join("attributes"),
+            b"*.attr text eol=lf\n",
+        )
+        .expect("write common attributes");
+        run(git, &main, &["config", "core.autocrlf", "true"]);
+        let admin_dir = String::from_utf8(run(git, &linked, &["rev-parse", "--git-dir"]))
+            .expect("git dir output is utf-8");
+        let admin_dir = PathBuf::from(admin_dir.trim());
+        fs::create_dir_all(admin_dir.join("info")).expect("create worktree admin info dir");
+        fs::write(admin_dir.join("info").join("attributes"), b"*.attr -text\n")
+            .expect("write ignored per-worktree attributes");
+        fs::write(linked.join("file.attr"), b"attributes\r\n")
+            .expect("write attribute-controlled file");
+        fs::write(linked.join("config.txt"), b"config\r\n").expect("write config-controlled file");
+
+        let args = ["hash-object", "--stdin-paths"];
+        let stdin = b"file.attr\nconfig.txt\n";
+        let expected = run_output_with_stdin(git, &linked, &args, stdin);
+        let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &linked, &args, stdin);
+        assert_same_output(actual, expected, &args);
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hash_object_honors_git_common_dir_info_attributes() {
+    let root = unique_temp_dir("hash-object-git-common-dir-attributes");
+    let common = root.join("custom-common");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        let git = sley_testkit::oracle_git();
+        run(git, &root, &["init", "-q", "-b", "main"]);
+        for directory in ["info", "objects", "refs"] {
+            fs::create_dir_all(common.join(directory)).expect("create custom common directory");
+        }
+        fs::write(
+            common.join("info").join("attributes"),
+            b"*.txt text eol=lf\n",
+        )
+        .expect("write custom common attributes");
+        fs::create_dir_all(root.join(".git").join("info")).expect("create git info dir");
+        fs::write(
+            root.join(".git").join("info").join("attributes"),
+            b"*.txt -text\n",
+        )
+        .expect("write ignored git-dir attributes");
+        fs::write(root.join("file.txt"), b"line\r\n").expect("write input file");
+
+        let git_dir = root.join(".git");
+        let git_dir = git_dir.to_str().expect("git dir is utf-8");
+        let common = common.to_str().expect("common dir is utf-8");
+        let worktree = root.to_str().expect("worktree is utf-8");
+        let envs = [
+            ("GIT_DIR", git_dir),
+            ("GIT_COMMON_DIR", common),
+            ("GIT_WORK_TREE", worktree),
+        ];
+        let args = ["hash-object", "file.txt"];
+        let expected = run_output_with_env_and_stdin(git, &root, &args, &envs, &[]);
+        let actual =
+            run_output_with_env_and_stdin(sley_testkit::sley_bin!(), &root, &args, &envs, &[]);
+        assert_same_output(actual, expected, &args);
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn hash_object_stdin_paths_nested_attributes_match_upstream_git() {
     let root = unique_temp_dir("hash-object-stdin-paths-attrs");
