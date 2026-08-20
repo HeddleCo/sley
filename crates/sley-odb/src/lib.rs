@@ -159,13 +159,15 @@ pub(crate) fn unique_temp_path(parent: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::Compression;
+    use flate2::write::ZlibEncoder;
     use sley_core::{BString, GitError};
     use sley_formats::Bundle;
     use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntry};
     use sley_pack::{MultiPackIndex, PackBitmapIndex, PackFile, PackIndex, PackWriteOptions};
     use std::collections::{HashMap, HashSet};
     use std::fs;
-    use std::io::Read;
+    use std::io::{Read, Write};
 
     fn blob_of(byte: u8, len: usize) -> EncodedObject {
         EncodedObject::new(ObjectType::Blob, vec![byte; len])
@@ -849,6 +851,138 @@ mod tests {
             db.read_object_header(&missing)
                 .expect("test operation should succeed"),
             None
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    /// Write a one-entry pack whose index claims `indexed_oid` for a ref-delta
+    /// based on `base_oid`. This intentionally bypasses pack installation's
+    /// integrity validation so header reads can be tested against corrupt
+    /// on-disk metadata that may be produced by disk damage.
+    fn write_indexed_ref_delta(
+        pack_dir: &Path,
+        format: ObjectFormat,
+        indexed_oid: ObjectId,
+        base_oid: ObjectId,
+    ) {
+        fs::create_dir_all(pack_dir).expect("test operation should succeed");
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+
+        let offset = pack.len() as u64;
+        let delta_header = [0u8, 0u8]; // base size 0, result size 0
+        pack.push(0x70 | delta_header.len() as u8); // ref-delta, size 2
+        pack.extend_from_slice(base_oid.as_bytes());
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&delta_header)
+            .expect("test operation should succeed");
+        pack.extend_from_slice(&encoder.finish().expect("test operation should succeed"));
+
+        let crc32 = crc32fast::hash(&pack[offset as usize..]);
+        let checksum =
+            sley_core::digest_bytes(format, &pack).expect("test operation should succeed");
+        pack.extend_from_slice(checksum.as_bytes());
+        let index = PackIndex::write_v2(
+            format,
+            &[PackIndexEntry {
+                oid: indexed_oid,
+                crc32,
+                offset,
+            }],
+            &checksum,
+        )
+        .expect("test operation should succeed");
+        let name = checksum.to_hex();
+        fs::write(pack_dir.join(format!("pack-{name}.pack")), pack)
+            .expect("test operation should succeed");
+        fs::write(pack_dir.join(format!("pack-{name}.idx")), index)
+            .expect("test operation should succeed");
+    }
+
+    #[test]
+    fn read_object_header_ref_delta_cycle_falls_back_to_loose_copy() {
+        let root = temp_root("sley-header-ref-delta-cycle");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let object = EncodedObject::new(ObjectType::Blob, b"good loose fallback\n".to_vec());
+        let oid = db
+            .write_object(object.clone())
+            .expect("test operation should succeed");
+        let other_oid = sley_core::object_id_for_bytes(format, "blob", b"cycle peer")
+            .expect("test operation should succeed");
+
+        // The corrupt indexes form `oid -> other_oid -> oid`. Header resolution
+        // must reject the cycle before recursively consulting stores, then use
+        // the complete loose copy of the requested object.
+        write_indexed_ref_delta(&db.pack_dir, format, oid, other_oid);
+        write_indexed_ref_delta(&db.pack_dir, format, other_oid, oid);
+        db.refresh_read_cache();
+        assert_eq!(
+            db.read_object_header(&oid)
+                .expect("the loose fallback should satisfy the header read"),
+            Some((ObjectType::Blob, object.body.len() as u64))
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn read_object_header_preserves_missing_ref_delta_base_error() {
+        let root = temp_root("sley-header-missing-ref-delta-base");
+        let git_dir = root.join(".git");
+        let pack_dir = git_dir.join("objects").join("pack");
+        let format = ObjectFormat::Sha1;
+        let oid = sley_core::object_id_for_bytes(format, "blob", b"indexed object")
+            .expect("test operation should succeed");
+        let missing_base = sley_core::object_id_for_bytes(format, "blob", b"missing base")
+            .expect("test operation should succeed");
+        write_indexed_ref_delta(&pack_dir, format, oid, missing_base);
+
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let error = db
+            .read_object_header(&oid)
+            .expect_err("an indexed object with no delta base must be corrupt, not absent");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("ref-delta base object {missing_base}")),
+            "the packed-header error must retain the missing base: {error}"
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn read_object_header_falls_back_from_corrupt_midx_and_preserves_lookup_error() {
+        let root = temp_root("sley-header-corrupt-midx-fallback");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let object = EncodedObject::new(ObjectType::Blob, b"loose despite corrupt midx\n".to_vec());
+        let oid = db
+            .write_object(object.clone())
+            .expect("test operation should succeed");
+        fs::create_dir_all(&db.pack_dir).expect("test operation should succeed");
+        fs::write(&db.midx_path, b"MIDX").expect("test operation should succeed");
+
+        assert_eq!(
+            db.read_object_header(&oid)
+                .expect("the valid loose copy should survive corrupt lookup metadata"),
+            Some((ObjectType::Blob, object.body.len() as u64))
+        );
+
+        let missing = sley_core::object_id_for_bytes(format, "blob", b"actually missing")
+            .expect("test operation should succeed");
+        let error = db
+            .read_object_header(&missing)
+            .expect_err("lookup corruption must not be flattened into a missing object");
+        assert!(
+            error.to_string().contains("multi-pack-index"),
+            "the original pack lookup error must be retained: {error}"
         );
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
