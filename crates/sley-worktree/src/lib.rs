@@ -72,6 +72,7 @@ mod tests {
     use crate::attributes::*;
     use crate::index_io::*;
     use sley_odb::ObjectReader;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2175,6 +2176,63 @@ mod tests {
             filter_attribute_checks(&root, path).expect("attribute checks should load"),
             full
         );
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn worktree_attributes_matches_per_path_clean_filter() {
+        let root = temp_root();
+        fs::create_dir_all(root.join(".git").join("info")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("src")).expect("test operation should succeed");
+        fs::write(root.join(".gitattributes"), b"* text\n")
+            .expect("test operation should succeed");
+        fs::write(root.join("src").join(".gitattributes"), b"*.txt text eol=lf\n")
+            .expect("test operation should succeed");
+        let config = GitConfig::default();
+        let attributes = WorktreeAttributes::from_worktree_root(&root)
+            .expect("test operation should succeed");
+        for (path, input) in [
+            (b"top.txt".as_slice(), b"a\r\nb\r\n".as_slice()),
+            (b"src/a.txt".as_slice(), b"a\r\nb\r\n".as_slice()),
+            (b"src/b.txt".as_slice(), b"x\r\ny\r\n".as_slice()),
+        ] {
+            let cached = attributes
+                .apply_clean_filter(&config, path, input)
+                .expect("cached clean filter");
+            let per_path = apply_clean_filter(&root, root.join(".git"), &config, path, input)
+                .expect("per-path clean filter");
+            assert_eq!(
+                cached, per_path,
+                "cached clean filter must match per-path lookup for {}",
+                String::from_utf8_lossy(path)
+            );
+        }
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn worktree_attributes_skips_unreadable_unrelated_directories() {
+        let root = temp_root();
+        fs::create_dir_all(root.join(".git")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("ok")).expect("test operation should succeed");
+        let secret = root.join("secret");
+        fs::create_dir_all(&secret).expect("test operation should succeed");
+        fs::write(secret.join("hidden.txt"), b"nope\n").expect("test operation should succeed");
+        let mut permissions = fs::metadata(&secret)
+            .expect("secret metadata")
+            .permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&secret, permissions.clone()).expect("lock secret dir");
+
+        let constructed = WorktreeAttributes::from_worktree_root(&root);
+        permissions.set_mode(0o755);
+        fs::set_permissions(&secret, permissions).expect("unlock secret dir");
+        let attributes = constructed.expect("must not walk unrelated directories");
+        let blob = attributes
+            .apply_clean_filter(&GitConfig::default(), b"ok/file.txt", b"hello\n")
+            .expect("path-chain lookup must ignore unreadable siblings");
+        assert_eq!(blob, b"hello\n");
 
         fs::remove_dir_all(root).expect("test operation should succeed");
     }

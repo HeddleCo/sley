@@ -904,7 +904,7 @@ pub(crate) fn wildcard_class_matches(
     Some((if negated { !matched } else { matched }, end + 1))
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct AttributeMatcher {
     pub(crate) patterns: Vec<AttributePattern>,
     pub(crate) attribute_order: BTreeMap<Vec<u8>, usize>,
@@ -912,7 +912,7 @@ pub(crate) struct AttributeMatcher {
     pub(crate) ignore_case: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct AttributePattern {
     base: Vec<u8>,
     pattern: Vec<u8>,
@@ -932,10 +932,7 @@ impl AttributeMatcher {
     pub(crate) fn from_worktree_root(root: &Path) -> Result<Self> {
         let mut matcher = Self::default();
         let git_dir = root.join(".git");
-        matcher.configure_case_sensitivity(&git_dir);
-        if !matcher.read_configured_attributes(root, &git_dir) {
-            matcher.read_default_global_attributes();
-        }
+        matcher.configure_from_repo(root, &git_dir);
         collect_attribute_patterns(root, root, &mut matcher)?;
         read_attribute_patterns(
             git_dir.join("info").join("attributes"),
@@ -945,6 +942,16 @@ impl AttributeMatcher {
             false,
         );
         Ok(matcher)
+    }
+
+    /// Global / `core.attributesFile` sources only — no in-tree `.gitattributes`
+    /// and no `$GIT_DIR/info/attributes`. Callers that resolve one path at a
+    /// time fold those higher-precedence frames themselves so they can avoid a
+    /// full-worktree walk.
+    pub(crate) fn from_global_sources(root: &Path, git_dir: &Path) -> Self {
+        let mut matcher = Self::default();
+        matcher.configure_from_repo(root, git_dir);
+        matcher
     }
 
     /// Builds only the repository-wide attribute sources — `core.attributesFile`
@@ -958,10 +965,7 @@ impl AttributeMatcher {
     pub(crate) fn from_worktree_base(root: &Path) -> Self {
         let mut matcher = Self::default();
         let git_dir = root.join(".git");
-        matcher.configure_case_sensitivity(&git_dir);
-        if !matcher.read_configured_attributes(root, &git_dir) {
-            matcher.read_default_global_attributes();
-        }
+        matcher.configure_from_repo(root, &git_dir);
         read_attribute_patterns(
             git_dir.join("info").join("attributes"),
             &mut matcher,
@@ -1043,6 +1047,24 @@ impl AttributeMatcher {
                 stack.push(macro_assignment.clone());
             }
         }
+    }
+
+    /// Read repository config once to set `core.ignoreCase` and load
+    /// `core.attributesFile` (or the default global file). Previously
+    /// [`Self::configure_case_sensitivity`] and [`Self::read_configured_attributes`]
+    /// each parsed the same config document.
+    pub(crate) fn configure_from_repo(&mut self, root: &Path, git_dir: &Path) {
+        let Ok(config) = sley_config::read_repo_config(git_dir, None) else {
+            self.read_default_global_attributes();
+            return;
+        };
+        self.ignore_case = config.get_bool("core", None, "ignorecase").unwrap_or(false);
+        let Some(value) = config.get("core", None, "attributesFile") else {
+            self.read_default_global_attributes();
+            return;
+        };
+        let path = expand_core_excludes_file(root, value);
+        read_attribute_patterns(path, self, &[], value.as_bytes(), false);
     }
 
     pub(crate) fn configure_case_sensitivity(&mut self, git_dir: &Path) {

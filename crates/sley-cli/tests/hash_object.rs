@@ -425,3 +425,34 @@ fn hash_object_stdin_paths_matches_upstream_git() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn hash_object_stdin_paths_nested_attributes_match_upstream_git() {
+    let root = unique_temp_dir("hash-object-stdin-paths-attrs");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
+        fs::write(root.join(".gitattributes"), b"* text\n").expect("write root attributes");
+        let mut stdin = Vec::new();
+        for dir_index in 0..3 {
+            let dir = root.join(format!("dir-{dir_index}"));
+            fs::create_dir_all(&dir).expect("create attr dir");
+            fs::write(dir.join(".gitattributes"), b"*.txt text eol=lf\n")
+                .expect("write dir attributes");
+            for file_index in 0..20 {
+                let name = format!("file-{file_index:02}.txt");
+                fs::write(dir.join(&name), b"line\r\nline\r\n").expect("write hashed file");
+                stdin.extend_from_slice(format!("dir-{dir_index}/{name}\n").as_bytes());
+            }
+        }
+        let args = ["hash-object", "--stdin-paths"];
+        let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, &stdin);
+        let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, &stdin);
+        assert_same_output(actual, expected, &args);
+    };
+    let _ = fs::remove_dir_all(&root);
+}

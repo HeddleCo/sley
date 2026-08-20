@@ -1595,39 +1595,74 @@ pub fn apply_clean_filter_keep_crlf(
     .into_owned())
 }
 
-/// A reusable handle that captures the worktree's `.gitattributes` chain once so
+/// A reusable handle that captures repository-wide attribute sources once so
 /// repeated clean-filter calls (e.g. `hash-object --stdin-paths` hashing many
-/// paths in one process) don't re-walk the worktree and re-read every
-/// `.gitattributes`/global config per path.
+/// paths in one process) don't re-read config / global attributes per path.
 ///
-/// Build it once with [`WorktreeAttributes::from_worktree_root`], then call
+/// Git only consults `.gitattributes` on the path's directory chain, not the
+/// rest of the worktree. This handle matches that: construction reads
+/// `core.attributesFile` (or the default global) once, then each path folds
+/// only its ancestor `.gitattributes` plus `$GIT_DIR/info/attributes`. Matchers
+/// are cached per parent directory so sibling files in the same folder reuse
+/// the folded chain.
+///
+/// Build it once with [`WorktreeAttributes::from_worktree_root`] (or
+/// [`WorktreeAttributes::from_worktree_and_git_dir`]), then call
 /// [`WorktreeAttributes::apply_clean_filter`] per path. This mirrors
-/// [`apply_clean_filter`] exactly except the expensive attribute-source scan is
-/// amortized across calls.
+/// [`apply_clean_filter`] except the expensive config parse is amortized.
 pub struct WorktreeAttributes {
-    matcher: AttributeMatcher,
+    worktree_root: PathBuf,
+    git_dir: PathBuf,
+    base: AttributeMatcher,
+    dir_matchers: RefCell<HashMap<Vec<u8>, AttributeMatcher>>,
 }
 
 impl WorktreeAttributes {
-    /// Read the worktree's attribute sources once (global/`core.attributesFile`,
-    /// every in-tree `.gitattributes`, and `$GIT_DIR/info/attributes`).
+    /// Read the worktree's global attribute sources. In-tree `.gitattributes`
+    /// and `$GIT_DIR/info/attributes` are folded on first use of each directory.
     pub fn from_worktree_root(worktree_root: impl AsRef<Path>) -> Result<Self> {
+        let root = worktree_root.as_ref();
+        Self::from_worktree_and_git_dir(root, &root.join(".git"))
+    }
+
+    /// Like [`Self::from_worktree_root`] but uses the already-resolved git
+    /// directory (linked worktrees, `GIT_DIR`, etc.) instead of `root/.git`.
+    pub fn from_worktree_and_git_dir(
+        worktree_root: impl AsRef<Path>,
+        git_dir: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let worktree_root = worktree_root.as_ref();
+        let git_dir = git_dir.as_ref();
         Ok(Self {
-            matcher: AttributeMatcher::from_worktree_root(worktree_root.as_ref())?,
+            worktree_root: worktree_root.to_path_buf(),
+            git_dir: git_dir.to_path_buf(),
+            base: AttributeMatcher::from_global_sources(worktree_root, git_dir),
+            dir_matchers: RefCell::new(HashMap::new()),
         })
     }
 
+    fn checks_for_path(&self, path: &[u8]) -> Result<Vec<AttributeCheck>> {
+        let dir_key = attribute_parent_dir(path);
+        if let Some(matcher) = self.dir_matchers.borrow().get(&dir_key) {
+            return Ok(matcher.attributes_for_path(path, &filter_attribute_names(), false));
+        }
+        let mut matcher = self.base.clone();
+        fold_in_tree_attribute_frames(&self.worktree_root, path, &mut matcher)?;
+        fold_info_attributes(&self.git_dir, &mut matcher);
+        let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
+        self.dir_matchers.borrow_mut().insert(dir_key, matcher);
+        Ok(checks)
+    }
+
     /// Apply the clean conversion to `content` for `path`, reusing the cached
-    /// attribute chain. Behaviourally identical to [`apply_clean_filter`].
+    /// attribute sources. Behaviourally identical to [`apply_clean_filter`].
     pub fn apply_clean_filter(
         &self,
         config: &GitConfig,
         path: &[u8],
         content: &[u8],
     ) -> Result<Vec<u8>> {
-        let checks = self
-            .matcher
-            .attributes_for_path(path, &filter_attribute_names(), false);
+        let checks = self.checks_for_path(path)?;
         apply_clean_filter_with_attributes(config, &checks, path, content)
     }
 
@@ -1642,9 +1677,7 @@ impl WorktreeAttributes {
         content: &[u8],
         index_blob: SafeCrlfIndexBlob<'_>,
     ) -> Result<Vec<u8>> {
-        let checks = self
-            .matcher
-            .attributes_for_path(path, &filter_attribute_names(), false);
+        let checks = self.checks_for_path(path)?;
         Ok(apply_clean_filter_with_attributes_cow_safecrlf(
             config,
             &checks,
@@ -1655,6 +1688,46 @@ impl WorktreeAttributes {
         )?
         .into_owned())
     }
+}
+
+fn attribute_parent_dir(path: &[u8]) -> Vec<u8> {
+    match path.iter().rposition(|byte| *byte == b'/') {
+        Some(index) => path[..index].to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// Fold `.gitattributes` from the worktree root down to `path`'s parent.
+fn fold_in_tree_attribute_frames(
+    worktree_root: &Path,
+    path: &[u8],
+    matcher: &mut AttributeMatcher,
+) -> Result<()> {
+    read_dir_attribute_patterns_for_base(worktree_root, &[], matcher)?;
+    let mut prefix = Vec::new();
+    let mut parts = path.split(|byte| *byte == b'/').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        if !prefix.is_empty() {
+            prefix.push(b'/');
+        }
+        prefix.extend_from_slice(part);
+        let dir = worktree_root.join(repo_path_to_os_path(&prefix)?);
+        read_dir_attribute_patterns_for_base(&dir, &prefix, matcher)?;
+    }
+    Ok(())
+}
+
+fn fold_info_attributes(git_dir: &Path, matcher: &mut AttributeMatcher) {
+    read_attribute_patterns(
+        git_dir.join("info").join("attributes"),
+        matcher,
+        &[],
+        b".git/info/attributes",
+        false,
+    );
 }
 
 /// A reusable handle that captures a *tree's* `.gitattributes` chain once so
@@ -2134,33 +2207,10 @@ pub(crate) fn filter_attribute_checks(
     path: &[u8],
 ) -> Result<Vec<AttributeCheck>> {
     let requested = filter_attribute_names();
-    let mut matcher = AttributeMatcher::default();
     let git_dir = worktree_root.join(".git");
-    matcher.configure_case_sensitivity(&git_dir);
-    if !matcher.read_configured_attributes(worktree_root, &git_dir) {
-        matcher.read_default_global_attributes();
-    }
-    read_dir_attribute_patterns_for_base(worktree_root, &[], &mut matcher)?;
-    let mut prefix = Vec::new();
-    let mut parts = path.split(|byte| *byte == b'/').peekable();
-    while let Some(part) = parts.next() {
-        if parts.peek().is_none() {
-            break;
-        }
-        if !prefix.is_empty() {
-            prefix.push(b'/');
-        }
-        prefix.extend_from_slice(part);
-        let dir = worktree_root.join(repo_path_to_os_path(&prefix)?);
-        read_dir_attribute_patterns_for_base(&dir, &prefix, &mut matcher)?;
-    }
-    read_attribute_patterns(
-        worktree_root.join(".git").join("info").join("attributes"),
-        &mut matcher,
-        &[],
-        b".git/info/attributes",
-        false,
-    );
+    let mut matcher = AttributeMatcher::from_global_sources(worktree_root, &git_dir);
+    fold_in_tree_attribute_frames(worktree_root, path, &mut matcher)?;
+    fold_info_attributes(&git_dir, &mut matcher);
     Ok(matcher.attributes_for_path(path, &requested, false))
 }
 

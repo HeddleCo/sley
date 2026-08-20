@@ -265,7 +265,8 @@ impl HashObjectInvocation {
         if !self.read_stdin && !self.read_stdin_paths && self.paths.is_empty() {
             return Ok(());
         }
-        let cwd = cli_session.cwd().to_path_buf();
+        let cwd = fs::canonicalize(cli_session.cwd())
+            .unwrap_or_else(|_| cli_session.cwd().to_path_buf());
         // Repository discovery belongs to the invocation session. Once open,
         // the embeddable facade is the source of repository layout, format,
         // and object-store state for the rest of this command.
@@ -288,18 +289,14 @@ impl HashObjectInvocation {
         } else {
             None
         };
-        // Caching the worktree `.gitattributes` chain pays for itself whenever
-        // more than one path is hashed in this process — `--stdin-paths` (many,
-        // count unknown up front) OR multiple positional paths. Gating only on
-        // `--stdin-paths` regressed `hash-object -w file1 file2 …` back to the
-        // per-path attribute re-walk this cache was added to avoid (sley#25).
-        let cache_attributes = self.read_stdin_paths || self.paths.len() > 1;
+        // Filters are Enabled by default. Without a process-lifetime attribute
+        // handle, each path re-parsed repo config and re-read global
+        // attributes (sley#25: ~163x slower than git for 200 `--stdin-paths`).
         let filter_context = HashObjectFilterContext::new(
             cli_session,
             self.object_type,
             &self.filters,
             repo_git_dir.as_deref(),
-            cache_attributes,
         )?;
         let mut stdout = io::stdout().lock();
 
@@ -433,14 +430,14 @@ impl HashObjectFilterPolicy {
 }
 
 struct HashObjectFilterContext {
-    git_dir: PathBuf,
     worktree_root: PathBuf,
     config: GitConfig,
-    // The worktree's `.gitattributes` chain, scanned once. `hash-object
-    // --stdin-paths` hashes many paths in one process; without this the clean
-    // filter re-walked the entire worktree and re-read every `.gitattributes`
-    // per path (sley#25: ~163x slower than git for 200 paths).
-    attributes: Option<sley_worktree::WorktreeAttributes>,
+    // Process-lifetime attribute handle. `hash-object --stdin-paths` hashes
+    // many paths in one process; without this the clean filter re-parsed
+    // repo config and re-read global attributes per path (sley#25: ~163x
+    // slower than git for 200 paths). In-tree `.gitattributes` are folded
+    // per directory chain, matching git — not by walking the whole worktree.
+    attributes: sley_worktree::WorktreeAttributes,
 }
 
 impl HashObjectFilterContext {
@@ -449,7 +446,6 @@ impl HashObjectFilterContext {
         object_type: ObjectType,
         policy: &HashObjectFilterPolicy,
         git_dir: Option<&Path>,
-        cache_attributes: bool,
     ) -> Result<Option<Self>> {
         if object_type != ObjectType::Blob || !policy.enabled() {
             return Ok(None);
@@ -460,11 +456,11 @@ impl HashObjectFilterContext {
         let Ok(worktree_root) = worktree_root_for_git_dir(cli_session, git_dir) else {
             return Ok(None);
         };
-        let attributes = cache_attributes
-            .then(|| sley_worktree::WorktreeAttributes::from_worktree_root(&worktree_root))
-            .transpose()?;
+        let worktree_root =
+            fs::canonicalize(&worktree_root).unwrap_or_else(|_| worktree_root.clone());
+        let attributes =
+            sley_worktree::WorktreeAttributes::from_worktree_and_git_dir(&worktree_root, git_dir)?;
         Ok(Some(Self {
-            git_dir: git_dir.to_path_buf(),
             worktree_root,
             config: read_repo_config(git_dir)?,
             attributes,
@@ -472,16 +468,8 @@ impl HashObjectFilterContext {
     }
 
     fn apply_clean_filter(&self, path: &[u8], content: &[u8]) -> Result<Vec<u8>> {
-        match &self.attributes {
-            Some(attributes) => attributes.apply_clean_filter(&self.config, path, content),
-            None => sley_worktree::apply_clean_filter(
-                &self.worktree_root,
-                &self.git_dir,
-                &self.config,
-                path,
-                content,
-            ),
-        }
+        self.attributes
+            .apply_clean_filter(&self.config, path, content)
     }
 }
 
@@ -509,6 +497,12 @@ fn hash_object_filter_git_path(
         } else {
             cwd.join(path)
         };
+        // Prefer a lexical strip so `--stdin-paths` does not realpath every
+        // file. Canonicalize only when the spelling differs from the
+        // already-canonical worktree root (symlinks, `..`, different cwd).
+        if let Ok(relative) = absolute.strip_prefix(worktree_root) {
+            return Ok(Some(hash_object_repo_path_bytes(relative)?));
+        }
         let absolute = fs::canonicalize(&absolute).unwrap_or(absolute);
         let Ok(relative) = absolute.strip_prefix(worktree_root) else {
             return Ok(None);
