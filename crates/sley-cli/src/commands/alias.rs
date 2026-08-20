@@ -27,8 +27,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
-use crate::commands::remote::repo_current_branch_name;
-use crate::{common_git_dir_for_git_dir, injected_config_parameters, worktree_root_for_git_dir};
+use crate::{injected_config_parameters, worktree_root_for_git_dir};
 
 /// A safety backstop on alias-expansion iterations. git relies purely on its
 /// loop/recursion detection; this guards against a pathological config that
@@ -226,13 +225,17 @@ fn resolve_alias_entry(entry: &sley_config::ConfigStackEntry) -> Option<Resolved
 /// missing-value diagnostic.
 fn load_alias_stack(cli_session: &crate::session::CliSession) -> Result<sley_config::ConfigStack> {
     let cwd = cli_session.cwd();
-    let git_dir = cli_session.git_dir().ok();
-    let common_git_dir = git_dir
+    let snapshot = match cli_session.repository_snapshot() {
+        Ok(snapshot) => Some(snapshot),
+        Err(GitError::NotFound(_)) => None,
+        Err(err) => return Err(crate::report_config_setup_error(err)),
+    };
+    let common_git_dir = snapshot
         .as_ref()
-        .and_then(|dir| common_git_dir_for_git_dir(dir).ok());
-    let branch = git_dir
+        .map(|snapshot| snapshot.common_dir.clone());
+    let branch = snapshot
         .as_ref()
-        .and_then(|dir| repo_current_branch_name(dir));
+        .and_then(|snapshot| snapshot.branch.clone());
     let context = ConfigIncludeContext::new(common_git_dir.clone(), branch);
     let mut stack = sley_config::ConfigStack::new();
     for (path, scope) in sley_config::default_config_layer_paths() {

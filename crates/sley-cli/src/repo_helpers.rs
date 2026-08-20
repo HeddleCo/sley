@@ -53,9 +53,6 @@ pub(crate) fn repository_abbrev_from_config(
     format: ObjectFormat,
     config: &GitConfig,
 ) -> Result<Option<usize>> {
-    if let Some(value) = global_config_value("core.abbrev")? {
-        return parse_repository_abbrev_value(git_dir, format, &value);
-    }
     let Some(value) = config.get("core", None, "abbrev") else {
         return Ok(Some(repository_auto_abbrev_width(git_dir, format)?));
     };

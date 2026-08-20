@@ -310,13 +310,24 @@ pub fn run(args: Vec<String>) -> Result<()> {
     // NFD path arguments to NFC when `core.precomposeunicode` is true. Command
     // name (argv[0]) is left alone; options and pathspecs are normalized.
     let mut dispatch_args: Vec<String> = global.args.to_vec();
-    if let Ok(git_dir) = cli_session.git_dir()
-        && let Ok(config) = read_repo_config(&git_dir)
-    {
-        sley_core::activate_precompose_unicode(config.get_bool("core", None, "precomposeunicode"));
-        if dispatch_args.len() > 1 {
-            sley_core::precompose_argv_if_needed(&mut dispatch_args[1..]);
+    match cli_session.repository_snapshot() {
+        Ok(snapshot) => {
+            sley_core::activate_precompose_unicode(snapshot.config.get_bool(
+                "core",
+                None,
+                "precomposeunicode",
+            ));
+            if dispatch_args.len() > 1 {
+                sley_core::precompose_argv_if_needed(&mut dispatch_args[1..]);
+            }
         }
+        // Commands such as `config --global` remain valid without a repository;
+        // their command-specific config reader owns any later diagnostic.
+        Err(GitError::NotFound(_)) => {}
+        // Repository bootstrap is the first authoritative parse of invocation
+        // config. Stop here after a malformed `-c` (whose parser has already
+        // emitted Git's diagnostic) instead of dispatching and parsing it again.
+        Err(err) => return Err(report_config_setup_error(err)),
     }
     dispatch::dispatch_with_aliases(&cli_session, &dispatch_args, &global.config, 0)
 }

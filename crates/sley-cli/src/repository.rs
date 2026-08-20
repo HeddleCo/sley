@@ -7,69 +7,97 @@
 
 use sley::plumbing::{sley_core, sley_odb, sley_rev};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::sley_worktree;
 use sley::ObjectDatabase as FileObjectDatabase;
 use sley::RefStore as FileRefStore;
-use sley::{GitConfig, OpenOptions, Repository};
+use sley::{GitConfig, Repository, ResolvedRepositoryOpen};
 use sley::{ObjectFormat, Result};
 
 use crate::{
-    common_git_dir_for_git_dir, read_repo_config, repository_abbrev, repository_object_format,
-    session, warn_ambiguous_refname_for_object_prefix, worktree_root_for_git_dir,
+    common_git_dir_for_git_dir, read_repo_config, repository_abbrev_from_config, session,
+    warn_ambiguous_refname_for_object_prefix,
 };
+
+/// Object-database behavior required by a command's invocation snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObjectAccess {
+    /// Repository layout/config only; no object reads are performed.
+    None,
+    /// Raw object writes. Replacement refs never participate in writes.
+    WriteOnly,
+    /// Object reads with the invocation's replacement policy.
+    ReadWithReplacements,
+}
+
+/// Purpose-specific worktree semantics for a repository snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorktreePolicy {
+    /// Normal command setup semantics.
+    Command,
+    /// Hash-object attribute lookup semantics, based on physical layout.
+    HashAttributes,
+}
 
 pub(crate) struct RepositoryContext {
     cwd: PathBuf,
-    cli_session: session::CliSession,
+    snapshot: Arc<session::InvocationRepositorySnapshot>,
     repository: Repository,
-    config: GitConfig,
     refs: FileRefStore,
     pathspec_magic: sley_worktree::PathspecMatchMagic,
-    worktree_root: OnceLock<PathBuf>,
+    worktree_root: Option<PathBuf>,
     abbrev: OnceLock<Option<usize>>,
 }
 
 impl RepositoryContext {
     /// Open the invocation repository without consulting compatibility globals.
     pub(crate) fn from_session(cli_session: &session::CliSession) -> Result<Self> {
-        Self::from_git_dir_and_cwd(
-            cli_session.git_dir()?,
-            cli_session.cwd().to_path_buf(),
-            cli_session.clone(),
-            cli_session.replace_objects(),
-            crate::effective_pathspec_flags(cli_session),
+        Self::from_session_with_access(
+            cli_session,
+            ObjectAccess::ReadWithReplacements,
+            WorktreePolicy::Command,
         )
     }
 
-    fn from_git_dir_and_cwd(
-        git_dir: PathBuf,
-        cwd: PathBuf,
-        cli_session: session::CliSession,
-        replace_objects: bool,
-        pathspec_magic: sley_worktree::PathspecMatchMagic,
+    /// Open one resolved repository/config/worktree snapshot for the command.
+    pub(crate) fn from_session_with_access(
+        cli_session: &session::CliSession,
+        access: ObjectAccess,
+        worktree_policy: WorktreePolicy,
     ) -> Result<Self> {
-        let config = read_repo_config(&git_dir)?;
-        let use_replace_refs = config
+        let snapshot = cli_session.repository_snapshot()?;
+        let worktree_root = cli_session.optional_worktree_from_config(
+            &snapshot.git_dir,
+            &snapshot.setup_config,
+            &snapshot.config,
+            snapshot.linked_worktree,
+            worktree_policy,
+        )?;
+        let use_replace_refs = snapshot
+            .config
             .get_bool("core", None, "useReplaceRefs")
             .unwrap_or(true);
-        let repository = Repository::open_with(
-            &git_dir,
-            OpenOptions::new()
-                .exact_path(true)
-                .replace_objects(replace_objects)
-                .effective_use_replace_refs(use_replace_refs),
+        let replacement_reads =
+            access == ObjectAccess::ReadWithReplacements && cli_session.replace_objects();
+        let repository = Repository::open_resolved(
+            ResolvedRepositoryOpen {
+                git_dir: snapshot.git_dir.clone(),
+                common_dir: snapshot.common_dir.clone(),
+                work_tree: worktree_root.clone(),
+                format: snapshot.format,
+                use_replace_refs,
+            },
+            replacement_reads,
         )?;
         let refs = repository.references();
         Ok(Self {
-            cwd,
-            cli_session,
+            cwd: cli_session.cwd().to_path_buf(),
+            snapshot,
             repository,
-            config,
             refs,
-            pathspec_magic,
-            worktree_root: OnceLock::new(),
+            pathspec_magic: crate::effective_pathspec_flags(cli_session),
+            worktree_root,
             abbrev: OnceLock::new(),
         })
     }
@@ -83,19 +111,23 @@ impl RepositoryContext {
     }
 
     pub(crate) fn git_dir(&self) -> &Path {
-        self.repository.git_dir()
+        &self.snapshot.git_dir
+    }
+
+    pub(crate) fn common_git_dir(&self) -> &Path {
+        &self.snapshot.common_dir
     }
 
     pub(crate) fn format(&self) -> ObjectFormat {
-        self.repository.object_format()
+        self.snapshot.format
     }
 
     pub(crate) fn config(&self) -> &GitConfig {
-        &self.config
+        &self.snapshot.config
     }
 
     pub(crate) fn objects(&self) -> &FileObjectDatabase {
-        self.repository.object_database()
+        self.repository().object_database()
     }
 
     pub(crate) fn refs(&self) -> &FileRefStore {
@@ -107,23 +139,16 @@ impl RepositoryContext {
     }
 
     pub(crate) fn worktree_root(&self) -> Result<&Path> {
-        if let Some(root) = self.worktree_root.get() {
-            return Ok(root);
-        }
-        let root = worktree_root_for_git_dir(&self.cli_session, self.repository.git_dir())?;
-        let _ = self.worktree_root.set(root);
-        Ok(self
-            .worktree_root
-            .get()
-            .expect("repository worktree root should be initialized")
-            .as_path())
+        self.worktree_root.as_deref().ok_or_else(|| {
+            sley::GitError::Unsupported("command requires a non-bare worktree".into())
+        })
     }
 
     pub(crate) fn abbrev(&self) -> Result<Option<usize>> {
         if let Some(abbrev) = self.abbrev.get() {
             return Ok(*abbrev);
         }
-        let abbrev = repository_abbrev(self.repository.git_dir(), self.repository.object_format())?;
+        let abbrev = repository_abbrev_from_config(self.git_dir(), self.format(), self.config())?;
         let _ = self.abbrev.set(abbrev);
         Ok(*self
             .abbrev
@@ -132,29 +157,17 @@ impl RepositoryContext {
     }
 
     pub(crate) fn resolve_revision(&self, rev: &str) -> Result<sley_core::ObjectId> {
-        warn_ambiguous_refname_for_object_prefix(
-            self.repository.git_dir(),
-            self.repository.object_format(),
-            rev,
-        );
+        warn_ambiguous_refname_for_object_prefix(self.git_dir(), self.format(), rev);
         self.revision_resolver().resolve(rev)
     }
 
     pub(crate) fn resolve_path(&self, rev: &str, path: &str) -> Result<sley_rev::ResolvedTreePath> {
-        warn_ambiguous_refname_for_object_prefix(
-            self.repository.git_dir(),
-            self.repository.object_format(),
-            rev,
-        );
+        warn_ambiguous_refname_for_object_prefix(self.git_dir(), self.format(), rev);
         self.revision_resolver().resolve_path(rev, path)
     }
 
     pub(crate) fn revision_resolver(&self) -> sley_rev::RevisionResolver<'_, FileObjectDatabase> {
-        sley_rev::RevisionResolver::new(
-            self.repository.git_dir(),
-            self.repository.object_format(),
-            self.repository.object_database(),
-        )
+        sley_rev::RevisionResolver::new(self.git_dir(), self.format(), self.objects())
     }
 }
 
@@ -221,4 +234,52 @@ fn repository_object_replacements(
         }
     }
     Ok(sley_odb::ObjectReplacements::new(replacements))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sley-{label}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn abbrev_uses_the_invocation_config_snapshot() {
+        let root = unique_temp_dir("repository-context-abbrev-snapshot");
+        let initialized = Repository::init(&root).expect("initialize repository");
+        let config_path = initialized.git_dir().join("config");
+        let mut config = fs::read_to_string(&config_path).expect("read initial config");
+        config.push_str("\n[core]\n\tabbrev = 12\n");
+        fs::write(&config_path, &config).expect("set initial abbrev");
+
+        let cli_session = session::CliSession::from_parsed_globals(
+            root.clone(),
+            Some(initialized.git_dir().to_path_buf()),
+            None,
+            None,
+            false,
+            true,
+            true,
+            crate::PathspecFlags::default(),
+        );
+        let context = RepositoryContext::from_session_with_access(
+            &cli_session,
+            ObjectAccess::None,
+            WorktreePolicy::Command,
+        )
+        .expect("capture repository context");
+
+        config.push_str("\n[core]\n\tabbrev = 4\n");
+        fs::write(&config_path, config).expect("mutate config after snapshot");
+        assert_eq!(context.abbrev().expect("read captured abbrev"), Some(12));
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
 }

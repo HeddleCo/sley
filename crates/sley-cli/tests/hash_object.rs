@@ -1,6 +1,9 @@
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -374,6 +377,22 @@ fn hash_object_filter_path_and_option_errors_match_upstream_git() {
             let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, stdin);
             assert_same_output(actual, expected, &args);
         }
+
+        for args in [
+            vec![
+                "-c",
+                "core.bigFileThreshold=invalid",
+                "hash-object",
+                "--stdin",
+            ],
+            vec!["-c", "core.bigFileThreshold", "hash-object", "--stdin"],
+        ] {
+            let expected =
+                run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, b"payload\n");
+            let actual =
+                run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, b"payload\n");
+            assert_same_output(actual, expected, &args);
+        }
     };
     let _ = fs::remove_dir_all(&root);
 }
@@ -427,6 +446,146 @@ fn hash_object_stdin_paths_matches_upstream_git() {
 }
 
 #[test]
+fn hash_object_stdin_paths_flushes_prior_oid_before_fatal_error() {
+    let root = unique_temp_dir("hash-object-stdin-paths-fatal-flush");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
+        fs::write(root.join("ok"), b"payload\n").expect("write first input");
+
+        let args = ["hash-object", "--stdin-paths"];
+        let stdin = b"ok\nmissing\n";
+        let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, stdin);
+        assert_eq!(expected.status.code(), Some(128));
+        assert_eq!(
+            expected
+                .stdout
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count(),
+            1
+        );
+        assert!(!expected.stdout.is_empty(), "git must retain the first oid");
+
+        let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, stdin);
+        assert_same_output(actual, expected, &args);
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hash_object_stdin_paths_responds_before_stdin_eof() {
+    let root = unique_temp_dir("hash-object-stdin-paths-streaming");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
+        fs::write(root.join("one.txt"), b"one\n").expect("write one");
+        fs::write(root.join("two.txt"), b"two\n").expect("write two");
+
+        let expected = [
+            git(&root, &["hash-object", "one.txt"], &[]),
+            git(&root, &["hash-object", "two.txt"], &[]),
+        ];
+        let mut child = Command::new(sley_testkit::sley_bin!())
+            .current_dir(&root)
+            .args(["hash-object", "--stdin-paths"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn streaming hash-object");
+        let mut stdin = child.stdin.take().expect("stdin pipe");
+        let mut stdout = child.stdout.take().expect("stdout pipe");
+        let response_lengths = expected.iter().map(Vec::len).collect::<Vec<_>>();
+        let (response_tx, response_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for response_len in response_lengths {
+                let mut response = vec![0; response_len];
+                let result = stdout.read_exact(&mut response).map(|()| response);
+                let stop = result.is_err();
+                if response_tx.send(result).is_err() || stop {
+                    break;
+                }
+            }
+        });
+
+        for (path, expected_response) in [b"one.txt\n".as_slice(), b"two.txt\n".as_slice()]
+            .into_iter()
+            .zip(&expected)
+        {
+            stdin.write_all(path).expect("write one path");
+            stdin.flush().expect("flush one path");
+            let response = match response_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(response)) => response,
+                Ok(Err(err)) => {
+                    let _ = child.kill();
+                    drop(stdin);
+                    let _ = child.wait();
+                    reader.join().expect("join stdout reader");
+                    panic!("hash-object closed stdout before responding: {err}");
+                }
+                Err(err) => {
+                    let _ = child.kill();
+                    drop(stdin);
+                    let _ = child.wait();
+                    reader.join().expect("join stdout reader");
+                    panic!("hash-object did not respond while stdin remained open: {err}");
+                }
+            };
+            assert_eq!(response, *expected_response);
+        }
+
+        drop(stdin);
+        assert!(
+            child
+                .wait()
+                .expect("wait for streaming hash-object")
+                .success(),
+            "hash-object failed after stdin EOF"
+        );
+        reader.join().expect("join stdout reader");
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hash_object_invalid_big_file_threshold_matches_upstream_git() {
+    let root = unique_temp_dir("hash-object-big-file-threshold");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
+        fs::write(root.join("file.txt"), b"payload\n").expect("write input");
+
+        for args in [
+            vec![
+                "-c",
+                "core.bigFileThreshold=invalid",
+                "hash-object",
+                "file.txt",
+            ],
+            vec!["-c", "core.bigFileThreshold", "hash-object", "file.txt"],
+        ] {
+            let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, &[]);
+            let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, &[]);
+            assert_same_output(actual, expected, &args);
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn hash_object_stdin_paths_parent_dir_matches_upstream_git() {
     let root = unique_temp_dir("hash-object-stdin-paths-dotdot");
     fs::create_dir_all(&root).expect("create temp repo");
@@ -446,6 +605,39 @@ fn hash_object_stdin_paths_parent_dir_matches_upstream_git() {
             "oracle git should hash dir/../file.txt"
         );
         let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, stdin);
+        assert_same_output(actual, expected, &args);
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn hash_object_stdin_paths_preserves_non_utf8_names() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = unique_temp_dir("hash-object-stdin-paths-non-utf8");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
+        fs::write(root.join(".gitattributes"), b"*.txt text eol=lf\n").expect("write attributes");
+        let name = b"non-utf8-\xff.txt";
+        fs::write(root.join(OsString::from_vec(name.to_vec())), b"line\r\n")
+            .expect("write non-utf8 path");
+        let mut stdin = name.to_vec();
+        stdin.push(b'\n');
+
+        let args = ["hash-object", "--stdin-paths"];
+        let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, &stdin);
+        assert!(
+            expected.status.success(),
+            "oracle git should hash non-utf8 path"
+        );
+        let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, &stdin);
         assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -539,6 +731,33 @@ fn hash_object_linked_worktree_uses_common_info_attributes() {
         let expected = run_output_with_stdin(git, &linked, &args, stdin);
         let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &linked, &args, stdin);
         assert_same_output(actual, expected, &args);
+
+        let gitfile = linked.join(".git");
+        let explicit_args = [
+            "--git-dir",
+            gitfile.to_str().expect("utf8 gitfile path"),
+            "-c",
+            "core.bare=true",
+            "hash-object",
+            "--stdin-paths",
+        ];
+        let common_git_dir = main.join(".git");
+        let envs = [
+            ("GIT_IMPLICIT_WORK_TREE", "0"),
+            (
+                "GIT_COMMON_DIR",
+                common_git_dir.to_str().expect("utf8 common git dir"),
+            ),
+        ];
+        let expected = run_output_with_env_and_stdin(git, &linked, &explicit_args, &envs, stdin);
+        let actual = run_output_with_env_and_stdin(
+            sley_testkit::sley_bin!(),
+            &linked,
+            &explicit_args,
+            &envs,
+            stdin,
+        );
+        assert_same_output(actual, expected, &explicit_args);
     };
     let _ = fs::remove_dir_all(&root);
 }
@@ -613,5 +832,248 @@ fn hash_object_stdin_paths_nested_attributes_match_upstream_git() {
         let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, &stdin);
         assert_same_output(actual, expected, &args);
     };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hash_object_repository_format_ignores_injected_extension() {
+    let root = unique_temp_dir("hash-object-local-format");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
+        let args = [
+            "-c",
+            "extensions.objectFormat=sha256",
+            "hash-object",
+            "--stdin",
+        ];
+        let expected =
+            run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, b"payload\n");
+        let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, b"payload\n");
+        assert_eq!(expected.stdout.len(), 41, "repository remains SHA-1");
+        assert_same_output(actual, expected, &args);
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hash_object_injected_core_bare_does_not_disable_worktree_filters() {
+    let root = unique_temp_dir("hash-object-injected-core-bare");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
+        fs::write(root.join(".gitattributes"), b"*.txt text eol=lf\n").expect("write attributes");
+        fs::write(root.join("file.txt"), b"line\r\n").expect("write input");
+
+        let args = ["-c", "core.bare=true", "hash-object", "file.txt"];
+        let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, &[]);
+        let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, &[]);
+        assert_same_output(actual, expected, &args);
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hash_object_explicit_normal_git_dir_ignores_injected_core_bare() {
+    let root = unique_temp_dir("hash-object-explicit-normal-core-bare");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
+        fs::write(root.join(".gitattributes"), b"*.txt text eol=lf\n").expect("write attributes");
+        fs::write(root.join("file.txt"), b"line\r\n").expect("write input");
+
+        let args = [
+            "--git-dir",
+            ".git",
+            "-c",
+            "core.bare=true",
+            "hash-object",
+            "file.txt",
+        ];
+        let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, &[]);
+        let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, &[]);
+        assert_same_output(actual, expected, &args);
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hash_object_injected_core_nonbare_enables_cwd_for_implicit_bare_repo() {
+    let root = unique_temp_dir("hash-object-implicit-bare-nonbare-override");
+    let bare = root.join("repo.git");
+    let conflicting_worktree = root.join("other-worktree");
+    fs::create_dir_all(&root).expect("create temp root");
+    fs::create_dir_all(&conflicting_worktree).expect("create conflicting worktree");
+    {
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "--bare", bare.to_str().expect("utf8 path")],
+        );
+        fs::write(bare.join(".gitattributes"), b"*.txt text eol=lf\n")
+            .expect("write cwd attributes");
+        fs::write(bare.join("file.txt"), b"line\r\n").expect("write cwd input");
+        fs::write(
+            conflicting_worktree.join(".gitattributes"),
+            b"*.txt -text\n",
+        )
+        .expect("write conflicting attributes");
+
+        let worktree_config = format!("core.worktree={}", conflicting_worktree.display());
+        let args = [
+            "-c",
+            "core.bare=false",
+            "-c",
+            worktree_config.as_str(),
+            "hash-object",
+            "file.txt",
+        ];
+        let envs = [("GIT_IMPLICIT_WORK_TREE", "0")];
+        let expected =
+            run_output_with_env_and_stdin(sley_testkit::oracle_git(), &bare, &args, &envs, &[]);
+        let actual =
+            run_output_with_env_and_stdin(sley_testkit::sley_bin!(), &bare, &args, &envs, &[]);
+        assert_same_output(actual, expected, &args);
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hash_object_write_only_ignores_broken_replace_refs() {
+    let root = unique_temp_dir("hash-object-broken-replace");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo");
+    fs::create_dir_all(&actual).expect("create actual repo");
+    {
+        for repo in [&expected, &actual] {
+            run(
+                sley_testkit::oracle_git(),
+                repo,
+                &["init", "-q", "-b", "main"],
+            );
+            let replace = repo.join(".git").join("refs").join("replace");
+            fs::create_dir_all(&replace).expect("create replace namespace");
+            fs::write(
+                replace.join("1111111111111111111111111111111111111111"),
+                b"not-an-object-id\n",
+            )
+            .expect("write broken replace ref");
+        }
+        for args in [
+            ["hash-object", "--stdin"].as_slice(),
+            ["hash-object", "-w", "--stdin"].as_slice(),
+        ] {
+            let expected_output =
+                run_output_with_stdin(sley_testkit::oracle_git(), &expected, args, b"payload\n");
+            let actual_output =
+                run_output_with_stdin(sley_testkit::sley_bin!(), &actual, args, b"payload\n");
+            assert_same_output(actual_output, expected_output, args);
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hash_object_explicit_bare_repository_matches_upstream_git() {
+    let root = unique_temp_dir("hash-object-explicit-bare");
+    let expected = root.join("expected.git");
+    let actual = root.join("actual.git");
+    fs::create_dir_all(&root).expect("create root");
+    {
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                expected.to_str().expect("utf8 path"),
+            ],
+        );
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "--bare", actual.to_str().expect("utf8 path")],
+        );
+        fs::write(root.join(".gitattributes"), b"*.txt text eol=lf\n")
+            .expect("write cwd attributes");
+        fs::write(root.join("file.txt"), b"line\r\n").expect("write cwd input");
+        for tail in [
+            vec!["hash-object", "--stdin"],
+            vec!["hash-object", "-w", "--stdin"],
+            vec!["-c", "core.bare=false", "hash-object", "file.txt"],
+        ] {
+            let expected_git_dir = expected.to_str().expect("utf8 path");
+            let actual_git_dir = actual.to_str().expect("utf8 path");
+            let mut expected_args = vec!["--git-dir", expected_git_dir];
+            expected_args.extend(tail.iter().copied());
+            let mut actual_args = vec!["--git-dir", actual_git_dir];
+            actual_args.extend(tail.iter().copied());
+            let expected_output = run_output_with_stdin(
+                sley_testkit::oracle_git(),
+                &root,
+                &expected_args,
+                b"payload\n",
+            );
+            let actual_output =
+                run_output_with_stdin(sley_testkit::sley_bin!(), &root, &actual_args, b"payload\n");
+            assert_eq!(actual_output.status.code(), expected_output.status.code());
+            assert_eq!(actual_output.stdout, expected_output.stdout);
+            assert_eq!(actual_output.stderr, expected_output.stderr);
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hash_object_invalid_explicit_git_dir_does_not_enable_worktree_filters() {
+    let root = unique_temp_dir("hash-object-invalid-git-dir");
+    let invalid = root.join("not-a-repository");
+    fs::create_dir_all(&invalid).expect("create invalid git dir");
+    {
+        fs::write(root.join(".gitattributes"), b"*.txt text eol=lf\n").expect("write attributes");
+        fs::write(root.join("file.txt"), b"line\r\n").expect("write input");
+        let invalid = invalid.to_str().expect("utf8 path");
+        let args = ["--git-dir", invalid, "hash-object", "file.txt"];
+        let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, &[]);
+        let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, &[]);
+        assert_same_output(actual, expected, &args);
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hash_object_large_regular_file_matches_upstream_git() {
+    let root = unique_temp_dir("hash-object-large-regular");
+    fs::create_dir_all(&root).expect("create root");
+    {
+        run(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
+        let mut payload = Vec::with_capacity(8 * 1024 * 1024);
+        for index in 0..(8 * 1024 * 1024 / 16) {
+            payload.extend_from_slice(&(index as u128).to_le_bytes());
+        }
+        fs::write(root.join("large.bin"), payload).expect("write large input");
+        let args = ["hash-object", "large.bin"];
+        let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, &[]);
+        let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, &[]);
+        assert_same_output(actual, expected, &args);
+    }
     let _ = fs::remove_dir_all(&root);
 }

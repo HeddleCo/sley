@@ -272,12 +272,11 @@ pub(crate) fn decode_utf16(data: &[u8], le: bool) -> Option<Vec<u8>> {
     if !data.len().is_multiple_of(2) {
         return None;
     }
-    let units = data.chunks_exact(2).map(|chunk| {
-        let pair = [chunk[0], chunk[1]];
+    let units = data.as_chunks::<2>().0.iter().map(|pair| {
         if le {
-            u16::from_le_bytes(pair)
+            u16::from_le_bytes(*pair)
         } else {
-            u16::from_be_bytes(pair)
+            u16::from_be_bytes(*pair)
         }
     });
     let mut out = String::new();
@@ -292,12 +291,11 @@ pub(crate) fn decode_utf32(data: &[u8], le: bool) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = String::new();
-    for chunk in data.chunks_exact(4) {
-        let quad = [chunk[0], chunk[1], chunk[2], chunk[3]];
+    for quad in data.as_chunks::<4>().0 {
         let cp = if le {
-            u32::from_le_bytes(quad)
+            u32::from_le_bytes(*quad)
         } else {
-            u32::from_be_bytes(quad)
+            u32::from_be_bytes(*quad)
         };
         out.push(char::from_u32(cp)?);
     }
@@ -1604,7 +1602,9 @@ pub fn apply_clean_filter_keep_crlf(
 /// `core.attributesFile` (or the default global) once, then each path folds
 /// only its ancestor `.gitattributes` plus
 /// `$GIT_COMMON_DIR/info/attributes`. Matchers are cached per parent directory
-/// so sibling files in the same folder reuse the folded chain.
+/// as persistent parent-linked frames. Each source (including a missing
+/// `.gitattributes`) is loaded at most once, and siblings share their ancestor
+/// frames without cloning the accumulated pattern set.
 ///
 /// Build it once with [`WorktreeAttributes::from_worktree_root`] (or
 /// [`WorktreeAttributes::from_worktree_and_git_dir`]), then call
@@ -1612,9 +1612,15 @@ pub fn apply_clean_filter_keep_crlf(
 /// [`apply_clean_filter`] except the expensive config parse is amortized.
 pub struct WorktreeAttributes {
     worktree_root: PathBuf,
-    common_git_dir: PathBuf,
     base: AttributeMatcher,
-    dir_matchers: RefCell<HashMap<Vec<u8>, AttributeMatcher>>,
+    root_frame: std::rc::Rc<WorktreeAttributeFrame>,
+    info: AttributeMatcher,
+    dir_frames: RefCell<HashMap<Vec<u8>, std::rc::Rc<WorktreeAttributeFrame>>>,
+}
+
+struct WorktreeAttributeFrame {
+    parent: Option<std::rc::Rc<WorktreeAttributeFrame>>,
+    matcher: AttributeMatcher,
 }
 
 impl WorktreeAttributes {
@@ -1638,12 +1644,7 @@ impl WorktreeAttributes {
         let git_dir = git_dir.as_ref();
         let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
         let base = AttributeMatcher::from_global_sources(worktree_root, &common_git_dir);
-        Ok(Self {
-            worktree_root: worktree_root.to_path_buf(),
-            common_git_dir,
-            base,
-            dir_matchers: RefCell::new(HashMap::new()),
-        })
+        Self::from_repository_sources(worktree_root, common_git_dir, base)
     }
 
     /// Construct from the command's already-loaded effective config. This is
@@ -1657,25 +1658,101 @@ impl WorktreeAttributes {
     ) -> Result<Self> {
         let worktree_root = worktree_root.as_ref();
         let common_git_dir = common_git_dir_for_git_dir(git_dir.as_ref())?;
+        let base = AttributeMatcher::from_global_config(worktree_root, config);
+        Self::from_repository_sources(worktree_root, common_git_dir, base)
+    }
+
+    /// Construct from a fully resolved invocation snapshot.
+    ///
+    /// The caller has already applied `GIT_COMMON_DIR` / linked-worktree
+    /// `commondir` policy, so attribute setup must not probe that state again.
+    pub fn from_worktree_and_common_git_dir_with_config(
+        worktree_root: impl AsRef<Path>,
+        common_git_dir: impl Into<PathBuf>,
+        config: &GitConfig,
+    ) -> Result<Self> {
+        let worktree_root = worktree_root.as_ref();
+        let base = AttributeMatcher::from_global_config(worktree_root, config);
+        Self::from_repository_sources(worktree_root, common_git_dir.into(), base)
+    }
+
+    fn from_repository_sources(
+        worktree_root: &Path,
+        common_git_dir: PathBuf,
+        base: AttributeMatcher,
+    ) -> Result<Self> {
+        let root_frame = std::rc::Rc::new(WorktreeAttributeFrame {
+            parent: None,
+            matcher: read_worktree_attribute_frame(worktree_root, &[], base.ignore_case)?,
+        });
+        let info = read_info_attribute_frame(&common_git_dir, base.ignore_case);
+        let mut dir_frames = HashMap::new();
+        dir_frames.insert(Vec::new(), std::rc::Rc::clone(&root_frame));
         Ok(Self {
             worktree_root: worktree_root.to_path_buf(),
-            common_git_dir,
-            base: AttributeMatcher::from_global_config(worktree_root, config),
-            dir_matchers: RefCell::new(HashMap::new()),
+            base,
+            root_frame,
+            info,
+            dir_frames: RefCell::new(dir_frames),
         })
     }
 
-    fn checks_for_path(&self, path: &[u8]) -> Result<Vec<AttributeCheck>> {
-        let dir_key = attribute_parent_dir(path);
-        if let Some(matcher) = self.dir_matchers.borrow().get(&dir_key) {
-            return Ok(matcher.attributes_for_path(path, &filter_attribute_names(), false));
+    /// Return the persistent frame for `dir_key`, materializing only uncached
+    /// descendants. An empty matcher is deliberately cached when a directory
+    /// has no `.gitattributes`, avoiding repeated negative filesystem probes.
+    fn frame_for_dir(&self, dir_key: &[u8]) -> Result<std::rc::Rc<WorktreeAttributeFrame>> {
+        if dir_key.is_empty() {
+            return Ok(std::rc::Rc::clone(&self.root_frame));
         }
-        let mut matcher = self.base.clone();
-        fold_in_tree_attribute_frames(&self.worktree_root, path, &mut matcher)?;
-        fold_info_attributes(&self.common_git_dir, &mut matcher);
-        let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
-        self.dir_matchers.borrow_mut().insert(dir_key, matcher);
-        Ok(checks)
+        if let Some(frame) = self.dir_frames.borrow().get(dir_key) {
+            return Ok(std::rc::Rc::clone(frame));
+        }
+
+        let mut parent = std::rc::Rc::clone(&self.root_frame);
+        let mut prefix = Vec::new();
+        for part in dir_key.split(|byte| *byte == b'/') {
+            if !prefix.is_empty() {
+                prefix.push(b'/');
+            }
+            prefix.extend_from_slice(part);
+            if let Some(cached) = self.dir_frames.borrow().get(&prefix) {
+                parent = std::rc::Rc::clone(cached);
+                continue;
+            }
+            let dir = self
+                .worktree_root
+                .join(repo_path_to_os_path(prefix.as_slice())?);
+            let frame = std::rc::Rc::new(WorktreeAttributeFrame {
+                parent: Some(std::rc::Rc::clone(&parent)),
+                matcher: read_worktree_attribute_frame(&dir, &prefix, self.base.ignore_case)?,
+            });
+            self.dir_frames
+                .borrow_mut()
+                .insert(prefix.clone(), std::rc::Rc::clone(&frame));
+            parent = frame;
+        }
+        Ok(parent)
+    }
+
+    fn checks_for_path(&self, path: &[u8]) -> Result<Vec<AttributeCheck>> {
+        let leaf = self.frame_for_dir(attribute_parent_dir(path))?;
+        let mut in_tree = Vec::new();
+        let mut frame = Some(leaf);
+        while let Some(current) = frame {
+            frame = current.parent.as_ref().map(std::rc::Rc::clone);
+            in_tree.push(current);
+        }
+        in_tree.reverse();
+
+        let frames = std::iter::once(&self.base)
+            .chain(in_tree.iter().map(|frame| &frame.matcher))
+            .chain(std::iter::once(&self.info));
+        Ok(AttributeMatcher::attributes_for_path_in_frames(
+            frames,
+            path,
+            filter_attribute_names(),
+            false,
+        ))
     }
 
     /// Apply the clean conversion to `content` for `path`, reusing the cached
@@ -1714,10 +1791,32 @@ impl WorktreeAttributes {
     }
 }
 
-fn attribute_parent_dir(path: &[u8]) -> Vec<u8> {
+fn read_worktree_attribute_frame(
+    dir: &Path,
+    base: &[u8],
+    ignore_case: bool,
+) -> Result<AttributeMatcher> {
+    let mut matcher = AttributeMatcher {
+        ignore_case,
+        ..AttributeMatcher::default()
+    };
+    read_dir_attribute_patterns_for_base(dir, base, &mut matcher)?;
+    Ok(matcher)
+}
+
+fn read_info_attribute_frame(git_dir: &Path, ignore_case: bool) -> AttributeMatcher {
+    let mut matcher = AttributeMatcher {
+        ignore_case,
+        ..AttributeMatcher::default()
+    };
+    fold_info_attributes(git_dir, &mut matcher);
+    matcher
+}
+
+fn attribute_parent_dir(path: &[u8]) -> &[u8] {
     match path.iter().rposition(|byte| *byte == b'/') {
-        Some(index) => path[..index].to_vec(),
-        None => Vec::new(),
+        Some(index) => &path[..index],
+        None => &[],
     }
 }
 
@@ -1823,7 +1922,7 @@ impl TreeAttributes {
     ) -> Result<Vec<u8>> {
         let checks = self
             .matcher
-            .attributes_for_path(path, &filter_attribute_names(), false);
+            .attributes_for_path(path, filter_attribute_names(), false);
         apply_smudge_filter_with_attributes(config, &checks, path, content)
     }
 
@@ -2235,7 +2334,7 @@ pub(crate) fn filter_attribute_checks(
     let mut matcher = AttributeMatcher::from_global_sources(worktree_root, &git_dir);
     fold_in_tree_attribute_frames(worktree_root, path, &mut matcher)?;
     fold_info_attributes(&git_dir, &mut matcher);
-    Ok(matcher.attributes_for_path(path, &requested, false))
+    Ok(matcher.attributes_for_path(path, requested, false))
 }
 
 /// Compute filtering attributes for a checkout (blob -> worktree).
@@ -2292,7 +2391,7 @@ pub(crate) fn smudge_attribute_checks_from_index(
         b".git/info/attributes",
         false,
     );
-    Ok(matcher.attributes_for_path(path, &requested, false))
+    Ok(matcher.attributes_for_path(path, requested, false))
 }
 
 /// Fold the `.gitattributes` governing directory `base` (whose on-disk location
@@ -2354,17 +2453,20 @@ pub(crate) fn index_gitattributes_by_base(
     Ok(map)
 }
 
-pub(crate) fn filter_attribute_names() -> Vec<Vec<u8>> {
+pub(crate) fn filter_attribute_names() -> &'static [Vec<u8>] {
     // `crlf` is git's legacy alias for `text` (convert.c registers both); it is
     // consulted as a fallback when `text` is unspecified, so we must resolve it.
-    vec![
-        b"text".to_vec(),
-        b"crlf".to_vec(),
-        b"ident".to_vec(),
-        b"eol".to_vec(),
-        b"filter".to_vec(),
-        b"working-tree-encoding".to_vec(),
-    ]
+    static NAMES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        vec![
+            b"text".to_vec(),
+            b"crlf".to_vec(),
+            b"ident".to_vec(),
+            b"eol".to_vec(),
+            b"filter".to_vec(),
+            b"working-tree-encoding".to_vec(),
+        ]
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2726,4 +2828,242 @@ pub fn eol_attribute_checks(
     path: &[u8],
 ) -> Result<Vec<AttributeCheck>> {
     filter_attribute_checks(worktree_root.as_ref(), path)
+}
+
+#[cfg(test)]
+mod worktree_attribute_cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_root() -> PathBuf {
+        let suffix = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "sley-worktree-attribute-cache-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create temporary worktree");
+        root
+    }
+
+    fn initialize_worktree(root: &Path) {
+        fs::create_dir_all(root.join(".git").join("info")).expect("create git directory");
+    }
+
+    #[test]
+    fn caches_missing_ancestor_sources_for_sibling_directories() {
+        let root = temp_root();
+        initialize_worktree(&root);
+        fs::create_dir_all(root.join("a").join("first")).expect("create first directory");
+        fs::create_dir_all(root.join("a").join("second")).expect("create second directory");
+        fs::write(root.join(".gitattributes"), b"*.txt text\n").expect("write root attributes");
+
+        let config = GitConfig::default();
+        let attributes = WorktreeAttributes::from_worktree_root(&root).expect("create cache");
+        assert_eq!(
+            attributes
+                .apply_clean_filter(&config, b"a/first/file.txt", b"one\r\n")
+                .expect("filter first path"),
+            b"one\n"
+        );
+
+        // `a/.gitattributes` was absent during the first lookup. The cached
+        // empty frame must be shared by the sibling lookup rather than probing
+        // and incorporating a mid-command filesystem change.
+        fs::write(root.join("a").join(".gitattributes"), b"*.txt -text\n")
+            .expect("write late attributes");
+        assert_eq!(
+            attributes
+                .apply_clean_filter(&config, b"a/second/file.txt", b"two\r\n")
+                .expect("filter sibling path"),
+            b"two\n"
+        );
+
+        let fresh = WorktreeAttributes::from_worktree_root(&root).expect("create fresh cache");
+        assert_eq!(
+            fresh
+                .apply_clean_filter(&config, b"a/second/file.txt", b"two\r\n")
+                .expect("filter with fresh cache"),
+            b"two\r\n"
+        );
+        fs::remove_dir_all(root).expect("remove temporary worktree");
+    }
+
+    #[test]
+    fn explicit_unspecified_state_crosses_frame_boundaries() {
+        let root = temp_root();
+        initialize_worktree(&root);
+        fs::create_dir_all(root.join("a")).expect("create child directory");
+        fs::write(root.join(".gitattributes"), b"*.txt text\n").expect("write root attributes");
+        fs::write(root.join("a").join(".gitattributes"), b"*.txt !text\n")
+            .expect("write child attributes");
+
+        let attributes = WorktreeAttributes::from_worktree_root(&root).expect("create cache");
+        assert_eq!(
+            attributes
+                .apply_clean_filter(&GitConfig::default(), b"a/file.txt", b"line\r\n")
+                .expect("filter child path"),
+            b"line\r\n",
+            "!text in a child frame must clear the lower-precedence root state"
+        );
+        fs::remove_dir_all(root).expect("remove temporary worktree");
+    }
+
+    #[test]
+    fn child_macro_redefinitions_are_ignored_but_root_macros_still_expand() {
+        let root = temp_root();
+        initialize_worktree(&root);
+        fs::create_dir_all(root.join("a")).expect("create child directory");
+        fs::write(
+            root.join(".gitattributes"),
+            b"[attr]normalized text eol=lf\n*.txt -text\n",
+        )
+        .expect("write root macro");
+        fs::write(
+            root.join("a").join(".gitattributes"),
+            b"[attr]normalized -text\n*.txt normalized\n",
+        )
+        .expect("redefine and use root macro in child");
+
+        let attributes = WorktreeAttributes::from_worktree_root(&root).expect("create cache");
+        assert_eq!(
+            attributes
+                .apply_clean_filter(&GitConfig::default(), b"a/file.txt", b"line\r\n")
+                .expect("filter macro-governed path"),
+            b"line\n"
+        );
+        fs::remove_dir_all(root).expect("remove temporary worktree");
+    }
+
+    #[test]
+    fn builtin_binary_macro_unsets_text_by_default() {
+        let root = temp_root();
+        initialize_worktree(&root);
+        fs::write(root.join(".gitattributes"), b"*.txt binary\n").expect("write binary attribute");
+
+        let requested = [
+            b"binary".as_slice(),
+            b"diff".as_slice(),
+            b"merge".as_slice(),
+            b"text".as_slice(),
+        ]
+        .map(<[u8]>::to_vec)
+        .to_vec();
+        let flat = AttributeMatcher::from_worktree_root(&root).expect("create flat matcher");
+        assert_eq!(
+            flat.attributes_for_path(b"file.txt", &requested, false),
+            vec![
+                AttributeCheck {
+                    attribute: b"binary".to_vec(),
+                    state: Some(AttributeState::Set),
+                },
+                AttributeCheck {
+                    attribute: b"diff".to_vec(),
+                    state: Some(AttributeState::Unset),
+                },
+                AttributeCheck {
+                    attribute: b"merge".to_vec(),
+                    state: Some(AttributeState::Unset),
+                },
+                AttributeCheck {
+                    attribute: b"text".to_vec(),
+                    state: Some(AttributeState::Unset),
+                },
+            ]
+        );
+        let attributes = WorktreeAttributes::from_worktree_root(&root).expect("create cache");
+        let checks = attributes
+            .checks_for_path(b"file.txt")
+            .expect("resolve binary macro");
+        assert_eq!(
+            checks
+                .iter()
+                .find(|check| check.attribute == b"text")
+                .and_then(|check| check.state.as_ref()),
+            Some(&AttributeState::Unset)
+        );
+        fs::remove_dir_all(root).expect("remove temporary worktree");
+    }
+
+    #[test]
+    fn info_definition_overrides_builtin_binary_for_root_patterns() {
+        let root = temp_root();
+        initialize_worktree(&root);
+        fs::write(root.join(".gitattributes"), b"*.txt binary\n")
+            .expect("write root binary pattern");
+        fs::write(
+            root.join(".git").join("info").join("attributes"),
+            b"[attr]binary text\n",
+        )
+        .expect("override binary macro in info attributes");
+
+        let requested = [
+            b"binary".as_slice(),
+            b"diff".as_slice(),
+            b"merge".as_slice(),
+            b"text".as_slice(),
+        ]
+        .map(<[u8]>::to_vec)
+        .to_vec();
+        let flat = AttributeMatcher::from_worktree_root(&root).expect("create flat matcher");
+        assert_eq!(
+            flat.attributes_for_path(b"file.txt", &requested, false),
+            vec![
+                AttributeCheck {
+                    attribute: b"binary".to_vec(),
+                    state: Some(AttributeState::Set),
+                },
+                AttributeCheck {
+                    attribute: b"diff".to_vec(),
+                    state: None,
+                },
+                AttributeCheck {
+                    attribute: b"merge".to_vec(),
+                    state: None,
+                },
+                AttributeCheck {
+                    attribute: b"text".to_vec(),
+                    state: Some(AttributeState::Set),
+                },
+            ]
+        );
+        let attributes = WorktreeAttributes::from_worktree_root(&root).expect("create cache");
+        assert_eq!(
+            attributes
+                .apply_clean_filter(&GitConfig::default(), b"file.txt", b"line\r\n")
+                .expect("filter info-overridden binary path"),
+            b"line\n"
+        );
+        fs::remove_dir_all(root).expect("remove temporary worktree");
+    }
+
+    #[test]
+    fn common_info_attributes_remain_highest_precedence() {
+        let root = temp_root();
+        let common = root.join("common.git");
+        let git_dir = common.join("worktrees").join("linked");
+        fs::create_dir_all(common.join("info")).expect("create common info directory");
+        fs::create_dir_all(&git_dir).expect("create linked git directory");
+        fs::create_dir_all(root.join("worktree").join("a")).expect("create linked worktree");
+        fs::write(git_dir.join("commondir"), b"../..\n").expect("write commondir");
+        fs::write(
+            root.join("worktree").join(".gitattributes"),
+            b"*.txt -text\n",
+        )
+        .expect("write worktree attributes");
+        fs::write(common.join("info").join("attributes"), b"a/*.txt text\n")
+            .expect("write common info attributes");
+
+        let attributes =
+            WorktreeAttributes::from_worktree_and_git_dir(root.join("worktree"), &git_dir)
+                .expect("create linked-worktree cache");
+        assert_eq!(
+            attributes
+                .apply_clean_filter(&GitConfig::default(), b"a/file.txt", b"line\r\n")
+                .expect("filter linked-worktree path"),
+            b"line\n"
+        );
+        fs::remove_dir_all(root).expect("remove temporary worktree");
+    }
 }

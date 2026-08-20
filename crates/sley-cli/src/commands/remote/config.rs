@@ -21,11 +21,27 @@ pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
 /// [`read_repo_config_on_disk`] so inherited settings are never persisted.
 pub(crate) fn read_effective_repo_config(git_dir: &Path, cwd: &Path) -> Result<GitConfig> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let branch = repo_current_branch_name(git_dir);
+    read_effective_repo_config_resolved(git_dir, &common_git_dir, branch, cwd)
+}
+
+/// Read the invocation config for an already-resolved repository layout.
+///
+/// Multi-file commands keep the common directory and current branch in their
+/// invocation repository snapshot. Accepting both here avoids re-reading the
+/// linked-worktree `commondir` and `HEAD` merely to construct the same include
+/// context again.
+pub(crate) fn read_effective_repo_config_resolved(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    branch: Option<String>,
+    cwd: &Path,
+) -> Result<GitConfig> {
     let context = sley_config::ConfigIncludeContext::new(
         Some(sley_config::git_dir_for_include_context(git_dir)),
-        repo_current_branch_name(git_dir),
+        branch,
     );
-    let mut config = sley_config::load_effective_config(&common_git_dir, &context)?;
+    let mut config = sley_config::load_effective_config(common_git_dir, &context)?;
     if config
         .get_bool("extensions", None, "worktreeconfig")
         .unwrap_or(false)
@@ -44,6 +60,58 @@ pub(crate) fn read_effective_repo_config(git_dir: &Path, cwd: &Path) -> Result<G
     sley_config::remotes::augment_with_legacy_remote_files(&mut config, git_dir);
     sley_core::activate_precompose_unicode(config.get_bool("core", None, "precomposeunicode"));
     Ok(config)
+}
+
+/// Load the effective command config together with physical setup config and
+/// the repository's physical object format.
+///
+/// `extensions.objectFormat` is repository-format metadata: a global or `-c`
+/// value must not change the format of an existing object database. Keep that
+/// value sourced from `<common-dir>/config` while all behavioral config uses
+/// the full effective stack. Setup-sensitive values such as `core.bare` and
+/// `core.worktree` likewise come only from the common config (plus the physical
+/// per-worktree config when enabled), because injected/global values do not
+/// redefine an existing repository's layout.
+pub(crate) fn read_effective_repo_snapshot_resolved(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    branch: Option<String>,
+    cwd: &Path,
+) -> Result<(GitConfig, GitConfig, ObjectFormat)> {
+    let mut setup_config =
+        GitConfig::read_optional(common_git_dir.join("config"))?.unwrap_or_default();
+    let format = setup_config.repository_object_format()?;
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(sley_config::git_dir_for_include_context(git_dir)),
+        branch,
+    );
+    // Build the behavioral stack around the already-parsed physical config so
+    // repository bootstrap opens `<common>/config` only once. Includes are
+    // still expanded from that parsed value in their original position.
+    let mut config = sley_config::load_pre_dispatch_config(None, &context)?;
+    let local = setup_config.resolve_includes(common_git_dir, &context)?;
+    config.sections.extend(local.sections);
+
+    if setup_config
+        .get_bool("extensions", None, "worktreeconfig")
+        .unwrap_or(false)
+    {
+        let worktree_path = git_dir.join("config.worktree");
+        if let Some(worktree) = GitConfig::read_optional(&worktree_path)? {
+            let effective_worktree = worktree.resolve_includes(git_dir, &context)?;
+            config.sections.extend(effective_worktree.sections);
+            setup_config.sections.extend(worktree.sections);
+        }
+    }
+    let parameters = injected_config_parameters()?;
+    sley_config::append_injected_config_sections_with_includes(
+        &mut config,
+        &parameters,
+        &context,
+        cwd,
+    )?;
+    sley_config::remotes::augment_with_legacy_remote_files(&mut config, git_dir);
+    Ok((config, setup_config, format))
 }
 
 /// The repository's on-disk `config` file alone, with NO command-line `-c` /

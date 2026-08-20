@@ -123,6 +123,23 @@ impl GitConfig {
         Self::parse(&fs::read(path)?)
     }
 
+    /// Read an optional config file without hiding real failures.
+    ///
+    /// A genuinely absent path returns `Ok(None)`. Permission errors, other
+    /// I/O failures, and malformed config all propagate; callers must not treat
+    /// those conditions as an empty configuration.
+    pub fn read_optional(path: impl AsRef<Path>) -> Result<Option<Self>> {
+        let path = path.as_ref();
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        Self::parse(&bytes)
+            .map(Some)
+            .map_err(|err| annotate_config_parse_path(err, path))
+    }
+
     /// Return the last value set for `section[.subsection].key`, or `None` if the
     /// key is unset.
     ///

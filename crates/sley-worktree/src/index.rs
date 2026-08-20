@@ -1600,7 +1600,7 @@ pub(crate) fn update_index_paths_impl(
                     // matcher instead of rebuilding it (and re-walking the tree)
                     // for this path.
                     let checks =
-                        matcher.attributes_for_path(&git_path, &requested_filter_attrs, false);
+                        matcher.attributes_for_path(&git_path, requested_filter_attrs, false);
                     apply_clean_filter_cow_inner(
                         config, &checks, &git_path, &body, conv_flags, index_blob, true, false,
                     )?

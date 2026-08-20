@@ -210,7 +210,19 @@ fn reapply_global_options(
         nested.lazy_fetch,
         nested.pathspec_flags,
     );
-    Ok(nested.args.to_vec())
+    let mut args = nested.args.to_vec();
+    match cli_session.repository_snapshot() {
+        Ok(_) => {
+            if args.len() > 1 {
+                sley_core::precompose_argv_if_needed(&mut args[1..]);
+            }
+        }
+        Err(GitError::NotFound(_)) => {
+            // Snapshot selection already disabled precomposition.
+        }
+        Err(err) => return Err(crate::report_config_setup_error(err)),
+    }
+    Ok(args)
 }
 
 /// Print git's `alias loop detected` diagnostic for the accumulated expansion

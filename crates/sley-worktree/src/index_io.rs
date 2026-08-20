@@ -1002,7 +1002,7 @@ pub(crate) fn worktree_entries_with_submodule_dirt(
         format,
         config: &config,
         matcher: &mut attr_matcher,
-        requested: &attr_requested,
+        requested: attr_requested,
         stat_cache,
         known_tracked_paths: tracked_paths,
         tracked_paths,
@@ -1038,7 +1038,7 @@ pub(crate) fn status_worktree_entries_with_submodule_dirt(
         format,
         config: &config,
         matcher: &mut attr_matcher,
-        requested: &attr_requested,
+        requested: attr_requested,
         stat_cache: Some(stat_cache),
         known_tracked_paths,
         tracked_paths,
@@ -1519,7 +1519,7 @@ pub(crate) fn tracked_only_clean_filter<'a>(
     clean_filter.get_or_insert_with(|| TrackedOnlyCleanFilter {
         config: sley_config::read_repo_config(git_dir, None).unwrap_or_default(),
         matcher: AttributeMatcher::from_worktree_base(worktree_root),
-        requested: filter_attribute_names(),
+        requested: filter_attribute_names().to_vec(),
         attribute_dirs: BTreeSet::new(),
     })
 }
@@ -1532,7 +1532,7 @@ pub(crate) fn tracked_only_clean_filter_with_config<'a>(
     clean_filter.get_or_insert_with(|| TrackedOnlyCleanFilter {
         config: config.clone(),
         matcher: AttributeMatcher::from_worktree_base(worktree_root),
-        requested: filter_attribute_names(),
+        requested: filter_attribute_names().to_vec(),
         attribute_dirs: BTreeSet::new(),
     })
 }

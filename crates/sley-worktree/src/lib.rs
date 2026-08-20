@@ -1999,7 +1999,7 @@ mod tests {
                 Some(line) => {
                     let mut matcher = AttributeMatcher::default();
                     read_attribute_patterns_from_bytes(line, &mut matcher, &[], b".gitattributes");
-                    matcher.attributes_for_path(b"f.txt", &filter_attribute_names(), false)
+                    matcher.attributes_for_path(b"f.txt", filter_attribute_names(), false)
                 }
                 None => Vec::new(),
             };
@@ -2169,7 +2169,7 @@ mod tests {
         .expect("test operation should succeed");
 
         let path = b"src/nested/file.txt";
-        let full = standard_attributes_for_path(&root, path, &filter_attribute_names(), false)
+        let full = standard_attributes_for_path(&root, path, filter_attribute_names(), false)
             .expect("test operation should succeed");
         assert_eq!(
             filter_attribute_checks(&root, path).expect("attribute checks should load"),
@@ -2295,7 +2295,7 @@ mod tests {
             &[],
             b".gitattributes",
         );
-        let checks = matcher.attributes_for_path(b"test.utf16", &filter_attribute_names(), false);
+        let checks = matcher.attributes_for_path(b"test.utf16", filter_attribute_names(), false);
 
         let restored = apply_smudge_filter_with_attributes(&config, &checks, b"test.utf16", b"A\n")
             .expect("smudge must encode UTF-16");
@@ -2315,7 +2315,7 @@ mod tests {
             &[],
             b".gitattributes",
         );
-        let checks = matcher.attributes_for_path(b"eol.utf32", &filter_attribute_names(), false);
+        let checks = matcher.attributes_for_path(b"eol.utf32", filter_attribute_names(), false);
 
         let restored =
             apply_smudge_filter_with_attributes(&config, &checks, b"eol.utf32", b"one\ntwo\n")
@@ -2336,7 +2336,7 @@ mod tests {
             b".gitattributes",
         );
         let checks =
-            matcher.attributes_for_path(b"roundtrip.shift", &filter_attribute_names(), false);
+            matcher.attributes_for_path(b"roundtrip.shift", filter_attribute_names(), false);
         let (shift_jis, _, had_errors) = encoding_rs::SHIFT_JIS.encode("hallo\n");
         assert!(!had_errors);
 
@@ -2362,7 +2362,7 @@ mod tests {
             b".gitattributes",
         );
         let checks =
-            matcher.attributes_for_path(b"nonsense.utf16", &filter_attribute_names(), false);
+            matcher.attributes_for_path(b"nonsense.utf16", filter_attribute_names(), false);
 
         let err = apply_clean_filter_cow_inner(
             &config,
