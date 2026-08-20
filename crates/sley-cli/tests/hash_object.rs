@@ -441,12 +441,12 @@ fn hash_object_stdin_paths_parent_dir_matches_upstream_git() {
         let args = ["hash-object", "--stdin-paths"];
         let stdin = b"dir/../file.txt\n";
         let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, stdin);
-        let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, stdin);
-        assert_same_output(actual, expected, &args);
         assert!(
             expected.status.success(),
             "oracle git should hash dir/../file.txt"
         );
+        let actual = run_output_with_stdin(sley_testkit::sley_bin!(), &root, &args, stdin);
+        assert_same_output(actual, expected, &args);
     };
     let _ = fs::remove_dir_all(&root);
 }
