@@ -1899,6 +1899,15 @@ case "$parity_platform" in
         ;;
 esac
 
+# The predecessor correctness gate required all 891 curated scripts. Floor
+# gating may replace 100% parity as the acceptance policy, but it must never
+# reduce that full-run coverage surface.
+readonly MIN_FULL_FLOOR_SCRIPTS=891
+if (( ${#FLOOR[@]} < MIN_FULL_FLOOR_SCRIPTS )); then
+    echo "FAIL: floor catalog has ${#FLOOR[@]} scripts; expected at least $MIN_FULL_FLOOR_SCRIPTS" >&2
+    exit 1
+fi
+
 # Open issues waive a measured genuine regression without banking it into
 # FLOOR.  Each waiver has its own minimum so a second loss in the same script
 # still fails.  Waivers are deliberately Linux-scoped because that is the lane

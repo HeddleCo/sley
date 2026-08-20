@@ -693,7 +693,7 @@ mod tests {
         let second_root = root.join("second");
         Repository::init(&first_root).expect("initialize first repository");
         let second = Repository::init(&second_root).expect("initialize second repository");
-        let mut session = session(first_root.clone(), None);
+        let mut session = session(first_root, None);
 
         let first = session.repository_snapshot().expect("first snapshot");
         merge_global_overrides(

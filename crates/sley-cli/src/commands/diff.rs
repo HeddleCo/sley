@@ -2222,13 +2222,17 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
     };
     let entries = apply_diff_pathspec(entries, &pathspec);
     let entries = if let Some(needle) = pickaxe.as_deref() {
-        let worktree_clean_attributes = if use_worktree_new {
-            worktree_root
-                .as_deref()
-                .map(sley_worktree::WorktreeAttributes::from_worktree_root)
-                .transpose()?
-        } else {
-            None
+        let worktree_clean_attributes = match (
+            use_worktree_new,
+            worktree_root.as_deref(),
+            repo_config.as_ref(),
+        ) {
+            (true, Some(root), Some(config)) => Some(
+                sley_worktree::WorktreeAttributes::from_worktree_and_git_dir_with_config(
+                    root, &git_dir, config,
+                )?,
+            ),
+            _ => None,
         };
         let worktree_clean = match (repo_config.as_ref(), worktree_clean_attributes.as_ref()) {
             (Some(config), Some(attributes)) => {
@@ -2270,13 +2274,17 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         relative_lookup_entries = lookups;
         entries
     };
-    let worktree_clean_attributes = if use_worktree_new || use_worktree_old {
-        worktree_root
-            .as_deref()
-            .map(sley_worktree::WorktreeAttributes::from_worktree_root)
-            .transpose()?
-    } else {
-        None
+    let worktree_clean_attributes = match (
+        use_worktree_new || use_worktree_old,
+        worktree_root.as_deref(),
+        repo_config.as_ref(),
+    ) {
+        (true, Some(root), Some(config)) => Some(
+            sley_worktree::WorktreeAttributes::from_worktree_and_git_dir_with_config(
+                root, &git_dir, config,
+            )?,
+        ),
+        _ => None,
     };
     let worktree_clean = match (repo_config.as_ref(), worktree_clean_attributes.as_ref()) {
         (Some(config), Some(attributes)) => Some(DiffWorktreeCleanContext { config, attributes }),

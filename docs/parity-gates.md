@@ -33,7 +33,9 @@ input still runs the stricter 100% oracle-applicable correctness check.
 The checked-in catalog is the measured macOS baseline. Linux applies only its
 measured environment-specific overrides and waivers. Platform corrections must
 be measured in that lane; they must never be copied from another platform just
-to turn a cell green.
+to turn a cell green. The checker also refuses a full floor catalog smaller
+than the predecessor gate's 891-script surface, so changing acceptance from
+100% parity to regression floors cannot silently narrow matrix coverage.
 
 Windows remains in the matrix and now builds past the Unix-only `OwnedFd`
 service boundary, but no successful Windows parity summary is retained in the

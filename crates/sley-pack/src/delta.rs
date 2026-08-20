@@ -394,12 +394,14 @@ pub(crate) fn plan_streaming_window_deltas(
             ) {
                 continue;
             }
-            // Prefer smaller deltas. Equal-sized candidates retain the first
-            // match, which is the most recent window entry and preserves Git's
-            // chained-delta locality for successively extended blobs.
+            // Prefer smaller deltas; for equal size prefer shallower chains
+            // (git try_delta: "Prefer only shallower same-sized deltas").
             let better = match best_delta.as_ref() {
                 None => true,
                 Some(current) if delta.len() < current.len() => true,
+                Some(current) if delta.len() == current.len() && base_depth < best_base_depth => {
+                    true
+                }
                 _ => false,
             };
             if better {
@@ -449,7 +451,7 @@ pub(crate) fn plan_streaming_window_deltas(
             let better = match best_delta.as_ref() {
                 None => true,
                 Some(current) if delta.len() < current.len() => true,
-                Some(current) if delta.len() == current.len() && 1 < best_base_depth + 1 => true,
+                Some(current) if delta.len() == current.len() && best_base_depth > 0 => true,
                 _ => false,
             };
             if better {
@@ -656,6 +658,11 @@ pub(crate) fn plan_pack_deltas(
             let better = match best_delta.as_ref() {
                 None => true,
                 Some(current) if delta.len() < current.len() => true,
+                Some(current)
+                    if delta.len() == current.len() && depth[base_idx] < best_base_depth =>
+                {
+                    true
+                }
                 _ => false,
             };
             if better {
@@ -696,7 +703,7 @@ pub(crate) fn plan_pack_deltas(
             let better = match best_delta.as_ref() {
                 None => true,
                 Some(current) if delta.len() < current.len() => true,
-                Some(current) if delta.len() == current.len() && 1 < best_base_depth + 1 => true,
+                Some(current) if delta.len() == current.len() && best_base_depth > 0 => true,
                 _ => false,
             };
             if better {
@@ -890,11 +897,14 @@ pub(crate) fn write_delta_insert(out: &mut Vec<u8>, mut bytes: &[u8]) {
 #[cfg(test)]
 mod git_delta_acceptance_tests {
     use super::{
-        PlannedBase, delta_is_acceptable, delta_is_acceptable_with_depth, plan_pack_deltas,
+        PlannedBase, StreamingPlannedBase, delta_is_acceptable, delta_is_acceptable_with_depth,
+        plan_pack_deltas, plan_streaming_window_deltas,
     };
     use crate::PackWriteOptions;
     use sley_core::{ObjectFormat, ObjectId};
     use sley_object::{EncodedObject, ObjectType};
+    use std::collections::VecDeque;
+    use std::sync::Arc;
 
     #[test]
     fn first_candidate_uses_git_half_target_minus_oid_budget() {
@@ -930,7 +940,7 @@ mod git_delta_acceptance_tests {
     }
 
     #[test]
-    fn equal_sized_delta_keeps_the_most_recent_base_and_forms_a_chain() {
+    fn equal_sized_delta_prefers_the_shallower_base_in_both_planners() {
         let base = (0..100_000)
             .map(|index| ((index * 31) % 251) as u8)
             .collect::<Vec<_>>();
@@ -962,8 +972,8 @@ mod git_delta_acceptance_tests {
             .expect("valid oid"),
         ];
 
-        let (plan, order) =
-            plan_pack_deltas(&object_refs, &ids, &PackWriteOptions::new()).expect("plan deltas");
+        let options = PackWriteOptions::new();
+        let (plan, order) = plan_pack_deltas(&object_refs, &ids, &options).expect("plan deltas");
 
         assert_eq!(order, vec![2, 1, 0]);
         assert!(matches!(
@@ -972,7 +982,20 @@ mod git_delta_acceptance_tests {
         ));
         assert!(matches!(
             plan[0].base,
-            PlannedBase::InPack { base_idx: 1, .. }
+            PlannedBase::InPack { base_idx: 2, .. }
+        ));
+
+        let streaming_objects = objects.into_iter().map(Arc::new).collect::<Vec<_>>();
+        let (streaming_plan, streaming_order) =
+            plan_streaming_window_deltas(&streaming_objects, &ids, &VecDeque::new(), &options);
+        assert_eq!(streaming_order, vec![2, 1, 0]);
+        assert!(matches!(
+            streaming_plan[1].base,
+            StreamingPlannedBase::Current { base_idx: 2, .. }
+        ));
+        assert!(matches!(
+            streaming_plan[0].base,
+            StreamingPlannedBase::Current { base_idx: 2, .. }
         ));
     }
 }

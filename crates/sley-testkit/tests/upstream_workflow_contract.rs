@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const WORKFLOW: &str = include_str!("../../../.github/workflows/upstream-parity.yml");
 const MATRIX_WORKFLOW: &str = include_str!("../../../.github/workflows/upstream-parity-matrix.yml");
 const PR_SCRIPTS: &str = include_str!("../../../.github/workflows/parity-pr-scripts.txt");
+const FLOOR_CHECKER: &str =
+    include_str!("../../../.github/workflows/scripts/check-parity-floors.sh");
 
 #[test]
 fn builds_all_native_cli_binaries() {
@@ -84,6 +86,21 @@ fn matrix_propagates_oracle_failures_and_gates_sley_on_floors() {
         !MATRIX_WORKFLOW.contains("continue-on-error"),
         "the floor gate must be able to fail each cell"
     );
+}
+
+#[test]
+fn full_floor_catalog_cannot_shrink_below_the_legacy_matrix_surface() {
+    let floor_count = FLOOR_CHECKER
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("[t") && line.contains("]="))
+        .count();
+
+    assert!(
+        floor_count >= 891,
+        "full floor catalog shrank from 891 scripts to {floor_count}"
+    );
+    assert!(FLOOR_CHECKER.contains("MIN_FULL_FLOOR_SCRIPTS=891"));
 }
 
 #[test]

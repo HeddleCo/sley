@@ -590,8 +590,9 @@ fn fetch_partial_clone_checkout_blobs(
     commit_oid: ObjectId,
     config: &GitConfig,
     accepted_promisors: &[sley_protocol::PromisorRemoteAdvertisement],
-    _credentials: &mut dyn CredentialProvider,
-    _cancel: DynCancelFlag<'_>,
+    #[cfg_attr(not(feature = "http"), allow(unused_variables))]
+    credentials: &mut dyn CredentialProvider,
+    #[cfg_attr(not(feature = "http"), allow(unused_variables))] cancel: DynCancelFlag<'_>,
     #[cfg(feature = "http")] http_client: Option<&dyn HttpClient>,
 ) -> Result<()> {
     if request.options.filter.is_none() && !request.options.filter_auto {
@@ -653,8 +654,8 @@ fn fetch_partial_clone_checkout_blobs(
             commit_oid,
             config,
             remote,
-            _credentials,
-            _cancel,
+            credentials,
+            cancel,
             http_client,
         ),
         // SSH/git:// partial clones are gated out by the CLI (the in-process
