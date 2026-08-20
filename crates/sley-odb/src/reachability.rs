@@ -4048,7 +4048,7 @@ fn load_incremental_midx_bitmap(
         let Ok(midx) = MultiPackIndex::parse(&bytes, format) else {
             return Ok(None);
         };
-        let mut positions: Vec<usize> = match &midx.reverse_index {
+        let positions: Vec<usize> = match &midx.reverse_index {
             Some(reverse) => reverse.iter().map(|position| *position as usize).collect(),
             None => {
                 let mut positions: Vec<usize> = (0..midx.objects.len()).collect();
@@ -4059,7 +4059,7 @@ fn load_incremental_midx_bitmap(
                 positions
             }
         };
-        for position in positions.drain(..) {
+        for position in positions {
             let Some(entry) = midx.objects.get(position) else {
                 return Ok(None);
             };

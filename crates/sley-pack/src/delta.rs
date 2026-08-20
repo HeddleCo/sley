@@ -105,6 +105,9 @@ impl<'a> DeltaIndex<'a> {
     }
 
     /// Generate a delta that reconstructs `target` from this index's base.
+    // The two additions address independent coordinate spaces in the base and
+    // target. Keeping them paired is the core of the match-extension loop.
+    #[allow(clippy::suspicious_operation_groupings)]
     pub(crate) fn delta(&self, target: &[u8]) -> Option<Vec<u8>> {
         if !self.has_shared_anchor(target) {
             return None;
@@ -391,16 +394,12 @@ pub(crate) fn plan_streaming_window_deltas(
             ) {
                 continue;
             }
-            // Prefer smaller deltas; for equal size prefer shallower chains
-            // (git try_delta: "Prefer only shallower same-sized deltas").
+            // Prefer smaller deltas. Equal-sized candidates retain the first
+            // match, which is the most recent window entry and preserves Git's
+            // chained-delta locality for successively extended blobs.
             let better = match best_delta.as_ref() {
                 None => true,
                 Some(current) if delta.len() < current.len() => true,
-                Some(current)
-                    if delta.len() == current.len() && base_depth + 1 < best_base_depth + 1 =>
-                {
-                    true
-                }
                 _ => false,
             };
             if better {
@@ -657,12 +656,6 @@ pub(crate) fn plan_pack_deltas(
             let better = match best_delta.as_ref() {
                 None => true,
                 Some(current) if delta.len() < current.len() => true,
-                Some(current)
-                    if delta.len() == current.len()
-                        && depth[base_idx] + 1 < best_base_depth + 1 =>
-                {
-                    true
-                }
                 _ => false,
             };
             if better {
@@ -784,7 +777,7 @@ pub(crate) fn plan_pack_deltas(
 /// so this matches git's initial `try_delta` budget. Prefer
 /// [`delta_is_acceptable_with_depth`] when replacing an existing delta or
 /// considering a non-zero base depth.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn delta_is_acceptable(
     delta: &[u8],
     target_len: usize,
@@ -896,7 +889,12 @@ pub(crate) fn write_delta_insert(out: &mut Vec<u8>, mut bytes: &[u8]) {
 
 #[cfg(test)]
 mod git_delta_acceptance_tests {
-    use super::{delta_is_acceptable, delta_is_acceptable_with_depth};
+    use super::{
+        PlannedBase, delta_is_acceptable, delta_is_acceptable_with_depth, plan_pack_deltas,
+    };
+    use crate::PackWriteOptions;
+    use sley_core::{ObjectFormat, ObjectId};
+    use sley_object::{EncodedObject, ObjectType};
 
     #[test]
     fn first_candidate_uses_git_half_target_minus_oid_budget() {
@@ -928,6 +926,53 @@ mod git_delta_acceptance_tests {
         // Same-depth base keeps the full current budget.
         assert!(delta_is_acceptable_with_depth(
             &[1; 60], 200, 200, 20, 0, current, 50
+        ));
+    }
+
+    #[test]
+    fn equal_sized_delta_keeps_the_most_recent_base_and_forms_a_chain() {
+        let base = (0..100_000)
+            .map(|index| ((index * 31) % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut delta_one = base.clone();
+        delta_one.extend_from_slice(b"trailing data\n");
+        let mut delta_two = delta_one.clone();
+        delta_two.extend_from_slice(b"trailing data\n");
+        let objects = [
+            EncodedObject::new(ObjectType::Blob, base),
+            EncodedObject::new(ObjectType::Blob, delta_one),
+            EncodedObject::new(ObjectType::Blob, delta_two),
+        ];
+        let object_refs = objects.iter().collect::<Vec<_>>();
+        let ids = [
+            ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "0000000000000000000000000000000000000001",
+            )
+            .expect("valid oid"),
+            ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "0000000000000000000000000000000000000002",
+            )
+            .expect("valid oid"),
+            ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "0000000000000000000000000000000000000003",
+            )
+            .expect("valid oid"),
+        ];
+
+        let (plan, order) =
+            plan_pack_deltas(&object_refs, &ids, &PackWriteOptions::new()).expect("plan deltas");
+
+        assert_eq!(order, vec![2, 1, 0]);
+        assert!(matches!(
+            plan[1].base,
+            PlannedBase::InPack { base_idx: 2, .. }
+        ));
+        assert!(matches!(
+            plan[0].base,
+            PlannedBase::InPack { base_idx: 1, .. }
         ));
     }
 }

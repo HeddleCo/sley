@@ -874,12 +874,9 @@ mod tests {
     fn read_object_at_matches_full_parse_for_ofs_delta_pack() {
         let (base, changed) = similar_blob_objects();
         let options = delta_pack_options(true);
-        let written = PackFile::write_packed_with_options(
-            &[base, changed.clone()],
-            ObjectFormat::Sha1,
-            &options,
-        )
-        .expect("test operation should succeed");
+        let written =
+            PackFile::write_packed_with_options(&[base, changed], ObjectFormat::Sha1, &options)
+                .expect("test operation should succeed");
         // Ensure the pack genuinely contains an ofs-delta (else the test is vacuous).
         let mut second = written.entries[1].offset as usize;
         assert_eq!(
@@ -985,12 +982,9 @@ mod tests {
     fn read_object_at_matches_full_parse_for_ref_delta_pack() {
         let (base, changed) = similar_blob_objects();
         let options = delta_pack_options(false);
-        let written = PackFile::write_packed_with_options(
-            &[base, changed.clone()],
-            ObjectFormat::Sha1,
-            &options,
-        )
-        .expect("test operation should succeed");
+        let written =
+            PackFile::write_packed_with_options(&[base, changed], ObjectFormat::Sha1, &options)
+                .expect("test operation should succeed");
         let parsed = PackFile::parse_sha1(&written.pack).expect("test operation should succeed");
         let by_oid: HashMap<ObjectId, Arc<EncodedObject>> = parsed
             .entries
@@ -1686,7 +1680,7 @@ mod tests {
         let index = PackIndex::parse(&written.index, ObjectFormat::Sha1)
             .expect("test operation should succeed");
         let view = PackIndexViewData::parse_trusted_without_checksum(
-            Arc::from(written.index.clone().into_boxed_slice()),
+            Arc::from(written.index.into_boxed_slice()),
             ObjectFormat::Sha1,
         )
         .expect("test operation should succeed");
@@ -2453,7 +2447,7 @@ mod tests {
             None,
         );
 
-        let mut truncated = bitmap.clone();
+        let mut truncated = bitmap;
         truncated.truncate(truncated.len() - ObjectFormat::Sha1.raw_len() - 1);
         refresh_trailing_checksum(ObjectFormat::Sha1, &mut truncated);
         assert!(PackBitmapIndex::parse(&truncated, ObjectFormat::Sha1, 2).is_err());

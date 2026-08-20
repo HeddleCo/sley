@@ -1,12 +1,17 @@
 #![allow(
-    dead_code,
-    unused_assignments,
-    unused_mut,
-    unused_variables,
-    unused_imports,
-    // W72 (partial): `clippy::unwrap_used` removed; `expect_used` module-scoped.
-    // Style lints (`clippy::all`) burn down post-integration — see plan §12.
-    clippy::all
+    // Git-compatible command handlers deliberately keep their option/state
+    // inputs visible; bundling them would obscure the upstream call shape.
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    // Complete literals retain `..Default::default()` so additions to shared
+    // option structs do not silently become mandatory in every CLI renderer.
+    clippy::needless_update,
+    // Generic I/O/iterator adapters keep explicit conversions to make the
+    // surrounding Result error type clear even when inference makes them no-ops.
+    clippy::useless_conversion,
+    // Large command modules keep focused unit tests next to the private helper
+    // they exercise instead of forcing all tests to the end of the file.
+    clippy::items_after_test_module
 )]
 
 use sley::plumbing::sley_config::{ConfigBoolOrInt, ConfigEntry, ConfigSection};
@@ -16,8 +21,7 @@ use sley::plumbing::sley_formats::{
     CommitGraphWriteEntry, InitOptions, RefStorageFormat, RepositoryBootstrap,
 };
 use sley::plumbing::sley_object::{
-    Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntries, TreeEntry, TreeEntryRef,
-    tree_entry_object_type,
+    Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntries, TreeEntry, tree_entry_object_type,
 };
 use sley::plumbing::sley_odb::{
     FileObjectDatabase, LooseObjectIntegrity, ObjectPrefixResolution, ObjectReader, ObjectWriter,
@@ -36,18 +40,11 @@ use sley::{
     BString, GitConfig, GitError, Index, IndexEntry, ObjectFormat, ObjectId, RefPrecondition,
     ReferenceTarget as RefTarget, Result,
 };
-use sley_pathspec::{
-    LsFilesPathFilter, PathspecAttributeCheck, PathspecAttributeState,
-    parse_normalized_pathspec_element, pathspec_attrs_match_with, pathspec_filters_have_include,
-    pathspec_filters_match, pathspec_filters_match_with,
-};
 use sley_protocol::{
-    FetchHeadRecord, FetchRefUpdate, ProtocolVersion, ReceivePackCommand, ReceivePackPushRequest,
-    RefAdvertisement, RefAdvertisementSet, UploadPackFeatures, parse_refspec, read_fetch_head,
-    read_receive_pack_push_options, read_receive_pack_request, read_ref_advertisement_set,
-    read_upload_pack_negotiation_request, read_upload_pack_request, refspec_map_source,
-    write_receive_pack_report_status, write_ref_advertisement_set,
-    write_upload_pack_packfile_response, write_upload_pack_raw_packfile_response,
+    FetchHeadRecord, ProtocolVersion, ReceivePackCommand, RefAdvertisement, RefAdvertisementSet,
+    UploadPackFeatures, parse_refspec, read_fetch_head, read_receive_pack_push_options,
+    read_receive_pack_request, read_ref_advertisement_set, read_upload_pack_negotiation_request,
+    read_upload_pack_request, refspec_map_source, write_ref_advertisement_set,
 };
 use sley_transport::{RemoteTransport, RemoteUrl, parse_remote_url};
 use std::borrow::Cow;
@@ -55,11 +52,11 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{self, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 mod checkout_reset;
 mod cli_misc;
@@ -95,8 +92,8 @@ mod tree_print;
 
 pub(crate) use sley::plumbing::sley_rev::revlist::*;
 pub(crate) use sley::plumbing::{
-    sley_config, sley_core, sley_diff_merge, sley_formats, sley_index, sley_object, sley_odb,
-    sley_pack, sley_pretty, sley_refs, sley_remote, sley_rev, sley_worktree,
+    sley_config, sley_core, sley_diff_merge, sley_index, sley_object, sley_odb, sley_pack,
+    sley_pretty, sley_refs, sley_remote, sley_rev, sley_worktree,
 };
 pub(crate) use sley_options::validators::*;
 pub(crate) use sley_ref_filter::*;
@@ -119,7 +116,7 @@ pub(crate) use diff_render::{
     DiffEntryStatRenderOptions, DiffEntryStatSource, DiffLineStats, DiffPathspec,
     DiffRenderOptions, DiffStatEntryData, DiffStatOptions, DiffWorktreeCleanContext,
     WordDiffRequest, apply_diff_max_depth, apply_diff_order_file, apply_diff_pathspec,
-    apply_submodule_ignore_filter, collect_diff_entry_blob_oids, collect_diff_stat_entries,
+    apply_submodule_ignore_filter, collect_diff_stat_entries,
     collect_diff_stat_entries_with_worktree_clean, collect_dirty_submodules,
     compile_ignore_matching_regexes, diff_entry_new_content, diff_entry_old_content,
     diff_entry_produces_output, diff_line_stats, diff_rename_limit_requires_integer_error,
@@ -128,11 +125,11 @@ pub(crate) use diff_render::{
     prefetch_diff_entry_blobs, prefetch_promisor_objects, prefetch_via_configured_upload_pack,
     promisor_remote_names, read_blob, read_object_maybe_prefetch_promisor, render_diff_entries,
     render_tree_to_tree_patch, repo_path_to_path, reverse_diff_entries, reverse_diff_entry,
-    submodule_diff_config, submodule_diff_config_with_config, submodule_git_dir_for_path,
-    validate_diff_rename_limit, write_diff_dirstat, write_diff_numstat_materialized_entry,
-    write_diff_patch_entry, write_diff_raw_entry, write_diff_shortstat_materialized,
-    write_diff_stat_materialized, write_diff_stat_materialized_with_widths,
-    write_diff_stat_summary_line, write_diff_summary_entry,
+    submodule_diff_config_with_config, submodule_git_dir_for_path, validate_diff_rename_limit,
+    write_diff_dirstat, write_diff_numstat_materialized_entry, write_diff_patch_entry,
+    write_diff_raw_entry, write_diff_shortstat_materialized, write_diff_stat_materialized,
+    write_diff_stat_materialized_with_widths, write_diff_stat_summary_line,
+    write_diff_summary_entry,
 };
 
 pub(crate) use discovery::{
@@ -146,11 +143,10 @@ pub(crate) use log_cli::{
     SimpleLogRegexMode, commit_author_identity, commit_identity_mailmapped,
     compile_log_message_grep_matcher, log_author_filters_match, log_author_requires_value_error,
     log_committer_filters_match, log_committer_requires_value_error, log_date_mode,
-    log_date_requires_value_error, log_days_from_civil, log_decoration_map, log_grep_filters_match,
+    log_date_requires_value_error, log_decoration_map, log_grep_filters_match,
     log_grep_pattern_kind_from_config, log_grep_requires_value_error,
     log_option_requires_value_error, log_option_takes_no_value_error, log_parse_age,
-    log_parse_date_cutoff, log_parse_date_ymd, log_parse_diff_algorithm, log_parse_time_hms,
-    log_parse_timezone_offset_seconds, log_pickaxe_all_objfind_conflict_error,
+    log_parse_date_cutoff, log_parse_diff_algorithm, log_pickaxe_all_objfind_conflict_error,
     log_pickaxe_empty_error, log_pickaxe_g_regex_conflict_error, log_pickaxe_kinds_conflict_error,
     log_pickaxe_requires_value_error, parse_log_filter_patterns,
     parse_log_filter_patterns_with_diagnostic_verbosity, print_log_decorations, print_log_format,
@@ -163,24 +159,21 @@ pub(crate) use repo_helpers::{
 
 pub(crate) use sley::plumbing::sley_pretty::{
     CompiledLogFormat, FormatToken, LogDescribeLookup, LogFormatContext, LogFormatDialect,
-    LogSignatureLookup, LogSignatureView, MailmapLookup, StashFormatContext, append_log_oid,
-    commit_author_for_commit_encoding, commit_body, commit_encoding, commit_encoding_config,
-    commit_encoding_header_from_config, commit_identity_name_email,
-    commit_message_for_commit_encoding, commit_message_for_output, commit_message_has_invalid_utf8,
-    commit_message_has_nul, commit_message_lines, commit_object_message_and_optional_encoding,
-    commit_subject, commit_subject_bytes, emit_compiled_log_format,
-    emit_compiled_log_format_limited_commit, emit_compiled_log_format_metadata,
-    emit_compiled_log_format_metadata_with_message, emit_compiled_stash_format, emit_log_one_token,
+    MailmapLookup, StashFormatContext, append_log_oid, commit_author_for_commit_encoding,
+    commit_body, commit_encoding, commit_encoding_config, commit_encoding_header_from_config,
+    commit_identity_name_email, commit_message_for_commit_encoding, commit_message_for_output,
+    commit_message_has_invalid_utf8, commit_message_has_nul, commit_message_lines,
+    commit_object_message_and_optional_encoding, commit_subject, commit_subject_bytes,
+    emit_compiled_log_format, emit_compiled_log_format_limited_commit,
+    emit_compiled_log_format_metadata, emit_compiled_stash_format, emit_log_one_token,
     encoding_for_name, encoding_is_none, encoding_is_utf8, format_log_abbrev_oid,
-    format_log_commit_header_oid, format_log_oid, format_subst_for_commit,
-    format_trailers_from_commit, git_color_name_to_ansi, git_color_spec_to_ansi,
-    log_email_local_part, log_output_encoding, log_pick_utf8, log_reencode_message, log_rewrap,
-    log_sanitized_subject, presets, try_git_color_spec_to_ansi,
+    format_log_commit_header_oid, format_log_oid, git_color_name_to_ansi, git_color_spec_to_ansi,
+    log_output_encoding, log_reencode_message, log_rewrap, presets, try_git_color_spec_to_ansi,
 };
 pub(crate) use sley::plumbing::sley_rev::diff_options::{
     DiffFilter, DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleIgnoreMode,
     diff_stat_count_option, diff_stat_parse_width_option, parse_diff_filter,
-    parse_diff_rename_limit, parse_similarity_threshold, parse_submodule_ignore_mode,
+    parse_similarity_threshold, parse_submodule_ignore_mode,
 };
 
 pub(crate) use commands::args::{GitArgCursor, long_option_value};
@@ -215,8 +208,7 @@ pub(crate) use cli_misc::{
     current_unix_seconds, delete_symbolic_ref, pack_refs_peeled_oid, parse_abbrev,
     read_pathspecs_from_file, read_repository_index, resolve_add_update_actions,
     resolve_ref_to_oid, set_config_value, show_ref_filter_matches,
-    submodule_worktree_has_untracked_entries, symbolic_ref_cannot_delete, symbolic_ref_delete_head,
-    write_check_attr_state,
+    submodule_worktree_has_untracked_entries, write_check_attr_state,
 };
 pub(crate) use init_config::{
     DEFAULT_BRANCH_NAME_ADVICE, clone_init_default_branch_config,
@@ -226,13 +218,12 @@ pub(crate) use init_config::{
 };
 pub(crate) use ls_files_pathspec::{
     LsFilesPathspec, index_entry_stage, normalize_absolute_cli_pathspec, normalize_lexical_path,
-    path_component_count, relative_path_bytes, relative_path_from_absolute,
-    relative_path_from_absolute_components,
+    path_component_count, relative_path_from_absolute, relative_path_from_absolute_components,
 };
 pub(crate) use reflog_parse::{
-    parse_reflog_count, parse_reflog_expire_date, parse_reflog_expire_time, parse_reflog_integer,
+    parse_reflog_count, parse_reflog_expire_date, parse_reflog_expire_time,
     parse_reflog_max_parent_count, parse_reflog_min_parent_count, parse_reflog_skip_count,
-    reflog_invalid_integer_error, reflog_reference_name,
+    reflog_reference_name,
 };
 pub(crate) use refname_pattern::{
     refname_pattern_matches, refname_pattern_matches_case, short_oid,

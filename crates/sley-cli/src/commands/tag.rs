@@ -1,7 +1,7 @@
 //! `git tag` (create/list/delete/verify) and tag-message helpers.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use sley::plumbing::{sley_core, sley_refs, sley_rev};
+use sley::plumbing::{sley_refs, sley_rev};
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
 use std::borrow::Cow;
@@ -96,7 +96,7 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
     let mut cleanup_mode = TagCleanupMode::Strip;
     let mut empty_file_noop = false;
     let mut positional = Vec::new();
-    let mut iter = args.iter().peekable();
+    let mut iter = args.iter();
     // Short-flag bundles whose trailing flag takes a value (`-am`) are split into
     // separate tokens pushed back here, so the existing per-flag arms handle them.
     // Because a bundle's value flag is always its last token, value-taking arms
@@ -120,7 +120,7 @@ pub(crate) fn cmd_tag(cli_session: &crate::session::CliSession, args: &[String])
         let arg = &owned;
         match arg.as_str() {
             "--" => {
-                positional.extend(pending.drain(..));
+                positional.extend(std::mem::take(&mut pending));
                 positional.extend(iter.cloned());
                 break;
             }
@@ -1036,33 +1036,6 @@ fn tag_object_body(
         raw_body: None,
     }
     .write()
-}
-
-fn tag_signature_is_valid(format: ObjectFormat, body: &[u8]) -> Result<bool> {
-    let marker = b"-----BEGIN PGP SIGNATURE-----";
-    let signature_count = body
-        .windows(marker.len())
-        .filter(|window| *window == marker)
-        .count();
-    if signature_count > 1 {
-        return Ok(true);
-    }
-    let Some(start) = body
-        .windows(marker.len())
-        .position(|window| window == marker)
-    else {
-        return Ok(false);
-    };
-    let unsigned = &body[..start];
-    let signature = &body[start..];
-    let signature_text = String::from_utf8_lossy(signature);
-    let Some(line) = signature_text
-        .lines()
-        .find_map(|line| line.strip_prefix("sley-signature "))
-    else {
-        return Ok(true);
-    };
-    Ok(line == sley_core::digest_bytes(format, unsigned)?.to_hex())
 }
 
 fn write_tag_verify_format(format_spec: &str, tag: &Tag) -> Result<()> {

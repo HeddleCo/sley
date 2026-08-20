@@ -114,7 +114,6 @@ pub fn ls_remote(
     filter: &LsRemoteFilter,
     matches: &dyn Fn(&str) -> bool,
     config: Option<&GitConfig>,
-    #[cfg_attr(not(feature = "http"), allow(unused_variables))]
     credentials: &mut dyn CredentialProvider,
 ) -> Result<(Vec<LsRemoteRecord>, ObjectFormat)> {
     let outcome = ls_remote_with(
@@ -161,7 +160,7 @@ pub fn ls_remote_with_http_client(
 fn ls_remote_with_impl(
     request: LsRemoteRequest<'_>,
     matches: &dyn Fn(&str) -> bool,
-    credentials: &mut dyn CredentialProvider,
+    _credentials: &mut dyn CredentialProvider,
     #[cfg(feature = "http")] http_client: Option<&dyn HttpClient>,
 ) -> Result<LsRemoteOutcome> {
     let LsRemoteRequest {
@@ -179,7 +178,7 @@ fn ls_remote_with_impl(
             format,
             filter,
             matches,
-            credentials,
+            _credentials,
             config,
             http_client,
         ),

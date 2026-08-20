@@ -526,10 +526,6 @@ fn mv_git_path_bytes(path: &Path) -> Result<Vec<u8>> {
         .into_bytes())
 }
 
-fn normalize_absolute_path_lexically(path: &Path) -> PathBuf {
-    normalize_mv_absolute_path_lexically(path)
-}
-
 fn normalize_mv_absolute_path_lexically(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {

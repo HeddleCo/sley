@@ -16,7 +16,6 @@ use sley_pathspec::{Pathspec, normalized_revwalk_pathspec};
 enum SignMode {
     #[default]
     Abort,
-    Warn,
     WarnVerbatim,
     Verbatim,
     WarnStrip,
@@ -95,15 +94,9 @@ impl Default for FastExportOptions {
 }
 
 #[derive(Clone)]
-enum PendingRefTarget {
-    Commit(ObjectId),
-    Tag(ObjectId),
-}
-
-#[derive(Clone)]
 struct PendingRef {
     name: String,
-    target: PendingRefTarget,
+    target: ObjectId,
 }
 
 struct ExportedCommitMessage {
@@ -187,10 +180,10 @@ pub(crate) fn cmd_fast_export(
     let mut import_mark_start = 0u64;
     if let Some(path) = &options.import_marks {
         import_mark_start = import_marks_into(&db, format, path, &mut imported_commit_marks)?;
-    } else if let Some(path) = &options.import_marks_if_exists {
-        if path.exists() {
-            import_mark_start = import_marks_into(&db, format, path, &mut imported_commit_marks)?;
-        }
+    } else if let Some(path) = &options.import_marks_if_exists
+        && path.exists()
+    {
+        import_mark_start = import_marks_into(&db, format, path, &mut imported_commit_marks)?;
     }
 
     let imported_commits: HashSet<ObjectId> = imported_commit_marks.keys().copied().collect();
@@ -250,10 +243,10 @@ pub(crate) fn cmd_fast_export(
     }
     exporter.emit_deletes()?;
 
-    if let Some(path) = &exporter.options.export_marks {
-        if exporter.next_mark != import_mark_start {
-            export_marks(path, &exporter.commit_marks, exporter.format)?;
-        }
+    if let Some(path) = &exporter.options.export_marks
+        && exporter.next_mark != import_mark_start
+    {
+        export_marks(path, &exporter.commit_marks, exporter.format)?;
     }
 
     if exporter.options.use_done_feature {
@@ -301,7 +294,7 @@ impl FastExporter {
                     self.note_revision_source(tip.oid, ref_name.clone());
                     self.pending_refs.push(PendingRef {
                         name: ref_name,
-                        target: PendingRefTarget::Commit(tip.oid),
+                        target: tip.oid,
                     });
                 }
                 ObjectType::Tag => {
@@ -552,9 +545,9 @@ impl FastExporter {
         }
 
         let first_commit_on_ref = self.initialized_refs.insert(ref_name.clone());
-        if first_commit_on_ref && self.commit_ref_needs_reset(&ref_name)? {
-            writeln!(self.out, "reset {ref_name}")?;
-        } else if record.parents.is_empty() {
+        if (first_commit_on_ref && self.commit_ref_needs_reset(&ref_name)?)
+            || record.parents.is_empty()
+        {
             writeln!(self.out, "reset {ref_name}")?;
         }
 
@@ -629,7 +622,7 @@ impl FastExporter {
                 );
                 return Err(GitError::Exit(128));
             }
-            SignMode::Warn | SignMode::WarnVerbatim => {
+            SignMode::WarnVerbatim => {
                 eprintln!(
                     "warning: exporting {} signature(s) for commit {oid}",
                     signatures.len()
@@ -705,7 +698,7 @@ impl FastExporter {
         changed_paths: &mut HashSet<Vec<u8>>,
     ) -> Result<()> {
         let mut sorted = changes.to_vec();
-        sorted.sort_by(|left, right| depth_first_cmp(left, right));
+        sorted.sort_by(depth_first_cmp);
 
         for entry in sorted {
             match entry.status {
@@ -798,40 +791,33 @@ impl FastExporter {
     }
 
     fn emit_pending_ref(&mut self, pending: &PendingRef) -> Result<()> {
-        match &pending.target {
-            PendingRefTarget::Commit(commit) => {
-                let rewritten = self.rewrite_commit_for_ref(*commit)?;
-                let Some(commit) = rewritten else {
-                    write!(
-                        self.out,
-                        "reset {}\nfrom {}\n\n",
-                        pending.name,
-                        ObjectId::null(self.format).to_hex()
-                    )?;
-                    return Ok(());
-                };
-                if let Some(mark) = self.commit_marks.get(&commit) {
-                    write!(self.out, "reset {}\nfrom :{mark}\n\n", pending.name)?;
-                    self.show_progress();
-                } else if self.options.reference_excluded_parents {
-                    write!(
-                        self.out,
-                        "reset {}\nfrom {}\n\n",
-                        pending.name,
-                        commit.to_hex()
-                    )?;
-                } else {
-                    write!(
-                        self.out,
-                        "reset {}\nfrom {}\n\n",
-                        pending.name,
-                        ObjectId::null(self.format).to_hex()
-                    )?;
-                }
-            }
-            PendingRefTarget::Tag(tag_oid) => {
-                self.emit_tag_ref(&pending.name, *tag_oid)?;
-            }
+        let rewritten = self.rewrite_commit_for_ref(pending.target)?;
+        let Some(commit) = rewritten else {
+            write!(
+                self.out,
+                "reset {}\nfrom {}\n\n",
+                pending.name,
+                ObjectId::null(self.format).to_hex()
+            )?;
+            return Ok(());
+        };
+        if let Some(mark) = self.commit_marks.get(&commit) {
+            write!(self.out, "reset {}\nfrom :{mark}\n\n", pending.name)?;
+            self.show_progress();
+        } else if self.options.reference_excluded_parents {
+            write!(
+                self.out,
+                "reset {}\nfrom {}\n\n",
+                pending.name,
+                commit.to_hex()
+            )?;
+        } else {
+            write!(
+                self.out,
+                "reset {}\nfrom {}\n\n",
+                pending.name,
+                ObjectId::null(self.format).to_hex()
+            )?;
         }
         Ok(())
     }
@@ -1048,7 +1034,7 @@ impl FastExporter {
                 eprintln!("fatal: encountered signed tag; use --signed-tags=<mode> to handle it");
                 Err(GitError::Exit(128))
             }
-            SignMode::Warn | SignMode::WarnVerbatim if sig_start < message.len() => {
+            SignMode::WarnVerbatim if sig_start < message.len() => {
                 eprintln!("warning: exporting signed tag");
                 Ok(message.to_vec())
             }
@@ -1132,7 +1118,7 @@ impl FastExporter {
             return;
         };
         self.progress_counter += 1;
-        if self.progress_counter % step == 0 {
+        if self.progress_counter.is_multiple_of(step) {
             let _ = writeln!(self.out, "progress {} objects", self.progress_counter);
         }
     }
@@ -1412,7 +1398,7 @@ fn import_marks_from_str(
     Ok(last)
 }
 
-fn export_marks(path: &Path, marks: &HashMap<ObjectId, u64>, format: ObjectFormat) -> Result<()> {
+fn export_marks(path: &Path, marks: &HashMap<ObjectId, u64>, _format: ObjectFormat) -> Result<()> {
     let mut entries: Vec<_> = marks.iter().map(|(oid, mark)| (*mark, *oid)).collect();
     entries.sort_by_key(|(mark, _)| *mark);
     let mut file = fs::File::create(path).map_err(|err| {

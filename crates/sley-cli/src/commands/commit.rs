@@ -924,14 +924,12 @@ pub(crate) fn cmd_commit(
         eprintln!("fatal: No paths with --include/--only does not make sense.");
         return Err(GitError::Exit(128));
     }
-    if !pathspec_args.is_empty() {
-        if all {
-            eprintln!(
-                "fatal: paths '{} ...' with -a does not make sense",
-                pathspec_args[0]
-            );
-            return Err(GitError::Exit(128));
-        }
+    if !pathspec_args.is_empty() && all {
+        eprintln!(
+            "fatal: paths '{} ...' with -a does not make sense",
+            pathspec_args[0]
+        );
+        return Err(GitError::Exit(128));
     }
     if unified_context.is_some() && !interactive && !patch {
         eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
@@ -987,11 +985,7 @@ pub(crate) fn cmd_commit(
         None
     };
     if interactive && !patch {
-        if let Err(err) =
-            commands::add_interactive::cmd_add_interactive(cli_session, &pathspec_args)
-        {
-            return Err(err);
-        }
+        commands::add_interactive::cmd_add_interactive(cli_session, &pathspec_args)?;
         refresh_commit_selection_cache_tree(cli_session)?;
     }
     if patch {
@@ -1275,7 +1269,7 @@ pub(crate) fn cmd_commit(
             {
                 template_file
                     .as_deref()
-                    .map(|path| read_commit_template_file(path))
+                    .map(read_commit_template_file)
                     .transpose()
                     .ok()
                     .flatten()
@@ -1392,7 +1386,7 @@ pub(crate) fn cmd_commit(
     // Resolve the cleanup mode now that `use_editor` is known. An explicit
     // `--cleanup`/`--no-cleanup` wins; otherwise `commit.cleanup` config; absent
     // both, git's editor-dependent default (ALL with an editor, SPACE without).
-    let cleanup_config = cleanup_arg.clone().or_else(|| {
+    let cleanup_config = cleanup_arg.or_else(|| {
         read_repo_config(&git_dir)
             .ok()
             .and_then(|c| c.get("commit", None, "cleanup").map(str::to_string))
@@ -1472,9 +1466,8 @@ pub(crate) fn cmd_commit(
         PrepareCommitMsgSource::Commit("HEAD")
     } else if in_rebase && (in_cherry_pick || in_revert) && git_dir.join("MERGE_MSG").is_file() {
         PrepareCommitMsgSource::Message
-    } else if in_rebase && git_dir.join("MERGE_MSG").is_file() {
-        PrepareCommitMsgSource::Merge
-    } else if in_merge
+    } else if (in_rebase && git_dir.join("MERGE_MSG").is_file())
+        || in_merge
         || ((in_cherry_pick || in_revert) && git_dir.join("MERGE_MSG").is_file())
         || (git_dir.join("SQUASH_MSG").is_file() && git_dir.join("MERGE_MSG").is_file())
     {
@@ -1510,7 +1503,7 @@ pub(crate) fn cmd_commit(
             &git_dir,
             "commit-msg",
             commands::hooks::HookRun {
-                args: vec![editmsg_arg.clone()],
+                args: vec![editmsg_arg],
                 env: author_hook_env,
                 force_serial: true,
                 ..commands::hooks::HookRun::default()
@@ -1659,10 +1652,10 @@ pub(crate) fn cmd_commit(
             amend,
             no_post_rewrite,
         );
-        if partial_result.is_ok() {
-            if let Some(guard) = interactive_index_guard.as_mut() {
-                guard.keep = true;
-            }
+        if partial_result.is_ok()
+            && let Some(guard) = interactive_index_guard.as_mut()
+        {
+            guard.keep = true;
         }
         return partial_result;
     }
@@ -1874,7 +1867,7 @@ fn print_commit_summary(
     let subject = commit_subject(message);
 
     let mut out = io::stdout();
-    write!(out, "[{head}{root} {abbrev}] {subject}\n")?;
+    writeln!(out, "[{head}{root} {abbrev}] {subject}")?;
 
     // `Author:` line when the author identity (name <email>) differs from the
     // committer's — git's `strbuf_cmp(&author_ident, &committer_ident)`.
@@ -3857,7 +3850,7 @@ fn render_commit_template_status(
     let base_ref = if amend { "HEAD^" } else { "HEAD" };
     let submodule_summary = status_submodule_summary(
         git_dir,
-        &worktree_root,
+        worktree_root,
         format,
         &config,
         base_ref,

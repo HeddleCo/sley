@@ -289,7 +289,7 @@ fn format_rev_text_input(
 }
 
 fn format_rev_text_substitute(
-    repo: &RepositoryContext,
+    _repo: &RepositoryContext,
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,

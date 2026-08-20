@@ -417,9 +417,9 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
     // `--sparse` is given. This guards every add flavor (regular, -u, -A, -N,
     // --refresh, --dry-run), so run it once up front before dispatching.
     reject_add_skip_worktree_paths(
-        &cwd,
-        &worktree_root,
-        &git_dir,
+        cwd,
+        worktree_root,
+        git_dir,
         format,
         &paths,
         sparse,
@@ -428,14 +428,14 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
     )?;
     // Must run before any early-return add path (intent-to-add, exact-tracked
     // fast path, etc.): `git -C unpopulated-sub add .` must die here.
-    let parsed_index = sley_worktree::read_repository_index(&git_dir, format)?;
-    die_in_unpopulated_submodule(&cwd, &worktree_root, parsed_index.as_ref())?;
-    die_on_pathspec_inside_submodule(&cwd, &worktree_root, parsed_index.as_ref(), &paths)?;
+    let parsed_index = sley_worktree::read_repository_index(git_dir, format)?;
+    die_in_unpopulated_submodule(cwd, worktree_root, parsed_index.as_ref())?;
+    die_on_pathspec_inside_submodule(cwd, worktree_root, parsed_index.as_ref(), &paths)?;
     if renormalize {
         let tracked_paths = resolve_add_renormalize_paths(
-            &cwd,
-            &worktree_root,
-            &git_dir,
+            cwd,
+            worktree_root,
+            git_dir,
             format,
             &paths,
             pathspec_magic,
@@ -445,12 +445,12 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
                 .into_iter()
                 .map(AddAction::Add)
                 .collect::<Vec<_>>();
-            print_add_actions(&worktree_root, &actions)?;
+            print_add_actions(worktree_root, &actions)?;
             return Ok(());
         }
         sley_worktree::renormalize_index_paths_filtered(
-            &worktree_root,
-            &git_dir,
+            worktree_root,
+            git_dir,
             format,
             &tracked_paths,
             &context.config,
@@ -460,9 +460,9 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
     }
     if refresh {
         refresh_index_after_add(
-            &cwd,
-            &worktree_root,
-            &git_dir,
+            cwd,
+            worktree_root,
+            git_dir,
             format,
             &paths,
             true,
@@ -471,14 +471,14 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         return Ok(());
     }
     if intent_to_add && !dry_run {
-        return add_intent_to_add(&cwd, &worktree_root, &git_dir, format, &paths);
+        return add_intent_to_add(cwd, worktree_root, git_dir, format, &paths);
     }
     if !update
         && !all
         && let Some(actions) = try_add_regular_exact_tracked_raw(
-            &cwd,
-            &worktree_root,
-            &git_dir,
+            cwd,
+            worktree_root,
+            git_dir,
             format,
             &paths,
             AddRegularOptions {
@@ -493,7 +493,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         )?
     {
         if verbose {
-            print_add_actions(&worktree_root, &actions)?;
+            print_add_actions(worktree_root, &actions)?;
         }
         return Ok(());
     }
@@ -519,8 +519,8 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
     let do_refresh = !dry_run && chmod.is_none();
     if update && !all && paths.is_empty() && !dry_run && chmod.is_none() {
         let actions = sley_worktree::add_update_all_tracked_filtered(
-            &worktree_root,
-            &git_dir,
+            worktree_root,
+            git_dir,
             format,
             &context.config,
         )?
@@ -543,23 +543,23 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         })
         .collect::<Result<Vec<_>>>()?;
         if verbose {
-            print_add_actions(&worktree_root, &actions)?;
+            print_add_actions(worktree_root, &actions)?;
         }
         return Ok(());
     }
     if update || all {
         let actions = resolve_add_update_actions(
-            &cwd,
-            &worktree_root,
-            &git_dir,
+            cwd,
+            worktree_root,
+            git_dir,
             format,
             paths,
             all,
             ignore_missing,
         )?;
         if dry_run {
-            print_add_actions(&worktree_root, &actions)?;
-            validate_add_chmod_dry_run(&worktree_root, &actions, chmod)?;
+            print_add_actions(worktree_root, &actions)?;
+            validate_add_chmod_dry_run(worktree_root, &actions, chmod)?;
             return Ok(());
         }
         let action_paths = actions
@@ -570,8 +570,8 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         let mut verbose_actions = actions;
         if !action_paths.is_empty() {
             let outcome = update_index_paths_filtered_for_add(
-                &worktree_root,
-                &git_dir,
+                worktree_root,
+                git_dir,
                 format,
                 &action_paths,
                 sley_worktree::UpdateIndexOptions {
@@ -593,16 +593,16 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
             }
             if outcome.had_errors {
                 if verbose {
-                    print_add_actions(&worktree_root, &verbose_actions)?;
+                    print_add_actions(worktree_root, &verbose_actions)?;
                 }
                 return Err(GitError::Exit(1));
             }
         }
         if do_refresh {
             refresh_index_after_add(
-                &cwd,
-                &worktree_root,
-                &git_dir,
+                cwd,
+                worktree_root,
+                git_dir,
                 format,
                 &refresh_paths,
                 false,
@@ -610,7 +610,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
             )?;
         }
         if verbose {
-            print_add_actions(&worktree_root, &verbose_actions)?;
+            print_add_actions(worktree_root, &verbose_actions)?;
         }
         return Ok(());
     }
@@ -620,9 +620,9 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         exact_tracked,
         ignored_paths,
     } = resolve_add_regular_actions(
-        &cwd,
-        &worktree_root,
-        &git_dir,
+        cwd,
+        worktree_root,
+        git_dir,
         format,
         paths,
         AddRegularOptions {
@@ -638,8 +638,8 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         pathspec_magic,
     )?;
     if dry_run {
-        print_add_actions(&worktree_root, &actions)?;
-        validate_add_chmod_dry_run(&worktree_root, &actions, chmod)?;
+        print_add_actions(worktree_root, &actions)?;
+        validate_add_chmod_dry_run(worktree_root, &actions, chmod)?;
         if !ignored_paths.is_empty() {
             print_add_ignored_paths(&context.config, &ignored_paths);
             return Err(GitError::Exit(1));
@@ -652,20 +652,20 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
                 GitError::Command("exact tracked add lost its parsed index".into())
             })?;
             sley_worktree::add_exact_tracked_path_with_index(
-                &worktree_root,
-                &git_dir,
+                worktree_root,
+                git_dir,
                 format,
                 index,
                 &exact.git_path,
             )?
             .into_iter()
-            .map(|action| add_update_tracked_action_to_add_action(&worktree_root, action))
+            .map(|action| add_update_tracked_action_to_add_action(worktree_root, action))
             .collect::<Result<Vec<_>>>()?
         } else {
             actions
         };
         if verbose {
-            print_add_actions(&worktree_root, &actions)?;
+            print_add_actions(worktree_root, &actions)?;
         }
         return Ok(());
     }
@@ -686,7 +686,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
                     .map(|entry| entry.path.as_bytes().to_vec())
                     .collect()
             } else {
-                sley_worktree::read_repository_index(&git_dir, format)?
+                sley_worktree::read_repository_index(git_dir, format)?
                     .map(|index| {
                         index
                             .entries
@@ -710,8 +710,8 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         };
         let outcome = if ignore_errors {
             update_index_paths_filtered_for_add(
-                &worktree_root,
-                &git_dir,
+                worktree_root,
+                git_dir,
                 format,
                 &action_paths,
                 update_options,
@@ -720,8 +720,8 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
             )?
         } else if let Some(index) = reusable_index.take() {
             sley_worktree::update_index_paths_filtered_with_index(
-                &worktree_root,
-                &git_dir,
+                worktree_root,
+                git_dir,
                 format,
                 index,
                 &action_paths,
@@ -730,12 +730,12 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
             )?;
             AddIndexUpdateOutcome {
                 had_errors: false,
-                succeeded: action_paths.clone(),
+                succeeded: action_paths,
             }
         } else {
             update_index_paths_filtered_for_add(
-                &worktree_root,
-                &git_dir,
+                worktree_root,
+                git_dir,
                 format,
                 &action_paths,
                 update_options,
@@ -751,27 +751,27 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         if warn_embedded {
             warn_on_embedded_repos(
                 &context.config,
-                &worktree_root,
+                worktree_root,
                 &verbose_actions,
                 &previously_tracked,
             )?;
         }
         if outcome.had_errors {
             if verbose {
-                print_add_actions(&worktree_root, &verbose_actions)?;
+                print_add_actions(worktree_root, &verbose_actions)?;
             }
             return Err(GitError::Exit(1));
         }
         // Reuse filtered list for the post-success verbose print below.
         if verbose {
-            print_add_actions(&worktree_root, &verbose_actions)?;
+            print_add_actions(worktree_root, &verbose_actions)?;
         }
-        if do_refresh && !add_refresh_is_redundant(&worktree_root, &refresh_paths, &verbose_actions)
+        if do_refresh && !add_refresh_is_redundant(worktree_root, &refresh_paths, &verbose_actions)
         {
             refresh_index_after_add(
-                &cwd,
-                &worktree_root,
-                &git_dir,
+                cwd,
+                worktree_root,
+                git_dir,
                 format,
                 &refresh_paths,
                 false,
@@ -785,11 +785,11 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         commands::hooks::run_post_index_change_hook(cli_session, false, false)?;
         return Ok(());
     }
-    if do_refresh && !add_refresh_is_redundant(&worktree_root, &refresh_paths, &actions) {
+    if do_refresh && !add_refresh_is_redundant(worktree_root, &refresh_paths, &actions) {
         refresh_index_after_add(
-            &cwd,
-            &worktree_root,
-            &git_dir,
+            cwd,
+            worktree_root,
+            git_dir,
             format,
             &refresh_paths,
             false,
@@ -797,7 +797,7 @@ pub(crate) fn cmd_add(cli_session: &crate::session::CliSession, args: &[String])
         )?;
     }
     if verbose {
-        print_add_actions(&worktree_root, &actions)?;
+        print_add_actions(worktree_root, &actions)?;
     }
     if !ignored_paths.is_empty() {
         print_add_ignored_paths(&context.config, &ignored_paths);
@@ -1562,7 +1562,7 @@ fn resolve_add_renormalize_paths(
             }
         }
     }
-    for spec in compiled.unmatched_includes() {
+    if let Some(spec) = compiled.unmatched_includes().next() {
         eprintln!("fatal: pathspec '{}' did not match any files", spec.display);
         return Err(GitError::Exit(128));
     }
@@ -1781,9 +1781,7 @@ fn resolve_add_regular_actions(
             continue;
         }
         if !compiled_pathspecs.have_include() {
-            for matched in &mut matched {
-                *matched = true;
-            }
+            matched.fill(true);
         } else {
             for idx in compiled_pathspecs.matched_include_indexes() {
                 matched[idx] = true;
@@ -1807,9 +1805,7 @@ fn resolve_add_regular_actions(
         let path_matches = compiled_pathspecs.matches(&path);
         if path_matches {
             if !compiled_pathspecs.have_include() {
-                for matched in &mut matched {
-                    *matched = true;
-                }
+                matched.fill(true);
             } else {
                 for idx in compiled_pathspecs.matched_include_indexes() {
                     matched[idx] = true;
@@ -1873,9 +1869,7 @@ fn resolve_add_regular_actions(
                 }
             }
             if !compiled_pathspecs.have_include() {
-                for matched in &mut matched {
-                    *matched = true;
-                }
+                matched.fill(true);
             } else {
                 for idx in compiled_pathspecs.matched_include_indexes() {
                     matched[idx] = true;

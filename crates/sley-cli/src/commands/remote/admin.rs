@@ -6,19 +6,11 @@ use super::config::{
     write_repo_config,
 };
 use super::fetch::cmd_fetch;
-use super::resolve::{local_remote_git_dir, ls_remote_git_dir};
-use crate::commands::config_cmd::{
-    ConfigKey, SimpleConfigRegex, config_set_value, parse_config_key,
-};
-use crate::remote::{
-    remote_config_values, resolve_remote_fetch_url, resolve_remote_push_url,
-    rewrite_url_with_config,
-};
+use super::resolve::local_remote_git_dir;
+use crate::commands::config_cmd::SimpleConfigRegex;
+use crate::remote::{remote_config_values, rewrite_url_with_config};
 use crate::*;
-use sley::plumbing::sley_odb::ObjectReader;
-use sley::plumbing::sley_remote::{FetchOptions, LsRemoteRecord};
 use std::path::{Path, PathBuf};
-use std::process::Command as Proc;
 
 pub(crate) struct RemoteCommandContext {
     session: crate::session::CliSession,

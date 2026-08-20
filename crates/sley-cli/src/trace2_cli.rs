@@ -72,9 +72,7 @@ fn trace2_dispatch_config(cli_session: &session::CliSession) -> Result<GitConfig
     let common_git_dir = git_dir
         .as_deref()
         .and_then(|git_dir| common_git_dir_for_git_dir(git_dir).ok());
-    let branch = git_dir
-        .as_deref()
-        .and_then(|git_dir| repo_current_branch_name(git_dir));
+    let branch = git_dir.as_deref().and_then(repo_current_branch_name);
     let context = crate::sley_config::ConfigIncludeContext::new(common_git_dir.clone(), branch);
     let mut config =
         crate::sley_config::load_pre_dispatch_config(common_git_dir.as_deref(), &context)?;

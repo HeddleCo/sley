@@ -5,12 +5,10 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use sley::plumbing::sley_object::{Commit, ObjectType};
-use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
+use sley::plumbing::sley_odb::ObjectReader;
 use sley::{GitError, ObjectFormat, Result};
 
 use crate::sley_rev;
-
-use crate::revision::resolve_revision;
 
 pub(crate) fn commit_message_requires_value_error() -> Result<()> {
     eprintln!("error: switch `m' requires a value");

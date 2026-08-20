@@ -215,21 +215,18 @@ pub(super) fn run_branch_general_list_options(
     options: BranchGeneralListOptions,
 ) -> Result<()> {
     let mut refs = branch_sorted_refs(git_dir, format, store, options.mode, options.sort)?;
-    if options.ignore_case {
-        match options.sort.unwrap_or(BranchSort::Refname(false)) {
-            BranchSort::Refname(descending) => {
-                refs.sort_by(|left, right| {
-                    let left_key = left.name.to_ascii_lowercase();
-                    let right_key = right.name.to_ascii_lowercase();
-                    left_key
-                        .cmp(&right_key)
-                        .then_with(|| left.name.cmp(&right.name))
-                });
-                if descending {
-                    refs.reverse();
-                }
-            }
-            _ => {}
+    if options.ignore_case
+        && let BranchSort::Refname(descending) = options.sort.unwrap_or(BranchSort::Refname(false))
+    {
+        refs.sort_by(|left, right| {
+            let left_key = left.name.to_ascii_lowercase();
+            let right_key = right.name.to_ascii_lowercase();
+            left_key
+                .cmp(&right_key)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        if descending {
+            refs.reverse();
         }
     }
     refs = branch_filter_refs_by_reachability(
@@ -478,7 +475,7 @@ pub(super) fn print_branch_list_points_at_matching(
 pub(super) fn branch_filter_refs_by_reachability(
     git_dir: &Path,
     format: ObjectFormat,
-    store: &FileRefStore,
+    _store: &FileRefStore,
     replace_objects: bool,
     refs: Vec<sley_refs::Ref>,
     filters: &BranchListFilters,
@@ -1796,7 +1793,7 @@ pub(super) fn detached_head_branch_line(store: &FileRefStore) -> Option<String> 
         }
     }
     Some(
-        detached_head_description(&store)
+        detached_head_description(store)
             .unwrap_or_else(|| format!("(HEAD detached at {})", format_log_abbrev_oid(&oid))),
     )
 }
@@ -2129,7 +2126,7 @@ pub(super) fn print_branch_columns(rows: &[String], style: BranchColumnStyle) ->
     let col_count = rows.len().div_ceil(row_count);
     let mut col_widths = vec![cell_width; col_count];
     if style == BranchColumnStyle::Dense {
-        for col in 0..col_count {
+        for (col, width) in col_widths.iter_mut().enumerate() {
             let mut col_len = 0usize;
             for row in 0..row_count {
                 let idx = col * row_count + row;
@@ -2137,7 +2134,7 @@ pub(super) fn print_branch_columns(rows: &[String], style: BranchColumnStyle) ->
                     col_len = col_len.max(value.len());
                 }
             }
-            col_widths[col] = col_len + 1;
+            *width = col_len + 1;
         }
     }
     for row in 0..row_count {

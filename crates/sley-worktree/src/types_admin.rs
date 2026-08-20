@@ -656,7 +656,7 @@ pub(crate) fn cached_repository_index_stat_probe(
             format,
             len,
             mtime,
-            probes: probes.clone(),
+            probes,
         });
     }
     Ok(probe)

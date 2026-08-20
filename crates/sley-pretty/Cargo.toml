@@ -16,7 +16,7 @@ sley-ref-filter.workspace = true
 sley-odb.workspace = true
 sley-object.workspace = true
 sley-config.workspace = true
-encoding_rs = "0.8"
+encoding_rs = "0.8.35"
 
 [lints]
 workspace = true

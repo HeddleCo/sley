@@ -844,9 +844,9 @@ mod tests {
 
     #[test]
     fn recursive_untracked_collapse_deduplicates_rows() {
-        let mut entries = vec![entry(b'?', b'?', b"dir/a"), entry(b'?', b'?', b"dir/b")];
+        let entries = vec![entry(b'?', b'?', b"dir/a"), entry(b'?', b'?', b"dir/b")];
         let mut collapsed = BTreeMap::new();
-        for mut row in entries.drain(..) {
+        for mut row in entries {
             row.path = b"dir/".to_vec();
             collapsed
                 .entry((row.index, row.worktree, row.path.clone()))

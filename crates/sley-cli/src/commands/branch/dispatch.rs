@@ -32,7 +32,7 @@ pub(crate) fn cmd_branch(cli_session: &crate::session::CliSession, args: &[Strin
     validate_autosetuprebase(&read_repo_config(git_dir)?)?;
     if let Some(option) = args
         .iter()
-        .find_map(|arg| matches!(arg.as_str(), "--no-remotes" | "--no-all").then_some(arg))
+        .find(|arg| matches!(arg.as_str(), "--no-remotes" | "--no-all"))
     {
         eprintln!(
             "error: unknown option `{}`",

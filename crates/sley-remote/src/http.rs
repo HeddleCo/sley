@@ -1281,7 +1281,7 @@ fn copy_packfile_uri_body(
     cancel: CancelFlag<'_>,
 ) -> Result<u64> {
     let mut reader = sley_core::CancellableRead::new(reader, cancel.as_ref());
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     let mut written = 0_u64;
     loop {
         let count = reader.read(&mut buffer)?;

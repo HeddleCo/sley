@@ -211,11 +211,13 @@ fn verify_one_commit(
 }
 
 /// The signature header keys git recognizes on a commit object.
+#[cfg(test)]
 const COMMIT_SIGNATURE_HEADERS: [&[u8]; 2] = [b"gpgsig", b"gpgsig-sha256"];
 
 /// Return true when the commit object body carries a signature header. Only the
 /// header block (everything before the first blank line) is examined, and only at
 /// the start of a (possibly continued) header line, matching git's parser.
+#[cfg(test)]
 fn commit_object_is_signed(body: &[u8]) -> bool {
     for line in commit_header_lines(body) {
         for key in COMMIT_SIGNATURE_HEADERS {
@@ -230,6 +232,7 @@ fn commit_object_is_signed(body: &[u8]) -> bool {
 /// Reconstruct the commit payload with its signature header removed, the way git
 /// presents a signed commit under `-v`. Folded continuation lines (those starting
 /// with a space) belonging to the signature header are dropped along with it.
+#[cfg(test)]
 fn commit_payload_without_signature(body: &[u8]) -> Vec<u8> {
     let Some(header_end) = header_block_end(body) else {
         // No header/message separator: nothing we can safely strip.
@@ -263,6 +266,7 @@ fn commit_payload_without_signature(body: &[u8]) -> Vec<u8> {
 
 /// Iterate the raw header lines (without trailing newlines) of a commit object,
 /// stopping at the blank line that separates headers from the message.
+#[cfg(test)]
 fn commit_header_lines(body: &[u8]) -> impl Iterator<Item = &[u8]> {
     let end = header_block_end(body).unwrap_or(body.len());
     body[..end]
@@ -272,6 +276,7 @@ fn commit_header_lines(body: &[u8]) -> impl Iterator<Item = &[u8]> {
 
 /// Byte offset just past the header/message separator (`"\n\n"`), or `None` when
 /// the object has no separator (a malformed commit).
+#[cfg(test)]
 fn header_block_end(body: &[u8]) -> Option<usize> {
     body.windows(2)
         .position(|window| window == b"\n\n")
@@ -280,10 +285,12 @@ fn header_block_end(body: &[u8]) -> Option<usize> {
 
 /// True when `line` is a header line whose key is exactly `key` (i.e. the key is
 /// followed by a space, as in `"gpgsig -----BEGIN..."`).
+#[cfg(test)]
 fn header_line_has_key(line: &[u8], key: &[u8]) -> bool {
     line.len() > key.len() && line.starts_with(key) && line[key.len()] == b' '
 }
 
+#[cfg(test)]
 fn strip_trailing_newline(line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\n").unwrap_or(line)
 }

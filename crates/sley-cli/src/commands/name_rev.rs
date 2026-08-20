@@ -875,9 +875,9 @@ fn subpath_matches(path: &str, filter: &str) -> Option<usize> {
         if wildmatch(filter, subpath) {
             return Some(offset);
         }
-        match subpath.find('/') {
-            Some(slash) => offset += slash + 1,
-            None => return None,
+        {
+            let slash = subpath.find('/')?;
+            offset += slash + 1
         }
     }
 }

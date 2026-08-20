@@ -585,21 +585,6 @@ pub(crate) fn cli_remote_git_dir_from(start: impl AsRef<Path>) -> Result<PathBuf
     discovery::resolve_git_dir_walk_only(start)
 }
 
-/// Convenience for commands that already have a loaded config snapshot.
-impl CliSession {
-    pub(crate) fn with_config<'a>(&'a self, config: &'a GitConfig) -> CliSessionView<'a> {
-        CliSessionView {
-            session: self,
-            config,
-        }
-    }
-}
-
-pub(crate) struct CliSessionView<'a> {
-    pub session: &'a CliSession,
-    pub config: &'a GitConfig,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

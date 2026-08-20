@@ -455,7 +455,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
             reset_result?;
         } else {
             sley_worktree::reset_index_and_worktree_to_commit_with_process_filter_metadata(
-                worktree_root.clone(),
+                worktree_root,
                 git_dir.clone(),
                 format,
                 &target_commit,

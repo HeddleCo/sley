@@ -35,10 +35,7 @@ fn main() {
         "SLEY_BENCH_PACK_REPO",
         &pack.repo_root.display().to_string(),
     );
-    export(
-        "SLEY_BENCH_PACK_SAMPLE_OID",
-        &pack.sample_oid.to_hex().to_string(),
-    );
+    export("SLEY_BENCH_PACK_SAMPLE_OID", &pack.sample_oid.to_hex());
     export(
         "SLEY_BENCH_PACK_BATCH_FILE",
         &batch_file.display().to_string(),

@@ -8,11 +8,6 @@ pub(crate) fn cli_usage_error(error: UsageError) -> GitError {
     GitError::Exit(error.exit_code())
 }
 
-pub(crate) fn cli_usage_error_with_code(error: UsageError, exit_code: i32) -> GitError {
-    eprint!("{}", error.render_stderr());
-    GitError::Exit(exit_code)
-}
-
 pub(crate) const fn opt_bool(
     short: Option<char>,
     long: Option<&'static str>,
@@ -64,7 +59,7 @@ pub(crate) fn last_tri_state_bool(parsed: &Parsed<'_>, long: &str) -> Option<boo
         .iter()
         .filter(|option| option.long == Some(long))
         .filter_map(option_bool)
-        .last()
+        .next_back()
 }
 
 pub(crate) fn count_force_occurrences(parsed: &Parsed<'_>) -> usize {

@@ -298,7 +298,7 @@ pub(crate) fn message_has_conforming_trailer_block(
         out_separator: config.out_separator,
         separators: config.separators.clone(),
         comment_prefix: config.comment_prefix.clone(),
-        conf_items: config.conf_items.clone(),
+        conf_items: config.conf_items,
         trailers: Vec::new(),
         files: Vec::new(),
     };
@@ -847,12 +847,12 @@ fn load_trailer_config(config: Option<&GitConfig>) -> TrailerConfig {
     cfg
 }
 
-/// The effective config (repo file + `-c`/env overlay) when inside a repository.
-/// `read_repo_config` already layers command-line `-c` / `GIT_CONFIG_*` overrides
-/// on top of the repo config file, so a single read gives us every `trailer.*`
-/// key including overrides. Best-effort; returns `None` outside a repository
-/// (git's compiled-in defaults then apply, matching real interpret-trailers which
-/// runs fine outside a repo).
+// The effective config (repo file + `-c`/env overlay) when inside a repository.
+// `read_repo_config` already layers command-line `-c` / `GIT_CONFIG_*` overrides
+// on top of the repo config file, so a single read gives us every `trailer.*`
+// key including overrides. Best-effort; returns `None` outside a repository
+// (git's compiled-in defaults then apply, matching real interpret-trailers which
+// runs fine outside a repo).
 // ---------------------------------------------------------------------------
 // Trailer model
 // ---------------------------------------------------------------------------
@@ -1503,7 +1503,7 @@ fn apply_arg(trailers: &mut Vec<Trailer>, arg: &ArgTrailer, out_sep: char) {
         // to start/end since there is no reference item.
         if matches!(arg.if_missing, IfMissing::Add) {
             let arg = resolve_command(arg, None, has_command);
-            let new = Trailer::token_item(arg.token.clone(), arg.value.clone(), out_sep);
+            let new = Trailer::token_item(arg.token.clone(), arg.value, out_sep);
             insert_relative(trailers, new, None, backwards);
         }
         return;
@@ -1515,7 +1515,7 @@ fn apply_arg(trailers: &mut Vec<Trailer>, arg: &ArgTrailer, out_sep: char) {
         // if-missing path: no same-token trailer exists.
         if matches!(arg.if_missing, IfMissing::Add) {
             let arg = resolve_command(arg, None, has_command);
-            let new = Trailer::token_item(arg.token.clone(), arg.value.clone(), out_sep);
+            let new = Trailer::token_item(arg.token.clone(), arg.value, out_sep);
             // on_tok is start_tok (head/tail); insert relative to it.
             insert_relative(trailers, new, Some(start_idx), backwards);
         }

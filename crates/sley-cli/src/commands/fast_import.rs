@@ -569,9 +569,7 @@ pub(crate) fn cmd_fast_import(
         } else if let Some(rest) = line_after(&line, b"option ") {
             features_allowed = false;
             handle_option(rest)?;
-        } else if line_after(&line, b"progress ").is_some() {
-            write_progress(&mut stdout, &line)?;
-        } else if line.as_slice() == b"progress" {
+        } else if line_after(&line, b"progress ").is_some() || line.as_slice() == b"progress" {
             write_progress(&mut stdout, &line)?;
         } else {
             return Err(GitError::Command(format!(
@@ -638,7 +636,7 @@ fn fast_import_output_for_cat_blob(fd: Option<i32>) -> Result<Box<dyn Write>> {
     };
     #[cfg(unix)]
     {
-        return Ok(Box::new(sley_procinfo::duplicate_fd(fd)?));
+        Ok(Box::new(sley_procinfo::duplicate_fd(fd)?))
     }
     #[cfg(not(unix))]
     {
@@ -2490,9 +2488,9 @@ fn handle_cat_blob_line(
 ) -> Result<()> {
     let oid = resolve_cat_blob_dataref(db, store, format, marks, ref_states, rest)?;
     let object = db.read_object(&oid)?;
-    write!(
+    writeln!(
         out,
-        "{} {} {}\n",
+        "{} {} {}",
         oid,
         object.object_type.as_str(),
         object.body.len()
@@ -2534,11 +2532,10 @@ fn handle_ls_line(
     } else {
         let (dataref, after_dataref) = split_field_preserve_rest(rest);
         let path = parse_path_at_eol(after_dataref, true, "path")?;
-        if staged_tree.is_some()
-            && current_mark.is_some()
-            && mark_ref_matches(dataref, current_mark.expect("checked is_some"))
+        if let (Some(staged_tree), Some(current_mark)) = (staged_tree, current_mark)
+            && mark_ref_matches(dataref, current_mark)
         {
-            (staged_tree.expect("checked is_some").clone(), path)
+            (staged_tree.clone(), path)
         } else {
             let root = resolve_ls_root_tree(db, store, format, marks, ref_states, dataref)?;
             let mut map = BTreeMap::new();

@@ -43,7 +43,7 @@ fn cmd_bundle_create(cli_session: &crate::session::CliSession, args: &[String]) 
     let mut version = None;
     let mut path = None::<String>;
     let mut rev_args = Vec::new();
-    let mut iter = args.iter().peekable();
+    let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if path.is_some() {
             rev_args.push(arg.clone());

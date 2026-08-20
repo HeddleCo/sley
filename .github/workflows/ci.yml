@@ -102,23 +102,31 @@ jobs:
       - name: Build (default features)
         run: cargo build --locked --workspace --tests
 
-      # 2. Formatting is part of the release gate. Keep this check workspace-wide
+      # 2. Keep the transport-free embedding surface honest. The all-feature
+      #    workspace lint below cannot see symbols accidentally left active only
+      #    when HTTP is disabled, so exercise that cfg branch explicitly.
+      - name: sley-remote minimal-feature Clippy
+        run: cargo clippy --locked -p sley-remote --all-targets --no-default-features --no-deps -- -D warnings
+
+      # 3. Formatting is part of the release gate. Keep this check workspace-wide
       #    so a newly added crate cannot silently fall outside enforcement.
       - name: Format check
         run: cargo fmt --all --check
 
-      # 3. Hard-fail panic-prone calls in the production libraries that parse or
+      # 4. Hard-fail panic-prone calls in the production libraries that parse or
       #    orchestrate untrusted remote input. The scope check fails on every
       #    unclassified new workspace crate so this list cannot silently shrink.
       - name: Untrusted-input panic gate
         run: python3 .github/workflows/scripts/clippy-panic-gate.py
 
-      # 4. Treat every workspace lint as an error. `--no-deps` excludes third-
-      #    party warnings while retaining every Sley target, including tests.
+      # 5. Treat every workspace lint as an error. `--all-features` keeps
+      #    feature-gated transports and format backends inside the policy;
+      #    `--no-deps` excludes third-party warnings while retaining every Sley
+      #    target, including tests.
       - name: Workspace Clippy
-        run: cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features --no-deps -- -D warnings
 
-      # 5. Run all workspace tests. The suite includes the t-file CLI parity
+      # 6. Run all workspace tests. The suite includes the t-file CLI parity
       #    tests, unit tests across the domain crates, and the upstream
       #    integration harness (sley-testkit, #[ignore]-gated; run on demand
       #    with --ignored + GIT_SRC_DIR). Most tests do NOT shell out to git;

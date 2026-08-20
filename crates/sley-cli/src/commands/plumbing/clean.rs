@@ -151,7 +151,7 @@ pub(crate) fn cmd_clean(cli_session: &crate::session::CliSession, args: &[String
         if target.is_dir {
             if clean_target_is_original_cwd(&absolute) {
                 clean_original_cwd_contents(&absolute, &excludes)?;
-                write!(stdout, "Refusing to remove current working directory\n")?;
+                writeln!(stdout, "Refusing to remove current working directory")?;
                 continue;
             }
             match fs::remove_dir_all(&absolute) {
@@ -258,7 +258,7 @@ fn clean_targets(
                 preserve_ignored_directories: directories && ignore_mode == CleanIgnoreMode::Normal,
                 exclude_standard: ignore_mode != CleanIgnoreMode::Include,
                 ignored_only: ignore_mode == CleanIgnoreMode::Only,
-                exclude_patterns: exclude_patterns.clone(),
+                exclude_patterns,
                 exclude_per_directory: Vec::new(),
                 pathspecs: pathspec.untracked_pathspecs(),
             },
@@ -422,7 +422,7 @@ fn clean_head_is_hex_object_name(head: &str) -> bool {
 
 /// regardless of `-x` or whether the repository has any commits yet.
 fn clean_untracked_file_eligible(path: &[u8], index: Option<&Index>) -> bool {
-    if !path.iter().any(|byte| *byte == b'/') {
+    if !path.contains(&b'/') {
         return true;
     }
     let Some(index) = index else {

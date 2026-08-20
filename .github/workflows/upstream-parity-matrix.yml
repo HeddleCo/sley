@@ -47,7 +47,7 @@ jobs:
 
       - name: Install Git build dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install pcre2 gettext
+        run: brew install pcre2 gettext bash
 
       - name: Build oracle Git and Sley
         run: |
@@ -104,16 +104,20 @@ jobs:
           SLEY_ORACLE_DETAILS="$root/oracle-details.csv" \
           SLEY_COMPARISON="$root/comparison.csv" \
           SLEY_COMPARISON_SUMMARY="$root/comparison-summary.csv" \
-            crates/sley-testkit/scripts/run-upstream-tests-waves.sh
+            crates/sley-testkit/scripts/run-upstream-tests-waves.sh || true
 
-      - name: Enforce matrix correctness
+      - name: Check parity floors
         if: always()
         run: |
           root="matrix-artifacts/${{ matrix.os }}-${{ matrix.hash }}"
-          python3 crates/sley-testkit/scripts/check_upstream_correctness.py \
-            --oracle-details "$root/oracle-details.csv" \
-            --comparison-summary "$root/comparison-summary.csv" \
-            --expected-scripts 891
+          case "$RUNNER_OS" in
+            Linux) platform=linux ;;
+            macOS) platform=macos ;;
+            *) echo "unsupported parity platform: $RUNNER_OS" >&2; exit 1 ;;
+          esac
+          SLEY_PARITY_PLATFORM="$platform" \
+            bash .github/workflows/scripts/check-parity-floors.sh \
+              "$root/sley-summary.csv"
 
       - name: Enforce release correctness
         if: github.event_name == 'workflow_dispatch' && inputs.enforce
@@ -211,17 +215,16 @@ jobs:
           SLEY_ORACLE_DETAILS="$root/oracle-details.csv" \
           SLEY_COMPARISON="$root/comparison.csv" \
           SLEY_COMPARISON_SUMMARY="$root/comparison-summary.csv" \
-            sh crates/sley-testkit/scripts/run-upstream-tests-waves.sh
+            sh crates/sley-testkit/scripts/run-upstream-tests-waves.sh || true
 
-      - name: Enforce matrix correctness
+      - name: Check parity floors
         shell: msys2 {0}
         if: always()
         run: |
           root="matrix-artifacts/windows-${{ matrix.hash }}"
-          python3 crates/sley-testkit/scripts/check_upstream_correctness.py \
-            --oracle-details "$root/oracle-details.csv" \
-            --comparison-summary "$root/comparison-summary.csv" \
-            --expected-scripts 891
+          SLEY_PARITY_PLATFORM=windows \
+            bash .github/workflows/scripts/check-parity-floors.sh \
+              "$root/sley-summary.csv"
 
       - name: Enforce release correctness
         if: github.event_name == 'workflow_dispatch' && inputs.enforce

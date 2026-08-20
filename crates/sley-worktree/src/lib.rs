@@ -718,7 +718,7 @@ mod tests {
 
         assert_eq!(
             worktree_root_for_git_dir(&git_dir).expect("resolve non-bare worktree root"),
-            Some(work.clone()),
+            Some(work),
             "a non-bare .git dir resolves to its parent"
         );
 
@@ -1885,7 +1885,7 @@ mod tests {
         let old = UntrackedCacheDir {
             valid: true,
             recurse: true,
-            dirs: vec![done.clone()],
+            dirs: vec![done],
             ..UntrackedCacheDir::default()
         };
         let mut new = old.clone();

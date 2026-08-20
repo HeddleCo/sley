@@ -547,7 +547,7 @@ fn malformed_and_truncated_sources_return_pack_errors() {
             | Err(PackReadError::Pack(GitError::InvalidFormat(_)))
     ));
 
-    let mut malformed = written.pack.clone();
+    let mut malformed = written.pack;
     malformed[entry_offset] = 0x50;
     let mut decoder = BoundedPackDecoder::new(
         SlicePackSource::new(&malformed),

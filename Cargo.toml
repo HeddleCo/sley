@@ -42,43 +42,43 @@ inherits = "release"
 debug = 1
 
 [workspace.dependencies]
-sley-archive = { path = "crates/sley-archive", version = "0.5.2" }
-sley-bench = { path = "crates/sley-bench", version = "0.5.2" }
-sley-cli = { path = "crates/sley-cli", version = "0.5.2" }
-sley-config = { path = "crates/sley-config", version = "0.5.2" }
-sley-core = { path = "crates/sley-core", version = "0.5.2" }
+sley-archive = { path = "crates/sley-archive", version = "0.6.0" }
+sley-bench = { path = "crates/sley-bench", version = "0.6.0" }
+sley-cli = { path = "crates/sley-cli", version = "0.6.0" }
+sley-config = { path = "crates/sley-config", version = "0.6.0" }
+sley-core = { path = "crates/sley-core", version = "0.6.0" }
 
-sley-diff-merge = { path = "crates/sley-diff-merge", version = "0.5.2" }
-sley-formats = { path = "crates/sley-formats", version = "0.5.2" }
-sley-fsck = { path = "crates/sley-fsck", version = "0.5.2" }
-sley-grep = { path = "crates/sley-grep", version = "0.5.2" }
-sley-i18n = { path = "crates/sley-i18n", version = "0.5.2" }
-sley-index = { path = "crates/sley-index", version = "0.5.2" }
-sley-mmap = { path = "crates/sley-mmap", version = "0.5.2" }
-sley-notes = { path = "crates/sley-notes", version = "0.5.2" }
-sley-object = { path = "crates/sley-object", version = "0.5.2" }
-sley-odb = { path = "crates/sley-odb", version = "0.5.2" }
-sley-options = { path = "crates/sley-options", version = "0.5.2" }
-sley-pack = { path = "crates/sley-pack", version = "0.5.2" }
-sley-pathspec = { path = "crates/sley-pathspec", version = "0.5.2" }
-sley-pretty = { path = "crates/sley-pretty", version = "0.5.2" }
-sley-procinfo = { path = "crates/sley-procinfo", version = "0.5.2" }
-sley-protocol = { path = "crates/sley-protocol", version = "0.5.2" }
-sley-ref-filter = { path = "crates/sley-ref-filter", version = "0.5.2" }
-sley-refs = { path = "crates/sley-refs", version = "0.5.2" }
-sley-remote = { path = "crates/sley-remote", version = "0.5.2" }
-sley-rev = { path = "crates/sley-rev", version = "0.5.2" }
-sley-sequencer = { path = "crates/sley-sequencer", version = "0.5.2" }
-sley-strbuf-expand = { path = "crates/sley-strbuf-expand", version = "0.5.2" }
-sley-submodule = { path = "crates/sley-submodule", version = "0.5.2" }
-sley-testkit = { path = "crates/sley-testkit", version = "0.5.2" }
-sley-transport = { path = "crates/sley-transport", version = "0.5.2" }
-sley-unpack-trees = { path = "crates/sley-unpack-trees", version = "0.5.2" }
-sley-worktree = { path = "crates/sley-worktree", version = "0.5.2" }
-sley = { path = "crates/sley", version = "0.5.2" }
+sley-diff-merge = { path = "crates/sley-diff-merge", version = "0.6.0" }
+sley-formats = { path = "crates/sley-formats", version = "0.6.0" }
+sley-fsck = { path = "crates/sley-fsck", version = "0.6.0" }
+sley-grep = { path = "crates/sley-grep", version = "0.6.0" }
+sley-i18n = { path = "crates/sley-i18n", version = "0.6.0" }
+sley-index = { path = "crates/sley-index", version = "0.6.0" }
+sley-mmap = { path = "crates/sley-mmap", version = "0.6.0" }
+sley-notes = { path = "crates/sley-notes", version = "0.6.0" }
+sley-object = { path = "crates/sley-object", version = "0.6.0" }
+sley-odb = { path = "crates/sley-odb", version = "0.6.0" }
+sley-options = { path = "crates/sley-options", version = "0.6.0" }
+sley-pack = { path = "crates/sley-pack", version = "0.6.0" }
+sley-pathspec = { path = "crates/sley-pathspec", version = "0.6.0" }
+sley-pretty = { path = "crates/sley-pretty", version = "0.6.0" }
+sley-procinfo = { path = "crates/sley-procinfo", version = "0.6.0" }
+sley-protocol = { path = "crates/sley-protocol", version = "0.6.0" }
+sley-ref-filter = { path = "crates/sley-ref-filter", version = "0.6.0" }
+sley-refs = { path = "crates/sley-refs", version = "0.6.0" }
+sley-remote = { path = "crates/sley-remote", version = "0.6.0" }
+sley-rev = { path = "crates/sley-rev", version = "0.6.0" }
+sley-sequencer = { path = "crates/sley-sequencer", version = "0.6.0" }
+sley-strbuf-expand = { path = "crates/sley-strbuf-expand", version = "0.6.0" }
+sley-submodule = { path = "crates/sley-submodule", version = "0.6.0" }
+sley-testkit = { path = "crates/sley-testkit", version = "0.6.0" }
+sley-transport = { path = "crates/sley-transport", version = "0.6.0" }
+sley-unpack-trees = { path = "crates/sley-unpack-trees", version = "0.6.0" }
+sley-worktree = { path = "crates/sley-worktree", version = "0.6.0" }
+sley = { path = "crates/sley", version = "0.6.0" }
 
 [workspace.package]
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -91,4 +91,10 @@ unsafe_code = "forbid"
 unwrap_used = "deny"
 dbg_macro = "deny"
 todo = "deny"
+redundant_clone = "deny"
+unused_peekable = "deny"
+iter_with_drain = "deny"
+suspicious_operation_groupings = "deny"
+large_stack_arrays = "deny"
+needless_collect = "deny"
 clone_on_copy = "allow"

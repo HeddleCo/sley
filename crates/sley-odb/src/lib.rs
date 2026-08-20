@@ -2027,7 +2027,7 @@ mod tests {
 
         let object = EncodedObject::new(ObjectType::Blob, b"raw reachable pack\n".to_vec());
         let oid = db
-            .write_object(object.clone())
+            .write_object(object)
             .expect("test operation should succeed");
         let pack = build_reachable_pack(&db, format, std::iter::once(oid), &HashSet::new())
             .expect("test operation should succeed")
@@ -2921,7 +2921,7 @@ mod tests {
         let graph = write_commit_graph(&mut db, b"repack payload\n");
 
         let mut expected: HashMap<ObjectId, EncodedObject> = graph.iter().cloned().collect();
-        expected.insert(packed_oid, packed_blob.clone());
+        expected.insert(packed_oid, packed_blob);
 
         let result = repack_all_objects(&git_dir, format)
             .expect("test operation should succeed")
@@ -2950,7 +2950,7 @@ mod tests {
         assert_eq!(idx.entries.len(), expected.len());
 
         // The pre-existing pack is reported obsolete (by its .pack path).
-        assert_eq!(result.obsolete_packs, vec![existing.pack_path.clone()]);
+        assert_eq!(result.obsolete_packs, vec![existing.pack_path]);
         // Every loose object id is reported as now packed.
         let mut want_loose: Vec<ObjectId> = graph.iter().map(|(oid, _)| *oid).collect();
         want_loose.sort_by_key(ObjectId::to_hex);

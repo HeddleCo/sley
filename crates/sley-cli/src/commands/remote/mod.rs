@@ -13,11 +13,7 @@ mod pack;
 mod remote_curl;
 mod resolve;
 
-pub(crate) use admin::{
-    cmd_remote, cmd_remote_add, cmd_remote_get_url, cmd_remote_prune, cmd_remote_remove,
-    cmd_remote_rename, cmd_remote_set_branches, cmd_remote_set_head, cmd_remote_set_url,
-    cmd_remote_show, cmd_remote_update,
-};
+pub(crate) use admin::cmd_remote;
 pub(crate) use clone::{cmd_clone, parse_clone_depth};
 pub(crate) use config::{
     read_effective_repo_config, read_effective_repo_config_resolved,
@@ -25,13 +21,11 @@ pub(crate) use config::{
     remote_exists, remote_names, repo_current_branch_name, validate_remote_name, write_repo_config,
 };
 pub(crate) use fetch::{
-    FetchSubmoduleRequest, StdoutProgress, changed_gitlinks_for_fetch, cmd_fetch, fetch_bundle,
-    fetch_git_repository, fetch_git_repository_with_outcome, fetch_http_repository_with_outcome,
-    fetch_local_repository, fetch_local_repository_with_outcome,
-    fetch_populated_submodules_after_superproject, fetch_ref_snapshot,
-    fetch_set_upstream_from_outcome, fetch_source_is_git, fetch_source_is_http,
-    fetch_source_is_ssh, fetch_ssh_repository, fetch_ssh_repository_with_outcome,
-    resolve_fetch_recurse_submodules,
+    FetchSubmoduleRequest, changed_gitlinks_for_fetch, cmd_fetch, fetch_bundle,
+    fetch_git_repository_with_outcome, fetch_http_repository_with_outcome,
+    fetch_local_repository_with_outcome, fetch_populated_submodules_after_superproject,
+    fetch_ref_snapshot, fetch_set_upstream_from_outcome, fetch_source_is_git, fetch_source_is_http,
+    fetch_source_is_ssh, fetch_ssh_repository_with_outcome, resolve_fetch_recurse_submodules,
 };
 pub(crate) use helper::fetch_with_remote_helper;
 pub(crate) use http_backend::cmd_http_backend;

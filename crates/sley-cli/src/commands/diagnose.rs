@@ -79,15 +79,15 @@ pub(crate) fn cmd_diagnose(
     let file_name = format!("git-diagnostics-{}.zip", strftime_suffix(&suffix));
     zip_path.push(file_name);
 
-    if let Some(parent) = zip_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|err| {
-                GitError::InvalidFormat(format!(
-                    "fatal: could not create leading directories for '{}': {err}",
-                    zip_path.display()
-                ))
-            })?;
-        }
+    if let Some(parent) = zip_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            GitError::InvalidFormat(format!(
+                "fatal: could not create leading directories for '{}': {err}",
+                zip_path.display()
+            ))
+        })?;
     }
 
     create_diagnostics_archive(cli_session, &zip_path, mode)?;

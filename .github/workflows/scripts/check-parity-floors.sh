@@ -10,7 +10,10 @@
 # selected per platform rather than lowering the cross-platform baseline.
 #
 # Usage:
-#   check-parity-floors.sh <summary.csv>
+#   check-parity-floors.sh <summary.csv> [required-scripts.txt]
+# The optional required-script list enables a fast partial PR lane: every
+# listed script must appear, while the full weekly lane still requires the
+# complete floor catalog.
 #   SLEY_PARITY_PLATFORM=linux|macos|windows overrides uname detection.
 #
 # Floors recorded 2026-06-10 against base b069dbe + git 2.54.0 (GIT_TEST_DEFAULT_HASH=sha1).
@@ -361,7 +364,8 @@
 
 set -euo pipefail
 
-summary=${1:?usage: check-parity-floors.sh <summary.csv>}
+summary=${1:?usage: check-parity-floors.sh <summary.csv> [required-scripts.txt]}
+required_scripts_file=${2:-}
 
 if [ ! -f "$summary" ]; then
     echo "FAIL: summary CSV not found: $summary" >&2
@@ -1406,7 +1410,7 @@ declare -A FLOOR=(
     # Git 2.55.0's t5003 plan is 78, and the current oracle run passes all
     # 78 cells. The older floor=81 came from a stale 2.54-era summary whose
     # plan is now impossible to satisfy under the current archive-zip script.
-    [t5003-archive-zip.sh]=81
+    [t5003-archive-zip.sh]=78
     [t5306-pack-nobase.sh]=4
     [t5311-pack-bitmaps-shallow.sh]=6
     [t5315-pack-objects-compression.sh]=5
@@ -1883,6 +1887,18 @@ if [ -z "$parity_platform" ]; then
     esac
 fi
 
+case "$parity_platform" in
+    linux | macos) ;;
+    windows)
+        echo "FAIL: Windows parity floors have not been measured; refusing to borrow the macOS catalog" >&2
+        exit 1
+        ;;
+    *)
+        echo "FAIL: unsupported parity platform: $parity_platform" >&2
+        exit 1
+        ;;
+esac
+
 # Open issues waive a measured genuine regression without banking it into
 # FLOOR.  Each waiver has its own minimum so a second loss in the same script
 # still fails.  Waivers are deliberately Linux-scoped because that is the lane
@@ -1927,24 +1943,32 @@ if [ "$parity_platform" = linux ]; then
     # corrected floor and is tracked as a genuine regression.
     FLOOR[t1092-sparse-checkout-compatibility.sh]=110
 
-    KNOWN_REGRESSION[t1092-sparse-checkout-compatibility.sh]=204
-    KNOWN_REGRESSION_MIN[t1092-sparse-checkout-compatibility.sh]=109
-    KNOWN_REGRESSION[t1501-work-tree.sh]=208
-    KNOWN_REGRESSION_MIN[t1501-work-tree.sh]=38
-    KNOWN_REGRESSION[t3437-rebase-fixup-options.sh]=205
-    KNOWN_REGRESSION_MIN[t3437-rebase-fixup-options.sh]=9
-    KNOWN_REGRESSION[t4103-apply-binary.sh]=203
-    KNOWN_REGRESSION_MIN[t4103-apply-binary.sh]=20
-    KNOWN_REGRESSION[t4112-apply-renames.sh]=203
-    KNOWN_REGRESSION_MIN[t4112-apply-renames.sh]=0
-    KNOWN_REGRESSION[t4114-apply-typechange.sh]=203
-    KNOWN_REGRESSION_MIN[t4114-apply-typechange.sh]=11
-    KNOWN_REGRESSION[t5003-archive-zip.sh]=206
-    KNOWN_REGRESSION_MIN[t5003-archive-zip.sh]=80
 fi
 
 fail=0
 seen=""
+declare -A REQUIRED=()
+if [ -n "$required_scripts_file" ]; then
+    if [ ! -f "$required_scripts_file" ]; then
+        echo "FAIL: required-script list not found: $required_scripts_file" >&2
+        exit 1
+    fi
+    while IFS= read -r script; do
+        script=${script%%#*}
+        script=${script//[[:space:]]/}
+        [ -z "$script" ] && continue
+        if [ -z "${FLOOR[$script]:-}" ]; then
+            echo "FAIL: required script has no recorded floor: $script" >&2
+            fail=1
+            continue
+        fi
+        REQUIRED[$script]=1
+    done < "$required_scripts_file"
+    if [ "${#REQUIRED[@]}" -eq 0 ]; then
+        echo "FAIL: required-script list is empty: $required_scripts_file" >&2
+        fail=1
+    fi
+fi
 
 # Skip the header row; read the columns we care about.
 while IFS=, read -r script command result ok notok total plan_total; do
@@ -1994,7 +2018,12 @@ done < "$summary"
 # Every tracked file must have appeared in the summary. A missing file means
 # the script never ran (build break, wrong selection) — treat as a failure so
 # a silently-skipped t-file can't pass the gate.
-for script in "${!FLOOR[@]}"; do
+if [ -n "$required_scripts_file" ]; then
+    required_scripts=("${!REQUIRED[@]}")
+else
+    required_scripts=("${!FLOOR[@]}")
+fi
+for script in "${required_scripts[@]}"; do
     case " $seen " in
         *" $script "*) ;;
         *)

@@ -636,7 +636,7 @@ impl WhitespaceRuleResolver {
         };
         let requested = vec![b"whitespace".to_vec(), b"conflict-marker-size".to_vec()];
         let checks = matcher.attributes_for_path(path, &requested, false);
-        let mut value_storage = String::new();
+        let value_storage;
         let whitespace_attr = match checks.first().and_then(|check| check.state.as_ref()) {
             Some(sley_worktree::AttributeState::Set) => WsAttr::True,
             Some(sley_worktree::AttributeState::Unset) => WsAttr::False,
@@ -1559,7 +1559,6 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                 patch_full_index,
                 patch_binary,
                 allow_external,
-                exit_code,
                 output: output.as_deref(),
                 reverse,
                 z,
@@ -2063,23 +2062,13 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
                     let worktree_root = worktree_root
                         .as_ref()
                         .expect("worktree root set for diff <rev>");
-                    if inexact_renames {
-                        sley_diff_merge::diff_name_status_tree_worktree_with_options(
-                            worktree_root,
-                            &git_dir,
-                            format,
-                            tree,
-                            options,
-                        )?
-                    } else {
-                        sley_diff_merge::diff_name_status_tree_worktree_with_options(
-                            worktree_root,
-                            &git_dir,
-                            format,
-                            tree,
-                            options,
-                        )?
-                    }
+                    sley_diff_merge::diff_name_status_tree_worktree_with_options(
+                        worktree_root,
+                        &git_dir,
+                        format,
+                        tree,
+                        options,
+                    )?
                 }
             }
             // `diff <rev> <rev>` / `<rev>..<rev>` / `<rev>...<rev>`: tree vs tree.
@@ -2158,21 +2147,12 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         let worktree_root = worktree_root
             .as_ref()
             .expect("worktree root set for diff HEAD");
-        if inexact_renames {
-            sley_diff_merge::diff_name_status_head_worktree_with_options(
-                worktree_root,
-                &git_dir,
-                format,
-                options,
-            )?
-        } else {
-            sley_diff_merge::diff_name_status_head_worktree_with_options(
-                worktree_root,
-                &git_dir,
-                format,
-                options,
-            )?
-        }
+        sley_diff_merge::diff_name_status_head_worktree_with_options(
+            worktree_root,
+            &git_dir,
+            format,
+            options,
+        )?
     } else {
         let worktree_root = worktree_root.as_ref().expect("worktree root set for diff");
         let mut stat_clean_validator = sley_worktree::StatCleanFilterValidator::new();
@@ -2281,7 +2261,6 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
     let use_worktree_new = use_worktree_new && !reverse;
     // `--relative` rewrites displayed paths only; content, raw oid, and
     // external-diff worktree lookups still resolve against the original paths.
-    let worktree_root = worktree_root;
     let mut relative_lookup_entries = DiffRelativeLookupMap::new();
     let entries = if matches!(diff_relative, sley_rev::diff_options::DiffRelativeMode::Off) {
         entries
@@ -2571,7 +2550,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
         if show_patch {
             // One promisor negotiation for every blob the patch body will open
             // (git's `diff_queued_diff_prefetch`).
-            crate::prefetch_diff_entry_blobs(&db, &entries, lazy_fetch)?;
+            crate::prefetch_diff_entry_blobs(&db, &entries, use_worktree_new, lazy_fetch)?;
             let combined_unmerged = if plain_index_worktree_diff {
                 diff_unmerged_worktree_combined_paths(&git_dir, worktree_root.as_deref(), format)?
             } else {
@@ -3812,7 +3791,6 @@ struct DiffNoIndexParams<'a> {
     patch_full_index: bool,
     patch_binary: bool,
     allow_external: bool,
-    exit_code: bool,
     output: Option<&'a str>,
     reverse: bool,
     z: bool,
@@ -3966,7 +3944,7 @@ fn cmd_diff_no_index(
     );
     let userdiff_attributes = worktree_root
         .as_ref()
-        .map(|root| sley_worktree::StandardAttributeMatcher::from_worktree_root(root))
+        .map(sley_worktree::StandardAttributeMatcher::from_worktree_root)
         .transpose()?;
     let userdiff =
         commands::userdiff::UserdiffResolver::with_attributes(userdiff_attributes, config.clone());
@@ -4155,15 +4133,14 @@ fn no_index_entries(
     }
     let old_is_dir = old_kind == NoIndexPathKind::Directory;
     let new_is_dir = new_kind == NoIndexPathKind::Directory;
-    if !pathspecs.is_empty() {
-        if pathspecs
+    if !pathspecs.is_empty()
+        && (pathspecs
             .iter()
             .any(|spec| no_index_pathspec_is_absolute(spec))
-            || !(old_is_dir && new_is_dir)
-        {
-            eprintln!("usage: git diff --no-index [<options>] <path> <path>");
-            return Err(GitError::Exit(129));
-        }
+            || !(old_is_dir && new_is_dir))
+    {
+        eprintln!("usage: git diff --no-index [<options>] <path> <path>");
+        return Err(GitError::Exit(129));
     }
     if old_is_dir || new_is_dir {
         let old_files = no_index_collect_path(old_spec, old_path, old_is_dir, format)?;
@@ -4658,7 +4635,7 @@ fn run_one_external_diff_no_index(
     let old_mode = external_diff_mode(entry.entry.old_mode);
     let new_mode = external_diff_mode(entry.entry.new_mode);
     let args = [
-        old_path.clone(),
+        old_path,
         old_file.path.to_string_lossy().into_owned(),
         old_hex,
         old_mode,

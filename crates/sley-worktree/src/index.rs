@@ -1537,7 +1537,7 @@ pub(crate) fn update_index_paths_impl(
                 if has_dot_git {
                     if clean_config.is_some() {
                         let display_dir = if display.ends_with('/') {
-                            display.clone()
+                            display
                         } else {
                             format!("{display}/")
                         };

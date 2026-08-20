@@ -2163,7 +2163,7 @@ fn protocol_v2_fetch_command_request_validates_against_handshake_features() {
     assert_eq!(fetch.want_refs, vec!["refs/heads/main"]);
     assert_eq!(fetch.filter.as_deref(), Some("blob:none"));
 
-    let mut bad = request.clone();
+    let mut bad = request;
     bad.arguments.push(b"sideband-all".to_vec());
     assert!(
         validate_protocol_v2_fetch_command_request(&handshake, ObjectFormat::Sha1, &bad).is_err()

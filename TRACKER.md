@@ -2,12 +2,12 @@
 
 > Living tracker for the sley effort: enabling **heddle** to drop-in replace
 > `gix`, decomposing the `sley-cli` monolith, strengthening domain types, and
-> performance. **Last updated: 2026-06-05 (bulk-read + SHA-1 + decoder perf, #51–#54).**
+> performance. **Last updated: 2026-08-20 (0.6.0 release bundle).**
 
 ## Context
 
 - **sley** — pure-Rust, minimal-dependency reimplementation of Git (target
-  upstream 2.54.0), meant to be *used as a library and injected downstream*.
+  upstream 2.55.0), meant to be *used as a library and injected downstream*.
 - **heddle** — a git-overlay VCS that wants to replace `gix` (gitoxide) with
   sley. It needs **byte-identical** git objects/refs/index and smart-HTTP
   transport, all callable as libraries. A non-`gix`-shaped API is fine (heddle
@@ -203,11 +203,20 @@ Still open from the review: rev-list *exclude* walks still use `walk_commits`
 
 ## 🔄 In progress
 
-_(none — profile #50 parallelism next.)_
+- **0.6.0 release certification** — public pack-writer facade cleanup, current
+  stable dependency minimums, upstream Git 2.55 regressions #204/#205/#206/#208,
+  PR parity sampling (#210), regression-based matrix gating (#212), and the
+  P0 hash-object/read-object-header performance fixes from #222/#223.
 
 ---
 
 ## 📋 Backlog (prioritized)
+
+0. **0.6.0 release bundle** — implementation complete locally pending
+   integration of #222/#223 and the measured Windows floor profile required by
+   #212; after rebasing, run the full workspace/security/parity certification,
+   bank Windows only from its own uploaded summary, and review the release diff
+   before publishing.
 
 1. ~~Config + facade polish~~ **DONE** — global/system config read + identity
    fallback (env → -c → repo → global → system), callable `[remote]`

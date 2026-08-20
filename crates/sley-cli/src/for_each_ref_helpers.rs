@@ -4,8 +4,7 @@
 use crate::commands;
 use crate::{
     GitConfig, GitError, ObjectFormat, ObjectId, RefTarget, Result, parse_refspec, remote_exists,
-    remote_names, repository_objects_dir, resolve_revision, sley_rev, sley_worktree,
-    write_object_id_hex,
+    remote_names, repository_objects_dir, sley_rev, sley_worktree, write_object_id_hex,
 };
 use sley::plumbing::sley_core::DateMode;
 use sley::plumbing::sley_object::{Commit, EncodedObject, ObjectType, Tag};
@@ -15,17 +14,16 @@ use sley::plumbing::sley_refs::{self, FileRefStore};
 use sley_protocol::refspec_map_source;
 use sley_ref_filter::{
     ForEachRefAtom, ForEachRefAtomIdentityPart, ForEachRefAtomIdentityRole, ForEachRefEmailMode,
-    ForEachRefFormat, ForEachRefFormatSegment, ForEachRefNameFormat, ForEachRefNameSource,
-    ForEachRefQuoteMode, ForEachRefStripDirection, ForEachRefTrack, for_each_ref_abbrev_oid,
-    for_each_ref_copy_subject, for_each_ref_identity_date, for_each_ref_identity_email,
-    for_each_ref_identity_name, for_each_ref_identity_timestamp, for_each_ref_lstrip_name,
-    for_each_ref_message_parts, for_each_ref_rstrip_name, for_each_ref_sanitize_subject,
-    for_each_ref_short_name, for_each_ref_track_short, parse_for_each_ref_abbrev_width,
-    parse_for_each_ref_contents_lines_count, parse_for_each_ref_hex_color,
-    parse_for_each_ref_strip_count, write_for_each_ref_format, write_for_each_ref_identity,
-    write_for_each_ref_identity_date_mode, write_for_each_ref_identity_date_raw,
-    write_for_each_ref_identity_email_mode, write_for_each_ref_identity_name,
-    write_for_each_ref_track,
+    ForEachRefFormat, ForEachRefNameFormat, ForEachRefNameSource, ForEachRefQuoteMode,
+    ForEachRefStripDirection, ForEachRefTrack, for_each_ref_abbrev_oid, for_each_ref_copy_subject,
+    for_each_ref_identity_date, for_each_ref_identity_email, for_each_ref_identity_name,
+    for_each_ref_identity_timestamp, for_each_ref_lstrip_name, for_each_ref_message_parts,
+    for_each_ref_rstrip_name, for_each_ref_sanitize_subject, for_each_ref_track_short,
+    parse_for_each_ref_abbrev_width, parse_for_each_ref_contents_lines_count,
+    parse_for_each_ref_hex_color, parse_for_each_ref_strip_count, write_for_each_ref_format,
+    write_for_each_ref_identity, write_for_each_ref_identity_date_mode,
+    write_for_each_ref_identity_date_raw, write_for_each_ref_identity_email_mode,
+    write_for_each_ref_identity_name, write_for_each_ref_track,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -221,11 +219,7 @@ pub(crate) fn vs_swap_prereleases(
     for (i, suffix) in prereleases.iter().enumerate() {
         let suffix = suffix.as_bytes();
         let suffix_len = suffix.len();
-        let start = if suffix_len < off {
-            off - suffix_len
-        } else {
-            0
-        };
+        let start = off.saturating_sub(suffix_len);
         vs_find_better_matching_suffix(s1, suffix, start, i, &mut m1);
         vs_find_better_matching_suffix(s2, suffix, start, i, &mut m2);
     }
@@ -670,7 +664,7 @@ pub(crate) fn for_each_ref_push_remote(
 
 pub(crate) fn remote_display_name(remote: ForEachRefPushRemote) -> String {
     if remote.expose_name {
-        remote.name.to_string()
+        remote.name
     } else {
         String::new()
     }
@@ -1965,16 +1959,14 @@ pub(crate) fn for_each_ref_try_trailers_atom(
         None
     } else if let Some(rest) = base.strip_prefix("trailers:") {
         Some(rest)
-    } else if let Some(rest) = base.strip_prefix("contents:") {
+    } else {
+        let rest = base.strip_prefix("contents:")?;
         if rest == "trailers" {
             None
-        } else if let Some(rest) = rest.strip_prefix("trailers:") {
-            Some(rest)
         } else {
-            return None;
+            let rest = rest.strip_prefix("trailers:")?;
+            Some(rest)
         }
-    } else {
-        return None;
     };
 
     let options = match arg {

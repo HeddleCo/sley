@@ -1948,7 +1948,7 @@ pub(crate) fn build_untracked_cache_dir<T: StatusTrackedLookup + ?Sized>(
                             node.dirs.push(child);
                         } else {
                             if child_has_untracked {
-                                let mut directory = component.clone();
+                                let mut directory = component;
                                 directory.push(b'/');
                                 node.untracked.push(directory);
                             }

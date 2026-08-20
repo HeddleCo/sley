@@ -117,7 +117,7 @@ pub(super) fn setup_ls_remote_options(args: &[String]) -> Result<LsRemoteOptions
             ParsedValue::Bool(value) => Some(value),
             _ => None,
         })
-        .last();
+        .next_back();
     if let Some(value) = heads {
         options.heads = value;
     }

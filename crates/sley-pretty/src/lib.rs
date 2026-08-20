@@ -186,7 +186,6 @@ pub enum LogFormatDialect {
 
 /// How much commit data a format needs to render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(dead_code)]
 pub enum FormatTier {
     /// `%H` (and literals / no-op color codes only).
     OidOnly,
@@ -201,7 +200,6 @@ pub enum FormatTier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FormatFields(u16);
 
-#[allow(dead_code)]
 impl FormatFields {
     pub const OID: Self = Self(1 << 0);
     pub const TREE: Self = Self(1 << 1);
@@ -468,7 +466,6 @@ impl CompiledLogFormat {
         })
     }
 
-    #[allow(dead_code)]
     pub fn tier(&self) -> FormatTier {
         self.fields.tier()
     }
@@ -505,7 +502,6 @@ impl CompiledLogFormat {
     }
 
     /// True when the format emits only full oids (`%H`) plus inert literals/newlines.
-    #[allow(dead_code)]
     pub fn is_oid_only(&self) -> bool {
         self.tokens
             .iter()

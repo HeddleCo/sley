@@ -33,7 +33,6 @@ const SUBMODULE_DEINIT_USAGE: &[&str] =
     &["git submodule deinit [-f|--force] (--all| [--] <path>...)"];
 const SUBMODULE_SYNC_USAGE: &[&str] = &["git submodule sync [--recursive] [--] [<path>...]"];
 const SUBMODULE_ABSORBGITDIRS_USAGE: &[&str] = &["git submodule absorbgitdirs [--] [<path>...]"];
-const SUBMODULE_FOREACH_USAGE: &[&str] = &["git submodule foreach [--recursive] <command>"];
 const SUBMODULE_SUMMARY_USAGE: &[&str] =
     &["git submodule summary [--cached|--files] [--summary-limit <n>] [commit] [--] [<path>...]"];
 const SUBMODULE_SET_URL_USAGE: &[&str] = &["git submodule set-url [--] <path> <newurl>"];

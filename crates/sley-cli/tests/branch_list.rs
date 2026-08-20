@@ -1172,7 +1172,7 @@ fn branch_list_patterns_match_upstream_git() {
             &["config", "branch.feature/foo.merge", "refs/heads/old"],
         );
 
-        for args in [
+        for args in vec![
             vec!["branch", "--list", "f*"],
             vec!["branch", "--list", "release/*", "qa-?"],
             vec!["branch", "-r", "--list", "origin/*"],

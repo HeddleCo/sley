@@ -431,7 +431,7 @@ fn compute_real_merge(
     cli_session: &crate::session::CliSession,
     options: &MergeTreeOptions,
 ) -> Result<MergeOutcome> {
-    let cwd = cli_session.cwd().to_path_buf();
+    let _cwd = cli_session.cwd().to_path_buf();
     let git_dir = cli_session.git_dir()?;
     let format = repository_object_format(&git_dir)?;
     let db =
@@ -518,9 +518,9 @@ fn compute_real_merge(
         )
     };
     ensure_merge_tree_inputs_readable(&db, format, base_tree.as_ref(), &ours_tree, &theirs_tree)?;
-    let mut write_db = db.clone();
+    let write_db = db.clone();
     let merge = match sley_diff_merge::merge_trees(
-        &mut write_db,
+        &write_db,
         format,
         base_tree.as_ref(),
         &ours_tree,

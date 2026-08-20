@@ -1574,7 +1574,7 @@ fn submodule_summary_log(
     // precedes its parent and ties resolve to the newer date first — exactly the
     // pop order of git's `src...dst` walk.
     let mut by_oid: HashMap<ObjectId, FpCommit> = HashMap::new();
-    for c in src_chain.into_iter().chain(dst_chain.into_iter()) {
+    for c in src_chain.into_iter().chain(dst_chain) {
         by_oid.entry(c.oid).or_insert(c);
     }
 
@@ -1593,13 +1593,13 @@ fn submodule_summary_log(
     let mut heap: std::collections::BinaryHeap<SummaryHeapEntry> = Default::default();
     let mut pushed: HashSet<ObjectId> = HashSet::new();
     for tip in [src, dst] {
-        if let Some(c) = by_oid.get(tip) {
-            if pushed.insert(*tip) {
-                heap.push(SummaryHeapEntry {
-                    time: c.commit_time,
-                    oid: *tip,
-                });
-            }
+        if let Some(c) = by_oid.get(tip)
+            && pushed.insert(*tip)
+        {
+            heap.push(SummaryHeapEntry {
+                time: c.commit_time,
+                oid: *tip,
+            });
         }
     }
 
@@ -1613,15 +1613,14 @@ fn submodule_summary_log(
             out.push((marker, commit.subject.clone()));
         }
         // Push the first parent so the chain continues toward the merge base.
-        if let Some(parent) = first_parent {
-            if let Some(pc) = by_oid.get(&parent) {
-                if pushed.insert(parent) {
-                    heap.push(SummaryHeapEntry {
-                        time: pc.commit_time,
-                        oid: parent,
-                    });
-                }
-            }
+        if let Some(parent) = first_parent
+            && let Some(pc) = by_oid.get(&parent)
+            && pushed.insert(parent)
+        {
+            heap.push(SummaryHeapEntry {
+                time: pc.commit_time,
+                oid: parent,
+            });
         }
     }
     Ok(out)
@@ -1982,18 +1981,16 @@ fn collect_auto_comment_char_advice(git_dir: &Path) -> Option<String> {
         out.push_str(key_name(item.key_id));
         out.push('\n');
     }
-    if auto_set_in_file {
-        if let Some(last) = items.last() {
-            out.push_str("hint: \n");
-            out.push_str("hint: To set a custom comment string please run\n");
-            out.push_str("hint: \n");
-            out.push_str("hint:     git config set ");
-            out.push_str(&config_scope_arg(git_dir, last.scope, &last.path));
-            out.push_str(key_name(last.key_id));
-            out.push_str(" <comment string>\n");
-            out.push_str("hint: \n");
-            out.push_str("hint: where '<comment string>' is the string you wish to use.\n");
-        }
+    if auto_set_in_file && let Some(last) = items.last() {
+        out.push_str("hint: \n");
+        out.push_str("hint: To set a custom comment string please run\n");
+        out.push_str("hint: \n");
+        out.push_str("hint:     git config set ");
+        out.push_str(&config_scope_arg(git_dir, last.scope, &last.path));
+        out.push_str(key_name(last.key_id));
+        out.push_str(" <comment string>\n");
+        out.push_str("hint: \n");
+        out.push_str("hint: where '<comment string>' is the string you wish to use.\n");
     }
     let _ = last_key_id;
     Some(out)

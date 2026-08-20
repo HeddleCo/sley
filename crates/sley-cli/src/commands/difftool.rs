@@ -173,7 +173,6 @@ fn resolve_difftool_tool(
             trust_exit_code: options
                 .trust_exit_code
                 .unwrap_or_else(|| config_bool(config, "difftool", "trustexitcode", false)),
-            is_builtin: false,
         });
     }
     let Some(tool) = select_tool_name(config, ToolMode::Diff, options.cli_tool.as_deref(), gui)

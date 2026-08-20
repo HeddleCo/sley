@@ -8,7 +8,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-memmap2 = "0.9"
+memmap2 = "0.9.11"
 
 # This crate is the single, audited home for the workspace's only `unsafe` (the
 # read-only mmap of immutable git files). It therefore does NOT inherit the workspace
@@ -21,4 +21,10 @@ unsafe_code = "allow"
 unwrap_used = "deny"
 dbg_macro = "deny"
 todo = "deny"
+redundant_clone = "deny"
+unused_peekable = "deny"
+iter_with_drain = "deny"
+suspicious_operation_groupings = "deny"
+large_stack_arrays = "deny"
+needless_collect = "deny"
 clone_on_copy = "allow"

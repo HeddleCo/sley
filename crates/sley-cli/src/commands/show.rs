@@ -644,11 +644,11 @@ fn show_tip_matches_grep(
             let tag = Tag::parse(format, &object.body)?;
             let target = db.read_object(&tag.object)?;
             if target.object_type != ObjectType::Commit {
-                return Ok(false != invert);
+                return Ok(invert);
             }
             Commit::parse(format, &target.body)?.message
         }
-        _ => return Ok(false != invert),
+        _ => return Ok(invert),
     };
     let matched = if all_match {
         matcher.matches_all(&message)
@@ -1392,7 +1392,7 @@ fn write_show_combined(
 ) -> Result<()> {
     let options = context.options;
     let db = context.db;
-    let stat_entries =
+    let _stat_entries =
         if options.numstat || options.stat || options.compact_summary || options.shortstat {
             collect_diff_stat_entries(entries, db, None, false, context.lazy_fetch)?
         } else {
@@ -1819,7 +1819,7 @@ fn write_commit_diff_patch(
     // does one promisor negotiation in a partial clone (t4067 #1).
     if show_patch || options.numstat || options.stat || options.compact_summary || options.shortstat
     {
-        crate::prefetch_diff_entry_blobs(db, entries, lazy_fetch)?;
+        crate::prefetch_diff_entry_blobs(db, entries, false, lazy_fetch)?;
     }
     let stat_entries =
         if options.numstat || options.stat || options.compact_summary || options.shortstat {

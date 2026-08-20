@@ -1831,10 +1831,10 @@ fn parse_rfc2822_date(value: &str) -> Option<String> {
 /// month-before-day token order; the timezone defaults to `+0000` when absent.
 fn parse_git_default_date(value: &str) -> Option<String> {
     let mut tokens: Vec<&str> = value.split_whitespace().collect();
-    if let Some(first) = tokens.first() {
-        if WEEKDAYS.contains(&first.trim_end_matches(',')) {
-            tokens.remove(0);
-        }
+    if let Some(first) = tokens.first()
+        && WEEKDAYS.contains(&first.trim_end_matches(','))
+    {
+        tokens.remove(0);
     }
     if tokens.len() < 4 {
         return None;
@@ -4825,7 +4825,7 @@ fn finish_rebase_apply(
         .ok()
         .and_then(|raw| ObjectId::from_hex(format, raw.trim()).ok())
         .unwrap_or(head);
-    let quiet = read_state_bool(state_dir, "quiet");
+    let _quiet = read_state_bool(state_dir, "quiet");
 
     let reflog_action = env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "rebase".to_string());
     let head_display = if head_name.starts_with("refs/heads/") {
@@ -4856,7 +4856,7 @@ fn finish_rebase_apply(
         tx.commit()?;
         // git's apply backend reports the FULL ref name here
         // (`refs/heads/<branch>`), not the short branch.
-        head_name.clone()
+        head_name
     } else {
         "detached HEAD".to_string()
     };
@@ -4867,7 +4867,7 @@ fn finish_rebase_apply(
     // apply backend records its autostash in `rebase-apply/autostash`; the state
     // dir is removed by the caller's finish, so consume the file before then.
     let _ = head_display;
-    apply_rebase_autostash(&common_git_dir, worktree_root, state_dir, lazy_fetch)?;
+    apply_rebase_autostash(common_git_dir, worktree_root, state_dir, lazy_fetch)?;
 
     Ok(())
 }
@@ -5217,12 +5217,12 @@ fn am_abort(
             let action = env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "rebase".to_string());
             let returning_to = match &rebase_branch {
                 Some(branch) => branch.clone(),
-                None => orig_head.unwrap_or(oid).to_hex().to_string(),
+                None => orig_head.unwrap_or(oid).to_hex(),
             };
             let reflog = ReflogEntry {
                 old_oid: current.unwrap_or(zero_oid(format)?),
                 new_oid: oid,
-                committer: committer.clone(),
+                committer,
                 message: format!("{action} (abort): returning to {returning_to}").into_bytes(),
             };
             match &rebase_branch {

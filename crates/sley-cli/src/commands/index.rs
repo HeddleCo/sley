@@ -376,27 +376,6 @@ impl LsTreePathContext {
         normalize_ls_tree_pathspec_into(&mut components, pathspec)
     }
 
-    fn display_path(&self, normalized: &str) -> String {
-        if self.full_name || self.prefix.is_empty() {
-            return normalized.to_string();
-        }
-        if normalized == self.prefix {
-            return String::new();
-        }
-        if let Some(rest) = normalized
-            .strip_prefix(self.prefix.as_str())
-            .and_then(|rest| rest.strip_prefix('/'))
-        {
-            return rest.to_string();
-        }
-        let mut display = String::new();
-        for _ in 0..self.cwd_depth {
-            display.push_str("../");
-        }
-        display.push_str(normalized);
-        display
-    }
-
     fn display_path_bytes(&self, normalized: &[u8]) -> Vec<u8> {
         if self.full_name || self.prefix.is_empty() {
             return normalized.to_vec();
@@ -1100,16 +1079,16 @@ pub(crate) fn cmd_ls_files(
     }
     if selected && !output_stage {
         if (cached || deleted || modified)
-            && let Some(mut index) = sley_worktree::read_repository_index(&git_dir, format)?
+            && let Some(index) = sley_worktree::read_repository_index(&git_dir, format)?
         {
-            ls_files_clear_skip_worktree_from_present(&mut index, &worktree_root, &git_dir)?;
-            let index = ls_files_display_index(
+            let mut index = ls_files_display_index(
                 repo.object_database(),
                 format,
                 index,
                 sparse && !(deleted || modified),
                 &pathspec,
             )?;
+            ls_files_clear_skip_worktree_from_present(&mut index, &worktree_root, &git_dir)?;
             let oid_candidates = ls_files_oid_candidates(&index);
             if ignored && cached {
                 let ignored_entries = sley_worktree::ignored_index_entries(
@@ -1164,15 +1143,12 @@ pub(crate) fn cmd_ls_files(
         }
         return Ok(());
     }
-    if let Some(mut index) = sley_worktree::read_repository_index(&git_dir, format)? {
+    if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
         // Sparse-directory entries are always stage zero. `ls-files -u` can
         // therefore inspect the serialized index directly: expanding it adds
         // no possible unmerged result and would incorrectly advertise an
         // `ensure_full_index` transition to interactive patch callers.
-        if !unmerged {
-            ls_files_clear_skip_worktree_from_present(&mut index, &worktree_root, &git_dir)?;
-        }
-        let index = if unmerged {
+        let mut index = if unmerged {
             index
         } else {
             ls_files_display_index(
@@ -1183,6 +1159,9 @@ pub(crate) fn cmd_ls_files(
                 &pathspec,
             )?
         };
+        if !unmerged {
+            ls_files_clear_skip_worktree_from_present(&mut index, &worktree_root, &git_dir)?;
+        }
         let oid_candidates = ls_files_oid_candidates(&index);
         if unmerged {
             write_ls_files_unmerged(
@@ -1294,8 +1273,8 @@ fn write_ls_files_with_tree(
         None
     };
     let tree_paths = sley_diff_merge::flatten_tree(repo.object_database(), format, &tree_oid)?
-        .into_iter()
-        .map(|(path, _value)| BString::from(path))
+        .into_keys()
+        .map(BString::from)
         .collect::<Vec<_>>();
     let projection =
         sley_index::projection::project_tree_overlay(sley_index::projection::TreeOverlayOptions {
@@ -1541,7 +1520,7 @@ fn write_ls_files_format(
     };
     let mut rest = ctx.spec;
     while let Some(start) = rest.find('%') {
-        stdout.write_all(rest[..start].as_bytes())?;
+        stdout.write_all(&rest.as_bytes()[..start])?;
         rest = &rest[start + 1..];
         if let Some(after_open) = rest.strip_prefix('(') {
             if let Some(end) = after_open.find(')') {
@@ -2820,7 +2799,7 @@ pub(crate) fn cmd_update_index(
         )?;
     } else if !ordered_paths.is_empty()
         && (refresh
-            || (again == false
+            || (!again
                 && index_version.is_none()
                 && fsmonitor_valid.is_none()
                 && skip_worktree.is_none()
@@ -3137,7 +3116,7 @@ fn parse_update_index_index_info(input: &[u8], nul: bool) -> Result<Vec<CliIndex
         }
         let (oid, stage) = match fields.as_slice() {
             [_, oid] => (*oid, 0),
-            [_, object_type, oid] if update_index_index_info_type(*object_type).is_some() => {
+            [_, object_type, oid] if update_index_index_info_type(object_type).is_some() => {
                 (*oid, 0)
             }
             [_, oid, stage] => {

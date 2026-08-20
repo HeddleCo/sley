@@ -1,0 +1,15 @@
+# Fast PR parity lane. Keep this focused on repository setup, refs, objects,
+# index/worktree boundaries, and the regressions restored for 0.6.0.
+t0001-init.sh
+t0002-gitfile.sh
+t0034-root-safe-directory.sh
+t1006-cat-file.sh
+t1007-hash-object.sh
+t1092-sparse-checkout-compatibility.sh
+t1300-config.sh
+t1400-update-ref.sh
+t1401-symbolic-ref.sh
+t1500-rev-parse.sh
+t1501-work-tree.sh
+t3437-rebase-fixup-options.sh
+t5003-archive-zip.sh

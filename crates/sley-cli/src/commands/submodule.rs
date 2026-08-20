@@ -245,7 +245,7 @@ fn cmd_submodule_add(
     let format = context.format;
     let worktree_root = &context.worktree_root;
     if (options.repository.starts_with("../") || options.repository.starts_with("./"))
-        && normalize_lexical_path(&cwd) != normalize_lexical_path(&worktree_root)
+        && normalize_lexical_path(cwd) != normalize_lexical_path(worktree_root)
     {
         eprintln!(
             "fatal: relative repository paths can only be used from the toplevel of the working tree"
@@ -260,8 +260,8 @@ fn cmd_submodule_add(
     // a submodule (the recursive `add ... subsubmodule` case).
     let real_repo = if options.repository.starts_with("../") || options.repository.starts_with("./")
     {
-        let config = read_repo_config(&git_dir)?;
-        resolve_submodule_relative_url(&worktree_root, &config, &options.repository, false)
+        let config = read_repo_config(git_dir)?;
+        resolve_submodule_relative_url(worktree_root, &config, &options.repository, false)
     } else {
         options.repository.clone()
     };
@@ -269,11 +269,11 @@ fn cmd_submodule_add(
         .path
         .clone()
         .unwrap_or_else(|| default_submodule_path(&options.repository));
-    let normalized_path = normalize_submodule_add_path(&cwd, &worktree_root, &path)?;
+    let normalized_path = normalize_submodule_add_path(cwd, worktree_root, &path)?;
     let destination = worktree_root.join(&normalized_path);
-    let add_name = submodule_add_name(&worktree_root, &normalized_path, options.name.as_deref())?;
+    let add_name = submodule_add_name(worktree_root, &normalized_path, options.name.as_deref())?;
     validate_submodule_add_name_available(
-        &worktree_root,
+        worktree_root,
         &add_name,
         &normalized_path,
         options.force,
@@ -294,7 +294,7 @@ fn cmd_submodule_add(
         return Err(GitError::Exit(128));
     }
     if !options.force
-        && let Some(index) = read_repository_index(&git_dir, format)?
+        && let Some(index) = read_repository_index(git_dir, format)?
         && index
             .entries
             .iter()
@@ -311,7 +311,7 @@ fn cmd_submodule_add(
     }
     if !options.force
         && sley_worktree::path_matches_standard_ignore(
-            &worktree_root,
+            worktree_root,
             normalized_path.as_bytes(),
             true,
         )?
@@ -323,7 +323,7 @@ fn cmd_submodule_add(
         return Err(GitError::Exit(1));
     }
 
-    ensure_writing_gitmodules_ok(&git_dir, format, &worktree_root)?;
+    ensure_writing_gitmodules_ok(git_dir, format, worktree_root)?;
 
     let modules_git_dir = git_dir.join("modules").join(&add_name);
     if existing_repo {
@@ -366,25 +366,20 @@ fn cmd_submodule_add(
     }
 
     write_submodule_mapping(
-        &git_dir,
-        &worktree_root,
+        git_dir,
+        worktree_root,
         &normalized_path,
         &options.repository,
         &real_repo,
         options.branch.as_deref(),
         Some(&add_name),
     )?;
-    record_submodule_gitdir_config_if_enabled(
-        &git_dir,
-        &worktree_root,
-        &add_name,
-        &modules_git_dir,
-    )?;
+    record_submodule_gitdir_config_if_enabled(git_dir, worktree_root, &add_name, &modules_git_dir)?;
     stage_submodule_paths(
         cli_session,
-        &git_dir,
+        git_dir,
         format,
-        &worktree_root,
+        worktree_root,
         &normalized_path,
         head_oid,
     )?;
@@ -416,17 +411,17 @@ fn cmd_submodule_update(
         }
         cmd_submodule_init(cli_session, &init_args, options.quiet)?;
     }
-    let index = read_repository_index(&git_dir, format)?;
-    let submodules = read_submodule_configs(&worktree_root)?;
+    let index = read_repository_index(git_dir, format)?;
+    let submodules = read_submodule_configs(worktree_root)?;
     let mut selected = filter_update_submodule_configs(
-        &cwd,
-        &worktree_root,
+        cwd,
+        worktree_root,
         &submodules,
         &options.paths,
         &index,
         &options.super_prefix,
     )?;
-    let config = read_repo_config(&git_dir)?;
+    let config = read_repo_config(git_dir)?;
     if options.paths.is_empty() && has_global_submodule_active(&config) {
         selected.retain(|submodule| submodule_is_active(&config, submodule));
     }
@@ -444,8 +439,8 @@ fn cmd_submodule_update(
             // `prepare_to_clone_next_submodule` "Skipping unmerged submodule".
             if submodule_index_is_unmerged(&index, &submodule.path) {
                 let display = submodule_displaypath(
-                    &cwd,
-                    &worktree_root,
+                    cwd,
+                    worktree_root,
                     &submodule.path,
                     &options.super_prefix,
                 )?;
@@ -925,10 +920,10 @@ fn resolve_remote_branch(
     }
     // `.` inherits the superproject's current branch.
     let store = context.repo.references();
-    if let Some(RefTarget::Symbolic(target)) = store.read_ref("HEAD")? {
-        if let Some(name) = target.strip_prefix("refs/heads/") {
-            return Ok(name.to_string());
-        }
+    if let Some(RefTarget::Symbolic(target)) = store.read_ref("HEAD")?
+        && let Some(name) = target.strip_prefix("refs/heads/")
+    {
+        return Ok(name.to_string());
     }
     eprintln!(
         "fatal: Submodule ({}) branch configured to inherit branch from superproject, but the superproject is not on any branch",
@@ -956,12 +951,11 @@ fn submodule_gitmodules_branch(
 fn submodule_default_remote(sub_git_dir: &Path, sub_format: ObjectFormat) -> Result<String> {
     let config = read_repo_config(sub_git_dir)?;
     let store = FileRefStore::new(sub_git_dir, sub_format);
-    if let Some(RefTarget::Symbolic(target)) = store.read_ref("HEAD")? {
-        if let Some(branch) = target.strip_prefix("refs/heads/") {
-            if let Some(remote) = config.get("branch", Some(branch), "remote") {
-                return Ok(remote.to_string());
-            }
-        }
+    if let Some(RefTarget::Symbolic(target)) = store.read_ref("HEAD")?
+        && let Some(branch) = target.strip_prefix("refs/heads/")
+        && let Some(remote) = config.get("branch", Some(branch), "remote")
+    {
+        return Ok(remote.to_string());
     }
     Ok("origin".to_string())
 }
@@ -1388,21 +1382,21 @@ fn cmd_submodule_init(
     let git_dir = &context.git_dir;
     let format = context.format;
     let worktree_root = &context.worktree_root;
-    let submodules = read_submodule_configs(&worktree_root)?;
+    let submodules = read_submodule_configs(worktree_root)?;
 
     // git's `module_list_compute` lists the INDEX gitlinks, then `init_submodule`
     // dies "No url found for submodule path '<p>' in .gitmodules" for any listed
     // gitlink with no `.gitmodules` url. Cross-reference the index gitlinks
     // (restricted to the requested pathspecs) against the parsed `.gitmodules`
     // so an index gitlink with no mapping aborts init, matching git.
-    let index = read_repository_index(&git_dir, format)?;
+    let index = read_repository_index(git_dir, format)?;
     let index_gitlinks = index_relevant_paths(&index, &BTreeMap::new());
     let known_paths: BTreeSet<String> = submodules.iter().map(|s| s.path.clone()).collect();
     for (path, (mode, _)) in &index_gitlinks {
         if *mode != 0o160000 {
             continue;
         }
-        if !path_selected_by_specs(&cwd, &worktree_root, path, &paths) {
+        if !path_selected_by_specs(cwd, worktree_root, path, &paths) {
             continue;
         }
         if !known_paths.contains(path) {
@@ -1411,8 +1405,8 @@ fn cmd_submodule_init(
         }
     }
 
-    let mut config = read_repo_config(&git_dir)?;
-    let mut selected = filter_submodule_configs(&cwd, &worktree_root, &submodules, &paths)?;
+    let mut config = read_repo_config(git_dir)?;
+    let mut selected = filter_submodule_configs(cwd, worktree_root, &submodules, &paths)?;
     if paths.is_empty() && has_global_submodule_active(&config) {
         selected.retain(|submodule| submodule_is_active(&config, submodule));
     }
@@ -1476,7 +1470,7 @@ fn cmd_submodule_deinit(
     let cwd = &context.cwd;
     let git_dir = &context.git_dir;
     let worktree_root = &context.worktree_root;
-    let submodules = read_submodule_configs(&worktree_root)?;
+    let submodules = read_submodule_configs(worktree_root)?;
     if submodules.is_empty() {
         return Ok(());
     }
@@ -1487,16 +1481,16 @@ fn cmd_submodule_deinit(
             eprintln!("fatal: Use '--all' if you really want to deinitialize all submodules");
             return Err(GitError::Exit(128));
         }
-        filter_submodule_configs(&cwd, &worktree_root, &submodules, &options.paths)?
+        filter_submodule_configs(cwd, worktree_root, &submodules, &options.paths)?
     };
-    let mut config = read_repo_config(&git_dir)?;
+    let mut config = read_repo_config(git_dir)?;
     let mut changed = false;
     for submodule in selected {
         let configured_url = config
             .get("submodule", Some(&submodule.name), "url")
             .map(str::to_string)
             .or_else(|| submodule.url.clone());
-        if !options.force && submodule_worktree_has_local_changes(&worktree_root, submodule)? {
+        if !options.force && submodule_worktree_has_local_changes(worktree_root, submodule)? {
             eprintln!("error: the following file has local modifications:");
             eprintln!("    {}", submodule.path);
             eprintln!("(use --cached to keep the file, or -f to force removal)");
@@ -1508,17 +1502,17 @@ fn cmd_submodule_deinit(
         }
         let submodule_root = worktree_root.join(&submodule.path);
         if submodule_root.join(".git").is_dir() {
-            absorb_submodule_git_dir(&git_dir, &worktree_root, submodule, true)?;
+            absorb_submodule_git_dir(git_dir, worktree_root, submodule, true)?;
         }
         let had_worktree_dir = submodule_root.is_dir();
         clear_submodule_worktree(&submodule_root)?;
-        unset_submodule_core_worktree(&git_dir, submodule)?;
+        unset_submodule_core_worktree(git_dir, submodule)?;
         let had_config = config.sections.iter().any(|section| {
             section.name == "submodule" && section.subsection.as_deref() == Some(&submodule.name)
         });
         remove_submodule_config_section(&mut config, &submodule.name);
         if !options.quiet {
-            let display = display_submodule_path(&cwd, &worktree_root, &submodule.path)?;
+            let display = display_submodule_path(cwd, worktree_root, &submodule.path)?;
             if had_worktree_dir {
                 println!("Cleared directory '{display}'");
             }
@@ -1533,7 +1527,7 @@ fn cmd_submodule_deinit(
         changed = true;
     }
     if changed {
-        write_repo_config(&git_dir, &config)?;
+        write_repo_config(git_dir, &config)?;
     }
     Ok(())
 }
@@ -1548,15 +1542,15 @@ fn cmd_submodule_sync(
     let cwd = &context.cwd;
     let git_dir = &context.git_dir;
     let worktree_root = &context.worktree_root;
-    let submodules = read_submodule_configs(&worktree_root)?;
-    let selected = filter_submodule_configs(&cwd, &worktree_root, &submodules, &paths)?;
-    let mut config = read_repo_config(&git_dir)?;
+    let submodules = read_submodule_configs(worktree_root)?;
+    let selected = filter_submodule_configs(cwd, worktree_root, &submodules, &paths)?;
+    let mut config = read_repo_config(git_dir)?;
     let mut changed = false;
     for submodule in selected {
         sync_one_submodule(
-            &git_dir,
-            &worktree_root,
-            &cwd,
+            git_dir,
+            worktree_root,
+            cwd,
             &mut config,
             &mut changed,
             submodule,
@@ -1566,7 +1560,7 @@ fn cmd_submodule_sync(
         )?;
     }
     if changed {
-        write_repo_config(&git_dir, &config)?;
+        write_repo_config(git_dir, &config)?;
     }
     Ok(())
 }
@@ -1712,16 +1706,16 @@ fn cmd_submodule_absorbgitdirs(
     // git's `module_list_compute`: iterate EVERY gitlink in the index (in index
     // order), not just `.gitmodules`-configured ones — a gitlink with no mapping
     // must still be visited so absorb can die "could not lookup name".
-    let gitlink_paths = index_gitlink_paths(&git_dir, format, &cwd, &worktree_root, &paths)?;
-    let configured = read_submodule_configs(&worktree_root)?;
+    let gitlink_paths = index_gitlink_paths(git_dir, format, cwd, worktree_root, &paths)?;
+    let configured = read_submodule_configs(worktree_root)?;
     for path in gitlink_paths {
         let name = configured
             .iter()
             .find(|sub| sub.path == path)
             .map(|sub| sub.name.as_str());
         absorb_git_dir_into_superproject(
-            &git_dir,
-            &worktree_root,
+            git_dir,
+            worktree_root,
             &path,
             name,
             &super_prefix,
@@ -1924,9 +1918,9 @@ fn cmd_submodule_foreach(
     let git_dir = &context.git_dir;
     let format = context.format;
     let worktree_root = &context.worktree_root;
-    let submodules = read_submodule_configs(&worktree_root)?;
-    let index = read_repository_index(&git_dir, format)?;
-    run_submodule_foreach_tree(&cwd, &worktree_root, &index, &submodules, &options)
+    let submodules = read_submodule_configs(worktree_root)?;
+    let index = read_repository_index(git_dir, format)?;
+    run_submodule_foreach_tree(cwd, worktree_root, &index, &submodules, &options)
 }
 
 /// A single gitlink change to summarize, the analogue of git's `struct
@@ -1983,20 +1977,20 @@ fn cmd_submodule_summary(
     // otherwise HEAD, falling back to the empty tree before the first commit.
     let head_tree = summary_source_tree(db, git_dir, format, commit.as_deref())?;
 
-    let index = read_repository_index(&git_dir, format)?;
+    let index = read_repository_index(git_dir, format)?;
     let mut entries = if options.files {
         // --files: diff-files (index vs worktree).
-        compute_summary_diff_files(&worktree_root, format, &index)?
+        compute_summary_diff_files(worktree_root, format, &index)?
     } else {
         // default / --cached: diff-index (source tree vs index).
-        compute_summary_diff_index(&worktree_root, format, &head_tree, &index, options.cached)?
+        compute_summary_diff_index(worktree_root, format, &head_tree, &index, options.cached)?
     };
 
     // Restrict to the requested pathspecs (git passes them through to diff).
     if !positionals.is_empty() {
         let specs: Vec<String> = positionals
             .iter()
-            .map(|path| normalize_submodule_pathspec(&cwd, &worktree_root, path))
+            .map(|path| normalize_submodule_pathspec(cwd, worktree_root, path))
             .collect();
         entries.retain(|entry| {
             specs
@@ -2007,8 +2001,8 @@ fn cmd_submodule_summary(
 
     for entry in &entries {
         generate_submodule_summary(
-            &cwd,
-            &worktree_root,
+            cwd,
+            worktree_root,
             &index,
             entry,
             options.cached,
@@ -2342,17 +2336,17 @@ fn cmd_submodule_set_url(
     set_submodule_config_value(&mut gitmodules, &name, "url", new_url);
     fs::write(&gitmodules_path, gitmodules.to_canonical_bytes())?;
 
-    let mut config = read_repo_config(&git_dir)?;
+    let mut config = read_repo_config(git_dir)?;
     let up_path = submodule_up_path(path);
     let (super_config_url, sub_origin_url) =
         if new_url.starts_with("../") || new_url.starts_with("./") {
-            resolve_sync_urls(&worktree_root, &config, new_url, &up_path)
+            resolve_sync_urls(worktree_root, &config, new_url, &up_path)
         } else {
             (new_url.to_string(), new_url.to_string())
         };
     if config.get("submodule", Some(&name), "url").is_some() {
         set_submodule_config_value(&mut config, &name, "url", &super_config_url);
-        write_repo_config(&git_dir, &config)?;
+        write_repo_config(git_dir, &config)?;
         if !quiet {
             println!("Synchronizing submodule url for '{path}'");
         }
@@ -2363,8 +2357,8 @@ fn cmd_submodule_set_url(
         let mut sub_config = read_repo_config(&sub_git_dir)?;
         let abs_path = normalize_lexical_path(&submodule_root);
         let remote = submodule_default_remote_name(
-            &worktree_root,
-            &git_dir,
+            worktree_root,
+            git_dir,
             &abs_path,
             &sub_git_dir,
             sub_format,
@@ -2963,12 +2957,14 @@ fn generate_submodule_summary(
     // dst is a blob/regular file, hash the worktree file. We only need the
     // gitlink-from-HEAD branch for the summary-without-cached forward case.
     let mut oid_dst = entry.oid_dst;
-    if !cached && entry.oid_dst.is_null() && entry.mod_dst == 0o160000 {
-        if let Some(git_dir) = &sub_repo {
-            let format = repository_object_format(git_dir)?;
-            if let Ok(head_oid) = resolve_revision(git_dir, format, "HEAD", replace_objects) {
-                oid_dst = head_oid;
-            }
+    if !cached
+        && entry.oid_dst.is_null()
+        && entry.mod_dst == 0o160000
+        && let Some(git_dir) = &sub_repo
+    {
+        let format = repository_object_format(git_dir)?;
+        if let Ok(head_oid) = resolve_revision(git_dir, format, "HEAD", replace_objects) {
+            oid_dst = head_oid;
         }
     }
     let oid_src = entry.oid_src;
@@ -3050,33 +3046,33 @@ fn generate_submodule_summary(
     // Body.
     if let Some(msg) = errmsg {
         print!("{msg}");
-    } else if total_commits.is_some_and(|n| n > 0) {
-        if let Some(git_dir) = &sub_repo {
-            let format = repository_object_format(git_dir)?;
-            let db = FileObjectDatabase::from_git_dir(git_dir, format);
-            let limit = summary_limit.and_then(|limit| usize::try_from(limit).ok());
-            if src_is_gitlink && dst_is_gitlink {
-                // log --pretty='  %m %s' --first-parent <src>...<dst>: the `%m`
-                // marker is `>` for commits reachable only from dst (forward),
-                // `<` for commits reachable only from src (backward). git lists
-                // the dst-only (`>`) commits first, then the src-only (`<`).
-                let marked = summary_symmetric_log(&db, format, &oid_src, &oid_dst)?;
-                let take = limit.unwrap_or(marked.len());
-                for (marker, commit) in marked.iter().take(take) {
-                    println!("  {marker} {}", commit_subject(&commit.message));
-                }
-            } else if dst_is_gitlink {
-                // log --pretty='  > %s' -1 <dst>
-                let commit = summary_tip_commit(&db, format, &oid_dst)?;
-                if let Some(commit) = commit {
-                    println!("  > {}", commit_subject(&commit.message));
-                }
-            } else {
-                // log --pretty='  < %s' -1 <src>
-                let commit = summary_tip_commit(&db, format, &oid_src)?;
-                if let Some(commit) = commit {
-                    println!("  < {}", commit_subject(&commit.message));
-                }
+    } else if total_commits.is_some_and(|n| n > 0)
+        && let Some(git_dir) = &sub_repo
+    {
+        let format = repository_object_format(git_dir)?;
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let limit = summary_limit.and_then(|limit| usize::try_from(limit).ok());
+        if src_is_gitlink && dst_is_gitlink {
+            // log --pretty='  %m %s' --first-parent <src>...<dst>: the `%m`
+            // marker is `>` for commits reachable only from dst (forward),
+            // `<` for commits reachable only from src (backward). git lists
+            // the dst-only (`>`) commits first, then the src-only (`<`).
+            let marked = summary_symmetric_log(&db, format, &oid_src, &oid_dst)?;
+            let take = limit.unwrap_or(marked.len());
+            for (marker, commit) in marked.iter().take(take) {
+                println!("  {marker} {}", commit_subject(&commit.message));
+            }
+        } else if dst_is_gitlink {
+            // log --pretty='  > %s' -1 <dst>
+            let commit = summary_tip_commit(&db, format, &oid_dst)?;
+            if let Some(commit) = commit {
+                println!("  > {}", commit_subject(&commit.message));
+            }
+        } else {
+            // log --pretty='  < %s' -1 <src>
+            let commit = summary_tip_commit(&db, format, &oid_src)?;
+            if let Some(commit) = commit {
+                println!("  < {}", commit_subject(&commit.message));
             }
         }
     }
@@ -3107,12 +3103,12 @@ fn summary_abbrev(
         return (hex7, false);
     }
     // Present in the submodule repo?
-    if let Some(git_dir) = sub_git_dir {
-        if let Ok(format) = repository_object_format(git_dir) {
-            let db = FileObjectDatabase::from_git_dir(git_dir, format);
-            if db.read_object(oid).is_ok() {
-                return (hex7, false);
-            }
+    if let Some(git_dir) = sub_git_dir
+        && let Ok(format) = repository_object_format(git_dir)
+    {
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        if db.read_object(oid).is_ok() {
+            return (hex7, false);
         }
     }
     (hex7, true)
@@ -4002,17 +3998,13 @@ fn configured_submodule_url(
 /// `repo_remote_from_url`: the name of the first remote with a url exactly equal
 /// to `url` (remotes in config first-appearance order).
 fn remote_name_for_url(config: &GitConfig, url: &str) -> Option<String> {
-    for name in distinct_remote_names(config) {
-        if config
-            .get_all("remote", Some(&name), "url")
+    distinct_remote_names(config).into_iter().find(|name| {
+        config
+            .get_all("remote", Some(name), "url")
             .into_iter()
             .flatten()
             .any(|configured| configured == url)
-        {
-            return Some(name);
-        }
-    }
-    None
+    })
 }
 
 /// `repo_default_remote`: the HEAD branch's `branch.<name>.remote`, else the sole

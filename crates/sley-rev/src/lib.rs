@@ -2167,15 +2167,6 @@ impl GraphParents {
             Self::Many(parents) => parents.clone(),
         }
     }
-
-    #[allow(dead_code)]
-    fn grafted_vec<R: ObjectReader>(&self, reader: &R, oid: &ObjectId) -> Vec<ObjectId> {
-        if reader.is_shallow_graft(oid) {
-            Vec::new()
-        } else {
-            self.to_vec()
-        }
-    }
 }
 
 enum GraphParentIter<'a> {
@@ -2242,12 +2233,6 @@ struct GraphCommit {
     parents: GraphParents,
     generation: u32,
     commit_time: u64,
-}
-
-#[allow(dead_code)]
-struct GraphCommitMetadata<'a> {
-    parents: &'a GraphParents,
-    commit_time: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -2918,16 +2903,6 @@ impl<'a> CommitGraphContext<'a> {
             return Ok(parent);
         }
         Ok(commit_parents(reader, format, oid)?.into_iter().next())
-    }
-
-    /// `oid`'s parents and committer time from the graph in one lookup, or `None`
-    /// when the commit is not represented (the caller then reads the object).
-    #[allow(dead_code)]
-    fn metadata(&mut self, oid: &ObjectId) -> Result<Option<GraphCommitMetadata<'_>>> {
-        Ok(self.lookup(oid)?.map(|commit| GraphCommitMetadata {
-            parents: &commit.parents,
-            commit_time: i64::try_from(commit.commit_time).unwrap_or(i64::MAX),
-        }))
     }
 
     fn metadata_owned<R: ObjectReader>(
@@ -5318,7 +5293,7 @@ pub fn simplify_history_with_bottoms(
     // topology-keep decisions.
     let reachable: HashSet<ObjectId> = records.iter().map(|r| r.oid).collect();
     let record_oids = reachable.clone();
-    let mut relevant_set = reachable.clone();
+    let mut relevant_set = reachable;
     relevant_set.extend(bottoms.iter().copied());
     // `--simplify-merges` and `--ancestry-path` both set git's
     // `simplify_history = 0`, which disables the default single-parent diversion
@@ -9759,7 +9734,7 @@ mod tests {
         let oids = build_linear_history(&git_dir, 4); // oldest..newest
         let tip = *oids.last().expect("tip");
         let got = walk_oids(RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [tip]));
-        let mut expected = oids.clone();
+        let mut expected = oids;
         expected.reverse(); // newest committer-date first
         assert_eq!(got, expected);
         fs::remove_dir_all(git_dir).expect("cleanup");

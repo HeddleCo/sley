@@ -778,14 +778,10 @@ fn diagnose(args: &[String], base: &Path) -> Result<()> {
             eprintln!("fatal: not a git repository (or any of the parent directories): .git");
             GitError::Exit(128)
         })?;
-        let diagnostics_root = repository
-            .workdir()
-            .ok_or_else(|| scalar_requires_worktree())?;
+        let diagnostics_root = repository.workdir().ok_or_else(scalar_requires_worktree)?;
         (repository, diagnostics_root)
     };
-    let worktree = repository
-        .workdir()
-        .ok_or_else(|| scalar_requires_worktree())?;
+    let worktree = repository.workdir().ok_or_else(scalar_requires_worktree)?;
     let output = diagnostics_root.join(".scalarDiagnostics");
 
     crate::run(vec![

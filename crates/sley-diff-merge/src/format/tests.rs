@@ -3,7 +3,7 @@ use sley_grep::{Regex, RegexMode};
 
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
+    let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             while chars.next().is_some_and(|ch| ch != 'm') {}

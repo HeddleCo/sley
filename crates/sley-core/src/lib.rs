@@ -300,7 +300,7 @@ fn strftime(template: &str, parts: &DateParts<'_>) -> String {
         .position(|day| *day == parts.weekday)
         .unwrap_or(0);
     let mut out = String::with_capacity(template.len());
-    let mut chars = template.chars().peekable();
+    let mut chars = template.chars();
     while let Some(ch) = chars.next() {
         if ch != '%' {
             out.push(ch);

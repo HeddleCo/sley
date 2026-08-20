@@ -678,9 +678,9 @@ pub(crate) fn cmd_rev_list(
             include_commits
                 .iter()
                 .copied()
-                .filter(|oid| {
+                .filter(|_| {
                     !object_filter
-                        .includes_object(ObjectType::Commit, oid, &[], None, 0)
+                        .includes_object(ObjectType::Commit, &[], None, 0)
                         .unwrap_or(true)
                 })
                 .collect::<HashSet<_>>()
@@ -826,19 +826,13 @@ pub(crate) fn cmd_rev_list(
         // With --filter-provided-objects the directly-provided blobs lose
         // their filter exemption.
         let mut kept = Vec::with_capacity(provided_objects.len());
-        for object in provided_objects.drain(..) {
+        for object in std::mem::take(&mut provided_objects) {
             let size = if rev_list_filter_needs_blob_size(&object_filter) {
                 Some(db.read_object(&object.oid)?.body.len())
             } else {
                 None
             };
-            let keep = object_filter.includes_object(
-                ObjectType::Blob,
-                &object.oid,
-                &object.name,
-                size,
-                0,
-            )?;
+            let keep = object_filter.includes_object(ObjectType::Blob, &object.name, size, 0)?;
             if keep {
                 kept.push(object);
             }
@@ -1376,7 +1370,7 @@ pub(crate) fn cmd_rev_list(
     let mut commit_ordered_objects = HashMap::<ObjectId, Vec<RevListObject>>::new();
     if objects_in_commit_order {
         let mut trailing_objects = Vec::new();
-        for object in selected_objects.drain(..) {
+        for object in std::mem::take(&mut selected_objects) {
             if let Some(commit) = object_origin_commits.get(&object.oid) {
                 commit_ordered_objects
                     .entry(*commit)
@@ -1623,7 +1617,7 @@ pub(crate) fn cmd_rev_list(
         }
     }
     if filter_print_omitted {
-        for object in omitted_objects.drain(..) {
+        for object in std::mem::take(&mut omitted_objects) {
             write_rev_list_omitted_object_line(&object, nul_terminated)?;
         }
     }
@@ -1633,17 +1627,17 @@ pub(crate) fn cmd_rev_list(
     ) {
         let print_info = missing_action == RevListMissingAction::PrintInfo;
         let mut printed_missing = HashSet::new();
-        for object in missing_tip_objects.drain(..) {
+        for object in std::mem::take(&mut missing_tip_objects) {
             if printed_missing.insert(object.oid) {
                 write_rev_list_missing_object_line(&object, nul_terminated, print_info)?;
             }
         }
-        for object in missing_commit_objects.drain(..) {
+        for object in std::mem::take(&mut missing_commit_objects) {
             if printed_missing.insert(object.oid) {
                 write_rev_list_missing_object_line(&object, nul_terminated, print_info)?;
             }
         }
-        for object in missing_objects.drain(..) {
+        for object in std::mem::take(&mut missing_objects) {
             if printed_missing.insert(object.oid) {
                 write_rev_list_missing_object_line(&object, nul_terminated, print_info)?;
             }
@@ -2696,7 +2690,6 @@ impl RevListObjectFilter {
     fn includes_object(
         &self,
         object_type: ObjectType,
-        oid: &ObjectId,
         path: &[u8],
         size: Option<usize>,
         depth: usize,
@@ -2714,7 +2707,7 @@ impl RevListObjectFilter {
                 || rev_list_sparse_patterns_include(patterns, path, object_type)),
             Self::Combine(filters) => {
                 for filter in filters {
-                    if !filter.includes_object(object_type, oid, path, size, depth)? {
+                    if !filter.includes_object(object_type, path, size, depth)? {
                         return Ok(false);
                     }
                 }
@@ -2781,7 +2774,7 @@ fn rev_list_should_print_commit(
     tip_oids: &HashSet<ObjectId>,
 ) -> bool {
     filter
-        .includes_object(ObjectType::Commit, &record.oid, &[], None, 0)
+        .includes_object(ObjectType::Commit, &[], None, 0)
         .unwrap_or(true)
         || tip_oids.contains(&record.oid)
 }
@@ -3173,7 +3166,7 @@ fn rev_list_record_filter_decision(
 ) -> Result<()> {
     if walk
         .filter
-        .includes_object(object_type, oid, path, size, depth)?
+        .includes_object(object_type, path, size, depth)?
     {
         if state.emitted_oids.insert(*oid) {
             if let Some(commit) = state.current_commit {

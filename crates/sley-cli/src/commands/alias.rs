@@ -288,7 +288,7 @@ pub(crate) fn run_shell_alias(
         format!("{command} \"$@\"")
     };
     let mut prepared: Vec<String> = Vec::with_capacity(4 + extra_args.len());
-    prepared.push(shell.clone());
+    prepared.push(shell);
     prepared.push("-c".to_string());
     prepared.push(script);
     prepared.push(command.to_string());
@@ -325,10 +325,7 @@ pub(crate) fn run_shell_alias(
     if status.success() {
         Ok(())
     } else {
-        let code = match status.code() {
-            Some(code) => code,
-            None => 1,
-        };
+        let code = status.code().unwrap_or(1);
         Err(GitError::Exit(code))
     }
 }
@@ -378,7 +375,7 @@ fn git_prefix_from_path(path: &Path) -> String {
 pub(crate) fn split_alias_value(value: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
-    let mut chars = value.chars().peekable();
+    let mut chars = value.chars();
     while let Some(ch) = chars.next() {
         match ch {
             ' ' | '\t' | '\n' => {

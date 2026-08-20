@@ -249,10 +249,10 @@ fn interpolate_path(path: &str) -> PathBuf {
         if let Some(home) = env::var_os("HOME") {
             return PathBuf::from(home);
         }
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = env::var_os("HOME") {
-            return Path::new(&home).join(rest);
-        }
+    } else if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = env::var_os("HOME")
+    {
+        return Path::new(&home).join(rest);
     }
     PathBuf::from(path)
 }

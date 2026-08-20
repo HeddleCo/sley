@@ -619,7 +619,7 @@ fn fetch_impl(
             // (empty) quarantine transfer_git_dir. An empty have set makes the
             // v2 client send `done` on the first round, which skips the
             // acknowledgments/`ready` framing path that t5702 #72/#73 validate.
-            let pack_haves = match negotiation_haves.clone() {
+            let pack_haves = match negotiation_haves {
                 Some(haves) => Some(haves),
                 None => Some(crate::local::local_negotiation_have_oids(
                     request.git_dir,
@@ -773,7 +773,7 @@ fn fetch_impl(
                     remote,
                     features: &features,
                     wants,
-                    haves: negotiation_haves.clone(),
+                    haves: negotiation_haves,
                     shallow: existing_shallow,
                     deepen: options.depth,
                     promisor: promisor_remote,
@@ -884,7 +884,7 @@ fn fetch_impl(
                     config: Some(request.config),
                     features: &features,
                     wants,
-                    haves: negotiation_haves.clone(),
+                    haves: negotiation_haves,
                     shallow: existing_shallow,
                     deepen: options.depth,
                     promisor: promisor_remote,
@@ -1239,7 +1239,7 @@ fn fetch_impl(
                         format: request.format,
                         wants: exact_wants,
                         want_refs,
-                        haves: negotiation_haves.clone(),
+                        haves: negotiation_haves,
                         max_input_size,
                     },
                     services.cancel,
@@ -1278,7 +1278,7 @@ fn fetch_impl(
                     promisor_remote,
                     options.record_promisor_refs,
                     options.filter.clone(),
-                    negotiation_haves.clone(),
+                    negotiation_haves,
                     options.refetch,
                     local_fetch_unpack_limit(request.config, options.cloning, promisor_remote),
                     &promisor_decision,
@@ -1603,6 +1603,7 @@ fn normalize_relative_deepen_for_complete_repository(
     Ok(())
 }
 
+#[cfg(feature = "http")]
 fn resolve_deepen_not_refs(
     advertisements: &[RefAdvertisement],
     deepen_not: &[String],
@@ -3514,7 +3515,7 @@ mod tests {
         let remote_tip = commit_on(&remote, "main", "remote tip");
         let source = FetchSource::Local {
             git_dir: remote.clone(),
-            common_git_dir: remote.clone(),
+            common_git_dir: remote,
         };
         let refspecs = vec!["refs/heads/main:refs/remotes/origin/main".to_string()];
         let mut options = default_options();
@@ -3588,7 +3589,7 @@ mod tests {
         let local_tip = commit_on(&local, "side", "local side");
         let source = FetchSource::Local {
             git_dir: remote.clone(),
-            common_git_dir: remote.clone(),
+            common_git_dir: remote,
         };
         let refspecs = vec!["refs/heads/main:refs/heads/side".to_string()];
         let mut options = default_options();
@@ -3706,7 +3707,7 @@ mod tests {
         let tip = commit_on(&remote, "main", "remote tip");
         let source = FetchSource::Local {
             git_dir: remote.clone(),
-            common_git_dir: remote.clone(),
+            common_git_dir: remote,
         };
         let refspecs = vec!["refs/heads/main:refs/remotes/origin/main".to_string()];
         let options = default_options();
@@ -3761,6 +3762,7 @@ mod tests {
     /// serves a fixed smart-HTTP `info/refs` advertisement. Standing in for a
     /// host's SSRF-guarding client, it proves the fetch/clone HTTP path routes the
     /// dial through the injected client rather than constructing a fresh ureq one.
+    #[cfg(feature = "http")]
     struct RecordingHttpClient {
         advertisement: Vec<u8>,
         content_type: String,
@@ -3768,6 +3770,7 @@ mod tests {
         post_calls: std::sync::atomic::AtomicUsize,
     }
 
+    #[cfg(feature = "http")]
     impl HttpClient for RecordingHttpClient {
         fn get(
             &self,
@@ -3800,6 +3803,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn fetch_with_http_client_dials_injected_client() {
         use sley_protocol::{
@@ -3985,7 +3989,7 @@ mod tests {
         let tip = commit_on(&remote, "main", "tip");
         let source = FetchSource::Local {
             git_dir: remote.clone(),
-            common_git_dir: remote.clone(),
+            common_git_dir: remote,
         };
         let mut options = default_options();
         options.depth = Some(1);
@@ -4248,7 +4252,7 @@ mod tests {
         let tip = commit_on(&remote, "main", "tip");
         let source = FetchSource::Local {
             git_dir: remote.clone(),
-            common_git_dir: remote.clone(),
+            common_git_dir: remote,
         };
         let mut options = default_options();
         options.depth = Some(1);
@@ -4360,7 +4364,7 @@ mod tests {
         tx.commit().expect("local tracking ref should write");
         let source = FetchSource::Local {
             git_dir: remote.clone(),
-            common_git_dir: remote.clone(),
+            common_git_dir: remote,
         };
         let options = default_options();
         let mut credentials = NoCredentials;

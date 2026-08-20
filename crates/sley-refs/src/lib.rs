@@ -3612,7 +3612,7 @@ impl FileRefStore {
     }
 
     fn ref_prune_boundary(&self, name: &str) -> PathBuf {
-        let base = self.ref_base_dir(name).to_path_buf();
+        let base = self.ref_base_dir(name);
         let mut components = name.split('/');
         if components.next() == Some("refs")
             && let Some(namespace) = components.next()
@@ -3637,7 +3637,7 @@ impl FileRefStore {
         }
         let path = self.reflog_path(name);
         let _ = fs::remove_file(&path);
-        let base = self.ref_base_dir(name).to_path_buf();
+        let base = self.ref_base_dir(name);
         let logs_refs_root = base.join("logs").join("refs");
         if let Some(parent) = path.parent() {
             prune_empty_dirs_up_to(parent, &logs_refs_root);
@@ -4781,14 +4781,7 @@ impl FileRefStore {
         Ok(grouped.into_values().collect())
     }
 
-    /// Atomic, all-or-nothing commit for the loose-ref backend. See
-    /// [`FileRefTransaction::commit`] for the full ordering and rollback rules.
-    #[allow(dead_code)]
-    fn commit_loose(&self, changes: Vec<CoalescedRefChange>) -> Result<()> {
-        self.commit_loose_hooked(changes, None, None)
-    }
-
-    /// As [`commit_loose`](Self::commit_loose) but firing the
+    /// Atomic, all-or-nothing commit for the loose-ref backend, firing the
     /// `reference-transaction` hook at `prepared` (after every ref is locked and
     /// staged, before any rename) and `committed` (after every change lands).
     /// A nonzero hook exit in the `prepared` phase rolls the staged changes back

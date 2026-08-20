@@ -9,9 +9,6 @@ pub(super) enum PickaxeSpec {
     /// `-G<regex>`: the regex matches some added or removed line of the textual
     /// diff (the leading `+`/`-` is trimmed before matching).
     Grep(String),
-    /// `--find-object=<oid>`: a filepair matches when either side's blob oid is
-    /// in the object set.
-    FindObject(Vec<String>),
 }
 
 /// A compiled pickaxe predicate, ready to test a commit's diff filepairs.

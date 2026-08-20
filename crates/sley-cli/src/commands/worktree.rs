@@ -140,7 +140,7 @@ pub(crate) fn cmd_worktree_add(
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let path = resolve_cli_path(&cwd, &options.path);
+    let path = resolve_cli_path(cwd, &options.path);
     let add_plan = sley_worktree::admin::plan_add(
         path.clone(),
         options.force,
@@ -255,7 +255,7 @@ pub(crate) fn cmd_worktree_add(
         &add_head,
         reftable_refs,
         alternate_refs,
-        committer.clone(),
+        committer,
     )?;
     if let Some(contents) = add_plan.lock_contents.as_ref() {
         fs::write(admin_dir.join("locked"), contents)?;
@@ -323,7 +323,7 @@ fn write_linked_worktree_head(
             &[ReflogEntry {
                 old_oid: ObjectId::null(format),
                 new_oid: add_head.oid,
-                committer: committer.clone(),
+                committer,
                 message: b"worktree add".to_vec(),
             }],
         )?;
@@ -906,7 +906,7 @@ fn repair_registered_worktrees(
     failed: &mut bool,
 ) -> Result<()> {
     for admin in snapshot.linked() {
-        repair_registered_worktree_gitfile(common_git_dir, &admin, relative_paths, failed)?;
+        repair_registered_worktree_gitfile(common_git_dir, admin, relative_paths, failed)?;
     }
     Ok(())
 }
@@ -1510,7 +1510,7 @@ fn worktree_add_resolve_head(
                 worktree_unique_tracking_name(common_git_dir, store, &commitish)?
         {
             let new_branch = commitish.clone();
-            let start_short = remote_ref.clone();
+            let start_short = remote_ref;
             let start_oid = resolve_revision(common_git_dir, format, &start_short)?;
             store.create_branch(
                 &new_branch,
@@ -2053,11 +2053,6 @@ pub(crate) fn branch_checked_out_worktree(
         ));
     }
     Ok(None)
-}
-
-fn worktree_head_points_to(git_dir: &Path, refname: &str) -> Result<bool> {
-    let head = fs::read_to_string(git_dir.join("HEAD"))?;
-    Ok(head.trim() == format!("ref: {refname}"))
 }
 
 fn write_linked_worktree_checkout(

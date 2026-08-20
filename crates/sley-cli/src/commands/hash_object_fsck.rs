@@ -1025,7 +1025,7 @@ mod tests {
     fn decode_rejects_malformed_mode() {
         // Leading space => parse_mode returns NULL.
         let mut buf = b" 100644 name\0".to_vec();
-        buf.extend(std::iter::repeat(0u8).take(20));
+        buf.extend(std::iter::repeat_n(0u8, 20));
         assert_eq!(
             decode_tree_entry(&buf, 20).err(),
             Some("malformed mode in tree entry")
@@ -1035,7 +1035,7 @@ mod tests {
     #[test]
     fn decode_rejects_empty_filename() {
         let mut buf = b"100644 \0".to_vec();
-        buf.extend(std::iter::repeat(0u8).take(20));
+        buf.extend(std::iter::repeat_n(0u8, 20));
         assert_eq!(
             decode_tree_entry(&buf, 20).err(),
             Some("empty filename in tree entry")
@@ -1045,7 +1045,7 @@ mod tests {
     #[test]
     fn decode_accepts_valid_entry() {
         let mut buf = b"100644 file\0".to_vec();
-        buf.extend(std::iter::repeat(0x11u8).take(20));
+        buf.extend(std::iter::repeat_n(0x11u8, 20));
         let entry = decode_tree_entry(&buf, 20).expect("valid entry");
         assert_eq!(entry.mode, 0o100644);
         assert_eq!(entry.name, b"file");

@@ -194,6 +194,9 @@ pub(crate) fn path_component_count(path: &[u8]) -> usize {
 /// `prefix` is the cwd prefix and must end with `/` when non-empty, matching
 /// git's `cmd_prefix`. Emits `../` for each `prefix` component not shared with
 /// `input`, then the unshared tail of `input`.
+// `i` and `j` are independent cursors because repeated separators can advance
+// the prefix and input by different amounts.
+#[allow(clippy::suspicious_operation_groupings)]
 pub(crate) fn relative_path_bytes(input: &[u8], prefix: &[u8]) -> Vec<u8> {
     let in_len = input.len();
     let prefix_len = prefix.len();
@@ -208,7 +211,7 @@ pub(crate) fn relative_path_bytes(input: &[u8], prefix: &[u8]) -> Vec<u8> {
     let mut j = 0usize;
     let mut prefix_off = 0usize;
     let mut in_off = 0usize;
-    while i < prefix_len && j < in_len && prefix[i] == input[j] {
+    while i < prefix_len && j < in_len && prefix.get(i) == input.get(j) {
         if is_sep(prefix[i]) {
             while i < prefix_len && is_sep(prefix[i]) {
                 i += 1;

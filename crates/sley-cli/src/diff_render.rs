@@ -3,20 +3,18 @@
 
 use crate::commands;
 use crate::commands::remote::read_repo_config;
-use crate::session;
 use crate::{
     BString, DEFAULT_BIG_FILE_THRESHOLD, GitConfig, GitError, ObjectFormat, ObjectId, Result,
     commit_encoding, commit_subject, core_big_file_threshold, log_reencode_message,
     normalize_absolute_cli_pathspec, repository_object_format, sley_config, sley_core,
     sley_diff_merge, sley_odb, sley_pretty, sley_remote, sley_rev, sley_worktree,
-    status_quote_path, worktree_root_for_git_dir,
+    status_quote_path,
 };
 use sley::plumbing::sley_object::{Commit, EncodedObject, ObjectType};
 use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
 use sley::plumbing::sley_rev::diff_options::{
     DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleIgnoreMode, parse_submodule_ignore_mode,
 };
-use sley_grep;
 use sley_pathspec::{LsFilesPathFilter, parse_normalized_pathspec_element, pathspec_filters_match};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -348,14 +346,6 @@ impl SubmoduleDiffConfig {
     }
 }
 
-pub(crate) fn submodule_diff_config(
-    git_dir: &Path,
-    worktree_root: Option<&Path>,
-    cli: Option<SubmoduleIgnoreMode>,
-) -> SubmoduleDiffConfig {
-    submodule_diff_config_with_config(git_dir, worktree_root, cli, None)
-}
-
 pub(crate) fn submodule_diff_config_with_config(
     git_dir: &Path,
     worktree_root: Option<&Path>,
@@ -528,7 +518,7 @@ pub(crate) fn render_tree_to_tree_patch(
     )?;
     // Batch-prefetch every blob the patch body will open (git's
     // `diff_queued_diff_prefetch` / `promisor_remote_get_direct`).
-    prefetch_diff_entry_blobs(db, &entries, lazy_fetch)?;
+    prefetch_diff_entry_blobs(db, &entries, false, lazy_fetch)?;
     let mut out: Vec<u8> = Vec::new();
     for entry in &entries {
         write_diff_patch_entry(
@@ -1293,7 +1283,7 @@ fn diff_patch_oid(
     // Only repository-backed OIDs participate: a no-index/worktree content
     // hash may not exist in the ODB and therefore has no repository collision
     // set to extend against.
-    if let Some(oid) = oid.filter(|oid| !oid.is_null()) {
+    if let Some(_oid) = oid.filter(|oid| !oid.is_null()) {
         while width < hex.len()
             && matches!(
                 db.resolve_prefix(&hex[..width]),
@@ -1624,7 +1614,7 @@ pub(crate) fn collect_diff_stat_entries_with_worktree_clean<'a>(
 ) -> Result<Vec<DiffStatEntryData<'a>>> {
     // Batch-hydrate every blob the stat pass will open so a partial clone does
     // one promisor negotiation rather than one per path (t4067).
-    prefetch_diff_entry_blobs(db, entries, lazy_fetch)?;
+    prefetch_diff_entry_blobs(db, entries, use_worktree_new, lazy_fetch)?;
     let mut stat_entries = Vec::with_capacity(entries.len());
     for entry in entries {
         let old_content = diff_entry_old_stat_content(entry, db, lazy_fetch)?;
@@ -2496,9 +2486,20 @@ pub(crate) fn collect_diff_entry_blob_oids(
 pub(crate) fn prefetch_diff_entry_blobs(
     db: &FileObjectDatabase,
     entries: &[sley_diff_merge::NameStatusEntry],
+    new_side_is_worktree: bool,
     lazy_fetch: bool,
 ) -> Result<()> {
-    let oids = collect_diff_entry_blob_oids(entries);
+    let oids = if new_side_is_worktree {
+        let mut seen = HashSet::new();
+        entries
+            .iter()
+            .filter(|entry| entry.old_mode != Some(0o160000))
+            .filter_map(|entry| entry.old_oid)
+            .filter(|oid| seen.insert(*oid))
+            .collect()
+    } else {
+        collect_diff_entry_blob_oids(entries)
+    };
     prefetch_promisor_objects(db, &oids, lazy_fetch)
 }
 
@@ -2859,6 +2860,9 @@ fn is_binary_or_large_content(bytes: &[u8], big_file_threshold: u64) -> bool {
 /// Myers produces a shortest edit script, so the count of `Insert` lines is
 /// `new_len - lcs` and the count of `Delete` lines is `old_len - lcs` — exactly
 /// the values the removed local LCS counter returned.
+// The two independently shrinking suffix cursors intentionally index different
+// line arrays; grouping both subtractions would change the comparison.
+#[allow(clippy::suspicious_operation_groupings)]
 pub(crate) fn count_line_diff(old: &[u8], new: &[u8]) -> (usize, usize) {
     let old_lines = sley_diff_merge::split_lines(old);
     let new_lines = sley_diff_merge::split_lines(new);
@@ -2871,7 +2875,10 @@ pub(crate) fn count_line_diff(old: &[u8], new: &[u8]) -> (usize, usize) {
     }
     let mut old_end = old_lines.len();
     let mut new_end = new_lines.len();
-    while old_end > prefix && new_end > prefix && old_lines[old_end - 1] == new_lines[new_end - 1] {
+    while old_end > prefix
+        && new_end > prefix
+        && old_lines.get(old_end - 1) == new_lines.get(new_end - 1)
+    {
         old_end -= 1;
         new_end -= 1;
     }

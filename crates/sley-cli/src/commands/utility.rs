@@ -541,10 +541,8 @@ fn var_editor(
         Ok(term) => term == "dumb",
         Err(_) => true,
     };
-    if !terminal_is_dumb {
-        if let Ok(value) = env::var("VISUAL") {
-            return Ok(value);
-        }
+    if !terminal_is_dumb && let Ok(value) = env::var("VISUAL") {
+        return Ok(value);
     }
     if let Ok(value) = env::var("EDITOR") {
         return Ok(value);
@@ -1602,21 +1600,17 @@ fn expand_check_ref_format_branch_name(
         .strip_prefix("@{-")
         .and_then(|rest| rest.strip_suffix('}'))
     {
-        if inner.bytes().all(|b| b.is_ascii_digit()) {
-            if let Ok(n) = inner.parse::<usize>() {
-                if n > 0 {
-                    if let Ok(Some(from)) =
-                        sley_rev::nth_prior_checkout_branch_name(&git_dir, format, n)
-                    {
-                        // Reflog "from" is already the short name or an oid; strip
-                        // a heads/ prefix if a full ref was recorded.
-                        return from
-                            .strip_prefix("refs/heads/")
-                            .unwrap_or(&from)
-                            .to_string();
-                    }
-                }
-            }
+        if inner.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(n) = inner.parse::<usize>()
+            && n > 0
+            && let Ok(Some(from)) = sley_rev::nth_prior_checkout_branch_name(&git_dir, format, n)
+        {
+            // Reflog "from" is already the short name or an oid; strip
+            // a heads/ prefix if a full ref was recorded.
+            return from
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&from)
+                .to_string();
         }
         // Malformed / unresolvable `@{-N}` stays as the literal (then fails format).
         return name.to_string();

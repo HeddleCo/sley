@@ -2387,12 +2387,10 @@ fn refuse_if_current_working_directory_becomes_file(
     };
     if entries.iter().any(|(path, entry)| {
         path == &cwd && !sley_index::is_gitlink(entry.mode) && (entry.mode & 0o170000) != 0o040000
-    }) {
-        if let Some(path) = safe_worktree_path(worktree_root, &cwd)
-            && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
-        {
-            return refuse_remove_current_working_directory(&cwd);
-        }
+    }) && let Some(path) = safe_worktree_path(worktree_root, &cwd)
+        && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+    {
+        return refuse_remove_current_working_directory(&cwd);
     }
     Ok(())
 }

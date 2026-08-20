@@ -10,18 +10,18 @@ use sley::protocol::{
     SideBandChannel, SideBandPacket, StreamingSidebandReader, write_sideband_packet,
 };
 
-fn empty_sha1_pack() -> Vec<u8> {
-    let mut pack = b"PACK\0\0\0\x02\0\0\0\0".to_vec();
-    pack.extend_from_slice(&[
-        0x02, 0x9d, 0x08, 0x82, 0x3b, 0xd8, 0xa8, 0xea, 0xb5, 0x10, 0xad, 0x6a, 0xc7, 0x5c, 0x82,
-        0x3c, 0xfd, 0x3e, 0xd3, 0x1e,
-    ]);
-    pack
+fn single_blob_sha1_pack() -> Vec<u8> {
+    vec![
+        0x50, 0x41, 0x43, 0x4b, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x36, 0x78, 0x9c,
+        0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0xe7, 0x02, 0x00, 0x08, 0x4b, 0x02, 0x1f, 0xde, 0x04, 0x12,
+        0x40, 0x1f, 0x4a, 0x9e, 0x5f, 0x05, 0x41, 0x1f, 0x44, 0xea, 0xf9, 0xc8, 0x6d, 0x46, 0x09,
+        0x67, 0x46,
+    ]
 }
 
 #[test]
 fn public_streaming_primitives_index_and_demux_without_a_repository() {
-    let pack = empty_sha1_pack();
+    let pack = single_blob_sha1_pack();
     let mut response = Vec::new();
     write_sideband_packet(
         &mut response,
@@ -46,10 +46,18 @@ fn public_streaming_primitives_index_and_demux_without_a_repository() {
     let mut seekable_pack = Cursor::new(demuxed_pack);
     let build = index_pack_from_reader(&mut seekable_pack, ObjectFormat::Sha1)
         .expect("seekable pack should index");
-    assert!(build.entries.is_empty());
+    assert_eq!(build.entries.len(), 1);
+    assert_eq!(build.objects.len(), 1);
+    assert_eq!(
+        build.entries[0].oid.to_hex(),
+        "ce013625030ba8dba906f756967f9e9ca394464a"
+    );
+    assert_eq!(build.objects[0].oid, build.entries[0].oid);
+    assert_eq!(build.objects[0].object_type.as_str(), "blob");
+    assert_eq!(build.objects[0].size, 6);
     assert_eq!(
         build.pack_checksum.to_hex(),
-        "029d08823bd8a8eab510ad6ac75c823cfd3ed31e"
+        "de0412401f4a9e5f05411f44eaf9c86d46096746"
     );
     assert!(!build.index.is_empty());
 

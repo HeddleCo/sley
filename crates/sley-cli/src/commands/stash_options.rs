@@ -1,7 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 use super::{StashApplyOptions, StashListFormat, StashListOptions};
 use crate::*;
-use sley_grep::PatternKind;
 
 pub(super) fn setup_stash_apply_options(
     args: &[String],

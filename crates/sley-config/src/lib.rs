@@ -3935,7 +3935,7 @@ mod tests {
             .expect("test operation should succeed");
 
         // git_dir under the pattern: condition matches.
-        let matching = ConfigIncludeContext::new(Some(work_git.clone()), None);
+        let matching = ConfigIncludeContext::new(Some(work_git), None);
         let config =
             load_config_with_includes(&main, &matching).expect("test operation should succeed");
         assert_eq!(config.get("user", None, "name"), Some("work"));
@@ -4035,7 +4035,7 @@ mod tests {
         // Realpath-only context still works for patterns that name the
         // physical component (`foo/`), and does not spuriously match `bar/`
         // without a PWD rewrite available in this process.
-        let physical_ctx = ConfigIncludeContext::new(Some(discovered.clone()), None);
+        let physical_ctx = ConfigIncludeContext::new(Some(discovered), None);
         let config =
             load_config_with_includes(&main, &physical_ctx).expect("load includes physical");
         // No `$PWD` rewrite in-process here; physical path alone must not

@@ -333,7 +333,7 @@ fn patch_id_single_and_multi_file_diffs_match_git() {
 
     let m_only = git_capture_bytes(&repo, &["diff", "main~6", "main~5", "--", "m.txt"]);
     let z_only = git_capture_bytes(&repo, &["diff", "main~6", "main~5", "--", "z.txt"]);
-    let mut reversed = z_only.clone();
+    let mut reversed = z_only;
     reversed.extend_from_slice(&m_only);
     assert_all_modes(&repo, &reversed);
 

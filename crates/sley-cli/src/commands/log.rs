@@ -2612,7 +2612,6 @@ fn cmd_log_impl(
                     needle.clone().into_bytes()
                 },
             }),
-            PickaxeSpec::FindObject(_) => unreachable!("find-object handled above"),
         }
     } else {
         None
@@ -3432,7 +3431,7 @@ fn cmd_log_impl(
     if follow_applied {
         let LogFollowResult { records, paths } =
             log_follow_single_path(&db, format, selected, pathspecs[0].as_bytes(), true)?;
-        for (record, path) in records.iter().zip(paths.into_iter()) {
+        for (record, path) in records.iter().zip(paths) {
             follow_paths.insert(record.oid, path);
         }
         selected = records;
@@ -3608,13 +3607,13 @@ fn cmd_log_impl(
         let mut records: Vec<sley_rev::CommitRecord> = Vec::new();
         for record in &selected {
             for parent in &record.parents {
-                if !shown_set.contains(parent) && seen.insert(*parent) {
-                    if let Ok(rec) =
+                if !shown_set.contains(parent)
+                    && seen.insert(*parent)
+                    && let Ok(rec) =
                         sley_rev::revlist::read_rev_list_commit_record(&db, format, *parent)
-                    {
-                        boundary_oids.insert(*parent);
-                        records.push(rec);
-                    }
+                {
+                    boundary_oids.insert(*parent);
+                    records.push(rec);
                 }
             }
         }

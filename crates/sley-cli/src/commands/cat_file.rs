@@ -12,7 +12,7 @@ use crate::*;
 use sley::ObjectDatabase as FileObjectDatabase;
 use sley::plumbing::sley_object::ObjectType;
 use sley::plumbing::sley_odb::ObjectStorageInfo;
-use sley::{GitError, ObjectFormat, ObjectId, Repository, Result};
+use sley::{GitError, ObjectFormat, ObjectId, Result};
 
 pub(crate) fn cmd_cat_file(
     cli_session: &crate::session::CliSession,
@@ -396,27 +396,12 @@ enum CatFileCmdMode {
     BatchAllObjects,
 }
 
-impl CatFileCmdMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Exists => "-e",
-            Self::Type => "-t",
-            Self::Size => "-s",
-            Self::Pretty => "-p",
-            Self::Textconv => "--textconv",
-            Self::Filters => "--filters",
-            Self::BatchAllObjects => "--batch-all-objects",
-        }
-    }
-}
-
 struct RepositoryObjectView {
     git_dir: PathBuf,
     common_git_dir: PathBuf,
     worktree_root: Option<PathBuf>,
     format: ObjectFormat,
     db: Arc<FileObjectDatabase>,
-    refs: FileRefStore,
     lazy_fetch: bool,
     replace_objects: bool,
 }
@@ -430,7 +415,6 @@ impl RepositoryObjectView {
         let worktree_root = cli_session.worktree_root_for_git_dir(&git_dir).ok();
         Ok(Self {
             db: repository.objects(),
-            refs: repository.references(),
             git_dir,
             common_git_dir,
             worktree_root,
@@ -469,10 +453,6 @@ impl RepositoryObjectView {
 
     fn db(&self) -> &FileObjectDatabase {
         self.db.as_ref()
-    }
-
-    fn refs(&self) -> &FileRefStore {
-        &self.refs
     }
 
     fn resolve(&self, name: &str) -> Result<ObjectId> {
@@ -1154,7 +1134,7 @@ impl CatFileBatchRequest {
                         eprintln!("fatal: flush is only for --buffer mode");
                         return Err(GitError::Exit(128));
                     }
-                    for (queued_command, queued_mailmap) in queued.drain(..) {
+                    for (queued_command, queued_mailmap) in std::mem::take(&mut queued) {
                         self.run_batch_command(
                             &mut stdout,
                             &view,
@@ -1184,7 +1164,7 @@ impl CatFileBatchRequest {
             }
         }
         if self.buffer && !queued.is_empty() && !cat_file_no_flush_on_exit() {
-            for (queued_command, queued_mailmap) in queued.drain(..) {
+            for (queued_command, queued_mailmap) in std::mem::take(&mut queued) {
                 self.run_batch_command(
                     &mut stdout,
                     &view,

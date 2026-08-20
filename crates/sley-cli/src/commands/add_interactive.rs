@@ -12,7 +12,7 @@
 
 use sley::plumbing::{sley_config, sley_core, sley_worktree};
 use std::env;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -29,12 +29,9 @@ struct AddInteractiveContext {
 impl AddInteractiveContext {
     fn open(cli_session: &crate::session::CliSession) -> Result<Self> {
         let repository = cli_session.open_repository()?;
-        let worktree_root = repository
-            .workdir()
-            .ok_or_else(|| {
-                GitError::Unsupported("interactive add requires a repository worktree".into())
-            })?
-            .to_path_buf();
+        let worktree_root = repository.workdir().ok_or_else(|| {
+            GitError::Unsupported("interactive add requires a repository worktree".into())
+        })?;
         let git_dir = repository.git_dir().to_path_buf();
         let format = repository.object_format();
         let collapsed_sparse_prefixes = sley_worktree::read_repository_index(&git_dir, format)?
@@ -250,6 +247,8 @@ fn parse_numstat(bytes: &[u8]) -> Vec<(String, usize, usize, bool)> {
 }
 
 /// Which side(s) of the index/worktree to collect for a listing.
+// The repeated suffix makes the three CLI states read unambiguously at call sites.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, PartialEq)]
 enum Filter {
     NoFilter,
@@ -1129,7 +1128,7 @@ fn patch_color_enabled(config: Option<&GitConfig>, slot: &str) -> bool {
     let key = config
         .and_then(|c| c.get("color", None, slot))
         .or_else(|| config.and_then(|c| c.get("color", None, "ui")));
-    match key.as_deref().map(str::trim) {
+    match key.map(str::trim) {
         Some("always") | Some("auto") => true,
         Some(value) => sley_config::parse_config_bool(value).unwrap_or(false),
         None => {
@@ -1151,14 +1150,6 @@ fn patch_color_slot(
     }
     config
         .and_then(|c| c.get("color", Some(section), slot))
-        .and_then(|value| super::diff_words::parse_color_value(&value))
+        .and_then(super::diff_words::parse_color_value)
         .unwrap_or_else(|| default.to_string())
-}
-
-/// Drain all of stdin (used when a command path needs the buffered input but
-/// no longer wants it). Currently unused placeholder for future modes.
-#[allow(dead_code)]
-fn drain_stdin() {
-    let mut buf = Vec::new();
-    let _ = io::stdin().read_to_end(&mut buf);
 }
