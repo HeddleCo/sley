@@ -1,6 +1,9 @@
 //! Streaming pack writer: known-count iterators and byte-budgeted windows.
 
-use sley_core::{ByteBudget, GitError, ObjectFormat, ObjectId, ResourceLimitKind, Result};
+use sley_core::{
+    AtomicCancel, ByteBudget, CancelFlag, GitError, ObjectFormat, ObjectId, ResourceLimitKind,
+    Result,
+};
 use sley_object::{EncodedObject, ObjectType};
 use sley_pack::{PackFile, PackWriteLimits, PackWriteOptions};
 use std::cell::Cell;
@@ -388,6 +391,155 @@ fn empty_known_count_writes_empty_pack() {
     .expect("empty pack");
     let parsed = PackFile::parse(&pack, format).expect("parse empty");
     assert!(parsed.entries.is_empty());
+}
+
+#[test]
+fn huge_declared_count_with_empty_iterator_is_count_mismatch() {
+    let format = ObjectFormat::Sha1;
+    let err = write_from_map(
+        std::iter::empty(),
+        u32::MAX,
+        format,
+        &PackWriteOptions::new(),
+        PackWriteLimits::default(),
+        &HashMap::new(),
+    )
+    .expect_err("unverified huge count must not allocate a successful pack");
+    assert_eq!(
+        err,
+        GitError::CountMismatch {
+            expected: u64::from(u32::MAX),
+            actual: 0
+        }
+    );
+}
+
+#[test]
+fn leftover_lookahead_is_charged_to_peak_working_set() {
+    let format = ObjectFormat::Sha1;
+    let first = EncodedObject::new(ObjectType::Blob, vec![b'A'; 100]);
+    let second = EncodedObject::new(ObjectType::Blob, vec![b'B'; 100]);
+    let first_oid = first.object_id(format).expect("oid");
+    let second_oid = second.object_id(format).expect("oid");
+    let map = HashMap::from([(first_oid, Arc::new(first)), (second_oid, Arc::new(second))]);
+    let object_cost = 100 + 64;
+    let limits = PackWriteLimits::new()
+        .with_compression_working_set(ByteBudget::new(200))
+        .with_delta_base(ByteBudget::ZERO)
+        .with_decoded_object(ByteBudget::new(1024));
+    let mut written = Vec::new();
+    let summary = PackFile::write_packed_from_source_to_writer(
+        [first_oid, second_oid],
+        2,
+        format,
+        &PackWriteOptions::new().with_depth(0).with_reorder(false),
+        limits,
+        |oid| {
+            map.get(oid)
+                .cloned()
+                .ok_or_else(|| GitError::not_found(format!("missing {oid}")))
+        },
+        &mut written,
+    )
+    .expect("leftover write");
+    assert_eq!(
+        summary.peak_working_set_bytes,
+        object_cost * 2,
+        "peak must include the decoded leftover lookahead"
+    );
+    PackFile::verify_pack_stats(&written, format).expect("verify");
+}
+
+#[test]
+fn duplicate_ids_are_rejected_before_self_ref_delta() {
+    let format = ObjectFormat::Sha1;
+    let object = EncodedObject::new(ObjectType::Blob, b"dup\n".to_vec());
+    let oid = object.object_id(format).expect("oid");
+    let map = HashMap::from([(oid, Arc::new(object))]);
+    let err = write_from_map(
+        [oid, oid],
+        2,
+        format,
+        &PackWriteOptions::new().with_prefer_ofs_delta(false),
+        PackWriteLimits::default(),
+        &map,
+    )
+    .expect_err("duplicate ids must fail");
+    assert!(
+        matches!(err, GitError::InvalidFormat(ref msg) if msg.contains("duplicate object id")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn cancel_is_polled_while_filling_tiny_object_window() {
+    let format = ObjectFormat::Sha1;
+    let (ids, map) = blob_objects(format, 64, b"");
+    let reads = Rc::new(Cell::new(0usize));
+    let source = AtomicCancel::new();
+    let mut written = Vec::new();
+    let err = PackFile::write_packed_from_source_to_writer_with_cancel(
+        ids,
+        64,
+        format,
+        &PackWriteOptions::new().with_reorder(false),
+        PackWriteLimits::default(),
+        |oid| {
+            let n = reads.get() + 1;
+            reads.set(n);
+            if n == 1 {
+                source.cancel();
+            }
+            map.get(oid)
+                .cloned()
+                .ok_or_else(|| GitError::not_found(format!("missing {oid}")))
+        },
+        &mut written,
+        CancelFlag::new(&source),
+    )
+    .expect_err("cancel during fill must fail");
+    assert_eq!(err, GitError::Cancelled);
+    assert_eq!(
+        reads.get(),
+        1,
+        "must not keep filling a tiny-object window after cancel"
+    );
+}
+
+#[test]
+fn empty_delta_bases_charge_metadata_against_horizon() {
+    let format = ObjectFormat::Sha1;
+    let (ids, map) = blob_objects(format, 8, b"");
+    let limits = PackWriteLimits::new()
+        .with_compression_working_set(ByteBudget::new(8 * 64))
+        .with_delta_base(ByteBudget::new(64 * 2))
+        .with_decoded_object(ByteBudget::new(1024));
+    let mut written = Vec::new();
+    let summary = PackFile::write_packed_from_source_to_writer(
+        ids,
+        8,
+        format,
+        &PackWriteOptions::new().with_window(32).with_reorder(false),
+        limits,
+        |oid| {
+            map.get(oid)
+                .cloned()
+                .ok_or_else(|| GitError::not_found(format!("missing {oid}")))
+        },
+        &mut written,
+    )
+    .expect("empty-base write");
+    assert!(
+        summary.peak_working_set_bytes >= 64 * 2,
+        "empty retained bases must still charge metadata, peak {}",
+        summary.peak_working_set_bytes
+    );
+    let unpaid_horizon = 8 * 64;
+    assert!(
+        summary.peak_working_set_bytes < unpaid_horizon.saturating_add(8 * 64),
+        "horizon must evict empty bases once metadata exceeds delta_base, peak {}",
+        summary.peak_working_set_bytes
+    );
 }
 
 #[test]

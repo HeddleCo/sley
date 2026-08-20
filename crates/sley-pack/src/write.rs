@@ -149,8 +149,10 @@ impl PackWriteOptions {
 /// the configured budgets.
 ///
 /// Peak charged memory is at most `compression_working_set + delta_base` plus
-/// one oversized object or base. Zlib output buffers and allocator slack are
-/// not included.
+/// one leftover lookahead object that did not fit the current window, and one
+/// oversized one-object quantum or retained base. The leftover is charged so
+/// decoded RAM cannot silently approach twice the working-set budget.
+/// Zlib output buffers and allocator slack are not included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackWriteLimits {
     /// Decoded bodies plus per-object overhead admitted into one compression
@@ -202,7 +204,11 @@ fn pack_object_window_cost(object: &EncodedObject) -> u64 {
 }
 
 fn pack_delta_base_cost(object: &EncodedObject) -> u64 {
-    object.body.len() as u64
+    pack_object_window_cost(object)
+}
+
+fn duplicate_pack_object_id(oid: ObjectId) -> GitError {
+    GitError::InvalidFormat(format!("pack contains duplicate object id {oid}"))
 }
 
 fn next_compression_window_end(
@@ -235,9 +241,16 @@ struct PendingSourceObject {
     object: Arc<EncodedObject>,
 }
 
+fn leftover_window_cost(leftover: Option<&PendingSourceObject>) -> u64 {
+    leftover
+        .map(|pending| pack_object_window_cost(&pending.object))
+        .unwrap_or(0)
+}
+
 struct SourcePackStream<I, F> {
     selected: I,
     leftover: Option<PendingSourceObject>,
+    seen: HashSet<ObjectId>,
     yielded: u64,
     object_count: u32,
     format: ObjectFormat,
@@ -263,12 +276,13 @@ where
         Self {
             selected,
             leftover: None,
+            seen: HashSet::new(),
             yielded: 0,
             object_count,
             format,
             limits,
             read_object,
-            index_entries: Vec::with_capacity(object_count as usize),
+            index_entries: Vec::new(),
             delta_count: 0,
             peak_working_set_bytes: 0,
         }
@@ -293,6 +307,9 @@ where
                 "pack object id format does not match pack format".into(),
             ));
         }
+        if !self.seen.insert(oid) {
+            return Err(duplicate_pack_object_id(oid));
+        }
         let object = (self.read_object)(&oid)?;
         let attempted = object.body.len() as u64;
         let limit = self.limits.decoded_object.as_u64();
@@ -306,10 +323,14 @@ where
         Ok(Some(PendingSourceObject { oid, object }))
     }
 
-    fn fill_window(&mut self) -> Result<(Vec<PendingSourceObject>, u64)> {
+    fn fill_window(&mut self, cancel: CancelFlag<'_>) -> Result<(Vec<PendingSourceObject>, u64)> {
         let mut window = Vec::new();
         let mut used = 0u64;
-        while let Some(pending) = self.pull()? {
+        loop {
+            cancel.check()?;
+            let Some(pending) = self.pull()? else {
+                break;
+            };
             let cost = pack_object_window_cost(&pending.object);
             if window.is_empty() {
                 window.push(pending);
@@ -330,7 +351,9 @@ where
     }
 
     fn note_peak(&mut self, window_bytes: u64, horizon_bytes: u64) {
-        let now = window_bytes.saturating_add(horizon_bytes);
+        let now = window_bytes
+            .saturating_add(horizon_bytes)
+            .saturating_add(leftover_window_cost(self.leftover.as_ref()));
         if now > self.peak_working_set_bytes {
             self.peak_working_set_bytes = now;
         }
@@ -564,9 +587,7 @@ impl PackFile {
         let mut seen = HashSet::with_capacity(object_ids.len());
         for oid in &object_ids {
             if !seen.insert(oid) {
-                return Err(GitError::InvalidFormat(format!(
-                    "pack contains duplicate object id {oid}"
-                )));
+                return Err(duplicate_pack_object_id(*oid));
             }
         }
 
@@ -671,9 +692,7 @@ impl PackFile {
         let mut seen = HashSet::with_capacity(object_ids.len());
         for oid in &object_ids {
             if !seen.insert(oid) {
-                return Err(GitError::InvalidFormat(format!(
-                    "pack contains duplicate object id {oid}"
-                )));
+                return Err(duplicate_pack_object_id(*oid));
             }
         }
 
@@ -801,8 +820,9 @@ impl PackFile {
     ///
     /// `object_count` is written into the pack header. Yielding fewer or more
     /// ids is [`GitError::CountMismatch`] and never a successful pack.
-    /// Compression windows are admitted by [`PackWriteLimits`]. Polls `cancel`
-    /// between windows.
+    /// Repeated ids are rejected as they are consumed. Compression windows are
+    /// admitted by [`PackWriteLimits`]. Polls `cancel` between windows and
+    /// while filling a window.
     #[allow(clippy::too_many_arguments)]
     pub fn write_undeltified_from_source_to_writer_with_cancel<W, I, F>(
         selected_objects: I,
@@ -834,7 +854,7 @@ impl PackFile {
 
         loop {
             cancel.check()?;
-            let (window, window_bytes) = stream.fill_window()?;
+            let (window, window_bytes) = stream.fill_window(cancel)?;
             if window.is_empty() {
                 break;
             }
@@ -907,9 +927,12 @@ impl PackFile {
     /// budget is written as a one-object quantum when it still fits
     /// [`PackWriteLimits::decoded_object`]; otherwise it is a typed
     /// [`GitError::ResourceLimit`]. Delta-base retention is charged to
-    /// [`PackWriteLimits::delta_base`]. Output-writer backpressure and
-    /// `read_object` failures stop further enumeration. Polls `cancel`
-    /// between windows and returns [`GitError::Cancelled`] when the flag trips.
+    /// [`PackWriteLimits::delta_base`]. A leftover lookahead object that does
+    /// not fit the current window is charged against the working-set peak.
+    /// Repeated ids are rejected as they are consumed. Output-writer
+    /// backpressure and `read_object` failures stop further enumeration. Polls
+    /// `cancel` between windows and while filling a window, and returns
+    /// [`GitError::Cancelled`] when the flag trips.
     #[allow(clippy::too_many_arguments)]
     pub fn write_packed_from_source_to_writer_with_cancel<W, I, F>(
         selected_objects: I,
@@ -945,7 +968,7 @@ impl PackFile {
 
         loop {
             cancel.check()?;
-            let (window, window_bytes) = stream.fill_window()?;
+            let (window, window_bytes) = stream.fill_window(cancel)?;
             if window.is_empty() {
                 break;
             }
