@@ -150,9 +150,9 @@ pub mod plumbing {
 // so the common path (`use sley::{Repository, ObjectId, ...}`) stays short.
 pub use sley_config::GitConfig;
 pub use sley_core::{
-    AtomicCancel, BString, CancelFlag, CancellableRead, DynCancelFlag, FullName, GitError, GitTime,
-    MissingObjectContext, MissingObjectKind, NotFoundKind, ObjectFormat, ObjectId, Result,
-    Signature, StreamControl,
+    AtomicCancel, BString, ByteBudget, CancelFlag, CancellableRead, DynCancelFlag, FullName,
+    GitError, GitTime, MissingObjectContext, MissingObjectKind, NotFoundKind, ObjectFormat,
+    ObjectId, ResourceLimitKind, Result, Signature, StreamControl,
 };
 pub use sley_diff_merge::format as diff_format;
 pub use sley_diff_merge::{DiffNameStatusOptions, NameStatusEntry};
@@ -163,7 +163,7 @@ pub use sley_object::{
 };
 pub use sley_object::{EntryKind, TreeBuilder as TreeEditor};
 pub use sley_odb::FileObjectDatabase as ObjectDatabase;
-pub use sley_pack::PackWriteOptions;
+pub use sley_pack::{PackWriteLimits, PackWriteOptions};
 pub use sley_pretty as pretty;
 pub use sley_refs::{
     FileRefStore as RefStore, RefDeleteError, RefPrecondition, RefTarget as ReferenceTarget,

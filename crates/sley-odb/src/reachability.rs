@@ -7,7 +7,7 @@ use sley_core::{
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, tree_entry_object_type};
 use sley_pack::{
     MultiPackIndex, PackBitmapIndex, PackBitmapWriter, PackFile, PackIndex, PackIndexEntry,
-    PackIndexViewData, PackInput, PackWrite, PackWriteOptions, PackWriteSummary,
+    PackIndexViewData, PackInput, PackWrite, PackWriteLimits, PackWriteOptions, PackWriteSummary,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
@@ -498,27 +498,38 @@ where
             if metadata.is_empty() {
                 return Ok(None);
             }
-            let object_ids = metadata.iter().map(|meta| meta.oid).collect::<Vec<_>>();
-            write_object_id_pack_to_writer_with_cancel(reader, format, &object_ids, writer, cancel)
-                .map(Some)
+            let object_count = u32::try_from(metadata.len())
+                .map_err(|_| GitError::InvalidFormat("too many pack objects".into()))?;
+            write_object_id_pack_to_writer_with_cancel(
+                reader,
+                format,
+                metadata.iter().map(|meta| meta.oid),
+                object_count,
+                writer,
+                cancel,
+            )
+            .map(Some)
         }
     }
 }
 
-pub fn write_object_id_pack_to_writer<R, W>(
+pub fn write_object_id_pack_to_writer<R, I, W>(
     reader: &R,
     format: ObjectFormat,
-    object_ids: &[ObjectId],
+    selected_objects: I,
+    object_count: u32,
     writer: &mut W,
 ) -> Result<ReachablePackWriteSummary>
 where
     R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
     W: Write,
 {
     write_object_id_pack_to_writer_with_cancel(
         reader,
         format,
-        object_ids,
+        selected_objects,
+        object_count,
         writer,
         CancelFlag::never(),
     )
@@ -526,21 +537,25 @@ where
 
 /// Streaming object-id pack write that polls `cancel` between compression
 /// windows via [`PackFile::write_packed_from_source_to_writer_with_cancel`].
-pub fn write_object_id_pack_to_writer_with_cancel<R, W>(
+pub fn write_object_id_pack_to_writer_with_cancel<R, I, W>(
     reader: &R,
     format: ObjectFormat,
-    object_ids: &[ObjectId],
+    selected_objects: I,
+    object_count: u32,
     writer: &mut W,
     cancel: CancelFlag<'_>,
 ) -> Result<ReachablePackWriteSummary>
 where
     R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
     W: Write,
 {
     let summary = PackFile::write_packed_from_source_to_writer_with_cancel(
-        object_ids,
+        selected_objects,
+        object_count,
         format,
         &PackWriteOptions::new(),
+        PackWriteLimits::default(),
         |oid| reader.read_object(oid),
         writer,
         cancel,
@@ -902,10 +917,14 @@ fn build_reachable_pack_objects_with_reuse<R: ObjectReader>(
             }
             ReachablePackObjectsForWrite::Streaming(_) => {
                 let mut pack = Vec::new();
+                let object_count = u32::try_from(fresh_oids.len())
+                    .map_err(|_| GitError::InvalidFormat("too many pack objects".into()))?;
                 let summary = PackFile::write_packed_from_source_to_writer(
-                    &fresh_oids,
+                    fresh_oids.iter().copied(),
+                    object_count,
                     format,
                     &PackWriteOptions::new(),
+                    PackWriteLimits::default(),
                     |oid| reader.read_object(oid),
                     &mut pack,
                 )?;
@@ -1050,10 +1069,14 @@ where
     let mut delta_count = 0u32;
     if !fresh_oids.is_empty() {
         let mut fresh_body = GeneratedPackBodyWriter::new(&mut output, format.raw_len());
+        let fresh_count = u32::try_from(fresh_oids.len())
+            .map_err(|_| GitError::InvalidFormat("too many pack objects".into()))?;
         let fresh = PackFile::write_packed_from_source_to_writer(
-            &fresh_oids,
+            fresh_oids.iter().copied(),
+            fresh_count,
             format,
             &PackWriteOptions::new(),
+            PackWriteLimits::default(),
             |oid| reader.read_object(oid),
             &mut fresh_body,
         )?;

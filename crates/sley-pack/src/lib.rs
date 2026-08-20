@@ -3,7 +3,10 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use flate2::{Compress, Compression, FlushCompress, Status};
-use sley_core::{CancelFlag, GitError, ObjectFormat, ObjectId, Result, StreamingDigest};
+use sley_core::{
+    ByteBudget, CancelFlag, GitError, ObjectFormat, ObjectId, ResourceLimitKind, Result,
+    StreamingDigest,
+};
 use sley_formats::Bundle;
 use sley_object::{EncodedObject, ObjectType};
 use std::borrow::Borrow;
@@ -115,6 +118,10 @@ pub struct PackWriteSummary {
     pub entries: Vec<PackIndexEntry>,
     pub delta_count: u32,
     pub pack_size: u64,
+    /// High-water mark of decoded window bodies plus retained delta bases,
+    /// as charged by [`PackWriteLimits`]. Does not include zlib output buffers
+    /// or allocator slack.
+    pub peak_working_set_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,8 +327,7 @@ mod tests {
     #[test]
     fn write_packed_from_source_respects_cancel_between_windows() {
         let format = ObjectFormat::Sha1;
-        // Two compression windows so cancel between windows is observable.
-        let count = PACK_STREAM_COMPRESSION_WINDOW_OBJECTS + 4;
+        let count = 4u32;
         let objects = (0..count)
             .map(|idx| {
                 EncodedObject::new(
@@ -344,9 +350,11 @@ mod tests {
         source.cancel();
         let mut written = Vec::new();
         let err = PackFile::write_packed_from_source_to_writer_with_cancel(
-            &object_ids,
+            object_ids.iter().copied(),
+            count,
             format,
             &PackWriteOptions::new().with_reorder(false),
+            PackWriteLimits::default(),
             |oid| {
                 object_map
                     .get(oid)
@@ -2591,23 +2599,18 @@ mod tests {
     #[test]
     fn write_packed_from_source_to_writer_deltifies_across_windows() {
         let format = ObjectFormat::Sha1;
-        let mut objects = Vec::new();
-        for idx in 0..PACK_STREAM_COMPRESSION_WINDOW_OBJECTS - 1 {
-            objects.push(EncodedObject::new(
-                ObjectType::Blob,
-                format!("unrelated streamed source object {idx:04}\n").into_bytes(),
-            ));
-        }
         // Keep this candidate inside Git's first-delta budget (half the
         // target size minus one raw object id), while still straddling two
-        // streaming compression windows.
+        // byte-budgeted compression windows.
         let shared = b"cross-window base payload with enough shared anchors\n".repeat(64);
         let mut base_body = shared.clone();
         base_body.extend_from_slice(b"base\n");
         let mut target_body = shared;
         target_body.extend_from_slice(b"target\n");
-        objects.push(EncodedObject::new(ObjectType::Blob, base_body));
-        objects.push(EncodedObject::new(ObjectType::Blob, target_body));
+        let objects = vec![
+            EncodedObject::new(ObjectType::Blob, base_body),
+            EncodedObject::new(ObjectType::Blob, target_body),
+        ];
 
         let object_ids = objects
             .iter()
@@ -2617,8 +2620,8 @@ mod tests {
                     .expect("test operation should succeed")
             })
             .collect::<Vec<_>>();
-        let base_oid = object_ids[PACK_STREAM_COMPRESSION_WINDOW_OBJECTS - 1];
-        let target_oid = object_ids[PACK_STREAM_COMPRESSION_WINDOW_OBJECTS];
+        let base_oid = object_ids[0];
+        let target_oid = object_ids[1];
         let object_map = object_ids
             .iter()
             .copied()
@@ -2626,11 +2629,16 @@ mod tests {
             .collect::<HashMap<_, _>>();
 
         let options = PackWriteOptions::new().with_reorder(false).with_window(10);
+        let one_object = object_map.get(&base_oid).expect("base").body.len() as u64 + 80;
+        let limits =
+            PackWriteLimits::new().with_compression_working_set(ByteBudget::new(one_object));
         let mut written = Vec::new();
         let summary = PackFile::write_packed_from_source_to_writer(
-            &object_ids,
+            object_ids.iter().copied(),
+            2,
             format,
             &options,
+            limits,
             |oid| {
                 object_map
                     .get(oid)

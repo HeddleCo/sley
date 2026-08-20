@@ -1737,6 +1737,68 @@ impl CliExit {
     }
 }
 
+/// Fail-closed byte budget used by pack write/read working-set caps.
+///
+/// One shared budget type so callers do not invent per-path helpers. The limit
+/// is inclusive: a value equal to the budget is admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ByteBudget(u64);
+
+impl ByteBudget {
+    pub const ZERO: Self = Self(0);
+
+    pub const fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    pub const fn as_usize(self) -> Option<usize> {
+        if self.0 > usize::MAX as u64 {
+            None
+        } else {
+            Some(self.0 as usize)
+        }
+    }
+
+    /// Whether `used + additional` stays within this budget.
+    pub const fn allows(self, used: u64, additional: u64) -> bool {
+        used.saturating_add(additional) <= self.0
+    }
+}
+
+impl From<u64> for ByteBudget {
+    fn from(bytes: u64) -> Self {
+        Self::new(bytes)
+    }
+}
+
+impl fmt::Display for ByteBudget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} bytes", self.0)
+    }
+}
+
+/// Which explicit budget rejected a resource-limit check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceLimitKind {
+    CompressionWorkingSet,
+    DecodedObject,
+    DeltaBase,
+}
+
+impl fmt::Display for ResourceLimitKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CompressionWorkingSet => f.write_str("compression working set"),
+            Self::DecodedObject => f.write_str("decoded object"),
+            Self::DeltaBase => f.write_str("delta base"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitError {
     Io(String),
@@ -1758,6 +1820,20 @@ pub enum GitError {
     /// write, fetch demux, emit loops). Distinct from I/O failure so embedders
     /// and the CLI can treat user-stop as non-corruption.
     Cancelled,
+    /// A known-count stream yielded fewer or more items than the caller declared.
+    ///
+    /// Used by pack generation so a truncated or overlong object-id iterator
+    /// cannot produce a successful pack.
+    CountMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    /// An explicit byte/count budget was exceeded.
+    ResourceLimit {
+        kind: ResourceLimitKind,
+        limit: u64,
+        attempted: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, GitError>;
@@ -1777,6 +1853,17 @@ impl fmt::Display for GitError {
             Self::Cli(_, msg) => f.write_str(msg),
             Self::Exit(code) => write!(f, "exit {code}"),
             Self::Cancelled => f.write_str("operation cancelled"),
+            Self::CountMismatch { expected, actual } => {
+                write!(f, "count mismatch: expected {expected}, yielded {actual}")
+            }
+            Self::ResourceLimit {
+                kind,
+                limit,
+                attempted,
+            } => write!(
+                f,
+                "resource limit exceeded: {kind} limit {limit}, attempted {attempted}"
+            ),
         }
     }
 }
@@ -1855,6 +1942,18 @@ impl GitError {
         match self {
             Self::NotFound(kind) => Some(kind),
             _ => None,
+        }
+    }
+
+    pub fn count_mismatch(expected: u64, actual: u64) -> Self {
+        Self::CountMismatch { expected, actual }
+    }
+
+    pub fn resource_limit(kind: ResourceLimitKind, limit: u64, attempted: u64) -> Self {
+        Self::ResourceLimit {
+            kind,
+            limit,
+            attempted,
         }
     }
 }

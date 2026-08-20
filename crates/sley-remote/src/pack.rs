@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
-use sley_core::{CancelFlag, ObjectFormat, ObjectId, Result};
+use sley_core::{CancelFlag, GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, collect_reachable_object_ids,
     write_object_id_pack_to_writer_with_cancel, write_reachable_pack_to_writer_with_cancel,
@@ -168,10 +168,13 @@ where
         return write_empty_packfile(req.format, writer);
     }
     if to_send.len() >= THIN_PUSH_STREAMING_MIN_OBJECTS {
+        let object_count = u32::try_from(to_send.len())
+            .map_err(|_| GitError::InvalidFormat("too many pack objects".into()))?;
         write_object_id_pack_to_writer_with_cancel(
             req.local_db,
             req.format,
-            &to_send,
+            to_send.iter().copied(),
+            object_count,
             writer,
             cancel,
         )?;

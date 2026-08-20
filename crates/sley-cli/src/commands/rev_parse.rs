@@ -1226,6 +1226,14 @@ fn rev_parse_error_message(err: &GitError) -> String {
         | GitError::Cli(_, msg) => msg.clone(),
         GitError::Exit(code) => format!("exit {code}"),
         GitError::Cancelled => "operation cancelled".to_string(),
+        GitError::CountMismatch { expected, actual } => {
+            format!("count mismatch: expected {expected}, yielded {actual}")
+        }
+        GitError::ResourceLimit {
+            kind,
+            limit,
+            attempted,
+        } => format!("resource limit exceeded: {kind} limit {limit}, attempted {attempted}"),
     }
 }
 
