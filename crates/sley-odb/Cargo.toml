@@ -13,6 +13,7 @@ license.workspace = true
 crc32fast = "1"
 flate2 = { version = "1", default-features = false }
 parking_lot = "0.12"
+smallvec = "1"
 sley-core.workspace = true
 sley-formats.workspace = true
 sley-mmap = { workspace = true, optional = true }

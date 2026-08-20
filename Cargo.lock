@@ -1688,6 +1688,7 @@ dependencies = [
  "sley-mmap",
  "sley-object",
  "sley-pack",
+ "smallvec",
 ]
 
 [[package]]
