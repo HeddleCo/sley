@@ -512,8 +512,8 @@ mod tests {
         .expect("test operation should succeed");
 
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
-        // Header read takes the loose-first path; it must still resolve from the pack
-        // and learn that the object's fanout dir is absent.
+        // Header reads prefer pack (sley#26), so a packed-only object never
+        // consults loose storage — and must not create or scan a fanout dir.
         assert_eq!(
             db.read_object_header(&oid)
                 .expect("test operation should succeed"),
@@ -521,8 +521,6 @@ mod tests {
         );
         assert_eq!(read_object_for_assert(&db, &oid), object);
 
-        // No fanout dir was created by the read (we never wrote loose), and the
-        // cached present-fanout set is the empty set — so further probes short-circuit.
         let fanout_hex = format!("{:02x}", oid.as_bytes()[0]);
         assert!(
             !git_dir.join("objects").join(&fanout_hex).exists(),
@@ -531,8 +529,8 @@ mod tests {
         if let Ok(guard) = db.loose().loose_cache.lock() {
             assert_eq!(
                 guard.present_fanouts.as_ref(),
-                Some(&HashSet::new()),
-                "an all-packed repo must learn zero present fanouts"
+                None,
+                "a packed-only header/body read must not probe loose fanouts"
             );
         }
         fs::remove_dir_all(root).expect("test operation should succeed");
@@ -852,6 +850,108 @@ mod tests {
                 .expect("test operation should succeed"),
             None
         );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn read_object_header_prefers_good_pack_over_corrupt_loose() {
+        // sley#26: the header path used to probe loose first, so a corrupt loose
+        // copy aborted --batch-check even when the pack was fine. Pack-first
+        // matches `read_object` and never opens the loose file.
+        let root = temp_root("sley-header-pack-over-corrupt-loose");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+
+        let object = EncodedObject::new(ObjectType::Blob, vec![b'h'; 2048]);
+        let oid = object
+            .object_id(format)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&object))
+            .expect("test operation should succeed");
+        db.install_pack(&pack)
+            .expect("test operation should succeed");
+        db.loose()
+            .write_object(object.clone())
+            .expect("test operation should succeed");
+        let loose_path = db
+            .loose()
+            .object_path(&oid)
+            .expect("test operation should succeed");
+        fs::write(&loose_path, b"this is not a zlib stream")
+            .expect("test operation should succeed");
+        db.refresh_read_cache();
+
+        assert_eq!(
+            db.read_object_header(&oid)
+                .expect("test operation should succeed"),
+            Some((ObjectType::Blob, object.body.len() as u64)),
+            "a corrupt loose copy must not shadow a good packed header"
+        );
+        assert_eq!(read_object_for_assert(&db, &oid), object);
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn read_object_header_ofs_delta_batch_matches_full_read_cold_and_warm() {
+        // Two passes over the same ofs-delta pack: the first populates the
+        // per-pack header memo, the second must stay byte-identical (sley#26).
+        let root = temp_root("sley-header-ofs-delta-batch");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let format = ObjectFormat::Sha1;
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+
+        let objects = (0..8)
+            .map(|index| {
+                let mut body = vec![b'a'; 1024];
+                body.extend_from_slice(format!(" tail {index}\n").as_bytes());
+                EncodedObject::new(ObjectType::Blob, body)
+            })
+            .collect::<Vec<_>>();
+        let oids = objects
+            .iter()
+            .map(|object| {
+                object
+                    .object_id(format)
+                    .expect("test operation should succeed")
+            })
+            .collect::<Vec<_>>();
+        let options = PackWriteOptions::new()
+            .with_prefer_ofs_delta(true)
+            .with_reorder(false);
+        let pack = PackFile::write_packed_with_options(&objects, format, &options)
+            .expect("test operation should succeed");
+        db.install_pack(&pack)
+            .expect("test operation should succeed");
+
+        let mut first_pass = Vec::with_capacity(oids.len());
+        for (oid, object) in oids.iter().zip(&objects) {
+            let header = db
+                .read_object_header(oid)
+                .expect("test operation should succeed");
+            assert_eq!(
+                header,
+                Some((ObjectType::Blob, object.body.len() as u64)),
+                "cold header for {oid}"
+            );
+            first_pass.push(header);
+        }
+        for (oid, want) in oids.iter().zip(&first_pass) {
+            assert_eq!(
+                db.read_object_header(oid)
+                    .expect("test operation should succeed"),
+                *want,
+                "warm header for {oid}"
+            );
+            let full = db.read_object(oid).expect("test operation should succeed");
+            assert_eq!(
+                *want,
+                Some((full.object_type, full.body.len() as u64)),
+                "header must match a full decode for {oid}"
+            );
+        }
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 

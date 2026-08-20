@@ -498,32 +498,31 @@ pub(crate) fn inflate_into(
     })
 }
 
-/// Inflate at least `max_out` bytes (or until the stream ends) from `compressed`
+/// Inflate at most `out.len()` bytes (or until the stream ends) from `compressed`
 /// into `out`, reusing the thread-local state. Used to read a delta's leading
-/// base-size / result-size varints without inflating the whole instruction stream.
-pub(crate) fn inflate_prefix(compressed: &[u8], max_out: usize, out: &mut Vec<u8>) -> Result<()> {
+/// base-size / result-size varints without inflating the whole instruction stream
+/// or allocating a heap prefix buffer (sley#26).
+pub(crate) fn inflate_prefix(compressed: &[u8], out: &mut [u8]) -> Result<usize> {
     INFLATE.with(|cell| {
         let mut decompress = cell.borrow_mut();
         decompress.reset(true);
-        out.reserve(max_out.max(16));
         let mut input = compressed;
-        while out.len() < max_out {
-            if out.len() == out.capacity() {
-                out.reserve(out.len().max(16));
-            }
+        let mut written = 0usize;
+        while written < out.len() {
             let before_in = decompress.total_in();
             let before_out = decompress.total_out();
             let status = decompress
-                .decompress_vec(input, out, flate2::FlushDecompress::None)
+                .decompress(input, &mut out[written..], flate2::FlushDecompress::None)
                 .map_err(|err| GitError::InvalidObject(format!("zlib inflate failed: {err}")))?;
             let consumed = (decompress.total_in() - before_in) as usize;
-            let produced = decompress.total_out() - before_out;
+            let produced = (decompress.total_out() - before_out) as usize;
             input = &input[consumed..];
+            written = written.saturating_add(produced);
             if status == flate2::Status::StreamEnd || (consumed == 0 && produced == 0) {
                 break;
             }
         }
-        Ok(())
+        Ok(written)
     })
 }
 /// Decode the single object stored at byte `offset` within `pack_bytes`, reading
@@ -899,9 +898,9 @@ pub(crate) const DELTA_HEADER_PREFIX_LEN: usize = 32;
 /// Result size of a delta whose zlib-compressed stream starts at `compressed`,
 /// inflating only the short prefix that holds its two leading varints.
 pub(crate) fn delta_result_size_from_stream(compressed: &[u8]) -> Result<u64> {
-    let mut prefix = Vec::new();
-    inflate_prefix(compressed, DELTA_HEADER_PREFIX_LEN, &mut prefix)?;
-    decoded_delta_result_size(&prefix)
+    let mut prefix = [0u8; DELTA_HEADER_PREFIX_LEN];
+    let written = inflate_prefix(compressed, &mut prefix)?;
+    decoded_delta_result_size(&prefix[..written])
 }
 
 /// The pack's entry region: everything between the 12-byte header and the
