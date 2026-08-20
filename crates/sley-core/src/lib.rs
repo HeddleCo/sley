@@ -853,7 +853,7 @@ impl ObjectId {
             )));
         }
         let mut raw = [0; 32];
-        for (i, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+        for (i, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             raw[i] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
         }
         Ok(Self { format, bytes: raw })

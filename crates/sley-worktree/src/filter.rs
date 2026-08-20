@@ -272,7 +272,7 @@ pub(crate) fn decode_utf16(data: &[u8], le: bool) -> Option<Vec<u8>> {
     if !data.len().is_multiple_of(2) {
         return None;
     }
-    let units = data.chunks_exact(2).map(|chunk| {
+    let units = data.as_chunks::<2>().0.iter().map(|chunk| {
         let pair = [chunk[0], chunk[1]];
         if le {
             u16::from_le_bytes(pair)
@@ -292,7 +292,7 @@ pub(crate) fn decode_utf32(data: &[u8], le: bool) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = String::new();
-    for chunk in data.chunks_exact(4) {
+    for chunk in data.as_chunks::<4>().0 {
         let quad = [chunk[0], chunk[1], chunk[2], chunk[3]];
         let cp = if le {
             u32::from_le_bytes(quad)

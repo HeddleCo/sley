@@ -1859,7 +1859,7 @@ impl PackBitmapIndex {
             None
         };
         if let Some(range) = lookup_table_range {
-            for row in bytes[range].chunks_exact(16) {
+            for row in bytes[range].as_chunks::<16>().0 {
                 let commit_position = u32_be(&row[..4]);
                 let entry_offset = u64_be(&row[4..12]);
                 let xor_row = u32_be(&row[12..16]);
