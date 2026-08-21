@@ -9,13 +9,6 @@ pub struct PackIndexBuild {
     pub index: Vec<u8>,
     pub pack_checksum: ObjectId,
     pub entries: Vec<PackIndexEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PackStreamIndexBuild {
-    pub index: Vec<u8>,
-    pub pack_checksum: ObjectId,
-    pub entries: Vec<PackIndexEntry>,
     pub objects: Vec<PackIndexedObject>,
 }
 
@@ -27,19 +20,12 @@ pub struct PackIndexedObject {
     pub offset: u64,
 }
 
-/// Streaming pack-receive counters emitted while `index_pack_from_stream`
-/// parses a pack off a reader. All fields are monotonically non-decreasing
-/// within one indexing pass.
+/// Completion counters emitted by the parallel pack indexer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PackStreamProgress {
-    /// Pack bytes consumed from the reader so far (header + object entries),
-    /// i.e. the streaming pack offset. Advances during download for streaming
-    /// transports; during the index walk for already-buffered ones.
-    pub received_bytes: u64,
-    /// Objects parsed from the pack so far.
-    pub received_objects: u64,
-    /// Total objects declared by the pack header (known once the 12-byte header
-    /// is read).
+pub struct PackIndexProgress {
+    /// Objects fully inflated, resolved, and hashed so far.
+    pub completed_objects: u64,
+    /// Total objects declared by the pack header.
     pub total_objects: u64,
 }
 
@@ -736,387 +722,37 @@ impl PackIndex {
     where
         F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
     {
-        let trailer_len = format.raw_len();
-        if pack_bytes.len() < 12 + trailer_len {
-            return Err(GitError::InvalidFormat("pack file too short".into()));
-        }
-        let trailer_offset = pack_bytes.len() - trailer_len;
-        let pack_checksum = sley_core::digest_bytes(format, &pack_bytes[..trailer_offset])?;
-        let expected = ObjectId::from_raw(format, &pack_bytes[trailer_offset..])?;
-        if pack_checksum != expected {
-            return Err(GitError::InvalidFormat(format!(
-                "pack checksum mismatch: expected {expected}, got {pack_checksum}"
-            )));
-        }
-
-        if &pack_bytes[..4] != b"PACK" {
-            return Err(GitError::InvalidFormat("missing PACK signature".into()));
-        }
-        let version = u32_be(&pack_bytes[4..8]);
-        if version != 2 && version != 3 {
-            return Err(GitError::Unsupported(format!("pack version {version}")));
-        }
-        // sley#4: see `checked_pack_object_count` — a short pack must not be
-        // able to name a count it has no room for.
-        let count = checked_pack_object_count(
-            u32_be(&pack_bytes[8..12]),
-            (trailer_offset.saturating_sub(12)) as u64,
-        )?;
-        let mut offset = 12usize;
-        let mut parsed_entries = Vec::with_capacity(pack_entry_prealloc(count));
-        let mut raw_entries = Vec::with_capacity(pack_entry_prealloc(count));
-        for _ in 0..count {
-            let entry_offset = offset;
-            let header = parse_entry_header(pack_bytes, &mut offset)?;
-            let base = match header.kind {
-                PackObjectKind::OfsDelta => Some(DeltaBase::Offset(parse_ofs_delta_base_offset(
-                    pack_bytes,
-                    &mut offset,
-                    entry_offset as u64,
-                )?)),
-                PackObjectKind::RefDelta => {
-                    let hash_len = format.raw_len();
-                    if offset + hash_len > trailer_offset {
-                        return Err(GitError::InvalidFormat(
-                            "truncated ref-delta base object id".into(),
-                        ));
-                    }
-                    let oid = ObjectId::from_raw(format, &pack_bytes[offset..offset + hash_len])?;
-                    offset += hash_len;
-                    Some(DeltaBase::Ref(oid))
-                }
-                _ => None,
-            };
-            let mut body = Vec::new();
-            let consumed = inflate_into(
-                &pack_bytes[offset..trailer_offset],
-                &mut body,
-                header.size.min(usize::MAX as u64) as usize,
-            )?;
-            if body.len() as u64 != header.size {
-                return Err(GitError::InvalidObject(format!(
-                    "pack object declared {} bytes, decoded {}",
-                    header.size,
-                    body.len()
-                )));
-            }
-            if consumed == 0 {
-                return Err(GitError::InvalidFormat(
-                    "empty compressed pack entry".into(),
-                ));
-            }
-            offset = offset
-                .checked_add(consumed)
-                .ok_or_else(|| GitError::InvalidFormat("pack offset overflow".into()))?;
-            if offset > trailer_offset {
-                return Err(GitError::InvalidFormat(
-                    "pack entry extends past checksum".into(),
-                ));
-            }
-            raw_entries.push((
-                entry_offset as u64,
-                crc32fast::hash(&pack_bytes[entry_offset..offset]),
-            ));
-            if let Some(base) = base {
-                parsed_entries.push(ParsedPackEntry::Delta {
-                    base,
-                    compressed_size: consumed as u64,
-                    delta_size: header.size,
-                    offset: entry_offset as u64,
-                    delta: body,
-                });
-            } else {
-                let object_type = match header.kind {
-                    PackObjectKind::Commit => ObjectType::Commit,
-                    PackObjectKind::Tree => ObjectType::Tree,
-                    PackObjectKind::Blob => ObjectType::Blob,
-                    PackObjectKind::Tag => ObjectType::Tag,
-                    PackObjectKind::OfsDelta | PackObjectKind::RefDelta => unreachable!(),
-                };
-                let object = EncodedObject::new(object_type, body);
-                let oid = object.object_id(format)?;
-                parsed_entries.push(ParsedPackEntry::Resolved(PackObject {
-                    entry: PackEntry {
-                        oid,
-                        compressed_size: consumed as u64,
-                        uncompressed_size: header.size,
-                        offset: entry_offset as u64,
-                    },
-                    object,
-                }));
-            }
-        }
-        if offset != trailer_offset {
-            return Err(GitError::InvalidFormat(format!(
-                "pack has {} trailing bytes before checksum",
-                trailer_offset - offset
-            )));
-        }
-
-        let resolved = resolve_pack_entries(parsed_entries, format, &mut external_base, limits)?;
-        let entries = resolved
-            .iter()
-            .zip(raw_entries)
-            .map(|(object, (offset, crc32))| PackIndexEntry {
-                oid: object.entry.oid,
-                crc32,
-                offset,
-            })
-            .collect::<Vec<_>>();
-        let index = PackIndex::write_v2(format, &entries, &pack_checksum)?;
-        Ok(PackIndexBuild {
-            index,
-            pack_checksum,
-            entries,
-        })
-    }
-
-    /// Validate and index a pack from the reader's current position to EOF.
-    ///
-    /// This produces the same v2 `.idx` bytes and object metadata as
-    /// [`PackIndex::write_v2_for_pack`] without requiring the caller to provide
-    /// the pack as one contiguous byte slice. The reader is left positioned at
-    /// EOF on success.
-    pub fn write_v2_for_pack_reader<R>(
-        reader: &mut R,
-        format: ObjectFormat,
-    ) -> Result<PackStreamIndexBuild>
-    where
-        R: Read + Seek,
-    {
-        Self::write_v2_for_pack_reader_with_limits(reader, format, PackReadLimits::default())
-    }
-
-    /// [`Self::write_v2_for_pack_reader`] with an external ref-delta resolver.
-    pub fn write_v2_for_pack_reader_with_base<R, F>(
-        reader: &mut R,
-        format: ObjectFormat,
-        external_base: F,
-    ) -> Result<PackStreamIndexBuild>
-    where
-        R: Read + Seek,
-        F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
-    {
-        Self::write_v2_for_pack_reader_with_base_and_limits(
-            reader,
+        build_parallel_index(
+            pack_bytes,
             format,
-            external_base,
-            PackReadLimits::default(),
+            &mut external_base,
+            PackIndexOptions::new(limits),
+            CancelFlag::never(),
+            &mut |_| {},
         )
     }
 
-    pub fn write_v2_for_pack_reader_with_limits<R>(
-        reader: &mut R,
+    /// Validate and index immutable pack bytes with explicit scheduling.
+    pub fn write_v2_for_pack_with_options<F, P>(
+        pack_bytes: &[u8],
         format: ObjectFormat,
-        limits: PackReadLimits,
-    ) -> Result<PackStreamIndexBuild>
-    where
-        R: Read + Seek,
-    {
-        index_pack_from_reader_with_limits(reader, format, limits)
-    }
-
-    pub fn write_v2_for_pack_reader_with_base_and_limits<R, F>(
-        reader: &mut R,
-        format: ObjectFormat,
-        external_base: F,
-        limits: PackReadLimits,
-    ) -> Result<PackStreamIndexBuild>
-    where
-        R: Read + Seek,
-        F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
-    {
-        index_pack_from_reader_with_base_and_limits(reader, format, external_base, limits)
-    }
-
-    /// Validate and index a pack from the reader's current position, stopping
-    /// after the pack trailer checksum.
-    ///
-    /// This is for transports where the pack length is not known in advance but
-    /// the stream is expected to contain exactly one pack. It avoids forcing the
-    /// caller to first materialize the pack only to learn its length.
-    pub fn write_v2_for_pack_reader_to_trailer<R>(
-        reader: &mut R,
-        format: ObjectFormat,
-    ) -> Result<PackStreamIndexBuild>
-    where
-        R: Read,
-    {
-        Self::write_v2_for_pack_reader_to_trailer_with_limits(
-            reader,
-            format,
-            PackReadLimits::default(),
-        )
-    }
-
-    /// [`Self::write_v2_for_pack_reader_to_trailer`] with an external
-    /// ref-delta resolver.
-    pub fn write_v2_for_pack_reader_to_trailer_with_base<R, F>(
-        reader: &mut R,
-        format: ObjectFormat,
-        external_base: F,
-    ) -> Result<PackStreamIndexBuild>
-    where
-        R: Read,
-        F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
-    {
-        Self::write_v2_for_pack_reader_to_trailer_with_base_and_limits(
-            reader,
-            format,
-            external_base,
-            PackReadLimits::default(),
-        )
-    }
-
-    pub fn write_v2_for_pack_reader_to_trailer_with_limits<R>(
-        reader: &mut R,
-        format: ObjectFormat,
-        limits: PackReadLimits,
-    ) -> Result<PackStreamIndexBuild>
-    where
-        R: Read,
-    {
-        index_pack_from_reader_to_trailer_with_limits(reader, format, limits)
-    }
-
-    pub fn write_v2_for_pack_reader_to_trailer_with_base_and_limits<R, F>(
-        reader: &mut R,
-        format: ObjectFormat,
-        external_base: F,
-        limits: PackReadLimits,
-    ) -> Result<PackStreamIndexBuild>
-    where
-        R: Read,
-        F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
-    {
-        index_pack_from_reader_to_trailer_with_base_and_limits(
-            reader,
-            format,
-            external_base,
-            limits,
-        )
-    }
-
-    /// `write_v2_for_pack_reader_to_trailer` that reports streaming pack
-    /// progress. `progress` is invoked on a throttled cadence with the pack byte
-    /// offset, objects parsed so far, and the header-declared total, then once
-    /// more at completion with `received_objects == total_objects`.
-    pub fn write_v2_for_pack_reader_to_trailer_with_progress<R, F>(
-        reader: &mut R,
-        format: ObjectFormat,
-        progress: F,
-    ) -> Result<PackStreamIndexBuild>
-    where
-        R: Read,
-        F: FnMut(PackStreamProgress),
-    {
-        Self::write_v2_for_pack_reader_to_trailer_with_progress_and_limits(
-            reader,
-            format,
-            PackReadLimits::default(),
-            progress,
-        )
-    }
-
-    pub fn write_v2_for_pack_reader_to_trailer_with_progress_and_limits<R, F>(
-        reader: &mut R,
-        format: ObjectFormat,
-        limits: PackReadLimits,
-        progress: F,
-    ) -> Result<PackStreamIndexBuild>
-    where
-        R: Read,
-        F: FnMut(PackStreamProgress),
-    {
-        index_pack_from_reader_to_trailer_with_progress_and_limits(reader, format, limits, progress)
-    }
-
-    /// Like [`Self::write_v2_for_pack_reader_to_trailer_with_progress`], but
-    /// polls `cancel` cooperatively between pack objects (and after progress
-    /// emission). Returns [`GitError::Cancelled`] when the flag trips.
-    ///
-    /// Progress callbacks remain side-effect only; cancellation is checked
-    /// independently and does not require the callback to return
-    /// [`sley_core::StreamControl`].
-    pub fn write_v2_for_pack_reader_to_trailer_with_progress_and_cancel<R, F>(
-        reader: &mut R,
-        format: ObjectFormat,
+        mut external_base: F,
+        options: PackIndexOptions,
         cancel: CancelFlag<'_>,
-        progress: F,
-    ) -> Result<PackStreamIndexBuild>
+        mut progress: P,
+    ) -> Result<PackIndexBuild>
     where
-        R: Read,
-        F: FnMut(PackStreamProgress),
+        F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+        P: FnMut(PackIndexProgress),
     {
-        Self::write_v2_for_pack_reader_to_trailer_with_progress_and_cancel_and_limits(
-            reader,
+        build_parallel_index(
+            pack_bytes,
             format,
+            &mut external_base,
+            options,
             cancel,
-            PackReadLimits::default(),
-            progress,
+            &mut progress,
         )
-    }
-
-    pub fn write_v2_for_pack_reader_to_trailer_with_progress_and_cancel_and_limits<R, F>(
-        reader: &mut R,
-        format: ObjectFormat,
-        cancel: CancelFlag<'_>,
-        limits: PackReadLimits,
-        progress: F,
-    ) -> Result<PackStreamIndexBuild>
-    where
-        R: Read,
-        F: FnMut(PackStreamProgress),
-    {
-        index_pack_from_reader_to_trailer_with_progress_and_cancel_and_limits(
-            reader, format, cancel, limits, progress,
-        )
-    }
-
-    pub fn write_v2_for_pack_reader_with_len<R>(
-        reader: &mut R,
-        format: ObjectFormat,
-        pack_len: u64,
-    ) -> Result<PackStreamIndexBuild>
-    where
-        R: Read,
-    {
-        Self::write_v2_for_pack_reader_with_len_and_limits(
-            reader,
-            format,
-            pack_len,
-            PackReadLimits::default(),
-        )
-    }
-
-    pub fn write_v2_for_pack_reader_with_len_and_limits<R>(
-        reader: &mut R,
-        format: ObjectFormat,
-        pack_len: u64,
-        limits: PackReadLimits,
-    ) -> Result<PackStreamIndexBuild>
-    where
-        R: Read,
-    {
-        index_pack_from_reader_with_len_and_limits(reader, format, pack_len, limits)
-    }
-
-    /// Validate and index a pack from a filesystem path without loading the
-    /// entire pack file into memory.
-    pub fn write_v2_for_pack_path(
-        path: impl AsRef<Path>,
-        format: ObjectFormat,
-    ) -> Result<PackStreamIndexBuild> {
-        Self::write_v2_for_pack_path_with_limits(path, format, PackReadLimits::default())
-    }
-
-    pub fn write_v2_for_pack_path_with_limits(
-        path: impl AsRef<Path>,
-        format: ObjectFormat,
-        limits: PackReadLimits,
-    ) -> Result<PackStreamIndexBuild> {
-        let mut file = File::open(path)?;
-        Self::write_v2_for_pack_reader_with_limits(&mut file, format, limits)
     }
 
     pub fn parse_v2_sha1(bytes: &[u8]) -> Result<Self> {

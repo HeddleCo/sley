@@ -5,13 +5,14 @@ use sley_core::{
 use sley_formats::{Bundle, BundleReference};
 use sley_object::{EncodedObject, ObjectType};
 use sley_pack::{
-    PackFile, PackIndex, PackInput, PackStreamIndexBuild, PackStreamProgress, PackWrite,
-    PackWriteOptions, fix_thin_pack,
+    PackFile, PackIndex, PackIndexBuild, PackIndexProgress, PackInput, PackWrite, PackWriteOptions,
+    fix_thin_pack,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use crate::{ObjectReader, ObjectWriter, unique_temp_path};
 
@@ -251,52 +252,15 @@ pub struct RawPackIndexedObject {
     pub offset: u64,
 }
 
-struct PackInstallTeeReader<'a, R, W> {
-    reader: &'a mut R,
-    writer: &'a mut W,
-    max_input_size: Option<u64>,
-    written: u64,
-}
-
-impl<R, W> Read for PackInstallTeeReader<'_, R, W>
-where
-    R: Read,
-    W: Write,
-{
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let len = self.reader.read(buf)?;
-        if len > 0 {
-            let next_written = self.written.checked_add(len as u64).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "pack size overflow")
-            })?;
-            if let Some(limit) = self.max_input_size
-                && next_written > limit
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("pack exceeds maximum allowed size ({limit})"),
-                ));
-            }
-            #[cfg(feature = "fetch-profile")]
-            let _profile_span = sley_core::fetch_profile::Span::enter(
-                sley_core::fetch_profile::Stage::ObjectStoreWrite,
-            );
-            self.writer.write_all(&buf[..len])?;
-            #[cfg(feature = "fetch-profile")]
-            {
-                sley_core::fetch_profile::add_count(
-                    sley_core::fetch_profile::Stage::ObjectStoreWrite,
-                    1,
-                );
-                sley_core::fetch_profile::add_bytes(
-                    sley_core::fetch_profile::Stage::ObjectStoreWrite,
-                    len as u64,
-                );
-            }
-            self.written = next_written;
-        }
-        Ok(len)
-    }
+/// Monotonic receipt and indexing counters for one staged pack installation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PackInstallProgress {
+    /// Pack bytes received from the input so far.
+    pub received_bytes: u64,
+    /// Objects fully inflated, resolved, and hashed so far.
+    pub indexed_objects: u64,
+    /// Total objects declared by the pack header once it is available.
+    pub total_objects: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,12 +305,11 @@ pub trait RawPackInstaller {
         self.install_raw_pack_from_reader_with_options(reader, RawPackInstallOptions::default())
     }
 
-    /// Install a raw pack while reporting streaming pack progress via `progress`.
+    /// Install a raw pack while reporting receipt and indexing progress.
     ///
     /// Delegates to [`install_raw_pack_from_reader_with_progress_and_cancel`] with
-    /// a never-cancel flag. Installers that do not stream through the pack
-    /// indexer (e.g. the in-memory store) keep the cancel-aware default, which
-    /// still polls cancel between reads via [`CancellableRead`].
+    /// a never-cancel flag. The default implementation still polls cancel
+    /// between reads via [`CancellableRead`].
     ///
     /// [`install_raw_pack_from_reader_with_progress_and_cancel`]: RawPackInstaller::install_raw_pack_from_reader_with_progress_and_cancel
     fn install_raw_pack_from_reader_with_progress<R, F>(
@@ -357,7 +320,7 @@ pub trait RawPackInstaller {
     ) -> Result<RawPackInstallResult>
     where
         R: Read,
-        F: FnMut(PackStreamProgress),
+        F: FnMut(PackInstallProgress),
     {
         self.install_raw_pack_from_reader_with_progress_and_cancel(
             reader,
@@ -372,7 +335,7 @@ pub trait RawPackInstaller {
     /// The default implementation ignores `progress`, polls `cancel` before the
     /// install, and wraps `reader` in [`CancellableRead`] so a trip mid-stream
     /// surfaces as [`GitError::Cancelled`]. [`FileObjectDatabase`] overrides this
-    /// to also thread cancel into the pack indexer.
+    /// to poll during both receipt and parallel indexing.
     fn install_raw_pack_from_reader_with_progress_and_cancel<R, F>(
         &self,
         reader: &mut R,
@@ -382,7 +345,7 @@ pub trait RawPackInstaller {
     ) -> Result<RawPackInstallResult>
     where
         R: Read,
-        F: FnMut(PackStreamProgress),
+        F: FnMut(PackInstallProgress),
     {
         cancel.check()?;
         let mut cancellable = CancellableRead::new(reader, cancel.as_ref());
@@ -392,7 +355,7 @@ pub trait RawPackInstaller {
 }
 
 /// Map cancel-flavored install failures (from [`CancellableRead`] I/O or pack
-/// indexer checks) onto [`GitError::Cancelled`].
+/// indexing checks) onto [`GitError::Cancelled`].
 fn map_install_cancel_error(err: GitError) -> GitError {
     if is_cancelled_error(&err) {
         return GitError::Cancelled;
@@ -401,6 +364,138 @@ fn map_install_cancel_error(err: GitError) -> GitError {
         GitError::Io(ref msg) if msg.contains("cancelled") => GitError::Cancelled,
         other => other,
     }
+}
+
+const PACK_RECEIVE_BUFFER_BYTES: usize = 1024 * 1024;
+const PACK_RECEIVE_QUEUE_DEPTH: usize = 4;
+const PACK_RECEIVE_PROGRESS_BYTES: u64 = 256 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct PackReceiveSummary {
+    bytes: u64,
+}
+
+fn receive_pack_to_file<R, F>(
+    reader: &mut R,
+    mut file: fs::File,
+    max_input_size: Option<u64>,
+    cancel: CancelFlag<'_>,
+    progress: &mut F,
+) -> Result<PackReceiveSummary>
+where
+    R: Read,
+    F: FnMut(PackInstallProgress),
+{
+    let (filled_sender, filled_receiver) = mpsc::sync_channel::<Vec<u8>>(PACK_RECEIVE_QUEUE_DEPTH);
+    let (empty_sender, empty_receiver) = mpsc::sync_channel::<Vec<u8>>(PACK_RECEIVE_QUEUE_DEPTH);
+    for _ in 0..PACK_RECEIVE_QUEUE_DEPTH {
+        empty_sender
+            .send(vec![0u8; PACK_RECEIVE_BUFFER_BYTES])
+            .map_err(|_| GitError::Io("could not initialize pack receive buffers".into()))?;
+    }
+
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || -> Result<()> {
+            for mut chunk in filled_receiver {
+                #[cfg(feature = "fetch-profile")]
+                let _profile_span = sley_core::fetch_profile::Span::enter(
+                    sley_core::fetch_profile::Stage::ObjectStoreWrite,
+                );
+                file.write_all(&chunk)?;
+                #[cfg(feature = "fetch-profile")]
+                {
+                    sley_core::fetch_profile::add_count(
+                        sley_core::fetch_profile::Stage::ObjectStoreWrite,
+                        1,
+                    );
+                    sley_core::fetch_profile::add_bytes(
+                        sley_core::fetch_profile::Stage::ObjectStoreWrite,
+                        chunk.len() as u64,
+                    );
+                }
+                chunk.resize(PACK_RECEIVE_BUFFER_BYTES, 0);
+                if empty_sender.send(chunk).is_err() {
+                    break;
+                }
+            }
+            file.flush()?;
+            file.sync_all()?;
+            #[cfg(feature = "fetch-profile")]
+            sley_core::fetch_profile::add_fsync();
+            Ok(())
+        });
+
+        let receive_result = (|| -> Result<PackReceiveSummary> {
+            let mut bytes = 0u64;
+            let mut last_progress = 0u64;
+            let mut header = Vec::with_capacity(12);
+            let mut total_objects = 0u64;
+            loop {
+                cancel.check()?;
+                let mut chunk = empty_receiver.recv().map_err(|_| {
+                    GitError::Io("pack staging writer stopped before receive completed".into())
+                })?;
+                let read = reader.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                chunk.truncate(read);
+                bytes = bytes
+                    .checked_add(read as u64)
+                    .ok_or_else(|| GitError::InvalidFormat("pack size overflow".into()))?;
+                if let Some(limit) = max_input_size
+                    && bytes > limit
+                {
+                    return Err(GitError::InvalidFormat(format!(
+                        "pack exceeds maximum allowed size ({limit})"
+                    )));
+                }
+                if header.len() < 12 {
+                    let needed = 12 - header.len();
+                    header.extend_from_slice(&chunk[..needed.min(chunk.len())]);
+                    if header.len() == 12 && &header[..4] == b"PACK" {
+                        total_objects = u64::from(u32::from_be_bytes([
+                            header[8], header[9], header[10], header[11],
+                        ]));
+                        progress(PackInstallProgress {
+                            received_bytes: 12,
+                            indexed_objects: 0,
+                            total_objects,
+                        });
+                        last_progress = 12;
+                        cancel.check()?;
+                    }
+                }
+                filled_sender.send(chunk).map_err(|_| {
+                    GitError::Io("pack staging writer stopped before receive completed".into())
+                })?;
+                if bytes.saturating_sub(last_progress) >= PACK_RECEIVE_PROGRESS_BYTES {
+                    last_progress = bytes;
+                    progress(PackInstallProgress {
+                        received_bytes: bytes,
+                        indexed_objects: 0,
+                        total_objects,
+                    });
+                    cancel.check()?;
+                }
+            }
+            progress(PackInstallProgress {
+                received_bytes: bytes,
+                indexed_objects: 0,
+                total_objects,
+            });
+            cancel.check()?;
+            Ok(PackReceiveSummary { bytes })
+        })();
+        drop(filled_sender);
+        let write_result = match writer.join() {
+            Ok(result) => result,
+            Err(_) => Err(GitError::Io("pack staging writer panicked".into())),
+        };
+        let summary = receive_result?;
+        write_result?;
+        Ok(summary)
+    })
 }
 
 #[cfg(test)]
@@ -446,7 +541,7 @@ impl RawPackInstaller for FileObjectDatabase {
     ) -> Result<RawPackInstallResult>
     where
         R: Read,
-        F: FnMut(PackStreamProgress),
+        F: FnMut(PackInstallProgress),
     {
         let result = FileObjectDatabase::install_raw_pack_from_reader_with_progress_and_cancel(
             self, reader, options, cancel, progress,
@@ -524,7 +619,10 @@ impl RawPackStreamingInstall {
                 )));
             }
 
-            let built = PackIndex::write_v2_for_pack_path(&self.temp_pack_path, self.format)?;
+            let built = {
+                let mapped = sley_mmap::MappedFile::open_pack(&self.temp_pack_path)?;
+                PackIndex::write_v2_for_pack(mapped.as_bytes(), self.format)?
+            };
             if built.pack_checksum != self.expected_pack_id {
                 return Err(GitError::InvalidFormat(format!(
                     "raw pack stream checksum mismatch: expected {}, got {}",
@@ -681,77 +779,22 @@ where
 }
 
 pub fn index_raw_pack(pack_bytes: &[u8], format: ObjectFormat) -> Result<RawPackIndexResult> {
-    let pack = PackFile::parse(pack_bytes, format)?;
     let built = PackIndex::write_v2_for_pack(pack_bytes, format)?;
-    if built.pack_checksum != pack.checksum {
-        return Err(GitError::InvalidFormat(
-            "pack index checksum does not match parsed pack checksum".to_string(),
-        ));
-    }
-
-    let offsets = built
-        .entries
-        .iter()
-        .map(|entry| (entry.oid, entry.offset))
-        .collect::<HashMap<_, _>>();
-    let mut objects = Vec::with_capacity(pack.entries.len());
-    for object in pack.entries {
-        let offset = offsets.get(&object.entry.oid).copied().ok_or_else(|| {
-            GitError::InvalidFormat(format!(
-                "pack index is missing object {}",
-                object.entry.oid.to_hex()
-            ))
-        })?;
-        objects.push(RawPackIndexedObject {
-            oid: object.entry.oid,
-            object_type: object.object.object_type,
-            size: object.object.body.len() as u64,
-            offset,
-        });
-    }
-
-    Ok(RawPackIndexResult {
-        pack_id: built.pack_checksum,
-        index: built.index,
-        objects,
-    })
-}
-
-pub fn index_raw_pack_from_reader<R>(
-    reader: &mut R,
-    format: ObjectFormat,
-) -> Result<RawPackIndexResult>
-where
-    R: Read,
-{
-    Ok(stream_index_build_to_raw_result(
-        PackIndex::write_v2_for_pack_reader_to_trailer(reader, format)?,
-    ))
-}
-
-pub fn index_raw_pack_from_reader_with_len<R>(
-    reader: &mut R,
-    format: ObjectFormat,
-    pack_len: u64,
-) -> Result<RawPackIndexResult>
-where
-    R: Read,
-{
-    Ok(stream_index_build_to_raw_result(
-        PackIndex::write_v2_for_pack_reader_with_len(reader, format, pack_len)?,
-    ))
+    Ok(index_build_to_raw_result(built))
 }
 
 pub fn index_raw_pack_file(
     path: impl AsRef<Path>,
     format: ObjectFormat,
 ) -> Result<RawPackIndexResult> {
-    Ok(stream_index_build_to_raw_result(
-        PackIndex::write_v2_for_pack_path(path, format)?,
-    ))
+    let mapped = sley_mmap::MappedFile::open_pack(path.as_ref())?;
+    Ok(index_build_to_raw_result(PackIndex::write_v2_for_pack(
+        mapped.as_bytes(),
+        format,
+    )?))
 }
 
-fn stream_index_build_to_raw_result(built: PackStreamIndexBuild) -> RawPackIndexResult {
+fn index_build_to_raw_result(built: PackIndexBuild) -> RawPackIndexResult {
     let objects = built
         .objects
         .into_iter()
@@ -1070,7 +1113,7 @@ impl FileObjectDatabase {
         let built = fixed.index;
         let pack_dir = self.objects_dir.join("pack");
         fs::create_dir_all(&pack_dir)?;
-        let temp_pack_path = unique_temp_path(&pack_dir);
+        let temp_pack_path = unique_temp_path(&pack_dir).with_extension("pack");
         fs::write(&temp_pack_path, &pack)?;
         let result = self.install_pack_file_from_temp(
             &temp_pack_path,
@@ -1115,7 +1158,7 @@ impl FileObjectDatabase {
         let pack_name = format!("pack-{}", expected_pack_id.to_hex());
         let pack_path = pack_dir.join(format!("{pack_name}.pack"));
         let index_path = pack_dir.join(format!("{pack_name}.idx"));
-        let temp_pack_path = unique_temp_path(&pack_dir);
+        let temp_pack_path = unique_temp_path(&pack_dir).with_extension("pack");
         let file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1147,10 +1190,9 @@ impl FileObjectDatabase {
         self.install_raw_pack_from_reader_with_progress(reader, options, |_| {})
     }
 
-    /// [`install_raw_pack_from_reader_with_options`] that reports streaming pack
-    /// progress. `progress` is threaded to the pack indexer, so it advances as
-    /// the pack is received off `reader` (during download for streaming
-    /// transports; during the index walk for already-buffered ones).
+    /// [`install_raw_pack_from_reader_with_options`] that reports receipt and
+    /// indexing progress. The callback advances while the bounded spool drains
+    /// `reader`, then while the immutable mapped pack is indexed.
     ///
     /// Delegates to [`Self::install_raw_pack_from_reader_with_progress_and_cancel`]
     /// with a never-cancel flag.
@@ -1164,7 +1206,7 @@ impl FileObjectDatabase {
     ) -> Result<PackInstallResult>
     where
         R: Read,
-        F: FnMut(PackStreamProgress),
+        F: FnMut(PackInstallProgress),
     {
         self.install_raw_pack_from_reader_with_progress_and_cancel(
             reader,
@@ -1176,8 +1218,8 @@ impl FileObjectDatabase {
 
     /// Install a raw pack stream with cooperative cancellation and progress.
     ///
-    /// Threads `cancel` into the pack indexer (between objects) and wraps the
-    /// inbound reader in [`CancellableRead`] so a trip mid-read also aborts.
+    /// Polls `cancel` between parallel indexing jobs and while receiving into
+    /// the bounded spool, so a trip during either stage aborts promptly.
     /// On any failure — including [`GitError::Cancelled`] — the temporary pack
     /// staging file under `objects/pack` is removed.
     pub fn install_raw_pack_from_reader_with_progress_and_cancel<R, F>(
@@ -1189,47 +1231,41 @@ impl FileObjectDatabase {
     ) -> Result<PackInstallResult>
     where
         R: Read,
-        F: FnMut(PackStreamProgress),
+        F: FnMut(PackInstallProgress),
     {
         // Fail before creating a temp file when cancel is already set.
         cancel.check()?;
         let pack_dir = self.objects_dir.join("pack");
         fs::create_dir_all(&pack_dir)?;
-        let temp_pack_path = unique_temp_path(&pack_dir);
+        let temp_pack_path = unique_temp_path(&pack_dir).with_extension("pack");
         let result = (|| -> Result<PackInstallResult> {
-            // Stage directly in objects/pack so validation, indexing, and the
-            // eventual checksum-named rename use one streamed write.
-            let mut file = fs::OpenOptions::new()
+            // Stage directly in objects/pack so validation, mmap indexing, and
+            // the checksum-named rename all use one immutable file.
+            let file = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&temp_pack_path)?;
+            let mut progress = progress;
+            let receive =
+                receive_pack_to_file(reader, file, options.max_input_size, cancel, &mut progress)
+                    .map_err(map_install_cancel_error)?;
             let built = {
-                // Belt and suspenders: pack indexer polls cancel between objects;
-                // CancellableRead aborts mid-object / mid-network-read as well.
-                let mut cancellable = CancellableRead::new(reader, cancel.as_ref());
-                let mut tee = PackInstallTeeReader {
-                    reader: &mut cancellable,
-                    writer: &mut file,
-                    max_input_size: options.max_input_size,
-                    written: 0,
-                };
-                PackIndex::write_v2_for_pack_reader_to_trailer_with_progress_and_cancel(
-                    &mut tee,
+                let mapped = sley_mmap::MappedFile::open_pack(&temp_pack_path)?;
+                PackIndex::write_v2_for_pack_with_options(
+                    mapped.as_bytes(),
                     self.format,
+                    |_| Ok(None),
+                    sley_pack::PackIndexOptions::default(),
                     cancel,
-                    progress,
-                )
-                .map_err(map_install_cancel_error)?
+                    |indexed: PackIndexProgress| {
+                        progress(PackInstallProgress {
+                            received_bytes: receive.bytes,
+                            indexed_objects: indexed.completed_objects,
+                            total_objects: indexed.total_objects,
+                        });
+                    },
+                )?
             };
-            #[cfg(feature = "fetch-profile")]
-            let _profile_span = sley_core::fetch_profile::Span::enter(
-                sley_core::fetch_profile::Stage::ObjectStoreWrite,
-            );
-            file.flush()?;
-            file.sync_all()?;
-            #[cfg(feature = "fetch-profile")]
-            sley_core::fetch_profile::add_fsync();
-            drop(file);
 
             self.install_pack_file_from_temp(
                 &temp_pack_path,

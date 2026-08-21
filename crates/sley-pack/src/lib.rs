@@ -13,10 +13,8 @@ use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::ops::Range;
-use std::path::Path;
 use std::sync::Arc;
 
 // --- Mechanical module split (W21) -----------------------------------------
@@ -31,8 +29,8 @@ mod fix_thin;
 mod index;
 pub mod inflate;
 mod limits;
+mod parallel_index;
 mod read;
-mod stream;
 mod write;
 
 pub use bounded_read::*;
@@ -41,8 +39,8 @@ pub use fix_thin::*;
 pub use index::*;
 pub use limits::{MAX_READ_DELTA_CHAIN_DEPTH, PACK_OBJECT_COUNT_PREALLOC_CAP};
 pub(crate) use limits::{checked_pack_object_count, pack_entry_prealloc};
+pub use parallel_index::*;
 pub use read::*;
-pub use stream::*;
 pub use write::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,18 +135,6 @@ enum PackObjectKind {
     Tag,
     OfsDelta,
     RefDelta,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ParsedPackEntry {
-    Resolved(PackObject),
-    Delta {
-        base: DeltaBase,
-        compressed_size: u64,
-        delta_size: u64,
-        offset: u64,
-        delta: Vec<u8>,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,7 +233,7 @@ mod tests {
     use flate2::write::ZlibEncoder;
     use sley_core::AtomicCancel;
     use std::fs;
-    use std::io::{Cursor, Read, Write};
+    use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -267,14 +253,15 @@ mod tests {
     }
 
     #[test]
-    fn index_pack_stream_already_cancelled_returns_cancelled() {
+    fn parallel_index_already_cancelled_returns_cancelled() {
         let pack = multi_blob_pack(4);
         let source = AtomicCancel::new();
         source.cancel();
-        let mut reader = Cursor::new(pack.as_slice());
-        let err = PackIndex::write_v2_for_pack_reader_to_trailer_with_progress_and_cancel(
-            &mut reader,
+        let err = PackIndex::write_v2_for_pack_with_options(
+            &pack,
             ObjectFormat::Sha1,
+            |_| Ok(None),
+            PackIndexOptions::default(),
             CancelFlag::new(&source),
             |_| {},
         )
@@ -283,45 +270,27 @@ mod tests {
     }
 
     #[test]
-    fn index_pack_stream_cancel_mid_stream_returns_cancelled() {
-        let pack = multi_blob_pack(8);
-        let source = AtomicCancel::new();
-        let mut saw_object = false;
-        let mut reader = Cursor::new(pack.as_slice());
-        let err = PackIndex::write_v2_for_pack_reader_to_trailer_with_progress_and_cancel(
-            &mut reader,
+    fn parallel_index_is_identical_with_one_or_many_workers() {
+        let pack = multi_blob_pack(128);
+        let serial_schedule = PackIndex::write_v2_for_pack_with_options(
+            &pack,
             ObjectFormat::Sha1,
-            CancelFlag::new(&source),
-            |progress| {
-                if progress.received_objects >= 1 {
-                    saw_object = true;
-                    source.cancel();
-                }
-            },
+            |_| Ok(None),
+            PackIndexOptions::default().with_threads(1),
+            CancelFlag::never(),
+            |_| {},
         )
-        .expect_err("mid-stream cancel should fail");
-        assert!(
-            saw_object,
-            "progress should have reported at least one object before cancel"
-        );
-        assert_eq!(err, GitError::Cancelled);
-    }
-
-    #[test]
-    fn index_pack_stream_with_progress_still_works_without_cancel() {
-        let pack = multi_blob_pack(3);
-        let mut samples = 0u32;
-        let mut reader = Cursor::new(pack.as_slice());
-        let build = PackIndex::write_v2_for_pack_reader_to_trailer_with_progress(
-            &mut reader,
+        .expect("one-worker schedule");
+        let parallel_schedule = PackIndex::write_v2_for_pack_with_options(
+            &pack,
             ObjectFormat::Sha1,
-            |_| {
-                samples += 1;
-            },
+            |_| Ok(None),
+            PackIndexOptions::default().with_threads(32),
+            CancelFlag::never(),
+            |_| {},
         )
-        .expect("uncancelled index should succeed");
-        assert_eq!(build.entries.len(), 3);
-        assert!(samples >= 2, "header + completion progress expected");
+        .expect("many-worker schedule");
+        assert_eq!(parallel_schedule, serial_schedule);
     }
 
     #[test]
@@ -838,6 +807,94 @@ mod tests {
     }
 
     #[test]
+    fn git_generated_pack_is_identical_with_one_and_many_workers() {
+        let root = unique_temp_dir("parallel-git-pack");
+        let repository = root.join("repo");
+        fs::create_dir_all(&repository).expect("create git fixture directory");
+        run_git_success(&repository, &["init", "-q"]);
+        run_git_success(&repository, &["config", "user.name", "Sley Test"]);
+        run_git_success(
+            &repository,
+            &["config", "user.email", "sley@example.invalid"],
+        );
+        for index in 0..64 {
+            let body = format!("git generated pack object {index}\n").repeat(128);
+            fs::write(repository.join(format!("object-{index:03}.txt")), body)
+                .expect("write git fixture object");
+        }
+        run_git_success(&repository, &["add", "."]);
+        run_git_success(&repository, &["commit", "-q", "-m", "pack fixture"]);
+        for index in 0..64 {
+            let path = repository.join(format!("object-{index:03}.txt"));
+            let mut body = fs::read(&path).expect("read git fixture object");
+            body.extend_from_slice(format!("second version {index}\n").as_bytes());
+            fs::write(path, body).expect("update git fixture object");
+        }
+        run_git_success(&repository, &["add", "."]);
+        run_git_success(&repository, &["commit", "-q", "-m", "deltified fixture"]);
+        run_git_success(&repository, &["gc", "--aggressive", "--prune=now"]);
+
+        let pack_dir = repository.join(".git/objects/pack");
+        let pack_path = largest_path_with_extension(&pack_dir, "pack");
+        let pack = fs::read(&pack_path).expect("read git-generated pack");
+        let git_index = fs::read(pack_path.with_extension("idx")).expect("read git index");
+        let one = PackIndex::write_v2_for_pack_with_options(
+            &pack,
+            ObjectFormat::Sha1,
+            |_| Ok(None),
+            PackIndexOptions::default().with_threads(1),
+            CancelFlag::never(),
+            |_| {},
+        )
+        .expect("index git pack with one worker");
+        let many = PackIndex::write_v2_for_pack_with_options(
+            &pack,
+            ObjectFormat::Sha1,
+            |_| Ok(None),
+            PackIndexOptions::default().with_threads(64),
+            CancelFlag::never(),
+            |_| {},
+        )
+        .expect("index git pack with many workers");
+        assert_eq!(many, one);
+        assert_eq!(many.index, git_index);
+        fs::remove_dir_all(root).expect("remove git fixture");
+    }
+
+    #[test]
+    fn parallel_index_rejects_self_referential_ref_delta_with_valid_checksum() {
+        let format = ObjectFormat::Sha1;
+        let mut pack = ref_delta_chain_pack(format, 1, false);
+        let descriptors = pack_entry_descriptors(&pack, format);
+        let delta_offset = descriptors[1].offset as usize;
+        let mut base_oid_offset = delta_offset;
+        let header = parse_entry_header(&pack, &mut base_oid_offset).expect("delta header");
+        assert_eq!(header.kind, PackObjectKind::RefDelta);
+        let self_oid = sley_core::object_id_for_bytes(format, "blob", &chain_bodies(1)[1])
+            .expect("self object id");
+        let base_oid_end = base_oid_offset + format.raw_len();
+        pack[base_oid_offset..base_oid_end].copy_from_slice(self_oid.as_bytes());
+        let trailer_offset = pack.len() - format.raw_len();
+        let checksum = sley_core::digest_bytes(format, &pack[..trailer_offset])
+            .expect("recompute valid pack checksum");
+        pack[trailer_offset..].copy_from_slice(checksum.as_bytes());
+
+        let error = PackIndex::write_v2_for_pack_with_options(
+            &pack,
+            format,
+            |_| Ok(None),
+            PackIndexOptions::default().with_threads(32),
+            CancelFlag::never(),
+            |_| {},
+        )
+        .expect_err("a self-referential delta chain must be rejected");
+        assert!(
+            error.to_string().contains("cyclic") || error.to_string().contains("unresolved"),
+            "unexpected chain error: {error}"
+        );
+    }
+
+    #[test]
     fn writes_ref_delta_pack_and_index_that_round_trip() {
         let (base, changed) = similar_blob_objects();
         let options = delta_pack_options(false);
@@ -1286,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_indexer_resolves_thin_bases_but_rejects_missing_ones() {
+    fn parallel_indexer_resolves_thin_bases_but_rejects_missing_ones() {
         let base = b"hello";
         let result = b"hello stream";
         let pack = thin_ref_delta_pack(ObjectFormat::Sha1, base, result);
@@ -1295,12 +1352,10 @@ mod tests {
             .object_id(ObjectFormat::Sha1)
             .expect("test operation should succeed");
 
-        let mut reader = Cursor::new(&pack);
-        let built =
-            PackIndex::write_v2_for_pack_reader_with_base(&mut reader, ObjectFormat::Sha1, |oid| {
-                Ok((oid == &base_oid).then(|| base_object.clone()))
-            })
-            .expect("streaming indexer should resolve the supplied base");
+        let built = PackIndex::write_v2_for_pack_with_base(&pack, ObjectFormat::Sha1, |oid| {
+            Ok((oid == &base_oid).then(|| base_object.clone()))
+        })
+        .expect("parallel indexer should resolve the supplied base");
         assert_eq!(built.entries.len(), 1);
         assert_eq!(
             built.entries[0].oid,
@@ -1308,14 +1363,9 @@ mod tests {
                 .expect("test operation should succeed")
         );
 
-        let mut missing_reader = Cursor::new(&pack);
-        let error = PackIndex::write_v2_for_pack_reader_with_base(
-            &mut missing_reader,
-            ObjectFormat::Sha1,
-            |_| Ok(None),
-        )
-        .expect_err("an unresolved streamed base must remain an error");
-        assert!(error.to_string().contains("unresolved delta base"));
+        let error = PackIndex::write_v2_for_pack_with_base(&pack, ObjectFormat::Sha1, |_| Ok(None))
+            .expect_err("an unresolved base must remain an error");
+        assert!(error.to_string().contains("unresolved"));
     }
 
     #[test]
@@ -3184,6 +3234,15 @@ mod tests {
         paths.remove(0)
     }
 
+    fn largest_path_with_extension(dir: &Path, extension: &str) -> PathBuf {
+        fs::read_dir(dir)
+            .expect("read fixture directory")
+            .map(|entry| entry.expect("read fixture entry").path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some(extension))
+            .max_by_key(|path| fs::metadata(path).expect("read fixture metadata").len())
+            .expect("at least one fixture path")
+    }
+
     fn pack_bitmap_index(
         format: ObjectFormat,
         object_count: u32,
@@ -4161,9 +4220,8 @@ mod tests {
     /// One `ref-delta` chain of `depth` links on top of a single blob. When
     /// `reversed`, the deltas are laid out deepest-first — legal for ref-deltas
     /// (unlike ofs-deltas, whose base must precede them) and the adversarial
-    /// shape from sley#5: each full pass of `resolve_pack_entries` can then
-    /// advance the chain by only one link, so an unbounded chain costs one
-    /// whole-list scan per link.
+    /// shape from sley#5: a naive resolver advances the chain by only one link
+    /// per full-list scan, so an unbounded chain costs one scan per link.
     fn ref_delta_chain_pack(format: ObjectFormat, depth: usize, reversed: bool) -> Vec<u8> {
         let bodies = chain_bodies(depth);
 
@@ -4366,14 +4424,6 @@ mod tests {
         let indexed = PackIndex::write_v2_for_pack_with_limits(&pack, ObjectFormat::Sha1, limits)
             .expect("the in-memory indexer must use the configured ceiling");
         assert_eq!(indexed.entries.len(), 61);
-
-        let streamed = PackIndex::write_v2_for_pack_reader_to_trailer_with_limits(
-            &mut Cursor::new(pack),
-            ObjectFormat::Sha1,
-            limits,
-        )
-        .expect("the streaming indexer must use the configured ceiling");
-        assert_eq!(streamed.entries.len(), 61);
     }
 
     #[test]
@@ -4420,12 +4470,10 @@ mod tests {
         }
     }
 
-    /// Regression (sley#5): a long chain laid out back to front made
-    /// `resolve_pack_entries` run one full pass per link — O(N^2) scans on top
-    /// of O(N) delta applications — with nothing to stop it. The depth ceiling
-    /// also bounds the pass count, because every pass advances each chain by at
-    /// least one link, so resolution now gives up after a fixed number of passes
-    /// instead of after N of them.
+    /// Regression (sley#5): a long chain laid out back to front made the former
+    /// resolver run one full pass per link — O(N^2) scans on top of O(N) delta
+    /// applications — with nothing to stop it. The dependency-level resolver
+    /// rejects the chain at the configured depth ceiling.
     #[test]
     fn rejects_adversarially_ordered_long_delta_chain_promptly() {
         let pack = ref_delta_chain_pack(ObjectFormat::Sha1, 5_000, true);

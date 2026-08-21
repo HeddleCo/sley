@@ -25,7 +25,7 @@
 //! * Cancel — cooperative stream cancellation for pack receive/generate:
 //!   [`AtomicCancel`], [`CancelFlag`], [`CancellableRead`], [`OperationContext`],
 //!   plus `Repository::{fetch,push,push_actions}_with_cancel`.
-//! * [`pack`] / [`protocol`] — repository-free streaming pack indexing and
+//! * [`pack`] / [`protocol`] — repository-free parallel pack indexing and
 //!   upload-pack sideband demultiplexing for custom storage pipelines.
 //! * [`hooks`] — traditional and config-defined hook discovery/execution.
 //! * [`OpenOptions::respect_environment`] / [`Repository::open_from_environment`]
@@ -98,17 +98,12 @@ pub mod notes {
     pub use sley_notes::*;
 }
 
-/// Streaming pack indexing primitives for embedders ([`sley_pack`]).
+/// Parallel pack indexing primitives for embedders ([`sley_pack`]).
 pub mod pack {
+    pub use sley_odb::PackInstallProgress;
     pub use sley_pack::{
-        PackIndexEntry, PackIndexedObject, PackReadLimits, PackReadStream, PackStreamIndexBuild,
-        PackStreamProgress, index_pack_from_reader, index_pack_from_reader_to_trailer,
-        index_pack_from_reader_to_trailer_with_limits,
-        index_pack_from_reader_to_trailer_with_progress,
-        index_pack_from_reader_to_trailer_with_progress_and_limits,
-        index_pack_from_reader_with_limits, index_pack_from_stream,
-        index_pack_from_stream_with_limits, index_pack_from_stream_with_progress,
-        index_pack_from_stream_with_progress_and_limits,
+        PackIndex, PackIndexBuild, PackIndexEntry, PackIndexOptions, PackIndexProgress,
+        PackIndexedObject, PackReadLimits,
     };
 }
 

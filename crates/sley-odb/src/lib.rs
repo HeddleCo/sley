@@ -29,7 +29,6 @@ pub use pack::*;
 pub use reachability::*;
 pub use registry::*;
 pub use repack::*;
-pub use sley_pack::PackStreamProgress;
 // Cancel types re-exported so callers of cancel-aware install (remote, fetch)
 // can name them without depending on `sley-pack` or reaching into `sley-core`.
 pub use sley_core::{AtomicCancel, CancelFlag, CancellableRead};
@@ -1707,7 +1706,7 @@ mod tests {
             .install_raw_pack_from_reader(&mut reader)
             .expect_err("trailing bytes should be rejected");
 
-        assert!(err.to_string().contains("trailing bytes after checksum"));
+        assert!(err.to_string().contains("pack checksum mismatch"));
         let pack_dir = git_dir.join("objects").join("pack");
         let pack_entries = fs::read_dir(&pack_dir)
             .map(|entries| entries.count())
@@ -2168,10 +2167,6 @@ mod tests {
             .expect("reachable pack should be built");
 
         let indexed = index_raw_pack(&pack.pack, format).expect("test operation should succeed");
-        let mut cursor = std::io::Cursor::new(pack.pack.clone());
-        let streamed = index_raw_pack_from_reader(&mut cursor, format)
-            .expect("streamed pack indexing should match in-memory indexing");
-        assert_eq!(streamed, indexed);
         let pack_path = root.join("reachable.pack");
         fs::write(&pack_path, &pack.pack).expect("test operation should succeed");
         let file_indexed = index_raw_pack_file(&pack_path, format)

@@ -209,7 +209,6 @@ fn render_report(elapsed: Duration, snapshot: &fetch_profile::Snapshot, folded: 
         .iter()
         .map(|sample| sample.duration)
         .sum::<Duration>();
-    let unattributed = elapsed.saturating_sub(profiled);
     let socket = &snapshot.stages[Stage::SocketRead as usize];
     let pack = &snapshot.stages[Stage::PktLineSideband as usize];
     let transfer_mbps = decimal_mbps(pack.bytes, elapsed);
@@ -217,11 +216,12 @@ fn render_report(elapsed: Duration, snapshot: &fetch_profile::Snapshot, folded: 
 
     let _ = writeln!(out, "sley protocol-v2 fetch/index-pack profile");
     let _ = writeln!(out, "total_wall_seconds={:.6}", elapsed.as_secs_f64());
-    let _ = writeln!(out, "profiled_wall_seconds={:.6}", profiled.as_secs_f64());
+    // Stage timers are exclusive within one thread, but parallel worker spans
+    // overlap. Their sum is useful CPU occupancy, not elapsed wall time.
     let _ = writeln!(
         out,
-        "unattributed_wall_seconds={:.6}",
-        unattributed.as_secs_f64()
+        "aggregate_profiled_seconds={:.6}",
+        profiled.as_secs_f64()
     );
     let _ = writeln!(out, "pack_bytes={}", pack.bytes);
     let _ = writeln!(out, "socket_body_bytes={}", socket.bytes);
@@ -235,12 +235,18 @@ fn render_report(elapsed: Duration, snapshot: &fetch_profile::Snapshot, folded: 
     );
     #[cfg(not(feature = "fast-sha1"))]
     let _ = writeln!(out, "sha1_backend=sley-core scalar SHA-1 (not SHA-1DC)");
-    let _ = writeln!(out, "index_pack_threads=1");
-    let _ = writeln!(out, "object_storage=packfile_plus_v2_idx");
+    let index_threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let _ = writeln!(out, "index_pack_threads={index_threads}");
+    let _ = writeln!(out, "object_storage=bounded_spool_plus_mmap_plus_v2_idx");
     let _ = writeln!(out, "fsync_count={}", snapshot.fsyncs);
     let _ = writeln!(out, "folded_stacks={}", folded.display());
     let _ = writeln!(out);
-    let _ = writeln!(out, "stage\twall_seconds\tpercent_total\tcount\tbytes");
+    let _ = writeln!(
+        out,
+        "stage\taggregate_seconds\tpercent_of_wall\tcount\tbytes"
+    );
     for sample in &snapshot.stages {
         let percent = if elapsed.is_zero() {
             0.0
@@ -256,16 +262,6 @@ fn render_report(elapsed: Duration, snapshot: &fetch_profile::Snapshot, folded: 
             sample.bytes,
         );
     }
-    let unattributed_percent = if elapsed.is_zero() {
-        0.0
-    } else {
-        unattributed.as_secs_f64() * 100.0 / elapsed.as_secs_f64()
-    };
-    let _ = writeln!(
-        out,
-        "unattributed / orchestration\t{:.6}\t{unattributed_percent:.2}\t0\t0",
-        unattributed.as_secs_f64(),
-    );
     out
 }
 

@@ -5,12 +5,22 @@
 //! iterative chain planner around that authoritative grammar.
 
 use super::*;
-use flate2::{Decompress, FlushDecompress, Status};
+use flate2::{FlushDecompress, Status};
 use std::collections::{HashMap, HashSet};
 use std::io;
 
 const ENTRY_PREFIX_BYTES: usize = 64;
-const INFLATE_CHUNK_BYTES: usize = 8 * 1024;
+const INFLATE_CHUNK_BYTES: usize = 256 * 1024;
+
+struct InflateScratch {
+    input: Vec<u8>,
+}
+
+thread_local! {
+    static INFLATE_SCRATCH: RefCell<InflateScratch> = RefCell::new(InflateScratch {
+        input: vec![0; INFLATE_CHUNK_BYTES],
+    });
+}
 
 /// A source that can read pack bytes positionally without changing shared
 /// cursor state or requiring the complete pack to be resident in memory.
@@ -21,6 +31,13 @@ pub trait PackReadSource {
     /// Read bytes beginning at `offset`, with the same short-read semantics as
     /// [`std::io::Read::read`]. Returning `0` means end of source.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
+
+    /// Borrow all source bytes when the backing is already contiguous (for
+    /// example an mmap or owned buffer). The decoder uses this to inflate
+    /// directly from the source without fixed-size input copies.
+    fn as_bytes(&self) -> Option<&[u8]> {
+        None
+    }
 
     /// Whether this source contains no bytes.
     fn is_empty(&self) -> io::Result<bool> {
@@ -55,6 +72,10 @@ impl PackReadSource for SlicePackSource<'_> {
         buf[..count].copy_from_slice(&remaining[..count]);
         Ok(count)
     }
+
+    fn as_bytes(&self) -> Option<&[u8]> {
+        Some(self.bytes)
+    }
 }
 
 impl PackReadSource for Vec<u8> {
@@ -70,6 +91,10 @@ impl PackReadSource for Vec<u8> {
         let count = remaining.len().min(buf.len());
         buf[..count].copy_from_slice(&remaining[..count]);
         Ok(count)
+    }
+
+    fn as_bytes(&self) -> Option<&[u8]> {
+        Some(self.as_slice())
     }
 }
 
@@ -1134,88 +1159,125 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
                 attempted: usize::MAX,
             })
         })?;
-        let source = self.source_state(entry.location)?;
         let source_id = entry.location.source;
-        let trailer_offset = source.trailer_offset;
+        let trailer_offset = self.source_state(entry.location)?.trailer_offset;
         let mut body = self.allocate_body(expected, active_bytes, pinned_cache, cancel, stats)?;
 
-        let mut decompressor = Decompress::new(true);
-        let mut input = [0u8; INFLATE_CHUNK_BYTES];
-        let mut output = [0u8; INFLATE_CHUNK_BYTES];
-        let mut input_start = 0usize;
-        let mut input_end = 0usize;
-        let mut source_offset = entry.data_offset;
-
-        loop {
-            cancel.check()?;
-            if input_start == input_end {
-                if source_offset >= trailer_offset {
-                    return Err(GitError::InvalidObject("truncated zlib stream".into()).into());
-                }
-                let wanted = usize::try_from(
-                    (trailer_offset - source_offset).min(INFLATE_CHUNK_BYTES as u64),
-                )
-                .unwrap_or(INFLATE_CHUNK_BYTES);
-                let read = self.read_source_at(
-                    source_id,
-                    source_offset,
-                    &mut input[..wanted],
-                    cancel,
-                    stats,
-                )?;
-                if read == 0 {
-                    return Err(GitError::InvalidObject("truncated zlib stream".into()).into());
-                }
-                source_offset = source_offset
-                    .checked_add(read as u64)
-                    .ok_or_else(|| GitError::InvalidFormat("pack source offset overflow".into()))?;
-                input_start = 0;
-                input_end = read;
-            }
-
-            let before_in = decompressor.total_in();
-            let before_out = decompressor.total_out();
-            let status = decompressor
-                .decompress(
-                    &input[input_start..input_end],
-                    &mut output,
-                    FlushDecompress::None,
-                )
-                .map_err(|error| {
-                    GitError::InvalidObject(format!("zlib inflate failed: {error}"))
-                })?;
-            let consumed =
-                usize::try_from(decompressor.total_in() - before_in).unwrap_or(usize::MAX);
-            let produced =
-                usize::try_from(decompressor.total_out() - before_out).unwrap_or(usize::MAX);
-            input_start = input_start.saturating_add(consumed);
+        if let Some(bytes) = self.source_state(entry.location)?.source.as_bytes() {
+            let start = usize::try_from(entry.data_offset).map_err(|_| {
+                GitError::InvalidFormat("pack object offset overflows usize".into())
+            })?;
+            let end = usize::try_from(trailer_offset).map_err(|_| {
+                GitError::InvalidFormat("pack trailer offset overflows usize".into())
+            })?;
+            let compressed = bytes.get(start..end).ok_or_else(|| {
+                GitError::InvalidFormat("pack object data range is out of bounds".into())
+            })?;
+            let consumed = inflate_exact_into(compressed, &mut body, expected, cancel)?;
             stats.compressed_bytes_read =
                 stats.compressed_bytes_read.saturating_add(consumed as u64);
-            let attempted = self.checked_materialized_add(body.len(), produced)?;
-            if attempted > expected {
-                return Err(GitError::InvalidObject(format!(
-                    "pack object declared {} bytes, decoded more than {}",
-                    entry.header.size, expected
-                ))
-                .into());
-            }
-            body.extend_from_slice(&output[..produced]);
-
-            if status == Status::StreamEnd {
-                if body.len() != expected {
-                    return Err(GitError::InvalidObject(format!(
-                        "pack object declared {} bytes, decoded {}",
-                        entry.header.size,
-                        body.len()
-                    ))
-                    .into());
-                }
-                return Ok(body);
-            }
-            if consumed == 0 && produced == 0 && input_start < input_end {
-                return Err(GitError::InvalidObject("zlib inflate made no progress".into()).into());
-            }
+            stats.source_bytes_read = stats.source_bytes_read.saturating_add(consumed as u64);
+            return Ok(body);
         }
+
+        INFLATE_SCRATCH.with(|scratch_cell| {
+            INFLATE.with(|decompress_cell| {
+                let mut scratch = scratch_cell.borrow_mut();
+                let mut decompressor = decompress_cell.borrow_mut();
+                decompressor.reset(true);
+                let mut input_start = 0usize;
+                let mut input_end = 0usize;
+                let mut source_offset = entry.data_offset;
+                let input_chunk_bytes = expected
+                    .saturating_add(64)
+                    .clamp(32 * 1024, INFLATE_CHUNK_BYTES);
+                let mut overflow = [0u8; 1];
+                loop {
+                    cancel.check()?;
+                    if input_start == input_end {
+                        if source_offset >= trailer_offset {
+                            return Err(
+                                GitError::InvalidObject("truncated zlib stream".into()).into()
+                            );
+                        }
+                        let wanted = usize::try_from(
+                            (trailer_offset - source_offset).min(input_chunk_bytes as u64),
+                        )
+                        .unwrap_or(input_chunk_bytes);
+                        let read = self.read_source_at(
+                            source_id,
+                            source_offset,
+                            &mut scratch.input[..wanted],
+                            cancel,
+                            stats,
+                        )?;
+                        if read == 0 {
+                            return Err(
+                                GitError::InvalidObject("truncated zlib stream".into()).into()
+                            );
+                        }
+                        source_offset =
+                            source_offset.checked_add(read as u64).ok_or_else(|| {
+                                GitError::InvalidFormat("pack source offset overflow".into())
+                            })?;
+                        input_start = 0;
+                        input_end = read;
+                    }
+
+                    let before_in = decompressor.total_in();
+                    let before_out = decompressor.total_out();
+                    let checking_overflow = body.len() == expected;
+                    let status = if checking_overflow {
+                        decompressor.decompress(
+                            &scratch.input[input_start..input_end],
+                            &mut overflow,
+                            FlushDecompress::None,
+                        )
+                    } else {
+                        decompressor.decompress_vec(
+                            &scratch.input[input_start..input_end],
+                            &mut body,
+                            FlushDecompress::None,
+                        )
+                    }
+                    .map_err(|error| {
+                        GitError::InvalidObject(format!("zlib inflate failed: {error}"))
+                    })?;
+                    let consumed =
+                        usize::try_from(decompressor.total_in() - before_in).unwrap_or(usize::MAX);
+                    let produced = usize::try_from(decompressor.total_out() - before_out)
+                        .unwrap_or(usize::MAX);
+                    input_start = input_start.saturating_add(consumed);
+                    stats.compressed_bytes_read =
+                        stats.compressed_bytes_read.saturating_add(consumed as u64);
+                    if body.len() > expected || (checking_overflow && produced != 0) {
+                        return Err(GitError::InvalidObject(format!(
+                            "pack object declared {} bytes, decoded more than {}",
+                            entry.header.size, expected
+                        ))
+                        .into());
+                    }
+
+                    if status == Status::StreamEnd {
+                        if body.len() != expected {
+                            return Err(GitError::InvalidObject(format!(
+                                "pack object declared {} bytes, decoded {}",
+                                entry.header.size,
+                                body.len()
+                            ))
+                            .into());
+                        }
+                        return Ok(body);
+                    }
+                    if consumed == 0 && produced == 0 && input_start < input_end {
+                        return Err(GitError::InvalidObject(
+                            "zlib inflate made no progress".into(),
+                        )
+                        .into());
+                    }
+                }
+            })
+        })
     }
 
     fn ensure_materialized(
@@ -1334,6 +1396,57 @@ impl<S: PackReadSource> BoundedPackDecoder<S> {
             .get(location.source.0)
             .ok_or_else(|| GitError::InvalidFormat("unknown pack source id".into()).into())
     }
+}
+
+fn inflate_exact_into(
+    compressed: &[u8],
+    body: &mut Vec<u8>,
+    expected: usize,
+    cancel: CancelFlag<'_>,
+) -> Result<usize> {
+    INFLATE.with(|cell| {
+        let mut decompressor = cell.borrow_mut();
+        decompressor.reset(true);
+        let mut input = compressed;
+        let mut overflow = [0u8; 1];
+        loop {
+            cancel.check()?;
+            let before_in = decompressor.total_in();
+            let before_out = decompressor.total_out();
+            let checking_overflow = body.len() == expected;
+            let status = if checking_overflow {
+                decompressor.decompress(input, &mut overflow, FlushDecompress::None)
+            } else {
+                decompressor.decompress_vec(input, body, FlushDecompress::None)
+            }
+            .map_err(|error| GitError::InvalidObject(format!("zlib inflate failed: {error}")))?;
+            let consumed = (decompressor.total_in() - before_in) as usize;
+            let produced = (decompressor.total_out() - before_out) as usize;
+            if body.len() > expected || (checking_overflow && produced != 0) {
+                return Err(GitError::InvalidObject(format!(
+                    "pack object declared {expected} bytes, decoded more than {expected}"
+                )));
+            }
+            input = input.get(consumed..).ok_or_else(|| {
+                GitError::InvalidObject("zlib consumed beyond pack entry input".into())
+            })?;
+            match status {
+                Status::StreamEnd if body.len() == expected => {
+                    return Ok(decompressor.total_in() as usize);
+                }
+                Status::StreamEnd => {
+                    return Err(GitError::InvalidObject(format!(
+                        "pack object declared {expected} bytes, decoded {}",
+                        body.len()
+                    )));
+                }
+                _ if consumed == 0 && produced == 0 => {
+                    return Err(GitError::InvalidObject("truncated zlib stream".into()));
+                }
+                _ => {}
+            }
+        }
+    })
 }
 
 fn cancellable_object_id(

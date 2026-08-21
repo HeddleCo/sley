@@ -3,7 +3,7 @@
 //!
 //! Packs reach these parsers straight off the wire (`sley-remote`'s fetch and
 //! receive-pack paths hand a remote's bytes to `PackFile::parse`,
-//! `PackIndex::write_v2_for_pack`, and the streaming indexer), so every field a
+//! `PackIndex::write_v2_for_pack`), so every field a
 //! peer controls needs an explicit ceiling rather than an implicit one.
 
 use super::*;
@@ -19,8 +19,7 @@ use super::*;
 const MIN_PACK_ENTRY_BYTES: u64 = 3;
 
 /// Upper bound on the speculative `Vec::with_capacity` taken from a declared
-/// object count when the total pack length is not known up front (the
-/// streaming indexer reads the header before it has seen the body).
+/// object count.
 ///
 /// 2^16 entries is roughly the object count of a routine incremental fetch, so
 /// ordinary packs still get a single up-front allocation; larger packs simply
@@ -35,11 +34,8 @@ pub const PACK_OBJECT_COUNT_PREALLOC_CAP: usize = 64 * 1024;
 /// [`PackReadLimits::default`]; callers that legitimately consume deeper packs
 /// can raise [`PackReadLimits::max_delta_depth`] while retaining a finite bound.
 ///
-/// The bound is what makes whole-pack resolution linear: `resolve_pack_entries`
-/// makes repeated passes over the entry list, and each pass advances every
-/// chain by at least one link, so the pass count is bounded by the deepest
-/// chain. Without a ceiling an adversarial pack that orders one long chain
-/// back-to-front costs O(N^2) in passes alone.
+/// The bound keeps recursive dependencies finite and rejects adversarially deep
+/// chains before applying their deltas.
 pub const MAX_READ_DELTA_CHAIN_DEPTH: usize = DEFAULT_PACK_DEPTH;
 
 /// Validate a pack header's declared object count against the bytes actually
