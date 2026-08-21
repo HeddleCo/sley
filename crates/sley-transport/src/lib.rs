@@ -1569,21 +1569,6 @@ const HTTP_SEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(feature = "http-client")]
 const HTTP_AWAIT_100_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Max time to receive the response headers (not the body).
-///
-/// A smart-HTTP server flushes its response headers before it starts writing
-/// the pack -- `git-upload-pack`'s object enumeration shows up as a gap inside
-/// the body, which `HTTP_BODY_TIMEOUT` covers, not as a delay before the
-/// headers. So this only has to cover a few round trips plus server dispatch,
-/// and 30s is already generous for a phase carrying a few hundred bytes.
-///
-/// Note that ureq also re-checks the *preceding* phase's deadline while it
-/// waits, so the effective bound on "request sent, no headers yet" is the
-/// tighter of this and [`HTTP_SEND_REQUEST_TIMEOUT`] measured from the start of
-/// the request -- 20s in practice, which is what a stalled peer actually hits.
-#[cfg(feature = "http-client")]
-const HTTP_RECV_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Max time to send or to receive a body.
 ///
 /// Derived rather than chosen: the largest body sley will buffer divided by the
@@ -1616,7 +1601,6 @@ fn http_global_timeout(limits: TransportLimits) -> Duration {
             + HTTP_CONNECT_TIMEOUT.as_secs()
             + HTTP_SEND_REQUEST_TIMEOUT.as_secs()
             + HTTP_AWAIT_100_TIMEOUT.as_secs()
-            + HTTP_RECV_RESPONSE_TIMEOUT.as_secs()
             + 2 * http_body_timeout(limits).as_secs(),
     )
 }
@@ -1641,7 +1625,12 @@ fn http_timeouts(limits: TransportLimits) -> ureq::config::Timeouts {
         send_request: Some(HTTP_SEND_REQUEST_TIMEOUT),
         await_100: Some(HTTP_AWAIT_100_TIMEOUT),
         send_body: Some(body),
-        recv_response: Some(HTTP_RECV_RESPONSE_TIMEOUT),
+        // ureq checks `recv_response` again throughout RecvBody, so a short
+        // header-only value here truncates large healthy bodies. Give both
+        // receive states the body budget. While awaiting headers ureq also
+        // checks the preceding `send_request` deadline, preserving the tighter
+        // 20-second stalled-header bound.
+        recv_response: Some(body),
         recv_body: Some(body),
     }
 }
@@ -3648,7 +3637,6 @@ mod http_timeout_tests {
                 + HTTP_CONNECT_TIMEOUT.as_secs()
                 + HTTP_SEND_REQUEST_TIMEOUT.as_secs()
                 + HTTP_AWAIT_100_TIMEOUT.as_secs()
-                + HTTP_RECV_RESPONSE_TIMEOUT.as_secs()
                 + 2 * http_body_timeout(limits).as_secs()
         );
     }
@@ -3665,6 +3653,7 @@ mod http_timeout_tests {
             ))
         );
         assert_eq!(timeouts.send_body, timeouts.recv_body);
+        assert_eq!(timeouts.recv_response, timeouts.recv_body);
         assert_eq!(UreqHttpClient::new().limits(), TransportLimits::default());
     }
 
@@ -3686,6 +3675,7 @@ mod http_timeout_tests {
             ))
         );
         assert!(timeouts.recv_body > Some(http_body_timeout(TransportLimits::default())));
+        assert_eq!(timeouts.recv_response, timeouts.recv_body);
     }
 
     /// The ceiling moves; it does not disappear. Every field stays set and

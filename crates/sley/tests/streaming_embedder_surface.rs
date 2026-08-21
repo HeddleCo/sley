@@ -1,11 +1,7 @@
 use std::io::{Cursor, Read};
 
 use sley::ObjectFormat;
-use sley::pack::{
-    PackReadStream, index_pack_from_reader, index_pack_from_reader_to_trailer,
-    index_pack_from_reader_to_trailer_with_progress, index_pack_from_stream,
-    index_pack_from_stream_with_progress,
-};
+use sley::pack::{PackIndex, PackIndexOptions};
 use sley::protocol::{
     SideBandChannel, SideBandPacket, StreamingSidebandReader, write_sideband_packet,
 };
@@ -20,7 +16,7 @@ fn single_blob_sha1_pack() -> Vec<u8> {
 }
 
 #[test]
-fn public_streaming_primitives_index_and_demux_without_a_repository() {
+fn public_parallel_pack_primitives_index_and_demux_without_a_repository() {
     let pack = single_blob_sha1_pack();
     let mut response = Vec::new();
     write_sideband_packet(
@@ -43,9 +39,15 @@ fn public_streaming_primitives_index_and_demux_without_a_repository() {
         .expect("sideband stream should end at flush");
     assert_eq!(demuxed_pack, pack);
 
-    let mut seekable_pack = Cursor::new(demuxed_pack);
-    let build = index_pack_from_reader(&mut seekable_pack, ObjectFormat::Sha1)
-        .expect("seekable pack should index");
+    let build = PackIndex::write_v2_for_pack_with_options(
+        &demuxed_pack,
+        ObjectFormat::Sha1,
+        |_| Ok(None),
+        PackIndexOptions::default().with_threads(8),
+        sley::CancelFlag::never(),
+        |_| {},
+    )
+    .expect("immutable pack bytes should index in parallel");
     assert_eq!(build.entries.len(), 1);
     assert_eq!(build.objects.len(), 1);
     assert_eq!(
@@ -61,34 +63,14 @@ fn public_streaming_primitives_index_and_demux_without_a_repository() {
     );
     assert!(!build.index.is_empty());
 
-    let mut trailer_reader = Cursor::new(pack.as_slice());
-    index_pack_from_reader_to_trailer(&mut trailer_reader, ObjectFormat::Sha1)
-        .expect("trailer-delimited pack should index");
-
-    let mut progress_reader = Cursor::new(pack.as_slice());
-    index_pack_from_reader_to_trailer_with_progress(
-        &mut progress_reader,
+    let one_worker = PackIndex::write_v2_for_pack_with_options(
+        &pack,
         ObjectFormat::Sha1,
+        |_| Ok(None),
+        PackIndexOptions::default().with_threads(1),
+        sley::CancelFlag::never(),
         |_| {},
     )
-    .expect("trailer-delimited pack should index with progress");
-
-    let mut stream_reader = Cursor::new(pack.as_slice());
-    let stream = PackReadStream::new(
-        &mut stream_reader,
-        ObjectFormat::Sha1,
-        Some(pack.len() as u64),
-    )
-    .expect("bounded pack stream should construct");
-    index_pack_from_stream(stream, ObjectFormat::Sha1).expect("prepared pack stream should index");
-
-    let mut stream_reader = Cursor::new(pack.as_slice());
-    let stream = PackReadStream::new(
-        &mut stream_reader,
-        ObjectFormat::Sha1,
-        Some(pack.len() as u64),
-    )
-    .expect("bounded pack stream should construct");
-    index_pack_from_stream_with_progress(stream, ObjectFormat::Sha1, |_| {})
-        .expect("prepared pack stream should index with progress");
+    .expect("one-worker scheduling should index");
+    assert_eq!(one_worker, build);
 }

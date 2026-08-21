@@ -14,7 +14,7 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use sley_bench::{FIXTURE_OBJECT_COUNT, build_blob_pack, create_pack_install_target};
 use sley_core::{AtomicCancel, CancelFlag, GitError};
 use sley_odb::{
-    FileObjectDatabase, PackStreamProgress, RawPackInstallOptions, RawPackInstallResult,
+    FileObjectDatabase, PackInstallProgress, RawPackInstallOptions, RawPackInstallResult,
     RawPackInstaller,
 };
 use sley_pack::PackWrite;
@@ -133,8 +133,8 @@ fn cancel_mid_stream_install(c: &mut Criterion) {
     group.finish();
 }
 
-/// Trip cancel from pack-indexer progress after the first object so the
-/// cooperative path observes mid-stream cancel.
+/// Trip cancel from pack-indexer progress after the first completed object so
+/// the cooperative path stops before installation.
 struct CancelOnProgressInstaller<'a> {
     inner: &'a FileObjectDatabase,
     source: &'a AtomicCancel,
@@ -162,7 +162,7 @@ impl RawPackInstaller for CancelOnProgressInstaller<'_> {
     ) -> sley_core::Result<RawPackInstallResult>
     where
         R: Read,
-        F: FnMut(PackStreamProgress),
+        F: FnMut(PackInstallProgress),
     {
         RawPackInstaller::install_raw_pack_from_reader_with_progress_and_cancel(
             self.inner,
@@ -170,7 +170,7 @@ impl RawPackInstaller for CancelOnProgressInstaller<'_> {
             options,
             cancel,
             |p| {
-                if p.received_objects >= 1 {
+                if p.indexed_objects >= 1 {
                     self.saw_object.set(true);
                     self.source.cancel();
                 }

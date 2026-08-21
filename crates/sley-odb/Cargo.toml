@@ -16,9 +16,9 @@ parking_lot = "0.12.5"
 smallvec = "1.15.2"
 sley-core.workspace = true
 sley-formats.workspace = true
-sley-mmap = { workspace = true, optional = true }
+sley-mmap.workspace = true
 sley-object.workspace = true
-sley-pack = { path = "../sley-pack", version = "0.6.0", default-features = false } # inline: default-features override cant use workspace inherit
+sley-pack = { path = "../sley-pack", version = "0.7.0", default-features = false } # inline: default-features override cant use workspace inherit
 
 [features]
 default = ["zlib-rs"]
@@ -29,9 +29,9 @@ zlib-rs = ["flate2/zlib-rs", "sley-pack/zlib-rs"]
 pure-rust = ["flate2/rust_backend", "sley-pack/pure-rust"]
 # Forward the hardware-accelerated SHA-1 backend (see sley-core).
 fast-sha1 = ["sley-core/fast-sha1", "sley-pack/fast-sha1"]
-# Memory-map pack files instead of reading them into the heap. Pulls in sley-mmap
-# (the workspace's only unsafe). Off by default; the gain is on large repos.
-mmap = ["dep:sley-mmap"]
+# Memory-map pack files instead of reading them into the heap when opening them
+# for object reads. Fetch indexing always maps its completed staging file.
+mmap = []
 fetch-profile = ["sley-core/fetch-profile", "sley-pack/fetch-profile"]
 
 [lints]

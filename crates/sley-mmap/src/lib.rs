@@ -61,13 +61,14 @@ impl MappedFile {
 
     /// Memory-map a git **pack/index file** (`*.pack` / `*.idx`) read-only.
     ///
-    /// This is the safe, audited entry point for sley: pack files are created by
-    /// writing a temporary and atomically renaming it into place, and are never
-    /// truncated or rewritten in place (a repack writes a new file and renames;
-    /// unlinking a still-mapped pack keeps the inode valid on Unix). That immutability
-    /// is exactly the precondition [`MappedFile::open`] requires, so mapping a pack is
-    /// sound. To keep this safe API scoped to those files, this rejects symlinks,
-    /// non-regular files, and paths whose extension is not `.pack` or `.idx`.
+    /// This is the safe, audited entry point for sley. Installed packs are
+    /// created by atomic rename and never rewritten in place (a repack writes a
+    /// new file and renames; unlinking a still-mapped pack keeps the inode valid
+    /// on Unix). A completed staging pack is likewise closed and immutable while
+    /// sley indexes its map, then atomically renamed after the map is dropped.
+    /// Those lifecycles satisfy the precondition [`MappedFile::open`] requires.
+    /// To keep this safe API scoped to them, this rejects symlinks, non-regular
+    /// files, and paths whose extension is not `.pack` or `.idx`.
     ///
     /// # Errors
     ///
@@ -89,8 +90,8 @@ impl MappedFile {
                 "pack path must end in .pack or .idx",
             ));
         }
-        // SAFETY: `path` is a git pack file, which sley writes atomically and never
-        // mutates in place (see the doc comment), so the mapped bytes stay valid.
+        // SAFETY: `path` is an installed or completed staging git pack file,
+        // whose audited lifecycle does not mutate it while mapped (see above).
         unsafe { Self::open(path) }
     }
 

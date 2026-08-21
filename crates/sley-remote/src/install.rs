@@ -4,15 +4,15 @@
 
 use sley_core::{CancelFlag, ObjectFormat, Result};
 use sley_odb::{
-    FileObjectDatabase, PackStreamProgress, RawPackInstallOptions, RawPackInstallResult,
+    FileObjectDatabase, PackInstallProgress, RawPackInstallOptions, RawPackInstallResult,
     RawPackInstaller,
 };
 use std::cell::RefCell;
 
 use crate::{ProgressSink, TransferProgress};
 
-/// Wraps a [`RawPackInstaller`] so the streaming pack counters produced while
-/// indexing are forwarded to a [`ProgressSink`] as [`TransferProgress`]. Passed
+/// Wraps a [`RawPackInstaller`] so its receipt and indexing counters are
+/// forwarded to a [`ProgressSink`] as [`TransferProgress`]. Passed
 /// as the `destination` of the generic `install_upload_pack_*` helpers, it
 /// threads live byte/object progress without changing their signatures.
 ///
@@ -66,7 +66,7 @@ where
     ) -> Result<RawPackInstallResult>
     where
         R: Read,
-        F: FnMut(PackStreamProgress),
+        F: FnMut(PackInstallProgress),
     {
         // External progress F is ignored: ProgressInstaller owns the ProgressSink.
         self.inner
@@ -83,14 +83,13 @@ where
     }
 }
 
-pub(crate) fn transfer_from_pack(progress: PackStreamProgress) -> TransferProgress {
+pub(crate) fn transfer_from_pack(progress: PackInstallProgress) -> TransferProgress {
     TransferProgress {
         received_bytes: progress.received_bytes,
-        received_objects: progress.received_objects,
+        received_objects: progress.indexed_objects,
         total_objects: Some(progress.total_objects),
-        // Deltas are resolved in one batch after the streaming parse, so
-        // per-delta progress is not surfaced yet. TODO(sley#146 follow-up):
-        // thread indexed-deltas from `resolve_pack_entries`.
+        // The pack engine reports completed objects, but does not split that
+        // count into full objects and deltas.
         indexed_deltas: 0,
     }
 }
@@ -278,11 +277,11 @@ where
     // can cancel mid-transfer without buffering the full response. Leading
     // ACK/NAK pkt-lines are skipped to match read_upload_pack_packfile_response
     // semantics. Channel-2 progress is ignored here; ProgressInstaller reports
-    // object/byte counters from the pack indexer instead.
+    // receipt/index counters from the installer instead.
     //
     // Parity with the old buffer-then-install path:
-    // - after the pack trailer is complete the indexer stops reading, but the
-    //   wire may still carry trailing progress frames + flush — drain them;
+    // - after channel-1 pack receipt completes, the wire may still carry
+    //   trailing progress frames + flush — drain them;
     // - sideband fatal/protocol errors surface as InvalidFormat (not bare Io).
     let mut pack_reader =
         StreamingSidebandReader::new(reader, |_: &[u8]| {}).skip_upload_pack_acks();
@@ -859,13 +858,13 @@ mod tests {
                 sley_odb::RawPackInstallOptions::default(),
                 CancelFlag::new(&source),
                 |progress| {
-                    if progress.received_objects >= 1 {
+                    if progress.indexed_objects >= 1 {
                         saw_object = true;
                         source.cancel();
                     }
                 },
             )
-            .expect_err("mid-stream cancel should fail");
+            .expect_err("mid-index cancel should fail");
 
         assert!(
             saw_object,
