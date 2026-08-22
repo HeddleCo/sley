@@ -3,7 +3,8 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use sley_config::GitConfig;
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_core::fsync::FsyncMethod as ReferenceFsyncMethod;
+use sley_core::{fsync, GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{
     Reftable, ReftableLogRecord, ReftableLogUpdate, ReftableLogValue, ReftableRefRecord,
     ReftableRefValue, ReftableWriteOptions,
@@ -819,57 +820,15 @@ struct RefStorageConfiguration {
     invalid_value: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReferenceFsyncMethod {
-    Fsync,
-    WriteoutOnly,
-    Batch,
-}
-
-impl ReferenceFsyncMethod {
-    const fn platform_default() -> Self {
-        #[cfg(target_os = "windows")]
-        {
-            Self::Batch
-        }
-        #[cfg(all(not(target_os = "windows"), target_os = "macos"))]
-        {
-            Self::WriteoutOnly
-        }
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        {
-            Self::Fsync
-        }
-    }
-
-    fn from_config(value: Option<&str>) -> Self {
-        match value {
-            Some("fsync") => Self::Fsync,
-            Some("writeout-only") => Self::WriteoutOnly,
-            Some("batch") => Self::Batch,
-            _ => Self::platform_default(),
-        }
-    }
-}
+/// Barrier method for reference writes, resolved through the shared policy in
+/// `sley_core::fsync`; alias keeps the internal write-path signatures stable.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReferenceFsyncPolicy {
-    enabled: bool,
-    method: ReferenceFsyncMethod,
-}
+struct ReferenceFsyncPolicy(sley_core::fsync::Policy);
 
 impl ReferenceFsyncPolicy {
-    fn from_config(core_fsync: Option<&str>, core_fsync_method: Option<&str>) -> Self {
-        let enabled =
-            core_fsync.is_some_and(core_fsync_includes_reference) && git_test_fsync_enabled();
-        Self {
-            enabled,
-            method: ReferenceFsyncMethod::from_config(core_fsync_method),
-        }
-    }
-
     fn method_if_enabled(self) -> Option<ReferenceFsyncMethod> {
-        self.enabled.then_some(self.method)
+        self.0.method_if_enabled(sley_core::fsync::FsyncComponents::REFERENCE)
     }
 }
 
@@ -965,76 +924,20 @@ fn configured_reference_fsync(common_dir: &Path) -> ReferenceFsyncPolicy {
         Some(sley_config::git_dir_for_include_context(common_dir)),
         sley_config::repo_current_branch_name(common_dir),
     );
-    let config = sley_config::load_effective_config(common_dir, &context).ok();
-    ReferenceFsyncPolicy::from_config(
-        config
-            .as_ref()
-            .and_then(|config| config.get("core", None, "fsync")),
-        config
-            .as_ref()
-            .and_then(|config| config.get("core", None, "fsyncMethod")),
-    )
-}
-
-fn core_fsync_includes_reference(value: &str) -> bool {
-    const COMPONENTS: [(&str, bool); 11] = [
-        ("loose-object", false),
-        ("pack", false),
-        ("pack-metadata", false),
-        ("commit-graph", false),
-        ("index", false),
-        ("objects", false),
-        ("reference", true),
-        ("derived-metadata", false),
-        ("committed", true),
-        ("added", true),
-        ("all", true),
-    ];
-    let mut positive = false;
-    let mut negative = false;
-    for raw_component in value.split(',') {
-        let component = raw_component.trim();
-        if component == "none" || component.is_empty() {
-            continue;
-        }
-        let (negated, component) = component
-            .strip_prefix('-')
-            .map_or((false, component), |component| (true, component));
-        if component.is_empty() {
-            continue;
-        }
-        let matches_reference = COMPONENTS
-            .iter()
-            .any(|(name, includes_reference)| *includes_reference && name.starts_with(component));
-        if matches_reference {
-            if negated {
-                negative = true;
-            } else {
-                positive = true;
-            }
-        }
+    match sley_config::load_effective_config(common_dir, &context) {
+        Ok(config) => ReferenceFsyncPolicy(fsync::Policy::resolve(&config)),
+        // Unreadable configuration behaves like a repository without the
+        // core.fsync keys.
+        Err(_) => ReferenceFsyncPolicy(fsync::Policy::from_values(None, None)),
     }
-    // Git starts from FSYNC_COMPONENTS_DEFAULT (which excludes references),
-    // then applies accumulated negatives and positives. Positives win when the
-    // same component appears in both sets.
-    (platform_default_includes_reference_fsync() && !negative) || positive
 }
 
-fn platform_default_includes_reference_fsync() -> bool {
-    // FSYNC_COMPONENTS_DEFAULT excludes reference files on every platform in
-    // Git v2.55. Keep this as a function because Git exposes the default as a
-    // platform-overridable compile-time policy.
-    false
-}
-
-fn git_test_fsync_enabled() -> bool {
-    let Ok(value) = env::var("GIT_TEST_FSYNC") else {
-        return true;
-    };
-    !matches!(
-        value.to_ascii_lowercase().as_str(),
-        "0" | "false" | "no" | "off" | ""
-    )
+/// Whether a `core.fsync` value turns on reference-file barriers. Kept as a
+/// predicate (tests assert its grammar directly); resolution now lives in
+/// `sley_core::fsync`.
+#[cfg(test)]
+fn core_fsync_includes_reference(value: &str) -> bool {
+    fsync::FsyncComponents::parse(value).includes_reference()
 }
 
 fn ref_storage_path_from_config(common_dir: &Path, path: PathBuf) -> PathBuf {
@@ -1189,14 +1092,8 @@ impl FileRefStore {
         core_fsync_method: Option<&str>,
     ) -> Self {
         if core_fsync.is_some() || core_fsync_method.is_some() {
-            let enabled = core_fsync
-                .map(core_fsync_includes_reference)
-                .unwrap_or(self.reference_fsync.enabled)
-                && git_test_fsync_enabled();
-            let method = core_fsync_method.map_or(self.reference_fsync.method, |value| {
-                ReferenceFsyncMethod::from_config(Some(value))
-            });
-            self.reference_fsync = ReferenceFsyncPolicy { enabled, method };
+            self.reference_fsync =
+                ReferenceFsyncPolicy(self.reference_fsync.0.overridden(core_fsync, core_fsync_method));
         }
         self
     }
@@ -6474,10 +6371,7 @@ fn sync_reference_file(file: &fs::File, method: ReferenceFsyncMethod) -> std::io
             return Err(std::io::Error::other("injected reference fsync failure"));
         }
     }
-    match method {
-        ReferenceFsyncMethod::WriteoutOnly => file.sync_data(),
-        ReferenceFsyncMethod::Fsync | ReferenceFsyncMethod::Batch => file.sync_all(),
-    }
+    method.apply(file)
 }
 
 fn write_locked(

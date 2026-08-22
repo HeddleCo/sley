@@ -4043,11 +4043,17 @@ pub fn write_metadata_file_atomic(
         let _ = fs::remove_file(&lock_path);
         return Err(err.into());
     }
-    if options.fsync_file
-        && let Err(err) = lock.sync_all()
-    {
-        let _ = fs::remove_file(&lock_path);
-        return Err(err.into());
+    if options.fsync_file {
+        let barrier = match options.fsync_policy {
+            Some(policy) => {
+                policy.apply(&lock, sley_core::fsync::FsyncComponents::REFERENCE)
+            }
+            None => lock.sync_all(),
+        };
+        if let Err(err) = barrier {
+            let _ = fs::remove_file(&lock_path);
+            return Err(err.into());
+        }
     }
     drop(lock);
     if let Err(err) = fs::rename(&lock_path, path) {

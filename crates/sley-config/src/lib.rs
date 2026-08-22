@@ -104,6 +104,14 @@ impl ConfigSection {
     }
 }
 
+/// Bridge so [`GitConfig`] can be handed to durability-policy resolution in
+/// `sley-core::fsync` without introducing a dependency cycle.
+impl sley_core::fsync::FsyncConfigSource for GitConfig {
+    fn fsync_lookup(&self, section: &str, subsection: Option<&str>, key: &str) -> Option<&str> {
+        self.get(section, subsection, key)
+    }
+}
+
 impl GitConfig {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let text =

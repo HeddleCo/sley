@@ -791,17 +791,15 @@ fn write_unpack_file_temp(contents: &[u8]) -> Result<PathBuf> {
             attempt
         );
         let path = cwd.join(&name);
-        let mut file = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(GitError::Io(err.to_string())),
-        };
-        file.write_all(contents)?;
-        return Ok(PathBuf::from(name));
+        match sley_core::atomic::LockFile::create(path) {
+            Ok(mut lock) => {
+                lock.write_all(contents)?;
+                lock.keep();
+                return Ok(PathBuf::from(name));
+            }
+            Err(err) if err.io_kind() == Some(io::ErrorKind::AlreadyExists) => continue,
+            Err(err) => return Err(err),
+        }
     }
     Err(GitError::Io(
         "unable to create temporary unpack file".into(),
