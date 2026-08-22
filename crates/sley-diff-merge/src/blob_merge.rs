@@ -4,6 +4,7 @@ use crate::line_diff::{
     DiffAlgorithm, DiffLine, DiffOp, WsIgnore, canonicalize_line, diff_lines_with_algorithm,
     myers_diff_lines, myers_diff_lines_ws, split_lines,
 };
+use sley_core::primitives::common_prefix_len;
 
 /// Whether to favour one side wholesale for textual conflicts (`-Xours` /
 /// `-Xtheirs`), or to leave conflict markers in place.
@@ -761,13 +762,6 @@ fn conflict_markers_need_cr(
         ),
         (Some(true), Some(true), Some(true)) | (Some(true), Some(true), None)
     )
-}
-
-fn common_prefix_len(a: &[DiffLine<'_>], b: &[DiffLine<'_>]) -> usize {
-    a.iter()
-        .zip(b)
-        .take_while(|(left, right)| left == right)
-        .count()
 }
 
 // The suffix offsets intentionally use each input's independent length.

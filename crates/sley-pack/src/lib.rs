@@ -4,6 +4,7 @@
 
 use flate2::{Compress, Compression, FlushCompress, Status};
 use sley_core::{
+    primitives::{u16_be, u32_be, u64_be},
     ByteBudget, CancelFlag, GitError, ObjectFormat, ObjectId, ResourceLimitKind, Result,
     StreamingDigest,
 };
@@ -166,19 +167,6 @@ fn next_byte(bytes: &[u8], offset: &mut usize) -> Result<u8> {
     Ok(byte)
 }
 
-fn u16_be(bytes: &[u8]) -> u16 {
-    u16::from_be_bytes([bytes[0], bytes[1]])
-}
-
-fn u32_be(bytes: &[u8]) -> u32 {
-    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-}
-
-fn u64_be(bytes: &[u8]) -> u64 {
-    u64::from_be_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ])
-}
 fn checked_range(
     start: usize,
     count: usize,

@@ -1635,6 +1635,7 @@ name = "sley-i18n"
 version = "0.7.0"
 dependencies = [
  "encoding_rs",
+ "sley-core",
 ]
 
 [[package]]

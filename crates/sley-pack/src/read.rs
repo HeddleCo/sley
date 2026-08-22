@@ -3,6 +3,7 @@
 //! Split out of `lib.rs` in the W21 mechanical refactor: a pure code move
 //! (no function body changed); all items are re-exported from `lib.rs`.
 use super::*;
+use sley_core::primitives::BiasedVarintError;
 
 impl PackFile {
     pub fn parse_sha1(bytes: &[u8]) -> Result<Self> {
@@ -938,16 +939,15 @@ pub(crate) fn parse_ofs_delta_base_offset(
     offset: &mut usize,
     entry_offset: u64,
 ) -> Result<u64> {
-    let mut byte = next_byte(bytes, offset)?;
-    let mut relative = u64::from(byte & 0x7f);
-    while byte & 0x80 != 0 {
-        byte = next_byte(bytes, offset)?;
-        relative = relative
-            .checked_add(1)
-            .and_then(|value| value.checked_shl(7))
-            .and_then(|value| value.checked_add(u64::from(byte & 0x7f)))
-            .ok_or_else(|| GitError::InvalidFormat("ofs-delta offset overflow".into()))?;
-    }
+    let relative = sley_core::primitives::read_biased_varint(bytes, offset).map_err(|err| {
+        GitError::InvalidFormat(
+            match err {
+                BiasedVarintError::Truncated => "truncated pack entry header",
+                BiasedVarintError::Overflow => "ofs-delta offset overflow",
+            }
+            .into(),
+        )
+    })?;
     entry_offset
         .checked_sub(relative)
         .ok_or_else(|| GitError::InvalidFormat("ofs-delta points before pack start".into()))

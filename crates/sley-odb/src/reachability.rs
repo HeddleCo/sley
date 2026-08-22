@@ -2,7 +2,8 @@ use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use flate2::{Decompress, FlushDecompress};
 use sley_core::{
-    CancelFlag, GitError, MissingObjectContext, ObjectFormat, ObjectId, Result, StreamingDigest,
+    primitives::u32_be, CancelFlag, GitError, MissingObjectContext, ObjectFormat, ObjectId, Result,
+    StreamingDigest,
 };
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, tree_entry_object_type};
 use sley_pack::{
@@ -2843,10 +2844,6 @@ pub(crate) fn scan_pack_offsets_without_index(
     Ok(None)
 }
 
-pub(crate) fn u32_be(bytes: &[u8]) -> u32 {
-    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-}
-
 pub(crate) fn inflate_pack_member_len(compressed: &[u8]) -> Result<usize> {
     let mut decompress = Decompress::new(true);
     let mut input = compressed;
@@ -2917,16 +2914,15 @@ fn parse_ref_delta_base_oid(
 }
 
 fn parse_ofs_delta_base_offset(pack: &[u8], cursor: &mut usize, entry_offset: u64) -> Result<u64> {
-    let mut byte = pack_next_byte(pack, cursor)?;
-    let mut relative = u64::from(byte & 0x7f);
-    while byte & 0x80 != 0 {
-        byte = pack_next_byte(pack, cursor)?;
-        relative = relative
-            .checked_add(1)
-            .and_then(|value| value.checked_shl(7))
-            .and_then(|value| value.checked_add(u64::from(byte & 0x7f)))
-            .ok_or_else(|| GitError::InvalidFormat("ofs-delta offset overflow".into()))?;
-    }
+    let relative = sley_core::primitives::read_biased_varint(pack, cursor).map_err(|err| {
+        GitError::InvalidFormat(
+            match err {
+                sley_core::primitives::BiasedVarintError::Truncated => "truncated pack entry",
+                sley_core::primitives::BiasedVarintError::Overflow => "ofs-delta offset overflow",
+            }
+            .into(),
+        )
+    })?;
     entry_offset
         .checked_sub(relative)
         .ok_or_else(|| GitError::InvalidFormat("ofs-delta points before pack start".into()))
