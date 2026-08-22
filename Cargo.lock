@@ -1495,6 +1495,7 @@ dependencies = [
  "sley-diff-merge",
  "sley-formats",
  "sley-grep",
+ "sley-hooks",
  "sley-index",
  "sley-notes",
  "sley-object",
@@ -1630,6 +1631,16 @@ name = "sley-grep"
 version = "0.7.0"
 dependencies = [
  "sley-core",
+]
+
+[[package]]
+name = "sley-hooks"
+version = "0.7.0"
+dependencies = [
+ "sley-config",
+ "sley-core",
+ "sley-odb",
+ "sley-worktree",
 ]
 
 [[package]]

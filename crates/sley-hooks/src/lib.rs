@@ -12,13 +12,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 
 use sley_config::{ConfigParameter, ConfigSection};
-use sley_core::GitError;
+use sley_core::{GitError, Result};
 use sley_odb::repository_common_dir;
-use sley_worktree::worktree_root_for_git_dir;
-
-use crate::Result;
-use crate::open_env::{
+use sley_worktree::{
     discover_git_dir_respecting_environment, environment_work_tree, resolve_path_from_cwd,
+    worktree_root_for_git_dir,
 };
 
 #[derive(Clone)]

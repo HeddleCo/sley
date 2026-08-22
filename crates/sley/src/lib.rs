@@ -55,7 +55,12 @@
 mod capabilities;
 mod config_edit;
 mod diff;
-pub mod hooks;
+/// Hook engine ([`sley_hooks`]) — traditional `$GIT_DIR/hooks/<name>` scripts
+/// and configured `hook.*` commands, with `git hook list` / `run` porcelain.
+/// Re-exported unchanged so embedder paths (`sley::hooks::*`) stay stable.
+pub mod hooks {
+    pub use sley_hooks::*;
+}
 mod index_io;
 mod notes_repo;
 mod objects;
@@ -126,6 +131,7 @@ pub mod plumbing {
     pub use sley_diff_merge::format;
     pub use sley_formats;
     pub use sley_grep;
+    pub use sley_hooks;
     pub use sley_index;
     pub use sley_notes;
     pub use sley_object;
@@ -169,6 +175,7 @@ pub use sley_worktree::{
     ShortStatusEntry, ShortStatusOptions, ShortStatusRow, StatusIgnoredMode, StatusUntrackedMode,
     SubmoduleStatus, WorktreeEntryState, write_metadata_file_atomic,
 };
+use sley_worktree::discovery::{is_git_dir, read_gitdir_link};
 
 pub use capabilities::RepositoryCapabilities;
 pub use config_edit::{
@@ -1321,30 +1328,6 @@ fn resolve_git_dir(path: &Path) -> Result<PathBuf> {
         return Ok(target);
     }
     Ok(path.to_path_buf())
-}
-
-/// True if `path` looks like a git directory (has a `HEAD` file and either an
-/// `objects` directory or a `commondir` pointer).
-fn is_git_dir(path: &Path) -> bool {
-    std::fs::symlink_metadata(path.join("HEAD"))
-        .is_ok_and(|metadata| metadata.is_file() || metadata.file_type().is_symlink())
-        && (path.join("objects").is_dir() || path.join("commondir").is_file())
-}
-
-/// Read a `gitdir: <path>` link file (used by linked worktrees and submodules),
-/// returning the absolute target path it points at.
-fn read_gitdir_link(path: &Path) -> Result<Option<PathBuf>> {
-    let contents = std::fs::read_to_string(path)?;
-    let Some(target) = contents.trim().strip_prefix("gitdir:") else {
-        return Ok(None);
-    };
-    let target = PathBuf::from(target.trim());
-    if target.is_absolute() {
-        Ok(Some(target))
-    } else {
-        let base = path.parent().unwrap_or_else(|| Path::new(""));
-        Ok(Some(base.join(target)))
-    }
 }
 
 /// Walk up from `start` looking for a repository, mirroring git's discovery
