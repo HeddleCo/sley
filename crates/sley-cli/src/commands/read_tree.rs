@@ -2118,9 +2118,10 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 
 /// git's `fill_stat_cache_info`/`fill_stat_data`: `lstat` the just-written path
 /// and project its fields into the engine's [`sley_unpack_trees::StatInfo`].
-/// `size` is the **on-disk** byte length (so it equals `metadata.len()`, which
-/// sley's `worktree_entry_is_uptodate` compares directly), and mtime is the
-/// file's real mtime so the racy-clean shortcut can prove the path unchanged.
+/// `size` is git's **munged** on-disk byte length (`munge_st_size` over
+/// `metadata.len()`, which sley's `worktree_entry_is_uptodate` compares
+/// munged-to-munged), and mtime is the file's real mtime so the racy-clean
+/// shortcut can prove the path unchanged.
 #[cfg(unix)]
 fn stat_info_from_lstat(file_path: &Path) -> Result<sley_unpack_trees::StatInfo> {
     use std::os::unix::fs::MetadataExt;
@@ -2134,7 +2135,7 @@ fn stat_info_from_lstat(file_path: &Path) -> Result<sley_unpack_trees::StatInfo>
         ino: md.ino() as u32,
         uid: md.uid(),
         gid: md.gid(),
-        size: md.len().min(u32::MAX as u64) as u32,
+        size: sley_unpack_trees::StatInfo::munge_size(md.len()),
     })
 }
 
@@ -2159,7 +2160,7 @@ fn stat_info_from_lstat(file_path: &Path) -> Result<sley_unpack_trees::StatInfo>
         ino: 0,
         uid: 0,
         gid: 0,
-        size: md.len().min(u32::MAX as u64) as u32,
+        size: sley_unpack_trees::StatInfo::munge_size(md.len()),
     })
 }
 

@@ -633,20 +633,28 @@ fn git_exec_path() -> Result<PathBuf> {
 
 #[cfg(feature = "git-compat-i18n")]
 fn cmd_sh_i18n_envsubst(args: &[String]) -> Result<()> {
-    if args.len() == 2 && args[0] == "--variables" {
-        for variable in sley_i18n::envsubst_variables(&args[1]) {
-            println!("{variable}");
+    match args {
+        [] => {
+            eprintln!("error: we won't substitute all variables on stdin for you");
         }
-        return Ok(());
+        [format] => {
+            let mut input = String::new();
+            io::stdin().read_to_string(&mut input)?;
+            let expanded = sley_i18n::envsubst(&input, format, |name| env::var(name).ok());
+            print!("{expanded}");
+        }
+        [first, template] => {
+            if first != "--variables" {
+                eprintln!("error: first argument must be --variables when two are given");
+            }
+            for variable in sley_i18n::envsubst_variables(template) {
+                println!("{variable}");
+            }
+        }
+        _ => {
+            eprintln!("error: too many arguments");
+        }
     }
-    if args.len() != 1 {
-        eprintln!("fatal: first argument must be --variables when two are given");
-        return Err(GitError::Exit(128));
-    }
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input)?;
-    let expanded = sley_i18n::envsubst(&input, &args[0], |name| env::var(name).ok());
-    print!("{expanded}");
     Ok(())
 }
 

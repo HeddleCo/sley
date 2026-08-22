@@ -1202,7 +1202,7 @@ fn write_delayed_checkout_output(
     let metadata = fs::symlink_metadata(&file_path)?;
     let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
     index_entry.mode = entry.mode;
-    index_entry.size = (body.len() as u64).min(u32::MAX as u64) as u32;
+    index_entry.size = sley_unpack_trees::StatInfo::munge_size(body.len() as u64);
     Ok(Some(index_entry))
 }
 
@@ -3926,7 +3926,9 @@ pub(crate) fn collapse_to_sparse_index(
 /// the worktree — gets a fresh mtime and so reads as modified, which is exactly
 /// the state git declines to overwrite during a sparse update.
 pub(crate) fn worktree_entry_is_uptodate(entry: &IndexEntry, metadata: &fs::Metadata) -> bool {
-    if u64::from(entry.size) != metadata.len() {
+    // Compare git's munged sizes (match_stat_data compares sd_size against
+    // munge_st_size(st)), so an exactly-4GiB clean file stays up to date.
+    if entry.size != sley_unpack_trees::StatInfo::munge_size(metadata.len()) {
         return false;
     }
     let Some((mtime_seconds, mtime_nanoseconds)) = file_mtime_parts(metadata) else {
@@ -3986,7 +3988,7 @@ pub(crate) fn worktree_entry_ref_is_uptodate(
     entry: &IndexEntryRef<'_>,
     metadata: &fs::Metadata,
 ) -> bool {
-    if u64::from(entry.size) != metadata.len() {
+    if entry.size != sley_unpack_trees::StatInfo::munge_size(metadata.len()) {
         return false;
     }
     let Some((mtime_seconds, mtime_nanoseconds)) = file_mtime_parts(metadata) else {

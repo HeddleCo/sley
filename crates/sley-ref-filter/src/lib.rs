@@ -763,19 +763,32 @@ fn for_each_ref_display_width(value: &[u8]) -> usize {
     let mut width = 0usize;
     let mut idx = 0usize;
     while idx < value.len() {
-        if value[idx] == 0x1b
-            && value.get(idx + 1) == Some(&b'[')
-            && let Some(end) = value[idx + 2..]
-                .iter()
-                .position(|byte| (0x40..=0x7e).contains(byte))
-        {
-            idx += end + 3;
+        if let Some(len) = csi_escape_sequence_len(value, idx) {
+            idx += len;
             continue;
         }
-        width += 1;
-        idx += 1;
+        // Measure the text run up to the next escape by display columns, not
+        // bytes, so multibyte characters (CJK, accents, emoji) pad like git.
+        let mut run = idx + 1;
+        while run < value.len() && csi_escape_sequence_len(value, run).is_none() {
+            run += 1;
+        }
+        width += sley_strbuf_expand::strwidth(&value[idx..run]);
+        idx = run;
     }
     width
+}
+
+/// Length of the CSI escape sequence starting at `idx`, if any
+/// (`ESC [ ... final-byte`, final byte in `0x40..=0x7e`).
+fn csi_escape_sequence_len(value: &[u8], idx: usize) -> Option<usize> {
+    if value[idx] != 0x1b || value.get(idx + 1) != Some(&b'[') {
+        return None;
+    }
+    value[idx + 2..]
+        .iter()
+        .position(|byte| (0x40..=0x7e).contains(byte))
+        .map(|end| end + 3)
 }
 
 fn trim_ascii(value: &[u8]) -> &[u8] {
@@ -1130,22 +1143,17 @@ fn for_each_ref_blank_line(buf: &[u8]) -> Option<usize> {
 }
 
 /// `copy_subject`: render the subject with embedded newlines turned into single
-/// spaces (CRLF's CR is dropped), matching ref-filter.c.
+/// spaces (CRLF's CR is dropped), matching ref-filter.c. Multibyte UTF-8
+/// content passes through byte-exactly; invalid UTF-8 degrades lossily.
 pub fn for_each_ref_copy_subject(subject: &[u8]) -> String {
-    let mut out = String::with_capacity(subject.len());
-    let mut idx = 0;
-    while idx < subject.len() {
-        let byte = subject[idx];
-        if byte == b'\r' && subject.get(idx + 1) == Some(&b'\n') {
-            idx += 1;
+    let decoded = String::from_utf8_lossy(subject);
+    let mut out = String::with_capacity(decoded.len());
+    let mut chars = decoded.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' && chars.peek() == Some(&'\n') {
             continue;
         }
-        if byte == b'\n' {
-            out.push(' ');
-        } else {
-            out.push(byte as char);
-        }
-        idx += 1;
+        out.push(if ch == '\n' { ' ' } else { ch });
     }
     out
 }
@@ -1496,6 +1504,77 @@ mod tests {
         )
         .expect("writes to in-memory buffer");
         assert_eq!(out, b"x  main");
+    }
+
+    #[test]
+    fn align_and_padding_measure_multibyte_subjects_by_display_columns() {
+        use sley_strbuf_expand::TruncateMode;
+
+        // copy_subject must pass multibyte content through byte-exactly
+        // (regression: bytes were re-encoded one Latin-1 char at a time).
+        assert_eq!(
+            for_each_ref_copy_subject("日本語テスト".as_bytes()),
+            "日本語テスト"
+        );
+        assert_eq!(
+            for_each_ref_copy_subject("héllo\r\nwörld\né".as_bytes()),
+            "héllo wörld é"
+        );
+
+
+        // "日本語テスト" renders in 12 terminal columns but occupies 18 bytes;
+        // git's strbuf_utf8_align pads to the column width (oracle:
+        // `git for-each-ref --format='[%(align:20,left)%(subject)%(end)]'`
+        // on a commit with this subject emits 18 bytes + 8 spaces).
+        let cjk = "日本語テスト".as_bytes();
+        assert_eq!(cjk.len(), 18);
+        assert_eq!(sley_strbuf_expand::strwidth(cjk), 12);
+
+        assert_eq!(for_each_ref_display_width(cjk), 12);
+        assert_eq!(for_each_ref_display_width("héllo".as_bytes()), 5);
+        assert_eq!(for_each_ref_display_width(b"\x1b[31mabc\x1b[m"), 3);
+        assert_eq!(for_each_ref_display_width(b"\x1b[31m\xe6\x97\xa5\x1b[m"), 2);
+
+        let mut aligned = cjk.to_vec();
+        apply_for_each_ref_align(
+            &mut aligned,
+            &ForEachRefAlignOptions {
+                width: 20,
+                position: ForEachRefAlignPosition::Left,
+            },
+        );
+        assert_eq!(
+            String::from_utf8(aligned).unwrap_or_default(),
+            format!("日本語テスト{}", " ".repeat(8))
+        );
+
+        let mut middle = cjk.to_vec();
+        apply_for_each_ref_align(
+            &mut middle,
+            &ForEachRefAlignOptions {
+                width: 20,
+                position: ForEachRefAlignPosition::Middle,
+            },
+        );
+        assert_eq!(
+            String::from_utf8(middle).unwrap_or_default(),
+            format!("{}日本語テスト{}", " ".repeat(4), " ".repeat(4))
+        );
+
+        let mut padded = cjk.to_vec();
+        apply_for_each_ref_padding(
+            &mut padded,
+            Some(PaddingSpec {
+                width: 20,
+                align: PaddingAlign::Right,
+                truncate: TruncateMode::None,
+                to_column: false,
+            }),
+        );
+        assert_eq!(
+            String::from_utf8(padded).unwrap_or_default(),
+            format!("{}日本語テスト", " ".repeat(8))
+        );
     }
 
     #[test]

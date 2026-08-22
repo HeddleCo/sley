@@ -761,7 +761,7 @@ fn checkout_index_entry_up_to_date(entry: &IndexEntry, metadata: &fs::Metadata) 
         && entry.ino == metadata.ino() as u32
         && entry.uid == metadata.uid()
         && entry.gid == metadata.gid()
-        && entry.size == (metadata.len().min(u32::MAX as u64) as u32)
+        && entry.size == sley_unpack_trees::StatInfo::munge_size(metadata.len())
 }
 
 #[cfg(not(unix))]
@@ -773,7 +773,7 @@ fn checkout_index_entry_up_to_date(entry: &IndexEntry, metadata: &fs::Metadata) 
         .unwrap_or_default();
     entry.mtime_seconds == mtime.as_secs().min(u32::MAX as u64) as u32
         && entry.mtime_nanoseconds == mtime.subsec_nanos()
-        && entry.size == (metadata.len().min(u32::MAX as u64) as u32)
+        && entry.size == sley_unpack_trees::StatInfo::munge_size(metadata.len())
 }
 
 /// Index mode (regular/exec/symlink) versus on-disk file type and exec bit.
@@ -932,13 +932,14 @@ fn checkout_index_refresh_stat(entry: &mut IndexEntry, metadata: &fs::Metadata) 
 
 #[cfg(unix)]
 fn checkout_index_stat_size(metadata: &fs::Metadata) -> u32 {
-    // Symlinks store their target length; the index records the link text size.
-    metadata.len().min(u32::MAX as u64) as u32
+    // Symlinks store their target length; the index records the link text size,
+    // munged like git's munge_st_size.
+    sley_unpack_trees::StatInfo::munge_size(metadata.len())
 }
 
 #[cfg(not(unix))]
 fn checkout_index_stat_size(metadata: &fs::Metadata) -> u32 {
-    metadata.len().min(u32::MAX as u64) as u32
+    sley_unpack_trees::StatInfo::munge_size(metadata.len())
 }
 
 #[cfg(unix)]

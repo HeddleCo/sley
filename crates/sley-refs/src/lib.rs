@@ -5614,14 +5614,26 @@ fn delete_precondition_mismatch(name: &str) -> GitError {
 }
 
 fn ref_delete_error_from_git(err: GitError) -> RefDeleteError {
+    // Lock contention is detected structurally (`AlreadyExists`) for
+    // structured I/O errors, and by message text only for legacy string-form
+    // errors.
+    let locked = match &err {
+        GitError::IoKind {
+            kind: std::io::ErrorKind::AlreadyExists,
+            ..
+        } => true,
+        GitError::Io(message) => {
+            message.contains("File exists") || message.contains("could not lock")
+        }
+        GitError::Transaction(message) => message.contains("could not lock"),
+        _ => false,
+    };
+    if locked {
+        return RefDeleteError::Locked;
+    }
     match err {
         GitError::InvalidPath(_) => RefDeleteError::InvalidName,
         GitError::NotFound(_) => RefDeleteError::NotFound,
-        GitError::Io(message) if message.contains("File exists") => RefDeleteError::Locked,
-        GitError::Io(message) if message.contains("could not lock") => RefDeleteError::Locked,
-        GitError::Transaction(message) if message.contains("could not lock") => {
-            RefDeleteError::Locked
-        }
         other => RefDeleteError::Io(std::io::Error::other(other.to_string())),
     }
 }
@@ -6671,7 +6683,7 @@ fn pack_refs_auto_required_for(packed_path: &Path, loose_count: usize) -> Result
 
 pub fn resolve_ref_peeled(store: &FileRefStore, name: &str) -> Result<Option<ObjectId>> {
     let mut current = name.to_string();
-    for _ in 0..16 {
+    for _ in 0..sley_core::MAX_SYMREF_DEPTH {
         match store.read_ref(&current)? {
             Some(RefTarget::Direct(oid)) => return Ok(Some(oid)),
             Some(RefTarget::Symbolic(next)) => {
@@ -7117,6 +7129,51 @@ mod tests {
             Some(oid)
         );
         let _ = fs::remove_dir_all(git_dir);
+    }
+
+    /// git's SYMREF_MAXDEPTH (refs.c): a chain of four symrefs onto a direct
+    /// ref resolves; five symrefs report ELOOP-style failure. Oracle 2.55
+    /// evidence: `git rev-parse --verify refs/heads/s4` succeeds while s5 fails.
+    #[test]
+    fn resolve_ref_peeled_stops_at_git_symref_depth() {
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("valid test oid");
+        let chain_resolves = |hops: usize| {
+            let git_dir = temp_git_dir();
+            let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+            let mut tx = store.transaction();
+            tx.update(RefUpdate {
+                name: "refs/heads/d0".into(),
+                expected: None,
+                new: RefTarget::Direct(oid),
+                reflog: None,
+            });
+            tx.commit().expect("seed direct ref");
+            for hop in 1..=hops {
+                let target = if hop == 1 {
+                    "refs/heads/d0".to_string()
+                } else {
+                    format!("refs/heads/h{}", hop - 1)
+                };
+                let mut tx = store.transaction();
+                tx.update(RefUpdate {
+                    name: format!("refs/heads/h{hop}"),
+                    expected: None,
+                    new: RefTarget::Symbolic(target),
+                    reflog: None,
+                });
+                tx.commit().expect("seed symref hop");
+            }
+            let resolved = resolve_ref_peeled(&store, &format!("refs/heads/h{hops}"))
+                .expect("resolution is not an error");
+            let _ = fs::remove_dir_all(git_dir);
+            resolved
+        };
+        assert_eq!(chain_resolves(sley_core::MAX_SYMREF_DEPTH - 1), Some(oid));
+        assert_eq!(chain_resolves(sley_core::MAX_SYMREF_DEPTH), None);
     }
 
     #[test]

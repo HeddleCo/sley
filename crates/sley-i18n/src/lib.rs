@@ -419,8 +419,14 @@ pub fn envsubst(
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] != b'$' {
-            output.push(bytes[index] as char);
-            index += 1;
+            // Copy the run of ordinary bytes verbatim so multibyte UTF-8
+            // survives byte-exactly; only `$` needs char semantics.
+            let run_end = bytes[index..]
+                .iter()
+                .position(|byte| *byte == b'$')
+                .map_or(bytes.len(), |offset| index + offset);
+            output.push_str(&input[index..run_end]);
+            index = run_end;
             continue;
         }
         if let Some((name, end)) = parse_braced_variable(bytes, index) {
@@ -871,6 +877,25 @@ mod tests {
             Some(format!("<{name}>"))
         });
         assert_eq!(out, "a <one> <two> $three");
+    }
+
+    #[test]
+    fn envsubst_preserves_multibyte_utf8_bytes() {
+        // Multibyte literals (Japanese + umlauts) around variables must pass
+        // through byte-exactly, not Latin-1-mangled per byte.
+        let template = "ja:\u{65e5}\u{672c}\u{8a9e} de:\u{e9}\u{f6} ${who} \u{1F600} $n end";
+        assert_eq!(
+            envsubst(template, "$who $n", |name| {
+                Some(match name {
+                    "who" => "B\u{f6}rde".to_string(),
+                    _ => "42".to_string(),
+                })
+            }),
+            "ja:\u{65e5}\u{672c}\u{8a9e} de:\u{e9}\u{f6} B\u{f6}rde \u{1F600} 42 end"
+        );
+        // Unsubstituted multibyte text (no format variables at all) round-trips.
+        assert_eq!(envsubst("\u{65e5}\u{672c}$x", "", |_| None), "\u{65e5}\u{672c}$x");
+        assert_eq!(envsubst("$\u{e9} $\u{65e5}", "$\u{e9}", |_| None), "$\u{e9} $\u{65e5}");
     }
 
     #[test]

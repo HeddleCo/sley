@@ -316,7 +316,9 @@ pub(crate) fn apply_unix_metadata_to_index_entry(
 }
 
 pub(crate) fn index_size_from_metadata(metadata: &fs::Metadata) -> u32 {
-    metadata.len().min(u32::MAX as u64) as u32
+    // git's munge_st_size: sizes whose low 32 bits are zero are stored as
+    // 0x8000_0000 so they never collide with the racy-smudged size-0 sentinel.
+    sley_unpack_trees::StatInfo::munge_size(metadata.len())
 }
 
 pub(crate) fn read_expected_object(

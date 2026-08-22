@@ -786,4 +786,49 @@ mod tests {
         );
         assert!(diagnostics.0.is_empty());
     }
+
+    /// git's on-disk index stores `munge_st_size` values: a non-zero size whose
+    /// low 32 bits are zero (an exact 4 GiB multiple) is recorded as
+    /// 0x8000_0000 instead of colliding with the racy-smudged size-0 sentinel.
+    /// Synthetic sizes — no real 4 GiB file needed.
+    #[test]
+    fn stat_size_round_trips_git_munge_for_4gib_files() {
+        let (_root, git_dir, db) = temp_repo();
+        let oid = blob(&db, b"payload");
+        let munged = sley_unpack_trees::StatInfo::munge_size(4 * 1024 * 1024 * 1024);
+        assert_eq!(munged, 0x8000_0000);
+        assert_eq!(
+            sley_unpack_trees::StatInfo::munge_size(4 * 1024 * 1024 * 1024 + 7),
+            7
+        );
+
+        // StatInfo -> persisted IndexEntry keeps the munge marker.
+        let read_entry = ReadTreeEntry {
+            mode: 0o100644,
+            oid,
+            stage: 0,
+            stat: Some(sley_unpack_trees::StatInfo {
+                size: munged,
+                ..sley_unpack_trees::StatInfo::default()
+            }),
+            skip_worktree: None,
+        };
+        persist_read_tree_entries(
+            &git_dir,
+            ObjectFormat::Sha1,
+            vec![(b"big".to_vec(), read_entry)],
+        )
+        .expect("persist entry with munged size");
+        let index = read_repository_index(&git_dir, ObjectFormat::Sha1)
+            .expect("read index")
+            .expect("index exists");
+        let [stored] = index.entries.as_slice() else {
+            panic!("expected exactly one entry");
+        };
+        assert_eq!(stored.size, 0x8000_0000);
+
+        // IndexEntry -> engine StatInfo passes the already-munged value through.
+        let stat = stat_info_from_index_entry(stored);
+        assert_eq!(stat.size, 0x8000_0000);
+    }
 }

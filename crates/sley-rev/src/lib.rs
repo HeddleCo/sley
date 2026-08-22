@@ -930,7 +930,7 @@ fn resolve_revision_ref(refs: &FileRefStore, rev: &str) -> Result<Option<ObjectI
 
 fn resolve_revision_ref_candidate(refs: &FileRefStore, name: &str) -> Result<Option<ObjectId>> {
     let mut current = name.to_string();
-    for _ in 0..16 {
+    for _ in 0..sley_core::MAX_SYMREF_DEPTH {
         match refs.read_ref(&current)? {
             Some(RefTarget::Direct(oid)) => return Ok(Some(oid)),
             Some(RefTarget::Symbolic(target)) => {

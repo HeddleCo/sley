@@ -779,15 +779,26 @@ pub fn notes_tree_oid(
     store: &FileRefStore,
     notes_ref: &NotesRef,
 ) -> Result<Option<ObjectId>> {
-    let Some(target) = store.read_ref(notes_ref.as_str())? else {
+    let Some(mut target) = store.read_ref(notes_ref.as_str())? else {
         return Ok(None);
     };
-    let commit_oid = match target {
-        RefTarget::Direct(oid) => oid,
-        RefTarget::Symbolic(name) => match store.read_ref(&name)? {
-            Some(RefTarget::Direct(oid)) => oid,
-            _ => return Ok(None),
-        },
+    // Follow symref chains with git's shared hop budget (refs.c
+    // SYMREF_MAXDEPTH); oracle `git notes` resolves multi-hop notes refs.
+    let mut commit_oid = None;
+    for _ in 0..sley_core::MAX_SYMREF_DEPTH {
+        match target {
+            RefTarget::Direct(oid) => {
+                commit_oid = Some(oid);
+                break;
+            }
+            RefTarget::Symbolic(name) => match store.read_ref(&name)? {
+                Some(next) => target = next,
+                None => return Ok(None),
+            },
+        }
+    }
+    let Some(commit_oid) = commit_oid else {
+        return Ok(None);
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let object = db.read_object(&commit_oid)?;
