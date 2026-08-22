@@ -20,6 +20,7 @@ pub mod remotes;
 
 /// Byte-faithful in-place config editing mirroring git's surgical splice writer.
 pub mod raw_edit;
+pub mod typed;
 
 /// A preserved comment or blank line from the source file.
 #[derive(Debug, Clone, PartialEq, Eq)]
