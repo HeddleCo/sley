@@ -46,7 +46,7 @@ pub(crate) fn cmd_difftool(
     let gui = options
         .gui
         .unwrap_or_else(|| gui_default(config, ToolMode::Diff));
-    let diffs = collect_difftool_entries(&repo, &options)?;
+    let (diffs, right_side_is_worktree) = collect_difftool_entries(&repo, &options)?;
     let diffs = order_difftool_entries(
         diffs,
         options.rotate_to.as_deref(),
@@ -70,6 +70,7 @@ pub(crate) fn cmd_difftool(
             entry,
             &temp.path,
             lazy_fetch,
+            right_side_is_worktree,
         )?;
         if prompt {
             let path = String::from_utf8_lossy(&entry.path);
@@ -199,10 +200,13 @@ fn should_prompt(config: &GitConfig, options: &DifftoolOptions) -> bool {
         .unwrap_or(true)
 }
 
+/// Returns the diff entries plus whether the right-hand side is the live
+/// worktree (`index-vs-worktree` / `tree-vs-worktree` modes), whose raw oids
+/// are unresolved and must be read from disk.
 fn collect_difftool_entries(
     repo: &RepositoryContext,
     options: &DifftoolOptions,
-) -> Result<Vec<sley_diff_merge::NameStatusEntry>> {
+) -> Result<(Vec<sley_diff_merge::NameStatusEntry>, bool)> {
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
@@ -224,7 +228,35 @@ fn collect_difftool_entries(
             base_options,
         )?,
         (false, []) => {
-            sley_diff_merge::diff_name_status_index_worktree(worktree_root, git_dir, format)?
+            // Racy-clean files (stale stat info) must be re-classified through
+            // the smudge/clean filters before being reported as modified,
+            // matching commands::diff; without this, CRLF/ident/filter repos
+            // phantom-show clean files as modified.
+            let mut stat_clean_validator = sley_worktree::StatCleanFilterValidator::new();
+            let mut validate_stat_clean =
+                |entry: sley_diff_merge::IndexWorktreeValidationEntry<'_>,
+                 absolute_path: &Path,
+                 metadata: &fs::Metadata| {
+                    stat_clean_validator.validate_path(
+                        worktree_root,
+                        git_dir,
+                        format,
+                        entry.mode,
+                        entry.oid,
+                        entry.size,
+                        entry.path,
+                        absolute_path,
+                        metadata,
+                    )
+                };
+            sley_diff_merge::diff_name_status_index_worktree_with_options_and_gitlinks_validated(
+                worktree_root,
+                git_dir,
+                format,
+                base_options,
+                &mut validate_stat_clean,
+            )?
+            .entries
         }
         (false, [tree]) => sley_diff_merge::diff_name_status_tree_worktree_with_options(
             worktree_root,
@@ -245,7 +277,11 @@ fn collect_difftool_entries(
     if options.cached {
         entries.retain(|entry| entry.status != sley_diff_merge::NameStatus::Unmerged);
     }
-    Ok(apply_diff_pathspec(entries, &pathspec))
+    let right_side_is_worktree = !options.cached && revs.len() <= 1;
+    Ok((
+        apply_diff_pathspec(entries, &pathspec),
+        right_side_is_worktree,
+    ))
 }
 
 fn split_difftool_revs(
@@ -311,6 +347,7 @@ fn materialize_difftool_entry(
     entry: &sley_diff_merge::NameStatusEntry,
     temp: &Path,
     lazy_fetch: bool,
+    right_side_is_worktree: bool,
 ) -> Result<ToolEnvironment> {
     let rel = repo_path_to_path(&entry.path);
     let local = temp.join("left").join(&rel);
@@ -326,7 +363,10 @@ fn materialize_difftool_entry(
             entry,
             db,
             Some(worktree_root),
-            entry.new_oid.is_none(),
+            // Worktree-involved comparisons report unresolved raw worktree
+            // oids (the blob was never written), so the right side must be
+            // read from the worktree file, not looked up in the odb.
+            right_side_is_worktree,
             None,
             lazy_fetch,
         )?

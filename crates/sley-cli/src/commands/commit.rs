@@ -3556,7 +3556,35 @@ fn append_commit_diff_index_patch(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let base_tree = commit_verbose_base_tree(git_dir, format, amend)?;
     let entries = if worktree {
-        sley_diff_merge::diff_name_status_index_worktree(&worktree_root, git_dir, format)?
+        // Racy-clean files (stale stat info) must be re-classified through the
+        // smudge/clean filters before being reported as modified, matching
+        // commands::diff and wt-status; without this, CRLF/ident/filter repos
+        // phantom-show clean files as modified in the commit template.
+        let mut stat_clean_validator = sley_worktree::StatCleanFilterValidator::new();
+        let mut validate_stat_clean =
+            |entry: sley_diff_merge::IndexWorktreeValidationEntry<'_>,
+             absolute_path: &Path,
+             metadata: &fs::Metadata| {
+                stat_clean_validator.validate_path(
+                    &worktree_root,
+                    git_dir,
+                    format,
+                    entry.mode,
+                    entry.oid,
+                    entry.size,
+                    entry.path,
+                    absolute_path,
+                    metadata,
+                )
+            };
+        sley_diff_merge::diff_name_status_index_worktree_with_options_and_gitlinks_validated(
+            &worktree_root,
+            git_dir,
+            format,
+            sley_diff_merge::DiffNameStatusOptions::default(),
+            &mut validate_stat_clean,
+        )?
+        .entries
     } else {
         sley_diff_merge::diff_name_status_tree_index_with_options(
             git_dir,

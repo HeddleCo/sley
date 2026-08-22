@@ -32,8 +32,8 @@ use sley::plumbing::sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, P
 use sley::plumbing::sley_refs::{
     FileRefStore, PackRefDecision, Ref, RefTransactionHookUpdate, RefTransactionPhase, RefUpdate,
     ReferenceTransactionHook, ReflogEntry, branch_ref_name, check_refname_format,
-    parse_packed_refs, resolve_ref_peeled, tag_ref_name,
-    validate_ref_name, validate_symref_name, validate_symref_target,
+    parse_packed_refs, resolve_ref_peeled, tag_ref_name, validate_ref_name, validate_symref_name,
+    validate_symref_target,
 };
 use sley::plumbing::sley_remote::FetchOutcome;
 use sley::{
