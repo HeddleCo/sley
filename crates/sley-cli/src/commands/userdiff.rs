@@ -370,7 +370,10 @@ impl UserdiffResolver {
                         any = true;
                         binary = match entry.value.as_deref() {
                             Some(value) if value.eq_ignore_ascii_case("auto") => None,
-                            Some(value) => parse_config_bool_like(value),
+                            // The shared primitive adds git's integer
+                            // fallback (`binary = 2` is true), matching the
+                            // `git_config_bool` upstream applies here.
+                            Some(value) => sley_config::parse_config_bool(value),
                             None => Some(true),
                         };
                     }
@@ -499,14 +502,6 @@ pub(crate) fn run_textconv(command: &str, content: &[u8]) -> Result<Option<Vec<u
         return Ok(None);
     }
     Ok(Some(output.stdout))
-}
-
-fn parse_config_bool_like(value: &str) -> Option<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" | "1" => Some(true),
-        "false" | "no" | "off" | "0" | "" => Some(false),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

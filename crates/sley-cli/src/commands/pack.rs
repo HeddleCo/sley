@@ -1812,15 +1812,21 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
         let cruft_pack_size =
             resolve_cruft_pack_size(max_pack_size, max_cruft_size, configured_pack_size);
         // Cruft-specific config intentionally overrides the general command
-        // option. Otherwise the command option overrides pack.window.
+        // option. Otherwise the command option overrides pack.window. The
+        // value was shape-validated above against pack-objects' option
+        // grammar; resolve it with the same classifier so units (`2k`) work.
+        let default_window = PackWriteOptions::new().window;
         let cruft_window = if let Some(value) = config.get("repack", None, "cruftWindow") {
-            parse_repack_window(value)?
+            sley_config::typed::classify_config_size(value)
+                .ok()
+                .and_then(|parsed| usize::try_from(parsed).ok())
+                .unwrap_or(default_window)
         } else if let Some(value) = window {
             value
         } else if let Some(value) = config.get("pack", None, "window") {
             parse_repack_window(value)?
         } else {
-            PackWriteOptions::new().window
+            default_window
         };
         return cmd_repack_cruft(
             cli_session,
@@ -2034,12 +2040,34 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
 }
 
 fn validate_repack_cruft_numeric_config(config: &GitConfig) -> Result<()> {
-    for key in ["cruftwindow", "cruftdepth", "cruftthreads"] {
-        if let Some(value) = config.get("repack", None, key)
-            && value.parse::<u64>().is_err()
-        {
-            eprintln!("fatal: bad numeric config value '{value}' for 'repack.{key}'");
-            return Err(GitError::Exit(128));
+    // Upstream forwards these values verbatim to `pack-objects
+    // --window/--depth/--threads`, where parse-options enforces a signed
+    // int32 with optional k/m/g units (hex/octal accepted, negatives legal):
+    //   malformed  -> error: option `<opt>' expects an integer value with an
+    //                 optional k/m/g suffix            (exit 129)
+    //   overflow   -> error: value <v> for option `<opt>' not in range
+    //                 [-2147483648,2147483647]        (exit 129)
+    const OPTIONS: [(&str, &str); 3] = [
+        ("cruftwindow", "window"),
+        ("cruftdepth", "depth"),
+        ("cruftthreads", "threads"),
+    ];
+    for (key, option) in OPTIONS {
+        let Some(value) = config.get("repack", None, key) else {
+            continue;
+        };
+        match sley_config::typed::classify_config_i32(value) {
+            Ok(_) => {}
+            Err(sley_config::typed::BadNumericKind::InvalidUnit) => {
+                eprintln!("error: option `{option}' expects an integer value with an optional k/m/g suffix");
+                return Err(GitError::Exit(129));
+            }
+            Err(_) => {
+                eprintln!(
+                    "error: value {value} for option `{option}' not in range [-2147483648,2147483647]"
+                );
+                return Err(GitError::Exit(129));
+            }
         }
     }
     Ok(())
@@ -3288,13 +3316,16 @@ fn trace_gc_repack(args: &[&str]) {
 }
 
 fn gc_config_i64(config: &GitConfig, key: &str) -> Option<i64> {
-    config.get("gc", None, key)?.parse().ok()
+    // Typed classifier replaces the plain `str::parse` composition; git's
+    // integer grammar (units, hex/octal) now applies, matching
+    // `git_config_int`. Invalid values stay silently ignored here.
+    sley_config::typed::classify_config_int(config.get("gc", None, key)?).ok()
 }
 
 fn gc_config_u64(config: &GitConfig, key: &str) -> Option<u64> {
-    config
-        .get("gc", None, key)
-        .and_then(|value| parse_gc_size(value).ok())
+    // Typed classifier replaces the hand-rolled digit-scan (`parse_gc_size`)
+    // for config reads: units plus hex/octal per git_parse_unsigned, no sign.
+    sley_config::typed::classify_config_size(config.get("gc", None, key)?).ok()
 }
 
 fn parse_gc_size(value: &str) -> Result<u64> {

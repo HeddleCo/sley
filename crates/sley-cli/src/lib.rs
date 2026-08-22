@@ -213,8 +213,11 @@ pub(crate) use init_config::{
     DEFAULT_BRANCH_NAME_ADVICE, clone_init_default_branch_config,
     clone_init_default_submodule_path_config, enable_submodule_path_config_extension,
     init_config_value, parse_bad_config_line_with_path, parse_bad_config_line_without_path,
-    parse_config_bool, report_config_setup_error, submodule_path_config_enabled,
+    report_config_setup_error, submodule_path_config_enabled,
 };
+// The keyword-only hand-rolled bool parser was retired in favour of the
+// shared git-grammar primitive (keywords plus the integer fallback).
+pub(crate) use sley::plumbing::sley_config::parse_config_bool;
 pub(crate) use ls_files_pathspec::{
     LsFilesPathspec, index_entry_stage, normalize_absolute_cli_pathspec, path_component_count,
 };

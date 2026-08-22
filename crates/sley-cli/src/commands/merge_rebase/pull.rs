@@ -451,19 +451,18 @@ fn parse_pull_rebase_value(key: &str, value: &str) -> Result<PullRebase> {
     }
 }
 
-fn parse_config_bool_value(value: &str) -> Option<bool> {
-    parse_maybe_bool(value.trim())
-}
-
 fn pull_autostash_config(config: &GitConfig, rebase: PullRebase) -> Option<bool> {
     config
         .get("pull", None, "autostash")
-        .and_then(parse_config_bool_value)
+        // The shared git-grammar primitive replaces the keyword-only local
+        // wrapper (integers now count as booleans, like upstream's
+        // `git_parse_maybe_bool`).
+        .and_then(sley_config::parse_config_bool)
         .or_else(|| {
             if rebase.enabled() {
                 config
                     .get("rebase", None, "autostash")
-                    .and_then(parse_config_bool_value)
+                    .and_then(sley_config::parse_config_bool)
             } else {
                 None
             }

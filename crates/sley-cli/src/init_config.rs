@@ -122,7 +122,7 @@ pub(crate) fn clone_init_default_submodule_path_config() -> Result<bool> {
     Ok(
         init_config_value("init.defaultSubmodulePathConfig", &[], None)?
             .as_deref()
-            .and_then(parse_config_bool)
+            .and_then(sley_config::parse_config_bool)
             .unwrap_or(false),
     )
 }
@@ -190,12 +190,4 @@ pub(crate) fn parse_bad_config_line_without_path(message: &str) -> Option<&str> 
     let rest = message.strip_prefix("config line ")?;
     let (line, _detail) = rest.split_once(':')?;
     Some(line)
-}
-
-pub(crate) fn parse_config_bool(value: &str) -> Option<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" | "1" => Some(true),
-        "false" | "no" | "off" | "0" => Some(false),
-        _ => None,
-    }
 }

@@ -582,10 +582,10 @@ pub(crate) fn cmd_pack_objects(
 fn pack_objects_write_options(git_dir: &Path) -> Result<PackWriteOptions> {
     let config = read_repo_config(git_dir)?;
     let mut options = PackWriteOptions::new();
-    if let Some(value) = config.get("pack", None, "window")
-        && let Some(window) = sley_config::parse_config_int(value)
-        && window == 0
-    {
+    // Typed accessor (sley-config::typed) replaces the hand-rolled
+    // get+`parse_config_int` composition; a malformed `pack.window` keeps its
+    // historical silent-ignore fallback instead of upstream's fatal.
+    if matches!(config.get_int("pack", None, "window"), Ok(Some(0))) {
         options = options.with_window(0).with_depth(0).with_reorder(false);
     }
     Ok(options)
@@ -612,8 +612,7 @@ fn pack_objects_pack_size_limit(
     let mut limit = arg_limit;
     if !stdout_mode
         && limit.is_none()
-        && let Some(value) = config.get("pack", None, "packSizeLimit")
-        && let Some(parsed) = sley_config::parse_config_int(value)
+        && let Ok(Some(parsed)) = config.get_int("pack", None, "packSizeLimit")
         && parsed > 0
     {
         limit = Some(parsed as u64);
@@ -2052,7 +2051,11 @@ fn pack_reuse_mode(git_dir: &Path) -> Result<PackReuseMode> {
             None => PackReuseMode::Single,
             Some(value) if value.eq_ignore_ascii_case("single") => PackReuseMode::Single,
             Some(value) if value.eq_ignore_ascii_case("multi") => PackReuseMode::Multi,
-            Some(value) => match sley_config::parse_config_bool(value) {
+            // Upstream (2.55 `pack.allowPackReuse`) also takes the literal
+            // string `none` plus strict boolean keywords — bare integers like
+            // `1` are rejected, unlike the full bool grammar.
+            Some(value) if value.eq_ignore_ascii_case("none") => PackReuseMode::None,
+            Some(value) => match sley_config::typed::parse_strict_bool_keyword(value) {
                 Some(true) => PackReuseMode::Single,
                 Some(false) => PackReuseMode::None,
                 None => {

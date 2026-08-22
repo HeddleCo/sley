@@ -183,6 +183,10 @@ fn cmd_commit_graph_write(cli_session: &crate::session::CliSession, args: &[Stri
     // on the write invocation take effect.
     let repo_config =
         sley_config::read_repo_config(&git_dir, effective_config_parameters_env().as_deref()).ok();
+    // The two numeric keys die through `die_bad_number`, whose diagnostic names
+    // the value's source file; look them up through an origin-carrying stack
+    // (same layering as the plain config above).
+    let origin_stack = commit_graph_origin_stack(cli_session, &git_dir);
     // git's `commit_graph_compatible()`: grafts and shallow boundaries make a
     // graph lie about parents. `cmd_commit_graph` also calls
     // `disable_replace_refs()`, so replace refs are intentionally *not*
@@ -190,7 +194,7 @@ fn cmd_commit_graph_write(cli_session: &crate::session::CliSession, args: &[Stri
     if !commit_graph_write_compatible(&git_dir, format) {
         return Ok(());
     }
-    let changed_paths_version = commit_graph_changed_paths_version(repo_config.as_ref())?;
+    let changed_paths_version = commit_graph_changed_paths_version(origin_stack.as_ref())?;
     if !(-1..=2).contains(&changed_paths_version) {
         eprintln!(
             "warning: attempting to write a commit-graph, but 'commitGraph.changedPathsVersion' ({changed_paths_version}) is not supported"
@@ -202,7 +206,7 @@ fn cmd_commit_graph_write(cli_session: &crate::session::CliSession, args: &[Stri
         commit_graph_bloom_settings_for_write(existing_bloom_settings, changed_paths_version, true);
     // git: write_generation_data = (get_configured_generation_version(r) == 2).
     // Default is 2; `commitGraph.generationVersion=1` omits the GDA2/GDO2 chunks.
-    let write_generation_data = commit_graph_generation_version(repo_config.as_ref()) == 2;
+    let write_generation_data = commit_graph_generation_version(origin_stack.as_ref())? == 2;
     let changed_paths = changed_paths.unwrap_or_else(|| {
         repo_config
             .as_ref()
@@ -2035,36 +2039,63 @@ fn commit_graph_write_compatible(git_dir: &Path, format: ObjectFormat) -> bool {
     true
 }
 
-/// `commitGraph.generationVersion` (git's `get_configured_generation_version`):
-/// defaults to 2, which writes the GDA2 corrected-commit-date chunk. A value of
-/// 1 selects the legacy topological-level-only layout (no GDA2/GDO2).
-fn commit_graph_generation_version(config: Option<&sley_config::GitConfig>) -> i64 {
-    config
-        .and_then(
-            |config| match config.get_entry("commitGraph", None, "generationVersion") {
-                Some(Some(value)) => sley_config::parse_config_int(value),
-                _ => None,
-            },
-        )
-        .unwrap_or(2)
+/// Build the origin-carrying config view (system → global → repository, plus
+/// `-c` injections) used for lookups whose failure diagnostics name the value's
+/// source file. Best-effort: unreadable layers simply don't contribute.
+fn commit_graph_origin_stack(
+    cli_session: &crate::session::CliSession,
+    git_dir: &Path,
+) -> Option<sley_config::ConfigStack> {
+    let mut stack = sley_config::ConfigStack::new();
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(sley_config::git_dir_for_include_context(git_dir)),
+        crate::repo_current_branch_name(git_dir),
+    );
+    for (path, scope) in sley_config::default_config_layer_paths() {
+        let _ = stack.push_file(&path, scope, true, &context);
+    }
+    let config_path = git_dir.join("config");
+    let display_path = config_path
+        .strip_prefix(cli_session.cwd())
+        .unwrap_or(&config_path);
+    let _ = stack.push_file(display_path, sley_config::ConfigScope::Local, true, &context);
+    if let Ok(parameters) = crate::injected_config_parameters() {
+        let _ = stack.push_parameters_with_includes(&parameters, &context);
+    }
+    Some(stack)
 }
 
-fn commit_graph_changed_paths_version(config: Option<&sley_config::GitConfig>) -> Result<i64> {
+/// `commitGraph.generationVersion` (git's `get_configured_generation_version`):
+/// defaults to 2, which writes the GDA2 corrected-commit-date chunk. A value of
+/// 1 selects the legacy topological-level-only layout (no GDA2/GDO2). A
+/// malformed value is fatal, as upstream's `repo_cfg_int` dies via
+/// `die_bad_number`.
+fn commit_graph_generation_version(config: Option<&sley_config::ConfigStack>) -> Result<i64> {
+    let Some(config) = config else {
+        return Ok(2);
+    };
+    match config.get_int("commitgraph", None, "generationversion") {
+        Ok(Some(version)) => Ok(version),
+        Ok(None) => Ok(2),
+        // The accessor already printed git's exact fatal line.
+        Err(report) => Err(report),
+    }
+}
+
+fn commit_graph_changed_paths_version(config: Option<&sley_config::ConfigStack>) -> Result<i64> {
     let Some(config) = config else {
         return Ok(-1);
     };
-    match config.get_entry("commitGraph", None, "changedPathsVersion") {
-        Some(None) => return Ok(1),
-        Some(Some(value)) => {
-            return sley_config::parse_config_int(value).ok_or_else(|| {
-                GitError::Command(format!(
-                    "bad numeric config value '{value}' for 'commitGraph.changedPathsVersion'"
-                ))
-            });
-        }
-        None => {}
+    // Upstream reads this through `repo_cfg_int`, so a value-less bare key is
+    // fatal (rendered with an empty value) exactly like a malformed one; only
+    // a genuinely absent key falls back to `commitGraph.readChangedPaths`.
+    match config.get_int("commitgraph", None, "changedpathsversion") {
+        Ok(Some(version)) => return Ok(version),
+        // The accessor already printed git's exact fatal line.
+        Err(report) => return Err(report),
+        Ok(None) => {}
     }
-    match config.get_bool("commitGraph", None, "readChangedPaths") {
+    match config.get_bool("commitgraph", None, "readchangedpaths") {
         Some(false) => Ok(0),
         Some(true) => Ok(-1),
         None => Ok(-1),
