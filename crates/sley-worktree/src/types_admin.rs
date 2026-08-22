@@ -438,6 +438,13 @@ pub enum WorktreeEntryState {
 pub struct AtomicMetadataWriteOptions {
     pub fsync_file: bool,
     pub fsync_dir: bool,
+    /// Resolved durability policy for the file barrier (see
+    /// `sley_core::fsync`). When set and `fsync_file` is requested, the
+    /// barrier routes through the policy — an empty component set disables
+    /// the barrier, otherwise its `core.fsyncMethod` mapping applies to the
+    /// reference/metadata component. `None` preserves the legacy
+    /// unconditional `sync_all`.
+    pub fsync_policy: Option<sley_core::fsync::Policy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
