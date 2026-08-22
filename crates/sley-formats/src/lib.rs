@@ -10,6 +10,8 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use sley_config::{ConfigEntry, ConfigSection, GitConfig};
+use sley_core::paths::{normalize_lexical, relative_path_lexical};
+use sley_core::primitives::{common_prefix_len, read_u16, read_u24, read_u32, read_u64, u32_be, u64_be};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -1037,13 +1039,6 @@ fn read_reftable_string(block: &[u8], offset: &mut usize, end: usize) -> Result<
     Ok(value)
 }
 
-fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
-    left.iter()
-        .zip(right.iter())
-        .take_while(|(a, b)| a == b)
-        .count()
-}
-
 /// Walk the `'g'` log section starting at `footer.log_position`, inflating each
 /// block and decoding its log records. Returns an empty vector when the table
 /// carries no logs.
@@ -1290,19 +1285,9 @@ fn write_reftable_varint(out: &mut Vec<u8>, mut value: u64) {
     out.extend_from_slice(&bytes[pos..]);
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
-    let raw = bytes
-        .get(offset..offset + 2)
-        .ok_or_else(|| GitError::InvalidFormat("truncated uint16".into()))?;
-    Ok(u16::from_be_bytes([raw[0], raw[1]]))
-}
-
-fn read_u24(bytes: &[u8], offset: usize) -> Result<u32> {
-    let raw = bytes
-        .get(offset..offset + 3)
-        .ok_or_else(|| GitError::InvalidFormat("truncated uint24".into()))?;
-    Ok((u32::from(raw[0]) << 16) | (u32::from(raw[1]) << 8) | u32::from(raw[2]))
-}
+// Fixed-width reads (`read_u16`/`read_u24`/`read_u32`/`read_u64`) and the
+// exact-width `u32_be`/`u64_be` come from `sley_core::primitives`. The writers
+// below stay local because the reftable block-size cap is reftable policy.
 
 fn write_u24(out: &mut Vec<u8>, value: u32) -> Result<()> {
     if value > REFTABLE_MAX_BLOCK_SIZE {
@@ -1310,9 +1295,7 @@ fn write_u24(out: &mut Vec<u8>, value: u32) -> Result<()> {
             "uint24 value {value} exceeds maximum"
         )));
     }
-    out.push((value >> 16) as u8);
-    out.push((value >> 8) as u8);
-    out.push(value as u8);
+    sley_core::primitives::write_u24(out, value);
     Ok(())
 }
 
@@ -1322,29 +1305,7 @@ fn write_u24_at(out: &mut [u8], offset: usize, value: u32) -> Result<()> {
             "uint24 value {value} exceeds maximum"
         )));
     }
-    let target = out
-        .get_mut(offset..offset + 3)
-        .ok_or_else(|| GitError::InvalidFormat("uint24 write is out of bounds".into()))?;
-    target[0] = (value >> 16) as u8;
-    target[1] = (value >> 8) as u8;
-    target[2] = value as u8;
-    Ok(())
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
-    let raw = bytes
-        .get(offset..offset + 4)
-        .ok_or_else(|| GitError::InvalidFormat("truncated uint32".into()))?;
-    Ok(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
-    let raw = bytes
-        .get(offset..offset + 8)
-        .ok_or_else(|| GitError::InvalidFormat("truncated uint64".into()))?;
-    Ok(u64::from_be_bytes([
-        raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-    ]))
+    sley_core::primitives::write_u24_at(out, offset, value)
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
@@ -3658,52 +3619,39 @@ fn write_worktree_linking_files(
     Ok(())
 }
 
-/// Lexically normalize a path (collapse `.`/`..`, no filesystem access), so a
-/// path built from a relative backlink against a non-existent (already-moved)
-/// old admin dir still resolves. Mirrors the cleanup git's
-/// `strbuf_realpath_forgiving` performs on the components that do exist.
-fn normalize_lexical(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
-                }
-            }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
+/// Resolve the common directory shared by all linked worktrees of `git_dir`
+/// — a faithful port of path.c's `get_common_dir_noenv` plus the
+/// `GIT_COMMON_DIR` environment override applied by its caller.
+///
+/// Resolution order:
+/// 1. `GIT_COMMON_DIR`, when `honor_environment` is set — used verbatim (git
+///    applies no realpath to it), so callers can redirect common files without
+///    a physical linked worktree;
+/// 2. `<git_dir>/commondir`, when present — relative values resolve against
+///    `git_dir`, then the result is canonicalized (`strbuf_add_real_path`);
+/// 3. otherwise `git_dir` itself, returned **verbatim** (upstream does not
+///    realpath this branch).
+///
+/// Preserving the verbatim third branch matters: callers detect
+/// linked-worktree identity by comparing the resolved common dir against the
+/// original git dir (`get_git_dir() != get_common_dir()`), which a
+/// canonicalization of the plain case would silently erase.
+pub fn repository_common_dir(git_dir: &Path, honor_environment: bool) -> Result<PathBuf> {
+    if honor_environment && let Some(common_dir) = env::var_os("GIT_COMMON_DIR") {
+        return Ok(PathBuf::from(common_dir));
     }
-    out
-}
-
-/// Compute `target` expressed relative to `base`, both absolute. Mirrors git's
-/// `relative_path()` for the common ancestor case (the only one that arises for
-/// sibling worktree/admin directories under a shared parent).
-fn relative_path_lexical(target: &Path, base: &Path) -> String {
-    let target = normalize_lexical(target);
-    let base = normalize_lexical(base);
-    let target_components: Vec<_> = target.components().collect();
-    let base_components: Vec<_> = base.components().collect();
-    let common = target_components
-        .iter()
-        .zip(base_components.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let mut result = PathBuf::new();
-    for _ in common..base_components.len() {
-        result.push("..");
+    let commondir = git_dir.join("commondir");
+    if commondir.is_file() {
+        let value = fs::read_to_string(&commondir)?;
+        let path = PathBuf::from(value.trim());
+        let common = if path.is_absolute() {
+            path
+        } else {
+            git_dir.join(path)
+        };
+        return Ok(fs::canonicalize(common)?);
     }
-    for component in &target_components[common..] {
-        result.push(component.as_os_str());
-    }
-    if result.as_os_str().is_empty() {
-        ".".to_string()
-    } else {
-        result.display().to_string()
-    }
+    Ok(git_dir.to_path_buf())
 }
 
 fn read_gitdir_file(path: &Path) -> Result<Option<PathBuf>> {
@@ -3961,16 +3909,6 @@ fn calc_shared_perm(perm: SharedPerm, mode: u32, is_dir: bool) -> u32 {
         }
     }
     new_mode
-}
-
-fn u32_be(bytes: &[u8]) -> u32 {
-    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-}
-
-fn u64_be(bytes: &[u8]) -> u64 {
-    u64::from_be_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ])
 }
 
 fn hash_function_id(format: ObjectFormat) -> u32 {

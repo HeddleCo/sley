@@ -1,3 +1,4 @@
+use sley_core::primitives::{get_u32_be, get_u32_le};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
@@ -655,9 +656,9 @@ fn parse_mo(bytes: &[u8]) -> Option<BTreeMap<String, String>> {
     }
     let magic = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
     let read_u32: fn(&[u8], usize) -> Option<u32> = if magic == 0x9504_12de {
-        read_u32_le
+        get_u32_le
     } else if magic == 0xde12_0495 {
-        read_u32_be
+        get_u32_be
     } else {
         return None;
     };
@@ -692,18 +693,6 @@ fn parse_mo(bytes: &[u8]) -> Option<BTreeMap<String, String>> {
         messages.insert(msgid.to_string(), msgstr.to_string());
     }
     Some(messages)
-}
-
-fn read_u32_le(bytes: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        bytes.get(off..off + 4)?.try_into().ok()?,
-    ))
-}
-
-fn read_u32_be(bytes: &[u8], off: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(
-        bytes.get(off..off + 4)?.try_into().ok()?,
-    ))
 }
 
 fn substitute_percent_s(template: &str, args: &[&str]) -> String {

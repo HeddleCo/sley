@@ -8,6 +8,9 @@
 //! ([`CacheTree`]) that caches the tree object ids a fully-staged index would
 //! write.
 
+use sley_core::primitives::{
+    common_prefix_len, u16_be, u32_be, u64_be, write_biased_varint,
+};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1231,7 +1234,7 @@ impl UntrackedCache {
 
     pub fn write(&self, format: ObjectFormat) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        encode_untracked_varint(self.ident.len(), &mut out);
+        write_biased_varint(self.ident.len() as u64, &mut out);
         out.extend_from_slice(&self.ident);
         self.info_exclude.stat.write(&mut out);
         self.excludes_file.stat.write(&mut out);
@@ -1243,13 +1246,13 @@ impl UntrackedCache {
         out.extend_from_slice(&self.exclude_per_dir);
         out.push(0);
         let Some(root) = self.root.as_ref() else {
-            encode_untracked_varint(0, &mut out);
+            write_biased_varint(0, &mut out);
             out.push(0);
             return Ok(out);
         };
         let mut dirs = Vec::new();
         root.write_preorder(&mut dirs);
-        encode_untracked_varint(dirs.len(), &mut out);
+        write_biased_varint(dirs.len() as u64, &mut out);
         let mut dir_bytes = Vec::new();
         for dir in &dirs {
             dir.write_record(&mut dir_bytes);
@@ -1344,9 +1347,9 @@ impl UntrackedCacheDir {
         if !self.valid {
             untracked.clear();
         }
-        encode_untracked_varint(untracked.len(), out);
+        write_biased_varint(untracked.len() as u64, out);
         let recurse_dirs = self.dirs.iter().filter(|dir| dir.recurse).count();
-        encode_untracked_varint(recurse_dirs, out);
+        write_biased_varint(recurse_dirs as u64, out);
         out.extend_from_slice(&self.name);
         out.push(0);
         for path in untracked {
@@ -1373,21 +1376,10 @@ fn ensure_oid_format(oid: &ObjectId, format: ObjectFormat) -> Result<()> {
     Ok(())
 }
 
-fn encode_untracked_varint(mut value: usize, out: &mut Vec<u8>) {
-    let mut bytes = [0u8; 16];
-    let mut len = 0;
-    bytes[len] = (value & 0x7f) as u8;
-    len += 1;
-    value >>= 7;
-    while value != 0 {
-        value -= 1;
-        bytes[len] = 0x80 | (value & 0x7f) as u8;
-        len += 1;
-        value >>= 7;
-    }
-    out.extend(bytes[..len].iter().rev());
-}
-
+// Kept local rather than delegating to `sley_core::primitives::read_biased_varint`:
+// this decoder is bounded by an explicit `end` (not the slice end) and
+// accumulates in `usize` with its own overflow messages, so forcing it through
+// the `u64` primitive would change error behavior on narrow platforms.
 fn decode_untracked_varint(bytes: &[u8], offset: &mut usize, end: usize) -> Result<usize> {
     let mut value = 0usize;
     loop {
@@ -2645,27 +2637,6 @@ fn encode_index_v4_path_strip_len(strip_len: usize, out: &mut Vec<u8>) {
     for byte in bytes.iter().rev() {
         out.push(*byte);
     }
-}
-
-fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
-    left.iter()
-        .zip(right.iter())
-        .take_while(|(left, right)| left == right)
-        .count()
-}
-
-fn u32_be(bytes: &[u8]) -> u32 {
-    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-}
-
-fn u64_be(bytes: &[u8]) -> u64 {
-    u64::from_be_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ])
-}
-
-fn u16_be(bytes: &[u8]) -> u16 {
-    u16::from_be_bytes([bytes[0], bytes[1]])
 }
 
 #[cfg(test)]

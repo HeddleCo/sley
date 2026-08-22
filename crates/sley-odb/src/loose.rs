@@ -2,6 +2,7 @@ use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::{Decompress, FlushDecompress};
+use sley_core::atomic::LockFile;
 use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 use sley_object::{EncodedObject, ObjectType, parse_framed_object};
 use std::collections::HashSet;
@@ -687,34 +688,19 @@ impl ObjectWriter for LooseObjectStore {
             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
             encoder.write_all(&object.framed_bytes())?;
             let compressed = encoder.finish()?;
-            {
-                let mut file = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&temp_path)?;
-                file.write_all(&compressed)?;
-                // No fsync: git's default `core.fsync=none` fsyncs nothing on the
-                // loose-object write path (object-file.c writes the temp file and
-                // renames it without syncing unless `core.fsync` names
-                // `loose-object`/`objects`/`all`, which it does not by default).
-                // A per-object sync_all() here made `git add` of N files cost N
-                // fsyncs — the dominant term in sley#27's 10x `add -u` slowdown —
-                // for durability git itself does not provide by default. The
-                // create_new temp + atomic rename below still guarantees the
-                // object never appears half-written under its final name.
-            }
-            match fs::rename(&temp_path, &path) {
-                Ok(()) => Ok(()),
-                Err(_) if path.exists() => {
-                    let _ = fs::remove_file(&temp_path);
-                    Ok(())
-                }
-                Err(err) => Err(GitError::Io(err.to_string())),
-            }
+            // No fsync: git's default `core.fsync=none` fsyncs nothing on the
+            // loose-object write path (object-file.c writes the temp file and
+            // renames it without syncing unless `core.fsync` names
+            // `loose-object`/`objects`/`all`, which it does not by default).
+            // A per-object sync_all() here made `git add` of N files cost N
+            // fsyncs — the dominant term in sley#27's 10x `add -u` slowdown —
+            // for durability git itself does not provide by default. The
+            // create_new temp + atomic rename below still guarantees the
+            // object never appears half-written under its final name.
+            let mut lock = LockFile::create(temp_path.clone())?;
+            lock.write_all(&compressed)?;
+            lock.persist_racy(&path)
         })();
-        if write_result.is_err() {
-            let _ = fs::remove_file(&temp_path);
-        }
         write_result?;
         self.shared_repository.adjust_file(&path)?;
         self.note_loose_write(oid);

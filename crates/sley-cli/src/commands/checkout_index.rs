@@ -610,14 +610,12 @@ fn checkout_temp_create_path(worktree_root: &Path) -> Result<(String, PathBuf)> 
         let suffix = std::str::from_utf8(&suffix).expect("temporary suffix is ASCII");
         let name = format!(".merge_file_{suffix}");
         let path = worktree_root.join(&name);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        // The handle is released immediately; the entry body is written
+        // through a separate call once the exclusive name is claimed.
+        match sley_core::atomic::LockFile::create(path.clone()).map(|lock| lock.keep()) {
             Ok(_) => return Ok((name, path)),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err.into()),
+            Err(err) if err.io_kind() == Some(io::ErrorKind::AlreadyExists) => continue,
+            Err(err) => return Err(err),
         }
     }
     Err(GitError::Io(

@@ -352,22 +352,12 @@ pub fn repository_objects_dir(git_dir: impl AsRef<Path>) -> PathBuf {
         .unwrap_or_else(|| repository_common_dir(git_dir).join("objects"))
 }
 
+/// Infallible adapter over the canonical resolver in [`sley_formats`]: on any
+/// resolution failure (missing/unreadable paths) fall back to the raw git dir
+/// rather than failing object-store access.
 pub fn repository_common_dir(git_dir: impl AsRef<Path>) -> PathBuf {
-    if let Some(common_dir) = env::var_os("GIT_COMMON_DIR") {
-        return PathBuf::from(common_dir);
-    }
     let git_dir = git_dir.as_ref();
-    let commondir = git_dir.join("commondir");
-    if let Ok(value) = fs::read_to_string(&commondir) {
-        let path = PathBuf::from(value.trim());
-        let common = if path.is_absolute() {
-            path
-        } else {
-            git_dir.join(path)
-        };
-        return fs::canonicalize(&common).unwrap_or(common);
-    }
-    git_dir.to_path_buf()
+    sley_formats::repository_common_dir(git_dir, true).unwrap_or_else(|_| git_dir.to_path_buf())
 }
 
 pub fn repository_object_ids(

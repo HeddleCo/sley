@@ -9,6 +9,10 @@ use crate::index::*;
 use crate::index_io::*;
 use crate::types_admin::*;
 
+// Canonical lexical helpers from `sley_core::paths`; the local copies were
+// consolidated there (leading-`..`-retaining normalization).
+use sley_core::paths::{normalize_lexical, relative_path_between};
+
 pub fn remove_index_and_worktree_paths(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
@@ -240,7 +244,7 @@ pub fn remove_index_and_worktree_paths(
             // Capture a directory-only pathspec before lexical normalization drops
             // the trailing separator.
             let has_trailing_slash = path_has_trailing_separator(&absolute);
-            let absolute = normalize_absolute_path_lexically(&absolute);
+            let absolute = normalize_lexical(&absolute);
             let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
@@ -722,7 +726,7 @@ fn remove_pathspec_parts(worktree_root: &Path, path: &Path) -> Result<RemovePath
     } else {
         worktree_root.join(path)
     };
-    let absolute = normalize_absolute_path_lexically(&absolute);
+    let absolute = normalize_lexical(&absolute);
     let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
         GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
     })?;
@@ -1205,7 +1209,7 @@ pub(crate) fn prepare_moved_gitlink_gitdirs(
             continue;
         };
         gitdir_moves.push(GitlinkGitdirMove {
-            git_dir: normalize_absolute_path_lexically(&git_dir),
+            git_dir: normalize_lexical(&git_dir),
             destination_root: worktree_path(worktree_root, &gitlink_move.destination)?,
         });
     }
@@ -1246,42 +1250,6 @@ pub(crate) fn apply_moved_gitlink_gitdirs(moves: &[GitlinkGitdirMove]) -> Result
         }
     }
     Ok(())
-}
-
-pub(crate) fn relative_path_between(from_dir: &Path, to_path: &Path) -> PathBuf {
-    let from = normalize_absolute_path_lexically(from_dir);
-    let to = normalize_absolute_path_lexically(to_path);
-    let from_components = from.components().collect::<Vec<_>>();
-    let to_components = to.components().collect::<Vec<_>>();
-    let mut common = 0usize;
-    while common < from_components.len()
-        && common < to_components.len()
-        && from_components[common] == to_components[common]
-    {
-        common += 1;
-    }
-    if common == 0 {
-        return to;
-    }
-    let mut relative = PathBuf::new();
-    for component in &from_components[common..] {
-        if matches!(component, std::path::Component::Normal(_)) {
-            relative.push("..");
-        }
-    }
-    for component in &to_components[common..] {
-        match component {
-            std::path::Component::Normal(value) => relative.push(value),
-            std::path::Component::ParentDir => relative.push(".."),
-            std::path::Component::CurDir
-            | std::path::Component::RootDir
-            | std::path::Component::Prefix(_) => {}
-        }
-    }
-    if relative.as_os_str().is_empty() {
-        relative.push(".");
-    }
-    relative
 }
 
 pub(crate) fn gitfile_path_value(path: &Path) -> String {
@@ -1395,14 +1363,14 @@ pub fn move_index_and_worktree_path(
     } else {
         worktree_root.join(source)
     };
-    let source_absolute = normalize_absolute_path_lexically(&source_absolute);
+    let source_absolute = normalize_lexical(&source_absolute);
     let destination_absolute = if destination.is_absolute() {
         destination.to_path_buf()
     } else {
         worktree_root.join(destination)
     };
     let destination_has_trailing_separator = path_has_trailing_separator(&destination_absolute);
-    let destination_absolute = normalize_absolute_path_lexically(&destination_absolute);
+    let destination_absolute = normalize_lexical(&destination_absolute);
     // When the destination is an existing directory, the source is moved *into*
     // it (`dst/basename`). Record that so the trailing-separator check below does
     // not then reject `git mv file dir/` — git only errors on a trailing slash

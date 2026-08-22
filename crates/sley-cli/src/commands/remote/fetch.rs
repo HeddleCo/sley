@@ -1827,14 +1827,14 @@ fn trace2_fetch_refetch_maintenance() {
         return;
     };
     let gc_auto_pack_limit = match global_config_value("gc.autopacklimit").ok().flatten() {
-        Some(value) if parse_config_int(&value) == Some(0) => "0",
+        Some(value) if sley_config::parse_config_int(&value) == Some(0) => "0",
         _ => "1",
     };
     let incremental_repack_auto = match global_config_value("maintenance.incremental-repack.auto")
         .ok()
         .flatten()
     {
-        Some(value) if parse_config_int(&value) == Some(0) => "0",
+        Some(value) if sley_config::parse_config_int(&value) == Some(0) => "0",
         _ => "-1",
     };
     let lines = [
@@ -1851,10 +1851,6 @@ fn trace2_fetch_refetch_maintenance() {
             let _ = file.write_all(line.as_bytes());
         }
     }
-}
-
-fn parse_config_int(value: &str) -> Option<i64> {
-    value.trim().parse::<i64>().ok()
 }
 
 /// Dispatch a single fetch source (bundle / http / ssh / git / local) — shared

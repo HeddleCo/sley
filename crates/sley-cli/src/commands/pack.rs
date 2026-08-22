@@ -1812,15 +1812,21 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
         let cruft_pack_size =
             resolve_cruft_pack_size(max_pack_size, max_cruft_size, configured_pack_size);
         // Cruft-specific config intentionally overrides the general command
-        // option. Otherwise the command option overrides pack.window.
+        // option. Otherwise the command option overrides pack.window. The
+        // value was shape-validated above against pack-objects' option
+        // grammar; resolve it with the same classifier so units (`2k`) work.
+        let default_window = PackWriteOptions::new().window;
         let cruft_window = if let Some(value) = config.get("repack", None, "cruftWindow") {
-            parse_repack_window(value)?
+            sley_config::typed::classify_config_size(value)
+                .ok()
+                .and_then(|parsed| usize::try_from(parsed).ok())
+                .unwrap_or(default_window)
         } else if let Some(value) = window {
             value
         } else if let Some(value) = config.get("pack", None, "window") {
             parse_repack_window(value)?
         } else {
-            PackWriteOptions::new().window
+            default_window
         };
         return cmd_repack_cruft(
             cli_session,
@@ -2034,12 +2040,34 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
 }
 
 fn validate_repack_cruft_numeric_config(config: &GitConfig) -> Result<()> {
-    for key in ["cruftwindow", "cruftdepth", "cruftthreads"] {
-        if let Some(value) = config.get("repack", None, key)
-            && value.parse::<u64>().is_err()
-        {
-            eprintln!("fatal: bad numeric config value '{value}' for 'repack.{key}'");
-            return Err(GitError::Exit(128));
+    // Upstream forwards these values verbatim to `pack-objects
+    // --window/--depth/--threads`, where parse-options enforces a signed
+    // int32 with optional k/m/g units (hex/octal accepted, negatives legal):
+    //   malformed  -> error: option `<opt>' expects an integer value with an
+    //                 optional k/m/g suffix            (exit 129)
+    //   overflow   -> error: value <v> for option `<opt>' not in range
+    //                 [-2147483648,2147483647]        (exit 129)
+    const OPTIONS: [(&str, &str); 3] = [
+        ("cruftwindow", "window"),
+        ("cruftdepth", "depth"),
+        ("cruftthreads", "threads"),
+    ];
+    for (key, option) in OPTIONS {
+        let Some(value) = config.get("repack", None, key) else {
+            continue;
+        };
+        match sley_config::typed::classify_config_i32(value) {
+            Ok(_) => {}
+            Err(sley_config::typed::BadNumericKind::InvalidUnit) => {
+                eprintln!("error: option `{option}' expects an integer value with an optional k/m/g suffix");
+                return Err(GitError::Exit(129));
+            }
+            Err(_) => {
+                eprintln!(
+                    "error: value {value} for option `{option}' not in range [-2147483648,2147483647]"
+                );
+                return Err(GitError::Exit(129));
+            }
         }
     }
     Ok(())
@@ -3288,13 +3316,16 @@ fn trace_gc_repack(args: &[&str]) {
 }
 
 fn gc_config_i64(config: &GitConfig, key: &str) -> Option<i64> {
-    config.get("gc", None, key)?.parse().ok()
+    // Typed classifier replaces the plain `str::parse` composition; git's
+    // integer grammar (units, hex/octal) now applies, matching
+    // `git_config_int`. Invalid values stay silently ignored here.
+    sley_config::typed::classify_config_int(config.get("gc", None, key)?).ok()
 }
 
 fn gc_config_u64(config: &GitConfig, key: &str) -> Option<u64> {
-    config
-        .get("gc", None, key)
-        .and_then(|value| parse_gc_size(value).ok())
+    // Typed classifier replaces the hand-rolled digit-scan (`parse_gc_size`)
+    // for config reads: units plus hex/octal per git_parse_unsigned, no sign.
+    sley_config::typed::classify_config_size(config.get("gc", None, key)?).ok()
 }
 
 fn parse_gc_size(value: &str) -> Result<u64> {
@@ -5746,7 +5777,7 @@ fn count_pack_index_metadata(bytes: &[u8], format: ObjectFormat) -> Result<Count
         if bytes.len() < 8 + 256 * 4 {
             return Err(GitError::InvalidFormat("pack index too short".into()));
         }
-        let version = count_u32_be(&bytes[4..8]);
+        let version = sley_core::primitives::u32_be(&bytes[4..8]);
         if version != 2 {
             return Err(GitError::Unsupported(format!(
                 "pack index version {version}"
@@ -5800,7 +5831,7 @@ fn count_pack_index_prefix_metadata(
         if bytes.len() < 8 + 256 * 4 {
             return Err(GitError::InvalidFormat("pack index too short".into()));
         }
-        let version = count_u32_be(&bytes[4..8]);
+        let version = sley_core::primitives::u32_be(&bytes[4..8]);
         if version != 2 {
             return Err(GitError::Unsupported(format!(
                 "pack index version {version}"
@@ -5863,7 +5894,7 @@ fn count_pack_index_fanout(bytes: &[u8]) -> Result<([u32; 256], u32)> {
     let mut previous = 0u32;
     for (idx, slot) in fanout.iter_mut().enumerate() {
         let start = idx * 4;
-        *slot = count_u32_be(&bytes[start..start + 4]);
+        *slot = sley_core::primitives::u32_be(&bytes[start..start + 4]);
         if *slot < previous {
             return Err(GitError::InvalidFormat(
                 "pack index fanout is not monotonic".into(),
@@ -5882,10 +5913,6 @@ fn count_checked_range(start: usize, count: usize, width: usize) -> Result<std::
         .checked_add(len)
         .ok_or_else(|| GitError::InvalidFormat("pack index table offset overflow".into()))?;
     Ok(start..end)
-}
-
-fn count_u32_be(bytes: &[u8]) -> u32 {
-    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 #[derive(Debug)]
@@ -8022,7 +8049,7 @@ fn parse_midx_for_verify(
     if &bytes[..4] != b"MIDX" {
         return Err(format!(
             "multi-pack-index signature 0x{:08x} does not match signature 0x{:08x}",
-            u32_be4(&bytes[..4]),
+            sley_core::primitives::u32_be(&bytes[..4]),
             u32::from_be_bytes(*b"MIDX")
         ));
     }
@@ -8041,7 +8068,7 @@ fn parse_midx_for_verify(
         ));
     }
     let num_chunks = bytes[6] as usize;
-    let num_packs = u32_be4(&bytes[8..12]) as usize;
+    let num_packs = sley_core::primitives::u32_be(&bytes[8..12]) as usize;
 
     // Table of contents: num_chunks entries of (id:4, offset:8) plus a
     // terminating entry. Reproduce read_table_of_contents's check order so the
@@ -8054,12 +8081,12 @@ fn parse_midx_for_verify(
             return Err("multi-pack-index file is too small".to_string());
         }
         let chunk_id = [bytes[toc], bytes[toc + 1], bytes[toc + 2], bytes[toc + 3]];
-        let chunk_offset = u64_be8(&bytes[toc + 4..toc + 12]);
+        let chunk_offset = sley_core::primitives::u64_be(&bytes[toc + 4..toc + 12]);
         if chunk_id == [0, 0, 0, 0] {
             return Err("terminating chunk id appears earlier than expected".to_string());
         }
         // CHUNK alignment for midx is 1 byte, so alignment never trips.
-        let next_offset = u64_be8(&bytes[toc + 12 + 4..toc + 12 + 12]);
+        let next_offset = sley_core::primitives::u64_be(&bytes[toc + 12 + 4..toc + 12 + 12]);
         if next_offset < chunk_offset || next_offset > checksum_offset as u64 {
             return Err(format!(
                 "improper chunk offset(s) {chunk_offset:x} and {next_offset:x}"
@@ -8073,10 +8100,10 @@ fn parse_midx_for_verify(
     if final_id != [0, 0, 0, 0] {
         return Err(format!(
             "final chunk has non-zero id {:x}",
-            u32_be4(&final_id)
+            sley_core::primitives::u32_be(&final_id)
         ));
     }
-    let final_offset = u64_be8(&bytes[toc + 4..toc + 12]);
+    let final_offset = sley_core::primitives::u64_be(&bytes[toc + 4..toc + 12]);
 
     // Resolve a chunk's data slice using the next chunk's start (or the
     // terminator) as the end.
@@ -8127,7 +8154,7 @@ fn parse_midx_for_verify(
     if oidf.len() != 256 * 4 {
         return Err("multi-pack-index OID fanout is of the wrong size".to_string());
     }
-    let fanout: Vec<u32> = (0..256).map(|i| u32_be4(&oidf[i * 4..i * 4 + 4])).collect();
+    let fanout: Vec<u32> = (0..256).map(|i| sley_core::primitives::u32_be(&oidf[i * 4..i * 4 + 4])).collect();
     for i in 0..255 {
         if fanout[i] > fanout[i + 1] {
             return Err(format!(
@@ -8167,13 +8194,13 @@ fn parse_midx_for_verify(
     for i in 0..object_count {
         let oid = ObjectId::from_raw(format, &oidl[i * hash_len..i * hash_len + hash_len])
             .map_err(|err| err.to_string())?;
-        let pack_int_id = u32_be4(&ooff[i * 8..i * 8 + 4]);
+        let pack_int_id = sley_core::primitives::u32_be(&ooff[i * 8..i * 8 + 4]);
         if pack_int_id as usize >= num_packs {
             return Err(format!(
                 "bad pack-int-id: {pack_int_id} ({num_packs} total packs)"
             ));
         }
-        let raw_offset = u32_be4(&ooff[i * 8 + 4..i * 8 + 8]);
+        let raw_offset = sley_core::primitives::u32_be(&ooff[i * 8 + 4..i * 8 + 8]);
         let offset = if raw_offset & 0x8000_0000 == 0 {
             u64::from(raw_offset)
         } else {
@@ -8182,7 +8209,7 @@ fn parse_midx_for_verify(
             if large_idx * 8 + 8 > loff.len() {
                 return Err("multi-pack-index large offset out of bounds".to_string());
             }
-            u64_be8(&loff[large_idx * 8..large_idx * 8 + 8])
+            sley_core::primitives::u64_be(&loff[large_idx * 8..large_idx * 8 + 8])
         };
         entries.push(MultiPackIndexEntry {
             oid,
@@ -8197,16 +8224,6 @@ fn parse_midx_for_verify(
         object_count,
         entries,
     })
-}
-
-fn u32_be4(bytes: &[u8]) -> u32 {
-    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-}
-
-fn u64_be8(bytes: &[u8]) -> u64 {
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&bytes[..8]);
-    u64::from_be_bytes(buf)
 }
 
 fn cmd_multi_pack_index_expire(

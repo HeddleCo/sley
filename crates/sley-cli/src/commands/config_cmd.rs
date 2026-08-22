@@ -1916,8 +1916,11 @@ fn value_canonicalizes_as(value: &str, value_type: ConfigValueType) -> bool {
     match value_type {
         ConfigValueType::Raw => true,
         ConfigValueType::Bool => sley_config::parse_config_bool(value).is_some(),
-        ConfigValueType::Int => sley_config::parse_config_int(value).is_some(),
-        ConfigValueType::BoolOrInt => sley_config::parse_config_bool_or_int(value).is_some(),
+        // The exact classifiers keep `--list --type=` filtering in lockstep
+        // with the formatter (e.g. trailing whitespace is an invalid unit,
+        // not a trailing-trimmed integer).
+        ConfigValueType::Int => sley_config::typed::classify_config_int(value).is_ok(),
+        ConfigValueType::BoolOrInt => sley_config::typed::classify_config_bool_or_int(value).is_ok(),
         ConfigValueType::Color => try_format_config_color_value(value).is_ok(),
         ConfigValueType::Path => config_path_value_can_expand(value),
         ConfigValueType::ExpiryDate => {
@@ -1952,15 +1955,20 @@ fn format_config_value_with(
             Some(false) => Ok("false".into()),
             None => config_bad_bool_value(value, name),
         },
-        ConfigValueType::Int => sley_config::parse_config_int(value)
-            .map(|value| value.to_string())
-            .ok_or_else(|| config_bad_numeric_value(value, name, origin)),
-        ConfigValueType::BoolOrInt => match sley_config::parse_config_bool_or_int(value) {
-            Some(ConfigBoolOrInt::Bool(true)) => Ok("true".into()),
-            Some(ConfigBoolOrInt::Bool(false)) => Ok("false".into()),
-            Some(ConfigBoolOrInt::Int(value)) => Ok(value.to_string()),
-            None => Err(config_bad_numeric_value(value, name, origin)),
+        // Exact classifiers (git_parse_signed): the errno split decides
+        // between "invalid unit" and "out of range" wording.
+        ConfigValueType::Int => match sley_config::typed::classify_config_int(value) {
+            Ok(parsed) => Ok(parsed.to_string()),
+            Err(kind) => Err(config_bad_numeric_value(value, name, origin, kind)),
         },
+        ConfigValueType::BoolOrInt => {
+            match sley_config::typed::classify_config_bool_or_int(value) {
+                Ok(ConfigBoolOrInt::Bool(true)) => Ok("true".into()),
+                Ok(ConfigBoolOrInt::Bool(false)) => Ok("false".into()),
+                Ok(ConfigBoolOrInt::Int(value)) => Ok(value.to_string()),
+                Err(kind) => Err(config_bad_numeric_value(value, name, origin, kind)),
+            }
+        }
         ConfigValueType::ExpiryDate => format_config_expiry_date_value(value),
         ConfigValueType::Color => format_config_color_value(value),
         ConfigValueType::Path => format_config_path_value(value).map(std::borrow::Cow::into_owned),
@@ -1976,11 +1984,13 @@ fn config_bad_bool_value<T>(value: &str, name: Option<&str>) -> Result<T> {
 }
 
 /// git's `die_bad_number`: the message names the key and the source when they
-/// are known ("in file .git/config", "in blob <spec>", "in standard input").
+/// are known ("in file .git/config", "in blob <spec>", "in standard input"),
+/// and the errno-derived kind ("invalid unit" versus "out of range").
 fn config_bad_numeric_value(
     value: &str,
     name: Option<&str>,
     origin: Option<&sley_config::ConfigOrigin>,
+    kind: sley_config::typed::BadNumericKind,
 ) -> GitError {
     let location = origin.and_then(|origin| match origin.kind {
         sley_config::ConfigOriginKind::File if !origin.name.is_empty() => {
@@ -1994,12 +2004,12 @@ fn config_bad_numeric_value(
     });
     match (name, location) {
         (Some(name), Some(location)) => eprintln!(
-            "fatal: bad numeric config value '{value}' for '{name}'{location}: invalid unit"
+            "fatal: bad numeric config value '{value}' for '{name}'{location}: {kind}"
         ),
         (Some(name), None) => {
-            eprintln!("fatal: bad numeric config value '{value}' for '{name}': invalid unit")
+            eprintln!("fatal: bad numeric config value '{value}' for '{name}': {kind}")
         }
-        _ => eprintln!("fatal: bad numeric config value '{value}': invalid unit"),
+        _ => eprintln!("fatal: bad numeric config value '{value}': {kind}"),
     }
     GitError::Exit(128)
 }

@@ -1021,7 +1021,7 @@ fn parse_date_cutoff(value: &str) -> Result<i64> {
         // (`@123 +0000`); bare `@123` is accepted by git's approxidate/parse
         // path used by `--since`/`--until` (t5620 backfill --since=@N).
         if let Some(timezone) = parts.next()
-            && (parts.next().is_some() || parse_timezone_offset_seconds(timezone).is_none())
+            && (parts.next().is_some() || sley_core::date::parse_tz_offset(timezone).is_none())
         {
             return invalid_date_format(value);
         }
@@ -1042,129 +1042,39 @@ fn parse_date_cutoff(value: &str) -> Result<i64> {
         return Ok(timestamp);
     }
     let (date, time, embedded_tz) = if let Some((date, rest)) = first.split_once('T') {
-        let (time, tz) = split_embedded_timezone(rest);
+        let (time, tz) = sley_core::date::split_embedded_timezone(rest);
         (date, time, tz)
     } else if let Some(time) = parts.next() {
         (first, time, None)
-    } else if parse_date_ymd(first).is_some() {
+    } else if sley_core::date::parse_date_ymd(first).is_some() {
         // A bare `YYYY-MM-DD` with no time of day: git's approxidate fills the
         // time from "now", but for the since/until window boundaries this feeds
         // (callers only compare against it), midnight UTC is precise enough.
-        (first, "00:00:00", Some("+0000".to_string()))
+        (first, "00:00:00", Some("+0000"))
     } else {
         return invalid_date_format(value);
     };
     let timezone = match embedded_tz {
         Some(tz) => tz,
         None => match parts.next() {
-            Some(tz) => tz.to_string(),
+            Some(tz) => tz,
             None => return invalid_date_format(value),
         },
     };
     if parts.next().is_some() {
         return invalid_date_format(value);
     }
-    let Some((year, month, day)) = parse_date_ymd(date) else {
+    let Some((year, month, day)) = sley_core::date::parse_date_ymd(date) else {
         return invalid_date_format(value);
     };
-    let Some((hour, minute, second)) = parse_time_hms(time) else {
+    let Some((hour, minute, second)) = sley_core::date::parse_time_hms(time) else {
         return invalid_date_format(value);
     };
-    let Some(timezone_offset) = parse_timezone_offset_seconds(&timezone) else {
+    let Some(timezone_offset) = sley_core::date::parse_tz_offset(timezone) else {
         return invalid_date_format(value);
     };
-    let days = days_from_civil(year, month, day);
+    let days = sley_core::date::days_from_civil(year, month, day);
     Ok(days * 86_400 + i64::from(hour * 3_600 + minute * 60 + second) - timezone_offset)
-}
-
-fn split_embedded_timezone(rest: &str) -> (&str, Option<String>) {
-    if let Some(time) = rest.strip_suffix('Z') {
-        return (time, Some("+0000".to_string()));
-    }
-    let bytes = rest.as_bytes();
-    if bytes.len() >= 5 {
-        let tz_start = bytes.len() - 5;
-        if matches!(bytes[tz_start], b'+' | b'-')
-            && bytes[tz_start + 1..]
-                .iter()
-                .all(|byte| byte.is_ascii_digit())
-        {
-            return (&rest[..tz_start], Some(rest[tz_start..].to_string()));
-        }
-    }
-    (rest, None)
-}
-
-fn parse_date_ymd(value: &str) -> Option<(i64, u32, u32)> {
-    let mut parts = value.split('-');
-    let year = parts.next()?.parse::<i64>().ok()?;
-    let month = parts.next()?.parse::<u32>().ok()?;
-    let day = parts.next()?.parse::<u32>().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&month) {
-        return None;
-    }
-    let max_day = days_in_month(year, month);
-    if !(1..=max_day).contains(&day) {
-        return None;
-    }
-    Some((year, month, day))
-}
-
-fn parse_time_hms(value: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = value.split(':');
-    let hour = parts.next()?.parse::<u32>().ok()?;
-    let minute = parts.next()?.parse::<u32>().ok()?;
-    let second = parts.next()?.parse::<u32>().ok()?;
-    if parts.next().is_some() || hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    Some((hour, minute, second))
-}
-
-fn parse_timezone_offset_seconds(value: &str) -> Option<i64> {
-    let bytes = value.as_bytes();
-    if bytes.len() != 5
-        || !matches!(bytes.first(), Some(b'+' | b'-'))
-        || !bytes[1..].iter().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    let hours = value[1..3].parse::<i64>().ok()?;
-    let minutes = value[3..5].parse::<i64>().ok()?;
-    if hours > 23 || minutes > 59 {
-        return None;
-    }
-    let offset = hours * 3_600 + minutes * 60;
-    if bytes[0] == b'-' {
-        Some(-offset)
-    } else {
-        Some(offset)
-    }
-}
-
-fn days_in_month(year: i64, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(year) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
-fn is_leap_year(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
-}
-
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let month = i64::from(month);
-    let day = i64::from(day);
-    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
 }
 
 fn invalid_date_format<T>(value: &str) -> Result<T> {

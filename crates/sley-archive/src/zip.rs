@@ -485,15 +485,15 @@ mod tests {
     use super::*;
 
     fn read_u16(data: &[u8], offset: usize) -> u16 {
-        u16::from_le_bytes(data[offset..offset + 2].try_into().expect("u16 bytes"))
+        sley_core::primitives::get_u16_le(data, offset).expect("test data bounds")
     }
 
     fn read_u32(data: &[u8], offset: usize) -> u32 {
-        u32::from_le_bytes(data[offset..offset + 4].try_into().expect("u32 bytes"))
+        sley_core::primitives::get_u32_le(data, offset).expect("test data bounds")
     }
 
     fn read_u64(data: &[u8], offset: usize) -> u64 {
-        u64::from_le_bytes(data[offset..offset + 8].try_into().expect("u64 bytes"))
+        sley_core::primitives::get_u64_le(data, offset).expect("test data bounds")
     }
 
     #[test]

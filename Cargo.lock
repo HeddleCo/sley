@@ -1635,6 +1635,7 @@ name = "sley-i18n"
 version = "0.7.0"
 dependencies = [
  "encoding_rs",
+ "sley-core",
 ]
 
 [[package]]
@@ -1872,6 +1873,7 @@ dependencies = [
  "sley-config",
  "sley-core",
  "sley-diff-merge",
+ "sley-formats",
  "sley-index",
  "sley-mmap",
  "sley-object",

@@ -9,6 +9,7 @@ license.workspace = true
 
 [dependencies]
 sley-core.workspace = true
+sley-pathspec.workspace = true
 
 [lints]
 workspace = true

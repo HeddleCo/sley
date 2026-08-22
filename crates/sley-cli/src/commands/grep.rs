@@ -1321,10 +1321,17 @@ impl NoIndexIgnore {
         let path = String::from_utf8_lossy(display);
         let basename = path.rsplit('/').next().unwrap_or(&path);
         self.patterns.iter().any(|pattern| {
+            // Canonical wildmatch (WM_PATHNAME: `*` stops at `/`, classes
+            // and `**` supported — the prior hand-rolled matcher silently
+            // failed bracket classes).
             if pattern.contains('/') {
-                wildcard_match(pattern.as_bytes(), path.as_bytes())
+                sley_pathspec::wildmatch(
+                    pattern.as_bytes(),
+                    path.as_bytes(),
+                    sley_pathspec::WM_PATHNAME,
+                )
             } else {
-                wildcard_match(pattern.as_bytes(), basename.as_bytes())
+                sley_pathspec::wildmatch(pattern.as_bytes(), basename.as_bytes(), 0)
             }
         })
     }
@@ -1411,20 +1418,6 @@ fn push_no_index_file(
         match_path,
     });
     Ok(())
-}
-
-fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
-    fn inner(pattern: &[u8], text: &[u8]) -> bool {
-        match pattern.split_first() {
-            None => text.is_empty(),
-            Some((&b'*', rest)) => {
-                inner(rest, text) || (!text.is_empty() && inner(pattern, &text[1..]))
-            }
-            Some((&b'?', rest)) => !text.is_empty() && inner(rest, &text[1..]),
-            Some((&p, rest)) => text.first() == Some(&p) && inner(rest, &text[1..]),
-        }
-    }
-    inner(pattern, text)
 }
 
 // ---------------------------------------------------------------------------
@@ -2696,27 +2689,11 @@ fn buffer_is_binary(content: &[u8]) -> bool {
 }
 
 fn path_to_bytes(path: &Path) -> Vec<u8> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes().to_vec()
-    }
-    #[cfg(not(unix))]
-    {
-        path.to_string_lossy().replace('\\', "/").into_bytes()
-    }
+    sley::plumbing::sley_core::paths::path_to_bytes(path)
 }
 
 fn bytes_to_path(bytes: &[u8]) -> PathBuf {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
-    }
-    #[cfg(not(unix))]
-    {
-        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
-    }
+    sley::plumbing::sley_core::paths::bytes_to_os_path(bytes)
 }
 
 // ---------------------------------------------------------------------------
