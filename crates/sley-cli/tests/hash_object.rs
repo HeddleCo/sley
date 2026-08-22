@@ -626,8 +626,15 @@ fn hash_object_stdin_paths_preserves_non_utf8_names() {
         );
         fs::write(root.join(".gitattributes"), b"*.txt text eol=lf\n").expect("write attributes");
         let name = b"non-utf8-\xff.txt";
-        fs::write(root.join(OsString::from_vec(name.to_vec())), b"line\r\n")
-            .expect("write non-utf8 path");
+        let non_utf8_path = root.join(OsString::from_vec(name.to_vec()));
+        if fs::write(&non_utf8_path, b"line\r\n").is_err() {
+            // Some filesystems (e.g. macOS APFS) reject non-UTF-8 file names
+            // outright ("Illegal byte sequence"), so the fixture cannot exist
+            // there. The parity scenario still runs on byte-transparent
+            // filesystems such as Linux ext4.
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
         let mut stdin = name.to_vec();
         stdin.push(b'\n');
 

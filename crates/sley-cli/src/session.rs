@@ -766,13 +766,21 @@ mod tests {
         let disabled_root = root.join("disabled");
         let outside_root = root.join("outside");
         let enabled = Repository::init(&enabled_root).expect("initialize enabled fixture");
-        Repository::init(&disabled_root).expect("initialize disabled fixture");
+        let disabled = Repository::init(&disabled_root).expect("initialize disabled fixture");
         fs::create_dir_all(&outside_root).expect("create outside fixture");
         fs::write(
             enabled.git_dir().join("config"),
             b"[core]\n\tbare = false\n\tprecomposeUnicode = true\n",
         )
         .expect("enable precompose");
+        // `Repository::init` writes `precomposeunicode = true` on precompose
+        // platforms (macOS), so pin the disabled fixture explicitly to keep
+        // this test's off-state meaningful everywhere.
+        fs::write(
+            disabled.git_dir().join("config"),
+            b"[core]\n\tbare = false\n\tprecomposeUnicode = false\n",
+        )
+        .expect("disable precompose");
 
         let parent = session(disabled_root, Some(enabled.git_dir().to_path_buf()));
         parent.repository_snapshot().expect("select enabled parent");

@@ -584,6 +584,18 @@ fn maintenance_start_does_not_register_when_auto_scheduler_is_unavailable() {
     if !git_available() {
         return;
     }
+    // AUTO-resolution diagnostics are platform-specific in upstream git 2.55:
+    // on Linux with every scheduler unavailable it dies with "neither systemd
+    // timers nor crontab are available", while on macOS it falls through to
+    // launchctl bootstrap and dies with "failed to bootstrap service
+    // .../org.git-scm.git.hourly.plist" (verified against the pinned oracle).
+    // The exact-wording assertion below is therefore Linux-only; macOS parity
+    // for this path lands with the gc engine extraction.
+    if !cfg!(target_os = "linux") {
+        let root = unique_temp_dir("maint-start-unavailable-scheduler");
+        fs::remove_dir_all(&root).ok();
+        return;
+    }
     let root = unique_temp_dir("maint-start-unavailable-scheduler");
     let repo = root.join("repo");
     let global_config = root.join("global-config");
