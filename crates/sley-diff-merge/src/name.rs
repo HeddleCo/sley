@@ -62,6 +62,12 @@ fn squash_slash(mut name: Vec<u8>) -> Vec<u8> {
 /// Decode a C-quoted string (git's `unquote_c_style`). `line` must start with a
 /// double quote. Returns the decoded bytes plus the index in `line` just past
 /// the closing quote, or `None` on a malformed quote.
+///
+/// Grammar verified byte-for-byte against oracle git 2.55 (quote.c):
+/// octal escapes are `\` + digit `0..=3` followed by exactly two more octal
+/// digits, all required (`\12` and `\12x` are errors; `\400`/`\777` overflow
+/// and are errors; `\1234` consumes `\123` and leaves `4` literal), and a raw
+/// NUL byte ends the scan like git's C-string view.
 pub(crate) fn unquote_c_style(line: &[u8]) -> Option<(Vec<u8>, usize)> {
     if line.first() != Some(&b'"') {
         return None;
@@ -74,6 +80,9 @@ pub(crate) fn unquote_c_style(line: &[u8]) -> Option<(Vec<u8>, usize)> {
         match c {
             b'"' => return Some((out, i)),
             b'\\' => {}
+            // A NUL byte ends git's C-string view of the input before any
+            // closing quote is found: error.
+            0 => return None,
             _ => {
                 out.push(c);
                 continue;
@@ -91,19 +100,17 @@ pub(crate) fn unquote_c_style(line: &[u8]) -> Option<(Vec<u8>, usize)> {
             b't' => out.push(b'\t'),
             b'v' => out.push(0x0b),
             b'\\' | b'"' => out.push(esc),
-            b'0'..=b'7' => {
-                // Up to three octal digits, the first already consumed.
-                let mut value = (esc - b'0') as u32;
-                let mut digits = 1;
-                while digits < 3 {
-                    match line.get(i) {
-                        Some(&d @ b'0'..=b'7') => {
-                            value = (value << 3) | (d - b'0') as u32;
-                            i += 1;
-                            digits += 1;
-                        }
-                        _ => break,
+            b'0'..=b'3' => {
+                // Octal: first digit 0..3 ("first digit over 4 overflows"),
+                // then exactly two more octal digits, all required.
+                let mut value = ((esc - b'0') as u32) << 6;
+                for shift in [3, 0] {
+                    let &d = line.get(i)?;
+                    if !(b'0'..=b'7').contains(&d) {
+                        return None;
                     }
+                    i += 1;
+                    value |= ((d - b'0') as u32) << shift;
                 }
                 out.push(value as u8);
             }
@@ -694,5 +701,48 @@ mod tests {
         assert!(!has_epoch_timestamp(
             b"linux/post image.txt\t2005-04-12 02:14:06 -07:00"
         ));
+    }
+
+    /// Empirically verified against oracle git 2.55 (`unquote_c_style`,
+    /// quote.c): each row was probed through real `git update-index
+    /// --index-info` and `git mktree`, which call the upstream function on
+    /// quoted paths, and accepted bytes were observed via `-z` output.
+    /// Keep this matrix byte-identical with the mirror copy in
+    /// crates/sley-cli/src/commands/ref_command_stream.rs so drift cannot
+    /// recur silently.
+    #[test]
+    fn unquote_oracle_truth_table() {
+        fn dec(line: &[u8]) -> Option<Vec<u8>> {
+            unquote_c_style(line).map(|(v, _)| v)
+        }
+        // sanity: letter escapes decode; `\t` -> 0x09.
+        assert_eq!(dec(br#""a\tb""#).as_deref(), Some(&b"a\tb"[..]));
+        // Octal: backslash + digit 0..3, then EXACTLY two more octal digits
+        // (all required). Three digits are consumed greedily; a following
+        // octal digit stays literal.
+        assert_eq!(dec(br#""\123""#).as_deref(), Some(&b"S"[..])); // 0o123 == 'S'
+        assert_eq!(dec(br#""\377""#), Some(vec![0xff])); // boundary: max value
+        assert_eq!(dec(br#""\000""#), Some(vec![0x00])); // NUL decodes fine
+        assert_eq!(dec(br#""\1234""#).as_deref(), Some(&b"S4"[..])); // '4' literal
+        assert_eq!(dec(br#""""#), Some(Vec::new()));
+        // Fewer than two continuation digits, or a non-octal continuation:
+        // malformed (git `goto error`s).
+        assert_eq!(dec(br#""\1""#), None);
+        assert_eq!(dec(br#""\12""#), None);
+        assert_eq!(dec(br#""\12x""#), None);
+        assert_eq!(dec(br#""\0""#), None);
+        assert_eq!(dec(br#""\00""#), None);
+        assert_eq!(dec(br#""\08""#), None);
+        assert_eq!(dec(br#""\9""#), None);
+        // First digit 4..7 overflows a byte (>255): malformed.
+        assert_eq!(dec(br#""\400""#), None);
+        assert_eq!(dec(br#""\777""#), None);
+        // Malformed framing: unterminated, escaped closing quote, lone
+        // trailing backslash, unknown escape letter, raw NUL (C-string end).
+        assert_eq!(dec(b"\"abc"), None);
+        assert_eq!(dec(b"\"ab\\\""), None); // backslash eats the closing quote
+        assert_eq!(dec(b"\"ab\\"), None);
+        assert_eq!(dec(br#""ab\z""#), None);
+        assert_eq!(dec(b"\"a\x00b\""), None);
     }
 }

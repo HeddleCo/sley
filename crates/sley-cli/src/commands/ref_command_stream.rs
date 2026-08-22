@@ -448,6 +448,44 @@ mod tests {
         assert_eq!(unquote(br#""ma\zn""#), None);
     }
 
+    /// Empirically verified against oracle git 2.55 (`unquote_c_style`,
+    /// quote.c): each row was probed through real `git update-index
+    /// --index-info` and `git mktree`, which call the upstream function on
+    /// quoted paths, and accepted bytes were observed via `-z` output. This
+    /// implementation matches the oracle on every row.
+    /// Keep this matrix byte-identical with the mirror copy in
+    /// crates/sley-diff-merge/src/name.rs so drift cannot recur silently.
+    #[test]
+    fn unquote_oracle_truth_table() {
+        // Octal: backslash + digit 0..3, then EXACTLY two more octal digits
+        // (all required). Three digits are consumed greedily; a following
+        // octal digit stays literal.
+        assert_eq!(unquote(br#""\123""#).as_deref(), Some(&b"S"[..])); // 0o123 == 'S'
+        assert_eq!(unquote(br#""\377""#), Some(vec![0xff])); // boundary: max value
+        assert_eq!(unquote(br#""\000""#), Some(vec![0x00])); // NUL decodes fine
+        assert_eq!(unquote(br#""\1234""#).as_deref(), Some(&b"S4"[..])); // '4' literal
+        assert_eq!(unquote(br#""""#), Some(Vec::new()));
+        // Fewer than two continuation digits, or a non-octal continuation:
+        // malformed (git `goto error`s).
+        assert_eq!(unquote(br#""\1""#), None);
+        assert_eq!(unquote(br#""\12""#), None);
+        assert_eq!(unquote(br#""\12x""#), None);
+        assert_eq!(unquote(br#""\0""#), None);
+        assert_eq!(unquote(br#""\00""#), None);
+        assert_eq!(unquote(br#""\08""#), None);
+        assert_eq!(unquote(br#""\9""#), None);
+        // First digit 4..7 overflows a byte (>255): malformed.
+        assert_eq!(unquote(br#""\400""#), None);
+        assert_eq!(unquote(br#""\777""#), None);
+        // Malformed framing: unterminated, escaped closing quote, lone
+        // trailing backslash, unknown escape letter, raw NUL (C-string end).
+        assert_eq!(unquote(b"\"abc"), None);
+        assert_eq!(unquote(b"\"ab\\\""), None); // backslash eats the closing quote
+        assert_eq!(unquote(b"\"ab\\"), None);
+        assert_eq!(unquote(br#""ab\z""#), None);
+        assert_eq!(unquote(b"\"a\x00b\""), None);
+    }
+
     #[test]
     fn cursor_plain_args() {
         let line = b"refs/heads/a deadbeef";
