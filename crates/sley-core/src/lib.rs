@@ -27,6 +27,11 @@ pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.55.0";
 pub const MAX_SYMREF_DEPTH: usize = 5;
 
 pub mod precompose;
+pub mod date;
+pub mod fsync;
+pub mod paths;
+pub mod primitives;
+pub mod text;
 pub use precompose::{
     activate_precompose_unicode, has_non_ascii, precompose_argv_if_needed,
     precompose_bytes_if_needed, precompose_os_str_bytes_if_needed,
