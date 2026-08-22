@@ -2,11 +2,9 @@
 
 use sley::{GitError, ObjectFormat, Result};
 
-use crate::log_cli::{
-    log_days_from_civil, log_parse_date_ymd, log_parse_time_hms, log_parse_timezone_offset_seconds,
-};
 use crate::sley_refs::{FileRefStore, branch_ref_name};
 use crate::sley_rev;
+use crate::sley_core::date;
 
 pub(crate) fn parse_reflog_expire_time(value: &str, option: &str) -> Result<i64> {
     // git's `parse_expiry_date`: "never"/"false" never expire; "all"/"now" expire
@@ -34,12 +32,12 @@ pub(crate) fn parse_reflog_expire_date(value: &str) -> Option<i64> {
     let first = parts.next()?;
     if let Some(timestamp) = first.strip_prefix('@') {
         let timezone = parts.next()?;
-        if parts.next().is_some() || log_parse_timezone_offset_seconds(timezone).is_none() {
+        if parts.next().is_some() || date::parse_tz_offset(timezone).is_none() {
             return None;
         }
         return timestamp.parse::<i64>().ok();
     }
-    let (date, time) = if let Some((date, time)) = first.split_once('T') {
+    let (date_str, time) = if let Some((date, time)) = first.split_once('T') {
         (date, time)
     } else {
         (first, parts.next()?)
@@ -48,11 +46,11 @@ pub(crate) fn parse_reflog_expire_date(value: &str) -> Option<i64> {
     if parts.next().is_some() {
         return None;
     }
-    let (year, month, day) = log_parse_date_ymd(date)?;
-    let (hour, minute, second) = log_parse_time_hms(time)?;
-    let timezone_offset = log_parse_timezone_offset_seconds(timezone)?;
+    let (year, month, day) = date::parse_date_ymd(date_str)?;
+    let (hour, minute, second) = date::parse_time_hms(time)?;
+    let timezone_offset = date::parse_tz_offset(timezone)?;
     Some(
-        log_days_from_civil(year, month, day)
+        date::days_from_civil(year, month, day)
             .saturating_mul(86_400)
             .saturating_add(i64::from(hour * 3_600 + minute * 60 + second))
             .saturating_sub(timezone_offset),

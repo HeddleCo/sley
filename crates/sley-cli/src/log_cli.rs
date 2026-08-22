@@ -42,7 +42,7 @@ pub(crate) fn log_parse_date_cutoff(value: &str) -> Result<i64> {
         let Some(timezone) = parts.next() else {
             return log_invalid_date_format(value);
         };
-        if parts.next().is_some() || log_parse_timezone_offset_seconds(timezone).is_none() {
+        if parts.next().is_some() || sley_core::date::parse_tz_offset(timezone).is_none() {
             return log_invalid_date_format(value);
         }
         return timestamp.parse::<i64>().map_err(|_| {
@@ -54,7 +54,7 @@ pub(crate) fn log_parse_date_cutoff(value: &str) -> Result<i64> {
     // ISO 8601 form (e.g. `1970-01-01T00:00:01Z` or `...01+0000`), in which case
     // there is no separate whitespace-delimited timezone token to consume.
     let (date, time, embedded_tz) = if let Some((date, rest)) = first.split_once('T') {
-        let (time, tz) = log_split_embedded_timezone(rest);
+        let (time, tz) = sley_core::date::split_embedded_timezone(rest);
         (date, time, tz)
     } else {
         let Some(time) = parts.next() else {
@@ -65,118 +65,24 @@ pub(crate) fn log_parse_date_cutoff(value: &str) -> Result<i64> {
     let timezone = match embedded_tz {
         Some(tz) => tz,
         None => match parts.next() {
-            Some(tz) => tz.to_string(),
+            Some(tz) => tz,
             None => return log_invalid_date_format(value),
         },
     };
     if parts.next().is_some() {
         return log_invalid_date_format(value);
     }
-    let Some((year, month, day)) = log_parse_date_ymd(date) else {
+    let Some((year, month, day)) = sley_core::date::parse_date_ymd(date) else {
         return log_invalid_date_format(value);
     };
-    let Some((hour, minute, second)) = log_parse_time_hms(time) else {
+    let Some((hour, minute, second)) = sley_core::date::parse_time_hms(time) else {
         return log_invalid_date_format(value);
     };
-    let Some(timezone_offset) = log_parse_timezone_offset_seconds(&timezone) else {
+    let Some(timezone_offset) = sley_core::date::parse_tz_offset(timezone) else {
         return log_invalid_date_format(value);
     };
-    let days = log_days_from_civil(year, month, day);
+    let days = sley_core::date::days_from_civil(year, month, day);
     Ok(days * 86_400 + i64::from(hour * 3_600 + minute * 60 + second) - timezone_offset)
-}
-
-/// Split an ISO 8601 time portion (the part after `T`) into the bare time and an
-/// optional embedded timezone. Recognises a trailing `Z` (UTC, normalised to
-/// `+0000`) and a trailing `±HHMM` offset; otherwise the whole string is the time
-/// and the timezone (if any) is supplied separately.
-fn log_split_embedded_timezone(rest: &str) -> (&str, Option<String>) {
-    if let Some(time) = rest.strip_suffix('Z') {
-        return (time, Some("+0000".to_string()));
-    }
-    let bytes = rest.as_bytes();
-    if bytes.len() >= 5 {
-        let tz_start = bytes.len() - 5;
-        if matches!(bytes[tz_start], b'+' | b'-')
-            && bytes[tz_start + 1..]
-                .iter()
-                .all(|byte| byte.is_ascii_digit())
-        {
-            return (&rest[..tz_start], Some(rest[tz_start..].to_string()));
-        }
-    }
-    (rest, None)
-}
-
-pub(crate) fn log_parse_date_ymd(value: &str) -> Option<(i64, u32, u32)> {
-    let mut parts = value.split('-');
-    let year = parts.next()?.parse::<i64>().ok()?;
-    let month = parts.next()?.parse::<u32>().ok()?;
-    let day = parts.next()?.parse::<u32>().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&month) {
-        return None;
-    }
-    let max_day = log_days_in_month(year, month);
-    if !(1..=max_day).contains(&day) {
-        return None;
-    }
-    Some((year, month, day))
-}
-
-pub(crate) fn log_parse_time_hms(value: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = value.split(':');
-    let hour = parts.next()?.parse::<u32>().ok()?;
-    let minute = parts.next()?.parse::<u32>().ok()?;
-    let second = parts.next()?.parse::<u32>().ok()?;
-    if parts.next().is_some() || hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    Some((hour, minute, second))
-}
-
-pub(crate) fn log_parse_timezone_offset_seconds(value: &str) -> Option<i64> {
-    let bytes = value.as_bytes();
-    if bytes.len() != 5
-        || !matches!(bytes.first(), Some(b'+' | b'-'))
-        || !bytes[1..].iter().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    let hours = value[1..3].parse::<i64>().ok()?;
-    let minutes = value[3..5].parse::<i64>().ok()?;
-    if hours > 23 || minutes > 59 {
-        return None;
-    }
-    let offset = hours * 3_600 + minutes * 60;
-    if bytes[0] == b'-' {
-        Some(-offset)
-    } else {
-        Some(offset)
-    }
-}
-
-fn log_days_in_month(year: i64, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if log_is_leap_year(year) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
-fn log_is_leap_year(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
-}
-
-pub(crate) fn log_days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let month = i64::from(month);
-    let day = i64::from(day);
-    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
 }
 
 fn log_invalid_date_format<T>(value: &str) -> Result<T> {
@@ -477,6 +383,31 @@ pub(crate) fn commit_identity_mailmapped(
     format!("{name} <{email}>")
 }
 
+/// A minimal BRE-subset matcher used by rev-list/shortlog/stash header/message
+/// filters.
+///
+/// Deliberately NOT flipped onto `sley_grep::Regex` (phase-2 evaluation,
+/// oracle-probed against git 2.55): neither engine is observationally
+/// identical to oracle across the probe matrix, so the swap was rejected per
+/// the no-divergence gate. Deltas found (all pre-existing):
+///
+/// - This engine treats a bare `*` (`abc*`) as a literal byte where oracle's
+///   BRE quantifies; same for `\+`/`\?`, `\{n,m\}`, and `[[:alpha:]]` classes.
+///   `sley_grep::Regex` handles those correctly, so a flip would *fix* them —
+///   but only after the remaining deltas below are closed, since the gate
+///   requires provable equivalence, not partial improvement.
+/// - Both engines fail `--grep='pat$'` when the match lands at the end of a
+///   commit message: the whole message buffer (with its trailing newline) is
+///   matched as one haystack while git's `grep_buffer` splits lines
+///   (REG_NEWLINE). `git grep` is unaffected because its caller line-splits.
+/// - Neither engine rejects a trailing backslash (`--author='abc\'`); oracle
+///   dies with `fatal: header, 'abc\': trailing backslash (\)`.
+/// - In extended mode, unmatched-group wording differs from oracle
+///   (`Invalid regular expression` vs `parentheses not balanced`).
+///
+/// Matching behavior for supported constructs (`^`/`$` anchors, `.`/`.*`,
+/// `[a-z]` classes with ranges/negation, `\|` alternation, fixed mode, ASCII
+/// case folding) is oracle-identical, as are balanced-bracket diagnostics.
 #[derive(Debug)]
 pub(crate) struct SimpleLogRegex {
     alternatives: Vec<SimpleLogRegexAlternative>,

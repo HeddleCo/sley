@@ -833,22 +833,8 @@ fn short_date_from_ident(ident: &[u8]) -> Option<String> {
 
 fn short_date_from_timestamp(timestamp: i64) -> Option<String> {
     let days = timestamp.div_euclid(86_400);
-    let (year, month, day) = civil_from_days_for_short_date(days)?;
+    let (year, month, day) = sley_core::date::civil_from_days(days);
     Some(format!("{year:04}-{month:02}-{day:02}"))
-}
-
-fn civil_from_days_for_short_date(days: i64) -> Option<(i64, u32, u32)> {
-    let z = days.checked_add(719_468)?;
-    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096).div_euclid(365);
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2).div_euclid(153);
-    let day = doy - (153 * mp + 2).div_euclid(5) + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    let year = y + i64::from(month <= 2);
-    Some((year, u32::try_from(month).ok()?, u32::try_from(day).ok()?))
 }
 
 /// Resolve a `git describe` name (`<ref>-<count>-g<hex>`) back to the commit it
@@ -1470,7 +1456,18 @@ fn timestamp_from_reflog_parts(
     second: i64,
     offset: i64,
 ) -> Option<i64> {
-    Some(days_from_civil(year, month, day)? * 86_400 + hour * 3_600 + minute * 60 + second - offset)
+    // The old local `days_from_civil` returned `None` for out-of-range months
+    // and days; keep that validation before the canonical infallible math.
+    if !(1..=12).contains(&month) || day == 0 || day > sley_core::date::days_in_month(year, month) {
+        return None;
+    }
+    Some(
+        sley_core::date::days_from_civil(year, month, day) * 86_400
+            + hour * 3_600
+            + minute * 60
+            + second
+            - offset,
+    )
 }
 
 fn parse_reflog_month(value: &str) -> Option<u32> {
@@ -1507,34 +1504,6 @@ fn parse_reflog_timezone(value: &str) -> Option<i64> {
     } else {
         Some(seconds)
     }
-}
-
-fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
-    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
-        return None;
-    }
-    let year = year - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let yoe = year - era * 400;
-    let month = i64::from(month);
-    let day = i64::from(day);
-    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146_097 + doe - 719_468)
-}
-
-fn days_in_month(year: i64, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(year) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
-fn is_leap_year(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
 /// Human-facing name for a reflog target in error messages (HEAD, or the branch

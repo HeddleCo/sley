@@ -1819,7 +1819,7 @@ fn parse_rfc2822_date(value: &str) -> Option<String> {
     let (hour, minute, second) = parse_clock(tokens[3])?;
     let timezone = parse_timezone(tokens[4])?;
 
-    let days = days_from_civil(year, month, day as i64);
+    let days = sley_core::date::days_from_civil(year, month, day);
     let local_seconds = days * 86_400 + (hour as i64) * 3600 + (minute as i64) * 60 + second as i64;
     let seconds = local_seconds - timezone.1;
     Some(format!("{seconds} {}", timezone.0))
@@ -1848,7 +1848,7 @@ fn parse_git_default_date(value: &str) -> Option<String> {
         .and_then(|token| parse_timezone(token))
         .unwrap_or_else(|| ("+0000".to_string(), 0));
 
-    let days = days_from_civil(year, month, day as i64);
+    let days = sley_core::date::days_from_civil(year, month, day);
     let local_seconds = days * 86_400 + (hour as i64) * 3600 + (minute as i64) * 60 + second as i64;
     let seconds = local_seconds - timezone.1;
     Some(format!("{seconds} {}", timezone.0))
@@ -1904,20 +1904,14 @@ fn parse_clock(token: &str) -> Option<(u32, u32, u32)> {
 }
 
 /// Parse a timezone token (`+0200`, `-0500`, or a named zone) into its
-/// canonical `±HHMM` string plus offset in seconds east of UTC.
+/// canonical `±HHMM` string plus offset in seconds east of UTC. Numeric tokens
+/// go through the canonical bounded parser (core::date::parse_tz_offset, the
+/// bounds of git's date.c match_tz); a handful of named zones from old mail
+/// (mostly UTC-equivalents) are handled here.
 fn parse_timezone(token: &str) -> Option<(String, i64)> {
-    let bytes = token.as_bytes();
-    if bytes.len() == 5
-        && matches!(bytes[0], b'+' | b'-')
-        && bytes[1..].iter().all(u8::is_ascii_digit)
-    {
-        let sign = if bytes[0] == b'+' { 1 } else { -1 };
-        let hours: i64 = token[1..3].parse().ok()?;
-        let minutes: i64 = token[3..5].parse().ok()?;
-        let offset = sign * (hours * 3600 + minutes * 60);
+    if let Some(offset) = sley_core::date::parse_tz_offset(token) {
         return Some((token.to_string(), offset));
     }
-    // A handful of named zones from old mail (mostly UTC-equivalents).
     let offset = match token {
         "UT" | "GMT" | "UTC" | "Z" => 0,
         "EST" => -5 * 3600,
@@ -1941,18 +1935,6 @@ fn format_offset(offset: i64) -> String {
         magnitude / 3600,
         (magnitude % 3600) / 60
     )
-}
-
-/// Days from 1970-01-01 to the given civil date (Howard Hinnant's algorithm).
-/// Valid for the full proleptic Gregorian range; matches git's date arithmetic.
-fn days_from_civil(year: i64, month: u32, day: i64) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let month = month as i64;
-    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
 }
 
 // ===========================================================================

@@ -275,7 +275,7 @@ mod tests {
         assert!(temp.exists(), "keep() must not delete the file");
 
         // Double-create is rejected with AlreadyExists.
-        let err = LockFile::create(temp.clone()).expect_err("exclusive create");
+        let err = LockFile::create(temp).expect_err("exclusive create");
         assert_eq!(err.io_kind(), Some(std::io::ErrorKind::AlreadyExists));
         fs::remove_dir_all(dir).expect("cleanup");
     }
