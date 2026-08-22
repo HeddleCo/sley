@@ -244,7 +244,10 @@ fn writer_failure_stops_enumeration() {
         &mut writer,
     )
     .expect_err("writer failure must fail the pack");
-    assert!(matches!(err, GitError::Io(_)), "got {err:?}");
+    assert!(
+        matches!(err, GitError::Io(_) | GitError::IoKind { .. }),
+        "got {err:?}"
+    );
     assert!(
         pulled.get() < 8,
         "writer failure must stop id enumeration, pulled {}",

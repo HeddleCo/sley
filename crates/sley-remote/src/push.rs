@@ -2980,21 +2980,18 @@ pub fn read_receive_pack_push_report_with_progress(
     }
 }
 
-/// Map sideband `Read` failures back to the [`GitError`] variants the buffered
-/// demux path used, so push report diagnostics stay parity-stable.
+/// Map sideband `Read` failures back to their typed [`GitError`] payloads.
+///
+/// The streaming demux carries errors as `GitError` payloads across the io
+/// boundary, so recovery is a downcast rather than substring matching.
 fn map_push_sideband_stream_io_error(err: std::io::Error) -> GitError {
-    let message = err.to_string();
-    if message.contains("sideband fatal:")
-        || message.contains("sideband stream")
-        || message.contains("side-band")
-        || message.contains("pkt-line")
-    {
-        GitError::InvalidFormat(message)
-    } else if sley_core::is_cancelled_io(&err) {
-        GitError::Cancelled
-    } else {
-        GitError::from(err)
+    if sley_core::is_cancelled_io(&err) {
+        return GitError::Cancelled;
     }
+    if let Some(inner) = err.get_ref().and_then(|inner| inner.downcast_ref::<GitError>()) {
+        return inner.clone();
+    }
+    GitError::from(err)
 }
 
 /// Fold a receive-pack report onto the per-ref [`PushStatusReport::refs`] entries.

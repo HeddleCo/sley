@@ -1,6 +1,5 @@
 use sley_core::{
     CancelFlag, CancellableRead, GitError, MissingObjectContext, ObjectFormat, ObjectId, Result,
-    is_cancelled_error,
 };
 use sley_formats::{Bundle, BundleReference};
 use sley_object::{EncodedObject, ObjectType};
@@ -356,13 +355,15 @@ pub trait RawPackInstaller {
 
 /// Map cancel-flavored install failures (from [`CancellableRead`] I/O or pack
 /// indexing checks) onto [`GitError::Cancelled`].
+///
+/// Cancellation is detected structurally via [`GitError::is_cancelled`]
+/// (explicit variant, cancel-payload intercept, or Interrupted kind) — no
+/// message-text sniffing.
 fn map_install_cancel_error(err: GitError) -> GitError {
-    if is_cancelled_error(&err) {
-        return GitError::Cancelled;
-    }
-    match err {
-        GitError::Io(ref msg) if msg.contains("cancelled") => GitError::Cancelled,
-        other => other,
+    if err.is_cancelled() {
+        GitError::Cancelled
+    } else {
+        err
     }
 }
 

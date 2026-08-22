@@ -2257,6 +2257,11 @@ fn curl_request_trace(method: &str, url: &str, headers: &[(&str, &str)], chunked
 
 #[cfg(feature = "http-client")]
 fn curl_trace_sink() -> Option<Box<dyn Write>> {
+    if !curl_trace_enabled() {
+        return None;
+    }
+    // Destination resolution happens only on the enabled path; the enabled
+    // probe itself is cached for the process lifetime (see `curl_trace_enabled`).
     let value = std::env::var("GIT_TRACE_CURL").ok()?;
     match value.to_ascii_lowercase().as_str() {
         "" | "0" | "false" => None,
@@ -2269,6 +2274,28 @@ fn curl_trace_sink() -> Option<Box<dyn Write>> {
             .map(|file| Box::new(file) as Box<dyn Write>),
         _ => None,
     }
+}
+
+/// Whether `GIT_TRACE_CURL` names a usable trace destination.
+///
+/// Probed once and cached for the process lifetime (`OnceLock`) so the
+/// per-request hot path does not re-read the environment; matches git's own
+/// process-lifetime trace setup semantics. Mirrors `get_trace_fd`: disabled by
+/// unset/empty/`0`/`false`, stderr for `1`/`2`/`true`, an append-mode file for
+/// absolute paths, anything else unusable.
+#[cfg(feature = "http-client")]
+fn curl_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let Ok(value) = std::env::var("GIT_TRACE_CURL") else {
+            return false;
+        };
+        match value.to_ascii_lowercase().as_str() {
+            "" | "0" | "false" => false,
+            "1" | "2" | "true" => true,
+            _ => std::path::Path::new(&value).is_absolute(),
+        }
+    })
 }
 
 /// Map a genuine ureq transport/protocol failure to a [`GitError`], always

@@ -1302,9 +1302,7 @@ pub fn parse_protocol_v2_fetch_sideband_all_response(
                     SideBandChannel::Progress => progress.push(packet.data),
                     SideBandChannel::Fatal => {
                         let message = String::from_utf8_lossy(&packet.data).into_owned();
-                        return Err(GitError::InvalidFormat(format!(
-                            "sideband fatal: {message}"
-                        )));
+                        return Err(GitError::SidebandFatal(message));
                     }
                 }
             }

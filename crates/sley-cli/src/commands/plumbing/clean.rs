@@ -395,7 +395,7 @@ fn clean_directory_is_nested_repository(absolute: &Path) -> Result<bool> {
         match read_gitdir_file(&dot_git) {
             Ok(Some(git_dir)) => return Ok(git_dir.exists()),
             Ok(None) => return Ok(false),
-            Err(GitError::Io(_)) => return Ok(true),
+            Err(GitError::Io(_) | GitError::IoKind { .. }) => return Ok(true),
             Err(err) => return Err(err),
         }
     }

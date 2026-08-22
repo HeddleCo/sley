@@ -264,9 +264,12 @@ pub fn map_cancel_io(err: io::Error) -> GitError {
 }
 
 /// True when `err` is a cooperative cancellation.
+///
+/// Delegates to [`GitError::is_cancelled`], which uniformly covers the
+/// explicit `Cancelled` variant and cancel-flavored I/O errors.
 #[inline]
 pub fn is_cancelled_error(err: &GitError) -> bool {
-    matches!(err, GitError::Cancelled)
+    err.is_cancelled()
 }
 
 /// Kill an OS child if cancel was requested (best-effort preemptive wake).

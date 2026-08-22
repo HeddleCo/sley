@@ -79,15 +79,24 @@ fn packet_trace_sink() -> Option<Box<dyn Write>> {
     }
 }
 
-/// Whether packet tracing is enabled (cheap env probe for the hot-path guard).
+/// Whether packet tracing is enabled (cheap probe for the hot-path guard).
+///
+/// The `GIT_TRACE_PACKET` value is probed once and cached for the process
+/// lifetime (`OnceLock`): this runs per pkt-line frame, and re-reading the
+/// environment each frame dominated traces with lock contention. Tracing
+/// configuration is therefore read at first use — matching git's own
+/// process-lifetime trace setup semantics.
 fn packet_trace_enabled() -> bool {
-    match std::env::var("GIT_TRACE_PACKET") {
-        Ok(value) => {
-            let lower = value.to_ascii_lowercase();
-            !matches!(lower.as_str(), "" | "0" | "false")
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        match std::env::var("GIT_TRACE_PACKET") {
+            Ok(value) => {
+                let lower = value.to_ascii_lowercase();
+                !matches!(lower.as_str(), "" | "0" | "false")
+            }
+            Err(_) => false,
         }
-        Err(_) => false,
-    }
+    })
 }
 
 /// Emit one packet-trace line for `data` (one pkt-line's framing token or

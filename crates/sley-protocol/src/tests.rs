@@ -1,6 +1,6 @@
 use super::*;
 use crate::receive_pack::zero_object_id;
-use sley_core::{Capability, ObjectFormat, ObjectId};
+use sley_core::{Capability, GitError, ObjectFormat, ObjectId};
 use std::io::{Read, Write};
 
 #[test]
@@ -1261,6 +1261,29 @@ fn streaming_sideband_reader_surfaces_fatal_channel() {
         "unexpected error: {err}"
     );
     assert_eq!(data, b"PA");
+}
+
+/// The fatal channel must carry a typed [`GitError::SidebandFatal`] payload so
+/// recovery classifies by variant instead of substring matching.
+#[test]
+fn streaming_sideband_reader_fatal_carries_typed_payload() {
+    let packets = vec![SideBandPacket {
+        channel: SideBandChannel::Fatal,
+        data: b"remote died".to_vec(),
+    }];
+    let mut encoded = Vec::new();
+    write_sideband_stream(&mut encoded, &packets).expect("test operation should succeed");
+
+    let mut reader = StreamingSidebandReader::new(encoded.as_slice(), |_: &[u8]| {});
+    let mut data = Vec::new();
+    let err = reader
+        .read_to_end(&mut data)
+        .expect_err("fatal sideband should fail");
+    let inner = err
+        .get_ref()
+        .and_then(|payload| payload.downcast_ref::<GitError>())
+        .expect("fatal io error should carry a GitError payload");
+    assert_eq!(*inner, GitError::SidebandFatal("remote died".to_string()));
 }
 
 #[test]

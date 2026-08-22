@@ -16,7 +16,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::install::{
-    ProgressInstaller, install_protocol_v2_packfile_from_reader_with_cancel,
+    ProgressInstaller, emit_remote_sideband_progress,
+    install_protocol_v2_packfile_from_reader_with_cancel,
     install_upload_pack_packfile_promisor_response_from_reader_with_cancel,
     install_upload_pack_packfile_response_from_reader_with_cancel,
     install_upload_pack_shallow_packfile_promisor_response_from_reader_with_cancel,
@@ -977,14 +978,19 @@ pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
                 &local_db,
                 request.max_input_size,
                 cancel,
+                Some(&mut |chunk: &[u8]| {
+                    emit_remote_sideband_progress(&mut *progress, chunk)
+                }),
             )?;
         } else {
+            let installer = ProgressInstaller::new(&local_db, progress);
             install_upload_pack_packfile_response_from_reader_with_cancel(
                 request.format,
                 &mut response.body,
-                &ProgressInstaller::new(&local_db, progress),
+                &installer,
                 request.max_input_size,
                 cancel,
+                Some(&mut installer.remote_sideband_forwarder()),
             )?;
         }
         return Ok(Vec::new());
@@ -1007,16 +1013,21 @@ pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
                 &local_db,
                 request.max_input_size,
                 cancel,
+                Some(&mut |chunk: &[u8]| {
+                    emit_remote_sideband_progress(&mut *progress, chunk)
+                }),
             )?;
         shallow_info
     } else {
+        let installer = ProgressInstaller::new(&local_db, progress);
         let (shallow_info, _) =
             install_upload_pack_shallow_packfile_response_from_reader_with_cancel(
                 request.format,
                 &mut response.body,
-                &ProgressInstaller::new(&local_db, progress),
+                &installer,
                 request.max_input_size,
                 cancel,
+                Some(&mut installer.remote_sideband_forwarder()),
             )?;
         shallow_info
     };
@@ -1193,14 +1204,19 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs<C: HttpClien
             true,
             max_input_size,
             cancel,
+            Some(&mut |chunk: &[u8]| {
+                emit_remote_sideband_progress(&mut *progress, chunk)
+            }),
         )?;
     } else {
+        let installer = ProgressInstaller::new(&local_db, progress);
         install_protocol_v2_packfile_from_reader_with_cancel(
             pack_body,
-            &ProgressInstaller::new(&local_db, progress),
+            &installer,
             false,
             max_input_size,
             cancel,
+            Some(&mut installer.remote_sideband_forwarder()),
         )?;
     }
     install_protocol_v2_packfile_uris(

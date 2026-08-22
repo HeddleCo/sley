@@ -2187,6 +2187,7 @@ pub(crate) fn install_fetch_pack_via_local_protocol_v2(
         &destination_db,
         input.max_input_size,
         cancel,
+        None,
     )?;
     let mut outcome = LocalProtocolV2FetchOutcome::default();
     for section in header.sections {

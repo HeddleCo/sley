@@ -5106,7 +5106,16 @@ pub(crate) fn cmd_pack_refs(
             return Ok(());
         }
         store.compact_reftable_stack().map_err(|err| {
-            if matches!(err, GitError::Io(ref message) if message.contains("File exists")) {
+            let locked = match &err {
+                GitError::Io(message) => message.contains("File exists"),
+                // Structured create errors surface lock contention by kind.
+                GitError::IoKind {
+                    kind: std::io::ErrorKind::AlreadyExists,
+                    ..
+                } => true,
+                _ => false,
+            };
+            if locked {
                 eprintln!("error: unable to compact stack: data is locked");
                 GitError::Exit(1)
             } else if matches!(err, GitError::InvalidFormat(ref message) if message == "entry too large") {

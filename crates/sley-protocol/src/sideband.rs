@@ -210,9 +210,7 @@ pub fn demux_sideband_packets(packets: &[SideBandPacket]) -> Result<SideBandDemu
             SideBandChannel::Progress => out.progress.push(packet.data.clone()),
             SideBandChannel::Fatal => {
                 let message = String::from_utf8_lossy(&packet.data).into_owned();
-                return Err(GitError::InvalidFormat(format!(
-                    "sideband fatal: {message}"
-                )));
+                return Err(GitError::SidebandFatal(message));
             }
         }
     }
@@ -378,9 +376,11 @@ impl<R: Read, F: FnMut(&[u8])> Read for StreamingSidebandReader<R, F> {
             let frame = match read_pkt_line_frame(&mut self.reader) {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
+                    // Typed payload so recovery classifies by variant; the
+                    // `UnexpectedEof` kind is preserved for kind-based checks.
                     let err = io::Error::new(
                         ErrorKind::UnexpectedEof,
-                        "sideband stream ended before flush",
+                        GitError::InvalidFormat("sideband stream ended before flush".into()),
                     );
                     if written > 0 {
                         self.pending_error = Some(err);
@@ -429,9 +429,12 @@ impl<R: Read, F: FnMut(&[u8])> Read for StreamingSidebandReader<R, F> {
                         }
                         SideBandChannel::Fatal => {
                             let message = String::from_utf8_lossy(&packet.data).into_owned();
+                            // Typed marker payload: recovery matches
+                            // `GitError::SidebandFatal` instead of sniffing
+                            // the rendered message.
                             let err = io::Error::new(
                                 ErrorKind::InvalidData,
-                                format!("sideband fatal: {message}"),
+                                GitError::SidebandFatal(message),
                             );
                             if written > 0 {
                                 self.pending_error = Some(err);
@@ -448,7 +451,9 @@ impl<R: Read, F: FnMut(&[u8])> Read for StreamingSidebandReader<R, F> {
                 PktLineFrame::Delimiter | PktLineFrame::ResponseEnd => {
                     let err = io::Error::new(
                         ErrorKind::InvalidData,
-                        "sideband stream contains a non-flush control packet",
+                        GitError::InvalidFormat(
+                            "sideband stream contains a non-flush control packet".into(),
+                        ),
                     );
                     if written > 0 {
                         self.pending_error = Some(err);
@@ -482,17 +487,18 @@ fn is_upload_pack_ack_or_nak_payload(payload: &[u8]) -> bool {
     trim_trailing_lf(payload) == b"NAK" || payload.starts_with(b"ACK ")
 }
 
+/// Convert a [`GitError`] from the pkt-line layer into the `io::Error` shape
+/// `StreamingSidebandReader` surfaces.
+///
+/// Cancellation is detected via [`GitError::is_cancelled`] and re-wrapped with
+/// its payload marker so downstream downcasts keep working. Every other error
+/// is carried as a typed payload, preserving its variant across the io
+/// boundary (no substring recovery needed on the other side).
 fn sideband_git_error_to_io(err: GitError) -> io::Error {
-    match err {
-        GitError::Io(message) => {
-            if message.contains("cancelled") {
-                sley_core::cancelled_io_error()
-            } else {
-                io::Error::other(message)
-            }
-        }
-        GitError::Cancelled => sley_core::cancelled_io_error(),
-        other => io::Error::new(ErrorKind::InvalidData, other.to_string()),
+    if err.is_cancelled() {
+        sley_core::cancelled_io_error()
+    } else {
+        io::Error::new(ErrorKind::InvalidData, err)
     }
 }
 

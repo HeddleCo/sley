@@ -21,6 +21,11 @@ pub use cancel::{
 
 pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.55.0";
 
+/// Maximum symbolic-ref hops git follows while resolving one ref
+/// (`refs.c` `SYMREF_MAXDEPTH`). Oracle 2.55 resolves a chain of four symrefs
+/// plus a final direct ref and reports a dangling/looped ref at five hops.
+pub const MAX_SYMREF_DEPTH: usize = 5;
+
 pub mod precompose;
 pub use precompose::{
     activate_precompose_unicode, has_non_ascii, precompose_argv_if_needed,
@@ -1783,6 +1788,23 @@ impl fmt::Display for ResourceLimitKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitError {
     Io(String),
+    /// An I/O failure that preserves the [`std::io::ErrorKind`] of the
+    /// underlying [`std::io::Error`].
+    ///
+    /// Produced by `From<std::io::Error>` so downstream code can branch on
+    /// [`GitError::io_kind`] instead of sniffing rendered message text. The
+    /// legacy [`GitError::Io`](Self::Io) variant remains for hand-built
+    /// messages and compatibility this cycle.
+    IoKind {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+    /// A sideband channel-3 (fatal) message from a pack protocol response.
+    ///
+    /// Typed marker produced where sideband demuxing surfaces remote aborts,
+    /// so recovery paths classify them by variant rather than substring-
+    /// matching `"sideband fatal:"` in rendered messages.
+    SidebandFatal(String),
     InvalidObjectId(String),
     InvalidObject(String),
     InvalidFormat(String),
@@ -1823,6 +1845,10 @@ impl fmt::Display for GitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(msg) => write!(f, "io error: {msg}"),
+            // Message text already carries the OS detail (`value.to_string()`
+            // of the source error); keep the rendering identical to `Io`.
+            Self::IoKind { kind: _, message } => write!(f, "io error: {message}"),
+            Self::SidebandFatal(message) => write!(f, "sideband fatal: {message}"),
             Self::InvalidObjectId(msg) => write!(f, "invalid object id: {msg}"),
             Self::InvalidObject(msg) => write!(f, "invalid object: {msg}"),
             Self::InvalidFormat(msg) => write!(f, "invalid format: {msg}"),
@@ -1937,11 +1963,61 @@ impl GitError {
             attempted,
         }
     }
+
+    /// The preserved I/O [`std::io::ErrorKind`], when this error originated
+    /// from (or was constructed with) an I/O error kind.
+    ///
+    /// `None` for non-I/O variants and for the legacy string-only
+    /// [`GitError::Io`](Self::Io) form, whose kind was erased at construction.
+    pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            Self::IoKind { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// Whether this error represents cooperative cancellation.
+    ///
+    /// Uniformly covers:
+    /// - the explicit [`GitError::Cancelled`] variant (raised directly by
+    ///   `CancelFlag`, or via the `OperationCancelled` payload intercept in
+    ///   `From<std::io::Error>`), and
+    /// - structured I/O errors of kind
+    ///   [`Interrupted`](std::io::ErrorKind::Interrupted) — the EINTR-style
+    ///   wake-up the cancel machinery produces when a blocked read is
+    ///   interrupted after retries are exhausted, and
+    /// - legacy string-form errors carrying "cancelled" text.
+    pub fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Cancelled => true,
+            Self::Io(message) => message.contains("cancelled"),
+            Self::IoKind { kind, message } => {
+                matches!(kind, std::io::ErrorKind::Interrupted)
+                    || message.contains("cancelled")
+            }
+            _ => false,
+        }
+    }
 }
 
 impl From<std::io::Error> for GitError {
     fn from(value: std::io::Error) -> Self {
-        Self::Io(value.to_string())
+        // Cooperative cancel round-trips through its payload marker here so
+        // the rest of the pipeline sees `Cancelled` instead of a stringly
+        // I/O error (previously recovered by sniffing "cancelled" text).
+        if is_cancelled_io(&value) {
+            return Self::Cancelled;
+        }
+        // Typed payloads installed across io boundaries (e.g. sideband demux
+        // surfacing `SidebandFatal`/`InvalidFormat` as `io::Error`) survive
+        // this conversion unchanged.
+        if let Some(inner) = value.get_ref().and_then(|err| err.downcast_ref::<GitError>()) {
+            return inner.clone();
+        }
+        Self::IoKind {
+            kind: value.kind(),
+            message: value.to_string(),
+        }
     }
 }
 
@@ -2407,6 +2483,56 @@ impl Sha256Hasher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn io_error_conversion_preserves_kind_and_message() {
+        let err = GitError::from(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "sealed away",
+        ));
+        assert_eq!(err.io_kind(), Some(ErrorKind::PermissionDenied));
+        assert!(!err.is_cancelled());
+        // Display parity with the legacy string form.
+        assert_eq!(err.to_string(), "io error: sealed away");
+    }
+
+    #[test]
+    fn cancel_payload_round_trips_to_cancelled_variant() {
+        let err = GitError::from(cancelled_io_error());
+        assert_eq!(err, GitError::Cancelled);
+        assert!(err.is_cancelled());
+        assert!(is_cancelled_error(&err));
+    }
+
+    #[test]
+    fn is_cancelled_covers_structured_and_legacy_shapes() {
+        assert!(GitError::Cancelled.is_cancelled());
+        let interrupted =
+            GitError::from(std::io::Error::new(ErrorKind::Interrupted, "wake-up"));
+        assert!(interrupted.is_cancelled(), "Interrupted kind is cancel-flavored");
+        assert!(GitError::Io("operation cancelled".into()).is_cancelled());
+        assert!(!GitError::from(std::io::Error::other("disk full")).is_cancelled());
+        assert_eq!(
+            GitError::from(std::io::Error::other("disk full")).io_kind(),
+            Some(ErrorKind::Other)
+        );
+    }
+
+    #[test]
+    fn sideband_fatal_displays_wire_text() {
+        let err = GitError::SidebandFatal("remote died".into());
+        assert_eq!(err.to_string(), "sideband fatal: remote died");
+    }
+
+    #[test]
+    fn typed_git_error_payload_survives_io_boundary() {
+        let wrapped = std::io::Error::new(
+            ErrorKind::InvalidData,
+            GitError::SidebandFatal("boom".into()),
+        );
+        assert_eq!(GitError::from(wrapped), GitError::SidebandFatal("boom".into()));
+    }
 
     #[test]
     fn sha1_blob_matches_git_known_value() {

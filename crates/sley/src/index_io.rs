@@ -236,6 +236,7 @@ impl IndexError {
             | GitError::InvalidPath(message) => Self::InvalidIndex(message),
             GitError::Unsupported(message) => Self::Unsupported(message),
             GitError::Io(message) => Self::Io(std::io::Error::other(message)),
+            GitError::IoKind { kind, message } => Self::Io(std::io::Error::new(kind, message)),
             other => Self::InvalidIndex(other.to_string()),
         }
     }
@@ -253,6 +254,7 @@ impl IndexWriteError {
             | GitError::InvalidPath(message) => Self::InvalidIndex(message),
             GitError::Unsupported(message) => Self::Unsupported(message),
             GitError::Io(message) => Self::Io(std::io::Error::other(message)),
+            GitError::IoKind { kind, message } => Self::Io(std::io::Error::new(kind, message)),
             other => Self::InvalidIndex(other.to_string()),
         }
     }

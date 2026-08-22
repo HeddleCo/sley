@@ -8,6 +8,7 @@ use sley_odb::{
     RawPackInstaller,
 };
 use std::cell::RefCell;
+use std::io::IsTerminal;
 
 use crate::{ProgressSink, TransferProgress};
 
@@ -33,6 +34,15 @@ impl<'a, I> ProgressInstaller<'a, I> {
         Self {
             inner,
             sink: RefCell::new(sink),
+        }
+    }
+
+    /// A sideband channel-2 chunk forwarder multiplexing this installer's
+    /// sink through its interior [`RefCell`], so remote progress lines and
+    /// pack-install transfer counters share the one exclusive borrow.
+    pub(crate) fn remote_sideband_forwarder(&self) -> impl FnMut(&[u8]) + '_ {
+        move |chunk: &[u8]| {
+            emit_remote_sideband_progress(&mut **self.sink.borrow_mut(), chunk);
         }
     }
 }
@@ -93,6 +103,12 @@ pub(crate) fn transfer_from_pack(progress: PackInstallProgress) -> TransferProgr
         indexed_deltas: 0,
     }
 }
+
+/// A sideband channel-2 chunk forwarder, invoked per progress frame with the
+/// raw remote bytes. Built from a [`ProgressSink`] via
+/// [`emit_remote_sideband_progress`] or
+/// [`ProgressInstaller::remote_sideband_forwarder`].
+pub(crate) type RemoteSidebandForward<'a> = &'a mut dyn FnMut(&[u8]);
 use sley_protocol::{
     ProtocolV2FetchResponseHeader, ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo,
     StreamingSidebandReader, read_protocol_v2_fetch_response_header,
@@ -166,6 +182,7 @@ where
         destination,
         max_input_size,
         CancelFlag::never(),
+        None,
     )
 }
 
@@ -176,6 +193,7 @@ pub fn install_upload_pack_packfile_promisor_response_from_reader_with_cancel<R>
     destination: &FileObjectDatabase,
     max_input_size: Option<u64>,
     cancel: CancelFlag<'_>,
+    remote_progress: Option<RemoteSidebandForward<'_>>,
 ) -> Result<RawPackInstallResult>
 where
     R: Read,
@@ -187,6 +205,7 @@ where
         true,
         max_input_size,
         cancel,
+        remote_progress,
     )
 }
 
@@ -208,6 +227,7 @@ where
         promisor,
         max_input_size,
         CancelFlag::never(),
+        None,
     )
 }
 
@@ -224,6 +244,7 @@ pub fn install_upload_pack_packfile_response_from_reader_with_cancel<I, R>(
     destination: &I,
     max_input_size: Option<u64>,
     cancel: CancelFlag<'_>,
+    remote_progress: Option<RemoteSidebandForward<'_>>,
 ) -> Result<RawPackInstallResult>
 where
     I: RawPackInstaller,
@@ -236,6 +257,7 @@ where
         false,
         max_input_size,
         cancel,
+        remote_progress,
     )
 }
 
@@ -261,13 +283,29 @@ where
     )
 }
 
-fn install_upload_pack_sideband_response_from_reader_with_cancel<I, R>(
+/// Forward one sideband channel-2 chunk to the fetch progress sink using
+/// git's stderr prefix rules (`sideband.c`): each line gets the `remote: `
+/// display prefix, plus the 8-space dumb-terminal suffix when stderr is not a
+/// terminal (parity with the CLI's push hook rendering).
+pub(crate) fn emit_remote_sideband_progress(sink: &mut dyn ProgressSink, chunk: &[u8]) {
+    const DUMB_SUFFIX: &str = "        ";
+    let suffix = if std::io::stderr().is_terminal() {
+        ""
+    } else {
+        DUMB_SUFFIX
+    };
+    let text = String::from_utf8_lossy(chunk);
+    for line in text.lines() {
+        sink.diagnostic(&format!("remote: {line}{suffix}"));
+    }
+}fn install_upload_pack_sideband_response_from_reader_with_cancel<I, R>(
     _format: ObjectFormat,
     reader: &mut R,
     destination: &I,
     promisor: bool,
     max_input_size: Option<u64>,
     cancel: CancelFlag<'_>,
+    mut remote_progress: Option<RemoteSidebandForward<'_>>,
 ) -> Result<RawPackInstallResult>
 where
     I: RawPackInstaller,
@@ -276,15 +314,21 @@ where
     // Stream demux sideband channel-1 bytes as frames arrive so pack install
     // can cancel mid-transfer without buffering the full response. Leading
     // ACK/NAK pkt-lines are skipped to match read_upload_pack_packfile_response
-    // semantics. Channel-2 progress is ignored here; ProgressInstaller reports
-    // receipt/index counters from the installer instead.
+    // semantics. Channel-2 progress lines are forwarded to the fetch progress
+    // sink with git's `remote:` prefix; ProgressInstaller reports receipt/index
+    // counters from the installer instead.
     //
     // Parity with the old buffer-then-install path:
     // - after channel-1 pack receipt completes, the wire may still carry
     //   trailing progress frames + flush — drain them;
-    // - sideband fatal/protocol errors surface as InvalidFormat (not bare Io).
-    let mut pack_reader =
-        StreamingSidebandReader::new(reader, |_: &[u8]| {}).skip_upload_pack_acks();
+    // - sideband fatal/protocol errors surface as typed payloads
+    //   (`GitError::SidebandFatal` / `InvalidFormat`), not bare Io.
+    let mut pack_reader = StreamingSidebandReader::new(reader, move |chunk: &[u8]| {
+        if let Some(forward) = remote_progress.as_mut() {
+            forward(chunk);
+        }
+    })
+    .skip_upload_pack_acks();
     let result = destination.install_raw_pack_from_reader_with_progress_and_cancel(
         &mut pack_reader,
         raw_pack_install_options(promisor, max_input_size),
@@ -310,35 +354,33 @@ where
     })
 }
 
-/// Map sideband `Read` failures back to the GitError variants the buffered
-/// demux path used, so fetch/clone diagnostics stay parity-stable.
+/// Map sideband `Read` failures back to their typed [`GitError`] payloads.
+///
+/// [`StreamingSidebandReader`](sley_protocol::StreamingSidebandReader) carries
+/// its errors as `GitError` payloads across the io boundary, so recovery is a
+/// downcast — no substring matching. Cancel keeps its dedicated payload
+/// marker; anything else from the transport falls through to the structured
+/// `IoKind` conversion.
 fn map_sideband_stream_io_error(err: std::io::Error) -> sley_core::GitError {
     if sley_core::is_cancelled_io(&err) {
         return sley_core::GitError::Cancelled;
     }
-    let message = err.to_string();
-    if message.contains("sideband fatal:")
-        || message.contains("sideband stream")
-        || message.contains("side-band")
-        || message.contains("pkt-line")
-    {
-        // demux_sideband_packets / parse_sideband used InvalidFormat for these.
-        sley_core::GitError::InvalidFormat(message)
-    } else {
-        sley_core::GitError::from(err)
+    if let Some(inner) = err.get_ref().and_then(|inner| inner.downcast_ref::<sley_core::GitError>()) {
+        return inner.clone();
     }
+    sley_core::GitError::from(err)
 }
 
+/// Normalize install-loop failures for fetch/clone diagnostics.
+///
+/// The streaming reader's typed payloads (`SidebandFatal`, `InvalidFormat`)
+/// survive the install loop's error conversion, so sideband aborts already
+/// arrive classified; only cancellation needs folding onto `Cancelled`.
 fn map_sideband_install_error(err: sley_core::GitError) -> sley_core::GitError {
-    match err {
-        sley_core::GitError::Io(message)
-            if message.contains("sideband fatal:")
-                || message.contains("sideband stream")
-                || message.contains("side-band") =>
-        {
-            sley_core::GitError::InvalidFormat(message)
-        }
-        other => other,
+    if err.is_cancelled() {
+        sley_core::GitError::Cancelled
+    } else {
+        err
     }
 }
 
@@ -444,6 +486,7 @@ where
         destination,
         max_input_size,
         CancelFlag::never(),
+        None,
     )
 }
 
@@ -454,6 +497,7 @@ pub fn install_upload_pack_shallow_packfile_response_from_reader_with_cancel<I, 
     destination: &I,
     max_input_size: Option<u64>,
     cancel: CancelFlag<'_>,
+    remote_progress: Option<RemoteSidebandForward<'_>>,
 ) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
 where
     I: RawPackInstaller,
@@ -466,6 +510,7 @@ where
         false,
         max_input_size,
         cancel,
+        remote_progress,
     )
 }
 
@@ -476,6 +521,7 @@ fn install_upload_pack_shallow_sideband_response_from_reader_with_cancel<I, R>(
     promisor: bool,
     max_input_size: Option<u64>,
     cancel: CancelFlag<'_>,
+    remote_progress: Option<RemoteSidebandForward<'_>>,
 ) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
 where
     I: RawPackInstaller,
@@ -489,6 +535,7 @@ where
         promisor,
         max_input_size,
         cancel,
+        remote_progress,
     )?;
     Ok((shallow, result))
 }
@@ -554,6 +601,7 @@ where
         destination,
         max_input_size,
         CancelFlag::never(),
+        None,
     )
 }
 
@@ -564,6 +612,7 @@ pub fn install_upload_pack_shallow_packfile_promisor_response_from_reader_with_c
     destination: &FileObjectDatabase,
     max_input_size: Option<u64>,
     cancel: CancelFlag<'_>,
+    remote_progress: Option<RemoteSidebandForward<'_>>,
 ) -> Result<(Vec<ProtocolV2FetchShallowInfo>, RawPackInstallResult)>
 where
     R: Read,
@@ -575,6 +624,7 @@ where
         true,
         max_input_size,
         cancel,
+        remote_progress,
     )
 }
 
@@ -596,6 +646,7 @@ where
         destination,
         max_input_size,
         CancelFlag::never(),
+        None,
     )
 }
 
@@ -612,6 +663,7 @@ pub fn install_protocol_v2_fetch_response_from_reader_with_cancel<I, R>(
     destination: &I,
     max_input_size: Option<u64>,
     cancel: CancelFlag<'_>,
+    remote_progress: Option<RemoteSidebandForward<'_>>,
 ) -> Result<(ProtocolV2FetchResponseHeader, Option<RawPackInstallResult>)>
 where
     I: RawPackInstaller,
@@ -627,6 +679,7 @@ where
         false,
         max_input_size,
         cancel,
+        remote_progress,
     )?;
     Ok((header, Some(result)))
 }
@@ -648,6 +701,7 @@ where
         destination,
         max_input_size,
         CancelFlag::never(),
+        None,
     )
 }
 
@@ -659,6 +713,7 @@ pub fn install_protocol_v2_fetch_promisor_response_from_reader_with_cancel<R>(
     destination: &FileObjectDatabase,
     max_input_size: Option<u64>,
     cancel: CancelFlag<'_>,
+    remote_progress: Option<RemoteSidebandForward<'_>>,
 ) -> Result<(ProtocolV2FetchResponseHeader, Option<RawPackInstallResult>)>
 where
     R: Read,
@@ -673,6 +728,7 @@ where
         true,
         max_input_size,
         cancel,
+        remote_progress,
     )?;
     Ok((header, Some(result)))
 }
@@ -687,12 +743,17 @@ pub(crate) fn install_protocol_v2_packfile_from_reader_with_cancel<I, R>(
     promisor: bool,
     max_input_size: Option<u64>,
     cancel: CancelFlag<'_>,
+    mut remote_progress: Option<RemoteSidebandForward<'_>>,
 ) -> Result<RawPackInstallResult>
 where
     I: RawPackInstaller,
     R: Read,
 {
-    let mut pack_reader = StreamingSidebandReader::new(reader, |_: &[u8]| {});
+    let mut pack_reader = StreamingSidebandReader::new(reader, move |chunk: &[u8]| {
+        if let Some(forward) = remote_progress.as_mut() {
+            forward(chunk);
+        }
+    });
     let result = destination.install_raw_pack_from_reader_with_progress_and_cancel(
         &mut pack_reader,
         raw_pack_install_options(promisor, max_input_size),
@@ -829,6 +890,63 @@ mod tests {
 
         assert_eq!(result.object_ids, vec![oid]);
         assert_pack_install(&root.join("objects"), &destination, &oid, &object);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Records `diagnostic` lines so tests can observe remote progress
+    /// forwarding without a terminal.
+    #[derive(Default)]
+    struct RecordingDiagnostics {
+        messages: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl crate::ProgressSink for RecordingDiagnostics {
+        fn diagnostic(&mut self, message: &str) {
+            self.messages.borrow_mut().push(message.to_string());
+        }
+    }
+
+    /// Sideband channel-2 frames must reach the fetch progress sink with git's
+    /// `remote:` display prefix (plus the dumb-terminal suffix when stderr is
+    /// not a terminal, as in the test harness).
+    #[test]
+    fn sideband_upload_pack_response_forwards_channel2_progress_to_sink() {
+        let root = test_temp_root("sley-remote-install-sideband-progress-forwarding");
+        let format = ObjectFormat::Sha1;
+        let object =
+            EncodedObject::new(ObjectType::Blob, b"sideband progress forwarding\n".to_vec());
+        let oid = object
+            .object_id(format)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format)
+            .expect("test operation should succeed");
+        let encoded = encode_sideband_upload_pack_pack(&pack.pack, 32);
+        let destination = FileObjectDatabase::new(root.join("objects"), format);
+        let mut reader = encoded.as_slice();
+
+        let mut progress = RecordingDiagnostics::default();
+        let result = {
+            let installer = ProgressInstaller::new(&destination, &mut progress);
+            install_upload_pack_packfile_response_from_reader_with_cancel(
+                format,
+                &mut reader,
+                &installer,
+                None,
+                CancelFlag::never(),
+                Some(&mut installer.remote_sideband_forwarder()),
+            )
+            .expect("test operation should succeed")
+        };
+
+        assert_eq!(result.object_ids, vec![oid]);
+        assert_pack_install(&root.join("objects"), &destination, &oid, &object);
+        let messages = progress.messages.borrow();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.starts_with("remote: counting objects")),
+            "channel-2 lines must reach the sink with the remote: prefix, got {messages:?}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1110,6 +1228,7 @@ mod tests {
                 &installer,
                 None,
                 CancelFlag::new(&source),
+                None,
             )
             .expect_err("mid-stream cancel should fail")
         };

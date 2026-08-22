@@ -11,7 +11,8 @@ use std::path::Path;
 use sley_config::GitConfig;
 
 use crate::install::{
-    ProgressInstaller, install_protocol_v2_fetch_promisor_response_from_reader_with_cancel,
+    ProgressInstaller, emit_remote_sideband_progress,
+    install_protocol_v2_fetch_promisor_response_from_reader_with_cancel,
     install_protocol_v2_fetch_response_from_reader_with_cancel,
     install_upload_pack_raw_promisor_response_from_reader_with_cancel,
     install_upload_pack_raw_response_from_reader_with_cancel,
@@ -674,15 +675,20 @@ fn git_protocol_v2_fetch_into_repository(
             local_db,
             request.max_input_size,
             cancel,
+            Some(&mut |chunk: &[u8]| {
+                emit_remote_sideband_progress(&mut *progress, chunk)
+            }),
         )?
     } else {
+        let installer = ProgressInstaller::new(local_db, progress);
         install_protocol_v2_fetch_response_from_reader_with_cancel(
             request.format,
             &mut stream,
             v2_features.sideband_all,
-            &ProgressInstaller::new(local_db, progress),
+            &installer,
             request.max_input_size,
             cancel,
+            Some(&mut installer.remote_sideband_forwarder()),
         )?
     };
     Ok(shallow_info_from_protocol_v2_fetch_header(&header))
