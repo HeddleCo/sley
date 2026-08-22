@@ -512,7 +512,10 @@ impl Repository {
         }
     }
 
-    fn default_reflog_committer(&self) -> Result<Vec<u8>> {
+    /// The reflog committer ident sley synthesizes when a caller does not
+    /// supply one: `user.name`/`user.email` from repo config (or `GIT_COMMITTER_*`),
+    /// falling back to a stable placeholder.
+    pub(crate) fn default_reflog_committer(&self) -> Result<Vec<u8>> {
         let config = self.config().ok();
         let name = env::var("GIT_COMMITTER_NAME")
             .ok()

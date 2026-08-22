@@ -57,11 +57,13 @@ mod config_edit;
 mod diff;
 pub mod hooks;
 mod index_io;
+mod local_clone;
 mod notes_repo;
 mod objects;
 mod open_env;
 mod pack_plan;
 mod refs;
+mod refspec;
 mod remote_edit;
 mod rev_graph;
 mod status_plan;
@@ -182,6 +184,7 @@ pub use hooks::{
     run_post_index_change_hook, run_reference_transaction_hook_at, run_traditional_hook_at,
 };
 pub use index_io::{IndexError, IndexWriteError, IndexWriteOptions, IndexWriteResult};
+pub use local_clone::{LocalCloneOptions, LocalCloneSummary, clone_local_to_bare};
 pub use objects::{BlobFetchOptions, BlobStore, LoadedObject};
 pub use pack_plan::{
     PreparedReachablePack, PreparedReachablePackFile, ReachablePackPlan, ReachablePackPlanBuilder,
@@ -191,6 +194,7 @@ pub use refs::{
     DeleteRef, HeadUpdateOptions, RefBatchChange, RefChange, RefChangeResult, RefConflict,
     RefDeleteExpected, RefUpdateOptions, ReflogMessage,
 };
+pub use refspec::{NegativeRefSpec, RefSpec};
 pub use rev_graph::{ReachableCommit, ReachableCommitOptions, RevGraph};
 pub use status_plan::{
     OwnedStatusRow, StatusCacheKey, StatusCode, StatusPlan, StatusPlanBuilder, StatusRow,
