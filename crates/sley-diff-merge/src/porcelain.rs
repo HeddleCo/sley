@@ -11,6 +11,7 @@ use crate::render::{
 };
 use crate::{DiffAlgorithm, NameStatus, NameStatusEntry, WsIgnore};
 use sley_core::{ObjectFormat, ObjectId};
+use sley_formats::{quoted_path, write_quoted_path as write_c_quoted_path};
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
@@ -1107,33 +1108,18 @@ fn compact_summary(entry: &NameStatusEntry) -> Option<&'static str> {
 }
 
 fn quote_path(path: &[u8], quote_path_fully: bool) -> String {
-    let needs_quotes = path.iter().any(|&byte| {
-        byte == b'"'
-            || byte == b'\\'
-            || byte == b'\n'
-            || byte == b'\t'
-            || byte < 0x20
-            || byte == 0x7f
-            || (quote_path_fully && byte >= 0x80)
-    });
-    if !needs_quotes {
-        return String::from_utf8_lossy(path).into_owned();
-    }
-    let mut output = Vec::with_capacity(path.len() + 2);
-    output.push(b'"');
-    for &byte in path {
-        match byte {
-            b'"' => output.extend_from_slice(b"\\\""),
-            b'\\' => output.extend_from_slice(b"\\\\"),
-            b'\n' => output.extend_from_slice(b"\\n"),
-            b'\t' => output.extend_from_slice(b"\\t"),
-            0x20..=0x7e => output.push(byte),
-            0x80..=0xff if !quote_path_fully => output.push(byte),
-            _ => output.extend_from_slice(format!("\\{byte:03o}").as_bytes()),
-        }
-    }
-    output.push(b'"');
-    String::from_utf8_lossy(&output).into_owned()
+    quoted_path(path, false, quote_path_fully)
+}
+
+/// Write `path` with Git's C-style porcelain quoting (`core.quotePath`
+/// semantics; no space quoting, matching the diff dialect). The single
+/// escape-loop implementation lives in `sley-formats::path_quote`.
+pub fn write_quoted_path(
+    writer: &mut dyn io::Write,
+    path: &[u8],
+    quote_path_fully: bool,
+) -> io::Result<()> {
+    write_c_quoted_path(writer, path, false, quote_path_fully)
 }
 
 fn color_inserted(value: &str, color: bool) -> String {

@@ -87,7 +87,6 @@ mod session_globals;
 mod setup;
 mod status_format;
 mod trace2_cli;
-mod tree_print;
 
 pub(crate) use sley::plumbing::sley_rev::revlist::*;
 pub(crate) use sley::plumbing::{
@@ -200,7 +199,9 @@ pub(crate) use commit_message::*;
 pub(crate) use revision::*;
 pub(crate) use session_globals::*;
 pub(crate) use status_format::*;
-pub(crate) use tree_print::*;
+// Tree printing moved to `sley-formats::tree_print`; the glob keeps the
+// historical unqualified names available across command modules.
+pub(crate) use sley::plumbing::sley_formats::tree_print::*;
 
 pub(crate) use cli_misc::{
     AddAction, add_path_matches, check_ignore_tracked_paths, count_objects_human_bytes,

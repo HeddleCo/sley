@@ -1578,6 +1578,7 @@ name = "sley-config"
 version = "0.7.0"
 dependencies = [
  "sley-core",
+ "sley-pathspec",
 ]
 
 [[package]]
@@ -1610,6 +1611,7 @@ dependencies = [
  "flate2",
  "sley-config",
  "sley-core",
+ "sley-object",
 ]
 
 [[package]]

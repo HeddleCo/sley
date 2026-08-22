@@ -711,7 +711,7 @@ impl ObjectQuery<'_> {
         };
         if object.object_type == ObjectType::Tree {
             print_tree(
-                None,
+                None::<&FileObjectDatabase>,
                 self.view.format(),
                 &object.body,
                 TreePrintOptions {
