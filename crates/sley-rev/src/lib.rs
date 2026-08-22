@@ -582,6 +582,116 @@ impl<'a, R: ObjectReader> RevisionResolver<'a, R> {
     }
 }
 
+/// Destination for git's ambiguous-refname diagnostic.
+///
+/// A revision spelling that names both a ref and a short object-id prefix is
+/// resolved ref-first, but git prints `warning: refname '<rev>' is ambiguous.`
+/// unless `core.warnAmbiguousRefs` disables it. The sink receives the bare
+/// refname; [`AmbiguousRefnameWarning::Stderr`] renders the exact upstream
+/// wording, while [`AmbiguousRefnameWarning::Custom`] lets embedders route the
+/// diagnostic elsewhere without re-implementing the trigger conditions.
+#[derive(Clone, Copy)]
+pub enum AmbiguousRefnameWarning<'s> {
+    /// Default command behavior: print git's warning to stderr when the
+    /// `core.warnAmbiguousRefs` policy allows it.
+    Stderr,
+    /// Route each warned refname through a caller sink. The policy gate still
+    /// applies, so suppressed warnings never reach the closure.
+    Custom(&'s dyn Fn(&str)),
+}
+
+/// Whether ambiguous-refname warnings are enabled for a repository.
+///
+/// Mirrors git's `core.warnAmbiguousRefs` (default true), read through the same
+/// effective-config reader every other library lookup uses so `include.path`
+/// and command-line `-c` overrides participate identically.
+pub fn ambiguous_refname_warnings_enabled(git_dir: &Path) -> bool {
+    let parameters_env = sley_config::effective_config_parameters_env();
+    sley_config::read_repo_config(git_dir, parameters_env.as_deref())
+        .map(|config| {
+            config
+                .get_bool("core", None, "warnAmbiguousRefs")
+                .unwrap_or(true)
+        })
+        .unwrap_or(true)
+}
+
+/// Emit git's ambiguous-refname warning for `rev`, honouring
+/// `core.warnAmbiguousRefs`.
+///
+/// The warning fires only when `rev` is a short object-id spelling that also
+/// names an existing ref *and* matches at least one stored object — exactly
+/// git's "ref wins over a same-spelled prefix, but say so" case. Callers that
+/// already hold an object database pass it via `objects` to avoid re-opening
+/// one on hot paths; `None` opens a plain database scoped to this call.
+pub fn warn_ambiguous_refname_with_sink(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+    objects: Option<&FileObjectDatabase>,
+    sink: AmbiguousRefnameWarning<'_>,
+) {
+    if rev.len() < 4
+        || rev.len() > format.hex_len()
+        || !rev.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !revision_ref_name_exists(git_dir, format, rev)
+    {
+        return;
+    }
+    let owned;
+    let objects = match objects {
+        Some(objects) => objects,
+        None => {
+            owned = FileObjectDatabase::from_git_dir(git_dir, format);
+            &owned
+        }
+    };
+    if !matches!(
+        objects.resolve_prefix(rev),
+        Ok(ObjectPrefixResolution::Unique(_) | ObjectPrefixResolution::Ambiguous(_))
+    ) || !ambiguous_refname_warnings_enabled(git_dir)
+    {
+        return;
+    }
+    match sink {
+        AmbiguousRefnameWarning::Stderr => eprintln!("warning: refname '{rev}' is ambiguous."),
+        AmbiguousRefnameWarning::Custom(warn) => warn(rev),
+    }
+}
+
+/// Default-policy form of [`warn_ambiguous_refname_with_sink`]: print git's
+/// warning to stderr when enabled.
+pub fn warn_ambiguous_refname_for_object_prefix(git_dir: &Path, format: ObjectFormat, rev: &str) {
+    warn_ambiguous_refname_with_sink(
+        git_dir,
+        format,
+        rev,
+        None,
+        AmbiguousRefnameWarning::Stderr,
+    );
+}
+
+/// Whether `rev` names a ref under git's dwim rules for revision arguments:
+/// `HEAD`, a full `refs/...` name, or a branch/tag shorthand.
+pub fn revision_ref_name_exists(git_dir: &Path, format: ObjectFormat, rev: &str) -> bool {
+    let refs = FileRefStore::new(git_dir, format);
+    if rev == "HEAD" {
+        return refs.read_ref("HEAD").ok().flatten().is_some();
+    }
+    if rev.starts_with("refs/") {
+        return refs.read_ref(rev).ok().flatten().is_some();
+    }
+    refs.read_ref(&format!("refs/heads/{rev}"))
+        .ok()
+        .flatten()
+        .is_some()
+        || refs
+            .read_ref(&format!("refs/tags/{rev}"))
+            .ok()
+            .flatten()
+            .is_some()
+}
+
 fn resolve_revision_name(
     git_dir: &Path,
     format: sley_core::ObjectFormat,
@@ -638,6 +748,117 @@ pub fn object_ids_with_prefix(
 ) -> Result<Vec<ObjectId>> {
     FileObjectDatabase::from_git_dir(git_dir, format).object_ids_with_prefix(prefix)
 }
+
+/// Open an object database honouring the invocation's replacement policy.
+///
+/// This is the shared shape of the command-level revision helpers: object
+/// reads follow `refs/replace/*` (when both the caller's upper gate and the
+/// repository's `core.useReplaceRefs` allow it) while enumeration and
+/// prefix queries stay keyed by raw object id. The database reads from the
+/// common directory so linked-worktree invocations see the shared pack store;
+/// refs are listed through the caller-provided git directory exactly as the
+/// ref store does elsewhere.
+pub fn replacement_policy_object_database(
+    git_dir: &Path,
+    format: ObjectFormat,
+    replace_objects: bool,
+) -> Result<FileObjectDatabase> {
+    let common_git_dir = sley_formats::repository_common_dir(git_dir, true)?;
+    let parameters_env = sley_config::effective_config_parameters_env();
+    let config = sley_config::read_repo_config(git_dir, parameters_env.as_deref())?;
+    let refs = FileRefStore::new(git_dir, format);
+    let use_replace_refs = config
+        .get_bool("core", None, "useReplaceRefs")
+        .unwrap_or(true);
+    let replacements = if replace_objects && use_replace_refs {
+        let mut replacements = Vec::new();
+        // Prefer the replace namespace only so opening an object database does
+        // not emit "ignoring broken ref" warnings for unrelated refs (t6301).
+        for reference in refs.list_refs_with_prefix("refs/replace/")? {
+            let Some(source) = reference.name.strip_prefix("refs/replace/") else {
+                continue;
+            };
+            let Ok(source) = ObjectId::from_hex(format, source) else {
+                continue;
+            };
+            if let RefTarget::Direct(target) = reference.target {
+                replacements.push((source, target));
+            }
+        }
+        sley_odb::ObjectReplacements::new(replacements)
+    } else {
+        sley_odb::ObjectReplacements::default()
+    };
+    Ok(
+        FileObjectDatabase::from_git_dir(&common_git_dir, format)
+            .with_replacements(replacements),
+    )
+}
+
+/// Revision resolution with the command wrappers' warning + replacement
+/// semantics: emit the ambiguous-refname warning first, then resolve `rev`
+/// against a replacement-aware object database.
+pub fn resolve_revision_with_replacement_policy(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+    replace_objects: bool,
+) -> Result<ObjectId> {
+    warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
+    let db = replacement_policy_object_database(git_dir, format, replace_objects)?;
+    RevisionResolver::new(git_dir, format, &db).resolve(rev)
+}
+
+/// [`resolve_revision_with_replacement_policy`] narrowed to commit-ish: a bare
+/// hex prefix that is not a ref name must peel to a commit to be usable.
+pub fn resolve_revision_commitish_with_replacement_policy(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+    replace_objects: bool,
+) -> Result<ObjectId> {
+    warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
+    if rev.len() >= 4
+        && rev.len() < format.hex_len()
+        && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return resolve_short_object_id(
+            git_dir,
+            format,
+            rev,
+            ObjectDisambiguation::Commitish,
+        )?
+        .into_result(rev);
+    }
+    let db = replacement_policy_object_database(git_dir, format, replace_objects)?;
+    RevisionResolver::new(git_dir, format, &db).resolve(rev)
+}
+
+/// [`resolve_revision_with_replacement_policy`] narrowed to tree-ish: a bare
+/// hex prefix that is not a ref name must peel to a tree to be usable.
+pub fn resolve_revision_treeish_with_replacement_policy(
+    git_dir: &Path,
+    format: ObjectFormat,
+    rev: &str,
+    replace_objects: bool,
+) -> Result<ObjectId> {
+    warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
+    if rev.len() >= 4
+        && rev.len() < format.hex_len()
+        && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return resolve_short_object_id(
+            git_dir,
+            format,
+            rev,
+            ObjectDisambiguation::Treeish,
+        )?
+        .into_result(rev);
+    }
+    let db = replacement_policy_object_database(git_dir, format, replace_objects)?;
+    RevisionResolver::new(git_dir, format, &db).resolve(rev)
+}
+
 
 pub fn resolve_short_object_id_with_reader<R: ObjectReader>(
     git_dir: &Path,
@@ -8714,6 +8935,128 @@ mod tests {
             matches!(&bad_base, GitError::InvalidFormat(_)),
             "unexpected error: {bad_base:?}"
         );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    /// Fixture for the ambiguous-refname warning: one commit plus a branch
+    /// named after the commit oid's own four-hex prefix, so the ref and the
+    /// short object spelling collide by construction.
+    fn ambiguous_refname_fixture() -> (std::path::PathBuf, ObjectId, String) {
+        let git_dir = temp_git_dir();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let tree = db
+            .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
+            .expect("test operation should succeed");
+        let commit = write_dated_commit(&mut db, tree, Vec::new(), b"ambiguous\n", 1000);
+        let prefix = commit.to_hex()[..4].to_string();
+        set_branch(&git_dir, &prefix, &commit);
+        (git_dir, commit, prefix)
+    }
+
+    #[test]
+    fn ambiguous_refname_warning_fires_when_a_ref_shadows_an_object_prefix() {
+        let (git_dir, _commit, prefix) = ambiguous_refname_fixture();
+        let warned = std::cell::RefCell::new(Vec::new());
+        warn_ambiguous_refname_with_sink(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &prefix,
+            None,
+            AmbiguousRefnameWarning::Custom(&|name| {
+                warned.borrow_mut().push(name.to_string());
+            }),
+        );
+        assert_eq!(warned.into_inner(), vec![prefix.clone()]);
+        // The caller-owned database path must behave identically.
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let warned = std::cell::RefCell::new(Vec::new());
+        warn_ambiguous_refname_with_sink(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &prefix,
+            Some(&db),
+            AmbiguousRefnameWarning::Custom(&|name| {
+                warned.borrow_mut().push(name.to_string());
+            }),
+        );
+        assert_eq!(warned.into_inner(), vec![prefix]);
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn core_warn_ambiguous_refs_false_suppresses_the_warning() {
+        let (git_dir, _commit, prefix) = ambiguous_refname_fixture();
+        fs::write(
+            git_dir.join("config"),
+            b"[core]\n\twarnAmbiguousRefs = false\n",
+        )
+        .expect("test operation should succeed");
+        assert!(!ambiguous_refname_warnings_enabled(&git_dir));
+        let warned = std::cell::RefCell::new(Vec::new());
+        warn_ambiguous_refname_with_sink(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &prefix,
+            None,
+            AmbiguousRefnameWarning::Custom(&|name| {
+                warned.borrow_mut().push(name.to_string());
+            }),
+        );
+        assert!(
+            warned.into_inner().is_empty(),
+            "suppressed warning must not reach the sink"
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn ambiguous_refname_warning_requires_ref_and_object_to_collide() {
+        let git_dir = temp_git_dir();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let tree = db
+            .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
+            .expect("test operation should succeed");
+        let commit = write_dated_commit(&mut db, tree, Vec::new(), b"solo\n", 1000);
+        let commit_hex = commit.to_hex();
+        // Deterministic fixture content: the commit's own prefix never spells
+        // `dead`, so a branch named `dead` has no same-spelled object.
+        assert!(!commit_hex.starts_with("dead"));
+        set_branch(&git_dir, "dead", &commit);
+        let warned = std::cell::RefCell::new(Vec::new());
+        let sink =
+            AmbiguousRefnameWarning::Custom(&|name| warned.borrow_mut().push(name.to_string()));
+        // Ref exists but no object shares the prefix: silent.
+        warn_ambiguous_refname_with_sink(&git_dir, ObjectFormat::Sha1, "dead", Some(&db), sink);
+        // Short object prefix without a matching ref name: silent.
+        let object_prefix = &commit_hex[..4];
+        warn_ambiguous_refname_with_sink(
+            &git_dir,
+            ObjectFormat::Sha1,
+            object_prefix,
+            Some(&db),
+            sink,
+        );
+        // Below the four-character minimum: silent even with a branch there.
+        set_branch(&git_dir, "d", &commit);
+        warn_ambiguous_refname_with_sink(&git_dir, ObjectFormat::Sha1, "d", Some(&db), sink);
+        assert!(warned.into_inner().is_empty());
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn revision_ref_name_exists_follows_dwim_rules() {
+        let (git_dir, commit, prefix) = ambiguous_refname_fixture();
+        assert!(revision_ref_name_exists(&git_dir, ObjectFormat::Sha1, &prefix));
+        assert!(revision_ref_name_exists(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &format!("refs/heads/{prefix}")
+        ));
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+            .expect("test operation should succeed");
+        assert!(revision_ref_name_exists(&git_dir, ObjectFormat::Sha1, "HEAD"));
+        assert!(!revision_ref_name_exists(&git_dir, ObjectFormat::Sha1, "nosuchref"));
+        let _ = commit;
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 

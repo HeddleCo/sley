@@ -80,7 +80,6 @@ mod repo_helpers;
 mod repo_path;
 mod repo_paths;
 mod repository;
-mod revision;
 mod scalar;
 mod session;
 mod session_globals;
@@ -196,7 +195,16 @@ pub(crate) use repository::RepositoryContext;
 pub(crate) use checkout_reset::*;
 pub(crate) use commit_identity::*;
 pub(crate) use commit_message::*;
-pub(crate) use revision::*;
+// Revision-resolution wrappers dissolved into `sley-rev`; the aliases keep the
+// historical unqualified names working across command modules with no per-site
+// edits.
+pub(crate) use sley::plumbing::sley_rev::resolve_revision_symbolic_full_name as rev_parse_symbolic_full_name;
+pub(crate) use sley::plumbing::sley_rev::{
+    resolve_revision_commitish_with_replacement_policy as resolve_revision_commitish,
+    resolve_revision_treeish_with_replacement_policy as resolve_revision_treeish,
+    resolve_revision_with_replacement_policy as resolve_revision,
+    warn_ambiguous_refname_for_object_prefix,
+};
 pub(crate) use session_globals::*;
 pub(crate) use status_format::*;
 // Tree printing moved to `sley-formats::tree_print`; the glob keeps the

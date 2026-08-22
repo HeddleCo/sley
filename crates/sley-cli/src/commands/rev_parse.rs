@@ -545,36 +545,18 @@ fn rev_parse_warn_ambiguous_refname_for_object_prefix(
     repository: &RevParseRepository<'_>,
     rev: &str,
 ) {
-    if rev.len() < 4
-        || rev.len() > repository.format.hex_len()
-        || !rev.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return;
-    }
-    let refs = repository.refs();
-    let ref_exists = refs
-        .read_ref(&format!("refs/heads/{rev}"))
-        .ok()
-        .flatten()
-        .is_some()
-        || refs
-            .read_ref(&format!("refs/tags/{rev}"))
-            .ok()
-            .flatten()
-            .is_some();
-    if !ref_exists {
-        return;
-    }
     let Ok(objects) = repository.objects() else {
         return;
     };
-    if matches!(
-        objects.resolve_prefix(rev),
-        Ok(sley_odb::ObjectPrefixResolution::Unique(_)
-            | sley_odb::ObjectPrefixResolution::Ambiguous(_))
-    ) {
-        eprintln!("warning: refname '{rev}' is ambiguous.");
-    }
+    // Reuse the shared object database handle: prefix enumeration ignores
+    // replacement policy, so this matches a plain open without re-opening one.
+    sley_rev::warn_ambiguous_refname_with_sink(
+        repository.git_dir,
+        repository.format,
+        rev,
+        Some(objects),
+        sley_rev::AmbiguousRefnameWarning::Stderr,
+    );
 }
 
 fn rev_parse_core_disambiguate(

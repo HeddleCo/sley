@@ -910,7 +910,13 @@ fn for_each_ref_resolve_revision(
     db: &FileObjectDatabase,
     rev: &str,
 ) -> Result<ObjectId> {
-    warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
+    sley_rev::warn_ambiguous_refname_with_sink(
+        git_dir,
+        format,
+        rev,
+        Some(db),
+        sley_rev::AmbiguousRefnameWarning::Stderr,
+    );
     sley_rev::RevisionResolver::new(git_dir, format, db).resolve(rev)
 }
 
