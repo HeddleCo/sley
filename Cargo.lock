@@ -1578,6 +1578,7 @@ name = "sley-config"
 version = "0.7.0"
 dependencies = [
  "sley-core",
+ "sley-pathspec",
 ]
 
 [[package]]
