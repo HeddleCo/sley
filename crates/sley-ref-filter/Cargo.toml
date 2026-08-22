@@ -10,6 +10,19 @@ repository.workspace = true
 [dependencies]
 sley-core.workspace = true
 sley-strbuf-expand.workspace = true
+# Acyclicity proof for the deps below: the only workspace crates that depend on
+# sley-ref-filter are sley-pretty and sley-cli; none of these dependencies
+# reaches either of them transitively (object -> {config, core}; protocol ->
+# core; refs/formats -> {config, core, object}; odb -> {formats, mmap, object,
+# pack}; rev -> {diff-merge, index, options, odb, refs}; worktree -> {rev,
+# submodule, unpack-trees, ...}; all terminate in {core, pathspec, strbuf-expand}).
+sley-config.workspace = true
+sley-object.workspace = true
+sley-odb.workspace = true
+sley-protocol.workspace = true
+sley-refs.workspace = true
+sley-rev.workspace = true
+sley-worktree.workspace = true
 
 [lints]
 workspace = true

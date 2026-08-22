@@ -1760,8 +1760,15 @@ dependencies = [
 name = "sley-ref-filter"
 version = "0.7.0"
 dependencies = [
+ "sley-config",
  "sley-core",
+ "sley-object",
+ "sley-odb",
+ "sley-protocol",
+ "sley-refs",
+ "sley-rev",
  "sley-strbuf-expand",
+ "sley-worktree",
 ]
 
 [[package]]

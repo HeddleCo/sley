@@ -262,6 +262,32 @@ pub(crate) fn bare_signature_output(verification: &GpgVerification) -> Vec<u8> {
     verification.human_output.clone()
 }
 
+/// Adapter exposing the CLI's GPG/SSH verification through ref-filter's
+/// `%(signature*)` atom view (the verifier itself stays a CLI concern).
+impl sley_ref_filter::ForEachRefSignatureVerification for GpgVerification {
+    fn bare_output(&self) -> &[u8] {
+        &self.human_output
+    }
+    fn grade_byte(&self) -> u8 {
+        self.pretty_code()
+    }
+    fn key(&self) -> &str {
+        &self.key
+    }
+    fn signer(&self) -> &str {
+        &self.signer
+    }
+    fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+    fn primary_fingerprint(&self) -> &str {
+        &self.primary_fingerprint
+    }
+    fn trust(&self) -> &str {
+        &self.trust
+    }
+}
+
 const TAG_SIGNATURE_MARKERS: [&[u8]; 4] = [
     b"-----BEGIN PGP SIGNATURE-----",
     b"-----BEGIN PGP MESSAGE-----",

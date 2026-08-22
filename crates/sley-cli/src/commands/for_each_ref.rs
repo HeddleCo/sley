@@ -701,8 +701,12 @@ pub(crate) fn for_each_ref_core_with_config(
             push_track,
             contents,
             peeled_object,
-            signature,
-            peeled_signature,
+            signature: signature.as_ref().map(|verification| {
+                verification as &dyn sley_ref_filter::ForEachRefSignatureVerification
+            }),
+            peeled_signature: peeled_signature.as_ref().map(|verification| {
+                verification as &dyn sley_ref_filter::ForEachRefSignatureVerification
+            }),
             mailmap: &mailmap,
             ref_names: &ref_names,
             warn_ambiguous_refs,
