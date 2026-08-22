@@ -53,7 +53,10 @@ sley-transport = { workspace = true, features = ["http-client", "tls-rustls"] }
 sley-unpack-trees.workspace = true
 
 [features]
-default = ["mmap", "fast-sha1", "testkit", "git-compat-i18n"]
+default = ["mmap", "fast-sha1", "git-compat-i18n"]
+# Opt-in parity-harness command (`sley testkit ...`) backed by the path-only
+# sley-testkit crate. Deliberately NOT default: keeps the test harness out of
+# production binaries.
 testkit = ["dep:sley-testkit"]
 # The (de)compression backend is the default-on zlib-rs (pure Rust, ~zlib-ng
 # speed, no C). The `pure-rust` miniz_oxide fallback is a leaf-crate feature on
@@ -88,6 +91,10 @@ fetch-profile = ["dep:pprof", "sley/fetch-profile", "sley-protocol/fetch-profile
 sley-core.workspace = true
 sley-formats.workspace = true
 sley-odb.workspace = true
+# Path-only (never published): integration tests drive the binary via
+# sley_testkit::sley_bin!. This is independent of the `testkit` feature above,
+# which only gates the in-binary `sley testkit` parity command.
+sley-testkit = { path = "../sley-testkit" }
 
 [lints]
 workspace = true

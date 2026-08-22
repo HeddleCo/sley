@@ -1675,6 +1675,7 @@ fn check_ref_format_name(name: &str, allow_onelevel: bool, refspec_pattern: bool
     Ok(())
 }
 
+#[cfg(feature = "testkit")]
 pub(crate) fn cmd_testkit(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("hash-object") => {

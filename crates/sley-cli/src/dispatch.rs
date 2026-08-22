@@ -550,6 +550,7 @@ fn dispatch_command(
         "status" => commands::status::cmd_status(cli_session, &args[1..]),
         "switch" => commands::checkout::cmd_switch(cli_session, &args[1..]),
         "tag" => commands::tag::cmd_tag(cli_session, &args[1..]),
+        #[cfg(feature = "testkit")]
         "testkit" => commands::utility::cmd_testkit(&args[1..]),
         "unpack-file" => commands::utility::cmd_unpack_file(cli_session, &args[1..]),
         "update-server-info" => commands::refs::cmd_update_server_info(cli_session, &args[1..]),
