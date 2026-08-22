@@ -1683,6 +1683,7 @@ dependencies = [
 name = "sley-object"
 version = "0.7.0"
 dependencies = [
+ "sley-config",
  "sley-core",
 ]
 
@@ -1818,6 +1819,7 @@ dependencies = [
  "sley-object",
  "sley-odb",
  "sley-refs",
+ "sley-rev",
  "sley-worktree",
  "tempfile",
 ]
