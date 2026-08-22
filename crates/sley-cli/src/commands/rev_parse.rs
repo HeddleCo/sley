@@ -1816,29 +1816,17 @@ fn usage_padding_string(out: &mut String, width: usize) {
 }
 
 fn push_shell_sq_quote(out: &mut String, value: &str) {
-    out.push('\'');
-    for ch in value.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
+    out.push_str(&sley_core::text::sq_quote(value));
 }
 
 fn print_rev_parse_sq_quote(args: &[String]) -> Result<()> {
     let mut stdout = io::stdout();
+    let mut quoted = Vec::new();
     for arg in args {
-        stdout.write_all(b" '")?;
-        for byte in arg.as_bytes() {
-            if *byte == b'\'' {
-                stdout.write_all(b"'\\''")?;
-            } else {
-                stdout.write_all(&[*byte])?;
-            }
-        }
-        stdout.write_all(b"'")?;
+        stdout.write_all(b" ")?;
+        quoted.clear();
+        sley_core::text::sq_quote_buf(&mut quoted, arg.as_bytes());
+        stdout.write_all(&quoted)?;
     }
     stdout.write_all(b"\n")?;
     Ok(())

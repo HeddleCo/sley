@@ -2903,20 +2903,7 @@ pub fn append_injected_config_sections_with_includes(
 /// `git_config_push_split_parameter` does, so aliases and subprocesses inherit
 /// them and the env-list parser round-trips them.
 pub fn sq_quote(src: &str) -> String {
-    let mut out = String::with_capacity(src.len() + 2);
-    out.push('\'');
-    for ch in src.chars() {
-        if ch == '\'' || ch == '!' {
-            out.push('\'');
-            out.push('\\');
-            out.push(ch);
-            out.push('\'');
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
+    sley_core::text::sq_quote(src)
 }
 
 /// Load the *effective* configuration for a repository, merging the system,

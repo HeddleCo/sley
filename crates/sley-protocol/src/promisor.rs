@@ -136,44 +136,27 @@ fn percent_encode_optional_field(value: &str) -> String {
 }
 
 fn percent_encode_with(value: &str, allow_equals: bool) -> String {
+    let mode = if allow_equals {
+        sley_core::text::PercentEncodeMode::OptionalField
+    } else {
+        sley_core::text::PercentEncodeMode::Field
+    };
     let mut out = String::new();
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric()
-            || b"_.~/:-".contains(&byte)
-            || (allow_equals && byte == b'=')
-        {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
+    sley_core::text::percent_encode(&mut out, value.as_bytes(), mode);
     out
 }
 
 fn percent_decode(value: &str) -> Result<String> {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'%' {
-            out.push(bytes[index]);
-            index += 1;
-            continue;
+    use sley_core::text::PercentDecodeError;
+    let decoded = sley_core::text::percent_decode(value.as_bytes()).map_err(|err| match err {
+        PercentDecodeError::TruncatedEscape => {
+            GitError::InvalidFormat("truncated percent escape in promisor remote".into())
         }
-        if index + 2 >= bytes.len() {
-            return Err(GitError::InvalidFormat(
-                "truncated percent escape in promisor remote".into(),
-            ));
-        }
-        let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
-            .map_err(|err| GitError::InvalidFormat(err.to_string()))?;
-        let byte = u8::from_str_radix(hex, 16).map_err(|_| {
+        PercentDecodeError::InvalidHexDigit(_) => {
             GitError::InvalidFormat("invalid percent escape in promisor remote".into())
-        })?;
-        out.push(byte);
-        index += 3;
-    }
-    String::from_utf8(out).map_err(|err| GitError::InvalidFormat(err.to_string()))
+        }
+    })?;
+    String::from_utf8(decoded).map_err(|err| GitError::InvalidFormat(err.to_string()))
 }
 
 #[cfg(test)]

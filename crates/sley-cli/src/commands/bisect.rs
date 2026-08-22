@@ -437,15 +437,7 @@ fn sq_quote_args<I: IntoIterator<Item = S>, S: AsRef<str>>(args: I) -> String {
     let mut out = String::new();
     for arg in args {
         out.push(' ');
-        out.push('\'');
-        for ch in arg.as_ref().chars() {
-            if ch == '\'' {
-                out.push_str("'\\''");
-            } else {
-                out.push(ch);
-            }
-        }
-        out.push('\'');
+        out.push_str(&sley_core::text::sq_quote(arg.as_ref()));
     }
     out
 }

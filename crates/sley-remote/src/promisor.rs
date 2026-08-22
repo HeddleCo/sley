@@ -255,16 +255,11 @@ fn promisor_remote_contact_trace_line(remote_name: &str) -> String {
     )
 }
 
+/// Trace-style argument rendering (`sq_quote_buf_pretty`): safe arguments stay
+/// bare, everything else gets full sq-quote semantics including the `'\!'`
+/// bang escape.
 fn trace_quote_argument(value: &str) -> String {
-    const SAFE: &[u8] = b"+,-./:=@_^";
-    if !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || SAFE.contains(&byte))
-    {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\\''"))
+    sley_core::text::sq_quote_pretty(value)
 }
 
 fn configured_fields(config: &GitConfig, key: &str) -> Vec<String> {

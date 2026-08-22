@@ -347,40 +347,10 @@ fn path_with_dot_git_suffix(path: &Path) -> PathBuf {
 }
 
 fn percent_decode_url_path(value: &str) -> Result<String> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len() {
-                return Err(GitError::InvalidPath(format!(
-                    "invalid percent-encoded path {value:?}"
-                )));
-            }
-            let high = percent_hex_value(bytes[index + 1]).ok_or_else(|| {
-                GitError::InvalidPath(format!("invalid percent-encoded path {value:?}"))
-            })?;
-            let low = percent_hex_value(bytes[index + 2]).ok_or_else(|| {
-                GitError::InvalidPath(format!("invalid percent-encoded path {value:?}"))
-            })?;
-            decoded.push((high << 4) | low);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
+    let decoded = sley_core::text::percent_decode(value.as_bytes())
+        .map_err(|_| GitError::InvalidPath(format!("invalid percent-encoded path {value:?}")))?;
     String::from_utf8(decoded)
         .map_err(|_| GitError::InvalidPath(format!("invalid utf-8 file URL path {value:?}")))
-}
-
-fn percent_hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// Discover the git directory containing `start` (working tree or bare repo).

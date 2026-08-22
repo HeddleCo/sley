@@ -643,13 +643,7 @@ fn relative_inside(worktree: &Path, cwd: &Path) -> Option<String> {
 
 /// Render a path with forward slashes (git uses `/` in trace prefixes).
 fn path_to_slash(path: &Path) -> String {
-    path.components()
-        .filter_map(|c| match c {
-            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+    sley::plumbing::sley_core::paths::path_to_slash(path)
 }
 
 /// A path as a UTF-8-lossy string (git stores paths as bytes; the tested paths
@@ -790,37 +784,12 @@ pub(crate) fn git_trace_line(file_line: &str, message: &str) {
     let _ = writeln!(sink, "{prefix}{message}");
 }
 
-/// Port of git's `sq_quote_buf_pretty`: leave an argument unquoted when every
-/// byte is alphanumeric or one of `+,-./:=@_^`; otherwise single-quote it,
-/// escaping `'` and `!` as `'\''`-style sequences (`sq_quote_buf`). An empty
-/// argument becomes `''`.
-pub(crate) fn trace_quote_sq(arg: &str) -> String {
-    const OK_PUNCT: &[u8] = b"+,-./:=@_^";
-    if arg.is_empty() {
-        return "''".to_string();
-    }
-    let needs_quote = arg
-        .bytes()
-        .any(|b| !b.is_ascii_alphanumeric() && !OK_PUNCT.contains(&b));
-    if !needs_quote {
-        return arg.to_string();
-    }
-    let mut out = String::with_capacity(arg.len() + 2);
-    out.push('\'');
-    for ch in arg.chars() {
-        if ch == '\'' || ch == '!' {
-            // git's sq_quote_buf: close the quote, backslash-escape the byte,
-            // reopen the quote → `'\''` for a quote, `'\!'` for a bang.
-            out.push_str("'\\");
-            out.push(ch);
-            out.push('\'');
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
-}
+/// Trace-style sq-quote rendering. The canonical implementation lives in
+/// [`sley_core::text::sq_quote_buf_pretty`] (git's `sq_quote_buf_pretty`):
+/// leave an argument unquoted when every byte is alphanumeric or one of
+/// `+,-./:=@_^`; otherwise single-quote it, escaping `'` and `!` as
+/// `'\''`-style sequences. An empty argument becomes `''`.
+pub(crate) use sley::plumbing::sley_core::text::sq_quote_pretty as trace_quote_sq;
 
 /// `HH:MM:SS.uuuuuu` local-time timestamp matching git's trace prefix.
 fn trace_timestamp() -> String {

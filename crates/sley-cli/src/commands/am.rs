@@ -2305,23 +2305,7 @@ impl AmApplyOpts {
 /// single quotes, rendering an embedded `'` (or `!`) as the `'\''` escape. This
 /// is the exact byte layout `git am` writes to `rebase-apply/apply-opt`.
 fn sq_quote_argv(args: &[String]) -> String {
-    let mut out = String::new();
-    for arg in args {
-        out.push(' ');
-        out.push('\'');
-        for ch in arg.chars() {
-            if ch == '\'' || ch == '!' {
-                out.push('\'');
-                out.push('\\');
-                out.push(ch);
-                out.push('\'');
-            } else {
-                out.push(ch);
-            }
-        }
-        out.push('\'');
-    }
-    out
+    sley_core::text::sq_quote_argv(args)
 }
 
 /// git's `sq_dequote` (quote.c `sq_dequote_step`): split an sq-quoted line back

@@ -849,12 +849,7 @@ pub fn read_rebase_state(git_dir: &Path, format: ObjectFormat) -> Result<RebaseS
 }
 
 fn sq_quote_argv(args: &[String]) -> String {
-    let mut out = Vec::new();
-    for arg in args {
-        out.push(b' ');
-        out.extend_from_slice(&sq_quote_bytes(arg.as_bytes()));
-    }
-    String::from_utf8(out).expect("quoting UTF-8 arguments preserves UTF-8")
+    sley_core::text::sq_quote_argv(args)
 }
 
 fn parse_strategy_opts(text: &str) -> Vec<String> {
@@ -1060,22 +1055,12 @@ pub fn save_rebase_todo_list(
     Ok(())
 }
 
-/// `sq_quote_buf`: wrap in single quotes, escaping embedded quotes and bangs
-/// (`'` becomes `'\''`).
+/// `sq_quote_buf` (quote.c): wrap in single quotes, escaping embedded quotes
+/// and bangs (`'` becomes `'\''`, `!` becomes `'\!'`). Canonical impl lives in
+/// [`sley_core::text`].
 fn sq_quote_bytes(value: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(value.len() + 2);
-    out.push(b'\'');
-    for byte in value {
-        if *byte == b'\'' || *byte == b'!' {
-            out.push(b'\'');
-            out.push(b'\\');
-            out.push(*byte);
-            out.push(b'\'');
-        } else {
-            out.push(*byte);
-        }
-    }
-    out.push(b'\'');
+    sley_core::text::sq_quote_buf(&mut out, value);
     out
 }
 

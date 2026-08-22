@@ -522,25 +522,12 @@ pub mod trace2 {
         }
     }
 
+    /// Trace2 argv rendering (`sq_quote_buf_pretty` per argument): safe
+    /// arguments stay bare, empty arguments render as `''`, everything else
+    /// falls back to full sq-quote semantics. Oracle 2.55 renders the trace2
+    /// `start` line this way (`start git log -1 'v'\!'1'`).
     fn quote_arg(arg: &str) -> String {
-        if !arg.is_empty()
-            && !arg
-                .chars()
-                .any(|ch| ch.is_whitespace() || matches!(ch, '\'' | '"' | '\\'))
-        {
-            return arg.to_string();
-        }
-        let mut out = String::with_capacity(arg.len() + 2);
-        out.push('\'');
-        for ch in arg.chars() {
-            if ch == '\'' {
-                out.push_str("'\\''");
-            } else {
-                out.push(ch);
-            }
-        }
-        out.push('\'');
-        out
+        crate::text::sq_quote_pretty(arg)
     }
 
     fn argv0() -> String {

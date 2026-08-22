@@ -1006,41 +1006,12 @@ fn split_remote_authority_and_path(value: &str) -> Result<(&str, String)> {
 }
 
 fn percent_decode_remote_path(value: &str) -> Result<String> {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut idx = 0;
-    while idx < bytes.len() {
-        if bytes[idx] == b'%' {
-            if idx + 2 >= bytes.len() {
-                return Err(GitError::InvalidFormat(format!(
-                    "invalid percent-encoded remote path {value:?}"
-                )));
-            }
-            let high = percent_hex_value(bytes[idx + 1]).ok_or_else(|| {
-                GitError::InvalidFormat(format!("invalid percent-encoded remote path {value:?}"))
-            })?;
-            let low = percent_hex_value(bytes[idx + 2]).ok_or_else(|| {
-                GitError::InvalidFormat(format!("invalid percent-encoded remote path {value:?}"))
-            })?;
-            out.push((high << 4) | low);
-            idx += 3;
-        } else {
-            out.push(bytes[idx]);
-            idx += 1;
-        }
-    }
-    let decoded = String::from_utf8(out).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+    let decoded = sley_core::text::percent_decode(value.as_bytes()).map_err(|_| {
+        GitError::InvalidFormat(format!("invalid percent-encoded remote path {value:?}"))
+    })?;
+    let decoded = String::from_utf8(decoded).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
     validate_remote_path("remote path", &decoded)?;
     Ok(decoded)
-}
-
-fn percent_hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// Parsed remote authority: `(user, password, host, port)`. Password is only
