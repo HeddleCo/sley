@@ -3101,7 +3101,14 @@ fn clone_alternates(
             .and_then(|git_dir| cli_session.common_git_dir(&git_dir))
         {
             Ok(reference_git_dir) => {
-                push_unique_alternate(&mut alternates, reference_git_dir.join("objects"));
+                // Upstream real-paths --reference repositories during their
+                // discovery, so recorded alternates carry resolved paths
+                // (/private/var on macOS rather than /var); match bytes.
+                let objects = reference_git_dir.join("objects");
+                push_unique_alternate(
+                    &mut alternates,
+                    fs::canonicalize(&objects).unwrap_or(objects),
+                );
             }
             Err(_) if reference.if_able => eprintln!(
                 "info: Could not add alternate for '{}': reference repository '{}' is not a local repository.",
