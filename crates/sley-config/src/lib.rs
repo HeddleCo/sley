@@ -999,7 +999,7 @@ fn gitdir_condition_matches(
     }
     gitdir_match_targets(git_dir)
         .into_iter()
-        .any(|target| glob_match(&pattern, &target, case_insensitive))
+        .any(|target| glob_match_dir(&pattern, &target, case_insensitive))
 }
 
 // ---------------------------------------------------------------------------
@@ -1616,210 +1616,41 @@ fn onbranch_pattern_matches(pattern: &str, branch: &str) -> bool {
     glob_match(&pattern, branch, false)
 }
 
-/// One token of a compiled glob pattern.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GlobToken {
-    /// A literal character that must match exactly.
-    Literal(char),
-    /// `?` — matches exactly one character that is not `/`.
-    AnyChar,
-    /// `*` — matches zero or more characters, none of which is `/`.
-    Star,
-    /// `**` — matches zero or more characters, including `/`.
-    DoubleStar,
-    /// A `[...]` character class.
-    Class {
-        negated: bool,
-        items: Vec<ClassItem>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ClassItem {
-    Single(char),
-    Range(char, char),
-}
-
 /// Glob matcher supporting `*`, `?`, `[...]` character classes, and `**`.
 ///
-/// `*` matches any run of non-`/` characters; `**` matches across `/`
-/// boundaries (including none); `?` matches a single non-`/` character.
+/// `*`/`?` do not cross `/` and classes never match `/` (upstream
+/// `wildmatch` with `WM_PATHNAME`, verified against git 2.55: includeIf
+/// `onbranch:feature/*` does not match `feature/deep/x`). `**` crosses
+/// `/` boundaries including none. This plain form does NOT let `x/**`
+/// match bare `x` — oracle-verified for `includeIf "onbranch:main/"`,
+/// which must NOT match branch `main`.
 fn glob_match(pattern: &str, text: &str, case_insensitive: bool) -> bool {
-    let (pattern, text) = if case_insensitive {
-        (pattern.to_lowercase(), text.to_lowercase())
-    } else {
-        (pattern.to_string(), text.to_string())
-    };
-    let tokens = compile_glob(&pattern);
-    let text_chars: Vec<char> = text.chars().collect();
-    glob_match_tokens(&tokens, &text_chars)
+    let mut flags = sley_pathspec::WM_PATHNAME;
+    if case_insensitive {
+        flags |= sley_pathspec::WM_CASEFOLD;
+    }
+    sley_pathspec::wildmatch(pattern.as_bytes(), text.as_bytes(), flags)
 }
 
-/// Compile a glob string into tokens, handling `\` escapes and `[...]` classes.
-fn compile_glob(pattern: &str) -> Vec<GlobToken> {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut tokens = Vec::new();
-    let mut idx = 0;
-    while idx < chars.len() {
-        match chars[idx] {
-            '*' => {
-                if chars.get(idx + 1) == Some(&'*') {
-                    tokens.push(GlobToken::DoubleStar);
-                    idx += 2;
-                } else {
-                    tokens.push(GlobToken::Star);
-                    idx += 1;
-                }
-            }
-            '?' => {
-                tokens.push(GlobToken::AnyChar);
-                idx += 1;
-            }
-            '\\' => {
-                if let Some(&next) = chars.get(idx + 1) {
-                    tokens.push(GlobToken::Literal(next));
-                    idx += 2;
-                } else {
-                    tokens.push(GlobToken::Literal('\\'));
-                    idx += 1;
-                }
-            }
-            '[' => {
-                if let Some((token, next)) = compile_char_class(&chars, idx) {
-                    tokens.push(token);
-                    idx = next;
-                } else {
-                    // Unterminated class: treat `[` as a literal.
-                    tokens.push(GlobToken::Literal('['));
-                    idx += 1;
-                }
-            }
-            other => {
-                tokens.push(GlobToken::Literal(other));
-                idx += 1;
-            }
-        }
+/// Like [`glob_match`] but additionally lets `x/**` match bare `x`
+/// ("this directory and everything under it"). Oracle-verified for
+/// `includeIf "gitdir:<dir>/"`: the directory itself matches while a
+/// bare non-slash pattern (`<dir>` with no trailing slash) does not.
+fn glob_match_dir(pattern: &str, text: &str, case_insensitive: bool) -> bool {
+    if glob_match(pattern, text, case_insensitive) {
+        return true;
     }
-    tokens
-}
-
-/// Parse a `[...]` class beginning at `chars[start]`.
-///
-/// Returns the token and the index just past the closing `]`, or `None` if the
-/// class is unterminated.
-fn compile_char_class(chars: &[char], start: usize) -> Option<(GlobToken, usize)> {
-    let mut idx = start + 1;
-    let mut negated = false;
-    if chars.get(idx) == Some(&'!') || chars.get(idx) == Some(&'^') {
-        negated = true;
-        idx += 1;
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return !prefix.is_empty() && {
+            let (prefix, text) = if case_insensitive {
+                (prefix.to_lowercase(), text.to_lowercase())
+            } else {
+                (prefix.to_string(), text.to_string())
+            };
+            prefix == text
+        };
     }
-    let mut items = Vec::new();
-    let mut first = true;
-    while idx < chars.len() {
-        let current = chars[idx];
-        if current == ']' && !first {
-            return Some((GlobToken::Class { negated, items }, idx + 1));
-        }
-        first = false;
-        if chars.get(idx + 1) == Some(&'-')
-            && chars.get(idx + 2).is_some()
-            && chars.get(idx + 2) != Some(&']')
-        {
-            items.push(ClassItem::Range(current, chars[idx + 2]));
-            idx += 3;
-        } else {
-            items.push(ClassItem::Single(current));
-            idx += 1;
-        }
-    }
-    None
-}
-
-/// Recursively match compiled glob tokens against the remaining text.
-fn glob_match_tokens(tokens: &[GlobToken], text: &[char]) -> bool {
-    let Some((token, rest)) = tokens.split_first() else {
-        return text.is_empty();
-    };
-    match token {
-        GlobToken::Literal('/') => {
-            // A trailing `/**` also matches the directory itself, so `foo/**`
-            // matches `foo` (text already exhausted) as well as its contents.
-            if text.is_empty() && rest == [GlobToken::DoubleStar] {
-                return true;
-            }
-            matches!(text.split_first(), Some((&ch, tail)) if ch == '/' && glob_match_tokens(rest, tail))
-        }
-        GlobToken::Literal(expected) => {
-            matches!(text.split_first(), Some((&ch, tail)) if ch == *expected && glob_match_tokens(rest, tail))
-        }
-        GlobToken::AnyChar => {
-            matches!(text.split_first(), Some((&ch, tail)) if ch != '/' && glob_match_tokens(rest, tail))
-        }
-        GlobToken::Class { negated, items } => {
-            matches!(text.split_first(), Some((&ch, tail))
-                if ch != '/' && class_matches(items, ch) != *negated && glob_match_tokens(rest, tail))
-        }
-        GlobToken::Star => {
-            // Match zero-or-more non-`/` characters, trying shortest first.
-            if glob_match_tokens(rest, text) {
-                return true;
-            }
-            let mut consumed = 0;
-            while consumed < text.len() && text[consumed] != '/' {
-                consumed += 1;
-                if glob_match_tokens(rest, &text[consumed..]) {
-                    return true;
-                }
-            }
-            false
-        }
-        GlobToken::DoubleStar => {
-            match rest.split_first() {
-                // `**/<rest>` (a full path-component wildcard): match zero or
-                // more complete `component/` units. So `a/**/b` matches `a/b`,
-                // `a/x/b`, `a/x/y/b`, and a leading `**/foo` matches `foo` at
-                // any depth.
-                Some((GlobToken::Literal('/'), after_slash)) => {
-                    // Zero directories: the `**/` collapses away entirely.
-                    if glob_match_tokens(after_slash, text) {
-                        return true;
-                    }
-                    // One or more directories: consume up to and including the
-                    // next `/`, then retry the whole `**/...` against the rest.
-                    let mut consumed = 0;
-                    while consumed < text.len() {
-                        let ch = text[consumed];
-                        consumed += 1;
-                        if ch == '/' && glob_match_tokens(tokens, &text[consumed..]) {
-                            return true;
-                        }
-                    }
-                    false
-                }
-                // Trailing `**` or `**` before a non-slash: match any run of
-                // characters, including `/` and including none.
-                _ => {
-                    if glob_match_tokens(rest, text) {
-                        return true;
-                    }
-                    for consumed in 1..=text.len() {
-                        if glob_match_tokens(rest, &text[consumed..]) {
-                            return true;
-                        }
-                    }
-                    false
-                }
-            }
-        }
-    }
-}
-
-fn class_matches(items: &[ClassItem], ch: char) -> bool {
-    items.iter().any(|item| match item {
-        ClassItem::Single(value) => *value == ch,
-        ClassItem::Range(lo, hi) => *lo <= ch && ch <= *hi,
-    })
+    false
 }
 
 /// Character-level parser for the gitconfig file format.
@@ -3927,17 +3758,43 @@ mod tests {
         assert!(glob_match("[a-c]oo", "boo", false));
         assert!(!glob_match("[a-c]oo", "zoo", false));
         assert!(glob_match("[!a-c]oo", "zoo", false));
-        // `**` crosses separators, including zero directories.
+        // `**` crosses separators, including zero directories...
         assert!(glob_match("/home/**", "/home/user/work/.git", false));
-        assert!(glob_match("/home/**", "/home", false));
         assert!(glob_match("**/foo/.git", "/a/b/foo/.git", false));
         assert!(glob_match("**/foo/.git", "/foo/.git", false));
         assert!(glob_match("a/**/b", "a/b", false));
         assert!(glob_match("a/**/b", "a/x/y/b", false));
         assert!(!glob_match("a/**/b", "a/xb", false));
+        // ...but `x/**` does NOT match bare `x` (oracle: includeIf
+        // "onbranch:main/" must not match branch `main`).
+        assert!(!glob_match("/home/**", "/home", false));
+        assert!(glob_match_dir("/home/**", "/home", false));
+        assert!(glob_match_dir("/home/**", "/home/user/.git", false));
+        assert!(!glob_match_dir("/home/*", "/home", false));
         // Case-insensitive matching.
         assert!(glob_match("/Home/**", "/home/user/.git", true));
         assert!(!glob_match("/Home/**", "/home/user/.git", false));
+        assert!(glob_match_dir("/Home/**", "/home", true));
+    }
+
+    #[test]
+    fn onbranch_pattern_matches_upstream_matrix() {
+        // Matrix verified empirically against oracle git 2.55 via
+        // `includeIf "onbranch:<pattern>"` probes on branches main and
+        // feature/deep/x.
+        assert!(onbranch_pattern_matches("main", "main"));
+        assert!(onbranch_pattern_matches("main*", "main"));
+        assert!(onbranch_pattern_matches("ma*n", "main"));
+        assert!(onbranch_pattern_matches("[mn]ain", "main"));
+        assert!(!onbranch_pattern_matches("main/", "main"));
+        assert!(!onbranch_pattern_matches("**/deep/*", "main"));
+        assert!(!onbranch_pattern_matches("feature/**", "main"));
+        for pattern in ["main", "main/", "feature/*", "release/*"] {
+            assert!(!onbranch_pattern_matches(pattern, "feature/deep/x"));
+        }
+        assert!(onbranch_pattern_matches("**/deep/*", "feature/deep/x"));
+        assert!(onbranch_pattern_matches("feature/**", "feature/deep/x"));
+        assert!(onbranch_pattern_matches("feature/", "feature/deep/x"));
     }
 
     #[test]

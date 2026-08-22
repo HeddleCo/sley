@@ -1189,104 +1189,12 @@ fn unique_abbrev(
     Ok(hex[..width.min(hex.len())].to_string())
 }
 
-/// Minimal shell-style glob matcher (`*`, `?`, `[...]`) sufficient for
-/// show-branch ref patterns. Matches the whole string.
+/// Whole-string glob match for show-branch ref patterns: `*`, `?`,
+/// `[...]` via the canonical wildmatch engine (no `WM_PATHNAME`, so `*`
+/// crosses `/` — matching this module's prior matcher and upstream's
+/// plain-wildmatch use for ref patterns).
 fn wildmatch(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    wildmatch_inner(&p, &t)
-}
-
-fn wildmatch_inner(pattern: &[char], text: &[char]) -> bool {
-    let mut pi = 0usize;
-    let mut ti = 0usize;
-    // Backtracking positions for the most recent `*`.
-    let mut star: Option<(usize, usize)> = None;
-    while ti < text.len() {
-        if pi < pattern.len() {
-            match pattern[pi] {
-                '*' => {
-                    star = Some((pi, ti));
-                    pi += 1;
-                    continue;
-                }
-                '?' => {
-                    pi += 1;
-                    ti += 1;
-                    continue;
-                }
-                '[' => {
-                    if let Some((consumed, matched)) = match_class(&pattern[pi..], text[ti]) {
-                        if matched {
-                            pi += consumed;
-                            ti += 1;
-                            continue;
-                        }
-                    } else if pattern[pi] == text[ti] {
-                        // Malformed class: treat `[` literally.
-                        pi += 1;
-                        ti += 1;
-                        continue;
-                    }
-                }
-                c if c == text[ti] => {
-                    pi += 1;
-                    ti += 1;
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        // Mismatch: backtrack to the last `*` if any.
-        if let Some((sp, st)) = star {
-            pi = sp + 1;
-            ti = st + 1;
-            star = Some((sp, st + 1));
-        } else {
-            return false;
-        }
-    }
-    // Consume trailing `*`s.
-    while pi < pattern.len() && pattern[pi] == '*' {
-        pi += 1;
-    }
-    pi == pattern.len()
-}
-
-/// Match a `[...]` character class at the start of `pattern` against `ch`.
-/// Returns `(chars_consumed, matched)` or `None` if the class is unterminated.
-fn match_class(pattern: &[char], ch: char) -> Option<(usize, bool)> {
-    // pattern[0] == '['
-    let mut idx = 1usize;
-    let mut negate = false;
-    if idx < pattern.len() && (pattern[idx] == '!' || pattern[idx] == '^') {
-        negate = true;
-        idx += 1;
-    }
-    let mut matched = false;
-    let mut first = true;
-    while idx < pattern.len() {
-        let c = pattern[idx];
-        if c == ']' && !first {
-            return Some((idx + 1, matched ^ negate));
-        }
-        first = false;
-        // Range a-b.
-        if idx + 2 < pattern.len() && pattern[idx + 1] == '-' && pattern[idx + 2] != ']' {
-            let lo = c;
-            let hi = pattern[idx + 2];
-            if lo <= ch && ch <= hi {
-                matched = true;
-            }
-            idx += 3;
-        } else {
-            if c == ch {
-                matched = true;
-            }
-            idx += 1;
-        }
-    }
-    None
+    sley_pathspec::wildmatch(pattern.as_bytes(), text.as_bytes(), 0)
 }
 
 // ---------------------------------------------------------------------------
