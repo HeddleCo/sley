@@ -2,6 +2,8 @@
 //!
 //! Split out of `lib.rs` in the wave-47 mechanical refactor: a pure code move
 //! (no function body changed); all items are re-exported from `lib.rs`.
+use sley_core::paths::normalize_lexical;
+
 use super::*;
 use crate::checkout::*;
 use crate::index::*;
@@ -946,22 +948,10 @@ pub fn worktree_root_for_git_dir(git_dir: &Path) -> Result<Option<PathBuf>> {
         .ok_or_else(|| GitError::InvalidPath("git dir has no parent worktree".into()))
 }
 
+/// Delegates to the canonical resolver in [`sley_formats`] (environment always
+/// honored, errors propagate).
 pub fn common_git_dir_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
-    if let Some(common_dir) = env::var_os("GIT_COMMON_DIR") {
-        return Ok(PathBuf::from(common_dir));
-    }
-    let commondir = git_dir.join("commondir");
-    if commondir.is_file() {
-        let value = fs::read_to_string(&commondir)?;
-        let path = PathBuf::from(value.trim());
-        let common = if path.is_absolute() {
-            path
-        } else {
-            git_dir.join(path)
-        };
-        return fs::canonicalize(common).map_err(|err| GitError::Io(err.to_string()));
-    }
-    fs::canonicalize(git_dir).map_err(|err| GitError::Io(err.to_string()))
+    sley_formats::repository_common_dir(git_dir, true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1064,23 +1054,9 @@ pub(crate) fn linked_worktree_path(admin_dir: &Path) -> Option<PathBuf> {
         return None;
     }
     let gitdir_path = resolve_worktree_admin_path(admin_dir, gitdir);
-    gitdir_path.parent().map(|path| {
-        fs::canonicalize(path).unwrap_or_else(|_| normalize_lexical_worktree_path(path))
-    })
-}
-
-pub(crate) fn normalize_lexical_worktree_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            _ => out.push(component.as_os_str()),
-        }
-    }
-    out
+    gitdir_path
+        .parent()
+        .map(|path| fs::canonicalize(path).unwrap_or_else(|_| normalize_lexical(path)))
 }
 
 pub(crate) fn worktree_uses_symref(git_dir: &Path, symref: &str, target: &str) -> Result<bool> {

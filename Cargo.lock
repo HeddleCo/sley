@@ -1872,6 +1872,7 @@ dependencies = [
  "sley-config",
  "sley-core",
  "sley-diff-merge",
+ "sley-formats",
  "sley-index",
  "sley-mmap",
  "sley-object",

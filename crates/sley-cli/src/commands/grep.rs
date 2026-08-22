@@ -2696,27 +2696,11 @@ fn buffer_is_binary(content: &[u8]) -> bool {
 }
 
 fn path_to_bytes(path: &Path) -> Vec<u8> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes().to_vec()
-    }
-    #[cfg(not(unix))]
-    {
-        path.to_string_lossy().replace('\\', "/").into_bytes()
-    }
+    sley::plumbing::sley_core::paths::path_to_bytes(path)
 }
 
 fn bytes_to_path(bytes: &[u8]) -> PathBuf {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
-    }
-    #[cfg(not(unix))]
-    {
-        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
-    }
+    sley::plumbing::sley_core::paths::bytes_to_os_path(bytes)
 }
 
 // ---------------------------------------------------------------------------

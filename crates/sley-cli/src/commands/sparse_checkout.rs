@@ -25,33 +25,9 @@ use sley::plumbing::sley_worktree::{
     SparseCheckout, SparseCheckoutMode, apply_sparse_checkout_with_mode, path_in_sparse_checkout,
 };
 
-/// Interpret raw path bytes as a (relative) [`PathBuf`]. On Unix the bytes are
-/// the OS-native path encoding; off Unix they are decoded lossily as UTF-8.
-fn bytes_to_os_path(bytes: &[u8]) -> std::path::PathBuf {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
-    }
-    #[cfg(not(unix))]
-    {
-        std::path::PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
-    }
-}
-
-/// Path/`OsStr` → its byte encoding. On Unix this is the native bytes; off Unix
-/// it is the lossy UTF-8 form with `\` normalised to `/`.
-fn os_str_to_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        value.as_bytes().to_vec()
-    }
-    #[cfg(not(unix))]
-    {
-        value.to_string_lossy().replace('\\', "/").into_bytes()
-    }
-}
+// Bytes↔path conversion helpers live in `sley_core::paths` (canonical);
+// the local copies were consolidated there.
+use sley::plumbing::sley_core::paths::{bytes_to_os_path, os_str_to_bytes};
 
 const SPARSE_USAGE: &str = "usage: git sparse-checkout (init | list | set | add | reapply | disable | check-rules | clean) [<options>]";
 

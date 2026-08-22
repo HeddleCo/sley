@@ -216,8 +216,13 @@ pub(crate) use init_config::{
     parse_config_bool, report_config_setup_error, submodule_path_config_enabled,
 };
 pub(crate) use ls_files_pathspec::{
-    LsFilesPathspec, index_entry_stage, normalize_absolute_cli_pathspec, normalize_lexical_path,
-    path_component_count, relative_path_from_absolute, relative_path_from_absolute_components,
+    LsFilesPathspec, index_entry_stage, normalize_absolute_cli_pathspec, path_component_count,
+};
+// Canonical implementations moved to `sley_core::paths`; the legacy local
+// spellings stay available under their historical names.
+pub(crate) use sley::plumbing::sley_core::paths::normalize_lexical as normalize_lexical_path;
+pub(crate) use sley::plumbing::sley_core::paths::{
+    relative_path_from_absolute, relative_path_from_absolute_components,
 };
 pub(crate) use reflog_parse::{
     parse_reflog_count, parse_reflog_expire_date, parse_reflog_expire_time,

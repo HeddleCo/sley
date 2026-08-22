@@ -10,6 +10,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use sley_config::{ConfigEntry, ConfigSection, GitConfig};
+use sley_core::paths::{normalize_lexical, relative_path_lexical};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -3658,52 +3659,39 @@ fn write_worktree_linking_files(
     Ok(())
 }
 
-/// Lexically normalize a path (collapse `.`/`..`, no filesystem access), so a
-/// path built from a relative backlink against a non-existent (already-moved)
-/// old admin dir still resolves. Mirrors the cleanup git's
-/// `strbuf_realpath_forgiving` performs on the components that do exist.
-fn normalize_lexical(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
-                }
-            }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
+/// Resolve the common directory shared by all linked worktrees of `git_dir`
+/// — a faithful port of path.c's `get_common_dir_noenv` plus the
+/// `GIT_COMMON_DIR` environment override applied by its caller.
+///
+/// Resolution order:
+/// 1. `GIT_COMMON_DIR`, when `honor_environment` is set — used verbatim (git
+///    applies no realpath to it), so callers can redirect common files without
+///    a physical linked worktree;
+/// 2. `<git_dir>/commondir`, when present — relative values resolve against
+///    `git_dir`, then the result is canonicalized (`strbuf_add_real_path`);
+/// 3. otherwise `git_dir` itself, returned **verbatim** (upstream does not
+///    realpath this branch).
+///
+/// Preserving the verbatim third branch matters: callers detect
+/// linked-worktree identity by comparing the resolved common dir against the
+/// original git dir (`get_git_dir() != get_common_dir()`), which a
+/// canonicalization of the plain case would silently erase.
+pub fn repository_common_dir(git_dir: &Path, honor_environment: bool) -> Result<PathBuf> {
+    if honor_environment && let Some(common_dir) = env::var_os("GIT_COMMON_DIR") {
+        return Ok(PathBuf::from(common_dir));
     }
-    out
-}
-
-/// Compute `target` expressed relative to `base`, both absolute. Mirrors git's
-/// `relative_path()` for the common ancestor case (the only one that arises for
-/// sibling worktree/admin directories under a shared parent).
-fn relative_path_lexical(target: &Path, base: &Path) -> String {
-    let target = normalize_lexical(target);
-    let base = normalize_lexical(base);
-    let target_components: Vec<_> = target.components().collect();
-    let base_components: Vec<_> = base.components().collect();
-    let common = target_components
-        .iter()
-        .zip(base_components.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let mut result = PathBuf::new();
-    for _ in common..base_components.len() {
-        result.push("..");
+    let commondir = git_dir.join("commondir");
+    if commondir.is_file() {
+        let value = fs::read_to_string(&commondir)?;
+        let path = PathBuf::from(value.trim());
+        let common = if path.is_absolute() {
+            path
+        } else {
+            git_dir.join(path)
+        };
+        return Ok(fs::canonicalize(common)?);
     }
-    for component in &target_components[common..] {
-        result.push(component.as_os_str());
-    }
-    if result.as_os_str().is_empty() {
-        ".".to_string()
-    } else {
-        result.display().to_string()
-    }
+    Ok(git_dir.to_path_buf())
 }
 
 fn read_gitdir_file(path: &Path) -> Result<Option<PathBuf>> {

@@ -1213,7 +1213,5 @@ fn remove_dir_all_if_exists(path: &Path) -> Result<()> {
 }
 
 fn bytes_to_path_string(path: &[u8]) -> Result<String> {
-    std::str::from_utf8(path)
-        .map(str::to_string)
-        .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))
+    sley::plumbing::sley_core::paths::bytes_to_path_string(path)
 }

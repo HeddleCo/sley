@@ -4292,21 +4292,11 @@ fn reftable_table_name_is_valid(name: &str) -> bool {
     rest == ".ref" || rest == ".log"
 }
 
+/// Forgiving wrapper over the canonical resolver in [`sley_formats`]: on any
+/// resolution failure fall back to the raw git dir rather than failing ref
+/// access.
 fn repository_common_dir(git_dir: &Path) -> PathBuf {
-    if let Some(common_dir) = std::env::var_os("GIT_COMMON_DIR") {
-        return PathBuf::from(common_dir);
-    }
-    let commondir = git_dir.join("commondir");
-    if let Ok(value) = fs::read_to_string(&commondir) {
-        let path = PathBuf::from(value.trim());
-        let common = if path.is_absolute() {
-            path
-        } else {
-            git_dir.join(path)
-        };
-        return fs::canonicalize(&common).unwrap_or(common);
-    }
-    git_dir.to_path_buf()
+    sley_formats::repository_common_dir(git_dir, true).unwrap_or_else(|_| git_dir.to_path_buf())
 }
 
 fn log_all_ref_updates_matches(name: &str, value: &str) -> bool {

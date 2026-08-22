@@ -2,7 +2,7 @@
 
 use std::cell::Cell;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use sley::{GitError, Result};
 use sley_pathspec::{
@@ -13,6 +13,8 @@ use sley_pathspec::{
 use crate::session_globals::attribute_checks_for_matching;
 use crate::sley_index;
 use crate::sley_worktree;
+
+use sley::plumbing::sley_core::paths::relative_path_bytes;
 
 pub(crate) fn index_entry_stage(entry: &sley_index::IndexEntry) -> u16 {
     (entry.flags >> 12) & 0x3
@@ -187,135 +189,4 @@ pub(crate) fn path_component_count(path: &[u8]) -> usize {
     path.split(|byte| *byte == b'/')
         .filter(|component| !component.is_empty())
         .count()
-}
-
-/// Render `input` relative to `prefix`, a faithful byte-level port of git's
-/// `relative_path()` (path.c) for the POSIX, both-relative case (no DOS drive).
-/// `prefix` is the cwd prefix and must end with `/` when non-empty, matching
-/// git's `cmd_prefix`. Emits `../` for each `prefix` component not shared with
-/// `input`, then the unshared tail of `input`.
-// `i` and `j` are independent cursors because repeated separators can advance
-// the prefix and input by different amounts.
-#[allow(clippy::suspicious_operation_groupings)]
-pub(crate) fn relative_path_bytes(input: &[u8], prefix: &[u8]) -> Vec<u8> {
-    let in_len = input.len();
-    let prefix_len = prefix.len();
-    if in_len == 0 {
-        return b"./".to_vec();
-    }
-    if prefix_len == 0 {
-        return input.to_vec();
-    }
-    let is_sep = |byte: u8| byte == b'/';
-    let mut i = 0usize;
-    let mut j = 0usize;
-    let mut prefix_off = 0usize;
-    let mut in_off = 0usize;
-    while i < prefix_len && j < in_len && prefix.get(i) == input.get(j) {
-        if is_sep(prefix[i]) {
-            while i < prefix_len && is_sep(prefix[i]) {
-                i += 1;
-            }
-            while j < in_len && is_sep(input[j]) {
-                j += 1;
-            }
-            prefix_off = i;
-            in_off = j;
-        } else {
-            i += 1;
-            j += 1;
-        }
-    }
-
-    if i >= prefix_len && prefix_off < prefix_len {
-        if j >= in_len {
-            in_off = in_len;
-        } else if is_sep(input[j]) {
-            while j < in_len && is_sep(input[j]) {
-                j += 1;
-            }
-            in_off = j;
-        } else {
-            i = prefix_off;
-        }
-    } else if j >= in_len && in_off < in_len && i < prefix_len && is_sep(prefix[i]) {
-        while i < prefix_len && is_sep(prefix[i]) {
-            i += 1;
-        }
-        in_off = in_len;
-    }
-
-    let input = &input[in_off..];
-    if i >= prefix_len {
-        if input.is_empty() {
-            return b"./".to_vec();
-        }
-        return input.to_vec();
-    }
-
-    let mut out = Vec::new();
-    while i < prefix_len {
-        if is_sep(prefix[i]) {
-            out.extend_from_slice(b"../");
-            while i < prefix_len && is_sep(prefix[i]) {
-                i += 1;
-            }
-            continue;
-        }
-        i += 1;
-    }
-    if !is_sep(prefix[prefix_len - 1]) {
-        out.extend_from_slice(b"../");
-    }
-    out.extend_from_slice(input);
-    out
-}
-
-pub(crate) fn relative_path_from_absolute(cwd: &Path, target: &Path) -> Result<String> {
-    let cwd = fs::canonicalize(cwd)?;
-    relative_path_from_absolute_components(&cwd, target)
-}
-
-pub(crate) fn relative_path_from_absolute_components(cwd: &Path, target: &Path) -> Result<String> {
-    let cwd_components = cwd.components().collect::<Vec<_>>();
-    let target_components = target.components().collect::<Vec<_>>();
-    let common = cwd_components
-        .iter()
-        .zip(target_components.iter())
-        .take_while(|(left, right)| left == right)
-        .count();
-    if common == 0 {
-        return Ok(target.display().to_string());
-    }
-
-    let up_count = cwd_components.len().saturating_sub(common);
-    let mut parts = Vec::new();
-    parts.extend((0..up_count).map(|_| "..".to_string()));
-    parts.extend(
-        target_components[common..]
-            .iter()
-            .map(|component| component.as_os_str().to_string_lossy().into_owned()),
-    );
-    if parts.is_empty() {
-        return Ok("./".into());
-    }
-    let mut relative = parts.join("/");
-    if common == target_components.len() {
-        relative.push('/');
-    }
-    Ok(relative)
-}
-
-pub(crate) fn normalize_lexical_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
 }
