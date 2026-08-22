@@ -721,7 +721,23 @@ fn print_hash_object(
     stdout: &mut dyn Write,
 ) -> Result<()> {
     if !literally {
-        super::hash_object_fsck::check_object(object_type, format, &body)?;
+        // object-file.c `index_mem` under INDEX_FORMAT_CHECK: strict fsck over
+        // the framed bytes before hashing (sley-fsck's content engine).
+        let report = sley_fsck::content::hash_format_check(format, object_type, &body);
+        for finding in &report.diagnostics {
+            if let Some(raw) = &finding.raw_stderr {
+                print_hash_fsck_error_line(raw);
+            }
+            print_hash_fsck_error_line(&format!(
+                "object fails fsck: {}: {}",
+                finding.msg_id.camel(),
+                finding.detail
+            ));
+        }
+        if report.refuse {
+            eprintln!("fatal: refusing to create malformed object");
+            return Err(GitError::Exit(128));
+        }
     }
     let object = sley_object::EncodedObject::new(object_type, body);
     let oid = if let Some(repository) = store {
@@ -731,6 +747,27 @@ fn print_hash_object(
     };
     writeln!(stdout, "{oid}")?;
     Ok(())
+}
+
+/// Print `error: <msg>` with git's control-character sanitization (`vfreportf`
+/// in usage.c replaces every control byte other than `\t`/`\n` with `?`).
+fn print_hash_fsck_error_line(msg: &str) {
+    let line = format!("error: {msg}");
+    let sanitized: String = match String::from_utf8(
+        line.bytes()
+            .map(|byte| {
+                if byte.is_ascii_control() && byte != b'\t' && byte != b'\n' {
+                    b'?'
+                } else {
+                    byte
+                }
+            })
+            .collect::<Vec<u8>>(),
+    ) {
+        Ok(line) => line,
+        Err(_) => line,
+    };
+    eprintln!("{sanitized}");
 }
 
 fn parse_hash_object_format(value: &str) -> Result<ObjectFormat> {

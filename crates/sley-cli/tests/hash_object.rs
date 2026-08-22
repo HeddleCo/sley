@@ -1084,3 +1084,143 @@ fn hash_object_large_regular_file_matches_upstream_git() {
     }
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn hash_object_fsck_validation_matches_upstream_git() {
+    let root = unique_temp_dir("hash-object-fsck-validation");
+    fs::create_dir_all(&root).expect("create temp repo");
+    // Hermetic config: the oracle must not pick up user settings.
+    let envs: &[(&str, &str)] = &[
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_SYSTEM", "/dev/null"),
+    ];
+    let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    let tree_entry = |mode: &str, name: &[u8], fill: u8| {
+        let mut body = format!("{mode} ").into_bytes();
+        body.extend_from_slice(name);
+        body.push(0);
+        body.extend(std::iter::repeat_n(fill, 20));
+        body
+    };
+    let commit = |tree_line: &str, author: &str| {
+        format!("tree {tree_line}\nauthor {author}\ncommitter C <c@d> 1 +0000\n\nm").into_bytes()
+    };
+    let tag = |name: &str, tagger_tail: &str, tail: &str| {
+        format!("object {empty_tree}\ntype commit\ntag {name}\n{tagger_tail}\n{tail}").into_bytes()
+    };
+
+    let cases: Vec<(&str, &str, Vec<u8>)> = vec![
+        // Blobs are never validated.
+        ("blob", "blob", b"\0\0anything goes".to_vec()),
+        // Tree decode failures carry git's plain error() line ahead of badTree.
+        ("tree garbage", "tree", b"garbage".to_vec()),
+        (
+            "tree malformed mode",
+            "tree",
+            [b" 100644 name\0".to_vec(), vec![0; 20]].concat(),
+        ),
+        (
+            "tree empty filename",
+            "tree",
+            [b"100644 \0".to_vec(), vec![0; 20]].concat(),
+        ),
+        // badTree prints before the post-walk zeroPaddedFilemode finding.
+        (
+            "tree zeropad then undecodable",
+            "tree",
+            [
+                b"0100644 f\0".to_vec(),
+                vec![0x11; 20],
+                vec![0; 22],
+                b"x".to_vec(),
+            ]
+            .concat(),
+        ),
+        // Giant modes wrap like parse_mode's unsigned int => uint16_t store.
+        (
+            "tree giant mode",
+            "tree",
+            tree_entry("77777777777", b"f", 0x22),
+        ),
+        // Strict rejects git's early nonstandard 100664.
+        ("tree 100664 strict", "tree", tree_entry("100664", b"f", 0x33)),
+        (
+            "tree duplicate entries",
+            "tree",
+            [tree_entry("100644", b"x", 0x44), tree_entry("100644", b"x", 0x55)].concat(),
+        ),
+        // Commit header structure.
+        (
+            "commit missingTree",
+            "commit",
+            commit("zzz", "A <a@b> 1 +0000"),
+        ),
+        ("commit valid", "commit", commit(empty_tree, "A <a@b> 1 +0000")),
+        // date_overflows boundary: INT64_MAX hashes, INT64_MAX+1 overflows.
+        (
+            "commit ts INT64_MAX",
+            "commit",
+            commit(empty_tree, "A <a@b> 9223372036854775807 +0000"),
+        ),
+        (
+            "commit ts INT64_MAX+1",
+            "commit",
+            commit(empty_tree, "A <a@b> 9223372036854775808 +0000"),
+        ),
+        (
+            "commit nul in body",
+            "commit",
+            [
+                commit(empty_tree, "A <a@b> 1 +0000"),
+                b"more".to_vec(),
+                vec![0],
+            ]
+            .concat(),
+        ),
+        // Tag control flow: badTagName short-circuits; a tagger-ident error
+        // followed by an extra header prints but still hashes.
+        (
+            "tag valid",
+            "tag",
+            tag("t", "tagger A <a@b> 1 +0000", "\nm"),
+        ),
+        (
+            "tag badTagName",
+            "tag",
+            tag("bad~name", "tagger A <a@b> 1 +0000", "\nm"),
+        ),
+        (
+            "tag missingTaggerEntry",
+            "tag",
+            tag("t", "", "\nm"),
+        ),
+        (
+            "tag ident error then extra header",
+            "tag",
+            tag("t", "tagger A <a@b> 1 +00", "extra hdr\n\nm"),
+        ),
+        (
+            "tag ident error without extra header",
+            "tag",
+            tag("t", "tagger A <a@b> 1 badtz", "\nm"),
+        ),
+    ];
+
+    for (label, object_type, stdin) in cases {
+        let args = ["hash-object", "-t", object_type, "--stdin"];
+        let expected =
+            run_output_with_env_and_stdin(sley_testkit::oracle_git(), &root, &args, envs, &stdin);
+        let actual =
+            run_output_with_env_and_stdin(sley_testkit::sley_bin!(), &root, &args, envs, &stdin);
+        assert_same_output(actual, expected, &[label]);
+
+        // --literally bypasses the fsck pass entirely for both binaries.
+        let args = ["hash-object", "-t", object_type, "--stdin", "--literally"];
+        let expected =
+            run_output_with_env_and_stdin(sley_testkit::oracle_git(), &root, &args, envs, &stdin);
+        let actual =
+            run_output_with_env_and_stdin(sley_testkit::sley_bin!(), &root, &args, envs, &stdin);
+        assert_same_output(actual, expected, &[label, "(literally)"]);
+    }
+    let _ = fs::remove_dir_all(&root);
+}

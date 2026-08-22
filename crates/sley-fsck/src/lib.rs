@@ -1084,19 +1084,7 @@ where
 }
 
 fn is_tag_ident_msg(msg_id: content::MsgId) -> bool {
-    matches!(
-        msg_id,
-        content::MsgId::MissingNameBeforeEmail
-            | content::MsgId::MissingEmail
-            | content::MsgId::BadName
-            | content::MsgId::MissingSpaceBeforeEmail
-            | content::MsgId::BadEmail
-            | content::MsgId::MissingSpaceBeforeDate
-            | content::MsgId::BadDate
-            | content::MsgId::ZeroPaddedDate
-            | content::MsgId::BadDateOverflow
-            | content::MsgId::BadTimezone
-    )
+    content::is_tag_ident_msg(msg_id)
 }
 
 fn reachable_objects<R>(reader: &R, format: ObjectFormat, roots: &[ObjectId]) -> HashSet<ObjectId>
