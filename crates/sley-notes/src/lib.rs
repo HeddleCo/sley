@@ -1347,7 +1347,7 @@ fn commit_notes_update_with_preloaded_non_notes(
     if !update_ref {
         return Ok(commit_oid);
     }
-    let old_oid = parents.first().copied().unwrap_or(zero_oid(format)?);
+    let old_oid = parents.first().copied().unwrap_or(ObjectId::null(format));
     let mut tx = store.transaction();
     let reflog_message = reflog_message_from_commit_message(message);
     tx.update(RefUpdate {
@@ -1377,7 +1377,7 @@ fn update_notes_ref_to_commit(
     message: &str,
     identity: &NotesCommitIdentity,
 ) -> Result<()> {
-    let old_oid = old.unwrap_or(zero_oid(format)?);
+    let old_oid = old.unwrap_or(ObjectId::null(format));
     let mut tx = store.transaction();
     tx.update(RefUpdate {
         name: notes_ref.as_str().to_string(),
@@ -1634,10 +1634,6 @@ fn build_nested_tree(db: &mut FileObjectDatabase, entries: &[PathEntry]) -> Resu
         ObjectType::Tree,
         builder.build().write(),
     ))
-}
-
-fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {
-    ObjectId::from_hex(format, &"0".repeat(format.hex_len()))
 }
 
 #[cfg(test)]

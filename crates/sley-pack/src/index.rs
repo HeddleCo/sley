@@ -671,17 +671,6 @@ impl PackIndexViewData {
 }
 
 impl PackIndex {
-    pub fn write_v2_for_pack_sha1(pack_bytes: &[u8]) -> Result<PackIndexBuild> {
-        Self::write_v2_for_pack_sha1_with_limits(pack_bytes, PackReadLimits::default())
-    }
-
-    pub fn write_v2_for_pack_sha1_with_limits(
-        pack_bytes: &[u8],
-        limits: PackReadLimits,
-    ) -> Result<PackIndexBuild> {
-        Self::write_v2_for_pack_with_limits(pack_bytes, ObjectFormat::Sha1, limits)
-    }
-
     pub fn write_v2_for_pack(pack_bytes: &[u8], format: ObjectFormat) -> Result<PackIndexBuild> {
         Self::write_v2_for_pack_with_limits(pack_bytes, format, PackReadLimits::default())
     }

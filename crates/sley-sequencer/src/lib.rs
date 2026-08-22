@@ -262,7 +262,7 @@ fn commit_tree_with_amend_with_odb(
         },
     )?;
     let expected = parent.map(RefTarget::Direct);
-    let old_oid = parent.unwrap_or(zero_oid(format)?);
+    let old_oid = parent.unwrap_or(ObjectId::null(format));
     let reflog = refs
         .should_write_reflog_for_update(&updated_ref, false)?
         .then_some(ReflogEntry {
@@ -330,10 +330,6 @@ fn head_update_target(refs: &FileRefStore) -> Result<(String, Option<ObjectId>)>
         Some(RefTarget::Direct(oid)) => Ok(("HEAD".into(), Some(oid))),
         None => Ok(("HEAD".into(), None)),
     }
-}
-
-fn zero_oid(format: sley_core::ObjectFormat) -> Result<ObjectId> {
-    Ok(ObjectId::null(format))
 }
 
 fn validate_identity_component_bytes(name: &str, value: &[u8]) -> Result<()> {

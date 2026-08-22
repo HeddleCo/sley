@@ -1114,7 +1114,7 @@ mod tests {
         assert_eq!(loose_info.disk_size, loose_size);
         assert_eq!(
             loose_info.deltabase,
-            zero_oid(format).expect("test operation should succeed")
+            ObjectId::null(format)
         );
 
         let base = EncodedObject::new(ObjectType::Blob, vec![b'a'; 4096]);
@@ -1142,7 +1142,7 @@ mod tests {
         assert!(base_info.disk_size > 0);
         assert_eq!(
             base_info.deltabase,
-            zero_oid(format).expect("test operation should succeed")
+            ObjectId::null(format)
         );
 
         let child_info = db
@@ -1225,7 +1225,7 @@ mod tests {
         assert_eq!(missing_pack_info.disk_size, indexed_info.disk_size);
         assert_eq!(
             missing_pack_info.deltabase,
-            zero_oid(format).expect("test operation should succeed")
+            ObjectId::null(format)
         );
 
         fs::remove_dir_all(root).expect("test operation should succeed");

@@ -7,7 +7,7 @@
 
 use sley_core::{DateMode, GitError, ObjectId, Result};
 use sley_strbuf_expand::{
-    AtomTable, ExpandFormat, ExpandSegment, MagicPrefix, PaddingAlign, PaddingSpec,
+    AtomTable, ExpandFormat, ExpandSegment, PaddingAlign, PaddingSpec, apply_magic,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -493,7 +493,7 @@ fn write_for_each_ref_format_range(
                                 render_for_each_ref_align(segments, idx + 1, &options, write_atom)?;
                             let mut value = value;
                             apply_for_each_ref_padding(&mut value, pending_padding.take());
-                            apply_for_each_ref_magic(out, atom.magic, &value);
+                            apply_magic(out, atom.magic, &value);
                             write_for_each_ref_quoted_atom(out, &value, quote)?;
                             idx = next;
                             continue;
@@ -508,7 +508,7 @@ fn write_for_each_ref_format_range(
                             )?;
                             let mut value = value;
                             apply_for_each_ref_padding(&mut value, pending_padding.take());
-                            apply_for_each_ref_magic(out, atom.magic, &value);
+                            apply_magic(out, atom.magic, &value);
                             out.extend_from_slice(&value);
                             idx = next;
                             continue;
@@ -526,7 +526,7 @@ fn write_for_each_ref_format_range(
                 let mut value = Vec::new();
                 write_atom(&mut value, &atom.atom)?;
                 apply_for_each_ref_padding(&mut value, pending_padding.take());
-                apply_for_each_ref_magic(out, atom.magic, &value);
+                apply_magic(out, atom.magic, &value);
                 write_for_each_ref_quoted_atom(out, &value, quote)?;
             }
         }
@@ -735,20 +735,6 @@ fn apply_for_each_ref_align(value: &mut Vec<u8>, options: &ForEachRefAlignOption
     padded.extend_from_slice(value);
     padded.extend(std::iter::repeat_n(b' ', right));
     *value = padded;
-}
-
-fn apply_for_each_ref_magic(out: &mut Vec<u8>, magic: MagicPrefix, value: &[u8]) {
-    match (magic, value.is_empty()) {
-        (MagicPrefix::None, _) | (MagicPrefix::DeleteLfBeforeEmpty, _) => {}
-        (MagicPrefix::AddLfBeforeNonEmpty, false) => out.extend_from_slice(b"\n"),
-        (MagicPrefix::AddSpaceBeforeNonEmpty, false) => out.extend_from_slice(b" "),
-        (MagicPrefix::AddLfBeforeNonEmpty | MagicPrefix::AddSpaceBeforeNonEmpty, true) => {}
-    }
-    if magic == MagicPrefix::DeleteLfBeforeEmpty && value.is_empty() {
-        while out.last().copied() == Some(b'\n') {
-            out.pop();
-        }
-    }
 }
 
 fn apply_for_each_ref_padding(value: &mut Vec<u8>, padding: Option<PaddingSpec>) {

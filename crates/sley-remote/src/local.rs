@@ -59,10 +59,6 @@ use crate::install::install_protocol_v2_fetch_response_from_reader_with_cancel;
 
 /// The all-zero object id for `format`, used for the synthetic
 /// `capabilities^{}` advertisement when a repository has no refs.
-fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {
-    Ok(ObjectId::null(format))
-}
-
 /// Resolve a (possibly symbolic) ref target to its object id, following up to
 /// five levels of symbolic indirection, returning the first symbolic name seen.
 fn resolve_for_each_ref_target(
@@ -147,7 +143,7 @@ pub fn attach_upload_pack_capabilities(
         first.capabilities = capabilities;
     } else {
         advertisements.push(RefAdvertisement {
-            oid: zero_oid(format)?,
+            oid: ObjectId::null(format),
             name: "capabilities^{}".into(),
             capabilities,
         });
@@ -257,7 +253,7 @@ pub fn attach_receive_pack_capabilities(
         first.capabilities = capabilities;
     } else {
         advertisements.push(RefAdvertisement {
-            oid: zero_oid(format)?,
+            oid: ObjectId::null(format),
             name: "capabilities^{}".into(),
             capabilities,
         });

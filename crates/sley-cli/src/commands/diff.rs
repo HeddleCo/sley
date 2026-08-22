@@ -1850,7 +1850,7 @@ pub(crate) fn cmd_diff(cli_session: &crate::session::CliSession, args: &[String]
             diff_direct_blob_pair(&cwd, &git_dir, format, &db, &path_args)?
     {
         if reverse && right.file {
-            eprintln!("fatal: unable to read {}", zero_oid(format)?);
+            eprintln!("fatal: unable to read {}", ObjectId::null(format));
             return Err(GitError::Exit(128));
         }
         if reverse {

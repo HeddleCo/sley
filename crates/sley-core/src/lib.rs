@@ -15,7 +15,7 @@ pub mod fetch_profile;
 
 pub use cancel::{
     AtomicCancel, CancelFlag, CancellableRead, DynCancelFlag, OperationCancelled, StreamControl,
-    cancel_flag_from_arc, cancelled_io_error, is_cancelled_error, is_cancelled_io,
+    cancelled_io_error, is_cancelled_error, is_cancelled_io,
     kill_child_if_cancelled, map_cancel_io,
 };
 
@@ -23,10 +23,10 @@ pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.55.0";
 
 pub mod precompose;
 pub use precompose::{
-    activate_precompose_unicode, has_non_ascii, has_non_ascii_bytes, precompose_argv_if_needed,
+    activate_precompose_unicode, has_non_ascii, precompose_argv_if_needed,
     precompose_bytes_if_needed, precompose_os_str_bytes_if_needed,
-    precompose_owned_string_if_needed, precompose_path_if_needed, precompose_string_if_needed,
-    precompose_unicode_enabled, set_precompose_unicode,
+    precompose_path_if_needed, precompose_string_if_needed, precompose_unicode_enabled,
+    set_precompose_unicode,
 };
 
 pub mod namespace;
@@ -974,25 +974,6 @@ impl FromStr for ObjectId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ByteString(Vec<u8>);
-
-impl ByteString {
-    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
-        Self(bytes.into())
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl From<&str> for ByteString {
-    fn from(value: &str) -> Self {
-        Self(value.as_bytes().to_vec())
-    }
-}
-
 /// A validated git ref name (e.g. `refs/heads/main`, `HEAD`).
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FullName(String);
@@ -1243,10 +1224,10 @@ impl RepoPath {
 pub struct Signature {
     /// The identity's name: the bytes before the ` <` that opens the email,
     /// with one trailing space (the separator) removed. May be empty.
-    pub name: ByteString,
+    pub name: BString,
     /// The identity's email: the bytes between the `<` and `>` delimiters. May
     /// be empty.
-    pub email: ByteString,
+    pub email: BString,
     /// The commit/authorship time and its timezone offset.
     pub time: GitTime,
     /// The exact original ident-line bytes this view was parsed from, retained
@@ -1292,8 +1273,8 @@ impl Signature {
         let time = GitTime::from_time_fields(rest)?;
 
         Some(Self {
-            name: ByteString::new(name.to_vec()),
-            email: ByteString::new(email.to_vec()),
+            name: BString::new(name.to_vec()),
+            email: BString::new(email.to_vec()),
             time,
             raw: line.to_vec(),
         })
@@ -2089,7 +2070,8 @@ fn write_hex_bytes(bytes: &[u8], out: &mut impl fmt::Write) -> fmt::Result {
     Ok(())
 }
 
-fn hex_nibble_value(byte: u8) -> Option<u8> {
+/// Decode a single hex ASCII byte to its nibble value (`'a'` -> `10`).
+pub fn hex_nibble_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),

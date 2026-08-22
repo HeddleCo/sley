@@ -1101,7 +1101,7 @@ fn create_or_update_tag(options: TagCreateOrUpdate<'_>) -> Result<()> {
             reflog: tag_create_reflog_entry(
                 git_dir,
                 format,
-                zero_oid(format)?,
+                ObjectId::null(format),
                 target,
                 reflog_target,
                 create_reflog,
@@ -1116,7 +1116,7 @@ fn create_or_update_tag(options: TagCreateOrUpdate<'_>) -> Result<()> {
         Some(RefTarget::Direct(oid)) => Some(oid),
         Some(RefTarget::Symbolic(_)) | None => None,
     };
-    let old_oid = old.clone().unwrap_or(zero_oid(format)?);
+    let old_oid = old.clone().unwrap_or(ObjectId::null(format));
     let mut tx = store.transaction();
     tx.update(RefUpdate {
         name,
@@ -2205,7 +2205,7 @@ fn print_tag_list(
         } else {
             Vec::new()
         };
-        let deltabase = zero_oid(format)?;
+        let deltabase = ObjectId::null(format);
         let mailmap = if tag_format_needs_mailmap(format_spec) {
             commands::utility::Mailmap::load_default(git_dir, format, replace_objects)?
         } else {
@@ -2439,7 +2439,7 @@ fn populate_tag_sort_metadata(
             object_type: object.object_type.as_str().to_string(),
             object_size: object.body.len(),
             object_disk_size: for_each_ref_loose_object_disk_size(git_dir, &oid)?.unwrap_or(0),
-            deltabase: zero_oid(format)?.to_hex(),
+            deltabase: ObjectId::null(format).to_hex(),
             peeled_object,
             authordate: tag_sort_date_key(contents.as_ref(), ForEachRefDateSortField::Author),
             committerdate: tag_sort_date_key(contents.as_ref(), ForEachRefDateSortField::Committer),

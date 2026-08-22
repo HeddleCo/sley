@@ -394,16 +394,7 @@ fn parse_hex_pair(value: &[u8]) -> Option<u8> {
     let [high, low] = value else {
         return None;
     };
-    Some(hex_digit(*high)? << 4 | hex_digit(*low)?)
-}
-
-fn hex_digit(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
+    Some(sley_core::hex_nibble_value(*high)? << 4 | sley_core::hex_nibble_value(*low)?)
 }
 
 fn parse_padding(input: &str) -> Option<(PaddingSpec, usize)> {
@@ -470,7 +461,10 @@ fn parse_padding(input: &str) -> Option<(PaddingSpec, usize)> {
     ))
 }
 
-fn apply_magic(out: &mut Vec<u8>, magic: MagicPrefix, value: &[u8]) {
+/// Apply a placeholder's magic prefix (`%+`/`% `/`%-`) after appending `value`:
+/// insert the space/newline only when the value is non-empty, and strip
+/// trailing newlines for `%-` when it is (git's `format_commit_item` magic).
+pub fn apply_magic(out: &mut Vec<u8>, magic: MagicPrefix, value: &[u8]) {
     match (magic, value.is_empty()) {
         (MagicPrefix::None, _) | (MagicPrefix::DeleteLfBeforeEmpty, _) => {}
         (MagicPrefix::AddLfBeforeNonEmpty, false) => out.extend_from_slice(b"\n"),

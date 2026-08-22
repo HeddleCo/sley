@@ -2940,10 +2940,6 @@ fn pack_next_byte(pack: &[u8], cursor: &mut usize) -> Result<u8> {
     Ok(byte)
 }
 
-pub(crate) fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {
-    Ok(ObjectId::null(format))
-}
-
 /// Remove `path` if it exists, treating a missing file as success.
 pub(crate) fn remove_file_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {

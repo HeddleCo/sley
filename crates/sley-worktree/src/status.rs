@@ -160,25 +160,8 @@ impl<T> StatusTask<'_, T> {
     }
 }
 
-pub(crate) enum BorrowedIndexBytes {
-    Owned(Vec<u8>),
-    Mapped(sley_mmap::MappedFile),
-}
-
-impl AsRef<[u8]> for BorrowedIndexBytes {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            Self::Owned(bytes) => bytes,
-            Self::Mapped(bytes) => bytes.as_bytes(),
-        }
-    }
-}
-
-pub(crate) fn read_borrowed_index_bytes(index_path: &Path) -> Result<BorrowedIndexBytes> {
-    match sley_mmap::MappedFile::open_index(index_path) {
-        Ok(mapped) => Ok(BorrowedIndexBytes::Mapped(mapped)),
-        Err(_) => Ok(BorrowedIndexBytes::Owned(fs::read(index_path)?)),
-    }
+pub(crate) fn read_borrowed_index_bytes(index_path: &Path) -> Result<sley_mmap::FileBytes> {
+    Ok(sley_mmap::MappedFile::open_index_or_read(index_path)?)
 }
 
 impl StatusProfileCounters {
@@ -1232,7 +1215,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_if_possible(
             ("index_bytes_len", index_bytes.as_ref().len()),
             (
                 "index_bytes_mapped",
-                usize::from(matches!(index_bytes, BorrowedIndexBytes::Mapped(_))),
+                usize::from(matches!(index_bytes, sley_mmap::FileBytes::Mapped(_))),
             ),
         ],
     );
@@ -1248,7 +1231,7 @@ pub(crate) fn short_status_borrowed_head_matches_index_if_possible(
             ("index_bytes_len", index_bytes.as_ref().len()),
             (
                 "index_bytes_mapped",
-                usize::from(matches!(index_bytes, BorrowedIndexBytes::Mapped(_))),
+                usize::from(matches!(index_bytes, sley_mmap::FileBytes::Mapped(_))),
             ),
             ("borrowed_entries_len", borrowed.entries.len()),
             ("borrowed_entries_cap", borrowed.entries.capacity()),
@@ -1518,7 +1501,7 @@ where
             ("index_bytes_len", index_bytes.as_ref().len()),
             (
                 "index_bytes_mapped",
-                usize::from(matches!(index_bytes, BorrowedIndexBytes::Mapped(_))),
+                usize::from(matches!(index_bytes, sley_mmap::FileBytes::Mapped(_))),
             ),
         ],
     );
@@ -1534,7 +1517,7 @@ where
             ("index_bytes_len", index_bytes.as_ref().len()),
             (
                 "index_bytes_mapped",
-                usize::from(matches!(index_bytes, BorrowedIndexBytes::Mapped(_))),
+                usize::from(matches!(index_bytes, sley_mmap::FileBytes::Mapped(_))),
             ),
             ("borrowed_entries_len", borrowed.entries.len()),
             ("borrowed_entries_cap", borrowed.entries.capacity()),

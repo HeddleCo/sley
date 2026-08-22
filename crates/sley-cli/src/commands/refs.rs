@@ -408,15 +408,6 @@ fn loose_ref_path_for_ref(git_dir: &Path, name: &str) -> Result<PathBuf> {
     }
 }
 
-fn lock_path_for_loose_ref_path(path: &Path) -> Result<PathBuf> {
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| GitError::InvalidPath("ref path has no file name".into()))?;
-    let mut lock_name = file_name.to_os_string();
-    lock_name.push(".lock");
-    Ok(path.with_file_name(lock_name))
-}
-
 fn reflog_logs_dir_for_ref(git_dir: &Path, name: &str) -> Result<PathBuf> {
     if name == "HEAD" || name.starts_with("refs/worktree/") {
         Ok(git_dir.join("logs"))
@@ -567,7 +558,7 @@ fn delete_reflog_entry(
         let old_tip = entries.last().map(|entry| entry.new_oid);
         entries.remove(delete_index);
         if options.rewrite {
-            rewrite_reflog_old_oids(&mut entries, zero_oid(format)?);
+            rewrite_reflog_old_oids(&mut entries, ObjectId::null(format));
         }
         let new_tip = entries.last().map(|entry| entry.new_oid);
         store.write_reflog(&reference, &entries)?;
@@ -734,7 +725,7 @@ fn cmd_reflog_write(cli_session: &crate::session::CliSession, args: &[String]) -
     let format = repository_object_format(&git_dir)?;
     let old_oid = parse_reflog_write_oid(format, &args[1], "old")?;
     let new_oid = parse_reflog_write_oid(format, &args[2], "new")?;
-    let zero = zero_oid(format)?;
+    let zero = ObjectId::null(format);
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     validate_reflog_write_object(&db, &old_oid, &zero, "old")?;
     validate_reflog_write_object(&db, &new_oid, &zero, "new")?;
@@ -976,7 +967,7 @@ fn expire_reflog_entries(
         eprintln!("error: reflog could not be found: '{reference}'");
         return Err(GitError::Exit(255));
     }
-    let zero = zero_oid(format)?;
+    let zero = ObjectId::null(format);
     let mut retained = Vec::new();
     let mut last_kept = zero.clone();
     let mut reachable = None::<Option<HashSet<ObjectId>>>;
@@ -1699,7 +1690,7 @@ pub(crate) fn cmd_update_ref(
     if let Some(expected_oid) = expected_oid.as_ref() {
         check_update_ref_expected(format, &name, current.as_ref(), expected_oid)?;
     }
-    if new_oid == zero_oid(format)? {
+    if new_oid == ObjectId::null(format) {
         return update_ref_delete(
             &store,
             &git_dir,
@@ -1713,7 +1704,7 @@ pub(crate) fn cmd_update_ref(
     }
     let old_oid = match current {
         Some(RefTarget::Direct(oid)) => oid,
-        _ => zero_oid(format)?,
+        _ => ObjectId::null(format),
     };
     let writes_reflog = update_ref_should_write_reflog(&git_dir, &name, create_reflog)?;
     let reftable_fsync_count = if store.uses_reftable()? {
@@ -2217,11 +2208,11 @@ fn dispatch_ref_stdin_command(
 
             let new_oid = match new {
                 Some(v) => resolve_stdin_oid(context, "update", &raw_name, "<new-oid>", &v)?,
-                None => zero_oid(context.format)?,
+                None => ObjectId::null(context.format),
             };
             let expected = match old {
                 OldOid::Absent => None,
-                OldOid::Zero => Some(zero_oid(context.format)?),
+                OldOid::Zero => Some(ObjectId::null(context.format)),
                 OldOid::Value(v) => Some(resolve_stdin_oid(
                     context,
                     "update",
@@ -2293,14 +2284,14 @@ fn dispatch_ref_stdin_command(
 
             let new_oid = match new {
                 Some(v) => resolve_stdin_oid(context, "create", &raw_name, "<new-oid>", &v)?,
-                None => zero_oid(context.format)?,
+                None => ObjectId::null(context.format),
             };
-            if new_oid == zero_oid(context.format)? {
+            if new_oid == ObjectId::null(context.format) {
                 return update_ref_stdin_create_zero(&raw_name);
             }
             let effective = transaction.effective_ref(context.store, &raw_name, *deref)?;
             let name = effective.effective.clone();
-            let zero = zero_oid(context.format)?;
+            let zero = ObjectId::null(context.format);
             if context.batch_updates {
                 return update_ref_stdin_write_batch(
                     context,
@@ -2363,7 +2354,7 @@ fn dispatch_ref_stdin_command(
                 OldOid::Value(v) => {
                     let oid = resolve_stdin_oid(context, "delete", &raw_name, "<old-oid>", &v)?;
                     // git: a resolved zero <old-oid> is also rejected.
-                    if oid == zero_oid(context.format)? {
+                    if oid == ObjectId::null(context.format) {
                         return update_ref_stdin_delete_zero(&raw_name);
                     }
                     Some(oid)
@@ -2418,7 +2409,7 @@ fn dispatch_ref_stdin_command(
 
             let expected = match old {
                 Some(v) => resolve_stdin_oid(context, "verify", &raw_name, "<old-oid>", &v)?,
-                None => zero_oid(context.format)?,
+                None => ObjectId::null(context.format),
             };
             let effective = transaction.effective_ref(context.store, &raw_name, *deref)?;
             let name = effective.effective.clone();
@@ -3121,7 +3112,7 @@ impl UpdateRefStdinTransaction {
         if context.store.uses_reftable()? {
             return Ok(());
         }
-        let zero = zero_oid(context.format)?.to_string();
+        let zero = ObjectId::null(context.format).to_string();
         let updates = self
             .staged
             .iter()
@@ -3223,7 +3214,7 @@ impl UpdateRefStdinTransaction {
                 .parent()
                 .ok_or_else(|| GitError::InvalidPath("ref path has no parent".into()))?;
             fs::create_dir_all(parent)?;
-            let lock_path = lock_path_for_loose_ref_path(&path)?;
+            let lock_path = sley_refs::lock_path_for(&path)?;
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -3346,7 +3337,7 @@ fn update_ref_stdin_hook_updates(
     context: &UpdateRefStdinContext<'_>,
     staged: &[UpdateRefStdinStagedChange],
 ) -> Result<Vec<RefTransactionHookUpdate>> {
-    let zero = zero_oid(context.format)?.to_string();
+    let zero = ObjectId::null(context.format).to_string();
     let mut updates = Vec::new();
     for change in staged {
         match change {
@@ -3463,7 +3454,7 @@ fn update_ref_stdin_commit_staged(
                     | UpdateRefStdinStagedChange::SymrefUpdate(_)
             )
         });
-    let zero = zero_oid(context.format)?;
+    let zero = ObjectId::null(context.format);
     let hook = ReferenceTransactionHookRunner::new(context.git_dir);
     let mut tx = context.store.transaction();
     if run_hooks {
@@ -3839,7 +3830,7 @@ fn update_ref_stdin_symref_update_batch(
     if let Some(UpdateRefStdinSymrefExpected::Target(expected_target)) = expected.as_ref()
         && matches!(context.store.read_ref(name)?, Some(RefTarget::Direct(_)))
     {
-        let zero = zero_oid(context.format)?.to_string();
+        let zero = ObjectId::null(context.format).to_string();
         print_update_ref_stdin_rejection(
             UpdateRefStdinRejection {
                 name: name.to_string(),
@@ -3866,7 +3857,7 @@ fn update_ref_stdin_symref_reflog(
     if !update_ref_should_write_reflog(context.git_dir, name, context.create_reflog)? {
         return Ok(None);
     }
-    let zero = zero_oid(context.format)?;
+    let zero = ObjectId::null(context.format);
     let old_oid = resolve_ref_peeled(context.store, name)?.unwrap_or(zero);
     let new_oid = resolve_ref_peeled(context.store, target)?.unwrap_or(zero);
     Ok(Some(ReflogEntry {
@@ -3944,7 +3935,7 @@ fn update_ref_stdin_symref_verify_oid(
     current: Option<&RefTarget>,
     expected: &ObjectId,
 ) -> Result<()> {
-    let zero = zero_oid(format)?;
+    let zero = ObjectId::null(format);
     if matches!(current, Some(RefTarget::Symbolic(_))) && expected != &zero {
         eprintln!(
             "fatal: cannot lock ref '{requested}': reference is missing but expected {expected}"
@@ -4058,7 +4049,7 @@ fn print_update_ref_stdin_case_conflict_rejection(
         stdout,
         "rejected {name} {new_value} {old_value} reference conflict due to case-insensitive filesystem"
     )?;
-    let lock_path = lock_path_for_loose_ref_path(&loose_ref_path_for_ref(context.git_dir, name)?)?;
+    let lock_path = sley_refs::lock_path_for(&loose_ref_path_for_ref(context.git_dir, name)?)?;
     eprintln!(
         "error: cannot lock ref '{name}': Unable to create '{}': File exists",
         lock_path.display()
@@ -4092,7 +4083,7 @@ fn update_ref_stdin_expected_rejection(
         stdout_reason,
         stderr_reason,
     };
-    let zero = zero_oid(format)?;
+    let zero = ObjectId::null(format);
     if expected == &zero {
         if current.is_some() {
             return Ok(Some(make(
@@ -4143,7 +4134,7 @@ fn check_update_ref_new_value(
     display_name: &str,
     new_oid: &ObjectId,
 ) -> std::result::Result<(), String> {
-    if new_oid == &zero_oid(format).map_err(|err| err.to_string())? {
+    if new_oid == &ObjectId::null(format) {
         return Ok(());
     }
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -4167,7 +4158,7 @@ fn check_update_ref_new_value_cached(
     display_name: &str,
     new_oid: &ObjectId,
 ) -> std::result::Result<(), String> {
-    if new_oid == &zero_oid(context.format).map_err(|err| err.to_string())? {
+    if new_oid == &ObjectId::null(context.format) {
         return Ok(());
     }
     let object_type = if let Some(object_type) = context.object_type_cache.borrow().get(new_oid) {
@@ -4204,7 +4195,7 @@ fn update_ref_stdin_write_batch(
     stdout: &mut dyn Write,
 ) -> Result<()> {
     let current = context.store.read_ref(&request.name)?;
-    let zero = zero_oid(context.format)?;
+    let zero = ObjectId::null(context.format);
     if request.expected_oid == Some(&zero)
         && current.is_some()
         && find_case_insensitive_ref_conflict(context.store, &request.name)?.is_some()
@@ -4299,7 +4290,7 @@ fn update_ref_delete_stdin_batch(
             name,
             current.as_ref(),
             expected,
-            zero_oid(format)?.to_string(),
+            ObjectId::null(format).to_string(),
         )?
     {
         print_update_ref_stdin_rejection(rejection, stdout)?;
@@ -4346,7 +4337,7 @@ fn update_ref_stdin_write(
             expected_oid,
         )?;
     }
-    if request.new_oid == zero_oid(context.format)? {
+    if request.new_oid == ObjectId::null(context.format) {
         return update_ref_delete_stdin_named(
             context.store,
             context.format,
@@ -4362,7 +4353,7 @@ fn update_ref_stdin_write(
         })?;
     let old_oid = match current {
         Some(RefTarget::Direct(oid)) => oid,
-        _ => zero_oid(context.format)?,
+        _ => ObjectId::null(context.format),
     };
     let reflog =
         update_ref_should_write_reflog(context.git_dir, &request.name, context.create_reflog)?
@@ -4445,7 +4436,7 @@ fn update_ref_delete(
 ) -> Result<()> {
     let current = store.read_ref(name)?;
     if let Some(expected) = expected {
-        let zero = zero_oid(format)?;
+        let zero = ObjectId::null(format);
         if expected != &zero {
             match current.as_ref() {
                 Some(RefTarget::Direct(actual)) if actual == expected => {}
@@ -4494,7 +4485,7 @@ fn update_ref_delete(
             "HEAD",
             &ReflogEntry {
                 old_oid: deleted_oid,
-                new_oid: zero_oid(format)?,
+                new_oid: ObjectId::null(format),
                 committer: ref_reflog_committer(config),
                 message: message.to_vec(),
             },
@@ -4524,7 +4515,7 @@ fn update_ref_delete_stdin_named(
 ) -> Result<()> {
     let current = store.read_ref(effective)?;
     if let Some(expected) = expected {
-        let zero = zero_oid(format)?;
+        let zero = ObjectId::null(format);
         if expected != &zero {
             match current.as_ref() {
                 Some(RefTarget::Direct(actual)) if actual == expected => {}
@@ -4717,7 +4708,7 @@ fn check_update_ref_expected(
     current: Option<&RefTarget>,
     expected: &ObjectId,
 ) -> Result<()> {
-    let zero = zero_oid(format)?;
+    let zero = ObjectId::null(format);
     if expected == &zero {
         if current.is_some() {
             return update_ref_lock_failure(name, "reference already exists");
@@ -4755,7 +4746,7 @@ fn check_update_ref_stdin_expected_named(
     current: Option<&RefTarget>,
     expected: &ObjectId,
 ) -> Result<()> {
-    let zero = zero_oid(format)?;
+    let zero = ObjectId::null(format);
     if expected == &zero {
         if matches!(current, Some(RefTarget::Symbolic(_)))
             && resolve_ref_peeled(store, effective)?.is_none()
@@ -5159,7 +5150,7 @@ fn update_symbolic_ref(
     let new_oid = if sley_refs::validate_ref_name_for_read(target).is_ok() {
         resolve_symbolic_ref_oid(store, format, target)?
     } else {
-        zero_oid(format)?
+        ObjectId::null(format)
     };
     let reflog = symbolic_ref_should_write_reflog(git_dir, name)?.then(|| ReflogEntry {
         old_oid,
@@ -5206,8 +5197,8 @@ fn resolve_symbolic_ref_oid(
     name: &str,
 ) -> Result<ObjectId> {
     match resolve_ref_peeled(store, name) {
-        Err(_) => zero_oid(format),
-        Ok(None) => zero_oid(format),
+        Err(_) => Ok(ObjectId::null(format)),
+        Ok(None) => Ok(ObjectId::null(format)),
         Ok(Some(oid)) => Ok(oid),
     }
 }

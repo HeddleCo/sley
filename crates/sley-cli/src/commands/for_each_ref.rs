@@ -655,7 +655,7 @@ pub(crate) fn for_each_ref_core_with_config(
         } else {
             None
         };
-        let deltabase = zero_oid(format)?;
+        let deltabase = ObjectId::null(format);
         // `%(worktreepath)` reads from the hoisted map; the placeholder is the empty
         // path for refs not checked out anywhere, matching git.
         let worktree_path = worktree_paths
@@ -1748,7 +1748,7 @@ fn for_each_ref_sort_key(
         ForEachRefSort::PeeledDeltabase | ForEachRefSort::PeeledDeltabaseDescending => {
             ForEachRefSortKey::Text(
                 if for_each_ref_sort_peeled_object(reference, context)?.is_some() {
-                    zero_oid(context.format)?.to_hex()
+                    ObjectId::null(context.format).to_hex()
                 } else {
                     String::new()
                 },

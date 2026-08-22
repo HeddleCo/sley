@@ -1389,9 +1389,6 @@ impl CommitGraphEntry {
         self.parents.iter().copied()
     }
 
-    pub fn first_parent_index(&self) -> Option<u32> {
-        self.parents.first().copied()
-    }
 }
 
 /// Borrowed iterator over a commit-graph entry's parent object ids.
@@ -1749,19 +1746,6 @@ impl CommitGraphBloomFilters {
         self.filters.get(commit_index).map(Vec::as_slice)
     }
 
-    pub fn contains_path(&self, commit_index: usize, path: &[u8]) -> Option<bool> {
-        let filter = self.filter_for_commit(commit_index)?;
-        Some(commit_graph_bloom_filter_contains(
-            filter,
-            path,
-            CommitGraphBloomSettings {
-                hash_version: self.hash_version,
-                hash_count: self.hash_count,
-                bits_per_entry: self.bits_per_entry,
-                max_changed_paths: DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS.max_changed_paths,
-            },
-        ))
-    }
 }
 
 fn validate_commit_graph_bloom_settings(settings: CommitGraphBloomSettings) -> Result<()> {
@@ -3822,10 +3806,6 @@ fn apply_shared_file_mode(path: &Path, shared_repository: Option<&str>) -> Resul
 
 /// Adjust an existing file using Git's `core.sharedRepository` permission
 /// rules. Engine crates call this after atomically publishing repository files.
-pub fn adjust_shared_repository_file(path: &Path, shared_repository: Option<&str>) -> Result<()> {
-    apply_shared_file_mode(path, shared_repository)
-}
-
 /// Repository permission policy captured once and reused by storage writers.
 ///
 /// Keeping this typed policy on an open object/reference store avoids rereading
@@ -5369,26 +5349,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn shared_repository_file_adjustment_preserves_read_only_intent() {
+    fn shared_repository_permissions_adjust_dir_matches_git() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = unique_temp_dir("shared-file-mode");
+        let perms = SharedRepositoryPermissions {
+            git_dir: None,
+            value: std::sync::Arc::new({
+                let lock = std::sync::OnceLock::new();
+                lock.set(Some("0660".to_string())).ok();
+                lock
+            }),
+        };
+        let root = unique_temp_dir("shared-dir-mode");
         fs::create_dir_all(&root).expect("create temp root");
-        let path = root.join("refs");
-        fs::write(&path, b"refs\n").expect("write refs");
-
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).expect("set read-only mode");
-        adjust_shared_repository_file(&path, Some("0660")).expect("adjust read-only mode");
+        let dir = root.join("refs-heads");
+        fs::create_dir_all(&dir).expect("create dir");
+        perms.adjust_dir(&dir).expect("apply dir policy");
         assert_eq!(
-            fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
-            0o440
-        );
-
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("set writable mode");
-        adjust_shared_repository_file(&path, Some("0660")).expect("adjust writable mode");
-        assert_eq!(
-            fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
-            0o660
+            fs::metadata(&dir)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o770
         );
         let _ = fs::remove_dir_all(root);
     }

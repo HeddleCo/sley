@@ -9,19 +9,6 @@ use crate::index_io::*;
 use crate::status::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorktreeStatus {
-    Clean,
-    Modified(RepoPath),
-    Added(RepoPath),
-    Deleted(RepoPath),
-    Untracked(RepoPath),
-}
-
-pub trait WorktreeScanner {
-    fn status(&self) -> Result<Vec<WorktreeStatus>>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SparseCheckout {
     pub patterns: Vec<Vec<u8>>,
     pub sparse_index: bool,

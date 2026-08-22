@@ -1200,7 +1200,7 @@ pub(super) fn print_branch_list_format_omit_empty_with_sort_color(
     let head_ref = store.current_branch_ref()?;
     let objectname_abbrev = repository_abbrev(git_dir, format)?;
     let objectname_candidates = cat_file_all_object_ids(git_dir, format)?;
-    let deltabase = zero_oid(format)?;
+    let deltabase = ObjectId::null(format);
     let mailmap = commands::utility::Mailmap::load_default(git_dir, format, replace_objects)?;
     let all_refs = branch_sorted_refs(git_dir, format, store, options.mode, sort)?;
     let ref_names: std::collections::HashSet<String> = all_refs
@@ -1221,7 +1221,7 @@ pub(super) fn print_branch_list_format_omit_empty_with_sort_color(
                 name: "HEAD".into(),
                 target: store
                     .read_ref("HEAD")?
-                    .unwrap_or(RefTarget::Direct(zero_oid(format)?)),
+                    .unwrap_or(RefTarget::Direct(ObjectId::null(format))),
             },
         )?
     {
@@ -2182,7 +2182,7 @@ pub(super) fn print_branch_list_verbose(
                 name: "HEAD".into(),
                 target: store
                     .read_ref("HEAD")?
-                    .unwrap_or(RefTarget::Direct(zero_oid(format)?)),
+                    .unwrap_or(RefTarget::Direct(ObjectId::null(format))),
             },
         )?
     {

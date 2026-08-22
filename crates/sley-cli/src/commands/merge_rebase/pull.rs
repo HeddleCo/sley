@@ -1233,7 +1233,7 @@ pub(crate) fn cmd_pull(cli_session: &crate::session::CliSession, args: &[String]
                 expected: None,
                 new: RefTarget::Direct(merge_oid),
                 reflog: Some(ReflogEntry {
-                    old_oid: zero_oid(format)?,
+                    old_oid: ObjectId::null(format),
                     new_oid: merge_oid,
                     committer: commit_identity_from_env("COMMITTER", &config)?,
                     message: b"initial pull".to_vec(),

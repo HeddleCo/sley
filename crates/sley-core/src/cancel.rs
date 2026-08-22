@@ -24,7 +24,6 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Read};
 use std::process::Child;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Cooperative continue/stop control for callback-style event streams
@@ -276,12 +275,6 @@ pub fn kill_child_if_cancelled(child: &mut Child, cancel: CancelFlag<'_>) {
     if cancel.is_cancelled() {
         let _ = child.kill();
     }
-}
-
-/// Compatibility: treat a bare atomic reference as a cancel poll source.
-#[inline]
-pub fn cancel_flag_from_arc(source: &Arc<AtomicCancel>) -> CancelFlag<'_> {
-    CancelFlag::new(source.as_ref())
 }
 
 #[cfg(test)]

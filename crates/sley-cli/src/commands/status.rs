@@ -1097,7 +1097,7 @@ fn print_status_porcelain_v2(
             stdout.write_all(&[separator])?;
         }
     }
-    let zero = zero_oid(format)?;
+    let zero = ObjectId::null(format);
     let entries = status_entries_with_renames_with_database(
         worktree_root,
         format,

@@ -2311,19 +2311,8 @@ impl RawCommitGraphCountState {
     }
 }
 
-enum RawCommitGraphBytes {
-    Owned(Vec<u8>),
-    Mapped(sley_mmap::MappedFile),
-}
-
-impl AsRef<[u8]> for RawCommitGraphBytes {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            Self::Owned(bytes) => bytes,
-            Self::Mapped(bytes) => bytes.as_bytes(),
-        }
-    }
-}
+type RawCommitGraphBytes = sley_mmap::FileBytes;
+use sley_mmap::FileBytes;
 
 impl RawCommitGraph {
     fn parse_for_lookup(bytes: RawCommitGraphBytes, format: ObjectFormat) -> Result<Self> {
@@ -3021,7 +3010,7 @@ fn load_commit_graph_map_inner(
         // Prefer the hot-path reader's diagnostics (git-compatible wording)
         // so corrupt-chunk tests see the same `error:` lines as git. Never
         // surface parse failure as a hard walk error.
-        match RawCommitGraph::parse_for_lookup(RawCommitGraphBytes::Owned(bytes.clone()), format) {
+        match RawCommitGraph::parse_for_lookup(FileBytes::Heap(bytes.clone()), format) {
             Ok(_) => {}
             Err(GitError::InvalidFormat(message)) => {
                 report_commit_graph_load_error(&message);
@@ -3055,12 +3044,9 @@ fn load_direct_commit_graph(git_dir: &Path, format: sley_core::ObjectFormat) -> 
     if !path.exists() {
         return DirectCommitGraph::Missing;
     }
-    let bytes = match sley_mmap::MappedFile::open_commit_graph(&path) {
-        Ok(mapped) => RawCommitGraphBytes::Mapped(mapped),
-        Err(_) => match fs::read(&path) {
-            Ok(bytes) => RawCommitGraphBytes::Owned(bytes),
-            Err(err) => return DirectCommitGraph::Invalid(err.to_string()),
-        },
+    let bytes = match sley_mmap::MappedFile::open_commit_graph_or_read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => return DirectCommitGraph::Invalid(err.to_string()),
     };
     if commit_graph_hash_version_mismatch(bytes.as_ref(), format) {
         // Soft-fail: warned on stderr; treat as absent so walks fall back to objects.
@@ -8768,8 +8754,7 @@ mod tests {
     }
 
     fn zero_oid() -> ObjectId {
-        ObjectId::from_hex(ObjectFormat::Sha1, &"0".repeat(40))
-            .expect("test operation should succeed")
+        ObjectId::null(ObjectFormat::Sha1)
     }
 
     fn oid_set(oids: impl IntoIterator<Item = ObjectId>) -> HashSet<ObjectId> {

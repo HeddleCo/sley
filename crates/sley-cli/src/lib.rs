@@ -32,8 +32,8 @@ use sley::plumbing::sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, P
 use sley::plumbing::sley_refs::{
     FileRefStore, PackRefDecision, Ref, RefTransactionHookUpdate, RefTransactionPhase, RefUpdate,
     ReferenceTransactionHook, ReflogEntry, branch_ref_name, check_refname_format,
-    parse_packed_refs, resolve_ref_peeled, tag_ref_name, validate_ref_name, validate_symref_name,
-    validate_symref_target,
+    parse_packed_refs, resolve_ref_peeled, tag_ref_name,
+    validate_ref_name, validate_symref_name, validate_symref_target,
 };
 use sley::plumbing::sley_remote::FetchOutcome;
 use sley::{
@@ -75,7 +75,6 @@ mod log_cli;
 mod ls_files_pathspec;
 mod ownership;
 mod reflog_parse;
-mod refname_pattern;
 mod remote;
 mod repo_helpers;
 mod repo_path;
@@ -225,9 +224,15 @@ pub(crate) use reflog_parse::{
     parse_reflog_max_parent_count, parse_reflog_min_parent_count, parse_reflog_skip_count,
     reflog_reference_name,
 };
-pub(crate) use refname_pattern::{
-    refname_pattern_matches, refname_pattern_matches_case, short_oid,
-};
+pub(crate) use sley::plumbing::sley_refs::refname_pattern_matches_case;
+
+pub(crate) fn refname_pattern_matches(pattern: &str, name: &str) -> bool {
+    refname_pattern_matches_case(pattern, name, false)
+}
+
+pub(crate) fn short_oid(hex: &str) -> &str {
+    &hex[..hex.len().min(7)]
+}
 
 pub(crate) fn collect_short_status(
     worktree_root: impl AsRef<Path>,

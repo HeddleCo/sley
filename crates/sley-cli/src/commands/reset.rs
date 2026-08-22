@@ -241,7 +241,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
         let old_head =
             match resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects()) {
                 Ok(oid) => oid,
-                Err(_) => zero_oid(format)?,
+                Err(_) => ObjectId::null(format),
             };
         let target_oid =
             resolve_revision_commitish(&git_dir, format, target, cli_session.replace_objects())?;
@@ -388,7 +388,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
         let old_head =
             match resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects()) {
                 Ok(oid) => oid,
-                Err(_) => zero_oid(format)?,
+                Err(_) => ObjectId::null(format),
             };
         if target == "HEAD"
             && resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects()).is_err()
@@ -492,7 +492,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
         let old_head =
             match resolve_revision(&git_dir, format, "HEAD", cli_session.replace_objects()) {
                 Ok(oid) => oid,
-                Err(_) => zero_oid(format)?,
+                Err(_) => ObjectId::null(format),
             };
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         // For `git reset -N` capture the paths the *current* index tracks that the

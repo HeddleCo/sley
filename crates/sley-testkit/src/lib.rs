@@ -1042,7 +1042,7 @@ pub fn loose_ref_interop_parity_for_format(format: ObjectFormat) -> Result<RefIn
             expected: None,
             new: RefTarget::Direct(oid),
             reflog: Some(ReflogEntry {
-                old_oid: zero_oid(format)?,
+                old_oid: ObjectId::null(format),
                 new_oid: oid,
                 committer: b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
                 message: b"interop".to_vec(),
@@ -3436,7 +3436,7 @@ pub fn update_ref_delete_parity_for_format(format: ObjectFormat) -> Result<Updat
             expected: None,
             new: RefTarget::Direct(commit.oid),
             reflog: Some(ReflogEntry {
-                old_oid: zero_oid(format)?,
+                old_oid: ObjectId::null(format),
                 new_oid: commit.oid,
                 committer: identity,
                 message: b"update by test".to_vec(),
@@ -5536,10 +5536,6 @@ fn init_repo_with_format(root: &Path, format: ObjectFormat) -> Result<Vec<u8>> {
             &[],
         ),
     }
-}
-
-fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {
-    Ok(ObjectId::null(format))
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {

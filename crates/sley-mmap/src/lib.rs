@@ -197,6 +197,59 @@ impl AsRef<[u8]> for MappedFile {
     }
 }
 
+macro_rules! define_map_or_read {
+    ($doc:literal, $name:ident, $inner:ident) => {
+        #[doc = concat!("Load a git ", $doc, " read-only: memory-map it when possible, falling back to\n        /// a full heap read (`std::fs::read`) if mapping fails (e.g. symlinked,\n        /// unusually named, or otherwise unmappable paths).\n        ///\n        /// This bundles the try-mmap-else-read pattern every sley consumer needs\n        /// so the fallback policy lives next to the audited `unsafe` instead of\n        /// being hand-rolled per crate.\n        ///\n        /// # Errors\n        ///\n        /// Returns any I/O error from the final read attempt when both mapping\n        /// and reading fail.")]
+        pub fn $name(path: &Path) -> io::Result<FileBytes> {
+            match Self::$inner(path) {
+                Ok(mapped) => Ok(FileBytes::Mapped(mapped)),
+                Err(_) => Ok(FileBytes::Heap(std::fs::read(path)?)),
+            }
+        }
+    };
+}
+
+impl MappedFile {
+    define_map_or_read!(
+        "index file (`index`)",
+        open_index_or_read,
+        open_index
+    );
+    define_map_or_read!("pack/index file (`*.pack` / `*.idx`)", open_pack_or_read, open_pack);
+    define_map_or_read!(
+        "multi-pack-index file",
+        open_multi_pack_index_or_read,
+        open_multi_pack_index
+    );
+    define_map_or_read!("commit-graph file", open_commit_graph_or_read, open_commit_graph);
+}
+
+/// Owned bytes of an immutable git file: memory-mapped when possible, otherwise
+/// read into the heap. Dereferences to the same `&[u8]` either way, so decode
+/// paths are written once against the borrowed view.
+#[derive(Debug)]
+pub enum FileBytes {
+    Mapped(MappedFile),
+    Heap(Vec<u8>),
+}
+
+impl Deref for FileBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
+impl AsRef<[u8]> for FileBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(mapped) => mapped.as_bytes(),
+            Self::Heap(bytes) => bytes,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::MappedFile;

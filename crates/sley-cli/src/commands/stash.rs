@@ -4233,7 +4233,7 @@ fn cmd_stash_export(cli_session: &crate::session::CliSession, args: &[String]) -
     if let Some(refname) = to_ref {
         let old_oid = match store.read_ref(&refname)? {
             Some(RefTarget::Direct(oid)) => oid,
-            Some(RefTarget::Symbolic(_)) | None => zero_oid(format)?,
+            Some(RefTarget::Symbolic(_)) | None => ObjectId::null(format),
         };
         let mut tx = store.transaction();
         tx.update(RefUpdate {

@@ -8,7 +8,7 @@
 
 use sley_config::GitConfig;
 use sley_core::{
-    BString, GitError, MissingObjectContext, MissingObjectKind, ObjectFormat, ObjectId, RepoPath,
+    BString, GitError, MissingObjectContext, MissingObjectKind, ObjectFormat, ObjectId,
     Result,
 };
 use sley_index::{

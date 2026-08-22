@@ -38,7 +38,7 @@ use crate::install::{ObjectPrefixResolution, ObjectStorageInfo};
 use crate::loose::LooseObjectStore;
 use crate::reachability::{
     PackDeltaBase, PackIndexOffsetInfo, pack_entry_delta_base, scan_pack_index_offsets,
-    scan_pack_offsets_without_index, zero_oid,
+    scan_pack_offsets_without_index,
 };
 use crate::registry::{
     ObjectPresenceChecker, PackLookup, PackRegistryCache, PackRegistrySnapshot,
@@ -891,7 +891,7 @@ impl FileObjectDatabase {
         if let Some(disk_size) = self.loose.disk_size(oid)? {
             return Ok(Some(ObjectStorageInfo {
                 disk_size,
-                deltabase: zero_oid(self.format)?,
+                deltabase: ObjectId::null(self.format),
             }));
         }
         if let Some(info) = self.packed_object_storage_info(oid)? {
@@ -910,7 +910,7 @@ impl FileObjectDatabase {
         if let Some(disk_size) = self.loose.disk_size(oid)? {
             return Ok(Some(ObjectStorageInfo {
                 disk_size,
-                deltabase: zero_oid(self.format)?,
+                deltabase: ObjectId::null(self.format),
             }));
         }
         Ok(None)
@@ -1640,7 +1640,7 @@ impl FileObjectDatabase {
                     .ok_or_else(|| {
                         GitError::InvalidFormat(format!("ofs-delta base offset {offset} not found"))
                     })?,
-                None => zero_oid(self.format)?,
+                None => ObjectId::null(self.format),
             };
             PackIndexOffsetInfo {
                 end_offset,
@@ -1665,7 +1665,7 @@ impl FileObjectDatabase {
                 GitError::InvalidFormat("ofs-delta base oid missing from pack index".into())
             })?,
             Some(PackDeltaBase::Ref(oid)) => oid,
-            None => zero_oid(self.format)?,
+            None => ObjectId::null(self.format),
         };
         Ok(Some(ObjectStorageInfo {
             disk_size,

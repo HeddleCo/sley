@@ -5220,7 +5220,7 @@ fn am_abort(
                 None => orig_head.unwrap_or(oid).to_hex(),
             };
             let reflog = ReflogEntry {
-                old_oid: current.unwrap_or(zero_oid(format)?),
+                old_oid: current.unwrap_or(ObjectId::null(format)),
                 new_oid: oid,
                 committer,
                 message: format!("{action} (abort): returning to {returning_to}").into_bytes(),
@@ -5343,7 +5343,7 @@ fn am_abort(
                 expected: None,
                 new: RefTarget::Direct(*orig),
                 reflog: Some(ReflogEntry {
-                    old_oid: curr_head.unwrap_or(zero_oid(format)?),
+                    old_oid: curr_head.unwrap_or(ObjectId::null(format)),
                     new_oid: *orig,
                     committer,
                     message: b"am --abort".to_vec(),

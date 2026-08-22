@@ -118,7 +118,7 @@ pub(super) fn run_branch_move_options(
             let head_was_old = store.current_branch_ref()?.as_deref() == Some(old_ref.as_str());
             let old_oid = match store.read_ref(&old_ref)? {
                 Some(RefTarget::Direct(oid)) => oid,
-                _ => zero_oid(repository_object_format(git_dir)?)?,
+                _ => ObjectId::null(repository_object_format(git_dir)?),
             };
             let head_reflog_message =
                 format!("Branch: renamed {old_ref} to {new_ref}").into_bytes();

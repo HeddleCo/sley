@@ -2309,21 +2309,21 @@ fn read_worktree_list_entry(
                 if let Some(branch) = head.strip_prefix("ref: ") {
                     match read_common_ref_oid(common_git_dir, format, branch) {
                         Ok(oid) => (
-                            Some(oid.unwrap_or(zero_oid(format)?)),
+                            Some(oid.unwrap_or(ObjectId::null(format))),
                             Some(branch.to_string()),
                             false,
                             false,
                         ),
-                        Err(_) => (Some(zero_oid(format)?), None, false, true),
+                        Err(_) => (Some(ObjectId::null(format)), None, false, true),
                     }
                 } else {
                     match ObjectId::from_hex(format, head) {
                         Ok(oid) => (Some(oid), None, true, false),
-                        Err(_) => (Some(zero_oid(format)?), None, false, true),
+                        Err(_) => (Some(ObjectId::null(format)), None, false, true),
                     }
                 }
             }
-            Err(_) => (Some(zero_oid(format)?), None, false, true),
+            Err(_) => (Some(ObjectId::null(format)), None, false, true),
         }
     };
     Ok(WorktreeListEntry {

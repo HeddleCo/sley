@@ -399,7 +399,7 @@ fn write_config_entry(out: &mut Vec<u8>, entry: &ConfigEntry, indent: &[u8]) {
 
 /// Maximum depth of nested `include`/`includeIf` directives, matching git's
 /// `MAX_INCLUDE_DEPTH`.
-pub const CONFIG_MAX_INCLUDE_DEPTH: usize = 10;
+const CONFIG_MAX_INCLUDE_DEPTH: usize = 10;
 
 /// Context used to evaluate conditional `includeIf` directives.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

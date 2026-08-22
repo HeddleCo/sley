@@ -946,14 +946,9 @@ pub(crate) fn parse_pkt_len(bytes: &[u8]) -> Result<usize> {
 }
 
 fn hex_nibble(byte: u8) -> Result<u8> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(GitError::InvalidFormat(format!(
-            "invalid pkt-line length byte {byte:#04x}"
-        ))),
-    }
+    sley_core::hex_nibble_value(byte).ok_or_else(|| {
+        GitError::InvalidFormat(format!("invalid pkt-line length byte {byte:#04x}"))
+    })
 }
 fn validate_protocol_error_message(message: &str) -> Result<()> {
     if message.is_empty() {

@@ -780,7 +780,7 @@ mod tests {
         )
         .expect("test operation should succeed");
 
-        let indexed = PackIndex::write_v2_for_pack_sha1(&written.pack)
+        let indexed = PackIndex::write_v2_for_pack(&written.pack, ObjectFormat::Sha1)
             .expect("test operation should succeed");
         let index =
             PackIndex::parse_v2_sha1(&indexed.index).expect("test operation should succeed");
@@ -1525,7 +1525,7 @@ mod tests {
         let mut pack = single_object_pack(ObjectFormat::Sha1, ObjectType::Blob, b"hello\n");
         let last = pack.len() - 1;
         pack[last] ^= 1;
-        assert!(PackIndex::write_v2_for_pack_sha1(&pack).is_err());
+        assert!(PackIndex::write_v2_for_pack(&pack, ObjectFormat::Sha1).is_err());
     }
 
     #[test]

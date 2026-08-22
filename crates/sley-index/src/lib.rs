@@ -1720,27 +1720,10 @@ pub fn repository_index_path(git_dir: impl AsRef<Path>) -> PathBuf {
         .unwrap_or_else(|| git_dir.as_ref().join("index"))
 }
 
-enum RepositoryIndexBytes {
-    Owned(Vec<u8>),
-    Mapped(sley_mmap::MappedFile),
-}
-
-impl AsRef<[u8]> for RepositoryIndexBytes {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            Self::Owned(bytes) => bytes,
-            Self::Mapped(mapped) => mapped.as_bytes(),
-        }
-    }
-}
-
 /// Load repository index bytes, memory-mapping the standard `$GIT_DIR/index`
 /// path when possible and falling back to a heap read otherwise.
-fn read_repository_index_bytes(index_path: &Path) -> Result<RepositoryIndexBytes> {
-    match sley_mmap::MappedFile::open_index(index_path) {
-        Ok(mapped) => Ok(RepositoryIndexBytes::Mapped(mapped)),
-        Err(_) => Ok(RepositoryIndexBytes::Owned(fs::read(index_path)?)),
-    }
+fn read_repository_index_bytes(index_path: &Path) -> Result<sley_mmap::FileBytes> {
+    Ok(sley_mmap::MappedFile::open_index_or_read(index_path)?)
 }
 
 /// Read this repository's index and expand a split index through its

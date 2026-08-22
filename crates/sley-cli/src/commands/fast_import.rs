@@ -843,7 +843,7 @@ fn load_mark_file(
             GitError::InvalidFormat("fast-import: mark object id is not utf8".into())
         })?;
         let oid = ObjectId::from_hex(format, oid_text)?;
-        if oid == zero_oid(format)? {
+        if oid == ObjectId::null(format) {
             return Err(GitError::Command(format!(
                 "fast-import: corrupt mark line {}",
                 idx + 1
@@ -1255,7 +1255,7 @@ fn handle_commit(
             // An explicit `from` (even to the zero oid, meaning "no parent")
             // fixes the base, so the implicit default below is suppressed.
             let oid = resolve_committish(db, store, format, marks, ref_states, rest)?;
-            if oid != zero_oid(format)? {
+            if oid != ObjectId::null(format) {
                 unchanged_tree_oid = Some(seed_tree_from_commit(db, format, &oid, &mut tree)?);
                 parents.clear();
                 parents.push(oid);
@@ -1264,7 +1264,7 @@ fn handle_commit(
         } else if let Some(rest) = line_after(&line, b"merge ") {
             parser.next_command_line()?;
             let oid = resolve_committish(db, store, format, marks, ref_states, rest)?;
-            if oid != zero_oid(format)? {
+            if oid != ObjectId::null(format) {
                 parents.push(oid);
             }
         } else if let Some(rest) = line_after(&line, b"M ") {
@@ -1793,7 +1793,7 @@ fn handle_tag(
         } else if let Some(rest) = line_after(&line, b"from ") {
             parser.next_command_line()?;
             let oid = resolve_objectish(db, store, format, marks, ref_states, rest)?;
-            if oid == zero_oid(format)? {
+            if oid == ObjectId::null(format) {
                 return Err(GitError::Command(
                     "fast-import: tag cannot target zero oid".into(),
                 ));
@@ -1907,7 +1907,7 @@ fn handle_reset(
         return Ok(());
     };
     let oid = resolve_committish(db, store, format, marks, ref_states, &from)?;
-    if oid == zero_oid(format)? {
+    if oid == ObjectId::null(format) {
         dirty_refs.insert(ref_name.clone());
         ref_states.insert(ref_name, FastImportRefState::Empty);
     } else {
@@ -2214,7 +2214,7 @@ fn apply_notemodify(
     };
 
     let target = resolve_committish(db, store, format, marks, ref_states, committish)?;
-    if target == zero_oid(format)? {
+    if target == ObjectId::null(format) {
         return Err(GitError::Command(
             "fast-import: cannot add note for empty branch".into(),
         ));
@@ -2245,7 +2245,7 @@ fn resolve_committish(
         .map_err(|_| GitError::InvalidFormat("fast-import: committish not utf8".into()))?;
     let (base, suffix) = split_fast_import_revision_suffix(text)?;
     let mut oid = resolve_committish_base(db, store, format, marks, ref_states, base)?;
-    if oid == zero_oid(format)? {
+    if oid == ObjectId::null(format) {
         return Ok(oid);
     }
     apply_fast_import_revision_suffix(db, format, &mut oid, suffix)?;
@@ -2271,7 +2271,7 @@ fn resolve_committish_base(
     }
     if let Some(state) = ref_states.get(text) {
         return match state {
-            FastImportRefState::Empty => Ok(zero_oid(format)?),
+            FastImportRefState::Empty => Ok(ObjectId::null(format)),
             FastImportRefState::Tip(oid) => Ok(*oid),
         };
     }
@@ -2288,7 +2288,7 @@ fn resolve_committish_base(
     // Fall back to a literal hex oid.
     let oid = ObjectId::from_hex(format, text)
         .map_err(|_| GitError::Command(format!("fast-import: cannot resolve '{text}'")))?;
-    if oid == zero_oid(format)? {
+    if oid == ObjectId::null(format) {
         return Ok(oid);
     }
     if db.contains(&oid)? {
@@ -2855,11 +2855,11 @@ fn flush_fast_import_refs(
             FastImportRefState::Tip(new_oid) => {
                 let old_oid = match store.read_ref(&ref_name)? {
                     Some(RefTarget::Direct(oid)) => oid,
-                    _ => zero_oid(format)?,
+                    _ => ObjectId::null(format),
                 };
                 if !force
                     && ref_name.starts_with("refs/heads/")
-                    && old_oid != zero_oid(format)?
+                    && old_oid != ObjectId::null(format)
                     && !sley_rev::is_ancestor(git_dir, format, db, &old_oid, &new_oid)?
                 {
                     eprintln!(
@@ -2896,7 +2896,7 @@ fn update_ref_direct(
     }
     let old_oid = match store.read_ref(ref_name)? {
         Some(RefTarget::Direct(oid)) => oid,
-        _ => zero_oid(format)?,
+        _ => ObjectId::null(format),
     };
     let reflog = fast_import_should_write_reflog(git_dir, ref_name)?.then(|| ReflogEntry {
         old_oid,

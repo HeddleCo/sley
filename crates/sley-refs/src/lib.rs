@@ -886,7 +886,7 @@ pub struct BranchDelete {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TagCreate {
+pub struct TagRefCreated {
     pub name: String,
     pub oid: ObjectId,
 }
@@ -2249,7 +2249,7 @@ impl FileRefStore {
         Ok(())
     }
 
-    pub fn create_tag(&self, tag: &str, target: ObjectId) -> Result<TagCreate> {
+    pub fn create_tag(&self, tag: &str, target: ObjectId) -> Result<TagRefCreated> {
         let name = tag_ref_name(tag)?;
         if self.read_ref(&name)?.is_some() {
             return Err(GitError::Transaction(format!("tag {tag} already exists")));
@@ -2262,7 +2262,7 @@ impl FileRefStore {
             reflog: None,
         });
         tx.commit()?;
-        Ok(TagCreate { name, oid: target })
+        Ok(TagRefCreated { name, oid: target })
     }
 
     pub fn apply_bundle_ref_updates(
@@ -6570,7 +6570,8 @@ fn acquire_path_lock_with_timeout(path: &Path, timeout_millis: u64) -> Result<()
     }
 }
 
-fn lock_path_for(path: &Path) -> Result<PathBuf> {
+/// Lock-file path for a loose/packed ref file (`refs/heads/x` -> `refs/heads/x.lock`).
+pub fn lock_path_for(path: &Path) -> Result<PathBuf> {
     let file_name = path
         .file_name()
         .ok_or_else(|| GitError::InvalidPath("ref path has no filename".into()))?;
@@ -6937,7 +6938,7 @@ where
             Some(reflog) => Some(ReflogEntry {
                 old_oid: match &old_oid {
                     Some(oid) => *oid,
-                    None => null_oid(bundle_ref.oid.format())?,
+                    None => ObjectId::null(bundle_ref.oid.format()),
                 },
                 new_oid: bundle_ref.oid,
                 committer: reflog.committer.clone(),
@@ -6958,10 +6959,6 @@ where
         });
     }
     Ok((updates, applied))
-}
-
-fn null_oid(format: ObjectFormat) -> Result<ObjectId> {
-    Ok(ObjectId::null(format))
 }
 
 #[cfg(test)]
@@ -6986,6 +6983,15 @@ mod tests {
             false
         ));
         assert!(refname_pattern_matches_case("release[", "release[", false));
+        // `*` spans slashes; `?` is exactly one byte.
+        assert!(refname_pattern_matches_case("*2026.05", "release/2026.05", false));
+        assert!(refname_pattern_matches_case("qa-?", "qa-1", false));
+        assert!(!refname_pattern_matches_case("v?.0", "v10.0", false));
+        // Bracket classes, ranges, and `!` negation.
+        assert!(refname_pattern_matches_case("q[ab]-?", "qa-1", false));
+        assert!(refname_pattern_matches_case("v[1-3].0", "v2.0", false));
+        assert!(refname_pattern_matches_case("v[!1].0", "v2.0", false));
+        assert!(!refname_pattern_matches_case("v[!1].0", "v1.0", false));
     }
 
     #[test]
@@ -7359,7 +7365,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             expected: None,
             new: RefTarget::Direct(oid),
             reflog: Some(ReflogEntry {
-                old_oid: zero_oid(ObjectFormat::Sha1).expect("test operation should succeed"),
+                old_oid: ObjectId::null(ObjectFormat::Sha1),
                 new_oid: oid,
                 committer: b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
                 message: b"update by test".to_vec(),
@@ -7467,7 +7473,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         assert_eq!(tag_log.len(), 1);
         assert_eq!(
             tag_log[0].old_oid,
-            zero_oid(ObjectFormat::Sha1).expect("test operation should succeed")
+            ObjectId::null(ObjectFormat::Sha1)
         );
         assert_eq!(tag_log[0].new_oid, tag_oid);
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
@@ -7563,7 +7569,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             expected: None,
             new: RefTarget::Direct(first.clone()),
             reflog: Some(ReflogEntry {
-                old_oid: zero_oid(ObjectFormat::Sha1).expect("test operation should succeed"),
+                old_oid: ObjectId::null(ObjectFormat::Sha1),
                 new_oid: first.clone(),
                 committer: b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
                 message: b"old".to_vec(),
@@ -7685,7 +7691,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             expected: None,
             new: RefTarget::Direct(oid),
             reflog: Some(ReflogEntry {
-                old_oid: zero_oid(ObjectFormat::Sha1).expect("test operation should succeed"),
+                old_oid: ObjectId::null(ObjectFormat::Sha1),
                 new_oid: oid,
                 committer: b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
                 message: b"update by test".to_vec(),
@@ -7762,7 +7768,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             expected: None,
             new: RefTarget::Direct(oid),
             reflog: Some(ReflogEntry {
-                old_oid: zero_oid(ObjectFormat::Sha1).expect("test operation should succeed"),
+                old_oid: ObjectId::null(ObjectFormat::Sha1),
                 new_oid: oid,
                 committer: b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
                 message: b"create main".to_vec(),
@@ -9520,7 +9526,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
 
     fn reflog_entry(new_oid: &ObjectId, timestamp: i64, message: &str) -> ReflogEntry {
         ReflogEntry {
-            old_oid: zero_oid(new_oid.format()).expect("test operation should succeed"),
+            old_oid: ObjectId::null(new_oid.format()),
             new_oid: *new_oid,
             committer: format!("Git Rs <sley@example.invalid> {timestamp} +0000").into_bytes(),
             message: message.as_bytes().to_vec(),
@@ -10422,10 +10428,6 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         ));
         fs::create_dir_all(&path).expect("test operation should succeed");
         path
-    }
-
-    fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {
-        Ok(ObjectId::null(format))
     }
 
     fn write_reftable_config(git_dir: &Path) {

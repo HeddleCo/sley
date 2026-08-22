@@ -112,7 +112,3 @@ pub(crate) fn revision_ref_name_exists(git_dir: &Path, format: ObjectFormat, rev
             .flatten()
             .is_some()
 }
-
-pub(crate) fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {
-    Ok(ObjectId::null(format))
-}

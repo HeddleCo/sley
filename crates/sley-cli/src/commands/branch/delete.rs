@@ -208,7 +208,7 @@ pub(super) fn force_update_branch(
             })
         }
         Some(_) if branch_should_write_reflog(git_dir, &name, false)? => Some(ReflogEntry {
-            old_oid: zero_oid(format)?,
+            old_oid: ObjectId::null(format),
             new_oid,
             committer: commit_identity_from_env("COMMITTER", config)?,
             message: branch_reset_reflog_message(store, start)?,
