@@ -593,6 +593,83 @@ pub fn read_repo_config_file_only(git_dir: &Path) -> Result<GitConfig> {
     Ok(config)
 }
 
+/// Read the *effective* worktree configuration: system → global → repository
+/// layers with `include`/`includeIf` resolution, the optional per-worktree
+/// `<git_dir>/config.worktree` layer (when `extensions.worktreeConfig` is on),
+/// and inherited-environment `-c` injections (`GIT_CONFIG_COUNT` /
+/// `GIT_CONFIG_PARAMETERS`) layered last.
+///
+/// Unlike [`read_repo_config`] — which reads only `<git_dir>/config` (plus its
+/// includes and injections) and therefore silently misses keys set in
+/// `/etc/gitconfig` or a user's global config — this reader mirrors the
+/// composition the CLI performs per invocation. Upstream git consults this full
+/// stack for every worktree-behavior lookup (`core.excludesFile`,
+/// `core.attributesFile`, `core.ignoreCase`, `core.filemode`, `index.version`,
+/// …), so library consumers that feed worktree behavior must use *this*
+/// function, not [`read_repo_config`].
+///
+/// Use [`read_repo_config`] / [`read_repo_config_file_only`] instead when a
+/// consumer genuinely wants only the on-disk repository config: read-modify-
+/// write of `.git/config`, remote-policy checks during a local push, or legacy
+/// `$GIT_DIR/remotes/*` synthesis — none of which are performed here.
+///
+/// `common_git_dir` locates the shared repository config; pass `None` to
+/// resolve it from `<git_dir>/commondir` (linked worktrees), falling back to
+/// `git_dir` itself. `includeIf "gitdir:"` patterns match against `git_dir`
+/// exactly as upstream matches `$GIT_DIR` (the per-worktree directory inside a
+/// linked worktree), and `includeIf "onbranch:"` against `<git_dir>/HEAD`.
+pub fn read_effective_worktree_config(
+    git_dir: &Path,
+    common_git_dir: Option<&Path>,
+) -> Result<GitConfig> {
+    let resolved_common;
+    let common_git_dir = match common_git_dir {
+        Some(common) => common,
+        None => {
+            resolved_common = common_git_dir_from_disk(git_dir);
+            &resolved_common
+        }
+    };
+    let context = ConfigIncludeContext::new(
+        Some(git_dir_for_include_context(git_dir)),
+        repo_current_branch_name(git_dir),
+    );
+    let mut config = load_pre_dispatch_config(Some(common_git_dir), &context)?;
+    if config
+        .get_bool("extensions", None, "worktreeconfig")
+        .unwrap_or(false)
+    {
+        let worktree = load_config_with_includes(&git_dir.join("config.worktree"), &context)?;
+        config.sections.extend(worktree.sections);
+    }
+    if let Ok(parameters) = injected_config_parameters(None) {
+        let base = match std::env::current_dir() {
+            Ok(path) => path,
+            Err(_) => PathBuf::from("."),
+        };
+        append_injected_config_sections_with_includes(&mut config, &parameters, &context, &base)?;
+    }
+    // Keep git's cached `precomposed_unicode` behaviour for worktree lookups:
+    // callers previously reached it through [`read_repo_config`], and upstream
+    // caches it from the full effective stack.
+    sley_core::activate_precompose_unicode(config.get_bool("core", None, "precomposeunicode"));
+    Ok(config)
+}
+
+/// The repository's common directory: `<git_dir>/commondir` when present
+/// (linked worktrees store an absolute-or-relative pointer there), otherwise
+/// `git_dir` itself.
+fn common_git_dir_from_disk(git_dir: &Path) -> PathBuf {
+    if let Ok(value) = fs::read_to_string(git_dir.join("commondir")) {
+        let path = PathBuf::from(value.trim());
+        if path.is_absolute() {
+            return path;
+        }
+        return git_dir.join(path);
+    }
+    git_dir.to_path_buf()
+}
+
 /// Short branch name from `<git_dir>/HEAD` (e.g. "main"), or `None` when detached
 /// or unborn. Used for `includeIf "onbranch:<glob>"` resolution; reads HEAD
 /// directly so it needs no object-format or ref-store context.
@@ -2955,17 +3032,27 @@ fn global_config_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// `$XDG_CONFIG_HOME/git/config`, falling back to `~/.config/git/config`.
-fn xdg_config_path() -> Option<PathBuf> {
+/// `$XDG_CONFIG_HOME/git/<file_name>`, falling back to `$HOME/.config/git/<file_name>`;
+/// `None` when neither variable yields a base directory.
+///
+/// This directory holds git's user-level defaults: `config`
+/// (see [`global_config_paths`]) plus `ignore` and `attributes`, the default
+/// `core.excludesFile` / `core.attributesFile` when those keys are unset.
+pub fn xdg_git_home_path(file_name: &str) -> Option<PathBuf> {
     if let Some(xdg) = non_empty_env("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(xdg).join("git").join("config"));
+        return Some(PathBuf::from(xdg).join("git").join(file_name));
     }
     home_dir().map(|home| {
         PathBuf::from(home)
             .join(".config")
             .join("git")
-            .join("config")
+            .join(file_name)
     })
+}
+
+/// `$XDG_CONFIG_HOME/git/config`, falling back to `~/.config/git/config`.
+fn xdg_config_path() -> Option<PathBuf> {
+    xdg_git_home_path("config")
 }
 
 /// Read an environment variable, treating unset and empty as absent (git's

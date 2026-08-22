@@ -266,7 +266,10 @@ pub(crate) fn unescape_sparse_cone_dir(path: &[u8]) -> Vec<u8> {
 }
 
 pub(crate) fn read_core_excludes_file(root: &Path, patterns: &mut Vec<IgnorePattern>) -> bool {
-    let Ok(config) = sley_config::read_repo_config(&root.join(".git"), None) else {
+    // Upstream consults the full config stack (system → global → repo) for
+    // core.excludesFile, so a user's global setting must be honored even with
+    // an empty repo-local config.
+    let Ok(config) = sley_config::read_effective_worktree_config(&root.join(".git"), None) else {
         return false;
     };
     let Some(value) = config.get("core", None, "excludesFile") else {
@@ -291,19 +294,7 @@ pub(crate) fn expand_core_excludes_file(root: &Path, value: &str) -> PathBuf {
 }
 
 pub(crate) fn read_default_global_excludes_file(patterns: &mut Vec<IgnorePattern>) {
-    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME")
-        && !config_home.is_empty()
-    {
-        let path = PathBuf::from(config_home).join("git").join("ignore");
-        let source = path.to_string_lossy().into_owned();
-        read_ignore_patterns(path, patterns, &[], source.as_bytes());
-        return;
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let path = PathBuf::from(home)
-            .join(".config")
-            .join("git")
-            .join("ignore");
+    if let Some(path) = sley_config::xdg_git_home_path("ignore") {
         let source = path.to_string_lossy().into_owned();
         read_ignore_patterns(path, patterns, &[], source.as_bytes());
     }
@@ -1102,7 +1093,9 @@ impl AttributeMatcher {
     /// [`Self::configure_case_sensitivity`] and [`Self::read_configured_attributes`]
     /// each parsed the same config document.
     pub(crate) fn configure_from_repo(&mut self, root: &Path, git_dir: &Path) {
-        let Ok(config) = sley_config::read_repo_config(git_dir, None) else {
+        // Full config stack (system → global → repo): upstream honors
+        // core.ignoreCase / core.attributesFile from the global layers too.
+        let Ok(config) = sley_config::read_effective_worktree_config(git_dir, None) else {
             self.read_default_global_attributes();
             return;
         };
@@ -1120,14 +1113,14 @@ impl AttributeMatcher {
     }
 
     pub(crate) fn configure_case_sensitivity(&mut self, git_dir: &Path) {
-        let Ok(config) = sley_config::read_repo_config(git_dir, None) else {
+        let Ok(config) = sley_config::read_effective_worktree_config(git_dir, None) else {
             return;
         };
         self.ignore_case = config.get_bool("core", None, "ignorecase").unwrap_or(false);
     }
 
     pub(crate) fn read_configured_attributes(&mut self, root: &Path, git_dir: &Path) -> bool {
-        let Ok(config) = sley_config::read_repo_config(git_dir, None) else {
+        let Ok(config) = sley_config::read_effective_worktree_config(git_dir, None) else {
             return false;
         };
         let Some(value) = config.get("core", None, "attributesFile") else {
@@ -1139,19 +1132,7 @@ impl AttributeMatcher {
     }
 
     pub(crate) fn read_default_global_attributes(&mut self) {
-        if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME")
-            && !config_home.is_empty()
-        {
-            let path = PathBuf::from(config_home).join("git").join("attributes");
-            let source = path.to_string_lossy().into_owned();
-            read_attribute_patterns(path, self, &[], source.as_bytes(), false);
-            return;
-        }
-        if let Some(home) = std::env::var_os("HOME") {
-            let path = PathBuf::from(home)
-                .join(".config")
-                .join("git")
-                .join("attributes");
+        if let Some(path) = sley_config::xdg_git_home_path("attributes") {
             let source = path.to_string_lossy().into_owned();
             read_attribute_patterns(path, self, &[], source.as_bytes(), false);
         }
@@ -1702,4 +1683,159 @@ pub(crate) fn strip_attribute_base<'a>(
 
 pub(crate) fn ascii_lowercase(value: &[u8]) -> Vec<u8> {
     value.iter().map(u8::to_ascii_lowercase).collect()
+}
+
+/// Regression coverage for the config-stack defect: worktree behavior keys
+/// (`core.excludesFile`, `core.attributesFile`, `core.ignoreCase`,
+/// `index.version`) must be honored from the system/global layers even when
+/// the repository-local config is empty, exactly as upstream git does
+/// (verified against oracle `git check-ignore` / `git check-attr` /
+/// `git config --get core.ignorecase` with a temp `$GIT_CONFIG_GLOBAL`).
+#[cfg(test)]
+mod global_config_layer_tests {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    /// Sentinel marking a re-executed child that runs the scenarios under the
+    /// hermetic environment the parent applied. `unsafe_code` is forbidden
+    /// workspace-wide, so process env cannot be mutated in-process (edition
+    /// 2024 makes `set_var` unsafe) without racing parallel tests — the child
+    /// process owns its own environment instead.
+    const CHILD_ENV: &str = "SLEY_WORKTREE_GLOBAL_CONFIG_CHILD";
+
+    #[test]
+    fn worktree_behavior_keys_come_from_the_global_config_layer() {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            run_child_scenarios();
+            return;
+        }
+        let dir = TempDir::new().expect("temp dir should be creatable");
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).expect("HOME directory should be creatable");
+        let global = dir.path().join("global.gitconfig");
+        fs::write(
+            &global,
+            format!(
+                "[core]\n\texcludesFile = {}/excludes\n\tattributesFile = {}/attributes\n\tignoreCase = true\n[index]\n\tversion = 4\n",
+                dir.path().display(),
+                dir.path().display(),
+            ),
+        )
+        .expect("global config should be writable");
+        fs::write(dir.path().join("excludes"), "secret.txt\n").expect("excludes file");
+        fs::write(dir.path().join("attributes"), "*.img binary\n").expect("attributes file");
+
+        let status = Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                concat!(
+                    module_path!(),
+                    "::worktree_behavior_keys_come_from_the_global_config_layer"
+                ),
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            // The library reads these paths from its own environment; point
+            // them at files constructed on disk for this test only.
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &home)
+            .env_remove("GIT_CONFIG_SYSTEM")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_INDEX_VERSION")
+            .env_remove("XDG_CONFIG_HOME")
+            .status()
+            .expect("re-running the test binary should succeed");
+        assert!(
+            status.success(),
+            "child run died ({status:?}): worktree behavior keys were not read \
+             from the global config layer"
+        );
+    }
+
+    fn empty_repo_fixture() -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().expect("temp dir should be creatable");
+        let git_dir = dir.path().join(".git");
+        fs::create_dir_all(&git_dir).expect(".git should be creatable");
+        // Deliberately EMPTY repo-local config: every value under test may
+        // only come from the global layer.
+        fs::write(git_dir.join("config"), "").expect("empty local config");
+        let root = dir.path().to_path_buf();
+        (dir, root)
+    }
+
+    fn run_child_scenarios() {
+        let (_guard, root) = empty_repo_fixture();
+        let git_dir = root.join(".git");
+
+        // Direct read: the composed effective config sees the global value.
+        let config =
+            sley_config::read_effective_worktree_config(&git_dir, None).expect("config reads");
+        assert_eq!(
+            config.get_bool("core", None, "ignorecase"),
+            Some(true),
+            "core.ignoreCase from the global layer must be visible"
+        );
+
+        // check-ignore-style exclusion sourced from global core.excludesFile.
+        let mut patterns = Vec::new();
+        assert!(
+            read_core_excludes_file(&root, &mut patterns),
+            "global core.excludesFile must be consulted"
+        );
+        assert!(
+            patterns
+                .iter()
+                .any(|pattern| pattern.original == b"secret.txt"),
+            "the global excludesFile content must feed the ignore patterns"
+        );
+
+        // Attribute defined in global core.attributesFile is visible, and
+        // core.ignoreCase applies.
+        let mut matcher = AttributeMatcher::default();
+        matcher.configure_from_repo(&root, &git_dir);
+        let checks = matcher.attributes_for_path(b"photo.img", &[b"binary".to_vec()], false);
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.attribute == b"binary"
+                    && check.state == Some(AttributeState::Set)),
+            "attribute from the global attributesFile must resolve: {checks:?}"
+        );
+        assert!(
+            matcher.ignore_case,
+            "core.ignoreCase=true from the global layer must apply"
+        );
+        let mut case_matcher = AttributeMatcher::default();
+        case_matcher.configure_case_sensitivity(&git_dir);
+        assert!(case_matcher.ignore_case);
+        let mut attr_only = AttributeMatcher::default();
+        assert!(attr_only.read_configured_attributes(&root, &git_dir));
+
+        // index.version from the global layer picks the fresh index format.
+        assert_eq!(
+            fresh_index_default_version(&git_dir),
+            4,
+            "index.version from the global layer must drive the fresh index version"
+        );
+
+        // Control: with the global file gone the same reads fall back to
+        // defaults, proving the values above really came from that file and
+        // not ambient machine configuration.
+        let global = std::env::var_os("GIT_CONFIG_GLOBAL").expect("child keeps its env");
+        fs::remove_file(&global).expect("global config removal");
+        let mut fallback_patterns = Vec::new();
+        assert!(!read_core_excludes_file(&root, &mut fallback_patterns));
+        let mut plain_matcher = AttributeMatcher::default();
+        plain_matcher.configure_from_repo(&root, &git_dir);
+        assert!(!plain_matcher.ignore_case);
+        assert_ne!(
+            fresh_index_default_version(&git_dir),
+            4,
+            "without the global file no index.version=4 may leak in"
+        );
+    }
 }

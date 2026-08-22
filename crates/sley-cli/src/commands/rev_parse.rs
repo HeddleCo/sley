@@ -1208,8 +1208,10 @@ fn rev_parse_error_message(err: &GitError) -> String {
         | GitError::Unsupported(msg)
         | GitError::Command(msg)
         | GitError::Io(msg)
+        | GitError::SidebandFatal(msg)
         | GitError::Transaction(msg)
         | GitError::Cli(_, msg) => msg.clone(),
+        GitError::IoKind { message, .. } => message.clone(),
         GitError::Exit(code) => format!("exit {code}"),
         GitError::Cancelled => "operation cancelled".to_string(),
         GitError::CountMismatch { expected, actual } => {

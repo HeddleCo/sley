@@ -990,7 +990,7 @@ pub(crate) fn worktree_entries_with_submodule_dirt(
     // through the clean filter (core.autocrlf / .gitattributes) first -- exactly
     // as `git add` would store them. With no filter configured this is an exact
     // passthrough, so unfiltered repositories see identical OIDs.
-    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    let config = sley_config::read_effective_worktree_config(git_dir, None).unwrap_or_default();
     // Seed the matcher with the repo-wide sources only; each directory's
     // `.gitattributes` is folded in by `collect_worktree_entries` as it descends,
     // so the worktree is read exactly once (a separate full-tree attribute pass was
@@ -1030,7 +1030,7 @@ pub(crate) fn status_worktree_entries_with_submodule_dirt(
     let mut entries = BTreeMap::new();
     let mut submodule_dirt_map = BTreeMap::new();
     let mut tracked_presence = HashSet::new();
-    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    let config = sley_config::read_effective_worktree_config(git_dir, None).unwrap_or_default();
     let mut attr_matcher = AttributeMatcher::from_worktree_base(worktree_root);
     let attr_requested = filter_attribute_names();
     let odb = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -1119,7 +1119,7 @@ pub(crate) fn worktree_entry_for_git_path(
     let body = if metadata.file_type().is_symlink() {
         symlink_target_bytes(&absolute)?
     } else {
-        let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+        let config = sley_config::read_effective_worktree_config(git_dir, None).unwrap_or_default();
         let body = fs::read(&absolute)?;
         let index_entry = stat_cache.and_then(|cache| cache.index_entry(git_path));
         let checks = filter_attribute_checks(worktree_root, git_path)?;

@@ -172,7 +172,7 @@ mod apply_index_mutation_tests {
 /// (→4) then an `index.version` override (warning on out-of-range). The writer's
 /// `normalize_index_version_for_extended_flags` later collapses 2/3 by
 /// extended-flag need; a chosen version 4 is preserved.
-fn fresh_index_default_version(git_dir: &Path) -> u32 {
+pub(crate) fn fresh_index_default_version(git_dir: &Path) -> u32 {
     if let Some(raw) = env::var_os("GIT_INDEX_VERSION") {
         let raw = raw.to_string_lossy();
         return match raw.parse::<u32>() {
@@ -185,7 +185,9 @@ fn fresh_index_default_version(git_dir: &Path) -> u32 {
             }
         };
     }
-    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
+    // Full config stack (system → global → repo): feature.manyFiles /
+    // index.version set in a user's global or system config must be honored.
+    let config = sley_config::read_effective_worktree_config(git_dir, None).unwrap_or_default();
     let mut version = if config
         .get_bool("feature", None, "manyFiles")
         .unwrap_or(false)
