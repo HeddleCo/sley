@@ -728,7 +728,7 @@ pub struct HashFormatCheckReport {
 ///   tag finding appears, because git's `goto done` never reaches it.
 ///
 /// The caller prints each diagnostic as `error: object fails fsck:
-/// <camelCasedMsgId>: <detail>` and dies only when [`report.refuse`] is set.
+/// <camelCasedMsgId>: <detail>` and dies only when `report.refuse` is set.
 pub fn hash_format_check(
     format: ObjectFormat,
     object_type: ObjectType,

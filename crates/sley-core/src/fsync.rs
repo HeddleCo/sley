@@ -94,7 +94,7 @@ impl FsyncComponents {
     /// Grammar (upstream `parse_fsync_components`): start from
     /// [`Self::PLATFORM_DEFAULT`]; `none` resets the running base to empty;
     /// each remaining comma-separated component is trimmed and prefix-matched
-    /// against [`Self::COMPONENT_TABLE`], accumulating into negative or
+    /// against `Self::COMPONENT_TABLE`, accumulating into negative or
     /// positive masks by leading `-`; finally the result is
     /// `(base & ~negative) | positive`, so a component named both ways wins
     /// as positive in either order. Unknown components are ignored, and a
@@ -226,7 +226,7 @@ pub fn test_fsync_enabled() -> bool {
     )
 }
 
-/// Minimal read-only config lookup surface accepted by [`resolve`].
+/// Minimal read-only config lookup surface accepted by [`Policy::resolve`].
 ///
 /// Defined here — not as a concrete `GitConfig` parameter — because
 /// `sley-config` depends on this crate, not the other way around. The config
