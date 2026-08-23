@@ -59,33 +59,33 @@ jobs:
           # from `cargo metadata` (normal + build deps) and re-asserted below.
           CRATES=(
             sley-core
-            sley-i18n
-            sley-mmap
-            sley-procinfo
-            sley-strbuf-expand
-            sley-protocol
             sley-pathspec
-            sley-options
-            sley-object
-            sley-grep
             sley-config
-            sley-index
-            sley-ref-filter
-            sley-transport
-            sley-submodule
+            sley-object
             sley-formats
-            sley-refs
+            sley-grep
+            sley-mmap
+            sley-index
             sley-pack
             sley-odb
-            sley-fsck
+            sley-refs
             sley-diff-merge
+            sley-options
             sley-rev
+            sley-submodule
             sley-unpack-trees
             sley-worktree
-            sley-pretty
             sley-sequencer
-            sley-remote
             sley-notes
+            sley-protocol
+            sley-strbuf-expand
+            sley-ref-filter
+            sley-pretty
+            sley-fsck
+            sley-transport
+            sley-remote
+            sley-i18n
+            sley-procinfo
             sley
           )
 
