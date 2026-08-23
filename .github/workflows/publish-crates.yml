@@ -73,19 +73,20 @@ jobs:
             sley-options
             sley-rev
             sley-submodule
+            sley-fsck
             sley-unpack-trees
             sley-worktree
+            sley-hooks
+            sley-i18n
             sley-sequencer
             sley-notes
             sley-protocol
             sley-strbuf-expand
             sley-ref-filter
             sley-pretty
-            sley-fsck
+            sley-procinfo
             sley-transport
             sley-remote
-            sley-i18n
-            sley-procinfo
             sley
           )
 
@@ -103,8 +104,8 @@ jobs:
             POS[$c]=$i
             i=$((i + 1))
           done
-          if [ "${#CRATES[@]}" -ne 29 ]; then
-            echo "Expected 29 crates, got ${#CRATES[@]}" >&2
+          if [ "${#CRATES[@]}" -ne 30 ]; then
+            echo "Expected 30 crates, got ${#CRATES[@]}" >&2
             exit 1
           fi
           META="$(cargo metadata --format-version 1 --all-features --no-deps)"
