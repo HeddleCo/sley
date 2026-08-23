@@ -1,8 +1,12 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod blame;
 pub mod bisect;
+pub mod describe;
 pub mod format_patch;
 pub mod graph;
+pub mod line_log;
+pub mod name_rev;
 pub mod revlist;
 mod setup;
 

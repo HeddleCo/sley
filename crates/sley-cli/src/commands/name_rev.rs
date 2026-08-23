@@ -10,105 +10,16 @@
 #![allow(clippy::expect_used)]
 
 use sley::plumbing::sley_rev;
+use sley::plumbing::sley_rev::name_rev::{
+    CommitMetadataCache, RevName, Tip, committer_timestamp, name_all_tips, rev_name_string,
+};
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::commands::cli_options::opt_bool;
 use crate::*;
 use sley_options::{OptionName, OptionSpec, ParsedValue, parse_options};
 
-/// `MERGE_TRAVERSAL_WEIGHT` from upstream: crossing into a non-first parent is
-/// treated as a very long hop so first-parent ancestry is strongly preferred.
-const MERGE_TRAVERSAL_WEIGHT: i64 = 65535;
-
 /// Default abbreviation length used by `--always` (upstream `DEFAULT_ABBREV`).
 const DEFAULT_ABBREV: usize = 7;
-
-/// A ref selected as a starting point ("tip") for naming.
-struct Tip {
-    oid: ObjectId,
-    /// Display name for the ref after prefix shortening (e.g. `tags/v1`, `main`).
-    refname: String,
-    /// The commit this tip resolves to (after peeling tag objects), if any.
-    commit: Option<ObjectId>,
-    /// Tag date for annotated tags, else the commit date; `i64::MAX` when unknown.
-    taggerdate: i64,
-    /// Whether the ref lives under `refs/tags/`.
-    from_tag: bool,
-    /// Whether the ref pointed at a tag object that had to be dereferenced.
-    deref: bool,
-}
-
-/// Commit headers used by `name-rev`, cached per command invocation.
-#[derive(Clone)]
-struct CommitMetadata {
-    parents: Vec<ObjectId>,
-    committerdate: i64,
-}
-
-#[derive(Default)]
-struct CommitMetadataCache {
-    commits: HashMap<ObjectId, CommitMetadata>,
-}
-
-impl CommitMetadataCache {
-    fn get_cached(&self, oid: &ObjectId) -> Option<&CommitMetadata> {
-        self.commits.get(oid)
-    }
-
-    fn get_or_read(
-        &mut self,
-        db: &FileObjectDatabase,
-        format: ObjectFormat,
-        oid: &ObjectId,
-    ) -> Result<Option<&CommitMetadata>> {
-        if !self.commits.contains_key(oid) {
-            let object = db.read_object(oid)?;
-            if object.object_type != ObjectType::Commit {
-                return Ok(None);
-            }
-            let commit = Commit::parse(format, &object.body)?;
-            self.commits.insert(
-                *oid,
-                CommitMetadata {
-                    parents: commit.parents,
-                    committerdate: committer_timestamp(&commit.committer).unwrap_or(i64::MAX),
-                },
-            );
-        }
-        Ok(self.commits.get(oid))
-    }
-
-    fn get_or_parse_commit(
-        &mut self,
-        format: ObjectFormat,
-        oid: &ObjectId,
-        body: &[u8],
-    ) -> Result<&CommitMetadata> {
-        if !self.commits.contains_key(oid) {
-            let commit = Commit::parse(format, body)?;
-            self.commits.insert(
-                *oid,
-                CommitMetadata {
-                    parents: commit.parents,
-                    committerdate: committer_timestamp(&commit.committer).unwrap_or(i64::MAX),
-                },
-            );
-        }
-        Ok(self
-            .commits
-            .get(oid)
-            .expect("commit metadata was inserted or already cached"))
-    }
-}
-
-/// The best name discovered for a commit during the walk.
-#[derive(Clone)]
-struct RevName {
-    tip_name: String,
-    generation: i64,
-    distance: i64,
-    taggerdate: i64,
-    from_tag: bool,
-}
 
 /// Parsed command-line options for `name-rev`.
 struct NameRevOptions {
@@ -430,185 +341,6 @@ fn collect_tips(
     Ok(tips)
 }
 
-/// Seed a naming walk from every tip in upstream's `cmp_by_tag_and_age` order.
-fn name_all_tips(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    tips: &[Tip],
-    rev_names: &mut HashMap<ObjectId, RevName>,
-    commit_cache: &mut CommitMetadataCache,
-) -> Result<()> {
-    let mut order: Vec<usize> = (0..tips.len()).collect();
-    // Stable sort over the alphabetically-ordered tips: tags first, then older
-    // dates first; equal keys keep the alphabetical input order.
-    order.sort_by(|&left, &right| {
-        let a = &tips[left];
-        let b = &tips[right];
-        b.from_tag
-            .cmp(&a.from_tag)
-            .then_with(|| a.taggerdate.cmp(&b.taggerdate))
-    });
-    for index in order {
-        let tip = &tips[index];
-        let Some(commit) = &tip.commit else {
-            continue;
-        };
-        name_rev(db, format, commit, tip, rev_names, commit_cache)?;
-    }
-    Ok(())
-}
-
-/// Walk first-parent-first from a tip, recording the best name for each commit.
-fn name_rev(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    start: &ObjectId,
-    tip: &Tip,
-    rev_names: &mut HashMap<ObjectId, RevName>,
-    commit_cache: &mut CommitMetadataCache,
-) -> Result<()> {
-    let tip_name = if tip.deref {
-        format!("{}^0", tip.refname)
-    } else {
-        tip.refname.clone()
-    };
-    if !create_or_update_name(rev_names, start, tip.taggerdate, 0, 0, tip.from_tag) {
-        return Ok(());
-    }
-    if let Some(name) = rev_names.get_mut(start) {
-        name.tip_name = tip_name;
-    }
-
-    let mut stack = vec![start.clone()];
-    while let Some(oid) = stack.pop() {
-        let Some(current) = rev_names.get(&oid).cloned() else {
-            continue;
-        };
-        let Some(commit) = commit_cache.get_or_read(db, format, &oid)? else {
-            continue;
-        };
-        // Push parents so the first parent is processed before the others, just
-        // like upstream's two-stack arrangement.
-        let mut to_queue = Vec::new();
-        for (index, parent) in commit.parents.iter().enumerate() {
-            let parent_number = index + 1;
-            let (generation, distance) = if parent_number > 1 {
-                (0, current.distance + MERGE_TRAVERSAL_WEIGHT)
-            } else {
-                (current.generation + 1, current.distance + 1)
-            };
-            if create_or_update_name(
-                rev_names,
-                parent,
-                tip.taggerdate,
-                generation,
-                distance,
-                tip.from_tag,
-            ) {
-                let parent_tip_name = if parent_number > 1 {
-                    get_parent_name(&current, parent_number)
-                } else {
-                    current.tip_name.clone()
-                };
-                if let Some(name) = rev_names.get_mut(parent) {
-                    name.tip_name = parent_tip_name;
-                }
-                to_queue.push(parent);
-            }
-        }
-        while let Some(parent) = to_queue.pop() {
-            stack.push(*parent);
-        }
-    }
-    Ok(())
-}
-
-/// Insert or replace the name for `commit` when the candidate is strictly better.
-/// Returns whether the slot was (re)claimed, signalling that the walk should
-/// descend through this commit's parents.
-fn create_or_update_name(
-    rev_names: &mut HashMap<ObjectId, RevName>,
-    commit: &ObjectId,
-    taggerdate: i64,
-    generation: i64,
-    distance: i64,
-    from_tag: bool,
-) -> bool {
-    if let Some(existing) = rev_names.get(commit)
-        && !is_better_name(existing, taggerdate, generation, distance, from_tag)
-    {
-        return false;
-    }
-    rev_names.insert(
-        commit.clone(),
-        RevName {
-            tip_name: String::new(),
-            generation,
-            distance,
-            taggerdate,
-            from_tag,
-        },
-    );
-    true
-}
-
-/// Upstream `is_better_name`: tags beat non-tags; otherwise prefer the smaller
-/// effective distance, then the older date.
-fn is_better_name(
-    name: &RevName,
-    taggerdate: i64,
-    generation: i64,
-    distance: i64,
-    from_tag: bool,
-) -> bool {
-    let name_distance = effective_distance(name.distance, name.generation);
-    let new_distance = effective_distance(distance, generation);
-    if from_tag && name.from_tag {
-        return name_distance > new_distance;
-    }
-    if name.from_tag != from_tag {
-        return from_tag;
-    }
-    if name_distance != new_distance {
-        return name_distance > new_distance;
-    }
-    if name.taggerdate != taggerdate {
-        return name.taggerdate > taggerdate;
-    }
-    false
-}
-
-fn effective_distance(distance: i64, generation: i64) -> i64 {
-    distance
-        + if generation > 0 {
-            MERGE_TRAVERSAL_WEIGHT
-        } else {
-            0
-        }
-}
-
-/// Build a non-first-parent's name: strip a trailing `^0`, fold in the run of
-/// first-parent steps as `~<generation>`, then append `^<parent_number>`.
-fn get_parent_name(name: &RevName, parent_number: usize) -> String {
-    let base = name.tip_name.strip_suffix("^0").unwrap_or(&name.tip_name);
-    if name.generation > 0 {
-        format!("{base}~{}^{parent_number}", name.generation)
-    } else {
-        format!("{base}^{parent_number}")
-    }
-}
-
-/// Render a commit's stored name, collapsing the `^0`/`~<generation>` suffixes
-/// exactly as upstream's `get_rev_name`.
-fn rev_name_string(name: &RevName) -> String {
-    if name.generation == 0 {
-        name.tip_name.clone()
-    } else {
-        let base = name.tip_name.strip_suffix("^0").unwrap_or(&name.tip_name);
-        format!("{base}~{}", name.generation)
-    }
-}
-
 /// `--all`: one line per named commit. Upstream prints `<full-oid> <name>`
 /// (or just `<name>` with `--name-only`) in an unspecified hash-map order; we
 /// emit a deterministic listing sorted by object id.
@@ -867,12 +599,13 @@ fn find_unique_abbrev(db: &FileObjectDatabase, oid: &ObjectId) -> Result<String>
 }
 
 /// Match `filter` against `path` and each `/`-delimited suffix, returning the
-/// offset (in chars) of the matched suffix, mirroring upstream `subpath_matches`.
+/// offset (in bytes) of the matched suffix, mirroring upstream `subpath_matches`
+/// (`wildmatch(filter, subpath, 0)`: no `WM_PATHNAME`, so `*` crosses `/`).
 fn subpath_matches(path: &str, filter: &str) -> Option<usize> {
     let mut offset = 0;
     loop {
         let subpath = &path[offset..];
-        if wildmatch(filter, subpath) {
+        if sley_pathspec::wildmatch(filter.as_bytes(), subpath.as_bytes(), 0) {
             return Some(offset);
         }
         {
@@ -894,123 +627,8 @@ fn shorten_unambiguous_ref(refname: &str) -> String {
     refname.strip_prefix("refs/").unwrap_or(refname).to_string()
 }
 
-/// Shell-glob match (`*`, `?`, `[...]`) over the whole string. `*` matches `/`
-/// because upstream calls `wildmatch` with no `WM_PATHNAME` flag.
-fn wildmatch(pattern: &str, text: &str) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let text: Vec<char> = text.chars().collect();
-    wildmatch_inner(&pattern, &text)
-}
-
-fn wildmatch_inner(pattern: &[char], text: &[char]) -> bool {
-    let mut p = 0;
-    let mut t = 0;
-    // Backtracking position for the most recent `*`.
-    let mut star_pattern: Option<usize> = None;
-    let mut star_text = 0;
-    while t < text.len() {
-        if p < pattern.len() {
-            match pattern[p] {
-                '*' => {
-                    star_pattern = Some(p);
-                    star_text = t;
-                    p += 1;
-                    continue;
-                }
-                '?' => {
-                    p += 1;
-                    t += 1;
-                    continue;
-                }
-                '[' => {
-                    if let Some((matched, next)) = match_bracket(pattern, p, text[t]) {
-                        if matched {
-                            p = next;
-                            t += 1;
-                            continue;
-                        }
-                    } else if pattern[p] == text[t] {
-                        // Malformed class: treat `[` literally.
-                        p += 1;
-                        t += 1;
-                        continue;
-                    }
-                }
-                '\\' if p + 1 < pattern.len() && pattern[p + 1] == text[t] => {
-                    p += 2;
-                    t += 1;
-                    continue;
-                }
-                other if other == text[t] => {
-                    p += 1;
-                    t += 1;
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        // Mismatch: backtrack to the last `*` if there was one.
-        if let Some(star) = star_pattern {
-            p = star + 1;
-            star_text += 1;
-            t = star_text;
-        } else {
-            return false;
-        }
-    }
-    while p < pattern.len() && pattern[p] == '*' {
-        p += 1;
-    }
-    p == pattern.len()
-}
-
-/// Try to match a `[...]` bracket expression at `pattern[start]` against `ch`.
-/// Returns `Some((matched, index_after_class))`, or `None` if the class is
-/// malformed (no closing `]`).
-fn match_bracket(pattern: &[char], start: usize, ch: char) -> Option<(bool, usize)> {
-    let mut index = start + 1;
-    let mut negate = false;
-    if index < pattern.len() && (pattern[index] == '!' || pattern[index] == '^') {
-        negate = true;
-        index += 1;
-    }
-    let mut matched = false;
-    let mut first = true;
-    while index < pattern.len() {
-        if pattern[index] == ']' && !first {
-            let result = matched ^ negate;
-            return Some((result, index + 1));
-        }
-        first = false;
-        // Range like `a-z` (not when `-` is the final char before `]`).
-        if index + 2 < pattern.len() && pattern[index + 1] == '-' && pattern[index + 2] != ']' {
-            let low = pattern[index];
-            let high = pattern[index + 2];
-            if low <= ch && ch <= high {
-                matched = true;
-            }
-            index += 3;
-        } else {
-            if pattern[index] == ch {
-                matched = true;
-            }
-            index += 1;
-        }
-    }
-    None
-}
-
 fn is_lower_hex(byte: u8) -> bool {
     byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-}
-
-/// Parse the trailing `<unix-seconds> <tz>` of a committer/tagger identity line.
-fn committer_timestamp(ident: &[u8]) -> Option<i64> {
-    let text = std::str::from_utf8(ident).ok()?;
-    let close = text.rfind('>')?;
-    let rest = text[close + 1..].trim();
-    let seconds = rest.split_whitespace().next()?;
-    seconds.parse::<i64>().ok()
 }
 
 fn print_name_rev_help() {
