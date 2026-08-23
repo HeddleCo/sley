@@ -117,7 +117,7 @@ pub(crate) use diff_render::{
     collect_diff_stat_entries_with_worktree_clean, collect_dirty_submodules,
     compile_ignore_matching_regexes, diff_entry_new_content, diff_entry_old_content,
     diff_entry_produces_output, diff_line_stats, diff_rename_limit_requires_integer_error,
-    diff_stat_decimal_width, diff_stat_pprint_rename, diff_stat_totals, gitlink_diff_content,
+    diff_stat_decimal_width, diff_stat_totals, gitlink_diff_content,
     is_binary_content, is_gitlink_pair, parse_diff_max_depth, parse_dirstat_params,
     prefetch_diff_entry_blobs, prefetch_promisor_objects, prefetch_via_configured_upload_pack,
     promisor_remote_names, read_blob, read_object_maybe_prefetch_promisor, render_diff_entries,
@@ -126,7 +126,8 @@ pub(crate) use diff_render::{
     write_diff_dirstat, write_diff_numstat_materialized_entry, write_diff_patch_entry,
     write_diff_raw_entry, write_diff_shortstat_materialized, write_diff_stat_materialized,
     write_diff_stat_materialized_with_widths, write_diff_stat_summary_line,
-    write_diff_summary_entry,
+    write_diff_summary_entry, diff_lazy_fetch, diff_pathspec_new, cli_submodule_render,
+    diff_big_file_threshold, make_clean_apply, clean_context, cli_render_services,
 };
 
 pub(crate) use discovery::{
@@ -347,7 +348,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::diff_render::count_line_diff;
+    use sley::plumbing::sley_diff_merge::porcelain::count_line_diff;
 
     #[test]
     fn diff_stat_line_count_fast_paths_are_exact() {

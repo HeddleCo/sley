@@ -639,7 +639,7 @@ pub(crate) fn cmd_diff_tree(
     let diff_pathspec = if setup.pathspecs.is_empty() || options.max_depth.is_some() {
         None
     } else if let Ok(worktree_root) = repo.worktree_root() {
-        Some(DiffPathspec::new(
+        Some(crate::diff_pathspec_new(
             repo.cwd(),
             worktree_root,
             &setup.pathspecs,
@@ -1210,7 +1210,7 @@ fn run_diff_request(
         wrote_block = true;
     }
     let stat_entries_for_render = if output.numstat || output.stat || output.shortstat {
-        collect_diff_stat_entries(&entries, context.db, None, false, context.lazy_fetch)?
+        collect_diff_stat_entries(&entries, context.db, None, false, crate::diff_lazy_fetch(context.lazy_fetch))?
     } else {
         Vec::new()
     };
@@ -1234,6 +1234,7 @@ fn run_diff_request(
             patch: output.patch && !entries.is_empty(),
         },
         DiffEntryRenderContext {
+            services: cli_render_services(),
             raw: DiffEntryRawRenderOptions {
                 z: context.options.z,
                 abbrev: context.raw_abbrev,
@@ -1262,7 +1263,7 @@ fn run_diff_request(
                 anchors: &[],
                 allow_textconv: false,
                 db: context.db,
-                lazy_fetch: context.lazy_fetch,
+                lazy_fetch: crate::diff_lazy_fetch(context.lazy_fetch),
                 worktree_root: None,
                 use_worktree_new: false,
                 format: context.format,
@@ -1288,6 +1289,8 @@ fn run_diff_request(
                 ignore_regexes: &context.options.ignore_regexes,
                 line_ranges: None,
                 indent_heuristic: context.indent_heuristic,
+                big_file_threshold: crate::diff_big_file_threshold(context.db),
+                submodule_render: crate::cli_submodule_render()
             };
             write_diff_patch_entry(stdout, entry, patch_options)
         },
@@ -1399,7 +1402,7 @@ fn run_combined_request(
         )?;
         has_differences |= !first_parent_entries.is_empty();
         let stat_entries = if output.numstat || output.stat || output.shortstat {
-            collect_diff_stat_entries(&first_parent_entries, db, None, false, context.lazy_fetch)?
+            collect_diff_stat_entries(&first_parent_entries, db, None, false, crate::diff_lazy_fetch(context.lazy_fetch))?
         } else {
             Vec::new()
         };

@@ -1,87 +1,10 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubmoduleIgnoreMode {
-    None,
-    Untracked,
-    Dirty,
-    All,
-}
-pub fn parse_submodule_ignore_mode(value: &str) -> Option<SubmoduleIgnoreMode> {
-    match value {
-        "none" => Some(SubmoduleIgnoreMode::None),
-        "untracked" => Some(SubmoduleIgnoreMode::Untracked),
-        "dirty" => Some(SubmoduleIgnoreMode::Dirty),
-        "all" => Some(SubmoduleIgnoreMode::All),
-        _ => None,
-    }
-}
-#[derive(Debug, Clone, Copy)]
-pub struct DiffStatWidths {
-    pub stat_width: i64,
-    pub name_width: i64,
-    pub graph_width: i64,
-    pub line_prefix_width: i64,
-}
-impl DiffStatWidths {
-    pub fn terminal() -> Self {
-        Self {
-            stat_width: -1,
-            name_width: -1,
-            graph_width: -1,
-            line_prefix_width: 0,
-        }
-    }
-    pub fn plumbing() -> Self {
-        Self {
-            stat_width: 0,
-            name_width: 0,
-            graph_width: 0,
-            line_prefix_width: 0,
-        }
-    }
-    pub fn resolve_config(&mut self, config: &GitConfig) {
-        if self.name_width == -1 {
-            self.name_width = config
-                .get("diff", None, "statnamewidth")
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(0);
-        }
-        if self.graph_width == -1 {
-            self.graph_width = config
-                .get("diff", None, "statgraphwidth")
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(0);
-        }
-    }
-    pub fn resolve_config_defaults(&mut self) {
-        if self.name_width == -1 {
-            self.name_width = 0;
-        }
-        if self.graph_width == -1 {
-            self.graph_width = 0;
-        }
-    }
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DirstatMode {
-    Changes,
-    Lines,
-    Files,
-}
-#[derive(Debug, Clone, Copy)]
-pub struct DirstatOptions {
-    pub mode: DirstatMode,
-    pub cumulative: bool,
-    pub permille: i64,
-}
-impl Default for DirstatOptions {
-    fn default() -> Self {
-        Self {
-            mode: DirstatMode::Changes,
-            cumulative: false,
-            permille: 30,
-        }
-    }
-}
+// `SubmoduleIgnoreMode`, `DiffStatWidths`, and the dirstat option types moved
+// to `sley-diff-merge::porcelain` (the diff render engine owns them); these
+// re-exports keep the historical `sley_rev::diff_options` spellings working.
+pub use sley_diff_merge::porcelain::{
+    DiffStatWidths, DirstatMode, DirstatOptions, SubmoduleIgnoreMode,
+    parse_submodule_ignore_mode,
+};
 #[derive(Debug, Clone, Default)]
 pub struct DiffFilter {
     pub includes: HashSet<char>,

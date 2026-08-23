@@ -1972,7 +1972,7 @@ fn bisect_show_commit(repo: &BisectRepo, oid: &ObjectId, out: &mut dyn Write) ->
             sley_diff_merge::DiffNameStatusOptions::default(),
         )?,
     };
-    let stat_entries = collect_diff_stat_entries(&entries, &db, None, false, repo.lazy_fetch)?;
+    let stat_entries = collect_diff_stat_entries(&entries, &db, None, false, crate::diff_lazy_fetch(repo.lazy_fetch))?;
     write_diff_stat_materialized(
         out,
         &stat_entries,

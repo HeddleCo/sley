@@ -319,7 +319,7 @@ fn write_stage_file(
 ) -> Result<()> {
     let mut content = match entry {
         Some(entry) if entry.mode == 0o160000 => entry.oid.to_string().into_bytes(),
-        Some(entry) => read_blob(db, &entry.oid, lazy_fetch)?,
+        Some(entry) => read_blob(db, &entry.oid, crate::diff_lazy_fetch(lazy_fetch))?,
         None => Vec::new(),
     };
     if entry.is_some_and(|entry| entry.mode & sley_index::GIT_MODE_TYPE_MASK == 0o100000)

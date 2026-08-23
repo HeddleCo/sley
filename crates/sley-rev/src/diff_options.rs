@@ -261,22 +261,9 @@ pub enum DiffRelativeMode {
     Prefix(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubmoduleDiffFormat {
-    Short,
-    Log,
-    Diff,
-}
-
-impl SubmoduleDiffFormat {
-    pub fn parse(value: &str) -> Self {
-        match value {
-            "short" => Self::Short,
-            "diff" => Self::Diff,
-            _ => Self::Log,
-        }
-    }
-}
+// Moved to `sley-diff-merge::porcelain` with the rest of the diff render
+// options; re-exported so existing paths keep resolving.
+pub use sley_diff_merge::porcelain::SubmoduleDiffFormat;
 
 pub fn setup_diff_options(args: &[String]) -> Result<DiffOptions> {
     reject_exact_no_rename(args)?;

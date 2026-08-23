@@ -280,6 +280,13 @@ pub use promisor::{
     promisor_remote_auto_filter, promisor_remote_server_capability,
 };
 
+mod diff_promisor;
+pub use diff_promisor::{
+    LoadRepoConfig, prefetch_diff_entry_blobs, prefetch_promisor_objects,
+    prefetch_via_configured_upload_pack, promisor_remote_names,
+    read_object_maybe_prefetch_promisor,
+};
+
 mod resolve;
 pub use resolve::{
     RemoteResolutionContext, ResolvedRemote, discover_local_git_dir, fetch_source_for_url,

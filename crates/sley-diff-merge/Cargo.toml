@@ -8,6 +8,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+flate2 = { version = "1.1.9", default-features = false }
 sley-config.workspace = true
 sley-core.workspace = true
 sley-formats.workspace = true
@@ -15,6 +16,7 @@ sley-index.workspace = true
 sley-object.workspace = true
 sley-odb.workspace = true
 sley-pack.workspace = true
+sley-pathspec.workspace = true
 sley-refs.workspace = true
 sley-grep.workspace = true
 

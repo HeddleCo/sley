@@ -959,7 +959,7 @@ fn rerere_diff(
                 anchors: &[],
                 allow_textconv: false,
                 db: &db,
-                lazy_fetch,
+                lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
                 worktree_root: None,
                 use_worktree_new: false,
                 format,
@@ -983,6 +983,8 @@ fn rerere_diff(
                 ignore_regexes: &[],
                 line_ranges: None,
                 indent_heuristic: true,
+                big_file_threshold: crate::diff_big_file_threshold(&db),
+                submodule_render: crate::cli_submodule_render()
             },
         )?;
         stdout.write_all(&rerere_diff_payload(&rendered))?;

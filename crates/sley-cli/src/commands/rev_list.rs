@@ -1972,7 +1972,7 @@ fn rev_list_patchsame_oids(
         let Some(root) = worktree_root else {
             return Ok(HashSet::new());
         };
-        Some(DiffPathspec::new(cwd, root, pathspecs, pathspec_magic)?)
+        Some(crate::diff_pathspec_new(cwd, root, pathspecs, pathspec_magic)?)
     };
 
     let left_first = left_count < right_count;
@@ -2069,7 +2069,7 @@ fn rev_list_render_tree_to_tree_patch(
                 anchors: &[],
                 allow_textconv: false,
                 db,
-                lazy_fetch,
+                lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
                 worktree_root: None,
                 use_worktree_new: false,
                 format,
@@ -2093,6 +2093,8 @@ fn rev_list_render_tree_to_tree_patch(
                 ignore_regexes: &[],
                 line_ranges: None,
                 indent_heuristic: true,
+                big_file_threshold: crate::diff_big_file_threshold(db),
+                submodule_render: crate::cli_submodule_render()
             },
         )?;
     }

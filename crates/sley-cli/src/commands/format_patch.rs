@@ -727,7 +727,7 @@ pub(crate) fn cmd_format_patch(
     let diff_pathspec = if plan.pathspecs.is_empty() {
         None
     } else {
-        Some(DiffPathspec::new(
+        Some(crate::diff_pathspec_new(
             cwd,
             repo.worktree_root()?,
             &plan.pathspecs,
@@ -4002,37 +4002,39 @@ fn format_patch_diff_options_with<'a>(
     lazy_fetch: bool,
 ) -> crate::DiffRenderOptions<'a> {
     crate::DiffRenderOptions {
-        line_indicators: sley_diff_merge::render::LineIndicators::default(),
-        suppress_blank_empty: false,
-        binary,
-        anchors: &[],
-        allow_textconv: false,
-        db,
-        lazy_fetch,
-        worktree_root: None,
-        use_worktree_new: false,
-        format,
-        abbrev,
-        src_prefix,
-        dst_prefix,
-        context: context_lines,
-        userdiff: None,
-        funcname: None,
-        colors: None,
-        word_diff: None,
-        no_index_contents: None,
-        submodule_format: sley_rev::diff_options::SubmoduleDiffFormat::Short,
-        submodule_dirt: None,
-        ws_error: None,
-        color_moved: None,
-        interhunk: 0,
-        ws_ignore: sley_diff_merge::WsIgnore::default(),
-        diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
-        ignore_blank_lines: false,
-        ignore_regexes: &[],
-        line_ranges: None,
-        indent_heuristic: true,
-    }
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                suppress_blank_empty: false,
+                binary,
+                anchors: &[],
+                allow_textconv: false,
+                db,
+                lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
+                worktree_root: None,
+                use_worktree_new: false,
+                format,
+                abbrev,
+                src_prefix,
+                dst_prefix,
+                context: context_lines,
+                userdiff: None,
+                funcname: None,
+                colors: None,
+                word_diff: None,
+                no_index_contents: None,
+                submodule_format: sley_rev::diff_options::SubmoduleDiffFormat::Short,
+                submodule_dirt: None,
+                ws_error: None,
+                color_moved: None,
+                interhunk: 0,
+                ws_ignore: sley_diff_merge::WsIgnore::default(),
+                diff_algorithm: sley_diff_merge::DiffAlgorithm::Myers,
+                ignore_blank_lines: false,
+                ignore_regexes: &[],
+                line_ranges: None,
+                indent_heuristic: true,
+                big_file_threshold: crate::diff_big_file_threshold(db),
+                submodule_render: crate::cli_submodule_render()
+            }
 }
 
 /// Number of unchanged lines of context git keeps around each change in a hunk.
@@ -4049,7 +4051,7 @@ fn write_patch_diffstat(
     options: &FormatPatchOptions,
     lazy_fetch: bool,
 ) -> Result<()> {
-    let stat_entries = collect_diff_stat_entries(entries, db, None, false, lazy_fetch)?;
+    let stat_entries = collect_diff_stat_entries(entries, db, None, false, crate::diff_lazy_fetch(lazy_fetch))?;
     let mut widths = options.stat_widths;
     if widths.stat_width == 0 {
         // MAIL_DEFAULT_WRAP

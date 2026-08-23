@@ -519,7 +519,7 @@ pub(crate) fn cmd_show(cli_session: &crate::session::CliSession, args: &[String]
         None
     } else {
         let worktree_root = repo.worktree_root()?;
-        Some(DiffPathspec::new(
+        Some(crate::diff_pathspec_new(
             repo.cwd(),
             worktree_root,
             &setup.pathspecs,
@@ -1347,7 +1347,7 @@ fn write_merge_stat(
     lazy_fetch: bool,
 ) -> Result<()> {
     let color = diff_color_enabled(config);
-    let stat_entries = collect_diff_stat_entries(entries, db, None, false, lazy_fetch)?;
+    let stat_entries = collect_diff_stat_entries(entries, db, None, false, crate::diff_lazy_fetch(lazy_fetch))?;
     if options.numstat {
         for entry in &stat_entries {
             write_diff_numstat_materialized_entry(stdout, entry.entry, entry.stats, false)?;
@@ -1394,7 +1394,7 @@ fn write_show_combined(
     let db = context.db;
     let _stat_entries =
         if options.numstat || options.stat || options.compact_summary || options.shortstat {
-            collect_diff_stat_entries(entries, db, None, false, context.lazy_fetch)?
+            collect_diff_stat_entries(entries, db, None, false, crate::diff_lazy_fetch(context.lazy_fetch))?
         } else {
             Vec::new()
         };
@@ -1674,7 +1674,7 @@ fn write_show_remerge(
                 anchors: &[],
                 allow_textconv: true,
                 db,
-                lazy_fetch: context.lazy_fetch,
+                lazy_fetch: crate::diff_lazy_fetch(context.lazy_fetch),
                 worktree_root: None,
                 use_worktree_new: false,
                 format,
@@ -1700,6 +1700,8 @@ fn write_show_remerge(
                 ignore_regexes: &[],
                 line_ranges: None,
                 indent_heuristic: true,
+                big_file_threshold: crate::diff_big_file_threshold(db),
+                submodule_render: crate::cli_submodule_render()
             },
         )?;
         if let Some(header) = conflict_headers.get(entry.path.as_bytes()) {
@@ -1823,7 +1825,7 @@ fn write_commit_diff_patch(
     }
     let stat_entries =
         if options.numstat || options.stat || options.compact_summary || options.shortstat {
-            collect_diff_stat_entries(entries, db, None, false, lazy_fetch)?
+            collect_diff_stat_entries(entries, db, None, false, crate::diff_lazy_fetch(lazy_fetch))?
         } else {
             Vec::new()
         };
@@ -1862,6 +1864,7 @@ fn write_commit_diff_patch(
                 patch: true,
             },
             DiffEntryRenderContext {
+                services: cli_render_services(),
                 raw: DiffEntryRawRenderOptions {
                     z: false,
                     abbrev: raw_abbrev,
@@ -1885,43 +1888,45 @@ fn write_commit_diff_patch(
             |_| false,
             |stdout, entry| {
                 let patch_options = DiffRenderOptions {
-                    line_indicators: sley_diff_merge::render::LineIndicators::default(),
-                    suppress_blank_empty: config
+                line_indicators: sley_diff_merge::render::LineIndicators::default(),
+                suppress_blank_empty: config
                         .get_bool("diff", None, "suppressblankempty")
                         .unwrap_or(false),
-                    binary: options.patch_binary,
-                    anchors: &options.anchored,
-                    allow_textconv: options.textconv != Some(false),
-                    db,
-                    lazy_fetch,
-                    worktree_root: None,
-                    use_worktree_new: false,
-                    format,
-                    abbrev: patch_abbrev,
-                    src_prefix: "a/",
-                    dst_prefix: "b/",
-                    context: 3,
-                    userdiff: Some(&userdiff),
-                    funcname: None,
-                    colors: colors.as_ref(),
-                    word_diff: word_request.as_ref(),
-                    no_index_contents: None,
-                    submodule_format: sley_rev::diff_options::SubmoduleDiffFormat::Short,
-                    submodule_dirt: None,
-                    ws_error: None,
-                    color_moved: None,
-                    interhunk: options.interhunk,
-                    ws_ignore: options.ws_ignore,
-                    diff_algorithm: options.diff_algorithm,
-                    ignore_blank_lines: options.ignore_blank_lines,
-                    ignore_regexes: &options.ignore_regexes,
-                    line_ranges: None,
-                    indent_heuristic: options.indent_heuristic.unwrap_or_else(|| {
+                binary: options.patch_binary,
+                anchors: &options.anchored,
+                allow_textconv: options.textconv != Some(false),
+                db,
+                lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
+                worktree_root: None,
+                use_worktree_new: false,
+                format,
+                abbrev: patch_abbrev,
+                src_prefix: "a/",
+                dst_prefix: "b/",
+                context: 3,
+                userdiff: Some(&userdiff),
+                funcname: None,
+                colors: colors.as_ref(),
+                word_diff: word_request.as_ref(),
+                no_index_contents: None,
+                submodule_format: sley_rev::diff_options::SubmoduleDiffFormat::Short,
+                submodule_dirt: None,
+                ws_error: None,
+                color_moved: None,
+                interhunk: options.interhunk,
+                ws_ignore: options.ws_ignore,
+                diff_algorithm: options.diff_algorithm,
+                ignore_blank_lines: options.ignore_blank_lines,
+                ignore_regexes: &options.ignore_regexes,
+                line_ranges: None,
+                indent_heuristic: options.indent_heuristic.unwrap_or_else(|| {
                         config
                             .get_bool("diff", None, "indentheuristic")
                             .unwrap_or(true)
                     }),
-                };
+                big_file_threshold: crate::diff_big_file_threshold(db),
+                submodule_render: crate::cli_submodule_render()
+            };
                 write_diff_patch_entry(stdout, entry, patch_options)
             },
         )?;
@@ -1938,6 +1943,7 @@ fn write_commit_diff_patch(
                 patch: false,
             },
             DiffEntryRenderContext {
+                services: cli_render_services(),
                 raw: DiffEntryRawRenderOptions {
                     z: false,
                     abbrev: raw_abbrev,

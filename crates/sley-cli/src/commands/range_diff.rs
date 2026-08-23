@@ -587,7 +587,7 @@ fn build_patch_text(
     let entries = if pathspecs.is_empty() {
         entries
     } else {
-        let pathspec = DiffPathspec::new(
+        let pathspec = crate::diff_pathspec_new(
             repo.cwd(),
             repo.worktree_root()?,
             pathspecs,
@@ -611,7 +611,7 @@ fn build_patch_text(
                 anchors: &[],
                 allow_textconv: false,
                 db,
-                lazy_fetch,
+                lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
                 worktree_root: None,
                 use_worktree_new: false,
                 format,
@@ -635,6 +635,8 @@ fn build_patch_text(
                 ignore_regexes: &[],
                 line_ranges: None,
                 indent_heuristic: true,
+                big_file_threshold: crate::diff_big_file_threshold(db),
+                submodule_render: crate::cli_submodule_render()
             },
         )?;
         append_normalized_hunks(&mut out, &raw, section_path(entry));
