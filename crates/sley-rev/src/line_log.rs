@@ -47,7 +47,7 @@ impl RangeSet {
     /// `range_set_append`: must begin at or after the end of the last range.
     /// Skips empty ranges (git's `range_set_append` asserts `a <= b` but real
     /// range sets never store empties; the diff-ranges parallel arrays use
-    /// [`append_raw`] to keep zero-width sides).
+    /// `append_raw` to keep zero-width sides).
     pub fn append(&mut self, start: i64, end: i64) {
         if start >= end {
             return;

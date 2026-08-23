@@ -2894,7 +2894,7 @@ fn global_config_paths() -> Vec<PathBuf> {
 /// `None` when neither variable yields a base directory.
 ///
 /// This directory holds git's user-level defaults: `config`
-/// (see [`global_config_paths`]) plus `ignore` and `attributes`, the default
+/// (see `global_config_paths`) plus `ignore` and `attributes`, the default
 /// `core.excludesFile` / `core.attributesFile` when those keys are unset.
 pub fn xdg_git_home_path(file_name: &str) -> Option<PathBuf> {
     if let Some(xdg) = non_empty_env("XDG_CONFIG_HOME") {

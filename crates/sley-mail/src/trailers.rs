@@ -668,7 +668,7 @@ pub fn line_at(buf: &str, pos: usize, len: usize) -> &str {
 ///
 /// git callers require the result to be `>= 1`; this helper returns the raw
 /// position (which can be 0 for a leading separator) and leaves that check to
-/// [`is_trailer_line`]. Operates on bytes to match C's byte-wise `isalnum`.
+/// [`separator_index`]. Operates on bytes to match C's byte-wise `isalnum`.
 pub fn find_separator(line: &str, separators: &[char]) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut whitespace_found = false;
