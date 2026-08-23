@@ -25,6 +25,25 @@ env:
   SCCACHE_GHA_ENABLED: "false"
 
 jobs:
+  # Guard the publish workflow's explicit crate list. publish-crates.yml keeps
+  # an explicit CRATES=(...) list (so a crate flipping publish=true can't
+  # silently expand the crates.io surface without PR review — heddle#72). This
+  # job cross-checks that list against `cargo metadata`: it fails if the list is
+  # stale vs the actual publishable set (membership) or not topologically valid.
+  # Cheap: `cargo metadata --no-deps` reads manifests only (no build).
+  publish-list-check:
+    name: Publish crate-list check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Assert publish-crates.yml CRATES list vs cargo metadata
+        run: bash scripts/check-publish-pipeline.sh
+
   windows-transport-check:
     name: Windows transport check
     runs-on: windows-latest
