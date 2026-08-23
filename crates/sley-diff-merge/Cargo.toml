@@ -20,5 +20,8 @@ sley-pathspec.workspace = true
 sley-refs.workspace = true
 sley-grep.workspace = true
 
+[dev-dependencies]
+tempfile = "3.27.0"
+
 [lints]
 workspace = true

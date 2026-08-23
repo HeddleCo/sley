@@ -2633,6 +2633,18 @@ pub(crate) fn restore_index_and_worktree_paths_from_entries(
     })
 }
 
+/// Transition API — replace the index and working tree with the exact state of
+/// `commit_oid` (git's `reset --hard` / `read-tree -u --reset <commit>`).
+///
+/// This is the "put the worktree into state X" seam the sequencer engines
+/// (rebase/am/cherry-pick) call whenever a step must abandon local state and
+/// move the superproject to a recorded commit: every path in the current index
+/// (any stage) absent from the target tree is removed from the worktree, every
+/// target leaf is materialized through the smudge/delayed-filter queue, sparse
+/// patterns and sparse-index shape are preserved across the rewrite, and the
+/// result index carries refreshed cache-tree/extension data. Submodule gitlink
+/// recursion is deliberately NOT performed here — porcelain layers it on top
+/// (see the CLI reset/read-tree wrappers), matching git's layering.
 pub fn reset_index_and_worktree_to_commit(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
@@ -2757,6 +2769,11 @@ pub fn reset_index_and_worktree_to_commit(
     })
 }
 
+/// Transition API variant of [`reset_index_and_worktree_to_commit`] that also
+/// installs process filter metadata for the duration of the transition, so
+/// `filter.<name>.process` negotiations run with the caller's environment
+/// contract (git's `subprocess` filter context). Prefer the plain form when no
+/// process filters are configured.
 pub fn reset_index_and_worktree_to_commit_with_process_filter_metadata(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,

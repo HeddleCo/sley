@@ -8,6 +8,7 @@ mod name;
 mod name_status;
 mod orchestration;
 mod patch;
+pub mod rerere;
 pub mod porcelain;
 pub mod range;
 pub mod render;
@@ -22,6 +23,7 @@ pub use merge_trees::*;
 pub use name_status::*;
 pub use orchestration::*;
 pub use patch::*;
+pub use rerere::*;
 
 #[cfg(test)]
 mod tests {

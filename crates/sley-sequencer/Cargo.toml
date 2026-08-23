@@ -8,7 +8,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+sley-config.workspace = true
 sley-core.workspace = true
+# Rerere engine + patch/conflict primitives (FilePatch/HunkLine/
+# apply_file_patch/ConflictStyle) for the stage-B merge drive loops.
+# Acyclic: sley-diff-merge does not depend on this crate.
+sley-diff-merge.workspace = true
 sley-object.workspace = true
 sley-odb.workspace = true
 sley-refs.workspace = true

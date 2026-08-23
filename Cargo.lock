@@ -1607,6 +1607,7 @@ dependencies = [
  "sley-pack",
  "sley-pathspec",
  "sley-refs",
+ "tempfile",
 ]
 
 [[package]]
@@ -1852,7 +1853,9 @@ dependencies = [
 name = "sley-sequencer"
 version = "0.8.0"
 dependencies = [
+ "sley-config",
  "sley-core",
+ "sley-diff-merge",
  "sley-object",
  "sley-odb",
  "sley-refs",

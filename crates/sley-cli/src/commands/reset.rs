@@ -339,6 +339,7 @@ pub(crate) fn cmd_reset(cli_session: &crate::session::CliSession, args: &[String
             &worktree_root,
             format,
             &db,
+            &commands::remote::read_effective_repo_config(&git_dir, &worktree_root)?,
             Some(&head_tree),
             &target_tree,
             commands::read_tree::UnpackPorcelain::ReadTree,

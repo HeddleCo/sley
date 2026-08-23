@@ -50,6 +50,7 @@ mod read_tree;
 mod status;
 mod status_plan;
 mod types_admin;
+mod unpack_worktree;
 
 // Environment-respecting repository discovery, shared with the facade setup
 // path and the hook engine (see the `discovery` module docs).
@@ -83,6 +84,17 @@ pub use read_tree::*;
 pub use status::*;
 pub use status_plan::*;
 pub use types_admin::*;
+// `unpack_worktree` is re-exported explicitly (not via glob) because several of
+// its internal helpers intentionally keep module-private names that would
+// otherwise collide with the crate-wide prelude.
+pub use unpack_worktree::{
+    ReadTreeWorktree, SubmoduleCheckoutHook, SubmoduleHooks, SubmoduleRemoveHook,
+    UnpackPorcelain, checkout_two_way_engine, gitlink_should_recurse,
+    load_superproject_submodules, prune_empty_dirs, refuse_if_unpack_result_removes_current_directory,
+    remove_path_in_the_way, remove_worktree_path, safe_worktree_path, verify_uptodate_path,
+    write_tree_entry_to_worktree, write_tree_entry_to_worktree_with_hooks,
+    refuse_if_unpack_entries_turn_cwd_into_file,
+};
 
 #[cfg(test)]
 mod tests {

@@ -1713,6 +1713,18 @@ pub(crate) fn update_index_paths_impl(
     })
 }
 
+/// Transition API — refresh the on-disk index's stat cache against the
+/// working tree (git's `update-index --refresh`, path-scoped).
+///
+/// This is half of the "put the worktree into state X" seam the sequencer
+/// engines call after mutating worktree files outside a full unpack-trees
+/// transition: pair it with [`reset_index_and_worktree_to_commit`] (full
+/// state replacement) or [`crate::checkout_index_paths_with_database`]
+/// (path materialization) to leave index stat data consistent with the
+/// rewritten worktree. Empty `paths` means "refresh every stage-0 entry".
+/// `quiet` suppresses the per-path "needs update" reports, `ignore_missing`
+/// tolerates vanished worktree files, and `really_refresh` re-hashes content
+/// even when the cached stat already matches.
 pub fn refresh_index_paths(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
@@ -1735,6 +1747,9 @@ pub fn refresh_index_paths(
     )
 }
 
+/// Extended form of [`refresh_index_paths`] exposing git's remaining
+/// `update-index --refresh` knobs: submodule-aware dirtiness skipping and
+/// tolerance for unmerged (higher-stage) entries.
 pub fn refresh_index_paths_with_options(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,

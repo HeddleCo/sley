@@ -17,6 +17,39 @@ use std::path::Path;
 // re-exports keep every historical `sley_sequencer::*` path working.
 pub use sley_object::{CommitCreate, encode_commit_object, format_commit_identity, format_commit_identity_bytes};
 
+// Stage-B prerequisites: the patch/conflict primitives the inbound
+// rebase/am/cherry-pick drive loops consume (21+ refs live in the CLI's
+// rebase/am today), plus the rerere engine home. These are re-exports of the
+// sley-diff-merge surface so sequencer callers resolve every historical
+// `commands::*` symbol through this crate once the engines land.
+pub use sley_diff_merge::{
+    ConflictStyle, FilePatch, HunkLine, apply_file_patch,
+    rerere::{
+        MergeRrEntry, RerereConflict, RerereHooks, RerereReporter, RerereStageHook,
+        StderrRerereReporter, is_rerere_enabled_with_config, repo_rerere as sequencer_repo_rerere,
+        rerere_autoupdate_with_config,
+    },
+};
+
+/// Sequencer-side `rerere.autoupdate` resolution seam.
+///
+/// The drive loops call this once per conflicted step to decide whether a clean
+/// replay should be staged automatically (git's `rerere.autoupdate`, including
+/// the `--rerere-autoupdate` command-line override).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllowRerereAuto {
+    /// Explicit `--[no-]rerere-autoupdate` override from the invoking command.
+    pub override_value: Option<bool>,
+}
+
+impl AllowRerereAuto {
+    /// Resolve against the effective configuration view (`rerere.autoupdate`;
+    /// default off when unset).
+    pub fn resolve(&self, config: &sley_config::GitConfig) -> bool {
+        rerere_autoupdate_with_config(config, self.override_value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SequencerCommand {
     Pick(ObjectId),
