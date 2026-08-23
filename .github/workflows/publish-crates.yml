@@ -1,13 +1,22 @@
 name: Publish crates
 
-# Publishes the sley library facade and its 28-crate lib dependency closure to
+# Publishes the sley library facade and its lib dependency closure to
 # crates.io. The default run is a DRY RUN (no upload) — a human flips `dry_run`
 # to false to perform the real publish. The token comes from the repo secret
 # CRATES_IO_API_KEY (set as CARGO_REGISTRY_TOKEN for cargo).
 #
-# The crates are published in a VALIDATED topological order (every crate appears
-# after all of its in-set sley-* dependencies; `sley`, the facade, is last). The
-# order was computed from `cargo metadata` and is asserted at runtime below.
+# The publish set is an EXPLICIT list (`CRATES=(...)` below), in a valid
+# topological order (every crate appears after all of its in-workspace
+# publishable deps). The list is kept explicit — not auto-discovered from
+# `cargo metadata` — on purpose: a crate flipping `publish = true` must not
+# silently expand the public crates.io surface without a PR-review signal
+# (the heddle#72 safety property).
+#
+# The list can't rot unnoticed, either: scripts/check-publish-pipeline.sh runs
+# in PR CI (see ci.yml) and fails the build if CRATES drifts from the actual
+# publishable set (a crate added/removed/re-scoped) OR is not topologically
+# valid. That asserter — not a runtime re-derivation here — is the guard, so
+# by the time this workflow runs off main the list is already verified.
 
 on:
   workflow_dispatch:
@@ -54,9 +63,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          # VALIDATED topological publish order: each crate appears after all of
-          # its in-set sley-* dependencies; the `sley` facade is last. Computed
-          # from `cargo metadata` (normal + build deps) and re-asserted below.
+          # EXPLICIT publish set, in a valid topological order (every crate
+          # appears after all of its in-workspace publishable deps). Kept
+          # explicit so a crate flipping `publish = true` can't silently expand
+          # the crates.io surface without a PR-review signal (heddle#72).
+          #
+          # This list is GUARDED by scripts/check-publish-pipeline.sh, which runs
+          # in PR CI and fails if the list drifts from the actual publishable set
+          # (membership) or stops being topologically valid. When you add,
+          # remove, or re-scope a crate, update this list; the asserter will tell
+          # you if you got it wrong. The `sley` facade need not be dead-last —
+          # any topologically valid order is accepted (sley-i18n / sley-procinfo
+          # are independent publishable leaves that follow it).
           CRATES=(
             sley-core
             sley-pathspec
@@ -73,66 +91,24 @@ jobs:
             sley-options
             sley-rev
             sley-submodule
-            sley-fsck
             sley-unpack-trees
             sley-worktree
             sley-hooks
-            sley-i18n
             sley-sequencer
             sley-notes
             sley-protocol
             sley-strbuf-expand
             sley-ref-filter
             sley-pretty
-            sley-procinfo
+            sley-fsck
             sley-transport
             sley-remote
             sley
+            sley-i18n
+            sley-procinfo
           )
-
-          # --- Topological-order assertion ------------------------------------
-          # Re-derive the intra-set sley-* dependency edges from the live
-          # `cargo metadata` and confirm each crate is published only after all
-          # of its in-set deps. A drift in the dep graph (a new edge that the
-          # baked order no longer respects) fails the job before any upload.
-          echo "::group::Validate topological order"
-          IN_SET=" ${CRATES[*]} "
-          # positions
-          declare -A POS
-          i=0
-          for c in "${CRATES[@]}"; do
-            POS[$c]=$i
-            i=$((i + 1))
-          done
-          if [ "${#CRATES[@]}" -ne 30 ]; then
-            echo "Expected 30 crates, got ${#CRATES[@]}" >&2
-            exit 1
-          fi
-          META="$(cargo metadata --format-version 1 --all-features --no-deps)"
-          ORDER_OK=1
-          for c in "${CRATES[@]}"; do
-            # normal + build deps of c that are in our publish set
-            DEPS="$(echo "$META" | jq -r --arg c "$c" '
-              .packages[] | select(.name == $c) | .dependencies[]
-              | select((.kind == null) or (.kind == "build"))
-              | .name | select(startswith("sley"))')"
-            for d in $DEPS; do
-              case "$IN_SET" in
-                *" $d "*)
-                  if [ "${POS[$d]}" -ge "${POS[$c]}" ]; then
-                    echo "ORDER VIOLATION: $c (pos ${POS[$c]}) depends on $d (pos ${POS[$d]}) but $d is not earlier" >&2
-                    ORDER_OK=0
-                  fi
-                  ;;
-              esac
-            done
-          done
-          if [ "$ORDER_OK" -ne 1 ]; then
-            echo "Baked topological order is stale vs the dependency graph." >&2
-            exit 1
-          fi
-          echo "Topological order validated for ${#CRATES[@]} crates."
-          echo "::endgroup::"
+          printf 'Publishing %d crates in topological order:\n' "${#CRATES[@]}"
+          printf '  %s\n' "${CRATES[@]}"
 
           # --- Publish loop ----------------------------------------------------
           PUBLISHED=()
