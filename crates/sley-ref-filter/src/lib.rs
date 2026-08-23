@@ -16,6 +16,7 @@ mod atoms;
 mod context;
 mod contents;
 mod repo;
+mod render;
 mod sort;
 mod tracking;
 mod versioncmp;
@@ -36,6 +37,10 @@ pub use contents::{
 };
 pub use repo::{
     for_each_ref_loose_object_disk_size, for_each_ref_worktree_path, for_each_ref_worktree_paths,
+};
+pub use render::{
+    ForEachRefDescribeRenderer, ForEachRefRenderHooks, ForEachRefTrailersFormatter,
+    print_for_each_ref_format, print_for_each_ref_format_with_is_bases,
 };
 pub use sort::{
     ForEachRefDateSortField, ForEachRefIdentityPart, ForEachRefIdentitySortField,

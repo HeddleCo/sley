@@ -2292,7 +2292,12 @@ fn print_tag_list(
                 warn_ambiguous_refs,
             };
             let mut line = Vec::new();
-            print_for_each_ref_format(&mut line, format_spec, &format_context)?;
+            print_for_each_ref_format(
+                &mut line,
+                format_spec,
+                &format_context,
+                super::for_each_ref::FOR_EACH_REF_RENDER_HOOKS,
+            )?;
             if !options.omit_empty || !line.is_empty() {
                 stdout.write_all(&line)?;
                 stdout.write_all(b"\n")?;

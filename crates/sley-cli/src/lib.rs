@@ -67,7 +67,6 @@ mod commit_message;
 mod diff_render;
 mod discovery;
 mod dispatch;
-mod for_each_ref_helpers;
 mod global_options;
 mod init_config;
 mod interrupt_cancel;
@@ -133,7 +132,6 @@ pub(crate) use discovery::{
     is_git_dir_candidate, paths_refer_to_same_dir, read_gitdir_file, resolve_cli_path,
 };
 
-pub(crate) use for_each_ref_helpers::*;
 pub(crate) use log_cli::{
     CliLogDescribeAdapter, CliLogDescribeContext, CliLogSignatureAdapter, CliLogSignatureContext,
     CliMailmapAdapter, DecorationFilter, LogDecorationMode, LogFilterPattern, SimpleLogRegex,
