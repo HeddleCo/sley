@@ -5,6 +5,20 @@
 //! (`sley-hooks`), which must resolve a git directory from the current working
 //! directory with git's environment overrides when callers do not supply one.
 
+//! Consolidated repository-discovery cluster:
+//!
+//! * this module — env-var helpers, walk-up discovery, ceiling/filesystem
+//!   boundaries shared by every consumer below;
+//! * [`setup`] — the faithful `setup_git_directory_gently` port plus the
+//!   invocation worktree-policy quartet;
+//! * [`ownership`] — `safe.directory` / `safe.bareRepository` enforcement;
+//! * [`probes`] — gitfile classification diagnostics and remote local-path
+//!   walk-up resolution.
+
+pub mod ownership;
+pub mod probes;
+pub mod setup;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};

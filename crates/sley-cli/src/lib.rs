@@ -73,7 +73,6 @@ mod init_config;
 mod interrupt_cancel;
 mod log_cli;
 mod ls_files_pathspec;
-mod ownership;
 mod reflog_parse;
 mod remote;
 mod repo_helpers;

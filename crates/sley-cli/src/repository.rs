@@ -31,13 +31,11 @@ pub(crate) enum ObjectAccess {
 }
 
 /// Purpose-specific worktree semantics for a repository snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorktreePolicy {
-    /// Normal command setup semantics.
-    Command,
-    /// Hash-object attribute lookup semantics, based on physical layout.
-    HashAttributes,
-}
+///
+/// The canonical definition lives in the shared setup engine
+/// ([`sley_worktree::discovery::setup::WorktreePolicy`]); this alias keeps the
+/// CLI call sites unchanged.
+pub(crate) use crate::sley_worktree::discovery::setup::WorktreePolicy;
 
 pub(crate) struct RepositoryContext {
     cwd: PathBuf,
