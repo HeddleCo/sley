@@ -1,6 +1,5 @@
 [package]
 name = "sley-hooks"
-publish = false
 version.workspace = true
 description = "Native-Rust Git hook engine for the sley project: traditional and hook.*-configured hook discovery, parallel execution, and git hook run/list porcelain."
 repository.workspace = true
