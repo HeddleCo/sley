@@ -203,12 +203,6 @@ pub(crate) use sley_mail::encode::{
     message_body_has_non_ascii, needs_rfc2047_encoding, needs_rfc822_quoting,
     write_mime_closing, write_mime_part_header, write_mime_preamble,
 };
-pub(crate) use sley_mail::mailinfo::{
-    MailMessage as AmPatch, SubjectCleanup, commit_message_body_after_subject, hg_patch_to_mail,
-    is_diff_start, looks_like_patch_input, parse_mbox, parse_mboxrd, parse_message,
-    split_keep_newline, stgit_patch_to_mail, strip_cr, subject_of_message,
-    trim_trailing_newline, write_stored_subject_header,
-};
 pub(crate) use sley_mail::patch_id::{PatchIdOptions, get_one_patchid, split_keep_newlines};
 // Revision-resolution wrappers dissolved into `sley-rev`; the aliases keep the
 // historical unqualified names working across command modules with no per-site

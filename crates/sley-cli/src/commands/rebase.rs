@@ -21,6 +21,7 @@ use crate::*;
 use sley_sequencer::rebase as seq;
 use sley_sequencer::rebase::{RebaseTodoItem, TodoCommand};
 use sley_sequencer::rebase_drive as rdrive;
+use sley_sequencer::am as sam;
 
 // ---------------------------------------------------------------------------
 // Options
@@ -721,6 +722,27 @@ fn prefetch_adapter() -> &'static RebasePrefetch {
 }
 
 
+
+fn am_engine_ctx(ctx: &Ctx) -> sam::AmContext<'static> {
+    commands::am::am_engine_context(
+        &ctx.git_dir,
+        &ctx.common_git_dir,
+        &ctx.worktree_root,
+        ctx.format,
+        &ctx.config,
+        ctx.lazy_fetch,
+    )
+}
+
+fn am_engine_hosts_for(ctx: &Ctx) -> sam::AmHosts<'static> {
+    commands::am::am_engine_hosts(
+        &ctx.git_dir,
+        &ctx.common_git_dir,
+        &ctx.worktree_root,
+        ctx.lazy_fetch,
+    )
+}
+
 pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let parsed = parse_rebase_args(args)?;
     let mut ctx = Ctx::from_session(cli_session)?;
@@ -752,7 +774,7 @@ pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[Strin
     };
     let history_plan = seq::plan_history_edit(seq::HistoryEditPlanOptions {
         action: history_action,
-        apply_in_progress: commands::am::rebase_apply_in_progress(&ctx.git_dir),
+        apply_in_progress: sam::rebase_apply_in_progress(&ctx.git_dir),
         merge_in_progress: seq::in_progress(&ctx.git_dir),
     });
     if history_plan == seq::HistoryEditPlan::MissingState {
@@ -778,14 +800,8 @@ pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[Strin
     if apply_in_progress {
         match parsed.action {
             RebaseAction::Continue => {
-                let result = commands::am::rebase_apply_continue(
-                    &ctx.git_dir,
-                    &ctx.common_git_dir,
-                    &ctx.worktree_root,
-                    ctx.format,
-                    &ctx.config,
-                    ctx.lazy_fetch,
-                );
+                let result =
+                    sam::rebase_apply_continue(&am_engine_ctx(&ctx), &am_engine_hosts_for(&ctx));
                 // Ok iff the whole series completed; restore the autostash then
                 // (a fresh conflict returns Err and keeps it for the next step).
                 if result.is_ok() {
@@ -794,14 +810,8 @@ pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[Strin
                 return result;
             }
             RebaseAction::Skip => {
-                let result = commands::am::rebase_apply_skip(
-                    &ctx.git_dir,
-                    &ctx.common_git_dir,
-                    &ctx.worktree_root,
-                    ctx.format,
-                    &ctx.config,
-                    ctx.lazy_fetch,
-                );
+                let result =
+                    sam::rebase_apply_skip(&am_engine_ctx(&ctx), &am_engine_hosts_for(&ctx));
                 if result.is_ok() {
                     rdrive::finish_apply_autostash(&rctx, &hosts);
                 }
@@ -809,13 +819,8 @@ pub(crate) fn cmd_rebase(cli_session: &crate::session::CliSession, args: &[Strin
             }
             RebaseAction::Abort => {
                 let autostash = rdrive::read_apply_autostash(&ctx.git_dir);
-                let result = commands::am::rebase_apply_abort(
-                    &ctx.git_dir,
-                    &ctx.worktree_root,
-                    ctx.format,
-                    &ctx.config,
-                    ctx.lazy_fetch,
-                );
+                let result =
+                    sam::rebase_apply_abort(&am_engine_ctx(&ctx), &am_engine_hosts_for(&ctx));
                 // Abort always ends the rebase; restore the autostash on top of
                 // the restored orig_head (git applies it after reset).
                 if result.is_ok() {
@@ -1567,7 +1572,7 @@ fn run_apply_backend(
         if !message.ends_with(b"\n") {
             message.push(b'\n');
         }
-        commits.push(commands::am::RebaseApplyCommit {
+        commits.push(sam::RebaseApplyCommit {
             author_name: name,
             author_email: email,
             author_date: date,
@@ -1593,12 +1598,10 @@ fn run_apply_backend(
         return Err(err);
     }
 
-    let result = commands::am::start_rebase_apply(
-        &ctx.git_dir,
-        &ctx.common_git_dir,
-        &ctx.worktree_root,
-        ctx.format,
-        commands::am::RebaseApplyParams {
+    let result = sam::start_rebase_apply(
+        &am_engine_ctx(ctx),
+        &am_engine_hosts_for(ctx),
+        sam::RebaseApplyParams {
             commits,
             quiet: args.quiet,
             signoff: args.signoff,
@@ -1611,8 +1614,6 @@ fn run_apply_backend(
             orig_head: *orig_head,
             onto: *onto,
         },
-        &ctx.config,
-        ctx.lazy_fetch,
     );
     // The series finished cleanly (Ok) iff the whole rebase completed; restore
     // the autostash then. A conflict returns Err and leaves the stash in place

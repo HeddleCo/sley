@@ -1,3 +1,4 @@
+pub mod am;
 pub mod apply;
 pub mod commit_message;
 pub mod history;

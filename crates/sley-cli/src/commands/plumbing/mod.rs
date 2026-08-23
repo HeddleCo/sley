@@ -17,7 +17,7 @@ mod worktree;
 mod plumbing_options;
 
 pub(crate) use add::cmd_add;
-pub(crate) use apply::{BinaryApply, apply_binary_outcome, cmd_apply};
+pub(crate) use apply::cmd_apply;
 pub(crate) use archive::cmd_archive;
 pub(crate) use bundle::cmd_bundle;
 pub(crate) use clean::cmd_clean;

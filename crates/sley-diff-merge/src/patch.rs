@@ -1,6 +1,7 @@
 //! Unified diff patch parsing and application.
 
-use sley_core::{GitError, Result};
+use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_odb::FileObjectDatabase;
 
 use crate::{name, ws};
 
@@ -2149,4 +2150,121 @@ fn trim_ascii_end(bytes: &[u8]) -> &[u8] {
 
 fn lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// Binary patch application (apply.c `apply_binary`).
+// ---------------------------------------------------------------------------
+
+/// Outcome of applying a binary file patch.
+pub enum BinaryApply {
+    /// The postimage bytes to write.
+    Content(Vec<u8>),
+    /// The new blob OID is null — the file is removed.
+    Deletion,
+}
+
+/// Apply a `GIT binary patch` (or a metadata-only `Binary files … differ`)
+/// against `image` (the current preimage bytes). Mirrors apply.c's `apply_binary`:
+/// require a full index line, verify the preimage matches `old_oid`, then either
+/// read the postimage straight from the object store or reconstruct it from the
+/// binary fragment and verify it hashes to `new_oid`.
+// The unwraps are guarded by `is_full` above; the source module (the CLI's
+// plumbing/apply.rs) carried a file-level unwrap allowance.
+#[allow(clippy::unwrap_used)]
+pub fn apply_binary_outcome(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    patch: &FilePatch,
+    image: &[u8],
+) -> Result<BinaryApply> {
+    use sley_core::object_id_for_bytes;
+    use sley_odb::ObjectReader;
+
+    let name = String::from_utf8_lossy(
+        patch
+            .old_path
+            .as_deref()
+            .or(patch.new_path.as_deref())
+            .unwrap_or(b""),
+    )
+    .into_owned();
+    let hexsz = format.hex_len();
+    let is_full = |hex: Option<&Vec<u8>>| {
+        hex.is_some_and(|hex| hex.len() == hexsz && hex.iter().all(u8::is_ascii_hexdigit))
+    };
+    // For safety, git requires full hex object IDs for old and new.
+    if !is_full(patch.old_oid_hex.as_ref()) || !is_full(patch.new_oid_hex.as_ref()) {
+        eprintln!("error: cannot apply binary patch to '{name}' without full index line");
+        return Err(GitError::Exit(1));
+    }
+    let old_hex = String::from_utf8_lossy(patch.old_oid_hex.as_ref().unwrap()).into_owned();
+    let new_hex = String::from_utf8_lossy(patch.new_oid_hex.as_ref().unwrap()).into_owned();
+
+    // The preimage must match what the patch was prepared against.
+    if !patch.is_new && patch.old_path.is_some() {
+        let got = object_id_for_bytes(format, "blob", image)?.to_hex();
+        if got != old_hex {
+            eprintln!(
+                "error: the patch applies to '{name}' ({got}), which does not match the \
+                 current contents."
+            );
+            return Err(GitError::Exit(1));
+        }
+    } else if !image.is_empty() {
+        eprintln!("error: the patch applies to an empty '{name}' but it is not empty");
+        return Err(GitError::Exit(1));
+    }
+
+    let new_oid = ObjectId::from_hex(format, &new_hex)?;
+    if new_oid.is_null() {
+        return Ok(BinaryApply::Deletion);
+    }
+
+    // If we already have the postimage object, use it directly.
+    if db.contains(&new_oid)? {
+        let object = db.read_object(&new_oid)?;
+        return Ok(BinaryApply::Content(object.body.clone()));
+    }
+
+    // Otherwise reconstruct it from the binary fragment and verify the result.
+    let Some(binary) = &patch.binary else {
+        eprintln!("error: missing binary patch data for '{name}'");
+        return Err(GitError::Exit(1));
+    };
+    let frag = &binary.forward;
+    let binary_apply_failed = || {
+        eprintln!("error: binary patch does not apply to '{name}'");
+        GitError::Exit(1)
+    };
+    let inflated =
+        inflate_zlib_exact(&frag.deflated, frag.origlen).ok_or_else(binary_apply_failed)?;
+    let post = match frag.method {
+        BinaryMethod::Literal => inflated,
+        BinaryMethod::Delta => git_patch_delta(image, &inflated).ok_or_else(binary_apply_failed)?,
+    };
+    let got = object_id_for_bytes(format, "blob", &post)?.to_hex();
+    if got != new_hex {
+        eprintln!(
+            "error: binary patch to '{name}' creates incorrect result \
+             (expecting {new_hex}, got {got})"
+        );
+        return Err(GitError::Exit(1));
+    }
+    Ok(BinaryApply::Content(post))
+}
+
+/// Inflate a single zlib stream, expecting exactly `expected_len` bytes out.
+fn inflate_zlib_exact(deflated: &[u8], expected_len: usize) -> Option<Vec<u8>> {
+    use flate2::{Decompress, FlushDecompress};
+    let mut decoder = Decompress::new(true);
+    let mut out =
+        Vec::with_capacity(sley_pack::inflate::bounded_inflate_reserve(expected_len, deflated.len()));
+    decoder
+        .decompress_vec(deflated, &mut out, FlushDecompress::Finish)
+        .ok()?;
+    if out.len() != expected_len {
+        return None;
+    }
+    Some(out)
 }

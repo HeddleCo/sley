@@ -35,7 +35,6 @@ pub(crate) use merge_util::{
     merge_worktree_content, merge_write_worktree_file, three_way_merge_trees,
     three_way_merge_trees_inner_with_info,
     three_way_merge_trees_inner_with_info_opts_and_path_favor,
-    three_way_merge_trees_inner_with_info_opts_and_path_resolvers,
     three_way_merge_trees_outcome_with_info_opts_and_path_resolvers, three_way_merge_trees_styled,
     three_way_merge_trees_with_favor,
     virtual_ancestor_entry_map, worktree_file_matches_ours,
