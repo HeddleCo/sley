@@ -4,14 +4,15 @@
 mod cache;
 #[cfg(unix)]
 mod cache_daemon;
+mod exec;
 mod prompt;
 mod store;
 #[cfg(unix)]
 mod unix_socket;
 mod url;
 
-use std::io::{self, BufRead, Read, Write};
-use std::process::{Command, Stdio};
+use std::io::{self, BufRead, Write};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sley_config::{ConfigStack, GitConfig};
@@ -21,6 +22,10 @@ use sley_core::{GitError, Result};
 pub use cache::cmd_credential_cache;
 #[cfg(unix)]
 pub use cache_daemon::cmd_credential_cache_daemon;
+pub use exec::{
+    DEFAULT_HELPER_TIMEOUT, DEFAULT_MAX_OUTPUT_BYTES, HelperExecOptions, external_helper_command,
+    find_external_helper_executable, find_external_helper_executable_from_env,
+};
 pub use store::cmd_credential_store;
 
 pub const TIME_MAX: i64 = i64::MAX;
@@ -450,62 +455,57 @@ pub fn credential_helper_command(spec: &str, op: &str) -> Option<Command> {
     Some(command)
 }
 
-fn credential_do(
+/// Execution policy pinned to the pre-options behavior: no deadline, no
+/// fallthrough, embedded dispatch only. The legacy entry points use it so
+/// their semantics cannot drift from the options-carrying engine.
+fn legacy_helper_options() -> HelperExecOptions {
+    HelperExecOptions::new()
+        .timeout(None)
+        .fallthrough_on_error(false)
+        .prefer_path_helpers(false)
+}
+
+pub fn credential_do(
     credential: &mut GitCredential,
     helper: &str,
     operation: &str,
     want_output: bool,
 ) -> Result<()> {
-    let Some(mut command) = credential_helper_command(helper, operation) else {
+    credential_do_with_options(
+        credential,
+        helper,
+        operation,
+        want_output,
+        &legacy_helper_options(),
+    )
+}
+
+/// Run one credential-helper subprocess under an explicit execution policy.
+///
+/// See [`exec`] for the policy knobs. Compared to [`credential_do`], a parsed
+/// response is applied atomically: a malformed or partial reply leaves
+/// `credential` untouched instead of half-filled.
+pub fn credential_do_with_options(
+    credential: &mut GitCredential,
+    helper: &str,
+    operation: &str,
+    want_output: bool,
+    options: &HelperExecOptions,
+) -> Result<()> {
+    let Some(command) = exec::resolve_helper_command(helper, operation, options) else {
         return Err(GitError::Command("empty credential helper".into()));
     };
-    command.stdin(Stdio::piped());
-    command.stdout(if want_output {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    });
-    let mut child = command.spawn().map_err(|e| GitError::Io(e.to_string()))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let op_type = if want_output {
-            CredentialOpType::Helper
-        } else {
-            CredentialOpType::Response
-        };
-        credential_write(credential, &mut stdin, op_type)?;
+    let output = exec::run_helper_process(command, credential, helper, want_output, options)?;
+    if !want_output {
+        return Ok(());
     }
-    if want_output {
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| GitError::Io("credential helper stdout was not piped".into()))?;
-        let mut input = Vec::new();
-        stdout
-            .take((MAX_GIT_CREDENTIAL_RESPONSE_BYTES as u64).saturating_add(1))
-            .read_to_end(&mut input)
-            .map_err(|e| GitError::Io(e.to_string()))?;
-        if input.len() > MAX_GIT_CREDENTIAL_RESPONSE_BYTES {
-            return Err(GitError::InvalidFormat(format!(
-                "credential helper response exceeds maximum size of {} bytes (64 KiB)",
-                MAX_GIT_CREDENTIAL_RESPONSE_BYTES
-            )));
-        }
-        let status = child.wait().map_err(|e| GitError::Io(e.to_string()))?;
-        if !status.success() {
-            return Err(GitError::Command(format!(
-                "credential helper '{helper}' failed"
-            )));
-        }
-        let mut reader = io::Cursor::new(input);
-        credential_read(credential, &mut reader, CredentialOpType::Helper)?;
-    } else {
-        let status = child.wait().map_err(|e| GitError::Io(e.to_string()))?;
-        if !status.success() {
-            return Err(GitError::Command(format!(
-                "credential helper '{helper}' failed"
-            )));
-        }
-    }
+    let mut response = credential.clone();
+    credential_read(
+        &mut response,
+        &mut io::Cursor::new(output),
+        CredentialOpType::Helper,
+    )?;
+    *credential = response;
     Ok(())
 }
 
@@ -523,6 +523,29 @@ pub fn credential_fill(
     credential: &mut GitCredential,
     all_capabilities: bool,
 ) -> Result<()> {
+    credential_fill_with_options(
+        config,
+        stack,
+        credential,
+        all_capabilities,
+        &legacy_helper_options(),
+    )
+}
+
+/// [`credential_fill`] under an explicit execution policy.
+///
+/// With [`HelperExecOptions::fallthrough_on_error`], a helper that fails,
+/// hangs past its deadline, or emits garbage is skipped and the chain
+/// continues — matching how an embedder wants authentication to degrade, and
+/// how git users expect a broken optional helper to behave. With the flag off,
+/// the first failing helper aborts the fill (upstream-git strictness).
+pub fn credential_fill_with_options(
+    config: Option<&GitConfig>,
+    stack: Option<&ConfigStack>,
+    credential: &mut GitCredential,
+    all_capabilities: bool,
+    options: &HelperExecOptions,
+) -> Result<()> {
     if credential.is_full() {
         return Ok(());
     }
@@ -534,7 +557,11 @@ pub fn credential_fill(
     }
     let helpers = credential.helpers.clone();
     for helper in helpers {
-        credential_do(credential, &helper, "get", true)?;
+        if let Err(error) = credential_do_with_options(credential, &helper, "get", true, options)
+            && !options.falls_through_on_error()
+        {
+            return Err(error);
+        }
         if credential.password_expiry_utc < now() {
             credential_clear_secrets(credential);
             credential.password_expiry_utc = TIME_MAX;
