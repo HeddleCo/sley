@@ -3,6 +3,7 @@ pub mod commit_message;
 pub mod history;
 pub mod pick;
 pub mod rebase;
+pub mod rebase_drive;
 pub mod replay;
 pub mod stash;
 

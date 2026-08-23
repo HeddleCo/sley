@@ -169,19 +169,6 @@ pub fn strip_comment_string_lines(message: &[u8], comment: &[u8]) -> Vec<u8> {
     cleaned
 }
 
-#[cfg(test)]
-mod comment_cleanup_tests {
-    use super::strip_comment_string_lines;
-
-    #[test]
-    fn strips_the_complete_multibyte_comment_prefix() {
-        let message = b"A3\n\nCOMMENT generated help\nCOMMENT status\n\nedited\n";
-        assert_eq!(
-            strip_comment_string_lines(message, b"COMMENT"),
-            b"A3\n\nedited\n"
-        );
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Revision selection
@@ -1976,4 +1963,18 @@ pub fn reset_merge_in(
 
     replay::remove_branch_state(git_dir);
     Ok(())
+}
+
+#[cfg(test)]
+mod comment_cleanup_tests {
+    use super::strip_comment_string_lines;
+
+    #[test]
+    fn strips_the_complete_multibyte_comment_prefix() {
+        let message = b"A3\n\nCOMMENT generated help\nCOMMENT status\n\nedited\n";
+        assert_eq!(
+            strip_comment_string_lines(message, b"COMMENT"),
+            b"A3\n\nedited\n"
+        );
+    }
 }

@@ -30,7 +30,7 @@ pub(crate) use merge_base::{
 pub(crate) use merge_util::{
     MergePathResult, MergePathResults, MergeTreeMap, RenameMergeConfig, clear_merge_df_blockers,
     merge_conflict_style_from_config, merge_favor_from_strategy_opt,
-    merge_favor_from_strategy_opts, merge_index_entry, merge_read_blob,
+    merge_index_entry, merge_read_blob,
     merge_refuse_if_current_working_directory_becomes_file, merge_remove_worktree_file,
     merge_worktree_content, merge_write_worktree_file, three_way_merge_trees,
     three_way_merge_trees_inner_with_info,
