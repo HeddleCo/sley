@@ -1558,6 +1558,7 @@ dependencies = [
  "sley-fsck",
  "sley-grep",
  "sley-i18n",
+ "sley-mail",
  "sley-notes",
  "sley-odb",
  "sley-options",
@@ -1659,6 +1660,14 @@ version = "0.7.0"
 dependencies = [
  "sley-core",
  "sley-mmap",
+]
+
+[[package]]
+name = "sley-mail"
+version = "0.7.0"
+dependencies = [
+ "encoding_rs",
+ "sley-core",
 ]
 
 [[package]]
