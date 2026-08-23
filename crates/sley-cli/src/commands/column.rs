@@ -83,7 +83,7 @@ pub(crate) fn cmd_column(args: &[String]) -> Result<()> {
             let value = option_value(arg, "--nl", &mut arguments)?;
             options.line_terminator = value.as_bytes().to_vec();
         } else if matches!(arg.as_str(), "-h" | "--help-all") {
-            crate::commands::help::print_command_usage("column");
+            crate::command_synopsis::print_command_usage("column");
             return Err(GitError::Exit(129));
         } else {
             return column_usage_error(&format!("unknown option '{arg}'"));
@@ -137,6 +137,6 @@ where
 
 fn column_usage_error<T>(message: &str) -> Result<T> {
     eprintln!("error: {message}");
-    crate::commands::help::print_command_usage("column");
+    crate::command_synopsis::print_command_usage("column");
     Err(GitError::Exit(129))
 }
