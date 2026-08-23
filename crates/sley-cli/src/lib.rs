@@ -28,7 +28,7 @@ use sley::plumbing::sley_odb::{
     build_reachable_pack, collect_reachable_object_ids, grafted_parents, install_bundle_pack,
     install_reachable_pack, prune_unreachable_loose, repository_object_ids, repository_objects_dir,
 };
-use sley::plumbing::sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
+use sley::plumbing::sley_pack::{MultiPackIndex, PackFile, PackIndex};
 use sley::plumbing::sley_refs::{
     FileRefStore, PackRefDecision, Ref, RefTransactionHookUpdate, RefTransactionPhase, RefUpdate,
     ReferenceTransactionHook, ReflogEntry, branch_ref_name, check_refname_format,

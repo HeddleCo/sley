@@ -29,6 +29,7 @@ members = [
     "crates/sley-remote",
     "crates/sley-ref-filter",
     "crates/sley-fsck",
+    "crates/sley-gc",
     "crates/sley-archive",
     "crates/sley-hooks",
     "crates/sley-mail",
@@ -53,6 +54,7 @@ sley-core = { path = "crates/sley-core", version = "0.8.0" }
 sley-diff-merge = { path = "crates/sley-diff-merge", version = "0.8.0" }
 sley-formats = { path = "crates/sley-formats", version = "0.8.0" }
 sley-fsck = { path = "crates/sley-fsck", version = "0.8.0" }
+sley-gc = { path = "crates/sley-gc", version = "0.8.0" }
 sley-grep = { path = "crates/sley-grep", version = "0.8.0" }
 sley-hooks = { path = "crates/sley-hooks", version = "0.8.0" }
 sley-i18n = { path = "crates/sley-i18n", version = "0.8.0" }

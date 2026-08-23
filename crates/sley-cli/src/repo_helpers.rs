@@ -4,7 +4,6 @@ use crate::{common_git_dir_for_git_dir, global_config_value, session};
 use sley::plumbing::sley_odb::repository_objects_dir;
 use sley::{GitConfig, GitError, ObjectFormat, Result};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn worktree_prefix(
@@ -107,109 +106,26 @@ fn repository_approx_object_count(git_dir: &Path, format: ObjectFormat) -> Resul
         if path.extension() != Some(std::ffi::OsStr::new("idx")) {
             continue;
         }
-        count = count.saturating_add(u64::from(pack_index_object_count(&path)?));
+        count = count.saturating_add(u64::from(pack_index_object_count(&path, format)?));
     }
     Ok(count)
 }
 
 fn multi_pack_index_object_count(path: &Path, format: ObjectFormat) -> Result<Option<u64>> {
-    let mut file = match fs::File::open(path) {
-        Ok(file) => file,
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    let mut header = [0u8; 12];
-    file.read_exact(&mut header).map_err(|_| {
-        GitError::InvalidFormat(format!("multi-pack-index {} is too short", path.display()))
-    })?;
-    if &header[..4] != b"MIDX" {
-        return Err(GitError::InvalidFormat(format!(
-            "missing multi-pack-index signature in {}",
-            path.display()
-        )));
-    }
-    let version = header[4];
-    if version != 1 && version != 2 {
-        return Err(GitError::Unsupported(format!(
-            "multi-pack-index version {version}"
-        )));
-    }
-    let expected_hash_id = match format {
-        ObjectFormat::Sha1 => 1,
-        ObjectFormat::Sha256 => 2,
-    };
-    let hash_id = header[5];
-    if u32::from(hash_id) != expected_hash_id {
-        return Err(GitError::InvalidFormat(format!(
-            "multi-pack-index hash id {hash_id} does not match {}",
-            format.name()
-        )));
-    }
-    let chunk_count = header[6] as usize;
-    let base_midx_count = header[7];
-    if base_midx_count != 0 {
-        return Err(GitError::Unsupported(format!(
-            "multi-pack-index base count {base_midx_count}"
-        )));
-    }
-
-    let mut lookup = vec![0u8; (chunk_count + 1).saturating_mul(12)];
-    file.read_exact(&mut lookup).map_err(|_| {
-        GitError::InvalidFormat(format!(
-            "truncated multi-pack-index chunk lookup in {}",
-            path.display()
-        ))
-    })?;
-    let mut oid_fanout_offset = None;
-    for chunk in lookup.as_chunks::<12>().0.iter().take(chunk_count) {
-        if &chunk[..4] == b"OIDF" {
-            oid_fanout_offset = Some(u64::from_be_bytes([
-                chunk[4], chunk[5], chunk[6], chunk[7], chunk[8], chunk[9], chunk[10], chunk[11],
-            ]));
-            break;
-        }
-    }
-    let Some(oid_fanout_offset) = oid_fanout_offset else {
-        return Err(GitError::InvalidFormat(format!(
-            "multi-pack-index {} missing OIDF chunk",
-            path.display()
-        )));
-    };
-    file.seek(SeekFrom::Start(oid_fanout_offset + 255 * 4))?;
-    let mut count = [0u8; 4];
-    file.read_exact(&mut count).map_err(|_| {
-        GitError::InvalidFormat(format!(
-            "truncated multi-pack-index OIDF chunk in {}",
-            path.display()
-        ))
-    })?;
-    Ok(Some(u64::from(u32::from_be_bytes(count))))
+    let midx = sley::plumbing::sley_pack::MultiPackIndex::parse_without_checksum(&bytes, format)?;
+    Ok(Some(midx.objects.len() as u64))
 }
 
-fn pack_index_object_count(path: &Path) -> Result<u32> {
-    let mut file = fs::File::open(path)?;
-    let mut header = [0u8; 8 + 256 * 4];
-    file.read_exact(&mut header[..8]).map_err(|_| {
-        GitError::InvalidFormat(format!("pack index {} is too short", path.display()))
-    })?;
-    let fanout_offset = if header[..8].starts_with(&[0xff, b't', b'O', b'c']) {
-        file.read_exact(&mut header[8..]).map_err(|_| {
-            GitError::InvalidFormat(format!("pack index {} is too short", path.display()))
-        })?;
-        8
-    } else {
-        file.read_exact(&mut header[8..256 * 4]).map_err(|_| {
-            GitError::InvalidFormat(format!("pack index {} is too short", path.display()))
-        })?;
-        0
-    };
-    let offset = fanout_offset + 255 * 4;
-    Ok(u32::from_be_bytes([
-        header[offset],
-        header[offset + 1],
-        header[offset + 2],
-        header[offset + 3],
-    ]))
+fn pack_index_object_count(path: &Path, format_hash: ObjectFormat) -> Result<u32> {
+    let bytes = fs::read(path)?;
+    let index =
+        sley::plumbing::sley_pack::PackIndexView::parse_trusted_without_checksum(&bytes, format_hash)?;
+    Ok(index.count() as u32)
 }
 pub(crate) fn worktree_root_for_git_dir(
     cli_session: &session::CliSession,

@@ -1556,6 +1556,7 @@ dependencies = [
  "sley-core",
  "sley-formats",
  "sley-fsck",
+ "sley-gc",
  "sley-grep",
  "sley-i18n",
  "sley-mail",
@@ -1627,6 +1628,23 @@ dependencies = [
  "sley-object",
  "sley-odb",
  "sley-submodule",
+]
+
+[[package]]
+name = "sley-gc"
+version = "0.8.0"
+dependencies = [
+ "regex",
+ "sley-config",
+ "sley-core",
+ "sley-formats",
+ "sley-index",
+ "sley-object",
+ "sley-odb",
+ "sley-pack",
+ "sley-refs",
+ "sley-rev",
+ "sley-worktree",
 ]
 
 [[package]]

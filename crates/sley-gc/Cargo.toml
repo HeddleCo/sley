@@ -1,0 +1,25 @@
+[package]
+name = "sley-gc"
+version.workspace = true
+description = "Native-Rust Git garbage collection, repack, and maintenance engine for the sley engine."
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+regex = "1.13.1"
+sley-config.workspace = true
+sley-core.workspace = true
+sley-formats.workspace = true
+sley-index.workspace = true
+sley-object.workspace = true
+sley-odb.workspace = true
+sley-pack.workspace = true
+sley-refs.workspace = true
+sley-rev.workspace = true
+sley-worktree.workspace = true
+
+[lints]
+workspace = true

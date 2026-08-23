@@ -39,6 +39,7 @@ sley-grep.workspace = true
 sley-i18n = { workspace = true, optional = true }
 sley-mail.workspace = true
 sley-fsck.workspace = true
+sley-gc.workspace = true
 sley-notes.workspace = true
 sley-options.workspace = true
 sley-pathspec.workspace = true
