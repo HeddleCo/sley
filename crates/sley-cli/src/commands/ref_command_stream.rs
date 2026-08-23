@@ -344,70 +344,12 @@ fn die(message: String) -> GitError {
     GitError::Exit(128)
 }
 
-/// Faithful port of git's `unquote_c_style` (quote.c). Decodes a leading
-/// `"`-quoted C string from `input`, appending the decoded bytes to `out`.
-/// Returns the number of input bytes consumed (up to and including the closing
-/// quote) on success, or `None` if the quoting is malformed. A NUL byte
-/// terminates the input just as it does in git's C-string view.
+/// Faithful port of git's `unquote_c_style` (quote.c). The canonical
+/// implementation lives in `sley_sequencer::commit_message` (shared with the
+/// moved commit-message machinery); this alias keeps the historical
+/// `ref_command_stream` path working for its command-side consumers.
 pub(crate) fn unquote_c_style(input: &[u8], out: &mut Vec<u8>) -> Option<usize> {
-    let mut i = 0usize;
-    if input.get(i).copied()? != b'"' {
-        return None;
-    }
-    i += 1;
-    loop {
-        // Copy the run up to the next '"' or '\\' (NUL ends the C string).
-        while let Some(&c) = input.get(i) {
-            if c == b'"' || c == b'\\' || c == 0 {
-                break;
-            }
-            out.push(c);
-            i += 1;
-        }
-        match input.get(i).copied() {
-            Some(b'"') => {
-                i += 1;
-                return Some(i);
-            }
-            Some(b'\\') => {
-                i += 1;
-            }
-            // NUL or end-of-input before a closing quote: malformed.
-            _ => return None,
-        }
-        let esc = input.get(i).copied()?;
-        i += 1;
-        let decoded = match esc {
-            b'a' => 0x07,
-            b'b' => 0x08,
-            b'f' => 0x0c,
-            b'n' => b'\n',
-            b'r' => b'\r',
-            b't' => b'\t',
-            b'v' => 0x0b,
-            b'\\' | b'"' => esc,
-            b'0'..=b'3' => {
-                // Octal: first digit 0..3 (>=4 would overflow a byte), then two
-                // more octal digits, all required.
-                let mut ac = ((esc - b'0') as u32) << 6;
-                let d1 = input.get(i).copied()?;
-                if !(b'0'..=b'7').contains(&d1) {
-                    return None;
-                }
-                i += 1;
-                ac |= ((d1 - b'0') as u32) << 3;
-                let d2 = input.get(i).copied()?;
-                if !(b'0'..=b'7').contains(&d2) {
-                    return None;
-                }
-                i += 1;
-                ac |= (d2 - b'0') as u32;
-                ac as u8
-            }
-            _ => return None,
-        };
-        out.push(decoded);
-    }
+    sley_sequencer::commit_message::unquote_c_style(input, out)
 }
 
 #[cfg(test)]

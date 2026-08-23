@@ -216,7 +216,7 @@ fn collect_difftool_entries(
     let pathspec = if paths.is_empty() {
         DiffPathspec::default()
     } else {
-        DiffPathspec::new(cwd, worktree_root, &paths, repo.pathspec_magic())?
+        crate::diff_pathspec_new(cwd, worktree_root, &paths, repo.pathspec_magic())?
     };
     let base_options = sley_diff_merge::DiffNameStatusOptions::default();
     let mut entries = match (options.cached, revs.as_slice()) {
@@ -354,7 +354,7 @@ fn materialize_difftool_entry(
     let remote = temp.join("right").join(&rel);
     write_materialized(
         &local,
-        diff_entry_old_content(entry, db, lazy_fetch)?.as_deref(),
+        diff_entry_old_content(entry, db, crate::diff_lazy_fetch(lazy_fetch))?.as_deref(),
         entry.old_mode,
     )?;
     write_materialized(
@@ -368,7 +368,7 @@ fn materialize_difftool_entry(
             // read from the worktree file, not looked up in the odb.
             right_side_is_worktree,
             None,
-            lazy_fetch,
+            crate::diff_lazy_fetch(lazy_fetch),
         )?
         .as_deref(),
         entry.new_mode,
@@ -442,7 +442,7 @@ fn run_dir_difftool(
         let rel = repo_path_to_path(&entry.path);
         write_dir_materialized(
             &left.join(&rel),
-            diff_entry_old_content(entry, repo.objects(), lazy_fetch)?.as_deref(),
+            diff_entry_old_content(entry, repo.objects(), crate::diff_lazy_fetch(lazy_fetch))?.as_deref(),
             entry.old_mode,
         )?;
         let right_path = right.join(&rel);
@@ -559,7 +559,7 @@ fn dir_diff_new_content(
         Some(repo.worktree_root()?),
         entry.new_oid.is_none(),
         None,
-        lazy_fetch,
+        crate::diff_lazy_fetch(lazy_fetch),
     )
 }
 
@@ -581,7 +581,7 @@ fn can_symlink_right_side(
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Ok(false);
     }
-    Ok(read_blob(repo.objects(), oid, lazy_fetch)? == fs::read(worktree_path)?)
+    Ok(read_blob(repo.objects(), oid, crate::diff_lazy_fetch(lazy_fetch))? == fs::read(worktree_path)?)
 }
 
 fn is_regular_file_mode(mode: Option<u32>) -> bool {

@@ -14,7 +14,7 @@ use crate::commit_subject_bytes;
 use crate::format_log_abbrev_oid;
 use crate::log_output_encoding;
 use crate::log_reencode_message;
-use crate::revision::resolve_revision;
+use crate::resolve_revision;
 use crate::setup;
 use crate::sley_rev;
 use crate::sley_worktree;

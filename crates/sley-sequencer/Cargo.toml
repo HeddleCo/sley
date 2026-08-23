@@ -12,6 +12,9 @@ sley-core.workspace = true
 sley-object.workspace = true
 sley-odb.workspace = true
 sley-refs.workspace = true
+# `commit_message::read_reused_commit_from_db` resolves reused commits through
+# git's revision machinery. Acyclic: sley-rev does not depend on this crate.
+sley-rev.workspace = true
 sley-worktree.workspace = true
 
 [dev-dependencies]

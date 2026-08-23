@@ -55,7 +55,8 @@ impl StreamControl {
 
 /// Shared atomic cancellation flag.
 ///
-/// Safe to share across threads via [`Arc`] or bare references. Setting the
+/// Safe to share across threads via [`Arc`](std::sync::Arc) or bare
+/// references. Setting the
 /// flag does not interrupt a thread blocked in kernel I/O; pair with
 /// [`CancellableRead`] for poll-between-reads, and [`kill_child_if_cancelled`]
 /// (or closing the HTTP body) for preemptive wake-up.

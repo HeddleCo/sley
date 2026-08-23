@@ -1917,6 +1917,16 @@ impl ObjectReader for FileObjectDatabase {
     }
 }
 
+impl sley_formats::TreeObjectSource for FileObjectDatabase {
+    fn read_tree_object_header(&self, oid: &ObjectId) -> Result<Option<(ObjectType, u64)>> {
+        self.read_object_header(oid)
+    }
+
+    fn read_tree_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
+        ObjectReader::read_object(self, oid)
+    }
+}
+
 impl FileObjectDatabase {
     fn read_object_raw(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
         if let Some(object) = implied_empty_tree_object(self.format, oid) {

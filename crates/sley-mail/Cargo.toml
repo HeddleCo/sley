@@ -1,0 +1,16 @@
+[package]
+name = "sley-mail"
+publish = false
+version.workspace = true
+description = "Repo-independent mail/text engines for the sley project: mbox/mboxrd splitting, mailinfo header parsing (RFC 822/2047/2822), format-patch mail encoding, the patch-id hash core, and the interpret-trailers engine."
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+encoding_rs = "0.8.35"
+sley-core.workspace = true
+
+[lints]
+workspace = true

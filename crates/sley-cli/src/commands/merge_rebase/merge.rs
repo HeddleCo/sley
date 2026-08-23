@@ -87,7 +87,7 @@ fn write_merge_result_diffstat(
         sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     let compact = mode == MergeDiffstat::Compact;
-    let stat_entries = collect_diff_stat_entries(&entries, db, None, false, lazy_fetch)?;
+    let stat_entries = collect_diff_stat_entries(&entries, db, None, false, crate::diff_lazy_fetch(lazy_fetch))?;
     // Pass effective config so `diff.statGraphWidth` / `diff.statNameWidth`
     // (and COLUMNS) are honoured — git's merge --stat uses the same width
     // cascade as `git diff --stat` (t4052).
@@ -5638,7 +5638,7 @@ pub(crate) fn print_commit_shortstat_between_trees(
         return Ok(());
     }
     let mut stdout = io::stdout();
-    let stat_entries = collect_diff_stat_entries(&entries, db, None, false, lazy_fetch)?;
+    let stat_entries = collect_diff_stat_entries(&entries, db, None, false, crate::diff_lazy_fetch(lazy_fetch))?;
     write_diff_shortstat_materialized(&mut stdout, &stat_entries)?;
     Ok(())
 }

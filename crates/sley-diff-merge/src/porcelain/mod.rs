@@ -11,6 +11,7 @@ use crate::render::{
 };
 use crate::{DiffAlgorithm, NameStatus, NameStatusEntry, WsIgnore};
 use sley_core::{ObjectFormat, ObjectId};
+use sley_formats::{quoted_path, write_quoted_path as write_c_quoted_path};
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
@@ -123,10 +124,54 @@ pub fn select_render_formats(options: RenderSelectionOptions) -> RenderSelection
     }
 }
 
+mod binary_patch;
+mod content;
+mod filters;
+pub mod options;
+mod patch_entry;
+mod pipeline;
+
+pub use content::{
+    collect_diff_entry_blob_oids, collect_diff_stat_entries,
+    collect_diff_stat_entries_with_worktree_clean, count_line_diff, diff_entry_new_content,
+    diff_entry_old_content, diff_entry_produces_output, diff_line_stats, gitlink_diff_content,
+    is_binary_content, is_gitlink_pair, read_blob,
+    repo_path_to_path,
+};
+pub use filters::{
+    DIRTY_SUBMODULE_MODIFIED, DIRTY_SUBMODULE_UNTRACKED, DiffPathspec, LoadRepoConfig,
+    SubmoduleDirtSource, SubmoduleDiffConfig, apply_diff_max_depth, apply_diff_order_file,
+    apply_diff_pathspec, apply_submodule_ignore_filter, collect_dirty_submodules,
+    compile_ignore_matching_regexes, diff_rename_limit_requires_integer_error,
+    parse_diff_max_depth, render_tree_to_tree_patch, reverse_diff_entries, reverse_diff_entry,
+    submodule_diff_config_with_config, validate_diff_rename_limit,
+};
+pub use options::{
+    CleanFilterApply, DiffEntryRawRenderOptions, DiffEntryRenderContext, DiffEntryRenderModes,
+    DiffEntryStatRenderOptions, DiffEntryStatSource, DiffRenderOptions, DiffStatWidths,
+    DiffWorktreeCleanContext, DirstatMode, DirstatOptions, LazyObjectFetch, PatchDriver,
+    PatchUserdiff,
+    SubmoduleDiffFormat, SubmoduleIgnoreMode, SubmodulePatchRender, WordDiffRequest,
+    parse_submodule_ignore_mode,
+};
+pub use patch_entry::write_diff_patch_entry;
+pub use pipeline::{
+    diff_stat_decimal_width, diff_stat_totals, parse_dirstat_params, render_diff_entries,
+    write_diff_dirstat, write_diff_numstat_materialized_entry, write_diff_raw_entry,
+    write_diff_shortstat_materialized, write_diff_stat_materialized,
+    write_diff_stat_materialized_with_widths, write_diff_stat_summary_line,
+    write_diff_summary_entry,
+};
+
 /// Runtime services used while producing porcelain diff output.
 pub trait RenderServices {
     /// Return the terminal display width of a rendered path.
     fn display_width(&self, rendered: &str) -> i64;
+
+    /// Columns available for `--stat` output (`ioctl(TIOCGWINSZ)` /
+    /// `COLUMNS` / git's 80-column fallback); consulted when
+    /// [`DiffStatWidths::stat_width`] is `-1`.
+    fn terminal_columns(&self) -> i64;
 }
 
 /// A rendering failure.
@@ -1107,33 +1152,18 @@ fn compact_summary(entry: &NameStatusEntry) -> Option<&'static str> {
 }
 
 fn quote_path(path: &[u8], quote_path_fully: bool) -> String {
-    let needs_quotes = path.iter().any(|&byte| {
-        byte == b'"'
-            || byte == b'\\'
-            || byte == b'\n'
-            || byte == b'\t'
-            || byte < 0x20
-            || byte == 0x7f
-            || (quote_path_fully && byte >= 0x80)
-    });
-    if !needs_quotes {
-        return String::from_utf8_lossy(path).into_owned();
-    }
-    let mut output = Vec::with_capacity(path.len() + 2);
-    output.push(b'"');
-    for &byte in path {
-        match byte {
-            b'"' => output.extend_from_slice(b"\\\""),
-            b'\\' => output.extend_from_slice(b"\\\\"),
-            b'\n' => output.extend_from_slice(b"\\n"),
-            b'\t' => output.extend_from_slice(b"\\t"),
-            0x20..=0x7e => output.push(byte),
-            0x80..=0xff if !quote_path_fully => output.push(byte),
-            _ => output.extend_from_slice(format!("\\{byte:03o}").as_bytes()),
-        }
-    }
-    output.push(b'"');
-    String::from_utf8_lossy(&output).into_owned()
+    quoted_path(path, false, quote_path_fully)
+}
+
+/// Write `path` with Git's C-style porcelain quoting (`core.quotePath`
+/// semantics; no space quoting, matching the diff dialect). The single
+/// escape-loop implementation lives in `sley-formats::path_quote`.
+pub fn write_quoted_path(
+    writer: &mut dyn io::Write,
+    path: &[u8],
+    quote_path_fully: bool,
+) -> io::Result<()> {
+    write_c_quoted_path(writer, path, false, quote_path_fully)
 }
 
 fn color_inserted(value: &str, color: bool) -> String {
@@ -1166,6 +1196,10 @@ mod tests {
     impl RenderServices for Services {
         fn display_width(&self, rendered: &str) -> i64 {
             rendered.chars().count() as i64
+        }
+
+        fn terminal_columns(&self) -> i64 {
+            80
         }
     }
 

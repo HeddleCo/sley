@@ -30,6 +30,7 @@
 //! check (to know whether moving each one is safe).
 
 pub mod config;
+pub mod history;
 pub mod move_head;
 pub mod operations;
 pub mod path_safety;

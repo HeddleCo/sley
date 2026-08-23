@@ -456,7 +456,13 @@ impl RepositoryObjectView {
     }
 
     fn resolve(&self, name: &str) -> Result<ObjectId> {
-        warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, name);
+        sley_rev::warn_ambiguous_refname_with_sink(
+            &self.git_dir,
+            self.format,
+            name,
+            Some(self.db()),
+            sley_rev::AmbiguousRefnameWarning::Stderr,
+        );
         sley_rev::RevisionResolver::new(&self.git_dir, self.format, self.db()).resolve(name)
     }
 
@@ -465,13 +471,25 @@ impl RepositoryObjectView {
     }
 
     fn resolve_path(&self, rev: &str, path: &str) -> Result<sley_rev::ResolvedTreePath> {
-        warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, rev);
+        sley_rev::warn_ambiguous_refname_with_sink(
+            &self.git_dir,
+            self.format,
+            rev,
+            Some(self.db()),
+            sley_rev::AmbiguousRefnameWarning::Stderr,
+        );
         sley_rev::RevisionResolver::new(&self.git_dir, self.format, self.db())
             .resolve_path(rev, path)
     }
 
     fn resolve_path_follow_symlinks(&self, rev: &str, path: &str) -> sley_rev::SymlinkedTreePath {
-        warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, rev);
+        sley_rev::warn_ambiguous_refname_with_sink(
+            &self.git_dir,
+            self.format,
+            rev,
+            Some(self.db()),
+            sley_rev::AmbiguousRefnameWarning::Stderr,
+        );
         sley_rev::RevisionResolver::new(&self.git_dir, self.format, self.db())
             .resolve_path_follow_symlinks(rev, path)
     }
@@ -711,7 +729,7 @@ impl ObjectQuery<'_> {
         };
         if object.object_type == ObjectType::Tree {
             print_tree(
-                None,
+                None::<&FileObjectDatabase>,
                 self.view.format(),
                 &object.body,
                 TreePrintOptions {

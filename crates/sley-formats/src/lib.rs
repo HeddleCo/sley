@@ -18,6 +18,17 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod path_quote;
+pub mod tree_print;
+
+pub use path_quote::{quoted_path, write_quoted_path};
+pub use tree_print::{
+    TreeEntryView, TreeObjectSource, TreePrintOptions, find_tree_entry, format_hex_nibble,
+    print_tree, print_tree_entry_to_writer, print_tree_with_prefix, tree_entry_size_field,
+    write_object_id_hex, write_tree_entry_format, write_tree_format_placeholder, write_tree_oid,
+    write_tree_path,
+};
+
 const REFTABLE_MAGIC: &[u8; 4] = b"REFT";
 const REFTABLE_DEFAULT_BLOCK_SIZE: u32 = 4096;
 const REFTABLE_MAX_BLOCK_SIZE: u32 = 0x00ff_ffff;

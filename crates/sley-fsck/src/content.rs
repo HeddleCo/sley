@@ -298,6 +298,7 @@ impl MsgId {
             MsgId::NulInHeader
             | MsgId::UnterminatedHeader
             | MsgId::BadHeaderContinuation
+            | MsgId::BadGpgsig
             | MsgId::MissingTree
             | MsgId::BadTreeSha1
             | MsgId::BadParentSha1
@@ -371,7 +372,7 @@ impl MsgId {
             | MsgId::SymlinkRef
             | MsgId::EmptyPackedRefsFile => DefaultSeverity::Info,
             // IGNORE in git's table (only surfaces when elevated by config).
-            MsgId::ExtraHeaderEntry | MsgId::BadGpgsig => DefaultSeverity::Ignore,
+            MsgId::ExtraHeaderEntry => DefaultSeverity::Ignore,
         }
     }
 }
@@ -676,6 +677,101 @@ pub fn check_object_content_with_format(
     raw
 }
 
+/// The tag/commit identity-line message ids whose fsck_ident report falls
+/// through in `fsck_tag_standalone` instead of short-circuiting (`goto done`).
+pub(crate) fn is_tag_ident_msg(msg_id: MsgId) -> bool {
+    matches!(
+        msg_id,
+        MsgId::MissingNameBeforeEmail
+            | MsgId::MissingEmail
+            | MsgId::BadName
+            | MsgId::MissingSpaceBeforeEmail
+            | MsgId::BadEmail
+            | MsgId::MissingSpaceBeforeDate
+            | MsgId::BadDate
+            | MsgId::ZeroPaddedDate
+            | MsgId::BadDateOverflow
+            | MsgId::BadTimezone
+    )
+}
+
+/// Outcome of `git hash-object`'s format check over one object body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HashFormatCheckReport {
+    /// Diagnostics in print order. Each may carry a raw tree-walk stderr line
+    /// (`raw_stderr`) that precedes its formatted line.
+    pub diagnostics: Vec<ContentFinding>,
+    /// True when git refuses to create the object (`fsck_buffer` returned
+    /// non-zero ⇒ `fatal: refusing to create malformed object`, exit 128).
+    /// False even when `diagnostics` is non-empty for the one case where git
+    /// prints but still hashes: a tag whose tagger-ident error is overwritten
+    /// by a following extra-header report (IGNORE ⇒ ret 0).
+    pub refuse: bool,
+}
+
+/// Diagnostics for `git hash-object`'s format check — object-file.c's
+/// `index_mem` pass under `INDEX_FORMAT_CHECK`, which frames the bytes as
+/// `object_type` and runs strict fsck before hashing (`--literally` skips it).
+///
+/// Semantics differ from [`check_object_content_with_format`] in three ways,
+/// all upstream-exact:
+///
+/// * No repository config applies (`index_mem` never reads `fsck.<id>`), but
+///   `opts.strict = 1`, so WARN-severity ids are promoted; every non-IGNORE
+///   finding prints and fails (`hash_format_check_report` returns 1).
+/// * Tag control flow mirrors `fsck_tag_standalone`: a badTagName or missing
+///   tagger stops the scan (`goto done` on its non-zero report), while a
+///   tagger-ident error falls through and is *overwritten* by a following
+///   extra-header report (IGNORE ⇒ 0) — git prints the ident diagnostic but
+///   still hashes that object ([`HashFormatCheckReport::refuse`] is false).
+/// * Findings come back in print order; nothing past the first hash-lethal
+///   tag finding appears, because git's `goto done` never reaches it.
+///
+/// The caller prints each diagnostic as `error: object fails fsck:
+/// <camelCasedMsgId>: <detail>` and dies only when `report.refuse` is set.
+pub fn hash_format_check(
+    format: ObjectFormat,
+    object_type: ObjectType,
+    body: &[u8],
+) -> HashFormatCheckReport {
+    // Blobs are always valid: git's fsck has no blob checks.
+    let mut findings = match object_type {
+        ObjectType::Blob => Vec::new(),
+        _ => check_object_content_with_format(
+            format,
+            object_type,
+            body,
+            // opts.strict = 1, no fsck.* overrides.
+            &SeverityConfig::new(true),
+        ),
+    };
+    let refuse = if object_type == ObjectType::Tag {
+        // A surviving hash-lethal finding fails; a tail of masked ident
+        // findings (fatal cleared by the extra-header overwrite) only prints.
+        truncate_tag_findings_at_hash_lethal(&mut findings)
+    } else {
+        !findings.is_empty()
+    };
+    HashFormatCheckReport { diagnostics: findings, refuse }
+}
+
+/// Reproduce `fsck_tag_standalone`'s return-value bookkeeping for the
+/// hash-object path, where every printed report returns 1: everything except
+/// the fall-through tagger-ident report short-circuits via `goto done`, so any
+/// finding after the first non-fall-through one is never reached (and must not
+/// be printed). A fall-through ident report survives to the end only when a
+/// later extra header overwrote it to zero — exactly the ident findings whose
+/// masking cleared `fatal`. Returns true when a hash-lethal finding remains.
+fn truncate_tag_findings_at_hash_lethal(findings: &mut Vec<ContentFinding>) -> bool {
+    for idx in 0..findings.len() {
+        if !(is_tag_ident_msg(findings[idx].msg_id) && !findings[idx].fatal) {
+            findings.truncate(idx + 1);
+            return true;
+        }
+    }
+    false
+}
+
 /// Compatibility inference for content-only callers that do not own repository
 /// context. Valid commit/tag headers are unambiguous; malformed headers retain
 /// the historical SHA-1 default and still produce their existing fsck finding.
@@ -718,19 +814,7 @@ fn mask_tag_ident_error_if_extra_header_overwrites_return(
         return;
     }
     for finding in &mut findings[..extra_idx] {
-        if matches!(
-            finding.msg_id,
-            MsgId::MissingNameBeforeEmail
-                | MsgId::MissingEmail
-                | MsgId::BadName
-                | MsgId::MissingSpaceBeforeEmail
-                | MsgId::BadEmail
-                | MsgId::MissingSpaceBeforeDate
-                | MsgId::BadDate
-                | MsgId::ZeroPaddedDate
-                | MsgId::BadDateOverflow
-                | MsgId::BadTimezone
-        ) {
+        if is_tag_ident_msg(finding.msg_id) {
             finding.fatal = false;
         }
     }
@@ -932,18 +1016,21 @@ fn fsck_ident(body: &[u8], start: usize) -> Result<usize, ContentFinding> {
     Ok(next)
 }
 
-/// Git's `date_overflows`: a `timestamp_t` is a `uintmax_t` (64-bit). git's
-/// `parse_timestamp_from_buf` caps at 23 digits returning TIME_MAX, then
-/// `date_overflows` rejects TIME_MAX. We treat any value that does not fit in
-/// `u64` (or is the saturating max) as overflow.
+/// Git's `date_overflows` over `parse_timestamp_from_buf`. `timestamp_t` is
+/// `uintmax_t`; the parse fills a 24-byte buffer, so a 24th digit short-circuits
+/// to `TIME_MAX` (`UINTMAX_MAX`) which always overflows. Smaller inputs go
+/// through `strtoumax` (out-of-range clamps to `TIME_MAX`) and then the
+/// `time_t` round-trip in `date_overflows`, so any value above `INT64_MAX`
+/// fails to convert on 64-bit time_t. Verified against `git hash-object -t
+/// commit`: `9223372036854775807` hashes, `9223372036854775808` reports
+/// `badDateOverflow`.
 fn timestamp_overflows(digits: &[u8]) -> bool {
-    // git's buffer is 24 bytes (23 digits + NUL); >=23 digits => TIME_MAX.
-    if digits.len() >= 23 {
+    if digits.len() >= 24 {
         return true;
     }
-    let s = std::str::from_utf8(digits).unwrap_or("");
-    match s.parse::<u64>() {
-        Ok(v) => v == u64::MAX,
+    let text = std::str::from_utf8(digits).unwrap_or("");
+    match text.parse::<u64>() {
+        Ok(value) => value > i64::MAX as u64,
         Err(_) => true,
     }
 }
@@ -1213,6 +1300,83 @@ fn check_tag(format: ObjectFormat, body: &[u8]) -> Vec<ContentFinding> {
     out
 }
 
+/// One raw tree entry produced by [`scan_tree_entry`] (git's
+/// `decode_tree_entry` / `tree_entry_extract`).
+struct ScannedEntry<'a> {
+    /// Offset of this entry's start (the first mode digit).
+    start: usize,
+    mode: u32,
+    name: &'a [u8],
+    oid: &'a [u8],
+    /// Offset just past this entry, i.e. the successor's start.
+    next: usize,
+}
+
+/// Decode the tree entry beginning at `start`, or `None` when git's
+/// `decode_tree_entry` would fail (the matching stderr wording is recoverable
+/// via [`tree_decode_error`]).
+fn scan_tree_entry(body: &[u8], start: usize, oid_len: usize) -> Option<ScannedEntry<'_>> {
+    let mut pos = start;
+    // parse_mode: octal digits up to a space (NUL also stops the scan so an
+    // empty/terminated mode fails below).
+    while pos < body.len() && body[pos] != b' ' && body[pos] != 0 {
+        pos += 1;
+    }
+    if pos >= body.len() || body[pos] != b' ' {
+        return None;
+    }
+    let mode = parse_octal_mode(&body[start..pos])?;
+    pos += 1; // past space
+    let name_start = pos;
+    while pos < body.len() && body[pos] != 0 {
+        pos += 1;
+    }
+    if pos >= body.len() {
+        return None;
+    }
+    let name = &body[name_start..pos];
+    // `if (!*path)` — decode rejects an empty filename outright.
+    if name.is_empty() {
+        return None;
+    }
+    pos += 1; // past NUL
+    if pos + oid_len > body.len() {
+        return None;
+    }
+    Some(ScannedEntry {
+        start,
+        mode,
+        name,
+        oid: &body[pos..pos + oid_len],
+        next: pos + oid_len,
+    })
+}
+
+/// The plain `error: <msg>` wording git's tree-walk decoder prints before
+/// `fsck_tree` reports `badTree` (`decode_tree_entry` in tree-walk.c). Mirrors
+/// its three checks in order.
+fn tree_decode_error(remaining: &[u8], oid_len: usize) -> &'static str {
+    if remaining.len() < oid_len + 3 || remaining[remaining.len() - (oid_len + 1)] != 0 {
+        return "too-short tree object";
+    }
+    if remaining[0] == b' ' {
+        return "malformed mode in tree entry";
+    }
+    let mut idx = 0usize;
+    loop {
+        match remaining.get(idx) {
+            Some(b' ') => break,
+            Some(byte) if (b'0'..=b'7').contains(byte) => idx += 1,
+            _ => return "malformed mode in tree entry",
+        }
+    }
+    idx += 1; // past space; the path starts here
+    if remaining.get(idx) == Some(&0) {
+        return "empty filename in tree entry";
+    }
+    "too-short tree object"
+}
+
 fn check_tree(format: ObjectFormat, body: &[u8], large_pathname_len: usize) -> Vec<ContentFinding> {
     // Walk raw tree entries: "<mode> <name>\0<20-or-32-byte-oid>".
     let oid_len = format.raw_len();
@@ -1230,76 +1394,47 @@ fn check_tree(format: ObjectFormat, body: &[u8], large_pathname_len: usize) -> V
     let mut not_sorted = false;
     let mut has_large_name = false;
 
-    let mut pos = 0usize;
-    let mut prev: Option<(u32, Vec<u8>)> = None;
-    let mut malformed = false;
-    // An empty tree-entry filename is caught by git's `decode_tree_entry`
-    // (`!*path` → `error("empty filename in tree entry")` + `badTree`), distinct
-    // from the in-bounds `emptyName` warning (which a real tree can never reach,
-    // since decode rejects it first). When set we emit the raw stderr line and a
-    // fatal `badTree` instead.
-    let mut empty_filename = false;
+    // An empty buffer is a valid (empty) tree; `init_tree_desc_internal`
+    // decodes nothing and `fsck_tree` returns zero.
+    if body.is_empty() {
+        return out;
+    }
+
     // git's `df_dup_candidates`: non-directory names awaiting a later directory
     // that would collide via the implicitly-added '/'.
     let mut df_candidates: Vec<Vec<u8>> = Vec::new();
+    let mut prev: Option<(u32, Vec<u8>)> = None;
 
-    while pos < body.len() {
-        // mode: octal digits up to a space
-        let mode_start = pos;
-        while pos < body.len() && body[pos] != b' ' && body[pos] != 0 {
-            pos += 1;
+    // init_tree_desc_gently decodes the first entry up front; a failure there
+    // reports badTree and returns immediately (no property findings exist yet).
+    let mut current = match scan_tree_entry(body, 0, oid_len) {
+        Some(entry) => entry,
+        None => {
+            out.push(finding_with_raw(
+                MsgId::BadTree,
+                "cannot be parsed as a tree",
+                true,
+                tree_decode_error(body, oid_len),
+            ));
+            return out;
         }
-        if pos >= body.len() || body[pos] != b' ' {
-            malformed = true;
-            break;
-        }
-        let mode_bytes = &body[mode_start..pos];
-        // git flags a leading '0' in the mode as zero-padded.
-        if mode_bytes.first() == Some(&b'0') {
-            has_zero_pad = true;
-        }
-        let mode = match parse_octal_mode(mode_bytes) {
-            Some(m) => m,
-            None => {
-                malformed = true;
-                break;
-            }
-        };
-        pos += 1; // past space
-        // name up to NUL
-        let name_start = pos;
-        while pos < body.len() && body[pos] != 0 {
-            pos += 1;
-        }
-        if pos >= body.len() {
-            malformed = true;
-            break;
-        }
-        let name = &body[name_start..pos];
-        // git's `decode_tree_entry` rejects an empty filename before recording
-        // the entry: a raw `error: empty filename in tree entry` on stderr, then
-        // the tree is `badTree` ("cannot be parsed as a tree"). This is fatal —
-        // distinct from the in-bounds `emptyName` warning.
-        if name.is_empty() {
-            empty_filename = true;
-            malformed = true;
-            break;
-        }
-        pos += 1; // past NUL
-        // oid
-        if pos + oid_len > body.len() {
-            malformed = true;
-            break;
-        }
-        let oid = &body[pos..pos + oid_len];
-        pos += oid_len;
+    };
 
-        if oid.iter().all(|&b| b == 0) {
+    // Set when advancing to the successor fails mid-walk: git prints badTree
+    // *during* the loop (before the post-walk property reports) and breaks —
+    // skipping the mode and ordering checks for the current entry.
+    let mut walk_bad_tree: Option<ContentFinding> = None;
+
+    loop {
+        // Per-entry flag accumulation (runs for every extracted entry, even one
+        // whose successor later fails to decode).
+        if current.oid.iter().all(|&b| b == 0) {
             has_null_sha1 = true;
         }
-        if name.is_empty() {
+        if current.name.is_empty() {
             has_empty_name = true;
         }
+        let name = current.name;
         if name.contains(&b'/') {
             has_full_path = true;
         }
@@ -1324,26 +1459,70 @@ fn check_tree(format: ObjectFormat, body: &[u8], large_pathname_len: usize) -> V
                 }
             }
         }
-        if !is_valid_mode(mode) {
-            has_bad_modes = true;
+        // `has_zero_pad |= *(char *)desc.buffer == '0'`: the entry-start byte.
+        if body[current.start] == b'0' {
+            has_zero_pad = true;
         }
         if name.len() > large_pathname_len {
             has_large_name = true;
         }
 
-        // ordering / duplicate detection against the previous entry, using
-        // git's `verify_ordered` (with the d/f-conflict candidate stack).
-        if let Some((p_mode, p_name)) = prev.as_ref() {
-            match verify_ordered(*p_mode, p_name, mode, name, &mut df_candidates) {
+        // Advance (update_tree_entry_gently): git runs this BEFORE the mode and
+        // ordering checks, and on a decode failure reports badTree and breaks —
+        // so those checks are skipped for the current entry. A clean
+        // end-of-buffer advance still counts as success.
+        let mut next_entry = None;
+        let advance_failed = current.next < body.len()
+            && match scan_tree_entry(body, current.next, oid_len) {
+                Some(next) => {
+                    next_entry = Some(next);
+                    false
+                }
+                None => {
+                    walk_bad_tree = Some(finding_with_raw(
+                        MsgId::BadTree,
+                        "cannot be parsed as a tree",
+                        true,
+                        tree_decode_error(&body[current.next..], oid_len),
+                    ));
+                    true
+                }
+            };
+
+        if advance_failed {
+            break;
+        }
+
+        // switch (mode): standard modes only.
+        if !is_valid_mode(current.mode) {
+            has_bad_modes = true;
+        }
+        if let Some((prev_mode, prev_name)) = prev.as_ref() {
+            match verify_ordered(
+                *prev_mode,
+                prev_name,
+                current.mode,
+                current.name,
+                &mut df_candidates,
+            ) {
                 Ordering2::Equal => has_dup_entries = true,
                 Ordering2::Unordered => not_sorted = true,
                 Ordering2::Ordered => {}
             }
         }
-        prev = Some((mode, name.to_vec()));
+        prev = Some((current.mode, current.name.to_vec()));
+
+        match next_entry {
+            Some(next) => current = next,
+            None => break, // end of buffer reached
+        }
     }
 
-    // git accumulates per-flag reports in a fixed order.
+    // git emits badTree at its in-loop position, then the accumulated property
+    // reports in fixed order.
+    if let Some(bad_tree) = walk_bad_tree {
+        out.push(bad_tree);
+    }
     if has_null_sha1 {
         out.push(finding(
             MsgId::NullSha1,
@@ -1400,22 +1579,6 @@ fn check_tree(format: ObjectFormat, body: &[u8], large_pathname_len: usize) -> V
             "contains excessively large pathname",
             false,
         ));
-    }
-    if malformed {
-        if empty_filename {
-            // git: `decode_tree_entry` prints `error: empty filename in tree
-            // entry` (stderr) then `fsck_tree` reports `badTree`. The badTree is
-            // a hard object error (sets ERROR_OBJECT, exit 1) and is fatal so the
-            // link walk does not also run.
-            out.push(finding_with_raw(
-                MsgId::BadTree,
-                "cannot be parsed as a tree",
-                true,
-                "empty filename in tree entry",
-            ));
-        } else {
-            out.push(finding(MsgId::BadTree, "cannot be parsed as a tree", false));
-        }
     }
     out
 }
@@ -1501,6 +1664,10 @@ fn is_valid_mode(mode: u32) -> bool {
     matches!(mode, 0o100755 | 0o100644 | 0o120000 | 0o040000 | 0o160000)
 }
 
+/// git's `parse_mode` (object.h): octal digits accumulate into an `unsigned
+/// int` with silent 32-bit wrap-around, and the result is stored through a
+/// `uint16_t *`, truncating the high bits. A mode like `77777777777` therefore
+/// becomes `0o177777` (a `badFilemode` warning) rather than a parse failure.
 fn parse_octal_mode(bytes: &[u8]) -> Option<u32> {
     if bytes.is_empty() {
         return None;
@@ -1510,9 +1677,9 @@ fn parse_octal_mode(bytes: &[u8]) -> Option<u32> {
         if !(b'0'..=b'7').contains(&b) {
             return None;
         }
-        mode = mode.checked_mul(8)?.checked_add((b - b'0') as u32)?;
+        mode = mode.wrapping_mul(8).wrapping_add((b - b'0') as u32);
     }
-    Some(mode)
+    Some(mode as u16 as u32)
 }
 
 /// HFS/NTFS `.git` detection (the common cases t1450 exercises): `.git`,
@@ -1919,5 +2086,248 @@ msg\n"
             .find(|x| x.msg_id == MsgId::HasDotgit)
             .expect("hasDotgit finding");
         assert_eq!(dotgit.severity, Severity::Error);
+    }
+
+    // --- ports of the former CLI-owned hash-object fsck unit tests -----------
+    // (crates/sley-cli/src/commands/hash_object_fsck.rs, deleted when the
+    // engine moved here), re-expectations verified against `git
+    // hash-object -t <type> --stdin` (git 2.55).
+
+    fn tree_entry(mode: &[u8], name: &[u8], fill: u8) -> Vec<u8> {
+        let mut body = mode.to_vec();
+        body.push(b' ');
+        body.extend_from_slice(name);
+        body.push(0);
+        body.extend(std::iter::repeat_n(fill, 20));
+        body
+    }
+
+    #[test]
+    fn empty_tree_is_valid() {
+        assert!(check_tree(ObjectFormat::Sha1, b"", DEFAULT_LARGE_PATHNAME_LEN).is_empty());
+    }
+
+    #[test]
+    fn garbage_tree_fails_with_too_short_raw_line() {
+        let f = check_tree(ObjectFormat::Sha1, b"garbage", DEFAULT_LARGE_PATHNAME_LEN);
+        assert_eq!(ids(&f), vec!["badTree"]);
+        assert_eq!(f[0].raw_stderr.as_deref(), Some("too-short tree object"));
+        assert!(f[0].fatal);
+    }
+
+    #[test]
+    fn decode_error_wording_matches_git_tree_walk() {
+        assert_eq!(
+            tree_decode_error(b"abc\n", ObjectFormat::Sha1.raw_len()),
+            "too-short tree object"
+        );
+        // Leading space => parse_mode returns NULL.
+        let mut buf = b" 100644 name\0".to_vec();
+        buf.extend(std::iter::repeat_n(0u8, 20));
+        assert_eq!(
+            tree_decode_error(&buf, ObjectFormat::Sha1.raw_len()),
+            "malformed mode in tree entry"
+        );
+        // Empty filename (`!*path` after the space).
+        let mut buf = b"100644 \0".to_vec();
+        buf.extend(std::iter::repeat_n(0u8, 20));
+        assert_eq!(
+            tree_decode_error(&buf, ObjectFormat::Sha1.raw_len()),
+            "empty filename in tree entry"
+        );
+    }
+
+    #[test]
+    fn decode_accepts_valid_entry() {
+        let buf = tree_entry(b"100644", b"file", 0x11);
+        let entry = scan_tree_entry(&buf, 0, ObjectFormat::Sha1.raw_len()).expect("valid entry");
+        assert_eq!(entry.mode, 0o100644);
+        assert_eq!(entry.name, b"file");
+        assert_eq!(entry.next, buf.len());
+    }
+
+    #[test]
+    fn standard_modes_under_strict() {
+        for &mode in &[0o100644u32, 0o100755, 0o120000, 0o040000, 0o160000] {
+            let mut body = format!("{mode:o} file\0").into_bytes();
+            body.extend(std::iter::repeat_n(0x11u8, 20));
+            let f = check_object_content(ObjectType::Tree, &body, &cfg());
+            assert!(
+                !f.iter().any(|x| x.msg_id == MsgId::BadFilemode),
+                "{mode:o} should be standard: {f:?}"
+            );
+        }
+        // 0o100664 only passes git's fsck in non-strict mode; hash-object is strict.
+        for &mode in &[0o100664u32, 0o100600] {
+            let mut body = format!("{mode:o} file\0").into_bytes();
+            body.extend(std::iter::repeat_n(0x22u8, 20));
+            let f = check_object_content(ObjectType::Tree, &body, &cfg());
+            assert!(
+                f.iter().any(|x| x.msg_id == MsgId::BadFilemode),
+                "{mode:o} should be a bad filemode: {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn consecutive_identical_names_are_dups() {
+        let mut body = tree_entry(b"100644", b"file", 0x11);
+        body.extend(tree_entry(b"100644", b"file", 0x22));
+        let f = check_object_content(ObjectType::Tree, &body, &cfg());
+        assert!(f.iter().any(|x| x.msg_id == MsgId::DuplicateEntries));
+    }
+
+    #[test]
+    fn descending_names_are_unordered() {
+        let mut body = tree_entry(b"100644", b"b", 0x11);
+        body.extend(tree_entry(b"100644", b"a", 0x22));
+        let f = check_object_content(ObjectType::Tree, &body, &cfg());
+        assert!(f.iter().any(|x| x.msg_id == MsgId::TreeNotSorted));
+    }
+
+    #[test]
+    fn ascending_names_are_ok() {
+        let mut body = tree_entry(b"100644", b"a", 0x11);
+        body.extend(tree_entry(b"100644", b"b", 0x22));
+        assert!(check_object_content(ObjectType::Tree, &body, &cfg()).is_empty());
+    }
+
+    #[test]
+    fn tag_refname_rules_match_check_refname_format() {
+        // Verified against `git hash-object -t tag`: mid-path trailing dots and
+        // a lone "@" are legal ("refs/tags/<name>" never trips the whole-refname
+        // "@" or trailing-dot rules); the rest are rejected.
+        for name in [b"v1.0".as_slice(), b"release/1.0", b"@", b"v1./x"] {
+            assert!(valid_tag_name(name), "{name:?} should be valid");
+        }
+        for name in [
+            b"".as_slice(),
+            &b".hidden"[..],
+            b"ends.",
+            b"a..b",
+            b"has space",
+            b"caret^",
+            b"name.lock",
+            b"a/",
+            b"a@{b",
+        ] {
+            assert!(!valid_tag_name(name), "{name:?} should be invalid");
+        }
+    }
+
+    #[test]
+    fn date_overflow_boundaries_match_date_overflows() {
+        // TIME_MAX is UINTMAX_MAX; values above INT64_MAX fail date.c's time_t
+        // round-trip. Confirmed against oracle hash-object exits.
+        assert!(!timestamp_overflows(b"0"));
+        assert!(!timestamp_overflows(b"1234567890"));
+        assert!(!timestamp_overflows(b"9223372036854775807")); // i64::MAX
+        assert!(timestamp_overflows(b"9223372036854775808")); // i64::MAX + 1
+        assert!(timestamp_overflows(b"18446744073709551615")); // u64::MAX
+        assert!(timestamp_overflows(b"99999999999999999999999")); // clamps to TIME_MAX
+        assert!(timestamp_overflows(&[b'9'; 24])); // buffer-cap overflow
+    }
+
+    #[test]
+    fn empty_commit_is_unterminated_header() {
+        let report = hash_format_check(ObjectFormat::Sha1, ObjectType::Commit, b"");
+        assert!(report.refuse);
+        assert_eq!(ids(&report.diagnostics), vec!["unterminatedHeader"]);
+    }
+
+    #[test]
+    fn empty_tag_is_unterminated_header() {
+        let report = hash_format_check(ObjectFormat::Sha1, ObjectType::Tag, b"");
+        assert!(report.refuse);
+        assert_eq!(ids(&report.diagnostics), vec!["unterminatedHeader"]);
+    }
+
+    #[test]
+    fn extra_header_after_tagger_masks_ident_error_but_still_prints_it() {
+        // A bad tagger timezone reports an error, but the following extra
+        // header (FSCK_IGNORE) overwrites `ret` to zero, so git prints the
+        // diagnostic yet still hashes the object.
+        let body = b"object 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+            type commit\ntag t\ntagger a <a> 0 bad\nextra h\n\nm\n";
+        let report = hash_format_check(ObjectFormat::Sha1, ObjectType::Tag, body);
+        assert!(!report.refuse, "{report:?}");
+        assert_eq!(ids(&report.diagnostics), vec!["badTimezone"]);
+    }
+
+    #[test]
+    fn hash_lethal_tag_finding_truncates_later_diagnostics() {
+        // git's badTagName report short-circuits via `goto done`: the later
+        // ident error is never reached and must not print.
+        let body = b"object 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+            type commit\ntag bad~name\ntagger a <a> 0 bad\n\nm\n";
+        let report = hash_format_check(ObjectFormat::Sha1, ObjectType::Tag, body);
+        assert!(report.refuse);
+        assert_eq!(ids(&report.diagnostics), vec!["badTagName"]);
+    }
+
+    #[test]
+    fn missing_tagger_entry_is_hash_lethal() {
+        let body = b"object 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+            type commit\ntag t\n\nm\n";
+        let report = hash_format_check(ObjectFormat::Sha1, ObjectType::Tag, body);
+        assert!(report.refuse);
+        assert_eq!(ids(&report.diagnostics), vec!["missingTaggerEntry"]);
+    }
+
+    #[test]
+    fn valid_tag_passes() {
+        let body = b"object 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+            type commit\ntag t\ntagger a <a@b> 0 +0000\n\nmsg\n";
+        let report = hash_format_check(ObjectFormat::Sha1, ObjectType::Tag, body);
+        assert!(!report.refuse);
+        assert!(report.diagnostics.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn timezone_must_be_exactly_four_digits() {
+        let three = b"object 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+            type commit\ntag t\ntagger a <a> 0 +000\n";
+        let four = b"object 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+            type commit\ntag t\ntagger a <a> 0 +0000\n";
+        let report = hash_format_check(ObjectFormat::Sha1, ObjectType::Tag, three);
+        assert!(report.refuse);
+        let report = hash_format_check(ObjectFormat::Sha1, ObjectType::Tag, four);
+        assert!(!report.refuse);
+    }
+
+    #[test]
+    fn blob_is_never_validated() {
+        let report = hash_format_check(ObjectFormat::Sha1, ObjectType::Blob, b"\0\0garbage");
+        assert!(!report.refuse);
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn giant_octal_mode_wraps_like_parse_mode() {
+        // git accumulates into an unsigned int with silent wrap-around and
+        // stores through uint16_t, so 77777777777 becomes 0o177777 — a
+        // badFilemode warning, not a parse failure (oracle: exit 128 via the
+        // promoted warning alone, with no badTree).
+        let mut body = b"77777777777 f\0".to_vec();
+        body.extend(std::iter::repeat_n(0x22u8, 20));
+        let f = check_object_content(ObjectType::Tree, &body, &cfg());
+        assert_eq!(ids(&f), vec!["badFilemode"]);
+    }
+
+    #[test]
+    fn undecodable_successor_reports_bad_tree_before_property_findings() {
+        // A zero-padded first entry followed by an undecodable tail: git prints
+        // the tree-walk error, then badTree, then the accumulated property
+        // findings (zeroPaddedFilemode last).
+        let mut body = b"0100644 f\0".to_vec();
+        body.extend(std::iter::repeat_n(0x11u8, 20));
+        body.extend(std::iter::repeat_n(0u8, 22));
+        body.push(b'x');
+        let f = check_object_content(ObjectType::Tree, &body, &cfg());
+        assert_eq!(ids(&f), vec!["badTree", "zeroPaddedFilemode"], "{f:?}");
+        assert_eq!(
+            f[0].raw_stderr.as_deref(),
+            Some("malformed mode in tree entry")
+        );
     }
 }

@@ -4,6 +4,7 @@ use sley_grep::{Regex, RegexMode};
 /// A compiled funcname spec: newline-separated POSIX regexes tried in order;
 /// a leading `!` negates (a match rejects the line). Port of
 /// `xdiff_set_find_func` + `ff_regexp` from upstream `xdiff-interface.c`.
+#[derive(Clone)]
 pub struct CompiledFuncname {
     patterns: Vec<(bool, Regex)>,
 }

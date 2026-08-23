@@ -12,6 +12,48 @@ use sley_strbuf_expand::{
 use std::collections::HashMap;
 use std::io::Write;
 
+mod atoms;
+mod context;
+mod contents;
+mod repo;
+mod sort;
+mod tracking;
+mod versioncmp;
+
+pub use atoms::{
+    ForEachRefEmailOptions, for_each_ref_color_escape, for_each_ref_message,
+    for_each_ref_oid_atom_arg, for_each_ref_oid_atom_width, for_each_ref_push_color_code,
+    for_each_ref_try_date_atom, for_each_ref_try_email_atom, for_each_ref_try_name_atom,
+    for_each_ref_typed_identity, for_each_ref_typed_refname, for_each_ref_write_email,
+    setup_for_each_ref_email_options, write_for_each_ref_signature, write_for_each_ref_typed_atom,
+};
+pub use context::{
+    ForEachRefFormatContext, ForEachRefMailmapRewrite, ForEachRefSignatureVerification,
+};
+pub use contents::{
+    ForEachRefContents, ForEachRefPeeledObject, for_each_ref_contents,
+    for_each_ref_validate_tag_pointer, write_for_each_ref_contents_lines,
+};
+pub use repo::{
+    for_each_ref_loose_object_disk_size, for_each_ref_worktree_path, for_each_ref_worktree_paths,
+};
+pub use sort::{
+    ForEachRefDateSortField, ForEachRefIdentityPart, ForEachRefIdentitySortField,
+    ForEachRefIdentitySource, ForEachRefIdentityRole, for_each_ref_sort_date_key,
+    for_each_ref_sort_identity_key, parse_for_each_ref_identity_sort,
+};
+pub use tracking::{
+    ForEachRefPush, ForEachRefPushRemote, ForEachRefUpstream, expand_local_upstream_merge,
+    for_each_ref_ahead_behind, for_each_ref_ahead_behind_with_diagnostic, for_each_ref_push,
+    for_each_ref_push_remote, for_each_ref_upstream, for_each_ref_upstream_track,
+    map_remote_fetch_refspec, map_remote_push_refspec, map_remote_tracking_ref,
+    remote_display_name, resolve_for_each_ref_target,
+};
+pub use versioncmp::{
+    VsSuffixMatch, version_sort_cmp, vs_digit_class, vs_find_better_matching_suffix,
+    vs_swap_prereleases,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForEachRefFormat {
     inner: ExpandFormat<ForEachRefAtom>,

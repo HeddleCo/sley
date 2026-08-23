@@ -2236,3 +2236,11 @@ pub(crate) fn cmd_testkit(args: &[String]) -> Result<()> {
         )),
     }
 }
+
+/// Adapter exposing the CLI's mailmap through ref-filter's identity-rewrite
+/// view (the mailmap parser itself stays a CLI concern).
+impl sley_ref_filter::ForEachRefMailmapRewrite for Mailmap {
+    fn rewrite_identity(&self, identity: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        Mailmap::rewrite_identity(self, identity)
+    }
+}

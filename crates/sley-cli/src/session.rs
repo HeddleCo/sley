@@ -4,7 +4,6 @@
 //! dispatch explicitly.
 
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -311,7 +310,7 @@ impl CliSession {
     /// facade owns the repository-scoped object database and other handles.
     pub(crate) fn open_repository(&self) -> Result<Repository> {
         let git_dir = self.git_dir()?;
-        let work_tree = self.effective_worktree_for_git_dir(&git_dir)?;
+        let work_tree = crate::sley_worktree::discovery::setup::effective_worktree_for_git_dir(self, &git_dir)?;
         let config = crate::read_repo_config(&git_dir)?;
         let use_replace_refs = config
             .get_bool("core", None, "useReplaceRefs")
@@ -338,7 +337,7 @@ impl CliSession {
 
     /// Resolve the worktree for `git_dir` using this invocation's location policy.
     pub(crate) fn worktree_root_for_git_dir(&self, git_dir: &Path) -> Result<PathBuf> {
-        self.effective_worktree_for_git_dir(git_dir)?
+        crate::sley_worktree::discovery::setup::effective_worktree_for_git_dir(self, git_dir)?
             .ok_or_else(|| {
                 GitError::Unsupported("update-index currently requires a non-bare worktree".into())
             })
@@ -348,7 +347,7 @@ impl CliSession {
     /// Read-only commands use this to distinguish a bare repository from a
     /// bare repository paired with an explicit `--work-tree`.
     pub(crate) fn optional_worktree_for_git_dir(&self, git_dir: &Path) -> Result<Option<PathBuf>> {
-        self.effective_worktree_for_git_dir(git_dir)
+        crate::sley_worktree::discovery::setup::effective_worktree_for_git_dir(self, git_dir)
     }
 
     /// Resolve the invocation worktree from already-loaded physical and
@@ -361,176 +360,19 @@ impl CliSession {
         linked_worktree: bool,
         policy: crate::repository::WorktreePolicy,
     ) -> Result<Option<PathBuf>> {
-        if let Some(work_tree) = self.explicit_work_tree() {
-            let work_tree =
-                discovery::resolve_cli_path(&self.cwd, work_tree.to_string_lossy().as_ref());
-            return fs::canonicalize(work_tree)
-                .map(Some)
-                .map_err(|err| GitError::Io(err.to_string()));
-        }
-
-        match policy {
-            crate::repository::WorktreePolicy::Command => self
-                .optional_command_worktree_from_config(
-                    git_dir,
-                    setup_config,
-                    effective_config,
-                    linked_worktree,
-                ),
-            crate::repository::WorktreePolicy::HashAttributes => self
-                .optional_hash_attribute_root_from_config(
-                    git_dir,
-                    setup_config,
-                    effective_config,
-                    linked_worktree,
-                ),
-        }
-    }
-
-    fn optional_command_worktree_from_config(
-        &self,
-        git_dir: &Path,
-        setup_config: &GitConfig,
-        effective_config: &GitConfig,
-        linked_worktree: bool,
-    ) -> Result<Option<PathBuf>> {
-        if self.explicit_git_dir().is_some() {
-            if effective_config.get_bool("core", None, "bare") == Some(true) && !linked_worktree {
-                return Ok(None);
-            }
-            if let Some(worktree) = effective_config.get("core", None, "worktree") {
-                return canonicalize_configured_worktree(git_dir, worktree).map(Some);
-            }
-            if implicit_worktree_disabled() {
-                return Ok(None);
-            }
-            return canonicalize_cwd(&self.cwd).map(Some);
-        }
-        if self.explicit_bare() {
-            return Ok(None);
-        }
-        if linked_worktree && let Some(worktree) = linked_worktree_root(git_dir)? {
-            return Ok(Some(worktree));
-        }
-        if setup_config.get_bool("core", None, "bare") == Some(true) {
-            return Ok(None);
-        }
-        if let Some(worktree) = setup_config.get("core", None, "worktree") {
-            return canonicalize_configured_worktree(git_dir, worktree).map(Some);
-        }
-        if git_dir.file_name().and_then(|name| name.to_str()) == Some(".git") {
-            return git_dir
-                .parent()
-                .map(Path::to_path_buf)
-                .map(Some)
-                .ok_or_else(|| GitError::InvalidPath("git dir has no parent worktree".into()));
-        }
-        Ok(crate::setup::setup_git_directory(self).and_then(|setup| setup.worktree))
-    }
-
-    fn optional_hash_attribute_root_from_config(
-        &self,
-        git_dir: &Path,
-        setup_config: &GitConfig,
-        effective_config: &GitConfig,
-        linked_worktree: bool,
-    ) -> Result<Option<PathBuf>> {
-        // A linked worktree's backlink is intrinsic layout. It wins even when
-        // common/effective core.bare is true or implicit worktrees are disabled.
-        if linked_worktree && let Some(worktree) = linked_worktree_root(git_dir)? {
-            return Ok(Some(worktree));
-        }
-
-        let physical_bare = setup_config.get_bool("core", None, "bare") == Some(true);
-        if !physical_bare {
-            if let Some(worktree) = setup_config.get("core", None, "worktree") {
-                return canonicalize_configured_worktree(git_dir, worktree).map(Some);
-            }
-            if git_dir.file_name().and_then(|name| name.to_str()) == Some(".git") {
-                return git_dir
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .map(Some)
-                    .ok_or_else(|| GitError::InvalidPath("git dir has no parent worktree".into()));
-            }
-
-            // Preserve the non-standard gitfile fallback for a physically
-            // non-bare admin directory without a normal backlink.
-            return Ok(crate::setup::setup_git_directory(self).and_then(|setup| setup.worktree));
-        }
-
-        if effective_config.get_bool("core", None, "bare") != Some(false) {
-            return Ok(None);
-        }
-        // For hash-object attributes Git uses cwd here, ignoring config
-        // core.worktree and GIT_IMPLICIT_WORK_TREE. An explicit work-tree was
-        // already handled by the caller above.
-        canonicalize_cwd(&self.cwd).map(Some)
-    }
-
-    /// Resolve Git's effective worktree policy without requiring one to exist.
-    ///
-    /// An explicit git directory changes the implicit worktree from the
-    /// repository-intrinsic `.git` parent to the invocation cwd. Delegate that
-    /// distinction (including `core.worktree`, `core.bare`, and
-    /// `GIT_IMPLICIT_WORK_TREE`) to the shared setup engine.
-    fn effective_worktree_for_git_dir(&self, git_dir: &Path) -> Result<Option<PathBuf>> {
-        if let Some(work_tree) = self.explicit_work_tree() {
-            let work_tree =
-                discovery::resolve_cli_path(&self.cwd, work_tree.to_string_lossy().as_ref());
-            return fs::canonicalize(work_tree)
-                .map(Some)
-                .map_err(|err| GitError::Io(err.to_string()));
-        }
-        if self.explicit_git_dir().is_some() {
-            let setup = crate::setup::setup_git_directory(self).ok_or_else(|| {
-                GitError::repository_not_found(format!(
-                    "not a git repository: {}",
-                    git_dir.display()
-                ))
-            })?;
-            return Ok(setup.worktree);
-        }
-        if self.explicit_bare() {
-            return Ok(None);
-        }
-        if let Some(root) = crate::sley_worktree::worktree_root_for_git_dir(git_dir)? {
-            return Ok(Some(root));
-        }
-        // Intrinsic layout only recognizes a worktree when the admin dir is
-        // named `.git` (or has a linked-worktree `gitdir`/`commondir` pair).
-        // A gitfile that points at a differently-named directory (e.g. the
-        // t2105 `gitdir: .real` layout) has a real worktree at the gitfile's
-        // parent; fall back to CLI setup discovery so `add` / `commit` work.
-        if let Some(setup) = crate::setup::setup_git_directory(self) {
-            return Ok(setup.worktree);
-        }
-        Ok(None)
+        crate::sley_worktree::discovery::setup::optional_worktree_from_config(
+            self,
+            git_dir,
+            setup_config,
+            effective_config,
+            linked_worktree,
+            policy,
+        )
     }
 
     /// Resolved git directory for this session's cwd.
     pub(crate) fn git_dir(&self) -> Result<PathBuf> {
-        let cwd = self.cwd.clone();
-        if let Some(git_dir) = self.explicit_git_dir() {
-            if git_dir.as_os_str().is_empty() {
-                return Err(GitError::repository_not_found("not a git repository"));
-            }
-            let resolved = discovery::resolve_cli_path(&cwd, git_dir.to_string_lossy().as_ref());
-            if resolved.is_file()
-                && let Some(target) = discovery::read_gitdir_file(&resolved)?
-                && discovery::is_git_dir_candidate(&target)
-            {
-                return fs::canonicalize(target).map_err(|err| GitError::Io(err.to_string()));
-            }
-            return Ok(resolved);
-        }
-        if self.explicit_bare() {
-            if discovery::is_git_dir_candidate(&cwd) {
-                return fs::canonicalize(cwd).map_err(|err| GitError::Io(err.to_string()));
-            }
-            return Err(GitError::repository_not_found("not a git repository"));
-        }
-        discovery::resolve_git_dir_walk_only(cwd)
+        crate::sley_worktree::discovery::setup::invocation_git_dir(self)
     }
 
     pub(crate) fn cwd(&self) -> &Path {
@@ -538,46 +380,25 @@ impl CliSession {
     }
 }
 
-fn canonicalize_configured_worktree(git_dir: &Path, worktree: &str) -> Result<PathBuf> {
-    let worktree = PathBuf::from(worktree);
-    let worktree = if worktree.is_absolute() {
-        worktree
-    } else {
-        git_dir.join(worktree)
-    };
-    fs::canonicalize(worktree).map_err(|err| GitError::Io(err.to_string()))
-}
+/// The CLI session is the library setup engine's source of invocation-scoped
+/// overrides (`--git-dir` / `GIT_DIR`, `--work-tree` / `GIT_WORK_TREE`,
+/// `--bare`, and the invocation cwd).
+impl crate::sley_worktree::discovery::setup::SetupEnvironment for CliSession {
+    fn cwd(&self) -> &Path {
+        &self.cwd
+    }
 
-fn canonicalize_cwd(cwd: &Path) -> Result<PathBuf> {
-    fs::canonicalize(cwd).map_err(|err| GitError::Io(err.to_string()))
-}
+    fn explicit_git_dir(&self) -> Option<PathBuf> {
+        CliSession::explicit_git_dir(self)
+    }
 
-fn implicit_worktree_disabled() -> bool {
-    env::var_os("GIT_IMPLICIT_WORK_TREE").is_some_and(|value| {
-        matches!(
-            value.to_string_lossy().as_ref(),
-            "" | "0" | "false" | "no" | "off"
-        )
-    })
-}
+    fn explicit_work_tree(&self) -> Option<PathBuf> {
+        CliSession::explicit_work_tree(self)
+    }
 
-fn linked_worktree_root(git_dir: &Path) -> Result<Option<PathBuf>> {
-    let backlink = git_dir.join("gitdir");
-    let Ok(value) = fs::read_to_string(&backlink) else {
-        return Ok(None);
-    };
-    let path = PathBuf::from(value.trim());
-    let gitfile = if path.is_absolute() {
-        path
-    } else {
-        git_dir.join(path)
-    };
-    let Some(worktree) = gitfile.parent() else {
-        return Ok(None);
-    };
-    fs::canonicalize(worktree)
-        .map(Some)
-        .map_err(|err| GitError::Io(err.to_string()))
+    fn explicit_bare(&self) -> bool {
+        CliSession::explicit_bare(self)
+    }
 }
 
 /// Walk-up discovery without session overrides (local-path remotes).
@@ -587,6 +408,7 @@ pub(crate) fn cli_remote_git_dir_from(start: impl AsRef<Path>) -> Result<PathBuf
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use super::*;
 
     fn session(cwd: PathBuf, git_dir: Option<PathBuf>) -> CliSession {

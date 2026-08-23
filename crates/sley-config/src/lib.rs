@@ -2784,6 +2784,37 @@ pub fn load_effective_config(
     })
 }
 
+/// Assemble the invocation-effective configuration used as the identity
+/// fallback (`user.name`/`user.email`, `author.*`/`committer.*`, and friends):
+/// the effective system + global + repository snapshot layered with the
+/// `-c`/`--config-env` overrides, exactly as `git config` would read them.
+///
+/// Sunk from the CLI's identity setup. The caller supplies repository discovery
+/// results — `git_dir` (per-worktree, for `includeIf "onbranch:"`) and
+/// `common_git_dir` (for config-file discovery) — because common-dir resolution
+/// lives in sley-formats, which sits above this crate. Any load failure yields
+/// `None` so callers fall back to git's default-identity behavior.
+pub fn load_identity_effective_config(
+    common_git_dir: &Path,
+    git_dir: &Path,
+    cwd: &Path,
+) -> Option<GitConfig> {
+    let context = ConfigIncludeContext::new(
+        Some(common_git_dir.to_path_buf()),
+        repo_current_branch_name(git_dir),
+    );
+    let mut config = load_effective_config(common_git_dir, &context).ok()?;
+    // Layer the command-line `-c`/`--config-env` overrides on top, so reads like
+    // `mailmap.blob`/`mailmap.file` see the same values `git config` would (the
+    // CLI cannot push `-c` into the process env, so reconstruct it here).
+    let parameters_env = effective_config_parameters_env();
+    if let Ok(parameters) = injected_config_parameters(parameters_env.as_deref()) {
+        let _ =
+            append_injected_config_sections_with_includes(&mut config, &parameters, &context, cwd);
+    }
+    Some(config)
+}
+
 /// Load the config layers consulted before command dispatch (alias resolution):
 /// system, global, and repository when `common_git_dir` is known.
 ///
@@ -2863,7 +2894,7 @@ fn global_config_paths() -> Vec<PathBuf> {
 /// `None` when neither variable yields a base directory.
 ///
 /// This directory holds git's user-level defaults: `config`
-/// (see [`global_config_paths`]) plus `ignore` and `attributes`, the default
+/// (see `global_config_paths`) plus `ignore` and `attributes`, the default
 /// `core.excludesFile` / `core.attributesFile` when those keys are unset.
 pub fn xdg_git_home_path(file_name: &str) -> Option<PathBuf> {
     if let Some(xdg) = non_empty_env("XDG_CONFIG_HOME") {

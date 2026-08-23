@@ -73,21 +73,18 @@ mod init_config;
 mod interrupt_cancel;
 mod log_cli;
 mod ls_files_pathspec;
-mod ownership;
 mod reflog_parse;
 mod remote;
 mod repo_helpers;
 mod repo_path;
 mod repo_paths;
 mod repository;
-mod revision;
 mod scalar;
 mod session;
 mod session_globals;
 mod setup;
 mod status_format;
 mod trace2_cli;
-mod tree_print;
 
 pub(crate) use sley::plumbing::sley_rev::revlist::*;
 pub(crate) use sley::plumbing::{
@@ -119,7 +116,7 @@ pub(crate) use diff_render::{
     collect_diff_stat_entries_with_worktree_clean, collect_dirty_submodules,
     compile_ignore_matching_regexes, diff_entry_new_content, diff_entry_old_content,
     diff_entry_produces_output, diff_line_stats, diff_rename_limit_requires_integer_error,
-    diff_stat_decimal_width, diff_stat_pprint_rename, diff_stat_totals, gitlink_diff_content,
+    diff_stat_decimal_width, diff_stat_totals, gitlink_diff_content,
     is_binary_content, is_gitlink_pair, parse_diff_max_depth, parse_dirstat_params,
     prefetch_diff_entry_blobs, prefetch_promisor_objects, prefetch_via_configured_upload_pack,
     promisor_remote_names, read_blob, read_object_maybe_prefetch_promisor, render_diff_entries,
@@ -128,7 +125,8 @@ pub(crate) use diff_render::{
     write_diff_dirstat, write_diff_numstat_materialized_entry, write_diff_patch_entry,
     write_diff_raw_entry, write_diff_shortstat_materialized, write_diff_stat_materialized,
     write_diff_stat_materialized_with_widths, write_diff_stat_summary_line,
-    write_diff_summary_entry,
+    write_diff_summary_entry, diff_lazy_fetch, diff_pathspec_new, cli_submodule_render,
+    diff_big_file_threshold, make_clean_apply, clean_context, cli_render_services,
 };
 
 pub(crate) use discovery::{
@@ -197,10 +195,38 @@ pub(crate) use repository::RepositoryContext;
 pub(crate) use checkout_reset::*;
 pub(crate) use commit_identity::*;
 pub(crate) use commit_message::*;
-pub(crate) use revision::*;
+// Mail/text engines moved to `sley-mail` (phase-3 wave D); the re-exports keep
+// the historical unqualified names working across command modules with no
+// per-site edits.
+pub(crate) use sley_mail::encode::{
+    MailThreadHeaders, MimeAttach, Rfc2047Type, ThreadLevel, add_rfc2047, add_rfc822_quoted,
+    add_wrapped_text, build_thread_plan, format_patch_body_start,
+    format_patch_preserved_subject, format_patch_subject, last_line_length,
+    message_body_has_non_ascii, needs_rfc2047_encoding, needs_rfc822_quoting,
+    write_mime_closing, write_mime_part_header, write_mime_preamble,
+};
+pub(crate) use sley_mail::mailinfo::{
+    MailMessage as AmPatch, SubjectCleanup, commit_message_body_after_subject, hg_patch_to_mail,
+    is_diff_start, looks_like_patch_input, parse_mbox, parse_mboxrd, parse_message,
+    split_keep_newline, stgit_patch_to_mail, strip_cr, subject_of_message,
+    trim_trailing_newline, write_stored_subject_header,
+};
+pub(crate) use sley_mail::patch_id::{PatchIdOptions, get_one_patchid, split_keep_newlines};
+// Revision-resolution wrappers dissolved into `sley-rev`; the aliases keep the
+// historical unqualified names working across command modules with no per-site
+// edits.
+pub(crate) use sley::plumbing::sley_rev::resolve_revision_symbolic_full_name as rev_parse_symbolic_full_name;
+pub(crate) use sley::plumbing::sley_rev::{
+    resolve_revision_commitish_with_replacement_policy as resolve_revision_commitish,
+    resolve_revision_treeish_with_replacement_policy as resolve_revision_treeish,
+    resolve_revision_with_replacement_policy as resolve_revision,
+    warn_ambiguous_refname_for_object_prefix,
+};
 pub(crate) use session_globals::*;
 pub(crate) use status_format::*;
-pub(crate) use tree_print::*;
+// Tree printing moved to `sley-formats::tree_print`; the glob keeps the
+// historical unqualified names available across command modules.
+pub(crate) use sley::plumbing::sley_formats::tree_print::*;
 
 pub(crate) use cli_misc::{
     AddAction, add_path_matches, check_ignore_tracked_paths, count_objects_human_bytes,
@@ -338,7 +364,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::diff_render::count_line_diff;
+    use sley::plumbing::sley_diff_merge::porcelain::count_line_diff;
 
     #[test]
     fn diff_stat_line_count_fast_paths_are_exact() {

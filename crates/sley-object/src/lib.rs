@@ -20,6 +20,12 @@ use std::str::FromStr;
 
 pub use sley_core::BString;
 
+mod commit_create;
+mod identity;
+
+pub use commit_create::*;
+pub use identity::*;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ObjectType {
     Blob,

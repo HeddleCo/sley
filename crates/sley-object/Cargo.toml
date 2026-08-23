@@ -8,6 +8,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# Identity resolution (`ident.c`) reads `user.name`/`user.email`/role overrides
+# from the effective config, so object carries a config edge. Acyclic: config
+# depends only on core + pathspec.
+sley-config.workspace = true
 sley-core.workspace = true
 
 [lints]

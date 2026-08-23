@@ -2519,7 +2519,7 @@ fn cmd_log_impl(
             None
         } else {
             let worktree_root = repository.worktree_root()?;
-            Some(DiffPathspec::new(
+            Some(crate::diff_pathspec_new(
                 &cwd,
                 worktree_root,
                 &pathspecs,
@@ -2677,7 +2677,7 @@ fn cmd_log_impl(
         None
     } else if log_diff_requested {
         let worktree_root = repository.worktree_root()?;
-        Some(DiffPathspec::new(
+        Some(crate::diff_pathspec_new(
             &cwd,
             worktree_root,
             &pathspecs,
@@ -3304,7 +3304,7 @@ fn cmd_log_impl(
             None
         } else {
             let worktree_root = repository.worktree_root()?;
-            Some(DiffPathspec::new(
+            Some(crate::diff_pathspec_new(
                 &cwd,
                 worktree_root,
                 &pathspecs,
@@ -3336,7 +3336,7 @@ fn cmd_log_impl(
             None
         } else {
             let worktree_root = repository.worktree_root()?;
-            Some(DiffPathspec::new(
+            Some(crate::diff_pathspec_new(
                 &cwd,
                 worktree_root,
                 &pathspecs,

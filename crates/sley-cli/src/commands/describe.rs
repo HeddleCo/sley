@@ -80,23 +80,25 @@ pub(crate) fn describe_for_format(
         return Ok(Some(describe_tag_output_name(best, &options)));
     }
 
-    let search = describe_search(git_dir, format, db, &options, &tags.by_commit, target)?;
-    let Some((best, _traversed)) = search.found else {
+    let (found, _traversed, _unannotated_cnt) =
+        run_describe_search(git_dir, format, db, &options, &tags.by_commit, target)?;
+    let Some((tagged, depth)) = found else {
         return Ok(None);
     };
+    let best = &tags.by_commit[&tagged];
     let short = describe_abbrev_oid(db, target, abbrev)?;
-    if options.long || best.depth != 0 {
+    if options.long || depth != 0 {
         if abbrev == 0 {
-            Ok(Some(describe_tag_output_name(best.tag, &options)))
+            Ok(Some(describe_tag_output_name(best, &options)))
         } else {
             Ok(Some(format!(
                 "{}-{}-g{short}",
-                describe_tag_output_name(best.tag, &options),
-                best.depth
+                describe_tag_output_name(best, &options),
+                depth
             )))
         }
     } else {
-        Ok(Some(describe_tag_output_name(best.tag, &options)))
+        Ok(Some(describe_tag_output_name(best, &options)))
     }
 }
 
@@ -614,18 +616,6 @@ fn describe_peel_commit(
     }
 }
 
-/// State tracked for each candidate tag during the priority walk.
-struct PossibleTag<'a> {
-    tag: &'a DescribeTag,
-    /// Bit identifying commits reachable from this candidate's tagged commit.
-    flag: u32,
-    /// Count of traversed commits not reachable from this candidate.
-    depth: u32,
-    /// Order in which this candidate was registered during the commit-date walk;
-    /// breaks ties between equal-depth candidates, matching git's `compare_pt`.
-    found_order: usize,
-}
-
 /// Describe a single target commit, printing the result (or an error per git).
 fn describe_one(
     git_dir: &Path,
@@ -695,15 +685,16 @@ fn describe_commit_text(
         eprintln!("No exact match on refs or tags, searching to describe");
     }
 
-    let search = describe_search(git_dir, format, db, options, &tags.by_commit, target)?;
+    let (found, traversed, unannotated_cnt) =
+        run_describe_search(git_dir, format, db, options, &tags.by_commit, target)?;
 
-    let Some((best, traversed)) = search.found else {
+    let Some((tagged, depth)) = found else {
         // No candidate tag was reachable from the target.
         return describe_no_candidate(
             db,
             options,
             abbrev,
-            search.unannotated_cnt,
+            unannotated_cnt,
             target,
             dirty_suffix,
         );
@@ -713,12 +704,13 @@ fn describe_commit_text(
         eprintln!("traversed {traversed} commits");
     }
 
+    let best = &tags.by_commit[&tagged];
     let suffix = dirty_suffix.unwrap_or("");
     let short = describe_abbrev_oid(db, target, abbrev)?;
-    let name = describe_tag_output_name(best.tag, options);
-    warn_describe_misnamed_tag(best.tag, options);
-    if options.long || best.depth != 0 || describe_tag_is_misnamed(best.tag, options) {
-        if abbrev == 0 && !describe_tag_is_misnamed(best.tag, options) {
+    let name = describe_tag_output_name(best, options);
+    warn_describe_misnamed_tag(best, options);
+    if options.long || depth != 0 || describe_tag_is_misnamed(best, options) {
+        if abbrev == 0 && !describe_tag_is_misnamed(best, options) {
             // `--abbrev=0` without `--long`: print just the tag name.
             Ok(format!("{name}{suffix}"))
         } else {
@@ -727,241 +719,47 @@ fn describe_commit_text(
             } else {
                 short
             };
-            Ok(format!("{}-{}-g{short}{suffix}", name, best.depth))
+            Ok(format!("{}-{}-g{short}{suffix}", name, depth))
         }
     } else {
         Ok(format!("{name}{suffix}"))
     }
 }
 
-/// Per-candidate flags live in a u32; bit 0 is reserved (git's flags are 1-based
-/// via `1u << match_cnt` after the post-increment), so we can track up to 31
-/// candidates. git is likewise bounded by its commit-flag bits.
-const MAX_FLAG_CANDIDATES: usize = 31;
-
-/// Run the commit-date-ordered priority walk from `target`, returning the winning
-/// candidate together with the number of commits traversed. Returns `Ok(None)`
-/// when no candidate tag is reachable. This mirrors git's `describe_commit`
-/// walk, including the `depth = seen_commits - 1` seeding, the per-commit depth
-/// increments, the early-exit, and the `finish_depth_computation` tail.
-fn describe_search<'a>(
+/// Bridge to the describe search core in `sley-rev`: project the gathered tag
+/// map into the engine's candidate shape, run the commit-date walk, and map the
+/// winner back to its tag plus depth.
+fn run_describe_search(
     git_dir: &Path,
     format: ObjectFormat,
     db: &FileObjectDatabase,
     options: &DescribeOptions,
-    tags: &'a HashMap<ObjectId, DescribeTag>,
+    tags: &HashMap<ObjectId, DescribeTag>,
     target: &ObjectId,
-) -> Result<DescribeSearchResult<'a>> {
-    let mut candidates: Vec<PossibleTag<'a>> = Vec::new();
-    // Flags carried by each commit: the union of candidate bits whose tagged
-    // commit this commit is an ancestor-or-self of, propagated to parents.
-    let mut flags: HashMap<ObjectId, u32> = HashMap::new();
-    let mut seen: HashSet<ObjectId> = HashSet::new();
-    let mut queue: std::collections::BinaryHeap<DescribeQueueItem> =
-        std::collections::BinaryHeap::new();
-
-    let mut metadata = sley_rev::CommitMetadataReader::new(git_dir, format, db);
-    queue.push(describe_queue_item(
-        &mut metadata,
-        target,
-        options.first_parent,
-    )?);
-    seen.insert(*target);
-
-    let effective_max = options.max_candidates.min(MAX_FLAG_CANDIDATES);
-    let names_size = tags.len();
-    let mut seen_commits = 0usize;
-    let mut annotated_cnt = 0usize;
-    // Reachable unannotated tags skipped because the default mode wants annotated
-    // tags; drives the "try --tags" hint when no annotated tag is reachable.
-    let mut unannotated_cnt = 0usize;
-    // The commit at which we stopped because the candidate budget was exhausted;
-    // it must be re-fed to the depth-finishing pass.
-    let mut gave_up: Option<DescribeQueueItem> = None;
-
-    while let Some(item) = queue.pop() {
-        seen_commits += 1;
-
-        // Stop collecting once the candidate budget (or the entire tag universe)
-        // is exhausted; the winner's depth is finished separately below.
-        if candidates.len() == effective_max || candidates.len() == names_size {
-            gave_up = Some(item);
-            seen_commits -= 1;
-            break;
-        }
-        let oid = item.oid;
-
-        if let Some(best) = tags.get(&oid) {
-            if !describe_eligible(best, options) {
-                // A reachable unannotated tag we would have used with `--tags`.
-                unannotated_cnt += 1;
-            } else if candidates.len() < effective_max {
-                // git assigns the flag/found_order from the post-incremented
-                // match count, making both 1-based.
-                let found_order = candidates.len() + 1;
-                let flag = 1u32 << found_order;
-                let depth = (seen_commits - 1) as u32;
-                *flags.entry(oid).or_insert(0) |= flag;
-                if options.debug {
-                    eprintln!(" annotated {depth:>10} {}", best.name);
-                }
-                candidates.push(PossibleTag {
-                    tag: best,
-                    flag,
-                    depth,
-                    found_order,
-                });
-                if best.prio == 2 {
-                    annotated_cnt += 1;
-                }
-            }
-        }
-
-        // Every candidate not reached by this commit grows its depth by one.
-        let commit_flags = flags.get(&oid).copied().unwrap_or(0);
-        for candidate in &mut candidates {
-            if commit_flags & candidate.flag == 0 {
-                candidate.depth += 1;
-            }
-        }
-
-        // Early exit: if the queue is drained to commits all covered by the best
-        // candidate(s), remaining depth is already final.
-        if annotated_cnt > 0 && queue.is_empty() {
-            let mut best_depth = u32::MAX;
-            let mut best_within = 0u32;
-            for candidate in &candidates {
-                if candidate.depth < best_depth {
-                    best_depth = candidate.depth;
-                    best_within = candidate.flag;
-                } else if candidate.depth == best_depth {
-                    best_within |= candidate.flag;
-                }
-            }
-            if commit_flags & best_within == best_within {
-                break;
-            }
-        }
-
-        for parent in item.parents {
-            *flags.entry(parent).or_insert(0) |= commit_flags;
-            if seen.insert(parent) {
-                queue.push(describe_queue_item(
-                    &mut metadata,
-                    &parent,
-                    options.first_parent,
-                )?);
-            }
-        }
-    }
-
-    if candidates.is_empty() {
-        return Ok(DescribeSearchResult {
-            found: None,
-            unannotated_cnt,
-        });
-    }
-
-    // Pick the winner: smallest depth, ties broken by registration order.
-    let mut best_index = 0;
-    for index in 1..candidates.len() {
-        let challenger = &candidates[index];
-        let leader = &candidates[best_index];
-        if challenger.depth < leader.depth
-            || (challenger.depth == leader.depth && challenger.found_order < leader.found_order)
-        {
-            best_index = index;
-        }
-    }
-
-    // Finish the winner's depth over any commits left unprocessed (because the
-    // walk stopped early or gave up on the candidate budget).
-    let best_flag = candidates[best_index].flag;
-    if let Some(gave_up) = gave_up {
-        seen.remove(&gave_up.oid);
-        queue.push(gave_up);
-    }
-    let extra = finish_depth_computation(
-        &mut metadata,
-        options,
-        &mut queue,
-        &mut flags,
-        &mut seen,
-        best_flag,
-    )?;
-    candidates[best_index].depth += extra;
-
-    seen_commits += extra as usize;
-    let best = candidates.swap_remove(best_index);
-    Ok(DescribeSearchResult {
-        found: Some((best, seen_commits)),
-        unannotated_cnt,
-    })
-}
-
-/// The outcome of the describe walk: the winning candidate (with the commits
-/// traversed) if one was found, plus the count of reachable unannotated tags
-/// skipped in the default mode.
-struct DescribeSearchResult<'a> {
-    found: Option<(PossibleTag<'a>, usize)>,
-    unannotated_cnt: usize,
-}
-
-/// Continue walking the leftover queue to finish counting the winning
-/// candidate's depth, mirroring git's `finish_depth_computation`: every commit
-/// not reachable from the winning tag still lies between the target and that
-/// tag and adds one to its depth. Returns the additional depth accumulated.
-fn finish_depth_computation(
-    metadata: &mut sley_rev::CommitMetadataReader<'_, FileObjectDatabase>,
-    options: &DescribeOptions,
-    queue: &mut std::collections::BinaryHeap<DescribeQueueItem>,
-    flags: &mut HashMap<ObjectId, u32>,
-    seen: &mut HashSet<ObjectId>,
-    best_flag: u32,
-) -> Result<u32> {
-    // Commits currently queued that the winner does not yet reach.
-    let mut unflagged: HashSet<ObjectId> = queue
+) -> Result<(Option<(ObjectId, u32)>, usize, usize)> {
+    let candidates: Vec<sley_rev::describe::DescribeCandidate> = tags
         .iter()
-        .filter(|item| flags.get(&item.oid).copied().unwrap_or(0) & best_flag == 0)
-        .map(|item| item.oid)
+        .map(|(commit, tag)| sley_rev::describe::DescribeCandidate {
+            commit: *commit,
+            name: tag.name.clone(),
+            eligible: describe_eligible(tag, options),
+            annotated: tag.prio == 2,
+        })
         .collect();
-    let mut extra = 0u32;
-    while let Some(item) = queue.pop() {
-        let oid = item.oid;
-        let commit_flags = flags.get(&oid).copied().unwrap_or(0);
-        if commit_flags & best_flag != 0 {
-            // The winner reaches this commit; once nothing unflagged remains the
-            // depth can no longer grow.
-            if unflagged.is_empty() {
-                break;
-            }
-        } else {
-            unflagged.remove(&oid);
-            extra += 1;
-        }
-        for parent in item.parents {
-            let flag_before = flags.get(&parent).copied().unwrap_or(0) & best_flag;
-            let was_seen = seen.contains(&parent);
-            if !was_seen {
-                seen.insert(parent);
-            }
-            *flags.entry(parent).or_insert(0) |= commit_flags;
-            let flag_after = flags.get(&parent).copied().unwrap_or(0) & best_flag;
-            if !was_seen {
-                queue.push(describe_queue_item(
-                    metadata,
-                    &parent,
-                    options.first_parent,
-                )?);
-                if flag_after == 0 {
-                    unflagged.insert(parent);
-                }
-            } else if flag_before == 0 && flag_after != 0 {
-                unflagged.remove(&parent);
-            }
-        }
-    }
-    Ok(extra)
+    let walk = sley_rev::describe::DescribeWalkOptions {
+        max_candidates: options.max_candidates,
+        first_parent: options.first_parent,
+        debug: options.debug,
+    };
+    let outcome =
+        sley_rev::describe::describe_search(git_dir, format, db, &candidates, target, &walk)?;
+    Ok((
+        outcome
+            .winner
+            .map(|winner| (winner.tagged_commit, winner.depth)),
+        outcome.traversed,
+        outcome.unannotated_cnt,
+    ))
 }
 
 /// Handle the case where no reachable tag names the target: emit the abbreviated
@@ -1000,52 +798,6 @@ fn describe_no_candidate(
 
 /// `--always` still respects an explicit `--abbrev=0` request by widening to the
 /// minimum, mirroring git's fallback which never prints a zero-length name.
-/// Item for the commit-date priority queue. `Ord` yields a max-heap on date so
-/// the newest commit is processed first; ties fall back to oid for determinism.
-struct DescribeQueueItem {
-    date: i64,
-    oid: ObjectId,
-    parents: Vec<ObjectId>,
-}
-
-fn describe_queue_item(
-    metadata: &mut sley_rev::CommitMetadataReader<'_, FileObjectDatabase>,
-    oid: &ObjectId,
-    first_parent: bool,
-) -> Result<DescribeQueueItem> {
-    let mut commit = metadata.get(oid)?;
-    if first_parent {
-        commit.parents.truncate(1);
-    }
-    Ok(DescribeQueueItem {
-        date: commit.commit_time,
-        oid: commit.oid,
-        parents: commit.parents,
-    })
-}
-
-impl PartialEq for DescribeQueueItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.date == other.date && self.oid == other.oid
-    }
-}
-
-impl Eq for DescribeQueueItem {}
-
-impl Ord for DescribeQueueItem {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.date
-            .cmp(&other.date)
-            .then_with(|| self.oid.to_hex().cmp(&other.oid.to_hex()))
-    }
-}
-
-impl PartialOrd for DescribeQueueItem {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 fn describe_commit_date(
     db: &FileObjectDatabase,
     format: ObjectFormat,

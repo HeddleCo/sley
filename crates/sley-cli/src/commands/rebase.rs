@@ -1872,7 +1872,7 @@ fn print_rebase_diffstat(
         return Ok(());
     }
     let mut stdout = io::stdout();
-    let stat_entries = collect_diff_stat_entries(entries.as_slice(), db, None, false, lazy_fetch)?;
+    let stat_entries = collect_diff_stat_entries(entries.as_slice(), db, None, false, crate::diff_lazy_fetch(lazy_fetch))?;
     // The diffstat rows + the "N file changed …" trailer (already emitted by
     // `write_diff_stat`). It is NOT followed by a separate shortstat — emitting
     // one double-printed the "N file changed" line (t3404 "verbose flag is

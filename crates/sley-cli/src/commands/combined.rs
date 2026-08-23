@@ -351,14 +351,14 @@ pub(crate) fn write_combined_patch(
     // it as a blob would error or yield garbage.
     let result_blob = match &path.result_oid {
         Some(oid) if path.result_mode == 0o160000 => gitlink_diff_content(oid, false),
-        Some(oid) => read_blob(ctx.db, oid, ctx.lazy_fetch)?,
+        Some(oid) => read_blob(ctx.db, oid, crate::diff_lazy_fetch(ctx.lazy_fetch))?,
         None => Vec::new(),
     };
     let mut parent_blobs: Vec<Vec<u8>> = Vec::with_capacity(num_parent);
     for parent in &path.parents {
         parent_blobs.push(match &parent.oid {
             Some(oid) if parent.mode == 0o160000 => gitlink_diff_content(oid, false),
-            Some(oid) => read_blob(ctx.db, oid, ctx.lazy_fetch)?,
+            Some(oid) => read_blob(ctx.db, oid, crate::diff_lazy_fetch(ctx.lazy_fetch))?,
             None => Vec::new(),
         });
     }

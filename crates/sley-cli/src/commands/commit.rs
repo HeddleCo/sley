@@ -1899,7 +1899,7 @@ fn print_commit_summary(
         sley_diff_merge::DiffNameStatusOptions::default(),
     )?;
     if !entries.is_empty() {
-        let stat_entries = collect_diff_stat_entries(&entries, db, None, false, lazy_fetch)?;
+        let stat_entries = collect_diff_stat_entries(&entries, db, None, false, crate::diff_lazy_fetch(lazy_fetch))?;
         write_diff_shortstat_materialized(&mut out, &stat_entries)?;
         for entry in &entries {
             write_commit_summary_entry(&mut out, entry)?;
@@ -3608,7 +3608,7 @@ fn append_commit_diff_index_patch(
                 anchors: &[],
                 allow_textconv: true,
                 db: &db,
-                lazy_fetch,
+                lazy_fetch: crate::diff_lazy_fetch(lazy_fetch),
                 worktree_root: worktree.then_some(worktree_root.as_path()),
                 use_worktree_new: worktree,
                 format,
@@ -3632,6 +3632,8 @@ fn append_commit_diff_index_patch(
                 ignore_regexes: &[],
                 line_ranges: None,
                 indent_heuristic: true,
+                big_file_threshold: crate::diff_big_file_threshold(&db),
+                submodule_render: crate::cli_submodule_render()
             },
         )?;
     }

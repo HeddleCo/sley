@@ -48,7 +48,6 @@ pub(crate) mod fsmonitor;
 pub(crate) mod grep;
 pub(crate) mod grep_args;
 pub(crate) mod hash_object;
-pub(crate) mod hash_object_fsck;
 pub(crate) mod help;
 pub(crate) mod history;
 pub(crate) mod hooks;

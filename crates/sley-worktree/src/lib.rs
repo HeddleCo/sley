@@ -39,6 +39,7 @@ use std::{env, fs};
 pub mod admin;
 mod attributes;
 mod checkout;
+pub mod discovery;
 mod filter;
 mod fsmonitor;
 mod ignore;
@@ -49,6 +50,23 @@ mod read_tree;
 mod status;
 mod status_plan;
 mod types_admin;
+
+// Environment-respecting repository discovery, shared with the facade setup
+// path and the hook engine (see the `discovery` module docs).
+pub use discovery::{
+    discover_git_dir_respecting_environment, environment_git_dir, environment_work_tree,
+    is_git_dir, read_gitdir_link, resolve_explicit_git_dir, resolve_path_from_cwd,
+};
+// Consolidated setup/ownership engine (git's `setup_git_directory_gently` and
+// `ensure_valid_ownership`), shared by the CLI layer and embedders.
+pub use discovery::ownership::{ensure_valid_ownership, note_implicit_bare_repository};
+pub use discovery::probes::{
+    discovery_filesystem_boundary, paths_refer_to_same_dir, resolve_git_dir_walk_only,
+};
+pub use discovery::setup::{
+    effective_worktree_for_git_dir, invocation_git_dir, optional_worktree_from_config,
+    setup_git_directory, SetupEnvironment, SetupResult, WorktreePolicy,
+};
 
 // `attributes` and `index_io` hold only crate-internal helpers (no `pub`
 // items), so they are reached via direct `use crate::{attributes,index_io}::*`

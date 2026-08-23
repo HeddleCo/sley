@@ -309,7 +309,7 @@ pub(crate) fn cmd_diff_index(
             Some(worktree_root) => worktree_root,
             None => repo.worktree_root()?,
         };
-        DiffPathspec::new(cwd, worktree_root, &setup.pathspecs, repo.pathspec_magic())?
+        crate::diff_pathspec_new(cwd, worktree_root, &setup.pathspecs, repo.pathspec_magic())?
     };
 
     let base_options = sley_diff_merge::DiffNameStatusOptions {
@@ -604,7 +604,7 @@ fn render(
             ctx.db,
             ctx.worktree_root,
             ctx.use_worktree_new,
-            ctx.lazy_fetch,
+            crate::diff_lazy_fetch(ctx.lazy_fetch),
         )?
     } else {
         Vec::new()
@@ -665,7 +665,7 @@ fn render(
                 anchors: &[],
                 allow_textconv: false,
                 db: ctx.db,
-                lazy_fetch: ctx.lazy_fetch,
+                lazy_fetch: crate::diff_lazy_fetch(ctx.lazy_fetch),
                 worktree_root: ctx.worktree_root,
                 use_worktree_new: ctx.use_worktree_new,
                 format: ctx.format,
@@ -689,6 +689,8 @@ fn render(
                 ignore_regexes: &[],
                 line_ranges: None,
                 indent_heuristic: ctx.indent_heuristic,
+                big_file_threshold: crate::diff_big_file_threshold(ctx.db),
+                submodule_render: crate::cli_submodule_render()
             };
             write_diff_patch_entry(&mut stdout, entry, options)?;
         }

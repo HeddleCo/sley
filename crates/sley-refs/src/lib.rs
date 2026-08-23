@@ -6830,18 +6830,15 @@ where
             }
             None => None,
         };
-        let reflog = match reflog {
-            Some(reflog) => Some(ReflogEntry {
-                old_oid: match &old_oid {
-                    Some(oid) => *oid,
-                    None => ObjectId::null(bundle_ref.oid.format()),
-                },
-                new_oid: bundle_ref.oid,
-                committer: reflog.committer.clone(),
-                message: reflog.message.clone(),
-            }),
-            None => None,
-        };
+        let reflog = reflog.map(|reflog| ReflogEntry {
+            old_oid: match &old_oid {
+                Some(oid) => *oid,
+                None => ObjectId::null(bundle_ref.oid.format()),
+            },
+            new_oid: bundle_ref.oid,
+            committer: reflog.committer.clone(),
+            message: reflog.message.clone(),
+        });
         updates.push(RefUpdate {
             name: bundle_ref.name.clone(),
             expected: old_oid.map(RefTarget::Direct),

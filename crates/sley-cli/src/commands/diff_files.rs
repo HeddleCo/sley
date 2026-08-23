@@ -552,7 +552,7 @@ fn run_diff_files(cli_session: &crate::session::CliSession, o: DiffFilesOptions)
     let pathspec = if o.path_args.is_empty() {
         DiffPathspec::default()
     } else {
-        DiffPathspec::new(cwd, worktree_root, &o.path_args, repo.pathspec_magic())?
+        crate::diff_pathspec_new(cwd, worktree_root, &o.path_args, repo.pathspec_magic())?
     };
 
     let options = sley_diff_merge::DiffNameStatusOptions {
@@ -741,7 +741,7 @@ fn render_diff_files_entries(
             context.db,
             worktree_root,
             use_worktree_new,
-            context.lazy_fetch,
+            crate::diff_lazy_fetch(context.lazy_fetch),
         )?
         .into_iter()
         .filter(diff_files_stat_entry_has_content_change)
@@ -762,6 +762,7 @@ fn render_diff_files_entries(
             patch: show_patch,
         },
         DiffEntryRenderContext {
+            services: cli_render_services(),
             raw: DiffEntryRawRenderOptions {
                 z: o.z,
                 abbrev: context.raw_abbrev,
@@ -791,7 +792,7 @@ fn render_diff_files_entries(
                 anchors: &[],
                 allow_textconv: false,
                 db: context.db,
-                lazy_fetch: context.lazy_fetch,
+                lazy_fetch: crate::diff_lazy_fetch(context.lazy_fetch),
                 worktree_root,
                 use_worktree_new,
                 format: context.format,
@@ -815,6 +816,8 @@ fn render_diff_files_entries(
                 ignore_regexes: &[],
                 line_ranges: None,
                 indent_heuristic: context.indent_heuristic,
+                big_file_threshold: crate::diff_big_file_threshold(context.db),
+                submodule_render: crate::cli_submodule_render()
             };
             write_diff_patch_entry(stdout, entry, patch_options)
         },

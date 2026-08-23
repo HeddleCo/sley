@@ -8,21 +8,19 @@
 //! own config). `GIT_TEST_ASSUME_DIFFERENT_OWNER=1` forces the not-owned path so
 //! the check can be exercised regardless of real on-disk ownership.
 
-use crate::sley_config;
-use sley::plumbing::sley_core;
 use std::path::{Component, Path, PathBuf};
 
-use sley::plumbing::sley_config::ConfigIncludeContext;
-use sley::{GitError, Result};
+use sley_config::ConfigIncludeContext;
+use sley_core::{GitError, Result};
 
-use crate::{git_env_bool, injected_config_parameters};
+use super::git_env_bool;
 
 /// Validate that operating on a repository is safe, mirroring git's
 /// `ensure_valid_ownership`. `worktree` is the worktree top (`None` for a bare
 /// repo), `gitdir` the resolved git directory, and `gitfile` the `.git` *file*
 /// path when discovery went through a gitfile. Returns the dubious-ownership
 /// fatal error when the repository is neither owned nor allow-listed.
-pub(crate) fn ensure_valid_ownership(
+pub fn ensure_valid_ownership(
     worktree: Option<&Path>,
     gitdir: &Path,
     gitfile: Option<&Path>,
@@ -68,7 +66,7 @@ enum AllowedBareRepo {
 /// the `safe.bareRepository` policy: in `explicit` mode an implicit bare repo
 /// that is not a known git-internal directory (`.git`, a secondary worktree, or
 /// a submodule git dir) is refused.
-pub(crate) fn note_implicit_bare_repository(dir: &Path) -> Result<()> {
+pub fn note_implicit_bare_repository(dir: &Path) -> Result<()> {
     sley_core::trace2::perf_setup_data("implicit-bare-repository", dir.display());
     if get_allowed_bare_repo() == AllowedBareRepo::Explicit && !is_implicit_bare_repo(dir) {
         return Err(GitError::InvalidFormat(format!(
@@ -86,7 +84,7 @@ fn get_allowed_bare_repo() -> AllowedBareRepo {
     let Ok(mut config) = sley_config::load_pre_dispatch_config(None, &context) else {
         return AllowedBareRepo::All;
     };
-    if let Ok(parameters) = injected_config_parameters() {
+    if let Ok(parameters) = sley_config::injected_config_parameters(None) {
         let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let _ = sley_config::append_injected_config_sections_with_includes(
             &mut config,
@@ -110,7 +108,7 @@ fn get_allowed_bare_repo() -> AllowedBareRepo {
 /// known git-internal location — a `.git` directory, a secondary worktree's git
 /// dir, or a submodule's git dir — and therefore exempt from the
 /// `safe.bareRepository=explicit` refusal.
-fn is_implicit_bare_repo(path: &Path) -> bool {
+pub fn is_implicit_bare_repo(path: &Path) -> bool {
     if path.file_name().is_some_and(|name| name == ".git") {
         return true;
     }
@@ -175,7 +173,7 @@ fn protected_safe_directory_values() -> Vec<String> {
     let Ok(mut config) = sley_config::load_pre_dispatch_config(None, &context) else {
         return Vec::new();
     };
-    if let Ok(parameters) = injected_config_parameters() {
+    if let Ok(parameters) = sley_config::injected_config_parameters(None) {
         let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let _ = sley_config::append_injected_config_sections_with_includes(
             &mut config,

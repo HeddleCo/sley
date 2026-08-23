@@ -1495,6 +1495,7 @@ dependencies = [
  "sley-diff-merge",
  "sley-formats",
  "sley-grep",
+ "sley-hooks",
  "sley-index",
  "sley-notes",
  "sley-object",
@@ -1557,6 +1558,7 @@ dependencies = [
  "sley-fsck",
  "sley-grep",
  "sley-i18n",
+ "sley-mail",
  "sley-notes",
  "sley-odb",
  "sley-options",
@@ -1593,6 +1595,7 @@ dependencies = [
 name = "sley-diff-merge"
 version = "0.7.0"
 dependencies = [
+ "flate2",
  "sley-config",
  "sley-core",
  "sley-formats",
@@ -1601,6 +1604,7 @@ dependencies = [
  "sley-object",
  "sley-odb",
  "sley-pack",
+ "sley-pathspec",
  "sley-refs",
 ]
 
@@ -1611,6 +1615,7 @@ dependencies = [
  "flate2",
  "sley-config",
  "sley-core",
+ "sley-object",
 ]
 
 [[package]]
@@ -1632,6 +1637,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sley-hooks"
+version = "0.7.0"
+dependencies = [
+ "sley-config",
+ "sley-core",
+ "sley-odb",
+ "sley-worktree",
+]
+
+[[package]]
 name = "sley-i18n"
 version = "0.7.0"
 dependencies = [
@@ -1645,6 +1660,14 @@ version = "0.7.0"
 dependencies = [
  "sley-core",
  "sley-mmap",
+]
+
+[[package]]
+name = "sley-mail"
+version = "0.7.0"
+dependencies = [
+ "encoding_rs",
+ "sley-core",
 ]
 
 [[package]]
@@ -1671,6 +1694,7 @@ dependencies = [
 name = "sley-object"
 version = "0.7.0"
 dependencies = [
+ "sley-config",
  "sley-core",
 ]
 
@@ -1747,8 +1771,15 @@ dependencies = [
 name = "sley-ref-filter"
 version = "0.7.0"
 dependencies = [
+ "sley-config",
  "sley-core",
+ "sley-object",
+ "sley-odb",
+ "sley-protocol",
+ "sley-refs",
+ "sley-rev",
  "sley-strbuf-expand",
+ "sley-worktree",
 ]
 
 [[package]]
@@ -1766,6 +1797,7 @@ version = "0.7.0"
 dependencies = [
  "sley-config",
  "sley-core",
+ "sley-diff-merge",
  "sley-formats",
  "sley-fsck",
  "sley-index",
@@ -1806,6 +1838,7 @@ dependencies = [
  "sley-object",
  "sley-odb",
  "sley-refs",
+ "sley-rev",
  "sley-worktree",
  "tempfile",
 ]
@@ -1823,6 +1856,10 @@ version = "0.7.0"
 dependencies = [
  "sley-config",
  "sley-core",
+ "sley-diff-merge",
+ "sley-object",
+ "sley-odb",
+ "sley-rev",
 ]
 
 [[package]]

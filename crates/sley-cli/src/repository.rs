@@ -17,7 +17,6 @@ use sley::{ObjectFormat, Result};
 
 use crate::{
     common_git_dir_for_git_dir, read_repo_config, repository_abbrev_from_config, session,
-    warn_ambiguous_refname_for_object_prefix,
 };
 
 /// Object-database behavior required by a command's invocation snapshot.
@@ -32,13 +31,11 @@ pub(crate) enum ObjectAccess {
 }
 
 /// Purpose-specific worktree semantics for a repository snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorktreePolicy {
-    /// Normal command setup semantics.
-    Command,
-    /// Hash-object attribute lookup semantics, based on physical layout.
-    HashAttributes,
-}
+///
+/// The canonical definition lives in the shared setup engine
+/// ([`sley_worktree::discovery::setup::WorktreePolicy`]); this alias keeps the
+/// CLI call sites unchanged.
+pub(crate) use crate::sley_worktree::discovery::setup::WorktreePolicy;
 
 pub(crate) struct RepositoryContext {
     cwd: PathBuf,
@@ -157,12 +154,27 @@ impl RepositoryContext {
     }
 
     pub(crate) fn resolve_revision(&self, rev: &str) -> Result<sley_core::ObjectId> {
-        warn_ambiguous_refname_for_object_prefix(self.git_dir(), self.format(), rev);
+        // The prefix probe reuses this context's shared object database:
+        // enumeration ignores replacement policy, so the answer matches a
+        // plain open without paying one per resolution.
+        sley_rev::warn_ambiguous_refname_with_sink(
+            self.git_dir(),
+            self.format(),
+            rev,
+            Some(self.objects()),
+            sley_rev::AmbiguousRefnameWarning::Stderr,
+        );
         self.revision_resolver().resolve(rev)
     }
 
     pub(crate) fn resolve_path(&self, rev: &str, path: &str) -> Result<sley_rev::ResolvedTreePath> {
-        warn_ambiguous_refname_for_object_prefix(self.git_dir(), self.format(), rev);
+        sley_rev::warn_ambiguous_refname_with_sink(
+            self.git_dir(),
+            self.format(),
+            rev,
+            Some(self.objects()),
+            sley_rev::AmbiguousRefnameWarning::Stderr,
+        );
         self.revision_resolver().resolve_path(rev, path)
     }
 
