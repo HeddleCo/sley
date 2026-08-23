@@ -37,7 +37,7 @@ pub(crate) use merge_util::{
     three_way_merge_trees_inner_with_info_opts_and_path_favor,
     three_way_merge_trees_inner_with_info_opts_and_path_resolvers,
     three_way_merge_trees_outcome_with_info_opts_and_path_resolvers, three_way_merge_trees_styled,
-    three_way_merge_trees_styled_with_strategy_options, three_way_merge_trees_with_favor,
+    three_way_merge_trees_with_favor,
     virtual_ancestor_entry_map, worktree_file_matches_ours,
 };
 pub(crate) use pull::{

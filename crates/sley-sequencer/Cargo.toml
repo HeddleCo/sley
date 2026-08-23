@@ -14,8 +14,15 @@ sley-core.workspace = true
 # apply_file_patch/ConflictStyle) for the stage-B merge drive loops.
 # Acyclic: sley-diff-merge does not depend on this crate.
 sley-diff-merge.workspace = true
+sley-index.workspace = true
 sley-object.workspace = true
 sley-odb.workspace = true
+# Commit-message/encoding rendering helpers (`commit_subject`,
+# `commit_encoding_config`, ...) shared with the log renderer.
+# Acyclic: sley-pretty does not depend on this crate.
+sley-ref-filter.workspace = true
+# `commit_identity_date` for the revert --reference message format.
+sley-pretty.workspace = true
 sley-refs.workspace = true
 # `commit_message::read_reused_commit_from_db` resolves reused commits through
 # git's revision machinery. Acyclic: sley-rev does not depend on this crate.
