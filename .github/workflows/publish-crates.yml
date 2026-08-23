@@ -1,13 +1,15 @@
 name: Publish crates
 
-# Publishes the sley library facade and its 28-crate lib dependency closure to
+# Publishes the sley library facade and its lib dependency closure to
 # crates.io. The default run is a DRY RUN (no upload) — a human flips `dry_run`
 # to false to perform the real publish. The token comes from the repo secret
 # CRATES_IO_API_KEY (set as CARGO_REGISTRY_TOKEN for cargo).
 #
-# The crates are published in a VALIDATED topological order (every crate appears
-# after all of its in-set sley-* dependencies; `sley`, the facade, is last). The
-# order was computed from `cargo metadata` and is asserted at runtime below.
+# The crate set and its topological publish order are DERIVED at runtime from
+# `cargo metadata` (publishable = workspace members with `publish` != false,
+# each emitted after all of its in-workspace publishable deps). Nothing is
+# hand-maintained, so the list can never go stale as crates are added, removed,
+# or re-scoped. See the derivation step below.
 
 on:
   workflow_dispatch:
@@ -54,84 +56,43 @@ jobs:
         run: |
           set -euo pipefail
 
-          # VALIDATED topological publish order: each crate appears after all of
-          # its in-set sley-* dependencies; the `sley` facade is last. Computed
-          # from `cargo metadata` (normal + build deps) and re-asserted below.
-          CRATES=(
-            sley-core
-            sley-pathspec
-            sley-config
-            sley-object
-            sley-formats
-            sley-grep
-            sley-mmap
-            sley-index
-            sley-pack
-            sley-odb
-            sley-refs
-            sley-diff-merge
-            sley-options
-            sley-rev
-            sley-submodule
-            sley-fsck
-            sley-unpack-trees
-            sley-worktree
-            sley-hooks
-            sley-i18n
-            sley-sequencer
-            sley-notes
-            sley-protocol
-            sley-strbuf-expand
-            sley-ref-filter
-            sley-pretty
-            sley-procinfo
-            sley-transport
-            sley-remote
-            sley
+          # DERIVED publish set + topological order — computed at runtime from
+          # `cargo metadata`, never hand-maintained. This replaces the old baked
+          # CRATES=(...) array (plus its count assertion and hand-kept order
+          # re-assertion), which went stale every time a crate was added, removed,
+          # or re-scoped (it broke sley 0.8's publish twice: a stale topo order,
+          # then a facade→publish=false dep).
+          #
+          #   - publishable = workspace members whose `publish` is not [] (i.e.
+          #     not `publish = false`). `--no-deps` keeps this to workspace
+          #     members only; third-party deps are never in the set.
+          #   - topological order: each crate is emitted after all of its
+          #     in-workspace publishable dependencies, so every `cargo publish`
+          #     can resolve its deps against crates.io. The `sley` facade falls
+          #     out after its own deps naturally.
+          echo "::group::Derive publish set + topological order"
+          META="$(cargo metadata --format-version 1 --no-deps)"
+          mapfile -t CRATES < <(python3 - "$META" <<'PY'
+          import json,sys
+          m=json.loads(sys.argv[1])
+          pub={p["name"] for p in m["packages"] if p.get("publish")!=[]}
+          deps={p["name"]:{d["name"] for d in p["dependencies"] if d["name"] in pub and d["name"]!=p["name"]} for p in m["packages"] if p["name"] in pub}
+          order,seen=[],set()
+          def visit(n):
+              if n in seen: return
+              seen.add(n)
+              for d in sorted(deps[n]): visit(d)
+              order.append(n)
+          for n in sorted(pub): visit(n)
+          print("\n".join(order))
+          PY
           )
-
-          # --- Topological-order assertion ------------------------------------
-          # Re-derive the intra-set sley-* dependency edges from the live
-          # `cargo metadata` and confirm each crate is published only after all
-          # of its in-set deps. A drift in the dep graph (a new edge that the
-          # baked order no longer respects) fails the job before any upload.
-          echo "::group::Validate topological order"
-          IN_SET=" ${CRATES[*]} "
-          # positions
-          declare -A POS
-          i=0
-          for c in "${CRATES[@]}"; do
-            POS[$c]=$i
-            i=$((i + 1))
-          done
-          if [ "${#CRATES[@]}" -ne 30 ]; then
-            echo "Expected 30 crates, got ${#CRATES[@]}" >&2
+          if [ "${#CRATES[@]}" -eq 0 ]; then
+            echo "Derived publish set is empty — cargo metadata / derivation failed." >&2
             exit 1
           fi
-          META="$(cargo metadata --format-version 1 --all-features --no-deps)"
-          ORDER_OK=1
-          for c in "${CRATES[@]}"; do
-            # normal + build deps of c that are in our publish set
-            DEPS="$(echo "$META" | jq -r --arg c "$c" '
-              .packages[] | select(.name == $c) | .dependencies[]
-              | select((.kind == null) or (.kind == "build"))
-              | .name | select(startswith("sley"))')"
-            for d in $DEPS; do
-              case "$IN_SET" in
-                *" $d "*)
-                  if [ "${POS[$d]}" -ge "${POS[$c]}" ]; then
-                    echo "ORDER VIOLATION: $c (pos ${POS[$c]}) depends on $d (pos ${POS[$d]}) but $d is not earlier" >&2
-                    ORDER_OK=0
-                  fi
-                  ;;
-              esac
-            done
-          done
-          if [ "$ORDER_OK" -ne 1 ]; then
-            echo "Baked topological order is stale vs the dependency graph." >&2
-            exit 1
-          fi
-          echo "Topological order validated for ${#CRATES[@]} crates."
+          printf 'Derived %d publishable crates in topological order:\n' "${#CRATES[@]}"
+          printf '  %s\n' "${CRATES[@]}"
           echo "::endgroup::"
 
           # --- Publish loop ----------------------------------------------------
