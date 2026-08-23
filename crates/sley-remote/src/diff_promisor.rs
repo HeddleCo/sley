@@ -157,25 +157,9 @@ pub fn prefetch_promisor_objects(
                 None,
             )
             .is_ok()
-        } else if crate::remote_url_is_http(url).unwrap_or(false) {
-            // Smart-HTTP promisor hydrate (t0410 #39): exact-want, no haves.
-            let mut any = false;
-            for oid in &missing {
-                if hydrate_promisor_oid_via_http(
-                    &git_dir,
-                    db.object_format(),
-                    url,
-                    *oid,
-                    filter.clone(),
-                )
-                .is_ok()
-                {
-                    any = true;
-                }
-            }
-            any
         } else {
-            false
+            maybe_hydrate_promisor_via_http(&git_dir, db, url, &missing, filter.clone())
+                .unwrap_or_default()
         };
         if !hydrated_ok {
             continue;
@@ -239,11 +223,52 @@ fn prefetch_local_promisor_object(
     Ok(false)
 }
 
+/// Smart-HTTP promisor hydrate (t0410 #39): exact-want, no haves. Returns
+/// `Some(any_hydrated)` when `url` is an HTTP(S) remote this build can service,
+/// or `None` when the URL is not HTTP so the caller can fall through. Only the
+/// `http` feature carries the smart-HTTP transport, so without it every URL
+/// falls through here.
+#[cfg(feature = "http")]
+fn maybe_hydrate_promisor_via_http(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    url: &str,
+    missing: &[ObjectId],
+    filter: Option<sley_odb::PackObjectFilter>,
+) -> Option<bool> {
+    if !crate::remote_url_is_http(url).unwrap_or(false) {
+        return None;
+    }
+    let mut any = false;
+    for oid in missing {
+        if hydrate_promisor_oid_via_http(git_dir, db.object_format(), url, *oid, filter.clone())
+            .is_ok()
+        {
+            any = true;
+        }
+    }
+    Some(any)
+}
+
+/// Without the `http` feature there is no smart-HTTP transport, so no URL can
+/// be hydrated over HTTP; always fall through to the caller's next path.
+#[cfg(not(feature = "http"))]
+fn maybe_hydrate_promisor_via_http(
+    _git_dir: &Path,
+    _db: &FileObjectDatabase,
+    _url: &str,
+    _missing: &[ObjectId],
+    _filter: Option<sley_odb::PackObjectFilter>,
+) -> Option<bool> {
+    None
+}
+
 /// Lazy-fetch one missing object from a smart-HTTP promisor remote.
 ///
 /// Mirrors git's `promisor_remote_get_direct` over HTTP: exact-want, no haves,
 /// installed as a promisor pack so subsequent fsck/rev-list still treat the
 /// transfer as partial.
+#[cfg(feature = "http")]
 #[allow(clippy::too_many_arguments)]
 fn hydrate_promisor_oid_via_http(
     git_dir: &Path,
