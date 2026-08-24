@@ -1310,18 +1310,8 @@ pub(crate) fn cmd_gc(cli_session: &crate::session::CliSession, args: &[String]) 
     } else {
         GcAutoMode::Full
     };
-    if options.auto {
-        if gc_engine::gc_recent_log_blocks_auto(&common_git_dir, &config)? {
-            return Ok(());
-        }
-        if !options.quiet {
-            if gc_engine::gc_should_detach(&config, options.detach) {
-                eprintln!("Auto packing the repository in background for optimum performance.");
-            } else {
-                eprintln!("Auto packing the repository for optimum performance.");
-            }
-            eprintln!("See \"git help gc\" for manual housekeeping.");
-        }
+    if options.auto && gc_engine::gc_recent_log_blocks_auto(&common_git_dir, &config)? {
+        return Ok(());
     }
 
     // Single-step acquisition closes the old check-then-write race where two
@@ -1353,6 +1343,14 @@ pub(crate) fn cmd_gc(cli_session: &crate::session::CliSession, args: &[String]) 
         // Hook vetoed auto gc: release the lock we just acquired.
         let _ = fs::remove_file(common_git_dir.join("gc.pid"));
         return Ok(());
+    }
+    if options.auto && !options.quiet {
+        if gc_engine::gc_should_detach(&config, options.detach) {
+            eprintln!("Auto packing the repository in background for optimum performance.");
+        } else {
+            eprintln!("Auto packing the repository for optimum performance.");
+        }
+        eprintln!("See \"git help gc\" for manual housekeeping.");
     }
     let common_for_services = common_git_dir.clone();
     let git_dir_for_reflog = git_dir.clone();
