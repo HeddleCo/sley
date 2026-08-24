@@ -391,6 +391,17 @@ fn find_unique_abbrev_hex(
     sheet::unique_abbrev(db, oid, (hosts.abbrev_width)().min(hex.len()))
 }
 
+/// Crash-safe publication for operation-state files (`git-rebase-todo`,
+/// `done`, `update-refs`, message state, `MERGE_MSG`, ...): write to a
+/// sibling `.lock` temp file and rename over the final path. The rename is
+/// atomic within the filesystem, so a crash mid-write can never leave a
+/// truncated or partial file at the final path — THE crash-recovery surface
+/// for `--continue`/`--abort`. Bytes-on-disk semantics are unchanged: same
+/// content at the same final path.
+fn write_state_atomic(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result<()> {
+    sley_core::atomic::atomic_write(path.as_ref(), contents.as_ref())
+}
+
 fn todo_render_options(
     ctx: &RebaseContext,
     hosts: &RebaseHosts<'_>,
@@ -436,7 +447,7 @@ fn write_todo_file(
             check_error,
         );
     }
-    fs::write(path, buf)?;
+    write_state_atomic(path, buf)?;
     Ok(())
 }
 
@@ -517,7 +528,7 @@ fn write_update_refs_records(ctx: &RebaseContext, records: &[UpdateRefRecord]) -
         text.push_str(&rec.after.to_hex());
         text.push('\n');
     }
-    fs::write(&path, text)?;
+    write_state_atomic(&path, text)?;
     Ok(())
 }
 
@@ -559,7 +570,17 @@ fn do_update_refs(ctx: &RebaseContext, quiet: bool) -> Result<()> {
         if rec.after == zero {
             continue;
         }
-        let current = resolve_ref_peeled(refs, &rec.refname)?.unwrap_or(zero);
+        // Report and continue per-ref (like the CAS-failure arm below), not
+        // abort-the-loop: one unresolvable ref must not prevent the others
+        // from being updated.
+        let current = match resolve_ref_peeled(refs, &rec.refname) {
+            Ok(oid) => oid.unwrap_or(zero),
+            Err(_) => {
+                eprintln!("error: update_ref failed for ref '{}': ", rec.refname);
+                failed.push(rec.refname.clone());
+                continue;
+            }
+        };
         if current != rec.before {
             eprintln!("error: update_ref failed for ref '{}': ", rec.refname);
             failed.push(rec.refname.clone());
@@ -792,7 +813,7 @@ fn checkout_onto_base(
         ctx.reflog("start", Some(&format!("checkout {onto_name}"))),
         committer,
     )?;
-    fs::write(ctx.git_dir.join("ORIG_HEAD"), format!("{}\n", opts.orig_head))?;
+    write_state_atomic(ctx.git_dir.join("ORIG_HEAD"), format!("{}\n", opts.orig_head))?;
     (hosts.run_hook)(
         "post-checkout",
         vec![old.to_hex(), base.to_hex(), "1".to_string()],
@@ -933,7 +954,7 @@ pub fn complete_action(
                 &todo.items[..skipped],
                 todo_render_options(ctx, hosts, false, false),
             );
-            fs::write(ctx.state_path("done"), done_text)?;
+            write_state_atomic(ctx.state_path("done"), done_text)?;
             if todo
                 .items
                 .get(skipped)
@@ -952,14 +973,14 @@ pub fn complete_action(
 
     let already_on_rebased_head = head_commit_oid(ctx.refs())? == Some(opts.orig_head);
     if todo.items.is_empty() && already_on_rebased_head && base == opts.orig_head {
-        fs::write(ctx.state_path("git-rebase-todo"), b"")?;
-        fs::write(ctx.state_path("end"), format!("{}\n", todo.done_nr))?;
+        write_state_atomic(ctx.state_path("git-rebase-todo"), b"")?;
+        write_state_atomic(ctx.state_path("end"), format!("{}\n", todo.done_nr))?;
         return finish_rebase(ctx, hosts, &opts);
     }
 
     write_todo_file(ctx, hosts, &todo_path, &todo.items, false, false, None, None, &ctx.db())?;
     todo.total_nr = todo.done_nr + sheet::count_commands(&todo.items);
-    fs::write(ctx.state_path("end"), format!("{}\n", todo.total_nr))?;
+    write_state_atomic(ctx.state_path("end"), format!("{}\n", todo.total_nr))?;
 
     checkout_onto_base(ctx, hosts, &opts, onto_name, &base)?;
 
@@ -1032,7 +1053,7 @@ fn check_todo_dropped_commits(
             "You can fix this with 'git rebase --edit-todo' and then run 'git rebase --continue'."
         );
         eprintln!("Or you can abort the rebase with 'git rebase --abort'.");
-        fs::write(ctx.state_path("dropped"), b"")?;
+        write_state_atomic(ctx.state_path("dropped"), b"")?;
         return Ok(true);
     }
     Ok(false)
@@ -1084,7 +1105,7 @@ pub fn pick_commits(
         save_todo(ctx, todo, &ctx.db(), false)?;
         if item.command != TodoCommand::Comment {
             todo.done_nr += 1;
-            fs::write(ctx.state_path("msgnum"), format!("{}\n", todo.done_nr))?;
+            write_state_atomic(ctx.state_path("msgnum"), format!("{}\n", todo.done_nr))?;
             if !opts.quiet {
                 let terminator = if opts.verbose { "\n" } else { "\r" };
                 eprint!("Rebasing ({}/{}){terminator}", todo.done_nr, todo.total_nr);
@@ -1287,7 +1308,7 @@ fn do_reset(ctx: &RebaseContext, hosts: &RebaseHosts<'_>, opts: &MachineOpts, na
                 Some(oid) => oid,
                 None => {
                     let oid = create_squash_onto(ctx)?;
-                    fs::write(ctx.state_path("squash-onto"), format!("{oid}\n"))?;
+                    write_state_atomic(ctx.state_path("squash-onto"), format!("{oid}\n"))?;
                     oid
                 }
             }
@@ -1482,7 +1503,7 @@ fn do_merge(
     if !overwritten.is_empty() {
         print_merge_would_overwrite_untracked(&overwritten);
         if let Some(record) = &original {
-            fs::write(ctx.git_dir.join("REBASE_HEAD"), format!("{}\n", record.oid))?;
+            write_state_atomic(ctx.git_dir.join("REBASE_HEAD"), format!("{}\n", record.oid))?;
         }
         reschedule_current(ctx, hosts, todo, item)?;
         return Ok(PickOutcome::Fail(1));
@@ -1520,14 +1541,14 @@ fn do_merge(
     )?;
 
     let message = merge_todo_message(ctx, item, original.as_ref(), &labels, oneline.as_deref())?;
-    fs::write(ctx.git_dir.join("MERGE_MSG"), &message)?;
-    fs::write(ctx.state_path("message"), &message)?;
-    fs::write(ctx.git_dir.join("MERGE_HEAD"), format!("{merge_head}\n"))?;
+    write_state_atomic(ctx.git_dir.join("MERGE_MSG"), &message)?;
+    write_state_atomic(ctx.state_path("message"), &message)?;
+    write_state_atomic(ctx.git_dir.join("MERGE_HEAD"), format!("{merge_head}\n"))?;
 
     apply_merge_results(ctx, hosts, &results, &ours_map, !conflicts.is_empty())?;
     if !conflicts.is_empty() {
         let merged_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
-        fs::write(ctx.git_dir.join("AUTO_MERGE"), format!("{merged_tree}\n"))?;
+        write_state_atomic(ctx.git_dir.join("AUTO_MERGE"), format!("{merged_tree}\n"))?;
         for path in &conflicts {
             let display = String::from_utf8_lossy(path);
             if let Some(advice) = rebase_submodule_conflict_advice(&results, path) {
@@ -1667,9 +1688,9 @@ fn pick_one_commit_with_custom_strategy(
     }
     write_message_files(ctx, &message, is_fixup, final_fixup)?;
     if !is_fixup {
-        fs::write(ctx.state_path("message"), &message)?;
+        write_state_atomic(ctx.state_path("message"), &message)?;
     }
-    fs::write(ctx.git_dir.join("MERGE_HEAD"), format!("{}\n", record.oid))?;
+    write_state_atomic(ctx.git_dir.join("MERGE_HEAD"), format!("{}\n", record.oid))?;
 
     let status = run_custom_rebase_strategy(ctx, opts, strategy, base, head, record.oid)?;
     if status != 0 {
@@ -1697,7 +1718,7 @@ fn pick_one_commit_with_custom_strategy(
             let _ = fs::remove_file(ctx.git_dir.join("MERGE_HEAD"));
             return Ok(PickOutcome::Continue);
         } else {
-            fs::write(
+            write_state_atomic(
                 ctx.git_dir.join("CHERRY_PICK_HEAD"),
                 format!("{}\n", record.oid),
             )?;
@@ -1747,8 +1768,8 @@ fn pick_one_commit_with_custom_strategy(
             if is_fixup {
                 intend_to_amend(ctx)?;
                 let squash = fs::read(ctx.state_path("message-squash")).unwrap_or_default();
-                fs::write(ctx.state_path("message"), &squash)?;
-                fs::write(ctx.git_dir.join("MERGE_MSG"), &squash)?;
+                write_state_atomic(ctx.state_path("message"), &squash)?;
+                write_state_atomic(ctx.git_dir.join("MERGE_MSG"), &squash)?;
             }
             return stop_with_patch(ctx, hosts, opts, record, item, code, false);
         }
@@ -1789,9 +1810,9 @@ fn do_custom_strategy_merge(
 ) -> Result<PickOutcome> {
     let db = ctx.db();
     let message = merge_todo_message(ctx, item, original, labels, oneline)?;
-    fs::write(ctx.git_dir.join("MERGE_MSG"), &message)?;
-    fs::write(ctx.state_path("message"), &message)?;
-    fs::write(ctx.git_dir.join("MERGE_HEAD"), format!("{merge_head}\n"))?;
+    write_state_atomic(ctx.git_dir.join("MERGE_MSG"), &message)?;
+    write_state_atomic(ctx.state_path("message"), &message)?;
+    write_state_atomic(ctx.git_dir.join("MERGE_HEAD"), format!("{merge_head}\n"))?;
 
     let bases = merge_bases(&ctx.common_git_dir, ctx.format, &db, &head, &merge_head)?;
     let base = bases
@@ -1899,7 +1920,7 @@ fn merge_todo_message(
         let target_encoding = commit_encoding_config(&ctx.git_dir);
         let author = commit_author_for_commit_encoding(&record.commit, &target_encoding);
         if let Some(script) = sheet::format_author_script(&author) {
-            fs::write(ctx.state_path("author-script"), script)?;
+            write_state_atomic(ctx.state_path("author-script"), script)?;
         }
         return Ok(
             commit_message_for_commit_encoding(&record.commit, &target_encoding).into_owned(),
@@ -2061,7 +2082,9 @@ fn pick_one_commit(
     item: &RebaseTodoItem,
 ) -> Result<PickOutcome> {
     let db = ctx.db();
-    let oid = item.oid.expect("pick-like commands carry a commit");
+    let oid = item
+        .oid
+        .ok_or_else(|| GitError::Command("pick-like command carries no commit".into()))?;
     let record = read_rev_list_commit_record(&db, ctx.format, oid)?;
     let refs = ctx.refs();
     let head =
@@ -2080,7 +2103,7 @@ fn pick_one_commit(
     // Write the author script for --continue / commit amending.
     let author = commit_author_for_commit_encoding(&record.commit, &target_encoding);
     if let Some(script) = sheet::format_author_script(&author) {
-        fs::write(ctx.state_path("author-script"), script)?;
+        write_state_atomic(ctx.state_path("author-script"), script)?;
     }
 
     let parent = record.parents.first().copied();
@@ -2096,7 +2119,7 @@ fn pick_one_commit(
         let overwritten = would_overwrite_untracked(ctx, &db, &target_tree)?;
         if !overwritten.is_empty() {
             print_merge_would_overwrite_untracked(&overwritten);
-            fs::write(ctx.git_dir.join("REBASE_HEAD"), format!("{oid}\n"))?;
+            write_state_atomic(ctx.git_dir.join("REBASE_HEAD"), format!("{oid}\n"))?;
             reschedule_current(ctx, hosts, todo, item)?;
             return Ok(PickOutcome::Fail(1));
         }
@@ -2159,7 +2182,7 @@ fn pick_one_commit(
     let overwritten = would_overwrite_untracked(ctx, &db, &theirs_tree)?;
     if !overwritten.is_empty() {
         print_merge_would_overwrite_untracked(&overwritten);
-        fs::write(ctx.git_dir.join("REBASE_HEAD"), format!("{oid}\n"))?;
+        write_state_atomic(ctx.git_dir.join("REBASE_HEAD"), format!("{oid}\n"))?;
         reschedule_current(ctx, hosts, todo, item)?;
         return Ok(PickOutcome::Fail(1));
     }
@@ -2247,7 +2270,7 @@ fn pick_one_commit(
     if !conflicts.is_empty() {
         // Conflict stop.
         let merged_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
-        fs::write(ctx.git_dir.join("AUTO_MERGE"), format!("{merged_tree}\n"))?;
+        write_state_atomic(ctx.git_dir.join("AUTO_MERGE"), format!("{merged_tree}\n"))?;
         let conflict_set: BTreeSet<Vec<u8>> = conflicts.iter().cloned().collect();
         for path in &auto_merged_paths {
             if !conflict_set.contains(path) {
@@ -2298,12 +2321,12 @@ fn pick_one_commit(
         if is_fixup {
             // error_failed_squash: message file gets the squash message.
             let squash = fs::read(ctx.state_path("message-squash")).unwrap_or_default();
-            fs::write(ctx.state_path("message"), &squash)?;
-            fs::write(ctx.git_dir.join("MERGE_MSG"), &squash)?;
+            write_state_atomic(ctx.state_path("message"), &squash)?;
+            write_state_atomic(ctx.git_dir.join("MERGE_MSG"), &squash)?;
             intend_to_amend(ctx)?;
         } else {
-            fs::write(ctx.git_dir.join("MERGE_MSG"), &merge_msg)?;
-            fs::write(ctx.state_path("message"), &merge_msg)?;
+            write_state_atomic(ctx.git_dir.join("MERGE_MSG"), &merge_msg)?;
+            write_state_atomic(ctx.state_path("message"), &merge_msg)?;
         }
 
         // Record the conflict in the rerere database and, if a resolution is
@@ -2346,7 +2369,7 @@ fn pick_one_commit(
         } else {
             // EMPTY_STOP: try to commit without --allow-empty; it fails with
             // the "previous cherry-pick is now empty" advice.
-            fs::write(ctx.git_dir.join("CHERRY_PICK_HEAD"), format!("{oid}\n"))?;
+            write_state_atomic(ctx.git_dir.join("CHERRY_PICK_HEAD"), format!("{oid}\n"))?;
             write_message_files(ctx, &message, is_fixup, final_fixup)?;
             eprintln!(
                 "The previous cherry-pick is now empty, possibly due to conflict resolution."
@@ -2424,7 +2447,7 @@ fn pick_one_commit(
         opts,
         MachineCommit {
             amend,
-            edit: edit || item.command == TodoCommand::Reword,
+            edit,
             cleanup_message: !(is_fixup && !final_fixup),
             allow_empty,
             create_root,
@@ -2441,8 +2464,8 @@ fn pick_one_commit(
             if is_fixup {
                 intend_to_amend(ctx)?;
                 let squash = fs::read(ctx.state_path("message-squash")).unwrap_or_default();
-                fs::write(ctx.state_path("message"), &squash)?;
-                fs::write(ctx.git_dir.join("MERGE_MSG"), &squash)?;
+                write_state_atomic(ctx.state_path("message"), &squash)?;
+                write_state_atomic(ctx.git_dir.join("MERGE_MSG"), &squash)?;
             }
             return stop_with_patch(ctx, hosts, opts, &record, item, code, false);
         }
@@ -2455,13 +2478,11 @@ fn pick_one_commit(
     }
 
     if item.command == TodoCommand::Edit {
-        let new_head = head_commit_oid(ctx.refs())?.expect("just committed");
         eprintln!(
             "Stopped at {}...  {}",
             find_unique_abbrev_hex(hosts, &db, &oid),
             item.arg
         );
-        let _ = new_head;
         return stop_with_patch(ctx, hosts, opts, &record, item, 0, true);
     }
 
@@ -2555,7 +2576,7 @@ fn write_message_files(
     _final_fixup: bool,
 ) -> Result<()> {
     if !is_fixup {
-        fs::write(ctx.git_dir.join("MERGE_MSG"), message)?;
+        write_state_atomic(ctx.git_dir.join("MERGE_MSG"), message)?;
     }
     Ok(())
 }
@@ -2672,7 +2693,7 @@ fn apply_merge_results(
         checksum: None,
     };
     index.upgrade_version_for_flags();
-    fs::write(index_path, index.write(ctx.format)?)?;
+    write_state_atomic(index_path, index.write(ctx.format)?)?;
     Ok(())
 }
 
@@ -2694,7 +2715,7 @@ fn intend_to_amend(ctx: &RebaseContext) -> Result<()> {
     let refs = ctx.refs();
     let head =
         head_commit_oid(refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
-    fs::write(ctx.state_path("amend"), format!("{head}\n"))?;
+    write_state_atomic(ctx.state_path("amend"), format!("{head}\n"))?;
     Ok(())
 }
 
@@ -2708,8 +2729,8 @@ fn stop_with_patch(
     exit_code: i32,
     to_amend: bool,
 ) -> Result<PickOutcome> {
-    fs::write(ctx.state_path("stopped-sha"), format!("{}\n", record.oid))?;
-    fs::write(ctx.git_dir.join("REBASE_HEAD"), format!("{}\n", record.oid))?;
+    write_state_atomic(ctx.state_path("stopped-sha"), format!("{}\n", record.oid))?;
+    write_state_atomic(ctx.git_dir.join("REBASE_HEAD"), format!("{}\n", record.oid))?;
 
     // Write the patch file: diff of the commit against its first parent.
     let parent_tree = match record.parents.first() {
@@ -2717,7 +2738,7 @@ fn stop_with_patch(
         None => ObjectId::empty_tree(ctx.format),
     };
     let patch = (hosts.tree_patch)(&parent_tree, &record.commit.tree)?;
-    fs::write(ctx.state_path("patch"), patch)?;
+    write_state_atomic(ctx.state_path("patch"), patch)?;
 
     if to_amend {
         // An `edit` command has already created the rewritten commit.  Resume
@@ -2734,13 +2755,13 @@ fn stop_with_patch(
         if !message.ends_with(b"\n") {
             message.push(b'\n');
         }
-        fs::write(ctx.state_path("message"), message)?;
+        write_state_atomic(ctx.state_path("message"), message)?;
     } else if !ctx.state_path("message").exists() {
         let mut message = record.commit.message.clone();
         if !message.ends_with(b"\n") {
             message.push(b'\n');
         }
-        fs::write(ctx.state_path("message"), message)?;
+        write_state_atomic(ctx.state_path("message"), message)?;
     }
 
     if to_amend {
@@ -2986,7 +3007,7 @@ fn append_squash_message(
                 || !ctx.state_path("message-squash").exists())
         {
             let fixup_msg = &buf[fixup_off + skip_blank_lines(&buf[fixup_off..])..];
-            fs::write(ctx.state_path("message-fixup"), fixup_msg)?;
+            write_state_atomic(ctx.state_path("message-fixup"), fixup_msg)?;
         } else {
             let _ = fs::remove_file(ctx.state_path("message-fixup"));
         }
@@ -3040,7 +3061,7 @@ fn update_squash_messages(
             commit_message_for_commit_encoding(&head_record.commit, &target_encoding).into_owned();
         // Plain fixup (no flag) seeds message-fixup with HEAD's body.
         if item.command == TodoCommand::Fixup && item.flags == 0 {
-            fs::write(ctx.state_path("message-fixup"), &head_body)?;
+            write_state_atomic(ctx.state_path("message-fixup"), &head_body)?;
         }
         buf = format!("{comment_str} This is a combination of 2 commits.\n").into_bytes();
         if flagged {
@@ -3079,7 +3100,7 @@ fn update_squash_messages(
         );
         buf.extend_from_slice(&commented_lines(&body, comment.as_bytes()));
     }
-    fs::write(ctx.state_path("message-squash"), &buf)?;
+    write_state_atomic(ctx.state_path("message-squash"), &buf)?;
 
     // Append to current-fixups.
     let mut fixups = fs::read_to_string(ctx.state_path("current-fixups")).unwrap_or_default();
@@ -3090,7 +3111,7 @@ fn update_squash_messages(
     fixups.push(' ');
     fixups.push_str(&record.oid.to_hex());
     fixups.push('\n');
-    fs::write(
+    write_state_atomic(
         ctx.state_path("current-fixups"),
         fixups.trim_end_matches('\n'),
     )?;
@@ -3132,8 +3153,10 @@ fn machine_commit(
         head_commit_oid(refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
     let head_record = read_rev_list_commit_record(&db, ctx.format, head)?;
 
+    // A missing seed file is corruption (the machine wrote it before stopping):
+    // error out instead of silently committing an empty message.
     let seed = match &commit.message_file {
-        Some(path) => fs::read(path).unwrap_or_default(),
+        Some(path) => fs::read(path)?,
         None => head_record.commit.message.clone(),
     };
 
@@ -3171,14 +3194,17 @@ fn machine_commit(
     )?;
     if commit.edit {
         message = strip_comment_string_lines(&message, comment_string.as_bytes());
-        if message.iter().all(|b| b.is_ascii_whitespace()) {
-            eprintln!("Aborting commit due to empty commit message.");
-            return Ok(CommitOutcome::Failed(1));
-        }
     } else if commit.cleanup_message {
         // verbatim, but the seed files for non-edit commits never carry
         // comments except the conflicts block which only exists when editing.
         message = strip_comment_lines(&message, comment_char(&ctx.git_dir));
+    }
+    // git's builtin/commit refuses an empty (post-cleanup) message for the
+    // machine's non-edit commits too — a missing/blank seed must stop the
+    // rebase, not silently land an empty-message commit.
+    if message.iter().all(|b| b.is_ascii_whitespace()) {
+        eprintln!("Aborting commit due to empty commit message.");
+        return Ok(CommitOutcome::Failed(1));
     }
 
     let tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
@@ -3311,7 +3337,7 @@ pub(crate) fn rebase_commit_identities(
         None => author,
     };
     let committer = match (opts.committer_date_is_author_date, now.as_deref()) {
-        (true, Some(now)) | (false, Some(now)) => {
+        (_, Some(now)) => {
             reset_identity_date(commit_identity_from_env("COMMITTER", config)?, now)
         }
         (true, None) => {
@@ -3467,7 +3493,7 @@ pub(crate) fn flush_rewritten_pending(ctx: &RebaseContext) -> Result<()> {
         list.push_str(&head.to_hex());
         list.push('\n');
     }
-    fs::write(rewritten_list_path(ctx), list)?;
+    write_state_atomic(rewritten_list_path(ctx), list)?;
     let _ = fs::remove_file(pending_path);
     Ok(())
 }
@@ -3481,7 +3507,7 @@ pub(crate) fn record_rewritten(
     let mut pending = fs::read_to_string(&pending_path).unwrap_or_default();
     pending.push_str(&old_oid.to_hex());
     pending.push('\n');
-    fs::write(&pending_path, pending)?;
+    write_state_atomic(&pending_path, pending)?;
     if !next_command.is_some_and(TodoCommand::is_fixup) {
         flush_rewritten_pending(ctx)?;
     }
@@ -3653,14 +3679,14 @@ fn commit_staged_changes(
                 let mut lines: Vec<&str> = fixups.lines().collect();
                 lines.pop();
                 let had_squash = lines.iter().any(|line| line.starts_with("squash "));
-                fs::write(ctx.state_path("current-fixups"), lines.join("\n"))?;
+                write_state_atomic(ctx.state_path("current-fixups"), lines.join("\n"))?;
                 if !lines.is_empty() && !next_is_fixup_first(todo) {
                     final_fixup = true;
                     if !had_squash {
                         edit = false;
                         cleanup_only = true;
                         let head_record = read_rev_list_commit_record(db, ctx.format, head)?;
-                        fs::write(
+                        write_state_atomic(
                             ctx.state_path("message-squash"),
                             &head_record.commit.message,
                         )?;
@@ -3671,13 +3697,13 @@ fn commit_staged_changes(
                             remaining_messages,
                             &commit_comment_string(&ctx.git_dir),
                         );
-                        fs::write(ctx.state_path("message-squash"), pruned)?;
+                        write_state_atomic(ctx.state_path("message-squash"), pruned)?;
                     }
                 } else if next_is_fixup_first(todo) {
                     // Update the squash message to skip the latest commit
                     // message.
                     let head_record = read_rev_list_commit_record(db, ctx.format, head)?;
-                    fs::write(
+                    write_state_atomic(
                         ctx.state_path("message-squash"),
                         &head_record.commit.message,
                     )?;
@@ -3907,7 +3933,7 @@ pub fn rebase_edit_todo(ctx: &RebaseContext, hosts: &RebaseHosts<'_>) -> Result<
         })
         .unwrap_or(0);
     let total_nr = done_nr + sheet::count_commands(&new_items);
-    fs::write(ctx.state_path("end"), format!("{total_nr}\n"))?;
+    write_state_atomic(ctx.state_path("end"), format!("{total_nr}\n"))?;
     Ok(())
 }
 
@@ -3948,7 +3974,7 @@ pub fn create_autostash(
         sheet::merge_dir(&ctx.git_dir)
     };
     fs::create_dir_all(&dir)?;
-    fs::write(dir.join("autostash"), oid.to_hex())?;
+    write_state_atomic(dir.join("autostash"), oid.to_hex())?;
     println!(
         "Created autostash: {}",
         find_unique_abbrev_hex(hosts, &ctx.db(), &oid)
@@ -4064,6 +4090,55 @@ mod native_strategy_tests {
             "custom-driver"
         ));
         assert!(!is_unimplemented_git_core_merge_strategy("custom-driver"));
+    }
+}
+
+#[cfg(test)]
+mod atomic_state_write_tests {
+    use super::write_state_atomic;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sley-rebase-drive-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// The kill-mid-write property: a truncated temp left by a crashed writer
+    /// (simulated here as partial content at the sibling `.lock` path) must
+    /// never leak into the final path. Publication fails cleanly, the previous
+    /// full contents survive, and a later write publishes atomically.
+    #[test]
+    fn truncated_tmp_never_visible_at_final_path() {
+        let dir = scratch_dir("atomic");
+        let path = dir.join("git-rebase-todo");
+        fs::write(&path, b"pick aaa1111\n").expect("seed target");
+        let lock = dir.join("git-rebase-todo.lock");
+        fs::write(&lock, b"pick aaa11").expect("simulate crashed temp");
+
+        let err = write_state_atomic(&path, b"pick bbb2222\n").expect_err("held lock must fail");
+        assert_eq!(err.io_kind(), Some(std::io::ErrorKind::AlreadyExists));
+        assert_eq!(
+            fs::read(&path).expect("read target"),
+            b"pick aaa1111\n",
+            "final path must keep the previous full contents"
+        );
+
+        // Once the stale temp is gone, publication succeeds and cleans up.
+        fs::remove_file(&lock).expect("remove stale lock");
+        write_state_atomic(&path, b"pick bbb2222\n").expect("atomic publish");
+        assert_eq!(fs::read(&path).expect("read target"), b"pick bbb2222\n");
+        assert!(!lock.exists(), "publication must consume its temp");
+
+        fs::remove_dir_all(dir).ok();
     }
 }
 

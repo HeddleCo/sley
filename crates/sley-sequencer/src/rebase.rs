@@ -11,7 +11,6 @@
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::{FileObjectDatabase, ObjectPrefixResolution};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// User-requested history-editing action after CLI option parsing.
@@ -670,22 +669,30 @@ pub fn read_state_line(git_dir: &Path, name: &str) -> Option<String> {
     Some(text.trim_end_matches('\n').to_string())
 }
 
-pub fn write_state_file(git_dir: &Path, name: &str, contents: &str) -> std::io::Result<()> {
-    fs::write(state_path(git_dir, name), contents)
+/// Crash-safe publication for `rebase-merge` state files (the same contract as
+/// the drive loop's [`write_state_atomic`]): sibling `.lock` temp + rename, so
+/// a crash mid-write can never leave a truncated file for `--continue` to
+/// misread. Bytes-on-disk semantics are unchanged.
+pub(crate) fn write_state_atomic(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result<()> {
+    sley_core::atomic::atomic_write(path.as_ref(), contents.as_ref())
+}
+
+pub fn write_state_file(git_dir: &Path, name: &str, contents: &str) -> Result<()> {
+    write_state_atomic(state_path(git_dir, name), contents)
 }
 
 /// Append one completed instruction to `rebase-merge/done`.
 ///
-/// The sequencer advances this file once per todo command.  Opening it in
-/// append mode avoids reading and rewriting the complete history for every
-/// step while preserving the exact line-oriented on-disk contract.
-pub fn append_done_line(git_dir: &Path, line: &[u8]) -> std::io::Result<()> {
-    let mut done = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(state_path(git_dir, "done"))?;
-    done.write_all(line)?;
-    done.write_all(b"\n")
+/// The sequencer advances this file once per todo command. The append is
+/// published through the atomic-write path (read current contents, rewrite via
+/// lock+rename) so a crash can never leave a torn line behind; the
+/// line-oriented on-disk contract is unchanged.
+pub fn append_done_line(git_dir: &Path, line: &[u8]) -> Result<()> {
+    let done_path = state_path(git_dir, "done");
+    let mut contents = fs::read(&done_path).unwrap_or_default();
+    contents.extend_from_slice(line);
+    contents.push(b'\n');
+    write_state_atomic(done_path, contents)
 }
 
 pub fn remove_merge_state(git_dir: &Path) {
@@ -1044,7 +1051,7 @@ pub fn save_rebase_todo_list(
         minimum_abbrev: None,
         abbreviate_commands: false,
     };
-    fs::write(
+    write_state_atomic(
         state_path(git_dir, "git-rebase-todo"),
         render_todo_list(db, tail, options),
     )?;

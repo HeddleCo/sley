@@ -1100,6 +1100,28 @@ fn am_do_interactive(message: &[u8]) -> Result<AmInteractiveDecision> {
 }
 
 
+/// git's `am_next`: after a patch has been applied and committed (or skipped),
+/// record the new tip as the abort-safety point so that a later `am --abort`
+/// compares HEAD against the most recent stop rather than the start of the
+/// series. Without this refresh, stopping later WITHOUT a conflict (empty
+/// patch under `--empty=stop`, failing `applypatch-msg` hook) leaves the file
+/// pointing at the pre-series HEAD and `am --abort` falsely reports "You seem
+/// to have moved HEAD", refusing to rewind while deleting the session.
+/// The rebase apply backend keeps its rewind target in this file (head-name
+/// marker present), so only a bare `git am` updates it here.
+fn update_am_abort_safety(ctx: &AmContext, state_dir: &Path) -> Result<()> {
+    let git_dir: &Path = &ctx.git_dir;
+    if state_dir.join("head-name").exists() {
+        return Ok(());
+    }
+    let refs = FileRefStore::new(git_dir, ctx.format);
+    match head_commit_oid(&refs)? {
+        Some(oid) => fs::write(state_dir.join("abort-safety"), format!("{oid}\n"))?,
+        None => fs::write(state_dir.join("abort-safety"), b"")?,
+    }
+    Ok(())
+}
+
 /// Apply patches `start..=last` from the state directory, committing each.
 ///
 /// On a clean apply this advances HEAD per patch and, after the final patch,
@@ -1116,7 +1138,6 @@ fn run_am_series(
     start: usize,
     overrides: AmResumeOverrides,
 ) -> Result<()> {
-    let git_dir: &Path = &ctx.git_dir;
     let format: ObjectFormat = ctx.format;
 
     let last = read_state_usize(state_dir, "last")?;
@@ -1195,6 +1216,7 @@ fn run_am_series(
                     let new_oid =
                         create_am_commit(ctx, hosts, &patch, commit_opts)?;
                     record_rebase_rewrite(state_dir, format, number, &new_oid)?;
+                    update_am_abort_safety(ctx, state_dir)?;
                     number += 1;
                     continue;
                 }
@@ -1222,22 +1244,24 @@ fn run_am_series(
             &apply_opts,
             quiet,
         )? {
-            ApplyResult::Committed => number += 1,
-            ApplyResult::Skipped => number += 1,
+            ApplyResult::Committed => {
+                update_am_abort_safety(ctx, state_dir)?;
+                number += 1;
+            }
+            ApplyResult::Skipped => {
+                // HEAD did not move, but refresh anyway so the safety point
+                // tracks the tip after every loop iteration (git's am_next).
+                update_am_abort_safety(ctx, state_dir)?;
+                number += 1;
+            }
             ApplyResult::Conflict => {
                 am_print_conflict_hints();
                 println!("Patch failed at {number:04} {}", patch.subject);
                 // Record the stop tip as the abort-safety point (git's am_next)
                 // so `am --abort` can tell whether the user moved HEAD after the
-                // failure. The rebase backend keeps its rewind target here, so
-                // only a bare `git am` (no head-name marker) updates it.
-                if !state_dir.join("head-name").exists() {
-                    let refs = FileRefStore::new(git_dir, format);
-                    match head_commit_oid(&refs)? {
-                        Some(oid) => fs::write(state_dir.join("abort-safety"), format!("{oid}\n"))?,
-                        None => fs::write(state_dir.join("abort-safety"), b"")?,
-                    }
-                }
+                // failure. The rebase apply backend owns this file when it
+                // drives am (see `update_am_abort_safety`).
+                update_am_abort_safety(ctx, state_dir)?;
                 return Err(GitError::Exit(128));
             }
         }
@@ -3829,6 +3853,11 @@ pub fn am_abort(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Resul
 pub fn am_quit(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Result<()> {
 
     am_require_in_progress(state_dir)?;
+    // git's `am_quit` runs am_rerere_clear like --abort/--skip: a stale
+    // MERGE_RR would otherwise seed phantom conflicts in later operations
+    // (t4151 "am --quit ... test ! -f .git/MERGE_RR"). A no-op unless
+    // rerere.enabled.
+    (hosts.rerere_clear)()?;
     finish_am(ctx, hosts, state_dir)
 }
 
