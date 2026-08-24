@@ -254,21 +254,18 @@ fn argv_bytes_from_os(value: OsString) -> Vec<u8> {
     value.to_string_lossy().into_owned().into_bytes()
 }
 
-fn resolve_identity_fields(role: &str, config: &mut IdentityConfig<'_>) -> Option<(Vec<u8>, Vec<u8>)> {
+fn resolve_identity_fields(
+    role: &str,
+    config: &mut IdentityConfig<'_>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
     let env_name = env::var_os(format!("GIT_{role}_NAME")).map(argv_bytes_from_os);
     let env_email = env::var_os(format!("GIT_{role}_EMAIL")).map(argv_bytes_from_os);
     let name = env_name
-        .or_else(|| {
-            identity_config_value_for_role(role, "name", config).map(String::into_bytes)
-        })
+        .or_else(|| identity_config_value_for_role(role, "name", config).map(String::into_bytes))
         .or_else(|| identity_default_value("Git Rs", config).map(String::into_bytes));
     let email = env_email
-        .or_else(|| {
-            identity_config_value_for_role(role, "email", config).map(String::into_bytes)
-        })
-        .or_else(|| {
-            identity_default_value("sley@example.invalid", config).map(String::into_bytes)
-        });
+        .or_else(|| identity_config_value_for_role(role, "email", config).map(String::into_bytes))
+        .or_else(|| identity_default_value("sley@example.invalid", config).map(String::into_bytes));
     Some((name?, email?))
 }
 
@@ -336,7 +333,8 @@ pub fn committer_identity_for_reflog(effective_config: &GitConfig) -> Result<Vec
     let email = env::var_os("GIT_COMMITTER_EMAIL")
         .map(argv_bytes_from_os)
         .or_else(|| {
-            identity_config_value_for_role("COMMITTER", "email", &mut config).map(String::into_bytes)
+            identity_config_value_for_role("COMMITTER", "email", &mut config)
+                .map(String::into_bytes)
         })
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| b"sley@example.invalid".to_vec());
@@ -374,11 +372,7 @@ pub fn commit_reflog_message(message: &[u8], amend: bool) -> Vec<u8> {
     commit_reflog_message_with_initial(message, amend, false)
 }
 
-pub fn commit_reflog_message_with_initial(
-    message: &[u8],
-    amend: bool,
-    initial: bool,
-) -> Vec<u8> {
+pub fn commit_reflog_message_with_initial(message: &[u8], amend: bool, initial: bool) -> Vec<u8> {
     let subject = String::from_utf8_lossy(message)
         .lines()
         .next()
@@ -458,7 +452,10 @@ mod tests {
             commit_reflog_message_with_initial(b"subject", false, true),
             b"commit (initial): subject".to_vec()
         );
-        assert_eq!(default_committer(), b"Git Rs <sley@example.invalid> 0 +0000");
+        assert_eq!(
+            default_committer(),
+            b"Git Rs <sley@example.invalid> 0 +0000"
+        );
     }
 
     #[test]

@@ -503,16 +503,36 @@ mod tests {
             b"subject\n".to_vec()
         );
         assert_eq!(
-            commit_cleanup_message(b"subject\n".to_vec(), CommitCleanupMode::Verbatim, "#", false),
+            commit_cleanup_message(
+                b"subject\n".to_vec(),
+                CommitCleanupMode::Verbatim,
+                "#",
+                false
+            ),
             b"subject\n".to_vec()
         );
     }
 
     #[test]
     fn scissors_cutoff_matches_wt_status_locate_end() {
-        assert_eq!(commit_locate_scissors(b"# ------------------------ >8 ------------------------\nx", "#"), 0);
-        assert_eq!(commit_locate_scissors(b"a\n# ------------------------ >8 ------------------------\nb", "#"), 2);
-        assert_eq!(commit_locate_scissors(b"no cut here\n", "#"), b"no cut here\n".len());
+        assert_eq!(
+            commit_locate_scissors(
+                b"# ------------------------ >8 ------------------------\nx",
+                "#"
+            ),
+            0
+        );
+        assert_eq!(
+            commit_locate_scissors(
+                b"a\n# ------------------------ >8 ------------------------\nb",
+                "#"
+            ),
+            2
+        );
+        assert_eq!(
+            commit_locate_scissors(b"no cut here\n", "#"),
+            b"no cut here\n".len()
+        );
     }
 
     #[test]

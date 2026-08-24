@@ -2440,7 +2440,6 @@ fn read_worktree_patch_blob_bytes_with_eol(
     }
 }
 
-
 /// `git apply --3way`: reconstruct the recorded pre-image of every patch, apply
 /// the patch to it to form "theirs", and 3-way merge against the current index
 /// ("ours"). Returns `Ok(true)` when the 3-way path handled the apply, `Ok(false)`
@@ -2753,7 +2752,6 @@ fn apply_write_three_way(
     )?;
     Ok(())
 }
-
 
 /// Parse the `--whitespace=<action>` value into a [`WsAction`].
 fn parse_ws_action(value: &str) -> Result<WsAction> {

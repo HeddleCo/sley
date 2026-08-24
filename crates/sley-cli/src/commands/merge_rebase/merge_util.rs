@@ -11,11 +11,11 @@ use std::sync::Arc;
 
 /// Canonical types shared with the sequencer engines.
 pub(crate) use sley_sequencer::apply::{
-    merge_index_entry, merge_remove_worktree_file,
-    merge_refuse_if_current_working_directory_becomes_file, merge_write_worktree_file,
     MergeConflictPaths, MergeInfoMessages, MergePathBinaryResolver, MergePathFavorResolver,
     MergePathMarkerSizeResolver, MergePathResult, MergePathResults, MergeTreeMap,
-    ThreeWayMergeOutcome,
+    ThreeWayMergeOutcome, merge_index_entry,
+    merge_refuse_if_current_working_directory_becomes_file, merge_remove_worktree_file,
+    merge_write_worktree_file,
 };
 
 /// Host-side partial-clone hydration handed to the sequencer apply backend.
@@ -31,7 +31,9 @@ impl sley_sequencer::apply::PromisorObjectFetch for MergePrefetch {
     }
 }
 
-fn apply_fetch(lazy_fetch: bool) -> Option<&'static dyn sley_sequencer::apply::PromisorObjectFetch> {
+fn apply_fetch(
+    lazy_fetch: bool,
+) -> Option<&'static dyn sley_sequencer::apply::PromisorObjectFetch> {
     static PREFETCH: MergePrefetch = MergePrefetch;
     lazy_fetch.then_some(&PREFETCH)
 }
@@ -91,7 +93,6 @@ pub(crate) fn clear_merge_df_blockers(worktree_root: &Path, results: &MergePathR
         }
     }
 }
-
 
 /// True when it is safe to delete the worktree file at `path` during a merge:
 /// either the file is already gone, or its on-disk content hashes to the blob

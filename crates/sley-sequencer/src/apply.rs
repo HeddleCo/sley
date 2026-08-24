@@ -206,11 +206,8 @@ pub fn merge_write_worktree_file(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(if mode == 0o100755 {
-                0o755
-            } else {
-                0o644
-            });
+            let perms =
+                std::fs::Permissions::from_mode(if mode == 0o100755 { 0o755 } else { 0o644 });
             std::fs::set_permissions(&full, perms)?;
         }
     }
@@ -738,9 +735,7 @@ pub fn three_way_merge_trees_outcome_with_info_opts_and_path_resolvers(
             conflicts.push(entry.path.clone());
             if advisory_location {
                 let worktree = match entry.result {
-                    Some((mode, oid)) => {
-                        Some((mode, merge_read_blob_with_fetch(db, &oid, fetch)?))
-                    }
+                    Some((mode, oid)) => Some((mode, merge_read_blob_with_fetch(db, &oid, fetch)?)),
                     None => None,
                 };
                 results.insert(

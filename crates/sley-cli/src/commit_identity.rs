@@ -20,7 +20,9 @@ use crate::session;
 use crate::sley_config;
 
 /// Load identity/config fallback using an explicit invocation session.
-pub(crate) fn identity_effective_config_for(cli_session: &session::CliSession) -> Option<GitConfig> {
+pub(crate) fn identity_effective_config_for(
+    cli_session: &session::CliSession,
+) -> Option<GitConfig> {
     let git_dir = cli_session.git_dir().ok()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir).ok()?;
     sley_config::load_identity_effective_config(&common_git_dir, &git_dir, cli_session.cwd())

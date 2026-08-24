@@ -35,15 +35,16 @@ use super::rebase::{
     TodoRenderOptions,
 };
 use crate::apply::{
-    commit_tree_oid, head_commit_oid, merge_favor_from_strategy_opts, merge_index_entry,
-    merge_read_blob_with_fetch, merge_remove_worktree_file, merge_rename_limit_from_config,
-    merge_write_worktree_file, merge_ws_ignore_from_strategy_opts, directory_renames_from_config,
-    three_way_merge_trees_inner_with_info_opts, three_way_merge_trees_inner_with_info_opts_and_path_favor,
-    MergePathResult, MergePathResults, PromisorObjectFetch, RenameMergeConfig,
+    MergePathResult, MergePathResults, PromisorObjectFetch, RenameMergeConfig, commit_tree_oid,
+    directory_renames_from_config, head_commit_oid, merge_favor_from_strategy_opts,
+    merge_index_entry, merge_read_blob_with_fetch, merge_remove_worktree_file,
+    merge_rename_limit_from_config, merge_write_worktree_file, merge_ws_ignore_from_strategy_opts,
+    three_way_merge_trees_inner_with_info_opts,
+    three_way_merge_trees_inner_with_info_opts_and_path_favor,
 };
-use sley_config::{effective_config_parameters_env, GitConfig};
+use sley_config::{GitConfig, effective_config_parameters_env};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-use sley_diff_merge::{flatten_tree, ConflictStyle, WsIgnore};
+use sley_diff_merge::{ConflictStyle, WsIgnore, flatten_tree};
 use sley_index::{Index, IndexEntry};
 use sley_object::{
     canonicalize_commit_date, commit_identity_from_env, commit_identity_from_env_with_date,
@@ -55,10 +56,12 @@ use sley_pretty::{
     commit_message_for_commit_encoding, commit_subject,
 };
 use sley_refs::{
-    resolve_ref_peeled, FileRefStore, RefPrecondition, RefTarget, RefUpdate, ReflogEntry,
+    FileRefStore, RefPrecondition, RefTarget, RefUpdate, ReflogEntry, resolve_ref_peeled,
 };
 use sley_rev::revlist::read_rev_list_commit_record;
-use sley_rev::{is_ancestor, merge_bases, peel_to_commit, resolve_revision_with_replacement_policy};
+use sley_rev::{
+    is_ancestor, merge_bases, peel_to_commit, resolve_revision_with_replacement_policy,
+};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -173,8 +176,16 @@ pub struct RebaseHosts<'a> {
     /// `commit_head`, CHERRY_PICK_HEAD merge when `merge`, else `message`),
     /// launch the editor + commit-msg hook when `edit`, and return the raw
     /// (uncleaned) file contents.
-    pub prepare_commit_message:
-        Box<dyn Fn(&Path, Vec<u8>, bool /* commit_head */, bool /* merge */, bool /* edit */) -> Result<Vec<u8>> + 'a>,
+    pub prepare_commit_message: Box<
+        dyn Fn(
+                &Path,
+                Vec<u8>,
+                bool, /* commit_head */
+                bool, /* merge */
+                bool, /* edit */
+            ) -> Result<Vec<u8>>
+            + 'a,
+    >,
     /// Run a lifecycle hook (`post-checkout`, `post-rewrite`, `post-commit`)
     /// with args and optional stdin payload.
     pub run_hook: Box<dyn Fn(&str, Vec<String>, Option<Vec<u8>>) -> Result<()> + 'a>,
@@ -183,7 +194,8 @@ pub struct RebaseHosts<'a> {
     pub tree_patch: Box<dyn Fn(&ObjectId, &ObjectId) -> Result<Vec<u8>> + 'a>,
     /// `--continue` commit summary (`branch summary` + shortstat between
     /// trees); only invoked when the continue commit is not quiet.
-    pub print_continue_summary: Box<dyn Fn(&ObjectId, &[u8], ObjectId, ObjectId) -> Result<()> + 'a>,
+    pub print_continue_summary:
+        Box<dyn Fn(&ObjectId, &[u8], ObjectId, ObjectId) -> Result<()> + 'a>,
     /// Finish diffstat (`orig-head..HEAD`); only invoked when verbose.
     pub print_diffstat: Box<dyn Fn(&ObjectId, &ObjectId) -> Result<()> + 'a>,
     /// `git stash create autostash`: stash-commit oid without touching
@@ -252,13 +264,14 @@ fn rebase_config_bool(ctx: &RebaseContext, section: &str, key: &str) -> Option<b
 /// `#`. May be multi-char; `auto` resolves provisionally to `#` (the rebase
 /// machine never runs the commit-time unused-char scan).
 fn commit_comment_string(git_dir: &Path) -> String {
-    let value = sley_config::read_repo_config(git_dir, effective_config_parameters_env().as_deref())
-        .ok()
-        .and_then(|c| {
-            c.get("core", None, "commentchar")
-                .or_else(|| c.get("core", None, "commentstring"))
-                .map(str::to_string)
-        });
+    let value =
+        sley_config::read_repo_config(git_dir, effective_config_parameters_env().as_deref())
+            .ok()
+            .and_then(|c| {
+                c.get("core", None, "commentchar")
+                    .or_else(|| c.get("core", None, "commentstring"))
+                    .map(str::to_string)
+            });
     match value.as_deref() {
         None | Some("") => "#".to_string(),
         Some(v) if v.eq_ignore_ascii_case("auto") => "#".to_string(),
@@ -363,9 +376,12 @@ fn make_resolver<'a>(
     db: &'a FileObjectDatabase,
 ) -> impl FnMut(&str) -> TodoOidLookup + 'a {
     move |token: &str| {
-        let Ok(oid) =
-            resolve_revision_with_replacement_policy(&ctx.git_dir, ctx.format, token, ctx.replace_objects)
-        else {
+        let Ok(oid) = resolve_revision_with_replacement_policy(
+            &ctx.git_dir,
+            ctx.format,
+            token,
+            ctx.replace_objects,
+        ) else {
             return TodoOidLookup::Missing;
         };
         let Ok(peeled) = peel_to_commit(db, ctx.format, &oid) else {
@@ -433,8 +449,13 @@ fn write_todo_file(
     shortonto: Option<&str>,
     db: &FileObjectDatabase,
 ) -> Result<()> {
-    let abbreviate = help && rebase_config_bool(ctx, "rebase", "abbreviateCommands").unwrap_or(false);
-    let mut buf = sheet::render_todo_list(db, items, todo_render_options(ctx, hosts, short, abbreviate));
+    let abbreviate =
+        help && rebase_config_bool(ctx, "rebase", "abbreviateCommands").unwrap_or(false);
+    let mut buf = sheet::render_todo_list(
+        db,
+        items,
+        todo_render_options(ctx, hosts, short, abbreviate),
+    );
     if help {
         let comment = comment_char(&ctx.git_dir) as char;
         let check_error = missing_commit_check_level(ctx) == MissingCommitCheck::Error;
@@ -464,7 +485,11 @@ fn save_todo(
 
 fn read_populate_todo(ctx: &RebaseContext, db: &FileObjectDatabase) -> Result<TodoList> {
     let mut resolver = make_resolver(ctx, db);
-    match sheet::load_rebase_todo_list(&ctx.git_dir, comment_char(&ctx.git_dir) as char, &mut resolver)? {
+    match sheet::load_rebase_todo_list(
+        &ctx.git_dir,
+        comment_char(&ctx.git_dir) as char,
+        &mut resolver,
+    )? {
         LoadTodoListOutcome::Ready(todo) => Ok(todo),
         LoadTodoListOutcome::Invalid { messages } => {
             for message in messages {
@@ -709,16 +734,15 @@ pub fn checkout_would_overwrite_untracked(
     target_tree: &ObjectId,
 ) -> Result<Vec<Vec<u8>>> {
     let target = flatten_tree(db, format, target_tree)?;
-    let tracked: BTreeSet<Vec<u8>> =
-        match sley_worktree::read_repository_index(git_dir, format)? {
-            Some(index) => index
-                .entries
-                .iter()
-                .filter(|entry| entry.stage() == sley_index::Stage::Normal)
-                .map(|entry| entry.path.clone().into_bytes())
-                .collect(),
-            None => BTreeSet::new(),
-        };
+    let tracked: BTreeSet<Vec<u8>> = match sley_worktree::read_repository_index(git_dir, format)? {
+        Some(index) => index
+            .entries
+            .iter()
+            .filter(|entry| entry.stage() == sley_index::Stage::Normal)
+            .map(|entry| entry.path.clone().into_bytes())
+            .collect(),
+        None => BTreeSet::new(),
+    };
     let mut overwritten = Vec::new();
     for (path, (mode, oid)) in &target {
         if tracked.contains(path) {
@@ -768,7 +792,12 @@ fn print_merge_would_overwrite_untracked(paths: &[Vec<u8>]) {
     eprintln!("Aborting");
 }
 
-fn checkout_onto(ctx: &RebaseContext, hosts: &RebaseHosts<'_>, opts: &MachineOpts, onto_name: &str) -> Result<()> {
+fn checkout_onto(
+    ctx: &RebaseContext,
+    hosts: &RebaseHosts<'_>,
+    opts: &MachineOpts,
+    onto_name: &str,
+) -> Result<()> {
     checkout_onto_base(ctx, hosts, opts, onto_name, &opts.onto)
 }
 
@@ -813,7 +842,10 @@ fn checkout_onto_base(
         ctx.reflog("start", Some(&format!("checkout {onto_name}"))),
         committer,
     )?;
-    write_state_atomic(ctx.git_dir.join("ORIG_HEAD"), format!("{}\n", opts.orig_head))?;
+    write_state_atomic(
+        ctx.git_dir.join("ORIG_HEAD"),
+        format!("{}\n", opts.orig_head),
+    )?;
     (hosts.run_hook)(
         "post-checkout",
         vec![old.to_hex(), base.to_hex(), "1".to_string()],
@@ -978,7 +1010,17 @@ pub fn complete_action(
         return finish_rebase(ctx, hosts, &opts);
     }
 
-    write_todo_file(ctx, hosts, &todo_path, &todo.items, false, false, None, None, &ctx.db())?;
+    write_todo_file(
+        ctx,
+        hosts,
+        &todo_path,
+        &todo.items,
+        false,
+        false,
+        None,
+        None,
+        &ctx.db(),
+    )?;
     todo.total_nr = todo.done_nr + sheet::count_commands(&todo.items);
     write_state_atomic(ctx.state_path("end"), format!("{}\n", todo.total_nr))?;
 
@@ -1188,7 +1230,11 @@ fn reschedule_current(
     eprintln!("hint: ");
     eprintln!(
         "hint:     {}",
-        sheet::render_todo_item(&ctx.db(), item, todo_render_options(ctx, hosts, false, false))
+        sheet::render_todo_item(
+            &ctx.db(),
+            item,
+            todo_render_options(ctx, hosts, false, false)
+        )
     );
     eprintln!("hint: ");
     eprintln!("hint: It has been rescheduled; To edit the command before continuing, please");
@@ -1243,7 +1289,12 @@ fn stopped_at_head(ctx: &RebaseContext, hosts: &RebaseHosts<'_>) {
     }
 }
 
-fn do_exec(ctx: &RebaseContext, hosts: &RebaseHosts<'_>, command: &str, quiet: bool) -> Result<i32> {
+fn do_exec(
+    ctx: &RebaseContext,
+    hosts: &RebaseHosts<'_>,
+    command: &str,
+    quiet: bool,
+) -> Result<i32> {
     if !quiet {
         eprintln!("Executing: {command}");
     }
@@ -1300,7 +1351,12 @@ fn do_label(ctx: &RebaseContext, name: &str) -> Result<()> {
     tx.commit()
 }
 
-fn do_reset(ctx: &RebaseContext, hosts: &RebaseHosts<'_>, opts: &MachineOpts, name: &str) -> Result<()> {
+fn do_reset(
+    ctx: &RebaseContext,
+    hosts: &RebaseHosts<'_>,
+    opts: &MachineOpts,
+    name: &str,
+) -> Result<()> {
     let name = todo_arg_before_comment(name);
     let target = {
         if name == "[new root]" {
@@ -1472,7 +1528,16 @@ fn do_merge(
     }
 
     if merge_heads.len() > 1 {
-        return do_octopus_merge_commit(ctx, hosts, opts, todo, item, &merge_heads, original.as_ref(), oneline);
+        return do_octopus_merge_commit(
+            ctx,
+            hosts,
+            opts,
+            todo,
+            item,
+            &merge_heads,
+            original.as_ref(),
+            oneline,
+        );
     }
 
     let (label, merge_head) = &merge_heads[0];
@@ -1583,7 +1648,15 @@ fn do_merge(
     }
 
     let tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
-    create_merge_commit_from_index(ctx, hosts, opts, original.as_ref(), tree, vec![head, *merge_head], &message)?;
+    create_merge_commit_from_index(
+        ctx,
+        hosts,
+        opts,
+        original.as_ref(),
+        tree,
+        vec![head, *merge_head],
+        &message,
+    )?;
     if let Some(record) = &original {
         record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
     }
@@ -1824,7 +1897,15 @@ fn do_custom_strategy_merge(
     }
 
     let tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)?;
-    create_merge_commit_from_index(ctx, hosts, opts, original, tree, vec![head, merge_head], &message)?;
+    create_merge_commit_from_index(
+        ctx,
+        hosts,
+        opts,
+        original,
+        tree,
+        vec![head, merge_head],
+        &message,
+    )?;
     if let Some(record) = original {
         record_rewritten(ctx, &record.oid, next_command_after_current(todo))?;
     }
@@ -1864,8 +1945,12 @@ fn looks_like_object_name(name: &str) -> bool {
 
 fn resolve_reset_target(ctx: &RebaseContext, name: &str) -> Result<ObjectId> {
     let db = ctx.db();
-    let oid =
-        resolve_revision_with_replacement_policy(&ctx.git_dir, ctx.format, name, ctx.replace_objects)?;
+    let oid = resolve_revision_with_replacement_policy(
+        &ctx.git_dir,
+        ctx.format,
+        name,
+        ctx.replace_objects,
+    )?;
     match peel_to_commit(&db, ctx.format, &oid) {
         Ok(commit) => Ok(commit),
         Err(_) => {
@@ -1901,8 +1986,13 @@ fn resolve_merge_label(
     if let Some(RefTarget::Direct(oid)) = refs.read_ref(&rewritten)? {
         return Ok(Some(oid));
     }
-    match resolve_revision_with_replacement_policy(&ctx.git_dir, ctx.format, label, ctx.replace_objects)
-        .and_then(|oid| peel_to_commit(db, ctx.format, &oid))
+    match resolve_revision_with_replacement_policy(
+        &ctx.git_dir,
+        ctx.format,
+        label,
+        ctx.replace_objects,
+    )
+    .and_then(|oid| peel_to_commit(db, ctx.format, &oid))
     {
         Ok(oid) => Ok(Some(oid)),
         Err(_) => Ok(None),
@@ -2991,11 +3081,7 @@ fn append_squash_message(
     };
     buf.push(b'\n');
     buf.extend_from_slice(
-        format!(
-            "{comment} This is the commit message #{}:\n\n",
-            count + 2
-        )
-        .as_bytes(),
+        format!("{comment} This is the commit message #{}:\n\n", count + 2).as_bytes(),
     );
     buf.extend_from_slice(&commented_lines(&body[..commented_len], comment.as_bytes()));
     let fixup_off = buf.len();
@@ -3337,9 +3423,7 @@ pub(crate) fn rebase_commit_identities(
         None => author,
     };
     let committer = match (opts.committer_date_is_author_date, now.as_deref()) {
-        (_, Some(now)) => {
-            reset_identity_date(commit_identity_from_env("COMMITTER", config)?, now)
-        }
+        (_, Some(now)) => reset_identity_date(commit_identity_from_env("COMMITTER", config)?, now),
         (true, None) => {
             let author_date = identity_date(&author).unwrap_or_else(rebase_now_date);
             commit_identity_from_env_with_date("COMMITTER", &author_date, config)?
@@ -3403,11 +3487,7 @@ fn read_author_script_identity(ctx: &RebaseContext) -> Result<Option<Vec<u8>>> {
 // Finishing
 // ---------------------------------------------------------------------------
 
-fn finish_rebase(
-    ctx: &RebaseContext,
-    hosts: &RebaseHosts<'_>,
-    opts: &MachineOpts,
-) -> Result<()> {
+fn finish_rebase(ctx: &RebaseContext, hosts: &RebaseHosts<'_>, opts: &MachineOpts) -> Result<()> {
     let refs = ctx.refs();
     let head =
         head_commit_oid(refs)?.ok_or_else(|| GitError::Command("cannot read HEAD".into()))?;
@@ -3919,7 +3999,9 @@ pub fn rebase_edit_todo(ctx: &RebaseContext, hosts: &RebaseHosts<'_>) -> Result<
     // Reconcile the update-refs state with the edited todo (drop removed
     // update-ref lines, add new ones).
     filter_update_refs(ctx, &new_items)?;
-    write_todo_file(ctx, hosts, &todo_path, &new_items, false, false, None, None, &db)?;
+    write_todo_file(
+        ctx, hosts, &todo_path, &new_items, false, false, None, None, &db,
+    )?;
     let done_nr = fs::read_to_string(ctx.state_path("done"))
         .map(|text| {
             let mut resolver = make_resolver(ctx, &db);
@@ -4074,7 +4156,9 @@ pub fn cleanup_autostash_and_state(ctx: &RebaseContext, hosts: &RebaseHosts<'_>)
 
 #[cfg(test)]
 mod native_strategy_tests {
-    use super::{custom_rebase_strategy_needs_external_driver, is_unimplemented_git_core_merge_strategy};
+    use super::{
+        custom_rebase_strategy_needs_external_driver, is_unimplemented_git_core_merge_strategy,
+    };
 
     #[test]
     fn git_core_merge_helpers_never_fall_through_to_path() {
@@ -4141,8 +4225,3 @@ mod atomic_state_write_tests {
         fs::remove_dir_all(dir).ok();
     }
 }
-
-
-
-
-

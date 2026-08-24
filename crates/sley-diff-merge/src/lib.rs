@@ -8,10 +8,10 @@ mod name;
 mod name_status;
 mod orchestration;
 mod patch;
-pub mod rerere;
 pub mod porcelain;
 pub mod range;
 pub mod render;
+pub mod rerere;
 pub mod ws;
 
 pub use sley_core::BString;

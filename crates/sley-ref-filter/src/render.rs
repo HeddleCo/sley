@@ -6,16 +6,16 @@
 //! atoms stays on the CLI side of the boundary.
 
 use super::{
-    ForEachRefAtom, ForEachRefFormat, ForEachRefFormatContext,
-    for_each_ref_ahead_behind_with_diagnostic, for_each_ref_abbrev_oid,
-    for_each_ref_color_escape, for_each_ref_copy_subject, for_each_ref_lstrip_name,
-    for_each_ref_message, for_each_ref_message_parts, for_each_ref_oid_atom_arg,
-    for_each_ref_oid_atom_width, for_each_ref_rstrip_name, for_each_ref_sanitize_subject,
-    for_each_ref_track_short, for_each_ref_try_date_atom, for_each_ref_try_email_atom,
-    for_each_ref_try_name_atom, parse_for_each_ref_abbrev_width,
-    parse_for_each_ref_contents_lines_count, parse_for_each_ref_strip_count,
-    write_for_each_ref_contents_lines, write_for_each_ref_format, write_for_each_ref_identity,
-    write_for_each_ref_signature, write_for_each_ref_typed_atom, write_for_each_ref_track,
+    ForEachRefAtom, ForEachRefFormat, ForEachRefFormatContext, for_each_ref_abbrev_oid,
+    for_each_ref_ahead_behind_with_diagnostic, for_each_ref_color_escape,
+    for_each_ref_copy_subject, for_each_ref_lstrip_name, for_each_ref_message,
+    for_each_ref_message_parts, for_each_ref_oid_atom_arg, for_each_ref_oid_atom_width,
+    for_each_ref_rstrip_name, for_each_ref_sanitize_subject, for_each_ref_track_short,
+    for_each_ref_try_date_atom, for_each_ref_try_email_atom, for_each_ref_try_name_atom,
+    parse_for_each_ref_abbrev_width, parse_for_each_ref_contents_lines_count,
+    parse_for_each_ref_strip_count, write_for_each_ref_contents_lines, write_for_each_ref_format,
+    write_for_each_ref_identity, write_for_each_ref_signature, write_for_each_ref_track,
+    write_for_each_ref_typed_atom,
 };
 use sley_core::{GitError, Result};
 use std::collections::HashMap;
@@ -541,14 +541,12 @@ pub fn print_for_each_ref_format_with_is_bases(
                     {
                         let count = parse_for_each_ref_strip_count(value)?;
                         stdout.write_all(
-                            for_each_ref_lstrip_name(context.refname, count)
-                                .as_bytes(),
+                            for_each_ref_lstrip_name(context.refname, count).as_bytes(),
                         )?;
                     } else if let Some(value) = other.strip_prefix("refname:rstrip=") {
                         let count = parse_for_each_ref_strip_count(value)?;
                         stdout.write_all(
-                            for_each_ref_rstrip_name(context.refname, count)
-                                .as_bytes(),
+                            for_each_ref_rstrip_name(context.refname, count).as_bytes(),
                         )?;
                     } else if let Some(value) = other
                         .strip_prefix("upstream:lstrip=")
@@ -560,9 +558,7 @@ pub fn print_for_each_ref_format_with_is_bases(
                             .as_ref()
                             .map(|upstream| upstream.refname.as_str())
                             .unwrap_or("");
-                        stdout.write_all(
-                            for_each_ref_lstrip_name(upstream, count).as_bytes(),
-                        )?;
+                        stdout.write_all(for_each_ref_lstrip_name(upstream, count).as_bytes())?;
                     } else if let Some(value) = other.strip_prefix("upstream:rstrip=") {
                         let count = parse_for_each_ref_strip_count(value)?;
                         let upstream = context
@@ -570,9 +566,7 @@ pub fn print_for_each_ref_format_with_is_bases(
                             .as_ref()
                             .map(|upstream| upstream.refname.as_str())
                             .unwrap_or("");
-                        stdout.write_all(
-                            for_each_ref_rstrip_name(upstream, count).as_bytes(),
-                        )?;
+                        stdout.write_all(for_each_ref_rstrip_name(upstream, count).as_bytes())?;
                     } else if let Some(value) = other
                         .strip_prefix("push:lstrip=")
                         .or_else(|| other.strip_prefix("push:strip="))
@@ -583,9 +577,7 @@ pub fn print_for_each_ref_format_with_is_bases(
                             .as_ref()
                             .and_then(|push| push.refname.as_deref())
                             .unwrap_or("");
-                        stdout.write_all(
-                            for_each_ref_lstrip_name(push, count).as_bytes(),
-                        )?;
+                        stdout.write_all(for_each_ref_lstrip_name(push, count).as_bytes())?;
                     } else if let Some(value) = other.strip_prefix("push:rstrip=") {
                         let count = parse_for_each_ref_strip_count(value)?;
                         let push = context
@@ -593,24 +585,18 @@ pub fn print_for_each_ref_format_with_is_bases(
                             .as_ref()
                             .and_then(|push| push.refname.as_deref())
                             .unwrap_or("");
-                        stdout.write_all(
-                            for_each_ref_rstrip_name(push, count).as_bytes(),
-                        )?;
+                        stdout.write_all(for_each_ref_rstrip_name(push, count).as_bytes())?;
                     } else if let Some(value) = other
                         .strip_prefix("symref:lstrip=")
                         .or_else(|| other.strip_prefix("symref:strip="))
                     {
                         let count = parse_for_each_ref_strip_count(value)?;
                         let symref = context.symref.unwrap_or("");
-                        stdout.write_all(
-                            for_each_ref_lstrip_name(symref, count).as_bytes(),
-                        )?;
+                        stdout.write_all(for_each_ref_lstrip_name(symref, count).as_bytes())?;
                     } else if let Some(value) = other.strip_prefix("symref:rstrip=") {
                         let count = parse_for_each_ref_strip_count(value)?;
                         let symref = context.symref.unwrap_or("");
-                        stdout.write_all(
-                            for_each_ref_rstrip_name(symref, count).as_bytes(),
-                        )?;
+                        stdout.write_all(for_each_ref_rstrip_name(symref, count).as_bytes())?;
                     } else if let Some(width) = other.strip_prefix("objectname:short=") {
                         let width = parse_for_each_ref_abbrev_width(width)?;
                         stdout.write_all(
@@ -642,12 +628,8 @@ pub fn print_for_each_ref_format_with_is_bases(
                             .and_then(|contents| contents.tree.as_ref())
                         {
                             stdout.write_all(
-                                for_each_ref_abbrev_oid(
-                                    tree,
-                                    width,
-                                    context.objectname_candidates,
-                                )
-                                .as_bytes(),
+                                for_each_ref_abbrev_oid(tree, width, context.objectname_candidates)
+                                    .as_bytes(),
                             )?;
                         }
                     } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "*tree") {
@@ -659,12 +641,8 @@ pub fn print_for_each_ref_format_with_is_bases(
                             .and_then(|peeled| peeled.tree.as_ref())
                         {
                             stdout.write_all(
-                                for_each_ref_abbrev_oid(
-                                    tree,
-                                    width,
-                                    context.objectname_candidates,
-                                )
-                                .as_bytes(),
+                                for_each_ref_abbrev_oid(tree, width, context.objectname_candidates)
+                                    .as_bytes(),
                             )?;
                         }
                     } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "parent") {
@@ -703,8 +681,7 @@ pub fn print_for_each_ref_format_with_is_bases(
                                 )?;
                             }
                         }
-                    } else if let Some(result) =
-                        (hooks.trailers_formatter)(stdout, other, context)
+                    } else if let Some(result) = (hooks.trailers_formatter)(stdout, other, context)
                     {
                         result?;
                     } else if let Some(result) = for_each_ref_try_email_atom(stdout, other, context)
@@ -740,14 +717,12 @@ pub fn print_for_each_ref_format_with_is_bases(
                             write!(stdout, "{} {}", track.ahead, track.behind)?;
                         }
                     } else if let Some(value) = other.strip_prefix("contents:lines=") {
-                        let count =
-                            parse_for_each_ref_contents_lines_count(value)?;
+                        let count = parse_for_each_ref_contents_lines_count(value)?;
                         if let Some(contents) = &context.contents {
                             write_for_each_ref_contents_lines(stdout, &contents.message, count)?;
                         }
                     } else if let Some(value) = other.strip_prefix("*contents:lines=") {
-                        let count =
-                            parse_for_each_ref_contents_lines_count(value)?;
+                        let count = parse_for_each_ref_contents_lines_count(value)?;
                         if let Some(message) = context
                             .peeled_object
                             .as_ref()

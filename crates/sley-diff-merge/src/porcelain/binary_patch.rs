@@ -3,7 +3,7 @@
 
 use super::options::DiffRenderOptions;
 use super::patch_entry::{
-    diff_patch_oid, diff_patch_mode_suffix, diff_patch_prefixed_path, write_diff_similarity_headers,
+    diff_patch_mode_suffix, diff_patch_oid, diff_patch_prefixed_path, write_diff_similarity_headers,
 };
 use crate::{NameStatus, NameStatusEntry};
 use sley_core::Result;

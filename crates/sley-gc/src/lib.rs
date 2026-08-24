@@ -78,7 +78,10 @@ pub(crate) fn trace_line(services: &GcServices, file_line: &str, message: &str) 
 /// Read the repository config the way every gc-path consumer does: resolved
 /// includes layered with command-line / environment injections.
 pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
-    sley_config::read_repo_config(git_dir, sley_config::effective_config_parameters_env().as_deref())
+    sley_config::read_repo_config(
+        git_dir,
+        sley_config::effective_config_parameters_env().as_deref(),
+    )
 }
 
 /// Read the object format declared by `<git_dir>/config`, defaulting to SHA-1
@@ -125,7 +128,11 @@ pub(crate) fn current_unix_seconds() -> i64 {
 /// `resolve_cli_path`).
 pub(crate) fn resolve_path_under(cwd: &Path, value: &str) -> PathBuf {
     let path = PathBuf::from(value);
-    if path.is_absolute() { path } else { cwd.join(path) }
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
 }
 
 /// git's `parse_expiry_date` composition used across the gc/prune paths:

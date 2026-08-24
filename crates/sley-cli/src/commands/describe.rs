@@ -690,14 +690,7 @@ fn describe_commit_text(
 
     let Some((tagged, depth)) = found else {
         // No candidate tag was reachable from the target.
-        return describe_no_candidate(
-            db,
-            options,
-            abbrev,
-            unannotated_cnt,
-            target,
-            dirty_suffix,
-        );
+        return describe_no_candidate(db, options, abbrev, unannotated_cnt, target, dirty_suffix);
     };
 
     if options.debug {

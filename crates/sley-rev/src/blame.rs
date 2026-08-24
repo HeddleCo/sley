@@ -125,7 +125,10 @@ pub struct LineBlame {
 /// whitespace-separated list of object names: the first names a commit, the rest
 /// its grafted parents. Lines that don't parse are skipped. Empty map when the
 /// file is absent.
-pub fn read_graft_file(git_dir: &std::path::Path, format: ObjectFormat) -> HashMap<ObjectId, Vec<ObjectId>> {
+pub fn read_graft_file(
+    git_dir: &std::path::Path,
+    format: ObjectFormat,
+) -> HashMap<ObjectId, Vec<ObjectId>> {
     let mut map: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
     let Ok(content) = std::fs::read(git_dir.join("info").join("grafts")) else {
         return map;
@@ -664,10 +667,8 @@ fn diff_hunks(
     // header and append a function" edits; the alternative algorithms
     // (patience/histogram) produce their own anchoring, so only take the
     // shortcut for the Myers family.
-    if matches!(
-        algorithm,
-        DiffAlgorithm::Myers | DiffAlgorithm::Minimal
-    ) && let Some(hunks) = contiguous_parent_hunks(parent_lines, child_lines)
+    if matches!(algorithm, DiffAlgorithm::Myers | DiffAlgorithm::Minimal)
+        && let Some(hunks) = contiguous_parent_hunks(parent_lines, child_lines)
     {
         return hunks;
     }
@@ -941,8 +942,7 @@ fn find_copies_in_parents(
         if owned.is_empty() {
             break;
         }
-        let candidate_paths =
-            copy_candidate_paths(db, format, origin, parent, copy_level, reader)?;
+        let candidate_paths = copy_candidate_paths(db, format, origin, parent, copy_level, reader)?;
         for path in candidate_paths {
             if owned.is_empty() {
                 break;
@@ -993,8 +993,7 @@ fn copy_candidate_paths(
 ) -> Result<Vec<String>> {
     let parent_tree = peel_to_tree(db, format, parent)?;
     let use_all = copy_level >= 3
-        || (copy_level >= 2
-            && read_path_blob(db, format, parent, &origin.path, reader)?.is_none());
+        || (copy_level >= 2 && read_path_blob(db, format, parent, &origin.path, reader)?.is_none());
     if use_all {
         let mut out = Vec::new();
         collect_tree_blob_paths(db, format, &parent_tree, Vec::new(), &mut out)?;

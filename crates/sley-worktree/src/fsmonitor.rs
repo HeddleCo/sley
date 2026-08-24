@@ -475,9 +475,7 @@ mod tests {
             "server exited before listening: {:?}",
             done_rx.try_recv()
         );
-        session
-            .request_stop(STOP_DEADLINE)
-            .expect("stop daemon");
+        session.request_stop(STOP_DEADLINE).expect("stop daemon");
         done_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("server stopped")
@@ -487,7 +485,6 @@ mod tests {
 
     #[test]
     fn stale_endpoint_is_replaced_before_serving() {
-
         let root = tempfile::Builder::new()
             .prefix("sley-fsm-")
             .tempdir_in("/tmp")
@@ -512,9 +509,7 @@ mod tests {
             "server exited before listening: {:?}",
             done_rx.try_recv()
         );
-        session
-            .request_stop(STOP_DEADLINE)
-            .expect("stop daemon");
+        session.request_stop(STOP_DEADLINE).expect("stop daemon");
         handle.join().expect("join daemon").expect("daemon result");
     }
 
@@ -542,9 +537,7 @@ mod tests {
                 .expect("wait for start")
         );
         assert!(session.socket_path().exists());
-        session
-            .request_stop(STOP_DEADLINE)
-            .expect("stop daemon");
+        session.request_stop(STOP_DEADLINE).expect("stop daemon");
         handle.join().expect("join daemon").expect("daemon result");
     }
 

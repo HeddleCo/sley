@@ -636,7 +636,7 @@ fn build_patch_text(
                 line_ranges: None,
                 indent_heuristic: true,
                 big_file_threshold: crate::diff_big_file_threshold(db),
-                submodule_render: crate::cli_submodule_render()
+                submodule_render: crate::cli_submodule_render(),
             },
         )?;
         append_normalized_hunks(&mut out, &raw, section_path(entry));

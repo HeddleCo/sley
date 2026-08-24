@@ -225,7 +225,12 @@ impl DiffWorktreeCleanContext<'_> {
     ///
     /// # Errors
     /// Propagates host filter errors.
-    pub fn apply(&self, path: &[u8], content: &[u8], index_blob: Option<&ObjectId>) -> Result<Vec<u8>> {
+    pub fn apply(
+        &self,
+        path: &[u8],
+        content: &[u8],
+        index_blob: Option<&ObjectId>,
+    ) -> Result<Vec<u8>> {
         (self.apply_clean)(path, content, index_blob)
     }
 }

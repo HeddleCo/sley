@@ -824,7 +824,11 @@ pub(crate) fn cmd_clone(cli_session: &crate::session::CliSession, args: &[String
     // same `safe.directory` ownership check git applies when opening any repo.
     // The source is identified by its git directory (a clone needs no worktree),
     // so an exception is added as `<source>/.git`.
-    crate::sley_worktree::discovery::ownership::ensure_valid_ownership(None, &remote_git_dir, None)?;
+    crate::sley_worktree::discovery::ownership::ensure_valid_ownership(
+        None,
+        &remote_git_dir,
+        None,
+    )?;
     let remote_common_git_dir = cli_session.common_git_dir(&remote_git_dir)?;
     let format = repository_object_format(&remote_common_git_dir)?;
     validate_local_clone_source_refs(&remote_common_git_dir, format)?;

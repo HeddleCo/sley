@@ -326,23 +326,29 @@ mod tests {
             b"../../../sib/out.txt"
         );
         // Root file viewed from deep inside.
-        assert_eq!(relative_path_bytes(b"root.txt", b"a/b/c/"), b"../../../root.txt");
+        assert_eq!(
+            relative_path_bytes(b"root.txt", b"a/b/c/"),
+            b"../../../root.txt"
+        );
         // Deeper tail under the prefix keeps inner directories.
         assert_eq!(relative_path_bytes(b"a/b/c/d/e.txt", b"a/b/c/"), b"d/e.txt");
         // Prefix without trailing slash still terminates one level short
         // (git's cmd_prefix always supplies '/', but path.c tolerates both).
         assert_eq!(relative_path_bytes(b"a/top.txt", b"a/b"), b"../top.txt");
         // Divergent components at the same depth are NOT shared: 's' != 't'.
-        assert_eq!(
-            relative_path_bytes(b"t/c.txt", b"same/"),
-            b"../t/c.txt"
-        );
+        assert_eq!(relative_path_bytes(b"t/c.txt", b"same/"), b"../t/c.txt");
     }
 
     #[test]
     fn normalize_lexical_retains_leading_dotdot_and_drops_curdir() {
-        assert_eq!(normalize_lexical(Path::new("a/b/../c")), PathBuf::from("a/c"));
-        assert_eq!(normalize_lexical(Path::new("./a/./b")), PathBuf::from("a/b"));
+        assert_eq!(
+            normalize_lexical(Path::new("a/b/../c")),
+            PathBuf::from("a/c")
+        );
+        assert_eq!(
+            normalize_lexical(Path::new("./a/./b")),
+            PathBuf::from("a/b")
+        );
         // Leading .. must survive: the path genuinely escapes its base.
         assert_eq!(normalize_lexical(Path::new("../b")), PathBuf::from("../b"));
         assert_eq!(
@@ -436,7 +442,10 @@ mod tests {
         assert_eq!(os_str_to_bytes(OsStr::new("plain/path")), b"plain/path");
         assert_eq!(path_to_slash(Path::new("/a/b/c")), "a/b/c");
         assert_eq!(path_to_slash(Path::new("a/b")), "a/b");
-        assert_eq!(bytes_to_path_string(b"ok.txt").ok(), Some("ok.txt".to_string()));
+        assert_eq!(
+            bytes_to_path_string(b"ok.txt").ok(),
+            Some("ok.txt".to_string())
+        );
         assert!(bytes_to_path_string(b"\xff").is_err());
     }
 }

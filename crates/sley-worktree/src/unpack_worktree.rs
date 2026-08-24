@@ -394,25 +394,22 @@ impl sley_unpack_trees::WorktreeWriter for ReadTreeWorktree<'_> {
         let ordinary = entries
             .iter()
             .filter(|(_, mode, _)| !sley_index::is_gitlink(*mode))
-            .map(
-                |(path, mode, oid)| CheckoutMaterializationEntry {
-                    path: path.clone(),
-                    mode: *mode,
-                    oid: *oid,
-                },
-            )
+            .map(|(path, mode, oid)| CheckoutMaterializationEntry {
+                path: path.clone(),
+                mode: *mode,
+                oid: *oid,
+            })
             .collect::<Vec<_>>();
-        let mut ordinary_stats =
-            materialize_checkout_entries_with_database(
-                &self.worktree_root,
-                &self.git_dir,
-                self.format,
-                self.db,
-                &self.repo_config,
-                self.tree_attributes.as_ref(),
-                &ordinary,
-            )?
-            .stats;
+        let mut ordinary_stats = materialize_checkout_entries_with_database(
+            &self.worktree_root,
+            &self.git_dir,
+            self.format,
+            self.db,
+            &self.repo_config,
+            self.tree_attributes.as_ref(),
+            &ordinary,
+        )?
+        .stats;
         entries
             .iter()
             .map(|(path, mode, oid)| {
@@ -514,8 +511,7 @@ pub fn checkout_two_way_engine(
     let apply_sparse_checkout =
         configure_active_sparse_checkout_for_unpack_index(git_dir, &mut index, &sparse_paths)?;
 
-    let tree_attributes =
-        TreeAttributes::from_tree(worktree_root, git_dir, db, format, new_tree)?;
+    let tree_attributes = TreeAttributes::from_tree(worktree_root, git_dir, db, format, new_tree)?;
     let mut wt = ReadTreeWorktree {
         submodules: load_superproject_submodules(worktree_root),
         repo_config: repo_config.clone(),
@@ -856,7 +852,9 @@ fn write_blob_to_worktree(
     } else {
         let body = match tree_attributes {
             Some(attributes) => attributes.apply_smudge_filter(config, path, &object.body)?,
-            None => apply_smudge_filter(worktree_root, git_dir, format, config, path, &object.body)?,
+            None => {
+                apply_smudge_filter(worktree_root, git_dir, format, config, path, &object.body)?
+            }
         };
         fs::write(&file_path, &body)?;
         // Executable bit: 0o100755 → +x, 0o100644 → plain. git only honours the
@@ -1430,8 +1428,7 @@ mod tests {
     fn dirty_active_populated_nonforced_would_lose_and_errors() {
         // This is the cell-47/48 shape: a submodule whose HEAD is moving (old
         // set) and whose index is dirty, not forced → ERROR_WOULD_LOSE_SUBMODULE.
-        let _set = GitConfig::parse(b"[submodule \"sub1\"]\n\tpath = sub1\n\turl = ./sub1\n")
-            .ok();
+        let _set = GitConfig::parse(b"[submodule \"sub1\"]\n\tpath = sub1\n\turl = ./sub1\n").ok();
         let ctx = MoveHeadContext {
             active: true,
             populated: true,

@@ -52,19 +52,19 @@ pub(crate) fn cmd_rerere(cli_session: &crate::session::CliSession, args: &[Strin
     let format = repository_object_format(&common_git_dir)?;
     let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     match options.subcommand {
-        None => {
-            commands::rerere::repo_rerere(&git_dir, &worktree_root, format, options.autoupdate)
-                .map(|_| ())
-        }
+        None => commands::rerere::repo_rerere(&git_dir, &worktree_root, format, options.autoupdate)
+            .map(|_| ()),
         Some(RerereSubcommand::Status) => rerere_status(&git_dir),
         Some(RerereSubcommand::Remaining) => rerere_remaining(&git_dir, &worktree_root, format),
         Some(RerereSubcommand::Diff) => {
             rerere_diff(&git_dir, &worktree_root, format, cli_session.lazy_fetch())
         }
         Some(RerereSubcommand::Clear) => commands::rerere::rerere_clear(&git_dir),
-        Some(RerereSubcommand::Forget) => {
-            rerere_forget(&git_dir, &options.paths, &mut sley_diff_merge::StderrRerereReporter)
-        }
+        Some(RerereSubcommand::Forget) => rerere_forget(
+            &git_dir,
+            &options.paths,
+            &mut sley_diff_merge::StderrRerereReporter,
+        ),
         Some(RerereSubcommand::Gc) => rerere_gc(&git_dir),
     }
 }
@@ -256,9 +256,7 @@ fn rerere_status(git_dir: &Path) -> Result<()> {
 
 fn rerere_remaining(git_dir: &Path, worktree_root: &Path, format: ObjectFormat) -> Result<()> {
     let config = rerere_effective_config(git_dir);
-    for path in
-        sley_diff_merge::rerere_remaining_paths(git_dir, worktree_root, format, &config)?
-    {
+    for path in sley_diff_merge::rerere_remaining_paths(git_dir, worktree_root, format, &config)? {
         println!("{path}");
     }
     Ok(())
@@ -335,7 +333,7 @@ fn rerere_diff(
                 line_ranges: None,
                 indent_heuristic: true,
                 big_file_threshold: crate::diff_big_file_threshold(&db),
-                submodule_render: crate::cli_submodule_render()
+                submodule_render: crate::cli_submodule_render(),
             },
         )?;
         stdout.write_all(&rerere_diff_payload(&rendered))?;

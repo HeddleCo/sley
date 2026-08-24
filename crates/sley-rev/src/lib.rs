@@ -1,7 +1,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-pub mod blame;
 pub mod bisect;
+pub mod blame;
 pub mod describe;
 pub mod format_patch;
 pub mod graph;
@@ -666,13 +666,7 @@ pub fn warn_ambiguous_refname_with_sink(
 /// Default-policy form of [`warn_ambiguous_refname_with_sink`]: print git's
 /// warning to stderr when enabled.
 pub fn warn_ambiguous_refname_for_object_prefix(git_dir: &Path, format: ObjectFormat, rev: &str) {
-    warn_ambiguous_refname_with_sink(
-        git_dir,
-        format,
-        rev,
-        None,
-        AmbiguousRefnameWarning::Stderr,
-    );
+    warn_ambiguous_refname_with_sink(git_dir, format, rev, None, AmbiguousRefnameWarning::Stderr);
 }
 
 /// Whether `rev` names a ref under git's dwim rules for revision arguments:
@@ -793,10 +787,7 @@ pub fn replacement_policy_object_database(
     } else {
         sley_odb::ObjectReplacements::default()
     };
-    Ok(
-        FileObjectDatabase::from_git_dir(&common_git_dir, format)
-            .with_replacements(replacements),
-    )
+    Ok(FileObjectDatabase::from_git_dir(&common_git_dir, format).with_replacements(replacements))
 }
 
 /// Revision resolution with the command wrappers' warning + replacement
@@ -826,13 +817,8 @@ pub fn resolve_revision_commitish_with_replacement_policy(
         && rev.len() < format.hex_len()
         && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        return resolve_short_object_id(
-            git_dir,
-            format,
-            rev,
-            ObjectDisambiguation::Commitish,
-        )?
-        .into_result(rev);
+        return resolve_short_object_id(git_dir, format, rev, ObjectDisambiguation::Commitish)?
+            .into_result(rev);
     }
     let db = replacement_policy_object_database(git_dir, format, replace_objects)?;
     RevisionResolver::new(git_dir, format, &db).resolve(rev)
@@ -851,18 +837,12 @@ pub fn resolve_revision_treeish_with_replacement_policy(
         && rev.len() < format.hex_len()
         && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        return resolve_short_object_id(
-            git_dir,
-            format,
-            rev,
-            ObjectDisambiguation::Treeish,
-        )?
-        .into_result(rev);
+        return resolve_short_object_id(git_dir, format, rev, ObjectDisambiguation::Treeish)?
+            .into_result(rev);
     }
     let db = replacement_policy_object_database(git_dir, format, replace_objects)?;
     RevisionResolver::new(git_dir, format, &db).resolve(rev)
 }
-
 
 pub fn resolve_short_object_id_with_reader<R: ObjectReader>(
     git_dir: &Path,
@@ -9050,7 +9030,11 @@ mod tests {
     #[test]
     fn revision_ref_name_exists_follows_dwim_rules() {
         let (git_dir, commit, prefix) = ambiguous_refname_fixture();
-        assert!(revision_ref_name_exists(&git_dir, ObjectFormat::Sha1, &prefix));
+        assert!(revision_ref_name_exists(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &prefix
+        ));
         assert!(revision_ref_name_exists(
             &git_dir,
             ObjectFormat::Sha1,
@@ -9058,8 +9042,16 @@ mod tests {
         ));
         fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
             .expect("test operation should succeed");
-        assert!(revision_ref_name_exists(&git_dir, ObjectFormat::Sha1, "HEAD"));
-        assert!(!revision_ref_name_exists(&git_dir, ObjectFormat::Sha1, "nosuchref"));
+        assert!(revision_ref_name_exists(
+            &git_dir,
+            ObjectFormat::Sha1,
+            "HEAD"
+        ));
+        assert!(!revision_ref_name_exists(
+            &git_dir,
+            ObjectFormat::Sha1,
+            "nosuchref"
+        ));
         let _ = commit;
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }

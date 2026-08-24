@@ -965,7 +965,10 @@ fn am_abort_after_non_conflict_stop_rewinds_to_pre_series_head() {
     fs::create_dir_all(&patches_dir).expect("patches dir");
     // Second patch: an empty (no-diff) commit so format-patch emits a patch
     // with headers but no diff body.
-    git_ok(&source, &["commit", "-q", "--allow-empty", "-m", "empty patch"]);
+    git_ok(
+        &source,
+        &["commit", "-q", "--allow-empty", "-m", "empty patch"],
+    );
     git_ok(
         &source,
         &[

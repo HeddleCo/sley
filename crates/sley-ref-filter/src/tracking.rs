@@ -2,7 +2,7 @@
 
 use super::ForEachRefTrack;
 use sley_config::GitConfig;
-use sley_core::{ObjectId, ObjectFormat, Result};
+use sley_core::{ObjectFormat, ObjectId, Result};
 use sley_odb::{FileObjectDatabase, ObjectReader};
 use sley_refs::{FileRefStore, Ref, RefTarget, validate_ref_name};
 use std::path::Path;
@@ -26,10 +26,7 @@ pub struct ForEachRefPushRemote {
     expose_name: bool,
 }
 
-pub fn for_each_ref_upstream(
-    config: &GitConfig,
-    refname: &str,
-) -> Option<ForEachRefUpstream> {
+pub fn for_each_ref_upstream(config: &GitConfig, refname: &str) -> Option<ForEachRefUpstream> {
     let branch = refname.strip_prefix("refs/heads/")?;
     let remote = config.get("branch", Some(branch), "remote")?;
     let merge = config.get("branch", Some(branch), "merge")?;
@@ -125,10 +122,7 @@ pub fn for_each_ref_push(config: &GitConfig, refname: &str) -> Option<ForEachRef
     })
 }
 
-pub fn for_each_ref_push_remote(
-    config: &GitConfig,
-    branch: &str,
-) -> Option<ForEachRefPushRemote> {
+pub fn for_each_ref_push_remote(config: &GitConfig, branch: &str) -> Option<ForEachRefPushRemote> {
     if let Some(remote) = config.get("branch", Some(branch), "pushRemote") {
         return Some(ForEachRefPushRemote {
             name: remote.to_string(),

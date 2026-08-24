@@ -1010,8 +1010,9 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
                 options.max_pack_size = Some(gc_engine::parse_gc_size(&value)?);
             }
             value if value.starts_with("--max-pack-size=") => {
-                options.max_pack_size =
-                    Some(gc_engine::parse_gc_size(&value["--max-pack-size=".len()..])?);
+                options.max_pack_size = Some(gc_engine::parse_gc_size(
+                    &value["--max-pack-size=".len()..],
+                )?);
             }
             "--max-cruft-size" => {
                 let value = iter.next().ok_or_else(|| {
@@ -1020,8 +1021,9 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
                 options.max_cruft_size = Some(gc_engine::parse_gc_size(&value)?);
             }
             value if value.starts_with("--max-cruft-size=") => {
-                options.max_cruft_size =
-                    Some(gc_engine::parse_gc_size(&value["--max-cruft-size=".len()..])?);
+                options.max_cruft_size = Some(gc_engine::parse_gc_size(
+                    &value["--max-cruft-size=".len()..],
+                )?);
             }
             "--combine-cruft-below-size" => {
                 let value = iter.next().ok_or_else(|| {
@@ -1050,7 +1052,9 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
                 options.filter_specs.push(value);
             }
             value if value.starts_with("--filter=") => {
-                options.filter_specs.push(value["--filter=".len()..].to_string());
+                options
+                    .filter_specs
+                    .push(value["--filter=".len()..].to_string());
             }
             "--filter-to" => {
                 let value = iter.next().ok_or_else(|| {
@@ -1097,14 +1101,18 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
                 let value = iter.next().ok_or_else(|| {
                     GitError::Command("option `keep-pack' requires a value".into())
                 })?;
-                options.keep_packs.push(gc_repack::strip_pack_suffix(&value));
+                options
+                    .keep_packs
+                    .push(gc_repack::strip_pack_suffix(&value));
             }
             value if value.starts_with("--geometric=") => {
-                options.geometric =
-                    Some(gc_repack::parse_geometric_factor(&value["--geometric=".len()..])?);
+                options.geometric = Some(gc_repack::parse_geometric_factor(
+                    &value["--geometric=".len()..],
+                )?);
             }
             value if value.starts_with("--keep-pack=") => {
-                options.keep_packs
+                options
+                    .keep_packs
                     .push(gc_repack::strip_pack_suffix(&value["--keep-pack=".len()..]));
             }
             "--no-cruft" => options.cruft = false,
@@ -1130,23 +1138,22 @@ pub(crate) fn cmd_repack(cli_session: &crate::session::CliSession, args: &[Strin
     run_repack(cli_session, options)
 }
 
-
 // ---------------------------------------------------------------------------
 // gc/repack/maintenance engine wrappers (sley-gc). The CLI keeps argv parsing,
 // usage/help rendering, stdout formatting, hooks, and exit codes; everything
 // else lives in `sley_gc`.
 // ---------------------------------------------------------------------------
 
-use sley_gc::maintenance::{
-    self as gc_maintenance, validate_maintenance_schedule, MaintenanceScheduler,
-};
-use sley_gc::midx as gc_midx;
+use sley_gc::GcServices;
 use sley_gc::count_objects as gc_count_objects;
 use sley_gc::gc::{self as gc_engine, GcAutoMode, GcOptions};
+use sley_gc::maintenance::{
+    self as gc_maintenance, MaintenanceScheduler, validate_maintenance_schedule,
+};
+use sley_gc::midx as gc_midx;
 use sley_gc::prune as gc_prune;
 use sley_gc::repack as gc_repack;
 use sley_gc::trace2 as gc_trace2;
-use sley_gc::GcServices;
 
 pub(crate) fn trace2_child_start(args: &[&str]) {
     gc_trace2::child_start(args);
@@ -1182,7 +1189,12 @@ pub(crate) fn run_repack(
             sley_remote::hydrate_reachable_from_local_promisor_remotes(dir, format, roots)
         }),
     };
-    gc_repack::run_repack(&mut services, &git_dir, cli_session.replace_objects(), &options)
+    gc_repack::run_repack(
+        &mut services,
+        &git_dir,
+        cli_session.replace_objects(),
+        &options,
+    )
 }
 
 pub(crate) fn cmd_count_objects(
@@ -1263,10 +1275,6 @@ pub(crate) fn verify_midx_at(
 ) -> Result<()> {
     gc_midx::verify_midx_at(object_dir, format, progress)
 }
-
-
-
-
 
 pub(crate) fn cmd_gc(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let options = setup_gc_options(args)?;
@@ -1367,7 +1375,11 @@ pub(crate) fn cmd_gc(cli_session: &crate::session::CliSession, args: &[String]) 
             )
         },
         commit_graph_write_reachable: &mut |progress: bool| {
-            let progress_arg = if progress { "--progress" } else { "--no-progress" };
+            let progress_arg = if progress {
+                "--progress"
+            } else {
+                "--no-progress"
+            };
             commands::plumbing::cmd_commit_graph(
                 cli_session,
                 &[
@@ -1533,7 +1545,6 @@ fn gc_usage<T>() -> Result<T> {
     Err(GitError::Exit(129))
 }
 
-
 pub(crate) fn cmd_maintenance(
     cli_session: &crate::session::CliSession,
     args: &[String],
@@ -1582,7 +1593,6 @@ fn maintenance_run_usage<T>() -> Result<T> {
     eprintln!("    --task <task>         run a specific task");
     Err(GitError::Exit(129))
 }
-
 
 fn cmd_maintenance_run(cli_session: &crate::session::CliSession, args: &[String]) -> Result<()> {
     let mut quiet = true;
@@ -1649,15 +1659,18 @@ fn cmd_maintenance_run(cli_session: &crate::session::CliSession, args: &[String]
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
-    let selected =
-        gc_maintenance::maintenance_select_tasks(&config, &tasks, schedule.as_deref())?;
+    let selected = gc_maintenance::maintenance_select_tasks(&config, &tasks, schedule.as_deref())?;
     let mut services = GcServices {
         git_trace_line: &crate::setup::git_trace_line,
         replace_objects: cli_session.replace_objects(),
         pack_refs_all_prune: &mut || Ok(()),
         reflog_expire: &mut |_| Ok(()),
         commit_graph_write_reachable: &mut |progress: bool| {
-            let progress_arg = if progress { "--progress" } else { "--no-progress" };
+            let progress_arg = if progress {
+                "--progress"
+            } else {
+                "--no-progress"
+            };
             commands::plumbing::cmd_commit_graph(
                 cli_session,
                 &[
@@ -1685,8 +1698,6 @@ fn cmd_maintenance_run(cli_session: &crate::session::CliSession, args: &[String]
     Ok(())
 }
 
-
-
 /// Append a `--task=<name>` selection, mirroring git's `task_option_parse`:
 /// reject an unknown task name, and reject a task already selected (both rc 129).
 fn push_maintenance_task(tasks: &mut Vec<String>, task: &str) -> Result<()> {
@@ -1709,8 +1720,6 @@ fn push_maintenance_task(tasks: &mut Vec<String>, task: &str) -> Result<()> {
     tasks.push(task.to_string());
     Ok(())
 }
-
-
 
 fn cmd_maintenance_is_needed(
     cli_session: &crate::session::CliSession,
@@ -1752,24 +1761,17 @@ fn cmd_maintenance_is_needed(
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let config = read_repo_config(&common_git_dir)?;
-    let selected =
-        gc_maintenance::maintenance_select_tasks(&config, &tasks, schedule.as_deref())?;
+    let selected = gc_maintenance::maintenance_select_tasks(&config, &tasks, schedule.as_deref())?;
     if (!auto && !selected.is_empty())
-        || selected
-            .iter()
-            .any(|task| {
-                gc_maintenance::maintenance_task_needed(&common_git_dir, &config, task)
-                    .unwrap_or(false)
-            })
+        || selected.iter().any(|task| {
+            gc_maintenance::maintenance_task_needed(&common_git_dir, &config, task).unwrap_or(false)
+        })
     {
         Ok(())
     } else {
         Err(GitError::Exit(1))
     }
 }
-
-
-
 
 fn cmd_maintenance_register(
     cli_session: &crate::session::CliSession,
@@ -1816,8 +1818,7 @@ fn cmd_maintenance_unregister(
     let git_dir = cli_session.git_dir()?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let repo = env::current_dir()?.display().to_string();
-    let missing_repo_value =
-        gc_maintenance::report_missing_maintenance_repo(&common_git_dir);
+    let missing_repo_value = gc_maintenance::report_missing_maintenance_repo(&common_git_dir);
     if missing_repo_value && !force {
         return Err(GitError::Exit(128));
     }
@@ -1887,9 +1888,6 @@ fn maintenance_subcommand_usage<T>(subcommand: &str) -> Result<T> {
     }
     Err(GitError::Exit(129))
 }
-
-
-
 
 pub(crate) fn cmd_maintenance_start(
     cli_session: &crate::session::CliSession,
@@ -1966,8 +1964,6 @@ fn parse_scheduler(value: &str) -> Result<MaintenanceScheduler> {
     }
 }
 
-
-
 /// `git unpack-objects` — explode a pack stream from stdin into loose objects
 /// (upstream `builtin/unpack-objects.c`). `-n` parses without writing; the
 /// other upstream flags are accepted and inert for this in-process path.
@@ -2010,7 +2006,6 @@ pub(crate) fn cmd_unpack_objects(
     sley_odb::unpack_packfile_objects(&pack_bytes, format, repository.object_database().loose())?;
     Ok(())
 }
-
 
 #[derive(Debug)]
 struct PackRefsOptions {
@@ -2253,7 +2248,6 @@ fn pack_refs_timeout_millis(common_git_dir: &Path) -> Result<u64> {
         .unwrap_or(1000))
 }
 
-
 #[derive(Debug)]
 struct PruneOptions {
     dry_run: bool,
@@ -2400,7 +2394,6 @@ fn prune_option_specs() -> &'static [sley_options::OptionSpec<'static>] {
     SPECS
 }
 
-
 /// `git prune -h`: the same usage text as `prune_usage`, but printed to stdout
 /// (git's parse-options `-h` writes to stdout and exits 129).
 fn prune_help<T>() -> Result<T> {
@@ -2416,7 +2409,6 @@ fn prune_help<T>() -> Result<T> {
     println!();
     Err(GitError::Exit(129))
 }
-
 
 const MULTI_PACK_INDEX_USAGE: &str = "\
 usage: git multi-pack-index [--object-dir <dir>] [--[no-]bitmap]
@@ -2484,9 +2476,6 @@ pub(crate) fn cmd_multi_pack_index(
         }
     }
 }
-
-
-
 
 /// A packfile considered by `git pack-redundant`, mirroring its `pack_list`.
 struct RedundantPack {
@@ -2912,4 +2901,3 @@ mod tests {
         assert_eq!(resolve_cruft_pack_size(None, None, Some(1)), Some(1));
     }
 }
-

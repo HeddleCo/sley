@@ -2,8 +2,8 @@ use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use flate2::{Decompress, FlushDecompress};
 use sley_core::{
-    primitives::u32_be, CancelFlag, GitError, MissingObjectContext, ObjectFormat, ObjectId, Result,
-    StreamingDigest,
+    CancelFlag, GitError, MissingObjectContext, ObjectFormat, ObjectId, Result, StreamingDigest,
+    primitives::u32_be,
 };
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, tree_entry_object_type};
 use sley_pack::{

@@ -1055,13 +1055,9 @@ mod git_delta_acceptance_tests {
             (ids[2], 1_168_867_328),
         ]);
 
-        let (plan, order) = plan_pack_deltas(
-            &object_refs,
-            &ids,
-            &PackWriteOptions::new(),
-            Some(&hashes),
-        )
-        .expect("plan deltas");
+        let (plan, order) =
+            plan_pack_deltas(&object_refs, &ids, &PackWriteOptions::new(), Some(&hashes))
+                .expect("plan deltas");
 
         assert_eq!(order, vec![0, 2, 1]);
         assert!(matches!(

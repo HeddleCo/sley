@@ -8,8 +8,7 @@
 
 use sley_config::GitConfig;
 use sley_core::{
-    BString, GitError, MissingObjectContext, MissingObjectKind, ObjectFormat, ObjectId,
-    Result,
+    BString, GitError, MissingObjectContext, MissingObjectKind, ObjectFormat, ObjectId, Result,
 };
 use sley_index::{
     BorrowedIndex, CacheTree, Index, IndexEntry, IndexEntryRef, SPARSE_DIR_MODE, SplitIndexLink,
@@ -65,8 +64,8 @@ pub use discovery::probes::{
     discovery_filesystem_boundary, paths_refer_to_same_dir, resolve_git_dir_walk_only,
 };
 pub use discovery::setup::{
-    effective_worktree_for_git_dir, invocation_git_dir, optional_worktree_from_config,
-    setup_git_directory, SetupEnvironment, SetupResult, WorktreePolicy,
+    SetupEnvironment, SetupResult, WorktreePolicy, effective_worktree_for_git_dir,
+    invocation_git_dir, optional_worktree_from_config, setup_git_directory,
 };
 
 // `attributes` and `index_io` hold only crate-internal helpers (no `pub`
@@ -88,12 +87,12 @@ pub use types_admin::*;
 // its internal helpers intentionally keep module-private names that would
 // otherwise collide with the crate-wide prelude.
 pub use unpack_worktree::{
-    ReadTreeWorktree, SubmoduleCheckoutHook, SubmoduleHooks, SubmoduleRemoveHook,
-    UnpackPorcelain, checkout_two_way_engine, gitlink_should_recurse,
-    load_superproject_submodules, prune_empty_dirs, refuse_if_unpack_result_removes_current_directory,
-    remove_path_in_the_way, remove_worktree_path, safe_worktree_path, verify_uptodate_path,
-    write_tree_entry_to_worktree, write_tree_entry_to_worktree_with_hooks,
-    refuse_if_unpack_entries_turn_cwd_into_file,
+    ReadTreeWorktree, SubmoduleCheckoutHook, SubmoduleHooks, SubmoduleRemoveHook, UnpackPorcelain,
+    checkout_two_way_engine, gitlink_should_recurse, load_superproject_submodules,
+    prune_empty_dirs, refuse_if_unpack_entries_turn_cwd_into_file,
+    refuse_if_unpack_result_removes_current_directory, remove_path_in_the_way,
+    remove_worktree_path, safe_worktree_path, verify_uptodate_path, write_tree_entry_to_worktree,
+    write_tree_entry_to_worktree_with_hooks,
 };
 
 #[cfg(test)]

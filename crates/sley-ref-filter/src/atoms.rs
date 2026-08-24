@@ -4,12 +4,11 @@
 use super::context::{ForEachRefFormatContext, ForEachRefSignatureVerification};
 use super::{
     ForEachRefAtom, ForEachRefAtomIdentityPart, ForEachRefAtomIdentityRole, ForEachRefEmailMode,
-    ForEachRefNameFormat, ForEachRefNameSource, ForEachRefStripDirection,
-    for_each_ref_abbrev_oid, for_each_ref_identity_date, for_each_ref_identity_email,
-    parse_for_each_ref_abbrev_width, parse_for_each_ref_hex_color,
-    write_for_each_ref_identity, write_for_each_ref_identity_date_mode,
-    write_for_each_ref_identity_date_raw, write_for_each_ref_identity_email_mode,
-    write_for_each_ref_identity_name,
+    ForEachRefNameFormat, ForEachRefNameSource, ForEachRefStripDirection, for_each_ref_abbrev_oid,
+    for_each_ref_identity_date, for_each_ref_identity_email, parse_for_each_ref_abbrev_width,
+    parse_for_each_ref_hex_color, write_for_each_ref_identity,
+    write_for_each_ref_identity_date_mode, write_for_each_ref_identity_date_raw,
+    write_for_each_ref_identity_email_mode, write_for_each_ref_identity_name,
 };
 use sley_core::{DateMode, GitError, Result};
 use std::io::Write;
@@ -491,9 +490,7 @@ pub fn for_each_ref_color_escape(value: &str) -> Result<String> {
             "green" => for_each_ref_push_color_code(value, &mut foreground, &mut background, 32)?,
             "yellow" => for_each_ref_push_color_code(value, &mut foreground, &mut background, 33)?,
             "blue" => for_each_ref_push_color_code(value, &mut foreground, &mut background, 34)?,
-            "magenta" => {
-                for_each_ref_push_color_code(value, &mut foreground, &mut background, 35)?
-            }
+            "magenta" => for_each_ref_push_color_code(value, &mut foreground, &mut background, 35)?,
             "cyan" => for_each_ref_push_color_code(value, &mut foreground, &mut background, 36)?,
             "white" => for_each_ref_push_color_code(value, &mut foreground, &mut background, 37)?,
             "brightblack" => {

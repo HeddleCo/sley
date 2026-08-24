@@ -487,12 +487,7 @@ impl PackFile {
         format: ObjectFormat,
         options: &PackWriteOptions,
     ) -> Result<PackWrite> {
-        Self::write_packed_with_known_ids_and_options_and_name_hashes(
-            inputs,
-            format,
-            options,
-            None,
-        )
+        Self::write_packed_with_known_ids_and_options_and_name_hashes(inputs, format, options, None)
     }
 
     /// Like [`PackFile::write_packed_with_known_ids_and_options`], with

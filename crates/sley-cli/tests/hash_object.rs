@@ -1143,11 +1143,19 @@ fn hash_object_fsck_validation_matches_upstream_git() {
             tree_entry("77777777777", b"f", 0x22),
         ),
         // Strict rejects git's early nonstandard 100664.
-        ("tree 100664 strict", "tree", tree_entry("100664", b"f", 0x33)),
+        (
+            "tree 100664 strict",
+            "tree",
+            tree_entry("100664", b"f", 0x33),
+        ),
         (
             "tree duplicate entries",
             "tree",
-            [tree_entry("100644", b"x", 0x44), tree_entry("100644", b"x", 0x55)].concat(),
+            [
+                tree_entry("100644", b"x", 0x44),
+                tree_entry("100644", b"x", 0x55),
+            ]
+            .concat(),
         ),
         // Commit header structure.
         (
@@ -1155,7 +1163,11 @@ fn hash_object_fsck_validation_matches_upstream_git() {
             "commit",
             commit("zzz", "A <a@b> 1 +0000"),
         ),
-        ("commit valid", "commit", commit(empty_tree, "A <a@b> 1 +0000")),
+        (
+            "commit valid",
+            "commit",
+            commit(empty_tree, "A <a@b> 1 +0000"),
+        ),
         // date_overflows boundary: INT64_MAX hashes, INT64_MAX+1 overflows.
         (
             "commit ts INT64_MAX",
@@ -1189,11 +1201,7 @@ fn hash_object_fsck_validation_matches_upstream_git() {
             "tag",
             tag("bad~name", "tagger A <a@b> 1 +0000", "\nm"),
         ),
-        (
-            "tag missingTaggerEntry",
-            "tag",
-            tag("t", "", "\nm"),
-        ),
+        ("tag missingTaggerEntry", "tag", tag("t", "", "\nm")),
         (
             "tag ident error then extra header",
             "tag",

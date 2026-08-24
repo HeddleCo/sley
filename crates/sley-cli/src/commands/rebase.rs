@@ -18,10 +18,10 @@ use crate::commands::merge_rebase::{
 };
 use crate::commands::replay::launch_editor;
 use crate::*;
+use sley_sequencer::am as sam;
 use sley_sequencer::rebase as seq;
 use sley_sequencer::rebase::{RebaseTodoItem, TodoCommand};
 use sley_sequencer::rebase_drive as rdrive;
-use sley_sequencer::am as sam;
 
 // ---------------------------------------------------------------------------
 // Options
@@ -486,23 +486,11 @@ impl Ctx {
     }
 }
 
-
-
 type MachineOpts = seq::RebaseState;
 
 // ---------------------------------------------------------------------------
 // Todo list plumbing
 // ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
 
 fn rebase_config_value(ctx: &Ctx, section: &str, key: &str) -> Option<String> {
     // A linked worktree's administrative gitdir contains HEAD/index/rebase
@@ -521,7 +509,6 @@ fn rebase_config_bool(ctx: &Ctx, section: &str, key: &str) -> Option<bool> {
         _ => None,
     }
 }
-
 
 fn rebase_merges_config(ctx: &Ctx) -> Option<RebaseMergesMode> {
     let value = rebase_config_value(ctx, "rebase", "rebaseMerges")?;
@@ -628,7 +615,11 @@ fn rebase_hosts(ctx: &Ctx) -> rdrive::RebaseHosts<'_> {
                 if edit {
                     launch_editor(&ctx.git_dir, editmsg)?;
                     let path_arg = editmsg.to_string_lossy().into_owned();
-                    commands::hooks::run_hook_l_at(&ctx.git_dir, "commit-msg", &[path_arg.as_str()])?;
+                    commands::hooks::run_hook_l_at(
+                        &ctx.git_dir,
+                        "commit-msg",
+                        &[path_arg.as_str()],
+                    )?;
                 }
                 Ok(fs::read(editmsg)?)
             },
@@ -651,7 +642,13 @@ fn rebase_hosts(ctx: &Ctx) -> rdrive::RebaseHosts<'_> {
         print_continue_summary: Box::new(|new_oid, message, old_tree, new_tree| {
             let db = ctx.db();
             print_branch_commit_summary(&db, &ctx.git_dir, ctx.format, new_oid, message)?;
-            print_commit_shortstat_between_trees(&db, ctx.format, &old_tree, &new_tree, ctx.lazy_fetch)
+            print_commit_shortstat_between_trees(
+                &db,
+                ctx.format,
+                &old_tree,
+                &new_tree,
+                ctx.lazy_fetch,
+            )
         }),
         print_diffstat: Box::new(|old_tree, new_tree| {
             print_rebase_diffstat(
@@ -682,46 +679,59 @@ fn rebase_hosts(ctx: &Ctx) -> rdrive::RebaseHosts<'_> {
             commands::rerere::repo_rerere(&ctx.git_dir, &ctx.worktree_root, ctx.format, autoupdate)
         }),
         rerere_record_resolved: Box::new(|| {
-            commands::rerere::record_resolved_after_commit(&ctx.git_dir, &ctx.worktree_root, ctx.format)
+            commands::rerere::record_resolved_after_commit(
+                &ctx.git_dir,
+                &ctx.worktree_root,
+                ctx.format,
+            )
         }),
         append_signoff: Box::new(|message, signoff| {
             commands::replay::append_signoff_before_comments(message, signoff)
         }),
         copy_notes_for_rewrite: Box::new(|pairs| copy_notes_for_rewrite(ctx, pairs)),
-        commit_signature: Box::new(move |tree, parents, author, committer, message, encoding, opts| {
-            let sign = if opts.no_gpg_sign {
-                false
-            } else {
-                opts.gpg_sign.is_some()
-                    || ctx.config.get_bool("commit", None, "gpgsign").unwrap_or(false)
-            };
-            if !sign {
-                return Ok(None);
-            }
-            let unsigned = Commit {
-                tree,
-                parents: parents.to_vec(),
-                author: author.to_vec(),
-                committer: committer.to_vec(),
-                encoding,
-                message: message.to_vec(),
-            };
-            let key =
-                commands::signing::signing_key(Some(&ctx.config), opts.gpg_sign.as_deref(), committer);
-            commands::signing::sign_payload(Some(&ctx.config), &unsigned.write(), key.as_deref())
+        commit_signature: Box::new(
+            move |tree, parents, author, committer, message, encoding, opts| {
+                let sign = if opts.no_gpg_sign {
+                    false
+                } else {
+                    opts.gpg_sign.is_some()
+                        || ctx
+                            .config
+                            .get_bool("commit", None, "gpgsign")
+                            .unwrap_or(false)
+                };
+                if !sign {
+                    return Ok(None);
+                }
+                let unsigned = Commit {
+                    tree,
+                    parents: parents.to_vec(),
+                    author: author.to_vec(),
+                    committer: committer.to_vec(),
+                    encoding,
+                    message: message.to_vec(),
+                };
+                let key = commands::signing::signing_key(
+                    Some(&ctx.config),
+                    opts.gpg_sign.as_deref(),
+                    committer,
+                );
+                commands::signing::sign_payload(
+                    Some(&ctx.config),
+                    &unsigned.write(),
+                    key.as_deref(),
+                )
                 .map(Some)
-        }),
+            },
+        ),
     }
 }
-
 
 /// Shared promisor hydration adapter (one static per process).
 fn prefetch_adapter() -> &'static RebasePrefetch {
     static PREFETCH: RebasePrefetch = RebasePrefetch;
     &PREFETCH
 }
-
-
 
 fn am_engine_ctx(ctx: &Ctx) -> sam::AmContext<'static> {
     commands::am::am_engine_context(
@@ -1250,7 +1260,9 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
                     // The <branch> argument names a non-branch (e.g. a tag): git
                     // still switches to it before reporting up-to-date, so detach
                     // HEAD onto its commit (RESET_HEAD_DETACH path).
-                    rdrive::reset_index_and_worktree_to_commit_for_rebase(&rctx, &hosts, &orig_head)?;
+                    rdrive::reset_index_and_worktree_to_commit_for_rebase(
+                        &rctx, &hosts, &orig_head,
+                    )?;
                     let refs = ctx.refs();
                     let old = head_commit_oid(refs)?.unwrap_or_else(|| ObjectId::null(ctx.format));
                     let committer = committer_identity_for_reflog(&ctx.config)?;
@@ -1638,8 +1650,13 @@ fn checkout_onto_for_apply(
     let refs = ctx.refs();
     let old = head_commit_oid(refs)?.unwrap_or(ObjectId::null(ctx.format));
     let base_tree = commit_tree_oid(db, ctx.format, base)?;
-    let overwritten =
-        rdrive::checkout_would_overwrite_untracked(&ctx.git_dir, &ctx.worktree_root, ctx.format, db, &base_tree)?;
+    let overwritten = rdrive::checkout_would_overwrite_untracked(
+        &ctx.git_dir,
+        &ctx.worktree_root,
+        ctx.format,
+        db,
+        &base_tree,
+    )?;
     if !overwritten.is_empty() {
         eprintln!(
             "error: The following untracked working tree files would be overwritten by checkout:"
@@ -1884,7 +1901,13 @@ fn print_rebase_diffstat(
         return Ok(());
     }
     let mut stdout = io::stdout();
-    let stat_entries = collect_diff_stat_entries(entries.as_slice(), db, None, false, crate::diff_lazy_fetch(lazy_fetch))?;
+    let stat_entries = collect_diff_stat_entries(
+        entries.as_slice(),
+        db,
+        None,
+        false,
+        crate::diff_lazy_fetch(lazy_fetch),
+    )?;
     // The diffstat rows + the "N file changed …" trailer (already emitted by
     // `write_diff_stat`). It is NOT followed by a separate shortstat — emitting
     // one double-printed the "N file changed" line (t3404 "verbose flag is
@@ -1930,7 +1953,6 @@ fn create_squash_onto(ctx: &Ctx) -> Result<ObjectId> {
         },
     )
 }
-
 
 // ---------------------------------------------------------------------------
 // make_script: generate pick lines for upstream..orig_head
@@ -2881,7 +2903,9 @@ fn write_rebase_update_refs_state(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result
         if item.command != TodoCommand::UpdateRef {
             continue;
         }
-        let refname = rdrive::todo_arg_before_comment(&item.arg).trim().to_string();
+        let refname = rdrive::todo_arg_before_comment(&item.arg)
+            .trim()
+            .to_string();
         if seen.insert(refname.clone()) {
             refs.push(refname);
         }
@@ -2906,20 +2930,9 @@ fn write_rebase_update_refs_state(ctx: &Ctx, items: &[RebaseTodoItem]) -> Result
     Ok(())
 }
 
-
-
-
-
-
-
 // ---------------------------------------------------------------------------
 // complete_action: editor round + checkout onto + drive
 // ---------------------------------------------------------------------------
-
-
-
-
-
 
 fn launch_sequence_editor(ctx: &Ctx, path: &Path) -> Result<()> {
     let editor = env::var("GIT_SEQUENCE_EDITOR")
@@ -2946,10 +2959,6 @@ fn launch_sequence_editor(ctx: &Ctx, path: &Path) -> Result<()> {
     }
     Ok(())
 }
-
-
-
-
 
 fn run_rebase_post_checkout_hook(
     ctx: &Ctx,
@@ -2994,84 +3003,21 @@ fn detach_head_with_reflog(
 // The drive loop
 // ---------------------------------------------------------------------------
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // ---------------------------------------------------------------------------
 // Picking one commit
 // ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // ---------------------------------------------------------------------------
 // fixup / squash message machinery
 // ---------------------------------------------------------------------------
 
-
-
-
-
-
-
-
-
-
-
 // ---------------------------------------------------------------------------
 // Native `git commit` for the machine
 // ---------------------------------------------------------------------------
 
-
-
-
-
-
-
-
-
-
 // ---------------------------------------------------------------------------
 // Finishing
 // ---------------------------------------------------------------------------
-
-
-
-
-
-
-
 
 /// Match a `notes.rewriteRef` pattern against a concrete ref name. Supports a
 /// trailing `*` wildcard (e.g. `refs/notes/*`) and exact names, mirroring the
@@ -3184,20 +3130,9 @@ fn copy_notes_for_rewrite(ctx: &Ctx, rewritten: &[(ObjectId, ObjectId)]) -> Resu
     Ok(())
 }
 
-
-
 // ---------------------------------------------------------------------------
 // --continue / --skip / --abort / --quit / --edit-todo
 // ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
 
 // ---------------------------------------------------------------------------
 // Autostash

@@ -1,4 +1,4 @@
-use sley::{Result};
+use sley::Result;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn common_git_dir_for_git_dir(git_dir: &Path) -> Result<PathBuf> {

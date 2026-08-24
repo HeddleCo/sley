@@ -27,8 +27,8 @@ use std::path::PathBuf;
 use sley_core::{GitError, Result};
 
 use crate::{
-    eq_ignore_ascii_case, home_dir, ConfigBoolOrInt, ConfigOrigin, ConfigOriginKind, ConfigStack,
-    GitConfig,
+    ConfigBoolOrInt, ConfigOrigin, ConfigOriginKind, ConfigStack, GitConfig, eq_ignore_ascii_case,
+    home_dir,
 };
 
 /// Why a numeric config value failed to parse — upstream's `errno` split in
@@ -214,12 +214,7 @@ fn strtonum_prefix(bytes: &[u8]) -> (u32, usize, bool, bool) {
     // take an optional sign before base detection.
     let start = bytes
         .iter()
-        .position(|byte| {
-            !matches!(
-                byte,
-                b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r'
-            )
-        })
+        .position(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r'))
         .unwrap_or(bytes.len());
     let mut cursor = start;
     let mut negative = false;
@@ -298,7 +293,11 @@ fn classify_signed(value: &str, max: i64) -> std::result::Result<i64, BadNumeric
     if overflow {
         return Err(BadNumericKind::OutOfRange);
     }
-    let limit = if negative { 1u64 << 63 } else { i64::MAX as u64 };
+    let limit = if negative {
+        1u64 << 63
+    } else {
+        i64::MAX as u64
+    };
     if magnitude > limit {
         return Err(BadNumericKind::OutOfRange);
     }
@@ -314,9 +313,7 @@ fn classify_signed(value: &str, max: i64) -> std::result::Result<i64, BadNumeric
     let factor128 = factor as i128;
     // Upstream's pre-multiplication bounds check, in i128 so `i64::MIN`
     // magnitudes cannot trip intermediate overflow.
-    if (val > 0 && max128 / factor128 < val)
-        || (val < 0 && (-max128 - 1) / factor128 > val)
-    {
+    if (val > 0 && max128 / factor128 < val) || (val < 0 && (-max128 - 1) / factor128 > val) {
         return Err(BadNumericKind::OutOfRange);
     }
     Ok((val * factor128) as i64)
@@ -413,9 +410,7 @@ fn bad_numeric(
 /// Interpret a raw value with git's `--bool-or-int` typing, classifying a
 /// failure through the signed grammar so the caller can render
 /// `die_bad_number` verbatim.
-fn interpret_bool_or_int(
-    value: &str,
-) -> std::result::Result<ConfigBoolOrInt, BadNumericKind> {
+fn interpret_bool_or_int(value: &str) -> std::result::Result<ConfigBoolOrInt, BadNumericKind> {
     if let Some(parsed) = crate::parse_config_bool_or_int(value) {
         return Ok(parsed);
     }
@@ -458,7 +453,12 @@ impl GitConfig {
     /// exact `die_bad_number` diagnostic is printed and `Err(Exit(128))` is
     /// returned; a value-less bare key fails the same way (upstream renders
     /// its value as the empty string). Unset keys yield `Ok(None)`.
-    pub fn get_int(&self, section: &str, subsection: Option<&str>, key: &str) -> Result<Option<i64>> {
+    pub fn get_int(
+        &self,
+        section: &str,
+        subsection: Option<&str>,
+        key: &str,
+    ) -> Result<Option<i64>> {
         let name = config_display_name(section, subsection, key);
         match self.get_entry(section, subsection, key) {
             None => Ok(None),
@@ -474,7 +474,12 @@ impl GitConfig {
     /// git's unsigned grammar — `k`/`m`/`g` units, no sign allowed anywhere —
     /// range-checked against `u64`. Diagnostics behave as in
     /// [`GitConfig::get_int`].
-    pub fn get_size(&self, section: &str, subsection: Option<&str>, key: &str) -> Result<Option<u64>> {
+    pub fn get_size(
+        &self,
+        section: &str,
+        subsection: Option<&str>,
+        key: &str,
+    ) -> Result<Option<u64>> {
         let name = config_display_name(section, subsection, key);
         match self.get_entry(section, subsection, key) {
             None => Ok(None),
@@ -516,7 +521,12 @@ impl GitConfig {
     /// failed expansion prints `failed to expand user dir in: '<value>'` and
     /// a value-less bare key prints `missing value for '<name>'`, both as
     /// fatal exit-128 errors.
-    pub fn get_path(&self, section: &str, subsection: Option<&str>, key: &str) -> Result<Option<PathBuf>> {
+    pub fn get_path(
+        &self,
+        section: &str,
+        subsection: Option<&str>,
+        key: &str,
+    ) -> Result<Option<PathBuf>> {
         let name = config_display_name(section, subsection, key);
         match self.get_entry(section, subsection, key) {
             None => Ok(None),
@@ -535,12 +545,23 @@ impl ConfigStack {
     /// [`GitConfig::get_int`] over the flattened stack; failures carry the
     /// winning entry's origin, adding git's location clause (` in file …`,
     /// ` in blob …`, ` in standard input`) to the diagnostic.
-    pub fn get_int(&self, section: &str, subsection: Option<&str>, key: &str) -> Result<Option<i64>> {
+    pub fn get_int(
+        &self,
+        section: &str,
+        subsection: Option<&str>,
+        key: &str,
+    ) -> Result<Option<i64>> {
         let name = config_display_name(section, subsection, key);
         match self.get(section, subsection, key) {
             None => Ok(None),
             Some(entry) => match entry.value.as_deref() {
-                None => Err(bad_numeric("", name, Some(entry.origin.clone()), BadNumericKind::InvalidUnit).report()),
+                None => Err(bad_numeric(
+                    "",
+                    name,
+                    Some(entry.origin.clone()),
+                    BadNumericKind::InvalidUnit,
+                )
+                .report()),
                 Some(value) => match classify_signed(value, i64::MAX) {
                     Ok(parsed) => Ok(Some(parsed)),
                     Err(kind) => {
@@ -553,12 +574,23 @@ impl ConfigStack {
 
     /// [`GitConfig::get_size`] over the flattened stack, with the same
     /// origin-attributed diagnostics as [`ConfigStack::get_int`].
-    pub fn get_size(&self, section: &str, subsection: Option<&str>, key: &str) -> Result<Option<u64>> {
+    pub fn get_size(
+        &self,
+        section: &str,
+        subsection: Option<&str>,
+        key: &str,
+    ) -> Result<Option<u64>> {
         let name = config_display_name(section, subsection, key);
         match self.get(section, subsection, key) {
             None => Ok(None),
             Some(entry) => match entry.value.as_deref() {
-                None => Err(bad_numeric("", name, Some(entry.origin.clone()), BadNumericKind::InvalidUnit).report()),
+                None => Err(bad_numeric(
+                    "",
+                    name,
+                    Some(entry.origin.clone()),
+                    BadNumericKind::InvalidUnit,
+                )
+                .report()),
                 Some(value) => match classify_unsigned(value, u64::MAX) {
                     Ok(parsed) => Ok(Some(parsed)),
                     Err(kind) => {
@@ -595,7 +627,12 @@ impl ConfigStack {
     }
 
     /// [`GitConfig::get_path`] over the flattened stack.
-    pub fn get_path(&self, section: &str, subsection: Option<&str>, key: &str) -> Result<Option<PathBuf>> {
+    pub fn get_path(
+        &self,
+        section: &str,
+        subsection: Option<&str>,
+        key: &str,
+    ) -> Result<Option<PathBuf>> {
         match self.get(section, subsection, key) {
             None => Ok(None),
             Some(entry) => {
@@ -663,10 +700,7 @@ mod tests {
             int("99999999999999999999999"),
             Err(BadNumericKind::OutOfRange)
         );
-        assert_eq!(
-            int("9223372036854775807k"),
-            Err(BadNumericKind::OutOfRange)
-        );
+        assert_eq!(int("9223372036854775807k"), Err(BadNumericKind::OutOfRange));
         assert_eq!(int("-9223372036854775809"), Err(BadNumericKind::OutOfRange));
         assert_eq!(
             size("18446744073709551616"),
@@ -782,7 +816,10 @@ mod tests {
     #[test]
     fn get_size_rejects_negatives_and_reports_units() {
         let config = config_with(&[("limit", Some("2g"))]);
-        assert_eq!(config.get_size("foo", None, "limit").ok(), Some(Some(2 * 1024 * 1024 * 1024)));
+        assert_eq!(
+            config.get_size("foo", None, "limit").ok(),
+            Some(Some(2 * 1024 * 1024 * 1024))
+        );
         let negative = config_with(&[("limit", Some("-5"))]);
         assert!(negative.get_size("foo", None, "limit").is_err());
     }
@@ -790,7 +827,10 @@ mod tests {
     #[test]
     fn bool_int_duality() {
         // 'true'/'1' duality through the shared --bool-or-int interpretation.
-        assert_eq!(interpret_bool_or_int("true"), Ok(ConfigBoolOrInt::Bool(true)));
+        assert_eq!(
+            interpret_bool_or_int("true"),
+            Ok(ConfigBoolOrInt::Bool(true))
+        );
         assert_eq!(
             interpret_bool_or_int("TRUE"),
             Ok(ConfigBoolOrInt::Bool(true))
@@ -868,9 +908,13 @@ mod tests {
     #[test]
     fn path_expansion_cases() {
         let expand = |value: &str, home: Option<&str>| {
-            expand_config_path_with_home(value, home).map(|path| path.to_string_lossy().into_owned())
+            expand_config_path_with_home(value, home)
+                .map(|path| path.to_string_lossy().into_owned())
         };
-        assert_eq!(expand("~/templates", Some("/home/u")), Ok("/home/u/templates".into()));
+        assert_eq!(
+            expand("~/templates", Some("/home/u")),
+            Ok("/home/u/templates".into())
+        );
         assert_eq!(expand("~", Some("/home/u")), Ok("/home/u".into()));
         assert_eq!(expand("", Some("/home/u")), Ok(String::new()));
         assert_eq!(expand("rel/path", Some("/home/u")), Ok("rel/path".into()));
@@ -883,10 +927,7 @@ mod tests {
         );
         // …and `~user` forms fail even with one (no passwd lookup in sley).
         let err = expand("~other/x", Some("/home/u")).expect_err("fails");
-        assert_eq!(
-            err.diagnostic(),
-            "failed to expand user dir in: '~other/x'"
-        );
+        assert_eq!(err.diagnostic(), "failed to expand user dir in: '~other/x'");
     }
 
     #[test]

@@ -2,10 +2,12 @@
 //! byte-for-byte from the CLI's former `diff_render.rs` patch tier.
 
 use super::binary_patch::write_diff_binary_patch_entry;
-use super::options::{DiffRenderOptions, PatchUserdiff, SubmoduleDiffFormat};
 use super::content::{is_binary_or_large_content, is_gitlink_pair};
+use super::options::{DiffRenderOptions, PatchUserdiff, SubmoduleDiffFormat};
 use super::{diff_entry_new_content, diff_entry_old_content};
-use crate::format::{DiffColors, WordDiffAdapter, WordDiffConfig, heading_classifier, render_colors};
+use crate::format::{
+    DiffColors, WordDiffAdapter, WordDiffConfig, heading_classifier, render_colors,
+};
 use crate::render::{HunkRenderOptions, render_hunks};
 use crate::ws;
 use crate::{NameStatus, NameStatusEntry, is_type_change};
@@ -178,12 +180,11 @@ pub fn write_diff_patch_entry(
     let treat_as_binary = match binary_override {
         Some(binary) => binary,
         None => {
-            old_content
-                .as_deref()
-                .is_some_and(|content| is_binary_or_large_content(content, options.big_file_threshold))
-                || new_content
-                    .as_deref()
-                    .is_some_and(|content| is_binary_or_large_content(content, options.big_file_threshold))
+            old_content.as_deref().is_some_and(|content| {
+                is_binary_or_large_content(content, options.big_file_threshold)
+            }) || new_content.as_deref().is_some_and(|content| {
+                is_binary_or_large_content(content, options.big_file_threshold)
+            })
         }
     };
     if treat_as_binary {
@@ -228,12 +229,10 @@ pub fn write_diff_patch_entry(
                 .iter()
                 .any(|re| re.is_match_with_case(line, false))
         });
-        let change_ignore =
-            (options.ignore_blank_lines || !options.ignore_regexes.is_empty()).then(|| {
-                crate::render::ChangeIgnore {
-                    ignore_blank_lines: options.ignore_blank_lines,
-                    regex_match: regex_match.as_ref().map(|f| f as &dyn Fn(&[u8]) -> bool),
-                }
+        let change_ignore = (options.ignore_blank_lines || !options.ignore_regexes.is_empty())
+            .then(|| crate::render::ChangeIgnore {
+                ignore_blank_lines: options.ignore_blank_lines,
+                regex_match: regex_match.as_ref().map(|f| f as &dyn Fn(&[u8]) -> bool),
             });
         let mut probe_options = HunkRenderOptions {
             context: options.context,
@@ -333,8 +332,16 @@ pub fn write_diff_patch_entry(
     // `---`/`+++` file headers.
     let funcname = options
         .funcname
-        .or_else(|| old_driver.as_ref().and_then(|driver| driver.funcname.as_ref()))
-        .or_else(|| new_driver.as_ref().and_then(|driver| driver.funcname.as_ref()));
+        .or_else(|| {
+            old_driver
+                .as_ref()
+                .and_then(|driver| driver.funcname.as_ref())
+        })
+        .or_else(|| {
+            new_driver
+                .as_ref()
+                .and_then(|driver| driver.funcname.as_ref())
+        });
     let default_colors;
     let word_regex;
     let word_diff = match options.word_diff {
@@ -342,9 +349,21 @@ pub fn write_diff_patch_entry(
             let spec: Option<Vec<u8>> = request
                 .cli_regex
                 .map(|regex| regex.as_bytes().to_vec())
-                .or_else(|| old_driver.as_ref().and_then(|driver| driver.word_regex.clone()))
-                .or_else(|| new_driver.as_ref().and_then(|driver| driver.word_regex.clone()))
-                .or_else(|| options.userdiff.and_then(PatchUserdiff::patch_config_word_regex));
+                .or_else(|| {
+                    old_driver
+                        .as_ref()
+                        .and_then(|driver| driver.word_regex.clone())
+                })
+                .or_else(|| {
+                    new_driver
+                        .as_ref()
+                        .and_then(|driver| driver.word_regex.clone())
+                })
+                .or_else(|| {
+                    options
+                        .userdiff
+                        .and_then(PatchUserdiff::patch_config_word_regex)
+                });
             word_regex = spec
                 .map(|spec| {
                     sley_grep::Regex::compile_bytes(&spec, sley_grep::RegexMode::Ere, false, false)
@@ -367,9 +386,7 @@ pub fn write_diff_patch_entry(
         None => None,
     };
     let mut heading = heading_classifier(funcname);
-    let mut word_diff_adapter = word_diff
-        .as_ref()
-        .map(WordDiffAdapter::new);
+    let mut word_diff_adapter = word_diff.as_ref().map(WordDiffAdapter::new);
     let ws_error = colors.and(options.ws_error);
     let ignore_regexes = options.ignore_regexes;
     let regex_match = (!ignore_regexes.is_empty()).then_some(move |line: &[u8]| {
@@ -394,7 +411,9 @@ pub fn write_diff_patch_entry(
         line_indicators: options.line_indicators,
         suppress_blank_empty: options.suppress_blank_empty,
         ws_error,
-        color_moved: colors.and(options.color_moved).filter(|_| word_diff.is_none()),
+        color_moved: colors
+            .and(options.color_moved)
+            .filter(|_| word_diff.is_none()),
         ws_ignore: options.ws_ignore,
         algorithm: options.diff_algorithm,
         indent_heuristic: options.indent_heuristic,
@@ -483,9 +502,7 @@ pub(super) fn diff_patch_oid(
 ) -> String {
     let hex = oid
         .cloned()
-        .or_else(|| {
-            content.and_then(|content| object_id_for_bytes(format, "blob", content).ok())
-        })
+        .or_else(|| content.and_then(|content| object_id_for_bytes(format, "blob", content).ok()))
         .map(|oid| oid.to_hex())
         .unwrap_or_else(|| "0".repeat(format.hex_len()));
     let mut width = abbrev.min(hex.len());

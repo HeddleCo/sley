@@ -817,7 +817,7 @@ fn render_diff_files_entries(
                 line_ranges: None,
                 indent_heuristic: context.indent_heuristic,
                 big_file_threshold: crate::diff_big_file_threshold(context.db),
-                submodule_render: crate::cli_submodule_render()
+                submodule_render: crate::cli_submodule_render(),
             };
             write_diff_patch_entry(stdout, entry, patch_options)
         },

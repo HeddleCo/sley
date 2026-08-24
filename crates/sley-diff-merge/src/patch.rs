@@ -2258,8 +2258,10 @@ pub fn apply_binary_outcome(
 fn inflate_zlib_exact(deflated: &[u8], expected_len: usize) -> Option<Vec<u8>> {
     use flate2::{Decompress, FlushDecompress};
     let mut decoder = Decompress::new(true);
-    let mut out =
-        Vec::with_capacity(sley_pack::inflate::bounded_inflate_reserve(expected_len, deflated.len()));
+    let mut out = Vec::with_capacity(sley_pack::inflate::bounded_inflate_reserve(
+        expected_len,
+        deflated.len(),
+    ));
     decoder
         .decompress_vec(deflated, &mut out, FlushDecompress::Finish)
         .ok()?;

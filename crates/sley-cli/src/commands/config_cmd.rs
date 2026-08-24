@@ -1920,7 +1920,9 @@ fn value_canonicalizes_as(value: &str, value_type: ConfigValueType) -> bool {
         // with the formatter (e.g. trailing whitespace is an invalid unit,
         // not a trailing-trimmed integer).
         ConfigValueType::Int => sley_config::typed::classify_config_int(value).is_ok(),
-        ConfigValueType::BoolOrInt => sley_config::typed::classify_config_bool_or_int(value).is_ok(),
+        ConfigValueType::BoolOrInt => {
+            sley_config::typed::classify_config_bool_or_int(value).is_ok()
+        }
         ConfigValueType::Color => try_format_config_color_value(value).is_ok(),
         ConfigValueType::Path => config_path_value_can_expand(value),
         ConfigValueType::ExpiryDate => {
@@ -2003,9 +2005,9 @@ fn config_bad_numeric_value(
         _ => None,
     });
     match (name, location) {
-        (Some(name), Some(location)) => eprintln!(
-            "fatal: bad numeric config value '{value}' for '{name}'{location}: {kind}"
-        ),
+        (Some(name), Some(location)) => {
+            eprintln!("fatal: bad numeric config value '{value}' for '{name}'{location}: {kind}")
+        }
         (Some(name), None) => {
             eprintln!("fatal: bad numeric config value '{value}' for '{name}': {kind}")
         }

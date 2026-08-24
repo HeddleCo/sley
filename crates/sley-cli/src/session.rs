@@ -310,7 +310,8 @@ impl CliSession {
     /// facade owns the repository-scoped object database and other handles.
     pub(crate) fn open_repository(&self) -> Result<Repository> {
         let git_dir = self.git_dir()?;
-        let work_tree = crate::sley_worktree::discovery::setup::effective_worktree_for_git_dir(self, &git_dir)?;
+        let work_tree =
+            crate::sley_worktree::discovery::setup::effective_worktree_for_git_dir(self, &git_dir)?;
         let config = crate::read_repo_config(&git_dir)?;
         let use_replace_refs = config
             .get_bool("core", None, "useReplaceRefs")
@@ -408,8 +409,8 @@ pub(crate) fn cli_remote_git_dir_from(start: impl AsRef<Path>) -> Result<PathBuf
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use super::*;
+    use std::fs;
 
     fn session(cwd: PathBuf, git_dir: Option<PathBuf>) -> CliSession {
         CliSession::from_parsed_globals(

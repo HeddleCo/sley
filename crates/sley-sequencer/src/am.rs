@@ -28,25 +28,25 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use crate::apply::{
-    commit_tree_oid, head_commit_oid, merge_index_entry, merge_read_blob_with_fetch,
-    merge_remove_worktree_file, merge_rename_limit_from_config, merge_write_worktree_file,
-    MergePathResult, MergeTreeMap, PromisorObjectFetch, RenameMergeConfig,
+    MergePathResult, MergeTreeMap, PromisorObjectFetch, RenameMergeConfig, commit_tree_oid,
+    head_commit_oid, merge_index_entry, merge_read_blob_with_fetch, merge_remove_worktree_file,
+    merge_rename_limit_from_config, merge_write_worktree_file,
 };
-use crate::{create_commit, format_commit_identity_bytes, CommitCreate};
-use sley_config::{effective_config_parameters_env, GitConfig};
+use crate::{CommitCreate, create_commit, format_commit_identity_bytes};
+use sley_config::{GitConfig, effective_config_parameters_env};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_index::{Index, IndexEntry};
 use sley_mail::mailinfo::{
-    commit_message_body_after_subject, hg_patch_to_mail, is_diff_start, looks_like_patch_input,
-    parse_mbox, parse_mboxrd, parse_message, split_keep_newline, stgit_patch_to_mail, strip_cr,
-    subject_of_message, trim_trailing_newline, write_stored_subject_header, MailMessage as AmPatch,
-    SubjectCleanup,
+    MailMessage as AmPatch, SubjectCleanup, commit_message_body_after_subject, hg_patch_to_mail,
+    is_diff_start, looks_like_patch_input, parse_mbox, parse_mboxrd, parse_message,
+    split_keep_newline, stgit_patch_to_mail, strip_cr, subject_of_message, trim_trailing_newline,
+    write_stored_subject_header,
 };
 use sley_object::{
-    commit_identity_from_env, commit_identity_from_env_with_date, commit_signoff_from_env,
-    EncodedObject, ObjectType,
+    EncodedObject, ObjectType, commit_identity_from_env, commit_identity_from_env_with_date,
+    commit_signoff_from_env,
 };
-use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter, ObjectPrefixResolution};
+use sley_odb::{FileObjectDatabase, ObjectPrefixResolution, ObjectReader, ObjectWriter};
 use sley_pretty::{
     commit_encoding_config, commit_encoding_header_from_config, commit_message_has_invalid_utf8,
     encoding_is_utf8, log_reencode_message,
@@ -121,7 +121,6 @@ pub struct AmHosts<'a> {
     /// Clear the in-progress rerere state (`am --skip` / bare `--abort`).
     pub rerere_clear: Box<dyn Fn() -> Result<()> + 'a>,
 }
-
 
 /// Parsed command-line configuration for a fresh `git am` invocation.
 pub struct AmOptions {
@@ -258,7 +257,6 @@ fn read_am_rerere_autoupdate(state_dir: &Path) -> Option<bool> {
         _ => None,
     }
 }
-
 
 // ===========================================================================
 // Rebase apply backend (the `git rebase --apply` / `git-rebase--am` path)
@@ -433,8 +431,6 @@ pub fn rebase_apply_abort(ctx: &AmContext, hosts: &AmHosts<'_>) -> Result<()> {
     let state_dir = ctx.git_dir.join("rebase-apply");
     am_abort(ctx, hosts, &state_dir)
 }
-
-
 
 /// Read every mbox file (or stdin when none are given), keeping one buffer *per
 /// file* rather than concatenating them. git's `mailsplit` splits each input
@@ -658,7 +654,10 @@ fn write_am_state_dir(
     // `--reject`, `--ignore-whitespace` all round-trip through apply-opt.
     fs::write(
         state_dir.join("apply-opt"),
-        format!("{}\n", sley_core::text::sq_quote_argv(&options.git_apply_opts)),
+        format!(
+            "{}\n",
+            sley_core::text::sq_quote_argv(&options.git_apply_opts)
+        ),
     )?;
     // abort-safety records the HEAD the series is currently sitting on so
     // --abort can detect a HEAD the user moved out from under us. An unborn HEAD
@@ -1099,7 +1098,6 @@ fn am_do_interactive(message: &[u8]) -> Result<AmInteractiveDecision> {
     }
 }
 
-
 /// git's `am_next`: after a patch has been applied and committed (or skipped),
 /// record the new tip as the abort-safety point so that a later `am --abort`
 /// compares HEAD against the most recent stop rather than the start of the
@@ -1208,13 +1206,11 @@ fn run_am_series(
                     continue;
                 }
                 AmEmptyAction::Keep => {
-                    patch.message =
-                        prepare_am_commit_message(ctx, hosts, &patch, commit_opts)?;
+                    patch.message = prepare_am_commit_message(ctx, hosts, &patch, commit_opts)?;
                     if !quiet {
                         println!("Creating an empty commit: {}", patch.subject);
                     }
-                    let new_oid =
-                        create_am_commit(ctx, hosts, &patch, commit_opts)?;
+                    let new_oid = create_am_commit(ctx, hosts, &patch, commit_opts)?;
                     record_rebase_rewrite(state_dir, format, number, &new_oid)?;
                     update_am_abort_safety(ctx, state_dir)?;
                     number += 1;
@@ -1605,7 +1601,9 @@ fn try_straight_apply(
             index
                 .entries
                 .into_iter()
-                .filter(|entry| entry.stage() == sley_index::Stage::Normal && entry.is_skip_worktree())
+                .filter(|entry| {
+                    entry.stage() == sley_index::Stage::Normal && entry.is_skip_worktree()
+                })
                 .map(|entry| (entry.path.as_bytes().to_vec(), (entry.mode, entry.oid))),
         );
     }
@@ -2469,8 +2467,7 @@ fn am_commit_identities(
     let author_email =
         log_reencode_message(&patch.author_email, &patch.author_encoding, target_encoding)
             .into_owned();
-    let author =
-        format_commit_identity_bytes(&author_name, &author_email, &author_date)?;
+    let author = format_commit_identity_bytes(&author_name, &author_email, &author_date)?;
 
     let committer = if opts.committer_date_is_author_date {
         commit_identity_from_env_with_date("COMMITTER", &author_date, config)?
@@ -2765,9 +2762,7 @@ fn apply_three_way(
         })
         .unwrap_or(sley_diff_merge::ConflictStyle::Merge);
     let marker_attrs = vec![b"conflict-marker-size".to_vec()];
-    let path_marker_size = |path: &[u8]| {
-        am_conflict_marker_size_for_path(ctx, path, &marker_attrs)
-    };
+    let path_marker_size = |path: &[u8]| am_conflict_marker_size_for_path(ctx, path, &marker_attrs);
     let (results, conflicts, _info) =
         crate::apply::three_way_merge_trees_inner_with_info_opts_and_path_resolvers(
             &db,
@@ -3156,11 +3151,7 @@ fn write_merge_index_and_worktree(
 
 const AM_DEFAULT_CONFLICT_MARKER_SIZE: usize = 7;
 
-fn am_conflict_marker_size_for_path(
-    ctx: &AmContext,
-    path: &[u8],
-    requested: &[Vec<u8>],
-) -> usize {
+fn am_conflict_marker_size_for_path(ctx: &AmContext, path: &[u8], requested: &[Vec<u8>]) -> usize {
     let worktree_root: &Path = &ctx.worktree_root;
     let format: ObjectFormat = ctx.format;
 
@@ -3233,7 +3224,6 @@ fn display_state_dir(worktree_root: &Path, state_dir: &Path) -> String {
 /// was a `git rebase --apply`, so we first return HEAD to the original branch and
 /// print the rebase success line before dropping state.
 fn finish_am(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Result<()> {
-
     if state_dir.join("head-name").exists() {
         finish_rebase_apply(ctx, hosts, state_dir)?;
     }
@@ -3284,11 +3274,7 @@ fn run_apply_post_rewrite_hook(hosts: &AmHosts<'_>, state_dir: &Path) {
     if input.is_empty() {
         return;
     }
-    let _ = (hosts.run_hook)(
-        "post-rewrite",
-        vec!["rebase".to_string()],
-        Some(input),
-    );
+    let _ = (hosts.run_hook)("post-rewrite", vec!["rebase".to_string()], Some(input));
 }
 
 /// Move HEAD back to the original branch at the rebased tip and print the rebase
@@ -3370,11 +3356,7 @@ fn finish_rebase_apply(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -
 /// `rebase-apply/autostash`. Mirrors `apply_autostash` in the merge backend
 /// (rebase.rs) but reachable from the am finish path. Prints "Applied
 /// autostash." on a clean apply, or stores the stash on conflict.
-fn apply_rebase_autostash(
-    ctx: &AmContext,
-    hosts: &AmHosts<'_>,
-    state_dir: &Path,
-) -> Result<()> {
+fn apply_rebase_autostash(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Result<()> {
     let format: ObjectFormat = ctx.format;
 
     let autostash_path = state_dir.join("autostash");
@@ -3614,8 +3596,8 @@ fn am_clean_index(
     }
     if !checkout_paths.is_empty() {
         let config =
-        sley_config::read_repo_config(git_dir, effective_config_parameters_env().as_deref())
-            .unwrap_or_default();
+            sley_config::read_repo_config(git_dir, effective_config_parameters_env().as_deref())
+                .unwrap_or_default();
         sley_worktree::checkout_index_paths(
             worktree_root,
             git_dir,
@@ -3851,7 +3833,6 @@ pub fn am_abort(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Resul
 
 /// `git am --quit`: leave HEAD and the worktree as-is, only drop the state.
 pub fn am_quit(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Result<()> {
-
     am_require_in_progress(state_dir)?;
     // git's `am_quit` runs am_rerere_clear like --abort/--skip: a stale
     // MERGE_RR would otherwise seed phantom conflicts in later operations
@@ -3888,7 +3869,13 @@ pub fn am_skip(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Result
     if let Some(head_oid) = &head_oid {
         record_rebase_rewrite(state_dir, format, next, head_oid)?;
     }
-    run_am_series(ctx, hosts, state_dir, next + 1, AmResumeOverrides::default())
+    run_am_series(
+        ctx,
+        hosts,
+        state_dir,
+        next + 1,
+        AmResumeOverrides::default(),
+    )
 }
 
 /// `git am --continue`/`--resolved`: commit the staged resolution of the current
@@ -3968,7 +3955,13 @@ pub fn am_continue(
                 fs::write(state_dir.join("interactive"), bool_flag(false))?;
             }
             AmInteractiveDecision::Skip => {
-                return run_am_series(ctx, hosts, state_dir, next + 1, AmResumeOverrides::default());
+                return run_am_series(
+                    ctx,
+                    hosts,
+                    state_dir,
+                    next + 1,
+                    AmResumeOverrides::default(),
+                );
             }
         }
     }
@@ -3979,7 +3972,13 @@ pub fn am_continue(
     // future replay (t4150 "am -3 works with rerere"). A no-op unless rerere
     // is enabled and a MERGE_RR is in progress.
     (hosts.rerere_record_resolved)()?;
-    run_am_series(ctx, hosts, state_dir, next + 1, AmResumeOverrides::default())
+    run_am_series(
+        ctx,
+        hosts,
+        state_dir,
+        next + 1,
+        AmResumeOverrides::default(),
+    )
 }
 
 /// `git am --retry`: re-apply the current (failed) patch from scratch, honouring
@@ -3991,7 +3990,6 @@ pub fn am_retry(
     state_dir: &Path,
     overrides: AmResumeOverrides,
 ) -> Result<()> {
-
     am_require_in_progress(state_dir)?;
     let next = read_state_usize(state_dir, "next")?;
     run_am_series(ctx, hosts, state_dir, next, overrides)
@@ -4000,7 +3998,11 @@ pub fn am_retry(
 /// `git am --allow-empty`: when an empty patch stopped the series, record it as
 /// an empty commit and continue. For non-empty/conflicted states, use the normal
 /// `--continue` validation so clean or unmerged indexes are still rejected.
-pub fn am_continue_allow_empty(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: &Path) -> Result<()> {
+pub fn am_continue_allow_empty(
+    ctx: &AmContext,
+    hosts: &AmHosts<'_>,
+    state_dir: &Path,
+) -> Result<()> {
     let git_dir: &Path = &ctx.git_dir;
     let format: ObjectFormat = ctx.format;
 
@@ -4040,7 +4042,13 @@ pub fn am_continue_allow_empty(ctx: &AmContext, hosts: &AmHosts<'_>, state_dir: 
     if !quiet {
         println!("No changes - recorded it as an empty commit.");
     }
-    run_am_series(ctx, hosts, state_dir, next + 1, AmResumeOverrides::default())
+    run_am_series(
+        ctx,
+        hosts,
+        state_dir,
+        next + 1,
+        AmResumeOverrides::default(),
+    )
 }
 
 // ===========================================================================

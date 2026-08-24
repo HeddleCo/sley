@@ -19,9 +19,9 @@ pub(crate) use sley::plumbing::sley_sequencer::commit_message::{
 
 use std::path::Path;
 
-use sley::{ObjectFormat, Result};
 use sley::plumbing::sley_object::Commit;
 use sley::plumbing::sley_sequencer::commit_message::read_reused_commit_from_db;
+use sley::{ObjectFormat, Result};
 
 use crate::repository::open_object_database;
 

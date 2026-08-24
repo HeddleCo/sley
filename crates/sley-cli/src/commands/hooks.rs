@@ -95,7 +95,6 @@ pub(crate) fn run_recent_objects_hooks(
     sley_gc::prune::run_recent_objects_hooks(config, format, cwd)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

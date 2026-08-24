@@ -936,9 +936,7 @@ fn for_each_ref_describe_atom(placeholder: &str) -> Option<(bool, &str)> {
 /// comma-separated options, and on the first unrecognized token report
 /// `unrecognized %(describe) argument: <bad-token-through-end>` (git keeps the
 /// rest of the string, not just the offending token).
-pub(crate) fn for_each_ref_parse_describe_opts(
-    opts: &str,
-) -> Result<sley_pretty::DescribeSpec> {
+pub(crate) fn for_each_ref_parse_describe_opts(opts: &str) -> Result<sley_pretty::DescribeSpec> {
     let mut spec = sley_pretty::DescribeSpec::default();
     let mut rest = opts;
     while !rest.is_empty() {

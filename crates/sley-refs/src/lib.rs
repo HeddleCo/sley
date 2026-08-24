@@ -4,7 +4,7 @@
 
 use sley_config::GitConfig;
 use sley_core::fsync::FsyncMethod as ReferenceFsyncMethod;
-use sley_core::{fsync, GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{GitError, ObjectFormat, ObjectId, Result, fsync};
 use sley_formats::{
     Reftable, ReftableLogRecord, ReftableLogUpdate, ReftableLogValue, ReftableRefRecord,
     ReftableRefValue, ReftableWriteOptions,
@@ -828,7 +828,8 @@ struct ReferenceFsyncPolicy(sley_core::fsync::Policy);
 
 impl ReferenceFsyncPolicy {
     fn method_if_enabled(self) -> Option<ReferenceFsyncMethod> {
-        self.0.method_if_enabled(sley_core::fsync::FsyncComponents::REFERENCE)
+        self.0
+            .method_if_enabled(sley_core::fsync::FsyncComponents::REFERENCE)
     }
 }
 
@@ -1092,8 +1093,11 @@ impl FileRefStore {
         core_fsync_method: Option<&str>,
     ) -> Self {
         if core_fsync.is_some() || core_fsync_method.is_some() {
-            self.reference_fsync =
-                ReferenceFsyncPolicy(self.reference_fsync.0.overridden(core_fsync, core_fsync_method));
+            self.reference_fsync = ReferenceFsyncPolicy(
+                self.reference_fsync
+                    .0
+                    .overridden(core_fsync, core_fsync_method),
+            );
         }
         self
     }
@@ -6877,7 +6881,11 @@ mod tests {
         ));
         assert!(refname_pattern_matches_case("release[", "release[", false));
         // `*` spans slashes; `?` is exactly one byte.
-        assert!(refname_pattern_matches_case("*2026.05", "release/2026.05", false));
+        assert!(refname_pattern_matches_case(
+            "*2026.05",
+            "release/2026.05",
+            false
+        ));
         assert!(refname_pattern_matches_case("qa-?", "qa-1", false));
         assert!(!refname_pattern_matches_case("v?.0", "v10.0", false));
         // Bracket classes, ranges, and `!` negation.
@@ -7409,10 +7417,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             .read_reflog("refs/tags/v1.0")
             .expect("test operation should succeed");
         assert_eq!(tag_log.len(), 1);
-        assert_eq!(
-            tag_log[0].old_oid,
-            ObjectId::null(ObjectFormat::Sha1)
-        );
+        assert_eq!(tag_log[0].old_oid, ObjectId::null(ObjectFormat::Sha1));
         assert_eq!(tag_log[0].new_oid, tag_oid);
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }

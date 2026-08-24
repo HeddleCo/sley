@@ -13,7 +13,7 @@ use std::process::Command;
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-use sley_odb::{repository_objects_dir, FileObjectDatabase};
+use sley_odb::{FileObjectDatabase, repository_objects_dir};
 use sley_refs::FileRefStore;
 
 use crate::{parse_reflog_expire_time, read_repo_config, resolve_ref_to_oid, resolve_revision};
@@ -276,8 +276,11 @@ fn recent_objects_hook_command(script: &str) -> Command {
     }
 }
 
-
-pub fn prune_object_is_expired(db: &FileObjectDatabase, oid: &ObjectId, expire: i64) -> Result<bool> {
+pub fn prune_object_is_expired(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+    expire: i64,
+) -> Result<bool> {
     if expire == i64::MIN {
         return Ok(false);
     }
@@ -285,7 +288,11 @@ pub fn prune_object_is_expired(db: &FileObjectDatabase, oid: &ObjectId, expire: 
         return Ok(true);
     }
     let path = db.loose().object_path(oid)?;
-    let Some(mtime) = fs::metadata(path).ok().as_ref().and_then(file_mtime_seconds) else {
+    let Some(mtime) = fs::metadata(path)
+        .ok()
+        .as_ref()
+        .and_then(file_mtime_seconds)
+    else {
         // An object we cannot stat must fail closed toward preservation, the
         // way upstream skips objects whose mtime it cannot read.
         return Ok(false);
@@ -342,7 +349,11 @@ fn file_mtime_seconds(metadata: &fs::Metadata) -> Option<i64> {
         .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
 }
 
-pub fn prune_packed_loose_objects(git_dir: &Path, format: ObjectFormat, dry_run: bool) -> Result<()> {
+pub fn prune_packed_loose_objects(
+    git_dir: &Path,
+    format: ObjectFormat,
+    dry_run: bool,
+) -> Result<()> {
     let objects_dir = repository_objects_dir(git_dir);
     let packed = sley_odb::packed_object_ids(&objects_dir, format)?;
     if packed.is_empty() {

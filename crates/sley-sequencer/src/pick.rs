@@ -19,16 +19,16 @@
 
 use crate::apply::{
     MergePathResult, MergeTreeMap, PromisorObjectFetch, commit_tree_oid, head_commit_oid,
-    merge_index_entry, merge_read_blob_with_fetch, merge_remove_worktree_file,
-    merge_refuse_if_current_working_directory_becomes_file, merge_write_worktree_file,
-    three_way_merge_trees_styled_with_strategy_options,
+    merge_index_entry, merge_read_blob_with_fetch,
+    merge_refuse_if_current_working_directory_becomes_file, merge_remove_worktree_file,
+    merge_write_worktree_file, three_way_merge_trees_styled_with_strategy_options,
 };
 use crate::replay::{self, ReplayAction, ReplayOpts, TodoItem};
 use sley_config::{GitConfig, effective_config_parameters_env};
 use sley_core::{GitError, ObjectId, Result};
 use sley_index::{Index, IndexEntry, is_gitlink};
-use sley_object::{commit_identity_from_env, commit_signoff_from_env};
 use sley_object::{Commit, EncodedObject, ObjectType};
+use sley_object::{commit_identity_from_env, commit_signoff_from_env};
 use sley_odb::{FileObjectDatabase, ObjectReader};
 use sley_pretty::{
     commit_author_for_commit_encoding, commit_encoding_config, commit_encoding_header_from_config,
@@ -105,9 +105,14 @@ fn config_bool(config: &GitConfig, section: &str, key: &str) -> Option<bool> {
     }
 }
 
-fn read_effective_config_value_at_git_dir(git_dir: &Path, section: &str, key: &str) -> Option<String> {
-    let config = sley_config::read_repo_config(git_dir, effective_config_parameters_env().as_deref())
-        .ok()?;
+fn read_effective_config_value_at_git_dir(
+    git_dir: &Path,
+    section: &str,
+    key: &str,
+) -> Option<String> {
+    let config =
+        sley_config::read_repo_config(git_dir, effective_config_parameters_env().as_deref())
+            .ok()?;
     config.get(section, None, key).map(str::to_string)
 }
 
@@ -168,7 +173,6 @@ pub fn strip_comment_string_lines(message: &[u8], comment: &[u8]) -> Vec<u8> {
     }
     cleaned
 }
-
 
 // ---------------------------------------------------------------------------
 // Revision selection
@@ -264,7 +268,12 @@ fn select_revisions(
             .collect::<Result<Vec<_>>>()?;
         let mut excluded = HashSet::new();
         for oid in &options.negatives {
-            for record in sley_rev::revlist::rev_list_walk_commits(db, ctx.format, [*oid], options.first_parent)? {
+            for record in sley_rev::revlist::rev_list_walk_commits(
+                db,
+                ctx.format,
+                [*oid],
+                options.first_parent,
+            )? {
                 excluded.insert(record.oid);
             }
         }
@@ -297,9 +306,10 @@ fn select_revisions(
 
     if !options.author_patterns.is_empty() {
         commits.retain(|oid| {
-            options.author_patterns.iter().all(|pattern| {
-                commit_author_matches(db, ctx.format, oid, pattern).unwrap_or(false)
-            })
+            options
+                .author_patterns
+                .iter()
+                .all(|pattern| commit_author_matches(db, ctx.format, oid, pattern).unwrap_or(false))
         });
     }
     if options.skip > 0 {
@@ -431,11 +441,8 @@ pub fn pick_revisions(
     for oid in &selection.commits {
         items.push(make_todo_item(&ctx.db, ctx.format, ctx.action, oid)?);
     }
-    let advise_skip = ctx
-        .git_dir
-        .join("CHERRY_PICK_HEAD")
-        .exists()
-        || ctx.git_dir.join("REVERT_HEAD").exists();
+    let advise_skip =
+        ctx.git_dir.join("CHERRY_PICK_HEAD").exists() || ctx.git_dir.join("REVERT_HEAD").exists();
     if let Some(in_progress) = replay::in_progress_error(&ctx.git_dir, advise_skip) {
         eprintln!("error: {}", in_progress.error);
         if config_bool(&ctx.config, "advice", "sequencerInUse").unwrap_or(true) {
@@ -501,7 +508,11 @@ fn check_no_unmerged(ctx: &PickContext) -> std::result::Result<(), ReplayHalt> {
         Ok(index) => index,
         Err(err) => return Err(print_fatal_error(err)),
     };
-    if index.entries.iter().any(|entry| index_entry_stage(entry) > 0) {
+    if index
+        .entries
+        .iter()
+        .any(|entry| index_entry_stage(entry) > 0)
+    {
         let verb = match ctx.action {
             ReplayAction::Pick => "Cherry-picking",
             ReplayAction::Revert => "Reverting",
@@ -557,7 +568,10 @@ fn index_tree_oid(ctx: &PickContext) -> Result<ObjectId> {
     sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)
 }
 
-fn original_commit_empty(ctx: &PickContext, commit: &Commit) -> std::result::Result<bool, ReplayHalt> {
+fn original_commit_empty(
+    ctx: &PickContext,
+    commit: &Commit,
+) -> std::result::Result<bool, ReplayHalt> {
     let parent_tree = match commit.parents.first() {
         Some(parent) => commit_tree_oid(&ctx.db, ctx.format, parent).map_err(print_fatal_error)?,
         None => ObjectId::empty_tree(ctx.format),
@@ -665,19 +679,17 @@ fn do_pick_commit(
             }
             msg
         }
-        ReplayAction::Revert => {
-            format_revert_message(
-                &ctx.db,
-                ctx.format,
-                &ctx.git_dir,
-                item,
-                &commit,
-                &subject,
-                parent.as_ref(),
-                opts,
-            )
-            .map_err(print_fatal_error)?
-        }
+        ReplayAction::Revert => format_revert_message(
+            &ctx.db,
+            ctx.format,
+            &ctx.git_dir,
+            item,
+            &commit,
+            &subject,
+            parent.as_ref(),
+            opts,
+        )
+        .map_err(print_fatal_error)?,
     };
     if opts.signoff {
         let signoff = commit_signoff_from_env(&ctx.config).map_err(print_fatal_error)?;
@@ -713,29 +725,27 @@ fn do_pick_commit(
         Some("zdiff3") => sley_diff_merge::ConflictStyle::ZDiff3,
         _ => sley_diff_merge::ConflictStyle::Merge,
     };
-    let (results, conflicts) =
-        three_way_merge_trees_styled_with_strategy_options(
-            &ctx.db,
-            &ctx.config,
-            ctx.format,
-            &base_map,
-            &ours_map,
-            &theirs_map,
-            "HEAD",
-            &theirs_label,
-            &ancestor_label,
-            style,
-            &opts.strategy_options,
-            hosts.promisor_fetch,
-        )
-        .map_err(print_fatal_error)?;
+    let (results, conflicts) = three_way_merge_trees_styled_with_strategy_options(
+        &ctx.db,
+        &ctx.config,
+        ctx.format,
+        &base_map,
+        &ours_map,
+        &theirs_map,
+        "HEAD",
+        &theirs_label,
+        &ancestor_label,
+        style,
+        &opts.strategy_options,
+        hosts.promisor_fetch,
+    )
+    .map_err(print_fatal_error)?;
 
     // Pre-flight worktree clobber checks (unpack_trees' verify steps).
     let target_map = merge_results_to_tree_map(&results);
-    if let Err(err) = merge_refuse_if_current_working_directory_becomes_file(
-        &ctx.worktree_root,
-        &target_map,
-    ) {
+    if let Err(err) =
+        merge_refuse_if_current_working_directory_becomes_file(&ctx.worktree_root, &target_map)
+    {
         return match err {
             GitError::Exit(code) => Err(ReplayHalt::Code(code)),
             other => Err(print_fatal_error(other)),
@@ -797,8 +807,8 @@ fn do_pick_commit(
     // Clean merge: stage the result.
     apply_merge_results_to_index_and_worktree(ctx, hosts, &ours_map, &results)
         .map_err(print_fatal_error)?;
-    let new_tree =
-        sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format).map_err(print_fatal_error)?;
+    let new_tree = sley_worktree::write_tree_from_index(&ctx.git_dir, ctx.format)
+        .map_err(print_fatal_error)?;
 
     if opts.no_commit {
         if action == ReplayAction::Revert {
@@ -860,15 +870,13 @@ fn do_pick_commit(
     let edit = should_edit(ctx.action, opts);
     let source_is_merge = edit;
     message = (hosts.prepare_commit_message)(&ctx.git_dir, message.clone(), source_is_merge, edit)
-        .map_err(
-        |err| {
+        .map_err(|err| {
             // Editor / hook failure cancels the commit but keeps the state files.
             if !matches!(err, GitError::Exit(_)) {
                 eprintln!("error: {err}");
             }
             ReplayHalt::Code(1)
-        },
-    )?;
+        })?;
 
     // Create the commit and advance HEAD.
     let author = match action {
@@ -879,7 +887,8 @@ fn do_pick_commit(
             commit_identity_from_env("AUTHOR", &ctx.config).map_err(print_fatal_error)?
         }
     };
-    let committer = commit_identity_from_env("COMMITTER", &ctx.config).map_err(print_fatal_error)?;
+    let committer =
+        commit_identity_from_env("COMMITTER", &ctx.config).map_err(print_fatal_error)?;
     let reflog_message = format!("{}: {subject}", action.name()).into_bytes();
     let new_oid = commit_and_advance_head(
         ctx,
@@ -970,8 +979,7 @@ fn refer_to_commit(
     let object = db.read_object(oid)?;
     let commit = Commit::parse(format, &object.body)?;
     let subject = commit_subject(&commit.message);
-    let date =
-        sley_ref_filter::commit_identity_date(&commit.author, &sley_core::DateMode::Short);
+    let date = sley_ref_filter::commit_identity_date(&commit.author, &sley_core::DateMode::Short);
     Ok(format!(
         "{} ({subject}, {date})",
         format_log_abbrev_oid(oid)
@@ -1251,7 +1259,11 @@ fn restore_unchanged_sparse_directories(
     format: sley_core::ObjectFormat,
 ) -> Result<()> {
     let mut restored = false;
-    for sparse in physical.entries.iter().filter(|entry| entry.is_sparse_dir()) {
+    for sparse in physical
+        .entries
+        .iter()
+        .filter(|entry| entry.is_sparse_dir())
+    {
         let prefix = sparse.path.as_bytes();
         let expected = sley_diff_merge::flatten_tree(db, format, &sparse.oid)?;
         let actual = index
@@ -1348,9 +1360,7 @@ fn print_empty_halt_advice(ctx: &PickContext) {
     eprintln!("Otherwise, please use 'git {me} --skip'");
 }
 
-pub fn merge_results_to_tree_map(
-    results: &BTreeMap<Vec<u8>, MergePathResult>,
-) -> MergeTreeMap {
+pub fn merge_results_to_tree_map(results: &BTreeMap<Vec<u8>, MergePathResult>) -> MergeTreeMap {
     let mut out = MergeTreeMap::new();
     for (path, result) in results {
         if let MergePathResult::Resolved(Some((mode, oid))) = result {
@@ -1562,7 +1572,11 @@ fn continue_single_pick(
     if let Ok(bytes) = std::fs::read(&index_path) {
         let index = Index::parse(&bytes, ctx.format)?;
         let mut has_unmerged = false;
-        for entry in index.entries.iter().filter(|entry| index_entry_stage(entry) > 0) {
+        for entry in index
+            .entries
+            .iter()
+            .filter(|entry| index_entry_stage(entry) > 0)
+        {
             has_unmerged = true;
             println!("U\t{}", entry.path);
         }
@@ -1641,12 +1655,7 @@ pub fn skip_sequence(ctx: &PickContext, hosts: &mut PickHosts<'_>) -> Result<()>
     }
     // `git reset --merge HEAD` (an unborn HEAD resets to the empty tree).
     let head = ctx.head_oid();
-    reset_merge(
-        ctx,
-        hosts.promisor_fetch,
-        head.as_ref(),
-    )
-    .map_err(|_| {
+    reset_merge(ctx, hosts.promisor_fetch, head.as_ref()).map_err(|_| {
         eprintln!("error: failed to skip the commit");
         fatal_failed(ctx.action)
     })?;

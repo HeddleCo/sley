@@ -20,14 +20,14 @@ use std::process::Command as ProcessCommand;
 use sley_config::{ConfigEntry, ConfigSection, GitConfig};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::CommitGraph;
-use sley_odb::{repository_objects_dir, FileObjectDatabase};
-use sley_odb::ObjectReader as _;
 use sley_object::ObjectType;
+use sley_odb::ObjectReader as _;
+use sley_odb::{FileObjectDatabase, repository_objects_dir};
 use sley_refs::{FileRefStore, RefTarget};
 
-use crate::trace2;
 use crate::prune::parse_prune_expire;
-use crate::{current_unix_seconds, GcServices, parse_reflog_expire_time, repo_object_format};
+use crate::trace2;
+use crate::{GcServices, current_unix_seconds, parse_reflog_expire_time, repo_object_format};
 
 /// The maintenance task names git's `builtin/gc.c` `tasks[]` table recognises,
 /// in declaration order. `--task=<name>` is case-insensitive against this set.
@@ -306,7 +306,11 @@ fn maintenance_run_one(
     }
 }
 
-pub fn maintenance_task_needed(common_git_dir: &Path, config: &GitConfig, task: &str) -> Result<bool> {
+pub fn maintenance_task_needed(
+    common_git_dir: &Path,
+    config: &GitConfig,
+    task: &str,
+) -> Result<bool> {
     Ok(match task {
         "commit-graph" => maintenance_limit_satisfied(
             config,
@@ -830,7 +834,12 @@ pub fn report_missing_maintenance_repo(common_git_dir: &Path) -> bool {
     missing
 }
 
-pub fn config_add_value_if_missing(path: &Path, section: &str, key: &str, value: &str) -> Result<()> {
+pub fn config_add_value_if_missing(
+    path: &Path,
+    section: &str,
+    key: &str,
+    value: &str,
+) -> Result<()> {
     let mut config = if path.exists() {
         GitConfig::read(path)?
     } else {

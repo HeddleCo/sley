@@ -23,20 +23,21 @@ use std::path::{Path, PathBuf};
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::ObjectType;
+use sley_odb::{FileObjectDatabase, collect_reachable_object_ids, repository_objects_dir};
 use sley_odb::{ObjectReader as _, ObjectWriter as _};
-use sley_odb::{collect_reachable_object_ids, repository_objects_dir, FileObjectDatabase};
 use sley_pack::{PackFile, PackInput};
 use sley_refs::FileRefStore;
 
+use crate::count_objects::CountPackStem;
 use crate::prune::{
     parse_prune_expire, prune_empty_loose_object_dirs, prune_object_is_expired,
     prune_packed_loose_objects, prune_recent_hook_roots, prune_recent_object_roots,
 };
 use crate::repack::{
-    is_config_never, parse_cruft_expiration, repack_cruft_with_lazy_recent_hooks, repack_traversal_roots,
+    is_config_never, parse_cruft_expiration, repack_cruft_with_lazy_recent_hooks,
+    repack_traversal_roots,
 };
 use crate::trace2;
-use crate::count_objects::CountPackStem;
 use crate::{GcServices, parse_reflog_expire_time};
 
 #[derive(Debug, Default)]
@@ -70,12 +71,7 @@ pub fn gc_run_locked(
         gc_before_repack(services, git_dir, common_git_dir, format, config)?;
     }
 
-    let roots = repack_traversal_roots(
-        git_dir,
-        common_git_dir,
-        format,
-        services.replace_objects,
-    )?;
+    let roots = repack_traversal_roots(git_dir, common_git_dir, format, services.replace_objects)?;
     let keep_pack_stems = gc_keep_pack_stems(common_git_dir, config, options)?;
     let resolved_max_cruft_size = options
         .max_cruft_size
@@ -329,7 +325,11 @@ pub fn gc_before_repack(
     config: &GitConfig,
 ) -> Result<()> {
     if gc_pack_refs(config, common_git_dir)? {
-        crate::trace_line(services, "builtin/gc.c:0", "trace: built-in: git pack-refs --all --prune");
+        crate::trace_line(
+            services,
+            "builtin/gc.c:0",
+            "trace: built-in: git pack-refs --all --prune",
+        );
         (services.pack_refs_all_prune)()?;
     }
     let reflog_expire_never = is_config_never(config, "gc", "reflogExpire");
@@ -529,14 +529,10 @@ fn gc_unpack_recent_unreachable_from_repack(
             preserve_roots.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
             preserve_roots.dedup();
 
-            sley_odb::collect_reachable_object_ids_tolerating_missing(
-                &db,
-                format,
-                preserve_roots,
-            )?
-            .into_iter()
-            .filter(|oid| !newly_packed.contains(oid))
-            .collect::<Vec<_>>()
+            sley_odb::collect_reachable_object_ids_tolerating_missing(&db, format, preserve_roots)?
+                .into_iter()
+                .filter(|oid| !newly_packed.contains(oid))
+                .collect::<Vec<_>>()
         }
     };
     preserve.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
@@ -1069,8 +1065,7 @@ mod pid_lock_tests {
             return;
         };
         let dir = temp_dir("dead-pid");
-        fs::write(dir.join("gc.pid"), format!("{dead} {host}\n"))
-            .expect("write local gc.pid");
+        fs::write(dir.join("gc.pid"), format!("{dead} {host}\n")).expect("write local gc.pid");
         // A freshly-written file with a dead pid must not wait out the 12h
         // mtime window.
         assert_eq!(gc_acquire_pid_lock(&dir), Ok(GcPidLock::Acquired));
@@ -1091,7 +1086,10 @@ mod pid_lock_tests {
             .expect("write foreign gc.pid");
 
         assert_eq!(gc_acquire_pid_lock(&dir), Ok(GcPidLock::Held));
-        assert!(dir.join("gc.pid").exists(), "foreign lock must be untouched");
+        assert!(
+            dir.join("gc.pid").exists(),
+            "foreign lock must be untouched"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1105,7 +1103,10 @@ mod pid_lock_tests {
         let dir = temp_dir("live-pid");
         fs::write(dir.join("gc.pid"), format!("{live} live-host\n")).expect("write gc.pid");
         assert_eq!(gc_acquire_pid_lock(&dir), Ok(GcPidLock::Held));
-        assert!(dir.join("gc.pid").exists(), "foreign lock must be untouched");
+        assert!(
+            dir.join("gc.pid").exists(),
+            "foreign lock must be untouched"
+        );
         fs::remove_dir_all(&dir).ok();
         child.kill().ok();
         child.wait().ok();

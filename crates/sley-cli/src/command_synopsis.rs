@@ -6,7 +6,7 @@
 // `[synopsis]` block) live in COMMAND_USAGE_OVERRIDES and are rendered through
 // the same option-table machinery as migrated commands.
 
-use sley_options::{OptionSpec, OptFlags, OptValue, usage_with_options};
+use sley_options::{OptFlags, OptValue, OptionSpec, usage_with_options};
 
 /// Command help that cannot be generated from Documentation's modern
 /// `[synopsis]`/`[verse]` blocks. These legacy credential pages describe helper

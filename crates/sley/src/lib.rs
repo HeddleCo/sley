@@ -172,13 +172,13 @@ pub use sley_refs::{
     FileRefStore as RefStore, RefDeleteError, RefPrecondition, RefTarget as ReferenceTarget,
 };
 pub use sley_sequencer::TagCreate;
+use sley_worktree::discovery::ownership as discovery_ownership;
+use sley_worktree::discovery::{is_git_dir, read_gitdir_link};
 pub use sley_worktree::{
     AtomicMetadataWriteOptions, AtomicMetadataWriteResult, IndexStatProbe, IndexStatProbeCache,
     ShortStatusEntry, ShortStatusOptions, ShortStatusRow, StatusIgnoredMode, StatusUntrackedMode,
     SubmoduleStatus, WorktreeEntryState, write_metadata_file_atomic,
 };
-use sley_worktree::discovery::ownership as discovery_ownership;
-use sley_worktree::discovery::{is_git_dir, read_gitdir_link};
 
 pub use capabilities::RepositoryCapabilities;
 pub use config_edit::{
@@ -711,10 +711,7 @@ impl Repository {
     ///   allow-listed;
     /// * `safe.bareRepository` — in `explicit` mode, refuse implicitly
     ///   discovered standalone bare repositories.
-    pub fn discover_with_policy(
-        path: impl AsRef<Path>,
-        policy: &DiscoveryPolicy,
-    ) -> Result<Self> {
+    pub fn discover_with_policy(path: impl AsRef<Path>, policy: &DiscoveryPolicy) -> Result<Self> {
         let git_dir = discover_git_dir(path.as_ref(), false)?;
         if policy.safe_bare_repository && !discovery_ownership::is_implicit_bare_repo(&git_dir) {
             discovery_ownership::note_implicit_bare_repository(&git_dir)?;

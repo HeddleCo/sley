@@ -88,9 +88,9 @@ impl CommitMetadataCache {
                 },
             );
         }
-        self.commits.get(oid).ok_or_else(|| {
-            GitError::InvalidObject(format!("commit metadata missing for {oid}"))
-        })
+        self.commits
+            .get(oid)
+            .ok_or_else(|| GitError::InvalidObject(format!("commit metadata missing for {oid}")))
     }
 }
 

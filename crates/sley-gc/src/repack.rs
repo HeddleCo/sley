@@ -14,20 +14,22 @@ use regex::Regex;
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::ObjectType;
-use sley_odb::{repository_objects_dir, FileObjectDatabase};
 use sley_odb::ObjectReader as _;
+use sley_odb::{FileObjectDatabase, repository_objects_dir};
 use sley_pack::{MultiPackIndex, PackWriteOptions};
 use sley_refs::{FileRefStore, RefTarget};
 
 use crate::gc::parse_gc_size;
 use crate::midx;
 use crate::prune::{
-    prune_head_root, prune_recent_hook_roots, prune_repack_shallow_file,
-    prune_packed_loose_objects, prune_worktree_git_dirs, reflog_roots_from_dir,
+    prune_head_root, prune_packed_loose_objects, prune_recent_hook_roots,
+    prune_repack_shallow_file, prune_worktree_git_dirs, reflog_roots_from_dir,
 };
 use crate::trace2::{self, perf_data};
-use crate::{common_git_dir_for_git_dir, GcServices, read_repo_config, repo_object_format, resolve_ref_to_oid, resolve_revision};
-
+use crate::{
+    GcServices, common_git_dir_for_git_dir, read_repo_config, repo_object_format,
+    resolve_ref_to_oid, resolve_revision,
+};
 
 /// The commit oids that get bitmap selection preference, mirroring upstream's
 /// `NEEDS_BITMAP` marking: tips of refs under the `pack.preferBitmapTips`
@@ -522,8 +524,7 @@ fn repack_try_update_server_info_from_result(
         info_refs.push(b'\n');
     }
 
-    let shared_repository =
-        sley_formats::SharedRepositoryPermissions::from_git_dir(common_git_dir);
+    let shared_repository = sley_formats::SharedRepositoryPermissions::from_git_dir(common_git_dir);
     let info_dir = common_git_dir.join("info");
     shared_repository.create_dir_all(&info_dir)?;
     repack_write_server_info_file(&info_dir.join("refs"), &info_refs, &shared_repository)?;
@@ -600,7 +601,9 @@ pub(crate) fn validate_repack_cruft_numeric_config(config: &GitConfig) -> Result
         match sley_config::typed::classify_config_i32(value) {
             Ok(_) => {}
             Err(sley_config::typed::BadNumericKind::InvalidUnit) => {
-                eprintln!("error: option `{option}' expects an integer value with an optional k/m/g suffix");
+                eprintln!(
+                    "error: option `{option}' expects an integer value with an optional k/m/g suffix"
+                );
                 return Err(GitError::Exit(129));
             }
             Err(_) => {
@@ -691,7 +694,12 @@ pub fn run_geometric(
             if write_bitmaps {
                 midx_args.push("--bitmap".to_string());
             }
-            midx::write_with_pack_names(Path::new("."), common_git_dir, &midx_args, Some(selection.pack_names))?;
+            midx::write_with_pack_names(
+                Path::new("."),
+                common_git_dir,
+                &midx_args,
+                Some(selection.pack_names),
+            )?;
         }
         return Ok(());
     }
@@ -726,7 +734,12 @@ pub fn run_geometric(
         if let Some(preferred) = selection.preferred_pack_name {
             midx_args.push(format!("--preferred-pack={preferred}"));
         }
-        midx::write_with_pack_names(Path::new("."), common_git_dir, &midx_args, Some(selection.pack_names))?;
+        midx::write_with_pack_names(
+            Path::new("."),
+            common_git_dir,
+            &midx_args,
+            Some(selection.pack_names),
+        )?;
     }
     let _ = git_dir;
     Ok(())
@@ -781,8 +794,7 @@ pub fn run_cruft(
     cruft_window: usize,
     combine_cruft_below_size: Option<u64>,
 ) -> Result<()> {
-    let roots =
-        repack_traversal_roots(git_dir, common_git_dir, format, replace_objects)?;
+    let roots = repack_traversal_roots(git_dir, common_git_dir, format, replace_objects)?;
     let keep_pack_stems: HashSet<String> = keep_packs.iter().cloned().collect();
     let options = sley_odb::RepackOptions {
         local,
@@ -1335,12 +1347,7 @@ pub fn run_repack(
             )?,
         }
     } else {
-        let roots = repack_traversal_roots(
-            git_dir,
-            &common_git_dir,
-            format,
-            replace_objects,
-        )?;
+        let roots = repack_traversal_roots(git_dir, &common_git_dir, format, replace_objects)?;
         sley_odb::repack_reachable_loose_objects(&common_git_dir, format, &roots)?
     };
     let mut loose_prune_complete = false;
@@ -1433,7 +1440,9 @@ mod tests {
                 extensions,
                 checksum: None,
             };
-            let bytes = index.write(format).expect("write malformed extension fixture");
+            let bytes = index
+                .write(format)
+                .expect("write malformed extension fixture");
             let path = std::env::temp_dir().join(format!(
                 "sley-gc-index-extension-{}-{}",
                 std::process::id(),

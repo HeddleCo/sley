@@ -49,7 +49,10 @@ struct BlamePrefetchReader<'a> {
 }
 
 impl BlameObjectSource for BlamePrefetchReader<'_> {
-    fn read_blame_object(&self, oid: &ObjectId) -> Result<std::sync::Arc<sley_object::EncodedObject>> {
+    fn read_blame_object(
+        &self,
+        oid: &ObjectId,
+    ) -> Result<std::sync::Arc<sley_object::EncodedObject>> {
         read_object_maybe_prefetch_promisor(self.db, oid, self.lazy_fetch)
     }
 }
@@ -354,26 +357,16 @@ fn run_blame(
         // `cached_blob` produces. `--contents` is always a regular-file image.
         let (raw, mode) = match &options.contents_from {
             Some(spec) => (read_contents_file(cwd, spec)?, 0o100644),
-            None => read_worktree_image(
-                db,
-                format,
-                &repo,
-                &start_commit,
-                &repo_path,
-                &blame_reader,
-            )?,
+            None => {
+                read_worktree_image(db, format, &repo, &start_commit, &repo_path, &blame_reader)?
+            }
         };
         let blob = textconv.convert(&repo_path, mode, raw)?;
         // The porcelain `previous` pointer is the real parent when it has the
         // path; a brand-new (only-staged) file has no such parent.
-        let previous = sley_rev::blame::read_path_blob(
-            db,
-            format,
-            &start_commit,
-            &repo_path,
-            &blame_reader,
-        )?
-        .map(|_| (start_commit, repo_path.clone()));
+        let previous =
+            sley_rev::blame::read_path_blob(db, format, &start_commit, &repo_path, &blame_reader)?
+                .map(|_| (start_commit, repo_path.clone()));
         let (name, email) = if options.contents_from.is_some() {
             (
                 "External file (--contents)".to_string(),
@@ -401,13 +394,8 @@ fn run_blame(
     } else {
         // No fake commit: read the final image straight from the start rev's tree
         // and convert it through textconv, matching the committed-blob path.
-        match sley_rev::blame::read_path_blob(
-            db,
-            format,
-            &start_commit,
-            &repo_path,
-            &blame_reader,
-        )? {
+        match sley_rev::blame::read_path_blob(db, format, &start_commit, &repo_path, &blame_reader)?
+        {
             Some((blob, mode)) => (textconv.convert(&repo_path, mode, blob)?, false, None),
             None => {
                 // git reports the repository-relative path here, not the literal
@@ -1152,8 +1140,7 @@ fn read_index_blob(
     }) else {
         return Ok(None);
     };
-    let object =
-        read_object_maybe_prefetch_promisor(db, &entry.oid, reader.lazy_fetch)?;
+    let object = read_object_maybe_prefetch_promisor(db, &entry.oid, reader.lazy_fetch)?;
     if object.object_type != ObjectType::Blob {
         return Ok(None);
     }
@@ -1325,8 +1312,7 @@ fn read_worktree_image(
     // fatal, even when a file by that name exists on disk. An unmerged path
     // (stages 1/2/3, no stage 0) still counts as known, so a conflicted file
     // blames against HEAD rather than erroring.
-    let committed =
-        sley_rev::blame::read_path_blob(db, format, start_commit, repo_path, reader)?;
+    let committed = sley_rev::blame::read_path_blob(db, format, start_commit, repo_path, reader)?;
     let in_index = path_in_index_any_stage(repo.git_dir(), format, repo_path)?;
     if committed.is_none() && !in_index {
         eprintln!("fatal: no such path '{repo_path}' in HEAD");
@@ -1406,8 +1392,7 @@ fn read_worktree_image(
     }
     // A non-regular path that was present but unreadable can still be supplied
     // by the staged image, then by the committed image.
-    if let Some((blob, mode)) = read_index_blob(repo.git_dir(), db, format, repo_path, reader)?
-    {
+    if let Some((blob, mode)) = read_index_blob(repo.git_dir(), db, format, repo_path, reader)? {
         return Ok((blob, mode));
     }
     if let Some((blob, mode)) = committed {

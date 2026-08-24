@@ -56,7 +56,10 @@ fn stdout_trimmed(output: &Output) -> String {
 fn init_repo(root: &Path, name: &str) -> PathBuf {
     let repo = root.join(name);
     fs::create_dir_all(&repo).expect("create repo dir");
-    git_ok(root, &["init", "-q", "-b", "main", repo.to_str().expect("utf8")]);
+    git_ok(
+        root,
+        &["init", "-q", "-b", "main", repo.to_str().expect("utf8")],
+    );
     fs::write(repo.join("base.txt"), b"base\n").expect("write base file");
     git_ok(&repo, &["add", "base.txt"]);
     git_ok(&repo, &["commit", "-q", "-m", "base"]);
@@ -116,7 +119,15 @@ fn repack_all_keeps_linked_worktree_detached_head_commit() {
     let repo = init_repo(&root, "repo");
 
     let worktree_b = root.join("worktree-b");
-    git_ok(&repo, &["worktree", "add", "--detach", worktree_b.to_str().expect("utf8")]);
+    git_ok(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            worktree_b.to_str().expect("utf8"),
+        ],
+    );
 
     // Commit X exists only in worktree B's detached HEAD.
     fs::write(worktree_b.join("only-in-b.txt"), b"precious\n").expect("write file");
@@ -169,7 +180,12 @@ fn repack_all_keeps_staged_blob_of_linked_worktree() {
     let blob_oid = write_blob(&worktree_b, b"staged only in worktree b\n");
     git_ok(
         &worktree_b,
-        &["update-index", "--add", "--cacheinfo", &format!("100644,{blob_oid},staged.txt")],
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob_oid},staged.txt"),
+        ],
     );
     // Only copy of the blob lives in a pack now.
     isolate_blob_in_pack(&repo, &blob_oid);
@@ -317,11 +333,8 @@ fn gc_default_still_expires_old_unreachable_packed_objects() {
         .expect("clock after epoch")
         .as_secs() as i64
         - 30 * 24 * 3600;
-    filetime::set_file_mtime(
-        &pack_path,
-        filetime::FileTime::from_unix_time(stamp, 0),
-    )
-    .expect("backdate pack mtime");
+    filetime::set_file_mtime(&pack_path, filetime::FileTime::from_unix_time(stamp, 0))
+        .expect("backdate pack mtime");
 
     git_ok(&repo, &["config", "gc.cruftPacks", "false"]);
     success(sley_testkit::sley_bin!(), &repo, &["gc"]);
@@ -383,7 +396,10 @@ fn gc_pid_lock_liveness_and_recovery() {
     let local_host = sley_procinfo::hostname().expect("test platform hostname");
 
     // Crashed holder: dead-but-recorded pid recovers without waiting 12h.
-    let mut crashed = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
+    let mut crashed = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
     let dead_pid = crashed.id();
     crashed.kill().expect("kill sleep");
     crashed.wait().expect("reap sleep");
@@ -396,7 +412,10 @@ fn gc_pid_lock_liveness_and_recovery() {
     );
 
     // Live holder: manual gc refuses, foreign file untouched, --force proceeds.
-    let mut live = Command::new("sleep").arg("60").spawn().expect("spawn sleep");
+    let mut live = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn sleep");
     let live_pid = live.id();
     fs::write(&pid_file, format!("{live_pid} {local_host}\n")).expect("write live gc.pid");
 

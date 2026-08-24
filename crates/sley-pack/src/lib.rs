@@ -4,9 +4,9 @@
 
 use flate2::{Compress, Compression, FlushCompress, Status};
 use sley_core::{
-    primitives::{u16_be, u32_be, u64_be},
     ByteBudget, CancelFlag, GitError, ObjectFormat, ObjectId, ResourceLimitKind, Result,
     StreamingDigest,
+    primitives::{u16_be, u32_be, u64_be},
 };
 use sley_formats::Bundle;
 use sley_object::{EncodedObject, ObjectType};

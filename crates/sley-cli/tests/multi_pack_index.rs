@@ -879,7 +879,11 @@ fn multi_pack_index_expire_deletes_nothing_when_midx_rewrite_fails() {
         let full_idx_name = {
             let mut idx_names: Vec<String> = fs::read_dir(&pack_dir)
                 .expect("read pack dir")
-                .filter_map(|entry| entry.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                .filter_map(|entry| {
+                    entry
+                        .ok()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                })
                 .filter(|name| name.ends_with(".idx"))
                 .collect();
             idx_names.sort();

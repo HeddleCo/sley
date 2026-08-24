@@ -66,9 +66,9 @@ pub fn sq_quote(arg: &str) -> String {
 /// Convenience wrapper around [`sq_quote_buf_pretty`] for UTF-8 arguments.
 pub fn sq_quote_pretty(arg: &str) -> String {
     if !arg.is_empty()
-        && arg.bytes().all(
-            |byte| byte.is_ascii_alphanumeric() || PRETTY_SAFE_PUNCT.contains(&byte),
-        )
+        && arg
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || PRETTY_SAFE_PUNCT.contains(&byte))
     {
         return arg.to_string();
     }
@@ -121,7 +121,8 @@ impl PercentEncodeMode {
     fn allows(self, byte: u8) -> bool {
         match self {
             Self::Field => {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'~' | b'/' | b':' | b'-')
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'_' | b'.' | b'~' | b'/' | b':' | b'-')
             }
             Self::OptionalField => Self::Field.allows(byte) || byte == b'=',
         }
@@ -217,7 +218,11 @@ mod tests {
         assert_eq!(sq_quote_pretty("aBc123"), "aBc123");
         for punct in "+,-./:=@_^".chars() {
             let token = punct.to_string();
-            assert_eq!(sq_quote_pretty(&token), token, "punct {punct} should stay bare");
+            assert_eq!(
+                sq_quote_pretty(&token),
+                token,
+                "punct {punct} should stay bare"
+            );
         }
     }
 
@@ -237,7 +242,14 @@ mod tests {
     fn buf_and_str_variants_agree() {
         let to_string = |bytes: Vec<u8>| String::from_utf8(bytes).ok();
         for arg in [
-            "", "plain", "v!1", "it's", "a b", "+,-./:=@_^", "café", "back\\slash",
+            "",
+            "plain",
+            "v!1",
+            "it's",
+            "a b",
+            "+,-./:=@_^",
+            "café",
+            "back\\slash",
         ] {
             let mut bytes = Vec::new();
             sq_quote_buf_pretty(&mut bytes, arg.as_bytes());
@@ -258,7 +270,10 @@ mod tests {
 
     #[test]
     fn argv_helpers_space_prefix_each_argument() {
-        assert_eq!(sq_quote_argv(&["git".into(), "log --oneline".into()]), " 'git' 'log --oneline'");
+        assert_eq!(
+            sq_quote_argv(&["git".into(), "log --oneline".into()]),
+            " 'git' 'log --oneline'"
+        );
         assert_eq!(
             sq_quote_argv_pretty(&["git".into(), "log".into(), "v!1".into(), "".into()]),
             "git log 'v'\\!'1' ''"
@@ -275,7 +290,15 @@ mod tests {
         // sq-quoted words are consumed by a single shell parse (this is how
         // git splices them into shell command lines), so the quoted text is
         // passed as part of one `sh -c` program — no extra eval layer.
-        for value in ["plain", "v!1", "it's", "a b", "back\\slash", "$HOME", "`id`"] {
+        for value in [
+            "plain",
+            "v!1",
+            "it's",
+            "a b",
+            "back\\slash",
+            "$HOME",
+            "`id`",
+        ] {
             let quoted = sq_quote(value);
             let script = format!("printf %s {quoted}");
             let output = Command::new("sh")
@@ -331,10 +354,7 @@ mod tests {
 
     #[test]
     fn percent_decode_is_strict_and_case_insensitive() {
-        assert_eq!(
-            percent_decode(b"plain").as_deref(),
-            Ok(b"plain".as_slice())
-        );
+        assert_eq!(percent_decode(b"plain").as_deref(), Ok(b"plain".as_slice()));
         assert_eq!(percent_decode(b"%41%62").as_deref(), Ok(b"Ab".as_slice()));
         assert_eq!(percent_decode(b"a%20b").as_deref(), Ok(b"a b".as_slice()));
         assert_eq!(

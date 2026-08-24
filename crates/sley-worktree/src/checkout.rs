@@ -4062,9 +4062,7 @@ pub fn write_metadata_file_atomic(
     }
     if options.fsync_file {
         let barrier = match options.fsync_policy {
-            Some(policy) => {
-                policy.apply(&lock, sley_core::fsync::FsyncComponents::REFERENCE)
-            }
+            Some(policy) => policy.apply(&lock, sley_core::fsync::FsyncComponents::REFERENCE),
             None => lock.sync_all(),
         };
         if let Err(err) = barrier {

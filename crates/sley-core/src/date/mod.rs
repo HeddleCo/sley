@@ -177,7 +177,10 @@ mod tests {
 
     #[test]
     fn embedded_timezone_suffixes() {
-        assert_eq!(split_embedded_timezone("00:00:01Z"), ("00:00:01", Some("+0000")));
+        assert_eq!(
+            split_embedded_timezone("00:00:01Z"),
+            ("00:00:01", Some("+0000"))
+        );
         assert_eq!(
             split_embedded_timezone("03:04:05+0100"),
             ("03:04:05", Some("+0100"))

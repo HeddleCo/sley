@@ -689,11 +689,8 @@ fn backdate_mtime(path: &Path, hours_ago: i64) {
         .expect("system time")
         .as_secs() as i64
         - hours_ago * 3600;
-    filetime::set_file_mtime(
-        path,
-        filetime::FileTime::from_unix_time(stamp, 0),
-    )
-    .expect("backdate mtime");
+    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(stamp, 0))
+        .expect("backdate mtime");
 }
 
 /// A failing task must not leak maintenance.lock: after one failed run, the
@@ -707,15 +704,19 @@ fn maintenance_lock_removed_when_task_fails() {
     let repo = root.join("repo");
     git_ok(
         &root,
-        &[
-            "init",
-            "-q",
-            repo.to_str().expect("utf8 repository path"),
-        ],
+        &["init", "-q", repo.to_str().expect("utf8 repository path")],
     );
     commit_base_files(&repo);
     // A remote pointing nowhere makes the prefetch child fail hard.
-    git_ok(&repo, &["remote", "add", "origin", "/nonexistent/sley-no-such-remote"]);
+    git_ok(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "/nonexistent/sley-no-such-remote",
+        ],
+    );
 
     let out = sley(&repo, &["maintenance", "run", "--task=prefetch"]);
     assert!(
@@ -748,11 +749,7 @@ fn maintenance_stale_lock_is_recovered_fresh_lock_refused() {
     let repo = root.join("repo");
     git_ok(
         &root,
-        &[
-            "init",
-            "-q",
-            repo.to_str().expect("utf8 repository path"),
-        ],
+        &["init", "-q", repo.to_str().expect("utf8 repository path")],
     );
     commit_base_files(&repo);
     let lock = repo.join(".git").join("objects").join("maintenance.lock");
@@ -788,8 +785,7 @@ fn maintenance_stale_lock_is_recovered_fresh_lock_refused() {
         "explicit run unexpectedly succeeded against a live lock"
     );
     assert!(
-        String::from_utf8_lossy(&out.stderr)
-            .contains("'maintenance' lock held by another process"),
+        String::from_utf8_lossy(&out.stderr).contains("'maintenance' lock held by another process"),
         "unexpected stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -807,11 +803,7 @@ fn maintenance_schedule_lock_is_recovered_when_stale() {
     let repo = root.join("repo");
     git_ok(
         &root,
-        &[
-            "init",
-            "-q",
-            repo.to_str().expect("utf8 repository path"),
-        ],
+        &["init", "-q", repo.to_str().expect("utf8 repository path")],
     );
     let lock = repo.join(".git").join("objects").join("schedule.lock");
 
@@ -857,9 +849,8 @@ fn maintenance_schedule_lock_is_recovered_when_stale() {
         "fresh schedule.lock did not block registration"
     );
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains(
-            "Another scheduled git-maintenance(1) process seems to be running"
-        ),
+        String::from_utf8_lossy(&out.stderr)
+            .contains("Another scheduled git-maintenance(1) process seems to be running"),
         "unexpected stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -887,12 +878,12 @@ fn maintenance_loose_objects_auto_triggers_on_sha256_repo() {
         ],
     );
     commit_base_files(&repo);
-    git_ok(
-        &repo,
-        &["config", "maintenance.loose-objects.auto", "1"],
-    );
+    git_ok(&repo, &["config", "maintenance.loose-objects.auto", "1"]);
 
-    let out = sley(&repo, &["maintenance", "run", "--auto", "--task=loose-objects"]);
+    let out = sley(
+        &repo,
+        &["maintenance", "run", "--auto", "--task=loose-objects"],
+    );
     assert!(
         out.status.success(),
         "sha256 loose-objects maintenance failed: {}",

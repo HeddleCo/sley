@@ -19,7 +19,9 @@ use std::path::Path;
 // Commit authoring primitives (`CommitCreate`, identity formatting, body
 // serialization) are canonical in `sley_object` next to `Commit`; these
 // re-exports keep every historical `sley_sequencer::*` path working.
-pub use sley_object::{CommitCreate, encode_commit_object, format_commit_identity, format_commit_identity_bytes};
+pub use sley_object::{
+    CommitCreate, encode_commit_object, format_commit_identity, format_commit_identity_bytes,
+};
 
 // Stage-B prerequisites: the patch/conflict primitives the inbound
 // rebase/am/cherry-pick drive loops consume (21+ refs live in the CLI's

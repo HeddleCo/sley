@@ -1009,7 +1009,8 @@ fn percent_decode_remote_path(value: &str) -> Result<String> {
     let decoded = sley_core::text::percent_decode(value.as_bytes()).map_err(|_| {
         GitError::InvalidFormat(format!("invalid percent-encoded remote path {value:?}"))
     })?;
-    let decoded = String::from_utf8(decoded).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+    let decoded =
+        String::from_utf8(decoded).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
     validate_remote_path("remote path", &decoded)?;
     Ok(decoded)
 }

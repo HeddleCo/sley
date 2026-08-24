@@ -15,13 +15,11 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-use sley_odb::{
-    repository_objects_dir, FileObjectDatabase,
-};
 use sley_odb::ObjectReader as _;
+use sley_odb::{FileObjectDatabase, repository_objects_dir};
 use sley_pack::{
-    pack_order_index_positions, MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex,
-    PackReverseIndex, PackWriteLimits, PackWriteOptions,
+    MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex, PackReverseIndex, PackWriteLimits,
+    PackWriteOptions, pack_order_index_positions,
 };
 
 const MULTI_PACK_INDEX_USAGE: &str = "\n";
@@ -682,11 +680,7 @@ fn clear_incremental_midx_sidecars(pack_dir: &Path, format: ObjectFormat) -> Res
     Ok(())
 }
 
-pub fn compact(
-    cwd: &Path,
-    git_dir: &Path,
-    args: &[String],
-) -> Result<()> {
+pub fn compact(cwd: &Path, git_dir: &Path, args: &[String]) -> Result<()> {
     let format = repo_object_format(git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     let mut write_bitmap = false;
@@ -986,11 +980,7 @@ fn pack_is_cruft(pack_dir: &Path, idx_name: &str) -> bool {
     pack_dir.join(idx_name).with_extension("mtimes").exists()
 }
 
-pub fn repack(
-    cwd: &Path,
-    git_dir: &Path,
-    args: &[String],
-) -> Result<()> {
+pub fn repack(cwd: &Path, git_dir: &Path, args: &[String]) -> Result<()> {
     let format = repo_object_format(git_dir)?;
     let (object_dir, progress, batch_size) =
         parse_midx_object_dir_and_progress(args, cwd, git_dir, "repack")?;
@@ -1141,11 +1131,7 @@ pub fn repack(
     write_default_midx(&object_dir, format, &[])
 }
 
-pub fn verify(
-    cwd: &Path,
-    git_dir: &Path,
-    args: &[String],
-) -> Result<()> {
+pub fn verify(cwd: &Path, git_dir: &Path, args: &[String]) -> Result<()> {
     let format = repo_object_format(git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     // Upstream defaults progress to a tty heuristic; when stderr is not a tty
@@ -1189,11 +1175,7 @@ pub fn verify(
 /// `die()`/`error()` strings; verify-time corruptions (incorrect checksum,
 /// failed pack load, no oid, oid lookup order, incorrect object offset) are
 /// reported the way upstream's verify pass reports them.
-pub fn verify_midx_at(
-    object_dir: &Path,
-    format: ObjectFormat,
-    progress: bool,
-) -> Result<()> {
+pub fn verify_midx_at(object_dir: &Path, format: ObjectFormat, progress: bool) -> Result<()> {
     let pack_dir = object_dir.join("pack");
     let midx_path = pack_dir.join("multi-pack-index");
     let bytes = match fs::read(&midx_path) {
@@ -1432,7 +1414,9 @@ fn parse_midx_for_verify(
     if oidf.len() != 256 * 4 {
         return Err("multi-pack-index OID fanout is of the wrong size".to_string());
     }
-    let fanout: Vec<u32> = (0..256).map(|i| sley_core::primitives::u32_be(&oidf[i * 4..i * 4 + 4])).collect();
+    let fanout: Vec<u32> = (0..256)
+        .map(|i| sley_core::primitives::u32_be(&oidf[i * 4..i * 4 + 4]))
+        .collect();
     for i in 0..255 {
         if fanout[i] > fanout[i + 1] {
             return Err(format!(
@@ -1504,11 +1488,7 @@ fn parse_midx_for_verify(
     })
 }
 
-pub fn expire(
-    cwd: &Path,
-    git_dir: &Path,
-    args: &[String],
-) -> Result<()> {
+pub fn expire(cwd: &Path, git_dir: &Path, args: &[String]) -> Result<()> {
     let format = repo_object_format(git_dir)?;
     let (object_dir, progress, _) =
         parse_midx_object_dir_and_progress(args, cwd, git_dir, "expire")?;

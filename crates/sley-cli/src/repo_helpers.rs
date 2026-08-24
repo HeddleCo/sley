@@ -123,8 +123,10 @@ fn multi_pack_index_object_count(path: &Path, format: ObjectFormat) -> Result<Op
 
 fn pack_index_object_count(path: &Path, format_hash: ObjectFormat) -> Result<u32> {
     let bytes = fs::read(path)?;
-    let index =
-        sley::plumbing::sley_pack::PackIndexView::parse_trusted_without_checksum(&bytes, format_hash)?;
+    let index = sley::plumbing::sley_pack::PackIndexView::parse_trusted_without_checksum(
+        &bytes,
+        format_hash,
+    )?;
     Ok(index.count() as u32)
 }
 pub(crate) fn worktree_root_for_git_dir(

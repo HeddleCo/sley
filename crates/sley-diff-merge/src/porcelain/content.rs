@@ -4,8 +4,8 @@
 use super::options::{DiffWorktreeCleanContext, LazyObjectFetch};
 use super::{LineStats, NameStatus, NameStatusEntry, StatEntry};
 use sley_core::{GitError, ObjectId, Result};
-use sley_odb::{FileObjectDatabase, ObjectReader};
 use sley_object::{EncodedObject, ObjectType};
+use sley_odb::{FileObjectDatabase, ObjectReader};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -162,10 +162,7 @@ pub fn count_line_diff(old: &[u8], new: &[u8]) -> (usize, usize) {
     (inserted, deleted)
 }
 
-fn trivial_lcs_len(
-    old: &[crate::DiffLine<'_>],
-    new: &[crate::DiffLine<'_>],
-) -> Option<usize> {
+fn trivial_lcs_len(old: &[crate::DiffLine<'_>], new: &[crate::DiffLine<'_>]) -> Option<usize> {
     if old.is_empty() || new.is_empty() {
         return Some(0);
     }
@@ -178,10 +175,7 @@ fn trivial_lcs_len(
     None
 }
 
-fn diff_lines_have_any_common(
-    old: &[crate::DiffLine<'_>],
-    new: &[crate::DiffLine<'_>],
-) -> bool {
+fn diff_lines_have_any_common(old: &[crate::DiffLine<'_>], new: &[crate::DiffLine<'_>]) -> bool {
     let (small, large) = if old.len() <= new.len() {
         (old, new)
     } else {
@@ -481,12 +475,11 @@ pub fn diff_entry_produces_output(
             .iter()
             .any(|re| re.is_match_with_case(line, false))
     });
-    let change_ignore = (ignore_blank_lines || !ignore_regexes.is_empty()).then(|| {
-        crate::render::ChangeIgnore {
+    let change_ignore =
+        (ignore_blank_lines || !ignore_regexes.is_empty()).then(|| crate::render::ChangeIgnore {
             ignore_blank_lines,
             regex_match: regex_match.as_ref().map(|f| f as &dyn Fn(&[u8]) -> bool),
-        }
-    });
+        });
     let mut probe_options = crate::render::HunkRenderOptions {
         context,
         interhunk,

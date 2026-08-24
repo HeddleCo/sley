@@ -4,8 +4,8 @@ use super::contents::{ForEachRefContents, ForEachRefPeeledObject};
 use super::tracking::{ForEachRefPush, ForEachRefUpstream};
 use super::{ForEachRefQuoteMode, ForEachRefTrack, shorten_unambiguous_ref};
 use sley_core::{ObjectFormat, ObjectId};
-use sley_odb::FileObjectDatabase;
 use sley_object::ObjectType;
+use sley_odb::FileObjectDatabase;
 use std::collections::HashSet;
 use std::path::Path;
 

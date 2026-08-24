@@ -675,9 +675,7 @@ fn git_protocol_v2_fetch_into_repository(
             local_db,
             request.max_input_size,
             cancel,
-            Some(&mut |chunk: &[u8]| {
-                emit_remote_sideband_progress(&mut *progress, chunk)
-            }),
+            Some(&mut |chunk: &[u8]| emit_remote_sideband_progress(&mut *progress, chunk)),
         )?
     } else {
         let installer = ProgressInstaller::new(local_db, progress);

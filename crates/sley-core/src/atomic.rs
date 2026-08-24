@@ -15,7 +15,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::{fsync, GitError, Result};
+use crate::{GitError, Result, fsync};
 
 /// Lock path for `path`: the file name suffixed `.lock` in the same directory
 /// (git's lockfile convention, e.g. `packed-refs` -> `packed-refs.lock`).
@@ -97,7 +97,11 @@ impl LockFile {
     /// Apply `policy`'s barrier for `component` to the lock handle. No-op
     /// when the policy excludes the component or the test switch disables
     /// syncing.
-    pub fn sync(&mut self, policy: &fsync::Policy, component: fsync::FsyncComponents) -> Result<()> {
+    pub fn sync(
+        &mut self,
+        policy: &fsync::Policy,
+        component: fsync::FsyncComponents,
+    ) -> Result<()> {
         let Some(file) = self.file.as_mut() else {
             return Err(GitError::Io("lock file is already closed".into()));
         };

@@ -847,7 +847,10 @@ fn checkout_df_transition_honors_common_info_exclude_in_linked_worktree() {
         git(repo, &["checkout", "-q", "main"]);
 
         let linked_arg = linked.to_str().expect("linked worktree path utf8");
-        git(repo, &["worktree", "add", "-q", "--detach", linked_arg, "main"]);
+        git(
+            repo,
+            &["worktree", "add", "-q", "--detach", linked_arg, "main"],
+        );
         fs::write(repo.join(".git/info/exclude"), b"*.log\n").expect("write common exclude");
         fs::write(linked.join("dir/cache.log"), b"ignored\n").expect("write ignored file");
     };

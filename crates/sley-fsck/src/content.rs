@@ -752,7 +752,10 @@ pub fn hash_format_check(
     } else {
         !findings.is_empty()
     };
-    HashFormatCheckReport { diagnostics: findings, refuse }
+    HashFormatCheckReport {
+        diagnostics: findings,
+        refuse,
+    }
 }
 
 /// Reproduce `fsck_tag_standalone`'s return-value bookkeeping for the

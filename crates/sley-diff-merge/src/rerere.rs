@@ -225,7 +225,10 @@ fn do_rerere_one_path(
             if let Some(stage_resolved) = hooks.stage_resolved {
                 stage_resolved(git_dir, worktree_root, format, &entry.path)?;
             }
-            reporter.report(&format!("Staged '{}' using previous resolution.", entry.path));
+            reporter.report(&format!(
+                "Staged '{}' using previous resolution.",
+                entry.path
+            ));
             entry.variant = u32::MAX;
         } else {
             reporter.report(&format!(
@@ -1001,9 +1004,7 @@ pub fn rerere_forget(
             let cache_dir = rr_cache.join(&entry.hash);
             let postimage = rerere_cache_file_path(&cache_dir, entry.variant, "postimage");
             if !postimage.is_file() {
-                reporter.report(&format!(
-                    "error: no remembered resolution for '{pattern}'"
-                ));
+                reporter.report(&format!("error: no remembered resolution for '{pattern}'"));
                 continue;
             }
             fs::remove_file(&postimage)?;
@@ -1022,9 +1023,7 @@ pub fn rerere_forget(
             reporter.report(&format!("Forgot resolution for '{pattern}'"));
         }
         if !matched {
-            reporter.report(&format!(
-                "error: no remembered resolution for '{pattern}'"
-            ));
+            reporter.report(&format!("error: no remembered resolution for '{pattern}'"));
         }
     }
     if !forgotten.is_empty() {
@@ -1143,10 +1142,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let git_dir = dir.path();
         // No rerere.enabled, no rr-cache → off.
-        assert!(!is_rerere_enabled_with_config(git_dir, &GitConfig::default()));
+        assert!(!is_rerere_enabled_with_config(
+            git_dir,
+            &GitConfig::default()
+        ));
         // rr-cache present → on even without config.
         fs::create_dir_all(git_dir.join("rr-cache")).expect("mkdir");
-        assert!(is_rerere_enabled_with_config(git_dir, &GitConfig::default()));
+        assert!(is_rerere_enabled_with_config(
+            git_dir,
+            &GitConfig::default()
+        ));
         // Explicit false wins over rr-cache presence.
         let config = GitConfig::parse(b"[rerere]\n\tenabled = false\n").expect("config");
         assert!(!is_rerere_enabled_with_config(git_dir, &config));

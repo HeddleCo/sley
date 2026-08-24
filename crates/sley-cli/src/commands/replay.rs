@@ -299,7 +299,10 @@ fn parse_replay_ref_action(value: &str) -> Result<ReplayRefAction> {
     }
 }
 
-fn build_git_replay_plan(ctx: &sley_sequencer::pick::PickContext, parsed: GitReplayArgs) -> Result<GitReplayPlan> {
+fn build_git_replay_plan(
+    ctx: &sley_sequencer::pick::PickContext,
+    parsed: GitReplayArgs,
+) -> Result<GitReplayPlan> {
     let refs = ctx.refs();
     let mode = if parsed.onto.is_some() {
         ReplayModeKind::Onto
@@ -948,7 +951,8 @@ fn run_replay(
     let worktree_root = worktree_root_for_git_dir(cli_session, &git_dir)?;
     let config = read_repo_config(&git_dir)?;
     let config = crate::commands::merge_rebase::effective_config_with_overrides(&config);
-    let db = crate::repository::open_object_database(&git_dir, format, cli_session.replace_objects())?;
+    let db =
+        crate::repository::open_object_database(&git_dir, format, cli_session.replace_objects())?;
     let ctx = sley_sequencer::pick::PickContext {
         action,
         git_dir,
@@ -1129,7 +1133,6 @@ fn prepare_commit_message_at(
     Ok(strip_comment_lines(&edited, comment_char(git_dir)))
 }
 
-
 fn config_bool(config: &GitConfig, section: &str, key: &str) -> Option<bool> {
     let value = config_value(config, section, key)?;
     match value.to_ascii_lowercase().as_str() {
@@ -1201,7 +1204,6 @@ pub(crate) fn reset_merge_in(
         lazy_fetch.then_some(&PREFETCH as &'static dyn sley_sequencer::apply::PromisorObjectFetch),
     )
 }
-
 
 pub(crate) fn strip_comment_lines(message: &[u8], comment: u8) -> Vec<u8> {
     strip_comment_string_lines(message, &[comment])
@@ -1349,4 +1351,3 @@ pub(crate) fn append_signoff_before_comments_with_config(
     out.extend_from_slice(tail);
     out
 }
-

@@ -11,7 +11,9 @@
 
 use sley_config::{ConfigEntry, ConfigSection, GitConfig};
 use sley_core::paths::{normalize_lexical, relative_path_lexical};
-use sley_core::primitives::{common_prefix_len, read_u16, read_u24, read_u32, read_u64, u32_be, u64_be};
+use sley_core::primitives::{
+    common_prefix_len, read_u16, read_u24, read_u32, read_u64, u32_be, u64_be,
+};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -1360,7 +1362,6 @@ impl CommitGraphEntry {
     pub fn parent_indices(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
         self.parents.iter().copied()
     }
-
 }
 
 /// Borrowed iterator over a commit-graph entry's parent object ids.
@@ -1717,7 +1718,6 @@ impl CommitGraphBloomFilters {
     pub fn filter_for_commit(&self, commit_index: usize) -> Option<&[u8]> {
         self.filters.get(commit_index).map(Vec::as_slice)
     }
-
 }
 
 fn validate_commit_graph_bloom_settings(settings: CommitGraphBloomSettings) -> Result<()> {
@@ -5315,11 +5315,7 @@ mod tests {
         fs::create_dir_all(&dir).expect("create dir");
         perms.adjust_dir(&dir).expect("apply dir policy");
         assert_eq!(
-            fs::metadata(&dir)
-                .expect("metadata")
-                .permissions()
-                .mode()
-                & 0o777,
+            fs::metadata(&dir).expect("metadata").permissions().mode() & 0o777,
             0o770
         );
         let _ = fs::remove_dir_all(root);
