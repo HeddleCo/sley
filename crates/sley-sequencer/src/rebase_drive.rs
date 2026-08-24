@@ -3199,10 +3199,10 @@ fn machine_commit(
         // comments except the conflicts block which only exists when editing.
         message = strip_comment_lines(&message, comment_char(&ctx.git_dir));
     }
-    // git's builtin/commit refuses an empty (post-cleanup) message for the
-    // machine's non-edit commits too — a missing/blank seed must stop the
-    // rebase, not silently land an empty-message commit.
-    if message.iter().all(|b| b.is_ascii_whitespace()) {
+    // An editor that clears the post-cleanup message aborts the commit. Plain
+    // machine picks, however, preserve an original empty message without
+    // requiring an explicit --allow-empty-message option.
+    if commit.edit && message.iter().all(|b| b.is_ascii_whitespace()) {
         eprintln!("Aborting commit due to empty commit message.");
         return Ok(CommitOutcome::Failed(1));
     }

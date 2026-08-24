@@ -109,8 +109,10 @@ pub fn prune_head_root(
 }
 
 pub fn prune_index_roots(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
-    let Ok(bytes) = fs::read(git_dir.join("index")) else {
-        return Ok(Vec::new());
+    let bytes = match fs::read(git_dir.join("index")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
     };
     let index = sley_index::Index::parse(&bytes, format)?;
     Ok(index
@@ -144,21 +146,26 @@ pub fn prune_state_file_roots(git_dir: &Path, format: ObjectFormat) -> Result<Ve
 
 pub fn reflog_roots_from_dir(logs_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
     let mut roots = Vec::new();
-    let zero = "0".repeat(format.hex_len());
+    let zero = vec![b'0'; format.hex_len()];
     let mut stack: Vec<PathBuf> = vec![logs_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && dir == logs_dir => continue,
+            Err(error) => return Err(error.into()),
         };
         for entry in entries {
-            let path = entry?.path();
-            if path.is_dir() {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
                 stack.push(path);
-            } else if let Ok(contents) = fs::read_to_string(&path) {
-                for line in contents.lines() {
-                    let mut fields = line.split(' ');
+            } else {
+                let contents = fs::read(&path)?;
+                for line in contents.split(|byte| *byte == b'\n') {
+                    let mut fields = line.split(|byte| *byte == b' ');
                     for hex in [fields.next(), fields.next()].into_iter().flatten() {
                         if hex != zero
+                            && let Ok(hex) = std::str::from_utf8(hex)
                             && let Ok(oid) = ObjectId::from_hex(format, hex)
                         {
                             roots.push(oid);

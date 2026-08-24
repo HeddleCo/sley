@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use regex::Regex;
 use sley_config::GitConfig;
@@ -362,7 +362,7 @@ pub(crate) fn repack_traversal_roots(
     // Indexed objects (upstream `--indexed-objects`): cache entries, the
     // cache-tree extension, and resolve-undo blobs all keep pending objects
     // alive across a repack (t7700 "pending objects are repacked appropriately").
-    roots.extend(index_traversal_roots(&git_dir.join("index"), format));
+    roots.extend(index_traversal_roots(&git_dir.join("index"), format)?);
     // Linked worktrees: upstream pack-objects examines every worktree's HEAD,
     // index, and per-worktree reflogs by default. The current worktree is
     // covered above (with replacement-aware HEAD resolution); the common dir
@@ -377,7 +377,7 @@ pub(crate) fn repack_traversal_roots(
         roots.extend(index_traversal_roots(
             &worktree_git_dir.join("index"),
             format,
-        ));
+        )?);
         roots.extend(reflog_roots_from_dir(
             &worktree_git_dir.join("logs"),
             format,
@@ -386,28 +386,26 @@ pub(crate) fn repack_traversal_roots(
     Ok(roots)
 }
 
-fn index_traversal_roots(index_path: &Path, format: ObjectFormat) -> Vec<ObjectId> {
+fn index_traversal_roots(index_path: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
     let mut roots = Vec::new();
-    let Ok(bytes) = fs::read(index_path) else {
-        return roots;
+    let bytes = match fs::read(index_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(roots),
+        Err(error) => return Err(error.into()),
     };
-    let Ok(index) = sley_index::Index::parse(&bytes, format) else {
-        return roots;
-    };
+    let index = sley_index::Index::parse(&bytes, format)?;
     for entry in &index.entries {
         roots.push(entry.oid);
     }
-    if let Ok(Some(cache_tree)) = index.cache_tree(format) {
+    if let Some(cache_tree) = index.cache_tree(format)? {
         collect_cache_tree_oids(&cache_tree, &mut roots);
     }
-    if let Ok(records) = index.resolve_undo_records(format) {
-        for record in records {
-            for stage in record.stages.into_iter().flatten() {
-                roots.push(stage.oid);
-            }
+    for record in index.resolve_undo_records(format)? {
+        for stage in record.stages.into_iter().flatten() {
+            roots.push(stage.oid);
         }
     }
-    roots
+    Ok(roots)
 }
 
 fn collect_cache_tree_oids(tree: &sley_index::CacheTree, roots: &mut Vec<ObjectId>) {
@@ -484,32 +482,9 @@ fn reflog_traversal_roots(
     common_git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<Vec<ObjectId>> {
-    let mut roots = Vec::new();
-    let mut log_dirs = vec![common_git_dir.join("logs"), git_dir.join("logs")];
-    log_dirs.dedup();
-    let zero = "0".repeat(format.hex_len());
-    let mut stack: Vec<PathBuf> = log_dirs.into_iter().filter(|dir| dir.is_dir()).collect();
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries {
-            let path = entry?.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if let Ok(contents) = fs::read_to_string(&path) {
-                for line in contents.lines() {
-                    let mut fields = line.split(' ');
-                    for hex in [fields.next(), fields.next()].into_iter().flatten() {
-                        if hex != zero
-                            && let Ok(oid) = ObjectId::from_hex(format, hex)
-                        {
-                            roots.push(oid);
-                        }
-                    }
-                }
-            }
-        }
+    let mut roots = reflog_roots_from_dir(&common_git_dir.join("logs"), format)?;
+    if git_dir != common_git_dir {
+        roots.extend(reflog_roots_from_dir(&git_dir.join("logs"), format)?);
     }
     Ok(roots)
 }
@@ -1435,6 +1410,43 @@ pub fn run_repack(
     }
     let _ = quiet;
     Ok(())
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn index_traversal_propagates_malformed_root_extensions() {
+        let format = ObjectFormat::Sha1;
+        for (signature, body) in [
+            (*b"TREE", b"\0".as_slice()),
+            (*b"REUC", b"unterminated-path".as_slice()),
+        ] {
+            let mut extensions = Vec::new();
+            extensions.extend_from_slice(&signature);
+            extensions.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            extensions.extend_from_slice(body);
+            let index = sley_index::Index {
+                version: 2,
+                entries: Vec::new(),
+                extensions,
+                checksum: None,
+            };
+            let bytes = index.write(format).expect("write malformed extension fixture");
+            let path = std::env::temp_dir().join(format!(
+                "sley-gc-index-extension-{}-{}",
+                std::process::id(),
+                String::from_utf8_lossy(&signature)
+            ));
+            fs::write(&path, bytes).expect("write index fixture");
+
+            assert!(
+                index_traversal_roots(&path, format).is_err(),
+                "malformed {} extension was silently ignored",
+                String::from_utf8_lossy(&signature)
+            );
+            fs::remove_file(path).expect("remove index fixture");
+        }
+    }
 }

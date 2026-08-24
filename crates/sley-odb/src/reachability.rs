@@ -3231,24 +3231,45 @@ pub(crate) fn build_pack_name_hash_cache<R: ObjectReader>(
     index_entries: &[PackIndexEntry],
     known_object_types: &HashMap<ObjectId, ObjectType>,
 ) -> Result<Vec<u32>> {
-    let packed: HashSet<ObjectId> = index_entries.iter().map(|entry| entry.oid).collect();
+    let packed_objects = index_entries
+        .iter()
+        .map(|entry| {
+            known_object_types
+                .get(&entry.oid)
+                .copied()
+                .map(|object_type| (entry.oid, object_type))
+                .ok_or_else(|| {
+                    GitError::InvalidFormat(format!(
+                        "repack bitmap type cache is missing packed object {}",
+                        entry.oid
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let by_oid = build_pack_name_hashes(db, format, &packed_objects)?;
+    let mut sorted: Vec<&PackIndexEntry> = index_entries.iter().collect();
+    sorted.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
+    Ok(sorted
+        .into_iter()
+        .map(|entry| by_oid.get(&entry.oid).copied().unwrap_or(0))
+        .collect())
+}
+
+/// Compute Git's v1 pack-name hash for each named tree/blob object in a pack.
+/// Commits, tags, and unnamed root trees retain the implicit zero hash.
+pub(crate) fn build_pack_name_hashes<R: ObjectReader>(
+    db: &R,
+    format: ObjectFormat,
+    packed_objects: &[(ObjectId, ObjectType)],
+) -> Result<HashMap<ObjectId, u32>> {
+    let packed: HashSet<ObjectId> = packed_objects.iter().map(|(oid, _)| *oid).collect();
     let mut by_oid = HashMap::new();
     let mut seen_trees = HashSet::new();
-    for entry in index_entries {
-        // The repack walk already established every packed object's type.
-        // Consulting that map avoids inflating every tree and blob merely to
-        // discover that only commits can introduce root trees here.
-        match known_object_types.get(&entry.oid) {
-            Some(ObjectType::Commit) => {}
-            Some(ObjectType::Tree | ObjectType::Blob | ObjectType::Tag) => continue,
-            None => {
-                return Err(GitError::InvalidFormat(format!(
-                    "repack bitmap type cache is missing packed object {}",
-                    entry.oid
-                )));
-            }
+    for (oid, object_type) in packed_objects {
+        if *object_type != ObjectType::Commit {
+            continue;
         }
-        let object = db.read_object(&entry.oid)?;
+        let object = db.read_object(oid)?;
         let commit = Commit::parse_ref(format, &object.body)?;
         collect_tree_name_hashes(
             db,
@@ -3260,12 +3281,7 @@ pub(crate) fn build_pack_name_hash_cache<R: ObjectReader>(
             &mut by_oid,
         )?;
     }
-    let mut sorted: Vec<&PackIndexEntry> = index_entries.iter().collect();
-    sorted.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
-    Ok(sorted
-        .into_iter()
-        .map(|entry| by_oid.get(&entry.oid).copied().unwrap_or(0))
-        .collect())
+    Ok(by_oid)
 }
 
 fn collect_tree_name_hashes<R: ObjectReader>(

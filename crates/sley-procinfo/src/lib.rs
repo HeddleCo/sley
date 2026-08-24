@@ -18,6 +18,16 @@ pub fn process_ancestry() -> &'static [String] {
     PROCESS_ANCESTRY.get_or_init(platform::process_ancestry)
 }
 
+/// Return the operating system's hostname when it can be queried reliably.
+///
+/// Callers use `None` to make conservative decisions when this crate has no
+/// platform hostname implementation; environment variables are deliberately
+/// not treated as authoritative system identity.
+#[must_use]
+pub fn hostname() -> Option<String> {
+    platform::hostname()
+}
+
 #[cfg(unix)]
 pub fn duplicate_fd(fd: i32) -> std::io::Result<std::fs::File> {
     use std::os::fd::FromRawFd;
@@ -94,6 +104,10 @@ mod platform {
             buffer: *mut libc::c_void,
             buffersize: libc::c_int,
         ) -> libc::c_int;
+    }
+
+    pub(super) fn hostname() -> Option<String> {
+        super::unix_hostname()
     }
 
     pub(super) fn process_ancestry() -> Vec<String> {
@@ -178,6 +192,10 @@ mod platform {
 
     const NR_PIDS_LIMIT: usize = 10;
 
+    pub(super) fn hostname() -> Option<String> {
+        super::unix_hostname()
+    }
+
     pub(super) fn process_ancestry() -> Vec<String> {
         let mut names = Vec::new();
         let Some(mut pid) = parent_pid(std::process::id()) else {
@@ -248,6 +266,10 @@ mod platform {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod platform {
+    pub(super) fn hostname() -> Option<String> {
+        None
+    }
+
     pub(super) fn process_ancestry() -> Vec<String> {
         Vec::new()
     }
@@ -255,6 +277,23 @@ mod platform {
     pub(super) fn process_alive(_pid: u32) -> bool {
         true
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn unix_hostname() -> Option<String> {
+    // POSIX host names are bounded; 256 bytes covers the maximum host-name
+    // length on the Unix targets supported by this crate, including the NUL.
+    let mut buffer = [0_u8; 256];
+    // SAFETY: `buffer` is writable for exactly `buffer.len()` bytes and
+    // gethostname does not retain the pointer.
+    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+        return None;
+    }
+    let len = buffer.iter().position(|byte| *byte == 0)?;
+    if len == 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buffer[..len]).into_owned())
 }
 
 #[cfg(test)]
@@ -273,6 +312,14 @@ mod tests {
         for name in process_ancestry() {
             assert!(!name.contains('\0'));
         }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn hostname_is_nonempty_and_contains_no_nul() {
+        let hostname = hostname().expect("platform hostname should be available");
+        assert!(!hostname.is_empty());
+        assert!(!hostname.contains('\0'));
     }
 
     #[test]

@@ -487,6 +487,23 @@ impl PackFile {
         format: ObjectFormat,
         options: &PackWriteOptions,
     ) -> Result<PackWrite> {
+        Self::write_packed_with_known_ids_and_options_and_name_hashes(
+            inputs,
+            format,
+            options,
+            None,
+        )
+    }
+
+    /// Like [`PackFile::write_packed_with_known_ids_and_options`], with
+    /// optional Git-compatible path name hashes used to group delta candidates.
+    /// Missing entries are treated as unnamed objects (hash zero).
+    pub fn write_packed_with_known_ids_and_options_and_name_hashes(
+        inputs: &[PackInput<'_>],
+        format: ObjectFormat,
+        options: &PackWriteOptions,
+        name_hashes: Option<&HashMap<ObjectId, u32>>,
+    ) -> Result<PackWrite> {
         if inputs.len() > u32::MAX as usize {
             return Err(GitError::InvalidFormat("too many pack objects".into()));
         }
@@ -504,7 +521,7 @@ impl PackFile {
             objects.push(input.object);
             object_ids.push(*input.oid);
         }
-        Self::write_packed_from_parts(objects, object_ids, format, options)
+        Self::write_packed_from_parts(objects, object_ids, format, options, name_hashes)
     }
 
     pub fn write_packed_with_known_ids_to_writer<W>(
@@ -575,7 +592,7 @@ impl PackFile {
         for object in &objects {
             object_ids.push(object.object_id(format)?);
         }
-        Self::write_packed_from_parts(objects, object_ids, format, options)
+        Self::write_packed_from_parts(objects, object_ids, format, options, None)
     }
 
     pub(crate) fn write_packed_from_parts(
@@ -583,6 +600,7 @@ impl PackFile {
         object_ids: Vec<ObjectId>,
         format: ObjectFormat,
         options: &PackWriteOptions,
+        name_hashes: Option<&HashMap<ObjectId, u32>>,
     ) -> Result<PackWrite> {
         let mut seen = HashSet::with_capacity(object_ids.len());
         for oid in &object_ids {
@@ -605,7 +623,7 @@ impl PackFile {
         // obtain the emit order. In-pack deltas only ever reference candidates
         // that appear earlier in `order`, so emitting in `order` guarantees a
         // base is always written before any object that deltas against it.
-        let (plan, order) = plan_pack_deltas(&objects, &object_ids, options)?;
+        let (plan, order) = plan_pack_deltas(&objects, &object_ids, options, name_hashes)?;
 
         let mut pack = Vec::new();
         pack.extend_from_slice(b"PACK");
@@ -704,7 +722,7 @@ impl PackFile {
             }
         }
 
-        let (plan, order) = plan_pack_deltas(&objects, &object_ids, options)?;
+        let (plan, order) = plan_pack_deltas(&objects, &object_ids, options, None)?;
         let mut output = PackDigestWriter::new(writer, format);
         output.write_pack_bytes(b"PACK")?;
         output.write_pack_bytes(&2u32.to_be_bytes())?;

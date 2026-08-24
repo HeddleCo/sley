@@ -539,10 +539,14 @@ pub(crate) fn plan_streaming_window_deltas(
 ///
 /// # Ordering
 ///
-/// Candidates are sorted by `(type, size descending, object id)`:
+/// Candidates are sorted by `(type, name hash descending, size descending,
+/// object id)`:
 /// * **type** — only same-type objects are deltified against one another, so
 ///   grouping by type keeps the sliding window full of viable bases. Type rank
 ///   follows [`delta_type_rank`] (commit, tree, blob, tag).
+/// * **name hash descending** — when the caller can supply Git's path-derived
+///   pack name hashes, similarly named objects stay together. Unnamed objects
+///   use zero; callers without path provenance omit the map entirely.
 /// * **size descending** — larger objects come first so smaller, later objects
 ///   delta against larger bases (git's heuristic). Raw [`EncodedObject`]s carry
 ///   no path/name, so the usual path-hash key is unavailable; size is the next
@@ -567,6 +571,7 @@ pub(crate) fn plan_pack_deltas(
     objects: &[&EncodedObject],
     object_ids: &[ObjectId],
     options: &PackWriteOptions,
+    name_hashes: Option<&std::collections::HashMap<ObjectId, u32>>,
 ) -> Result<(Vec<PlannedEntry>, Vec<usize>)> {
     let count = objects.len();
     let mut plan: Vec<PlannedEntry> = (0..count)
@@ -583,6 +588,17 @@ pub(crate) fn plan_pack_deltas(
         order.sort_by(|&left, &right| {
             delta_type_rank(objects[left].object_type)
                 .cmp(&delta_type_rank(objects[right].object_type))
+                .then_with(|| {
+                    let left_hash = name_hashes
+                        .and_then(|hashes| hashes.get(&object_ids[left]))
+                        .copied()
+                        .unwrap_or(0);
+                    let right_hash = name_hashes
+                        .and_then(|hashes| hashes.get(&object_ids[right]))
+                        .copied()
+                        .unwrap_or(0);
+                    right_hash.cmp(&left_hash)
+                })
                 .then_with(|| objects[right].body.len().cmp(&objects[left].body.len()))
                 .then_with(|| {
                     object_ids[left]
@@ -973,7 +989,8 @@ mod git_delta_acceptance_tests {
         ];
 
         let options = PackWriteOptions::new();
-        let (plan, order) = plan_pack_deltas(&object_refs, &ids, &options).expect("plan deltas");
+        let (plan, order) =
+            plan_pack_deltas(&object_refs, &ids, &options, None).expect("plan deltas");
 
         assert_eq!(order, vec![2, 1, 0]);
         assert!(matches!(
@@ -996,6 +1013,64 @@ mod git_delta_acceptance_tests {
         assert!(matches!(
             streaming_plan[0].base,
             StreamingPlannedBase::Current { base_idx: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn git_name_hash_order_can_form_the_expected_delta_chain() {
+        let base = (0..100_000)
+            .map(|index| ((index * 31) % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut delta_one = base.clone();
+        delta_one.extend_from_slice(b"trailing data\n");
+        let mut delta_two = delta_one.clone();
+        delta_two.extend_from_slice(b"trailing data\n");
+        let objects = [
+            EncodedObject::new(ObjectType::Blob, base),
+            EncodedObject::new(ObjectType::Blob, delta_one),
+            EncodedObject::new(ObjectType::Blob, delta_two),
+        ];
+        let object_refs = objects.iter().collect::<Vec<_>>();
+        let ids = [
+            ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "0000000000000000000000000000000000000001",
+            )
+            .expect("valid oid"),
+            ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "0000000000000000000000000000000000000002",
+            )
+            .expect("valid oid"),
+            ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "0000000000000000000000000000000000000003",
+            )
+            .expect("valid oid"),
+        ];
+        // Git's v1 pack-name hashes for "base", "delta-1", and "delta-2".
+        let hashes = std::collections::HashMap::from([
+            (ids[0], 2_304_245_760),
+            (ids[1], 1_152_090_112),
+            (ids[2], 1_168_867_328),
+        ]);
+
+        let (plan, order) = plan_pack_deltas(
+            &object_refs,
+            &ids,
+            &PackWriteOptions::new(),
+            Some(&hashes),
+        )
+        .expect("plan deltas");
+
+        assert_eq!(order, vec![0, 2, 1]);
+        assert!(matches!(
+            plan[2].base,
+            PlannedBase::InPack { base_idx: 0, .. }
+        ));
+        assert!(matches!(
+            plan[1].base,
+            PlannedBase::InPack { base_idx: 2, .. }
         ));
     }
 }

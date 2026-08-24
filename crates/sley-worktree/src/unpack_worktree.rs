@@ -287,7 +287,11 @@ impl ReadTreeWorktree<'_> {
         }
         // One matcher for the whole walk: git builds a single `dir_struct` per
         // call too (`read_directory`), sharing the exclude-per-directory stack.
-        let ignores = crate::ignore::IgnoreMatcher::from_worktree_root(&self.worktree_root)?;
+        let common_git_dir = common_git_dir_for_git_dir(&self.git_dir)?;
+        let ignores = crate::ignore::IgnoreMatcher::from_worktree_root_and_git_dir(
+            &self.worktree_root,
+            &common_git_dir,
+        )?;
         let mut stack = vec![(dir_fs_path.to_path_buf(), dir_git_path.to_vec())];
         while let Some((fs_dir, git_dir)) = stack.pop() {
             let read = match fs::read_dir(&fs_dir) {

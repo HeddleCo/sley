@@ -357,7 +357,7 @@ fn percent_decode_url_path(value: &str) -> Result<String> {
 fn discover_git_dir(start: &Path) -> Result<PathBuf> {
     for candidate in start.ancestors() {
         let dot_git = candidate.join(".git");
-        if dot_git.is_dir() {
+        if dot_git.is_dir() && is_git_dir(&dot_git) {
             return Ok(dot_git);
         }
         if dot_git.is_file()

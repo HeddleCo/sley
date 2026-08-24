@@ -1424,7 +1424,7 @@ fn discover_git_dir_with_device(
     };
     for candidate in absolute.ancestors() {
         let dot_git = candidate.join(".git");
-        if dot_git.is_dir() {
+        if dot_git.is_dir() && is_git_dir(&dot_git) {
             return Ok(dot_git);
         }
         if dot_git.is_file()
@@ -2176,10 +2176,11 @@ mod tests {
     #[test]
     fn discover_errors_outside_any_repo() {
         let temp = TempDir::new();
-        // temp dir is not inside a repo (it lives directly under the system tmp
-        // dir, which is not a git working tree).
-        let err =
-            Repository::discover(temp.path()).expect_err("discovering outside any repo must fail");
+        fs::create_dir(temp.path().join(".git")).expect("create invalid .git directory");
+        let nested = temp.path().join("nested");
+        fs::create_dir(&nested).expect("create discovery start");
+        let err = Repository::discover(&nested)
+            .expect_err("an empty .git directory must not be discovered as a repository");
         assert!(matches!(err, GitError::NotFound(_)));
     }
 

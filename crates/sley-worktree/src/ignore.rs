@@ -2734,12 +2734,16 @@ impl IgnoreMatcher {
     }
 
     pub(crate) fn from_worktree_root(root: &Path) -> Result<Self> {
+        Self::from_worktree_root_and_git_dir(root, &root.join(".git"))
+    }
+
+    pub(crate) fn from_worktree_root_and_git_dir(root: &Path, git_dir: &Path) -> Result<Self> {
         let mut matcher = Self::default();
         if !read_core_excludes_file(root, &mut matcher.patterns) {
             read_default_global_excludes_file(&mut matcher.patterns);
         }
         read_ignore_patterns(
-            root.join(".git").join("info").join("exclude"),
+            git_dir.join("info").join("exclude"),
             &mut matcher.patterns,
             &[],
             b".git/info/exclude",

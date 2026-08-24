@@ -824,6 +824,58 @@ fn checkout_df_transition_ignored_files_do_not_block_directory_replacement() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// A linked worktree's `.git` is a gitfile, while `info/exclude` remains in the
+/// common git directory. D/F safety checks must therefore resolve the common
+/// directory instead of looking below the worktree's `.git` path.
+#[test]
+fn checkout_df_transition_honors_common_info_exclude_in_linked_worktree() {
+    let root = unique_temp_dir("checkout-df-linked-info-exclude");
+
+    let build = |repo: &Path, linked: &Path| {
+        fs::create_dir_all(repo).expect("create repo dir");
+        git(repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("dir")).expect("mkdir dir");
+        fs::write(repo.join("dir/tracked.txt"), b"tracked\n").expect("write tracked file");
+        git(repo, &["add", "."]);
+        run_with_identity(repo, &["commit", "-m", "base", "-q"]);
+
+        git(repo, &["checkout", "-q", "-b", "side"]);
+        git(repo, &["rm", "-q", "-r", "dir"]);
+        fs::write(repo.join("dir"), b"file-now\n").expect("write replacement file");
+        git(repo, &["add", "dir"]);
+        run_with_identity(repo, &["commit", "-m", "df transition", "-q"]);
+        git(repo, &["checkout", "-q", "main"]);
+
+        let linked_arg = linked.to_str().expect("linked worktree path utf8");
+        git(repo, &["worktree", "add", "-q", "--detach", linked_arg, "main"]);
+        fs::write(repo.join(".git/info/exclude"), b"*.log\n").expect("write common exclude");
+        fs::write(linked.join("dir/cache.log"), b"ignored\n").expect("write ignored file");
+    };
+
+    let upstream_repo = root.join("upstream-repo");
+    let upstream_linked = root.join("upstream-linked");
+    let rust_repo = root.join("rust-repo");
+    let rust_linked = root.join("rust-linked");
+    build(&upstream_repo, &upstream_linked);
+    build(&rust_repo, &rust_linked);
+
+    let args = ["checkout", "side"];
+    let expected = run_output(sley_testkit::oracle_git(), &upstream_linked, &args);
+    assert!(
+        expected.status.success(),
+        "oracle must honor common info/exclude: {}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+    let actual = run_output(sley_testkit::sley_bin!(), &rust_linked, &args);
+    assert_same_output(actual, expected, &args);
+    assert_eq!(
+        fs::read(rust_linked.join("dir")).expect("read replacement file"),
+        b"file-now\n"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// S11 regression (discriminating): `checkout -B <branch> <start>` must see the
 /// full effective config cascade. The filter driver here is defined ONLY in
 /// `$GIT_DIR/config.worktree` (`extensions.worktreeConfig = true`) — a layer a

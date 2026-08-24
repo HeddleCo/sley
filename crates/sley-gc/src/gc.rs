@@ -6,9 +6,9 @@
 //! Lock/pid/log semantics are byte-preserved engine behavior:
 //!
 //! * `gc.pid` is acquired single-step (create-new) by [`gc_acquire_pid_lock`],
-//!   records the holder pid, is probed for liveness before the twelve-hour
-//!   staleness window applies, and is removed only by the owner on every exit
-//!   path.
+//!   records the holder pid and hostname, probes local holders for liveness
+//!   before the twelve-hour staleness window applies, and is removed only by
+//!   the owner on every exit path.
 //! * `gc.log` is cleared only after a successful non-auto run.
 //! * The maintenance/schedule lock early-return paths deliberately leak their
 //!   locks (see `maintenance::run_selected` / `update_background_schedule`);
@@ -671,7 +671,7 @@ pub fn gc_recent_log_blocks_auto(common_git_dir: &Path, config: &GitConfig) -> R
 }
 
 /// `gc.pid` staleness window for files whose holder cannot be probed (no
-/// parsable pid, or no liveness facility on this platform).
+/// parsable pid/hostname, a foreign host, or no local inspection facility).
 const GC_PID_STALE_SECONDS: u64 = 12 * 60 * 60;
 
 /// Outcome of attempting to take the `gc.pid` repository lock.
@@ -687,10 +687,11 @@ pub enum GcPidLock {
 /// check-then-write window (two gcs could pass the staleness probe and both
 /// proceed to concurrent `-d` repacks) cannot occur.
 ///
-/// A pre-existing `gc.pid` is honored only while its recorded pid is alive;
-/// a dead holder (crashed gc) is recovered immediately instead of blocking
-/// manual gc runs for the full twelve-hour staleness window. Files without a
-/// parsable pid fall back to the mtime window.
+/// A pre-existing local `gc.pid` is honored only while its recorded pid is
+/// alive; a dead local holder (crashed gc) is recovered immediately instead of
+/// blocking manual gc runs for the full twelve-hour staleness window. Foreign
+/// hosts and files without a parsable pid and hostname fall back to the mtime
+/// window.
 pub fn gc_acquire_pid_lock(common_git_dir: &Path) -> Result<GcPidLock> {
     let path = common_git_dir.join("gc.pid");
     match gc_try_create_pid_file(&path) {
@@ -719,17 +720,26 @@ fn gc_try_create_pid_file(path: &Path) -> io::Result<()> {
         .write(true)
         .create_new(true)
         .open(path)?;
-    let host = env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
-    writeln!(file, "{} {host}", std::process::id())
+    let host = sley_procinfo::hostname().unwrap_or_else(|| "unknown".to_string());
+    let result = writeln!(file, "{} {host}", std::process::id());
+    if result.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+    }
+    result
 }
 
 /// True when the existing `gc.pid` can be treated as abandoned: it records a
-/// dead pid, or (unparsable content) is older than [`GC_PID_STALE_SECONDS`].
+/// dead local pid, or (foreign/unparsable content) is older than
+/// [`GC_PID_STALE_SECONDS`].
 fn gc_pid_lock_abandoned(path: &Path) -> bool {
     if let Ok(contents) = fs::read_to_string(path)
-        && let Some(pid_text) = contents.split_whitespace().next()
+        && let mut fields = contents.split_whitespace()
+        && let Some(pid_text) = fields.next()
+        && let Some(recorded_host) = fields.next()
         && let Ok(pid) = pid_text.parse::<u32>()
         && pid != 0
+        && sley_procinfo::hostname().as_deref() == Some(recorded_host)
     {
         return !gc_process_alive(pid);
     }
@@ -1051,16 +1061,37 @@ mod pid_lock_tests {
 
     #[cfg(unix)]
     #[test]
-    fn dead_pid_holder_is_recovered_immediately() {
+    fn dead_local_pid_holder_is_recovered_immediately() {
         let Some(dead) = reaped_pid() else {
             return;
         };
+        let Some(host) = sley_procinfo::hostname() else {
+            return;
+        };
         let dir = temp_dir("dead-pid");
-        fs::write(dir.join("gc.pid"), format!("{dead} crashed-host\n"))
-            .expect("write foreign gc.pid");
+        fs::write(dir.join("gc.pid"), format!("{dead} {host}\n"))
+            .expect("write local gc.pid");
         // A freshly-written file with a dead pid must not wait out the 12h
         // mtime window.
         assert_eq!(gc_acquire_pid_lock(&dir), Ok(GcPidLock::Acquired));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_foreign_pid_holder_blocks_while_file_is_fresh() {
+        let Some(dead) = reaped_pid() else {
+            return;
+        };
+        let Some(host) = sley_procinfo::hostname() else {
+            return;
+        };
+        let dir = temp_dir("dead-foreign-pid");
+        fs::write(dir.join("gc.pid"), format!("{dead} {host}.foreign\n"))
+            .expect("write foreign gc.pid");
+
+        assert_eq!(gc_acquire_pid_lock(&dir), Ok(GcPidLock::Held));
+        assert!(dir.join("gc.pid").exists(), "foreign lock must be untouched");
         fs::remove_dir_all(&dir).ok();
     }
 

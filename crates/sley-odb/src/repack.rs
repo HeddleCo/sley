@@ -14,7 +14,7 @@ use crate::pack::FileObjectDatabase;
 use crate::pack::promisor_pack_object_ids;
 use crate::reachability::{
     BitmapPseudoMergeGroup, PackObjectFilter, ReachabilityBitmapOptions, ReachablePackObject,
-    build_pack_bitmap_with_cached_objects, build_pack_name_hash_cache,
+    build_pack_bitmap_with_cached_objects, build_pack_name_hash_cache, build_pack_name_hashes,
     collect_reachable_object_ids_excluding_promised_missing, existing_pack_files, loose_object_ids,
     pack_inputs, prune_loose_objects, prune_obsolete_pack_paths, prune_stale_multi_pack_index,
     remove_file_if_exists, retain_filtered_pack_objects,
@@ -653,7 +653,17 @@ fn repack_reachable_objects_with_filter_to(
         let write_options = PackWriteOptions::new().with_reorder(false);
         PackFile::write_packed_with_known_ids_and_options(&inputs, format, &write_options)?
     } else {
-        PackFile::write_packed_with_known_ids(&inputs, format)?
+        let packed_object_types = objects
+            .iter()
+            .map(|entry| (entry.oid, entry.object.object_type))
+            .collect::<Vec<_>>();
+        let name_hashes = build_pack_name_hashes(&database, format, &packed_object_types)?;
+        PackFile::write_packed_with_known_ids_and_options_and_name_hashes(
+            &inputs,
+            format,
+            &PackWriteOptions::new(),
+            Some(&name_hashes),
+        )?
     };
     let object_count = written.entries.len();
 

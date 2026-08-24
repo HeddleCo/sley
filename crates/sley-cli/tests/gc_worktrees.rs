@@ -56,7 +56,7 @@ fn stdout_trimmed(output: &Output) -> String {
 fn init_repo(root: &Path, name: &str) -> PathBuf {
     let repo = root.join(name);
     fs::create_dir_all(&repo).expect("create repo dir");
-    git_ok(&root, &["init", "-q", "-b", "main", repo.to_str().expect("utf8")]);
+    git_ok(root, &["init", "-q", "-b", "main", repo.to_str().expect("utf8")]);
     fs::write(repo.join("base.txt"), b"base\n").expect("write base file");
     git_ok(&repo, &["add", "base.txt"]);
     git_ok(&repo, &["commit", "-q", "-m", "base"]);
@@ -179,6 +179,79 @@ fn repack_all_keeps_staged_blob_of_linked_worktree() {
     assert!(
         object_is_present(&worktree_b, &blob_oid),
         "staged blob {blob_oid} present only in linked worktree B's index was dropped"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A corrupt index must abort root collection before the old pack containing
+/// an index-only object is replaced or removed.
+#[test]
+fn repack_all_aborts_before_deleting_objects_when_index_is_malformed() {
+    let root = unique_temp_dir("gc-malformed-index");
+    let repo = init_repo(&root, "repo");
+
+    let blob_oid = write_blob(&repo, b"staged only in malformed index\n");
+    git_ok(
+        &repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob_oid},staged.txt"),
+        ],
+    );
+    isolate_blob_in_pack(&repo, &blob_oid);
+    fs::write(repo.join(".git/index"), b"not a valid index\n").expect("corrupt index");
+
+    let upstream = git(&repo, &["repack", "-a", "-d"]);
+    assert!(
+        !upstream.status.success(),
+        "upstream git unexpectedly accepted a malformed index"
+    );
+    assert!(
+        object_is_present(&repo, &blob_oid),
+        "upstream failure disturbed the source pack"
+    );
+
+    let sley = run(sley_testkit::sley_bin!(), &repo, &["repack", "-a", "-d"]);
+    assert!(
+        !sley.status.success(),
+        "sley repack unexpectedly accepted a malformed index"
+    );
+    assert!(
+        object_is_present(&repo, &blob_oid),
+        "sley deleted staged-only packed object {blob_oid} after an index parse failure"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Reflog identity and message bytes are not required to be UTF-8. Only the
+/// leading old/new object ids participate in reachability.
+#[test]
+fn repack_all_keeps_object_from_non_utf8_reflog() {
+    let root = unique_temp_dir("gc-non-utf8-reflog");
+    let repo = init_repo(&root, "repo");
+
+    let blob_oid = write_blob(&repo, b"reachable only from binary reflog\n");
+    isolate_blob_in_pack(&repo, &blob_oid);
+
+    let log_path = repo.join(".git/logs/refs/heads/binary-log");
+    fs::create_dir_all(log_path.parent().expect("reflog parent")).expect("create reflog dir");
+    let mut entry = format!(
+        "{} {blob_oid} Binary User <binary@example.com> 1 +0000\tbinary ",
+        "0".repeat(40)
+    )
+    .into_bytes();
+    entry.push(0xff);
+    entry.extend_from_slice(b" message\n");
+    fs::write(&log_path, entry).expect("write non-UTF-8 reflog");
+
+    success(sley_testkit::sley_bin!(), &repo, &["repack", "-a", "-d"]);
+    assert!(
+        object_is_present(&repo, &blob_oid),
+        "object {blob_oid} reachable only from a non-UTF-8 reflog was dropped"
     );
 
     fs::remove_dir_all(&root).ok();
@@ -307,13 +380,14 @@ fn gc_pid_lock_liveness_and_recovery() {
     let repo = init_repo(&root, "repo");
     let sley = sley_testkit::sley_bin!();
     let pid_file = repo.join(".git").join("gc.pid");
+    let local_host = sley_procinfo::hostname().expect("test platform hostname");
 
     // Crashed holder: dead-but-recorded pid recovers without waiting 12h.
     let mut crashed = Command::new("sleep").arg("30").spawn().expect("spawn sleep");
     let dead_pid = crashed.id();
     crashed.kill().expect("kill sleep");
     crashed.wait().expect("reap sleep");
-    fs::write(&pid_file, format!("{dead_pid} crashed-host\n")).expect("write stale gc.pid");
+    fs::write(&pid_file, format!("{dead_pid} {local_host}\n")).expect("write stale gc.pid");
 
     success(sley, &repo, &["gc"]);
     assert!(
@@ -324,7 +398,7 @@ fn gc_pid_lock_liveness_and_recovery() {
     // Live holder: manual gc refuses, foreign file untouched, --force proceeds.
     let mut live = Command::new("sleep").arg("60").spawn().expect("spawn sleep");
     let live_pid = live.id();
-    fs::write(&pid_file, format!("{live_pid} live-host\n")).expect("write live gc.pid");
+    fs::write(&pid_file, format!("{live_pid} {local_host}\n")).expect("write live gc.pid");
 
     let blocked = run(sley, &repo, &["gc"]);
     assert_eq!(
@@ -340,14 +414,14 @@ fn gc_pid_lock_liveness_and_recovery() {
     );
     assert_eq!(
         fs::read_to_string(&pid_file).expect("foreign lock survives"),
-        format!("{live_pid} live-host\n"),
+        format!("{live_pid} {local_host}\n"),
         "a refused gc disturbed the live holder's gc.pid"
     );
 
     success(sley, &repo, &["gc", "--force"]);
     assert_eq!(
         fs::read_to_string(&pid_file).expect("foreign lock survives --force"),
-        format!("{live_pid} live-host\n"),
+        format!("{live_pid} {local_host}\n"),
         "--force clobbered or removed the live holder's gc.pid"
     );
 

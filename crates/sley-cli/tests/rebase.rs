@@ -241,6 +241,70 @@ fn rebase_clean_matches_upstream_git() {
 }
 
 #[test]
+fn rebase_changed_commit_with_empty_message_matches_upstream_git() {
+    let root = unique_temp_dir("rebase-empty-message");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    for repo in [&upstream, &rust] {
+        fs::create_dir_all(repo).expect("create repo");
+        git(repo, &["init", "-q", "-b", "master"]);
+        prepare_identity(repo);
+
+        fs::write(repo.join("base.txt"), b"base\n").expect("write base file");
+        git(repo, &["add", "base.txt"]);
+        git_with_identity(repo, &["commit", "-m", "base", "-q"]);
+
+        git(repo, &["checkout", "-b", "topic", "-q"]);
+        fs::write(repo.join("topic.txt"), b"topic\n").expect("write topic file");
+        git(repo, &["add", "topic.txt"]);
+        git_with_identity(repo, &["commit", "--allow-empty-message", "-m", "", "-q"]);
+
+        git(repo, &["checkout", "master", "-q"]);
+        fs::write(repo.join("main.txt"), b"main\n").expect("write main file");
+        git(repo, &["add", "main.txt"]);
+        git_with_identity(repo, &["commit", "-m", "main", "-q"]);
+        git(repo, &["checkout", "topic", "-q"]);
+    }
+
+    let args = ["rebase", "master"];
+    let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
+    let actual = run_output_with_identity(sley_testkit::sley_bin!(), &rust, &args);
+    assert_eq!(
+        actual.status.code(),
+        expected.status.code(),
+        "status differed for empty-message rebase\nactual stderr:\n{}\nexpected stderr:\n{}",
+        String::from_utf8_lossy(&actual.stderr),
+        String::from_utf8_lossy(&expected.stderr)
+    );
+    assert!(
+        actual.status.success(),
+        "sley rebase failed: {}",
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert_eq!(
+        rev_parse(sley_testkit::oracle_git(), &rust, "HEAD"),
+        rev_parse(sley_testkit::oracle_git(), &upstream, "HEAD"),
+        "rebased commit differed"
+    );
+    assert_eq!(
+        run_output(
+            sley_testkit::oracle_git(),
+            &rust,
+            &["show", "-s", "--format=%B", "HEAD"]
+        )
+        .stdout,
+        b"\n",
+        "rebased commit message should remain empty"
+    );
+    assert_eq!(
+        fs::read(rust.join("topic.txt")).expect("read rebased topic file"),
+        b"topic\n",
+        "empty-message commit's changes should be replayed"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn rebase_already_up_to_date_matches_upstream_git() {
     let root = unique_temp_dir("rebase-up-to-date");
     let upstream = root.join("upstream");
