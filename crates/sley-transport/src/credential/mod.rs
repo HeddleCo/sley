@@ -482,7 +482,7 @@ pub fn credential_do(
 
 /// Run one credential-helper subprocess under an explicit execution policy.
 ///
-/// See [`exec`] for the policy knobs. Compared to [`credential_do`], a parsed
+/// See [`HelperExecOptions`] for the policy knobs. Compared to [`credential_do`], a parsed
 /// response is applied atomically: a malformed or partial reply leaves
 /// `credential` untouched instead of half-filled.
 pub fn credential_do_with_options(

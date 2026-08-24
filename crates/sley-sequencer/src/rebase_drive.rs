@@ -4,7 +4,7 @@
 //! sheet now lives with the engine — the `complete_action` editor round, the
 //! `pick_commits` loop and every todo verb (`pick`/`reword`/`edit`/`fixup`/
 //! `squash`/`exec`/`break`/`label`/`reset`/`merge`/`update-ref`), commit
-//! creation for the machine ([`machine_commit`]), the fixup/squash message
+//! creation for the machine (`machine_commit`), the fixup/squash message
 //! machinery, rewritten-commit tracking (`rewritten-list`/`rewritten-pending`),
 //! the `--continue`/`--skip`/`--abort`/`--quit`/`--edit-todo` transitions,
 //! update-refs bookkeeping, and autostash integration. The CLI keeps argv
@@ -21,7 +21,7 @@
 //! * Notes copying stays behind a host seam: `sley-notes` depends on this
 //!   crate, so the note-copy primitive cannot live here without a cycle. The
 //!   rewritten-pair policy (flush cadence, list parsing, warning emission) is
-//!   owned by [`run_post_rewrite_hook`].
+//!   owned by `run_post_rewrite_hook`.
 //!
 //! This module is a faithful move; the module-level lint allowances mirror the
 //! source file's (`commands/rebase.rs`) so error paths keep their exact
@@ -74,7 +74,7 @@ pub type TodoList = RebaseTodoList;
 // ---------------------------------------------------------------------------
 
 /// Repository handles shared by every rebase merge-backend operation. The CLI
-/// builds this from its open [`sley::Repository`] (git dir layout, config
+/// builds this from its open `sley::Repository` (git dir layout, config
 /// cascade, ref stores) and hands it to the engine; nothing in here reaches
 /// back into process/session state.
 pub struct RebaseContext {

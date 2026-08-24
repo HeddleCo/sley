@@ -12,6 +12,7 @@ from pathlib import Path
 # Every workspace member must be classified. Keeping the exclusions explicit
 # makes a newly added crate fail closed instead of silently escaping the gate.
 GATED_CRATES = {
+    "sley-gc",
     "sley-pack",
     "sley-protocol",
     "sley-remote",
