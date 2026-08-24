@@ -125,9 +125,14 @@ pub fn repo_rerere(
             continue;
         };
         let (normalized, hash) = match scan_conflicted_content(&content, true)? {
-            ConflictScan::Conflicted { normalized, hash } => {
-                (normalized, hash.expect("hash requested"))
-            }
+            // compute_hash=true guarantees a conflict id; a missing one means
+            // the content is not rerere-addressable, so skip it rather than
+            // trust the invariant with a panic.
+            ConflictScan::Conflicted {
+                normalized,
+                hash: Some(hash),
+            } => (normalized, hash),
+            ConflictScan::Conflicted { .. } => continue,
             ConflictScan::Clean => {
                 if let Some(pos) = rr
                     .iter()

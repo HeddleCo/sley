@@ -71,8 +71,6 @@ pub(crate) fn clear_merge_df_blockers(worktree_root: &Path, results: &MergePathR
             continue;
         }
         if let Ok(rel) = std::str::from_utf8(path) {
-            // Best-effort: errors are swallowed so a genuine I/O problem
-            // surfaces from the subsequent checkout instead.
             let mut prefix = String::new();
             let mut components = rel.split('/').peekable();
             while let Some(component) = components.next() {
@@ -84,14 +82,11 @@ pub(crate) fn clear_merge_df_blockers(worktree_root: &Path, results: &MergePathR
                 }
                 prefix.push_str(component);
                 let candidate = worktree_root.join(&prefix);
-                match fs::symlink_metadata(&candidate) {
-                    Ok(meta) if !meta.is_dir() => {
-                        let _ = fs::remove_file(&candidate);
-                    }
-                    Ok(_) => {}
-                    Err(_) => {}
+                // Best-effort: errors are swallowed so a genuine I/O problem
+                // surfaces from the subsequent checkout instead.
+                if fs::symlink_metadata(&candidate).is_ok_and(|meta| !meta.is_dir()) {
+                    let _ = fs::remove_file(&candidate);
                 }
-                let _ = &candidate;
             }
         }
     }

@@ -270,9 +270,13 @@ impl ReadTreeWorktree<'_> {
     /// git's `verify_clean_subdirectory`: a directory occupies `path` where the
     /// merge wants to write a file (the D/F dir→file transition). It is safe to
     /// replace only when the directory holds nothing we would lose — concretely,
-    /// no **untracked** file (one absent from the pre-merge index). Every file
-    /// under it that *is* tracked is already accounted for by the merge result
-    /// (it will be removed or rewritten), so it does not block the replacement.
+    /// no **untracked, not-ignored** file (one absent from the pre-merge index
+    /// and excluded by neither `.gitignore` nor `.git/info/exclude`). Upstream
+    /// collects the survivors with `read_directory`, whose standard exclude
+    /// machinery drops ignored paths, so ignored files (build output, caches)
+    /// do not block the replacement and are removed with the subtree. Every
+    /// file under it that *is* tracked is already accounted for by the merge
+    /// result (it will be removed or rewritten), so it does not block either.
     ///
     /// On a clean subdirectory the writer's `remove_subtree` clears it before the
     /// file is written; on an unclean one this rejects with git's
@@ -281,6 +285,9 @@ impl ReadTreeWorktree<'_> {
         if original_cwd_relative_to(&self.worktree_root).as_deref() == Some(dir_git_path) {
             return refuse_remove_current_working_directory(dir_git_path);
         }
+        // One matcher for the whole walk: git builds a single `dir_struct` per
+        // call too (`read_directory`), sharing the exclude-per-directory stack.
+        let ignores = crate::ignore::IgnoreMatcher::from_worktree_root(&self.worktree_root)?;
         let mut stack = vec![(dir_fs_path.to_path_buf(), dir_git_path.to_vec())];
         while let Some((fs_dir, git_dir)) = stack.pop() {
             let read = match fs::read_dir(&fs_dir) {
@@ -297,15 +304,40 @@ impl ReadTreeWorktree<'_> {
                 child_git.extend_from_slice(name.as_encoded_bytes());
                 let file_type = entry.file_type()?;
                 if file_type.is_dir() {
-                    stack.push((entry.path(), child_git));
+                    // An ignored subdirectory is pruned wholesale by
+                    // `read_directory`; nothing under it can block.
+                    if !ignores.is_ignored(&child_git, true) {
+                        stack.push((entry.path(), child_git));
+                    }
                     continue;
                 }
                 // A tracked path (present in the pre-merge index at any stage) is
-                // owned by the merge; an untracked one would be lost → reject.
-                if !self.original_paths.contains(&child_git) {
-                    let display = String::from_utf8_lossy(dir_git_path);
-                    eprintln!("error: Updating '{display}' would lose untracked files in it");
-                    return Err(GitError::Exit(128));
+                // owned by the merge; an untracked one would be lost → reject,
+                // unless the standard ignore rules excuse it.
+                if !self.original_paths.contains(&child_git)
+                    && !ignores.is_ignored(&child_git, false)
+                {
+                    match self.porcelain {
+                        // read-tree keeps its historic per-path wording and dies.
+                        UnpackPorcelain::ReadTree => {
+                            let display = String::from_utf8_lossy(dir_git_path);
+                            eprintln!(
+                                "error: Updating '{display}' would lose untracked files in it"
+                            );
+                        }
+                        // The checkout/switch porcelain uses the collected-path
+                        // block from setup_unpack_trees_porcelain and exits 1.
+                        UnpackPorcelain::Checkout => {
+                            let display = String::from_utf8_lossy(dir_git_path);
+                            eprintln!(
+                                "error: Updating the following directories would lose untracked files in them:"
+                            );
+                            eprintln!("\t{display}");
+                            eprintln!();
+                            eprintln!("Aborting");
+                        }
+                    }
+                    return Err(GitError::Exit(unpack_rejection_exit(self.porcelain)));
                 }
             }
         }
@@ -966,6 +998,16 @@ fn leading_nondir_component(worktree_root: &Path, git_path: &[u8]) -> Result<Opt
 /// Emit the porcelain-specific "untracked would be overwritten" abort for
 /// `path` and return exit 128, matching git's `add_rejected_path` path for
 /// `ERROR_WOULD_LOSE_UNTRACKED_OVERWRITTEN`.
+/// Process exit status for an unpack-trees rejection. Upstream dies with 128
+/// from the read-tree plumbing, but the checkout/switch porcelain reports the
+/// collected "Aborting" block through its normal error return (exit 1).
+fn unpack_rejection_exit(porcelain: UnpackPorcelain) -> i32 {
+    match porcelain {
+        UnpackPorcelain::ReadTree => 128,
+        UnpackPorcelain::Checkout => 1,
+    }
+}
+
 fn reject_untracked_would_be_overwritten(porcelain: UnpackPorcelain, path: &[u8]) -> Result<()> {
     match porcelain {
         UnpackPorcelain::ReadTree => {
@@ -983,7 +1025,7 @@ fn reject_untracked_would_be_overwritten(porcelain: UnpackPorcelain, path: &[u8]
             eprintln!("Aborting");
         }
     }
-    Err(GitError::Exit(128))
+    Err(GitError::Exit(unpack_rejection_exit(porcelain)))
 }
 
 /// git's `write_entry` D/F-removal preamble: remove whatever currently occupies

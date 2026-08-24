@@ -21,6 +21,18 @@ use sley_core::{GitError, Result};
 use std::collections::HashMap;
 use std::io::Write;
 
+/// Render through an atom-recognizer hook. The dispatch arms above only reach
+/// the recognizers whose placeholder grammar they match, so `None` here is a
+/// dispatch invariant violation; report it as an error instead of panicking.
+fn write_recognized_atom(placeholder: &str, recognized: Option<Result<()>>) -> Result<()> {
+    match recognized {
+        Some(rendered) => rendered,
+        None => Err(GitError::InvalidFormat(format!(
+            "unrecognized for-each-ref atom %({placeholder})"
+        ))),
+    }
+}
+
 /// Trailers formatting for `%(trailers...)` / `%(contents:trailers...)`.
 /// Returns `Some(Err(_))` after reporting a bad-argument diagnostic, `None`
 /// when the placeholder is not a trailers atom (dispatch falls through).
@@ -374,12 +386,12 @@ pub fn print_for_each_ref_format_with_is_bases(
                         .and_then(|peeled| peeled.author.as_deref()),
                 )?,
                 "authorname" | "*authorname" => {
-                    for_each_ref_try_name_atom(stdout, placeholder, context)
-                        .expect("name atom recognized")?
+                    let recognized = for_each_ref_try_name_atom(stdout, placeholder, context);
+                    write_recognized_atom(placeholder, recognized)?
                 }
                 "authoremail" | "*authoremail" => {
-                    for_each_ref_try_email_atom(stdout, placeholder, context)
-                        .expect("email atom recognized")?
+                    let recognized = for_each_ref_try_email_atom(stdout, placeholder, context);
+                    write_recognized_atom(placeholder, recognized)?
                 }
                 "committer" => write_for_each_ref_identity(
                     stdout,
@@ -396,12 +408,12 @@ pub fn print_for_each_ref_format_with_is_bases(
                         .and_then(|peeled| peeled.committer.as_deref()),
                 )?,
                 "committername" | "*committername" => {
-                    for_each_ref_try_name_atom(stdout, placeholder, context)
-                        .expect("name atom recognized")?
+                    let recognized = for_each_ref_try_name_atom(stdout, placeholder, context);
+                    write_recognized_atom(placeholder, recognized)?
                 }
                 "committeremail" | "*committeremail" => {
-                    for_each_ref_try_email_atom(stdout, placeholder, context)
-                        .expect("email atom recognized")?
+                    let recognized = for_each_ref_try_email_atom(stdout, placeholder, context);
+                    write_recognized_atom(placeholder, recognized)?
                 }
                 "tagger" => write_for_each_ref_identity(
                     stdout,
@@ -412,12 +424,12 @@ pub fn print_for_each_ref_format_with_is_bases(
                 )?,
                 "*tagger" => write_for_each_ref_identity(stdout, None)?,
                 "taggername" | "*taggername" => {
-                    for_each_ref_try_name_atom(stdout, placeholder, context)
-                        .expect("name atom recognized")?
+                    let recognized = for_each_ref_try_name_atom(stdout, placeholder, context);
+                    write_recognized_atom(placeholder, recognized)?
                 }
                 "taggeremail" | "*taggeremail" => {
-                    for_each_ref_try_email_atom(stdout, placeholder, context)
-                        .expect("email atom recognized")?
+                    let recognized = for_each_ref_try_email_atom(stdout, placeholder, context);
+                    write_recognized_atom(placeholder, recognized)?
                 }
                 "creator" => write_for_each_ref_identity(
                     stdout,
@@ -435,8 +447,8 @@ pub fn print_for_each_ref_format_with_is_bases(
                 )?,
                 "authordate" | "*authordate" | "committerdate" | "*committerdate"
                 | "taggerdate" | "*taggerdate" | "creatordate" | "*creatordate" => {
-                    for_each_ref_try_date_atom(stdout, placeholder, context)
-                        .expect("date atom recognized")?
+                    let recognized = for_each_ref_try_date_atom(stdout, placeholder, context);
+                    write_recognized_atom(placeholder, recognized)?
                 }
                 "tree" => {
                     if let Some(tree) = context
