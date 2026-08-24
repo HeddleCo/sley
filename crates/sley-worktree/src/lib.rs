@@ -54,8 +54,10 @@ mod unpack_worktree;
 // Environment-respecting repository discovery, shared with the facade setup
 // path and the hook engine (see the `discovery` module docs).
 pub use discovery::{
-    discover_git_dir_respecting_environment, environment_git_dir, environment_work_tree,
-    is_git_dir, read_gitdir_link, resolve_explicit_git_dir, resolve_path_from_cwd,
+    DiscoveredRepository, RepositoryDiscoveryMode, RepositoryDiscoveryOptions,
+    RepositoryDiscoverySafety, discover_git_dir_respecting_environment, discover_repository,
+    environment_git_dir, environment_work_tree, is_git_dir, read_gitdir_link,
+    resolve_exact_git_dir, resolve_explicit_git_dir, resolve_path_from_cwd,
 };
 // Consolidated setup/ownership engine (git's `setup_git_directory_gently` and
 // `ensure_valid_ownership`), shared by the CLI layer and embedders.
