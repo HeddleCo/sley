@@ -442,6 +442,12 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::sync::mpsc;
 
+    // Generous deadlines: under full-workspace parallel load the daemon
+    // thread can exceed tight bounds before binding its socket; genuine
+    // startup failures still surface immediately via the done-channel.
+    const START_DEADLINE: Duration = Duration::from_secs(30);
+    const STOP_DEADLINE: Duration = Duration::from_secs(30);
+
     #[test]
     fn daemon_lifecycle_uses_a_live_endpoint() {
         let root = tempfile::Builder::new()
@@ -462,7 +468,7 @@ mod tests {
             done_tx.send(server.serve()).expect("report server result");
         });
         let listening = session
-            .wait_for_state(FsmonitorDaemonState::Listening, Duration::from_secs(2))
+            .wait_for_state(FsmonitorDaemonState::Listening, START_DEADLINE)
             .expect("wait for start");
         assert!(
             listening,
@@ -470,7 +476,7 @@ mod tests {
             done_rx.try_recv()
         );
         session
-            .request_stop(Duration::from_secs(2))
+            .request_stop(STOP_DEADLINE)
             .expect("stop daemon");
         done_rx
             .recv_timeout(Duration::from_secs(2))
@@ -481,6 +487,7 @@ mod tests {
 
     #[test]
     fn stale_endpoint_is_replaced_before_serving() {
+
         let root = tempfile::Builder::new()
             .prefix("sley-fsm-")
             .tempdir_in("/tmp")
@@ -498,7 +505,7 @@ mod tests {
             result
         });
         let listening = session
-            .wait_for_state(FsmonitorDaemonState::Listening, Duration::from_secs(2))
+            .wait_for_state(FsmonitorDaemonState::Listening, START_DEADLINE)
             .expect("wait for start");
         assert!(
             listening,
@@ -506,7 +513,7 @@ mod tests {
             done_rx.try_recv()
         );
         session
-            .request_stop(Duration::from_secs(2))
+            .request_stop(STOP_DEADLINE)
             .expect("stop daemon");
         handle.join().expect("join daemon").expect("daemon result");
     }
@@ -531,12 +538,12 @@ mod tests {
         let handle = std::thread::spawn(move || server.serve());
         assert!(
             session
-                .wait_for_state(FsmonitorDaemonState::Listening, Duration::from_secs(2))
+                .wait_for_state(FsmonitorDaemonState::Listening, START_DEADLINE)
                 .expect("wait for start")
         );
         assert!(session.socket_path().exists());
         session
-            .request_stop(Duration::from_secs(2))
+            .request_stop(STOP_DEADLINE)
             .expect("stop daemon");
         handle.join().expect("join daemon").expect("daemon result");
     }
@@ -557,7 +564,7 @@ mod tests {
         });
         assert!(
             session
-                .wait_for_state(FsmonitorDaemonState::Listening, Duration::from_secs(2))
+                .wait_for_state(FsmonitorDaemonState::Listening, START_DEADLINE)
                 .expect("wait for start")
         );
 
