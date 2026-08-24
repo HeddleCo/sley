@@ -14,6 +14,8 @@
 //! cargo bench -p sley-bench --bench cat_file -- --quick
 //! ```
 
+pub mod repack_measure;
+
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{CommitGraph, CommitGraphWriteEntry};
 use sley_object::BString;

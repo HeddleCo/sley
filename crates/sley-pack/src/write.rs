@@ -487,17 +487,35 @@ impl PackFile {
         format: ObjectFormat,
         options: &PackWriteOptions,
     ) -> Result<PackWrite> {
-        Self::write_packed_with_known_ids_and_options_and_name_hashes(inputs, format, options, None)
+        Self::write_packed_with_known_ids_and_options_and_hints(
+            inputs,
+            format,
+            options,
+            PackPlanningHints::new(),
+        )
     }
 
-    /// Like [`PackFile::write_packed_with_known_ids_and_options`], with
-    /// optional Git-compatible path name hashes used to group delta candidates.
-    /// Missing entries are treated as unnamed objects (hash zero).
+    /// Compatibility wrapper for callers that only have Git path-name hashes.
     pub fn write_packed_with_known_ids_and_options_and_name_hashes(
         inputs: &[PackInput<'_>],
         format: ObjectFormat,
         options: &PackWriteOptions,
         name_hashes: Option<&HashMap<ObjectId, u32>>,
+    ) -> Result<PackWrite> {
+        let hints = name_hashes.map_or_else(PackPlanningHints::new, |hashes| {
+            PackPlanningHints::new().with_name_hashes(hashes)
+        });
+        Self::write_packed_with_known_ids_and_options_and_hints(inputs, format, options, hints)
+    }
+
+    /// Like [`PackFile::write_packed_with_known_ids_and_options`], with
+    /// repository-derived planning metadata kept separate from encoding
+    /// policy.
+    pub fn write_packed_with_known_ids_and_options_and_hints(
+        inputs: &[PackInput<'_>],
+        format: ObjectFormat,
+        options: &PackWriteOptions,
+        hints: PackPlanningHints<'_>,
     ) -> Result<PackWrite> {
         if inputs.len() > u32::MAX as usize {
             return Err(GitError::InvalidFormat("too many pack objects".into()));
@@ -516,13 +534,33 @@ impl PackFile {
             objects.push(input.object);
             object_ids.push(*input.oid);
         }
-        Self::write_packed_from_parts(objects, object_ids, format, options, name_hashes)
+        Self::write_packed_from_parts(objects, object_ids, format, options, hints)
     }
 
     pub fn write_packed_with_known_ids_to_writer<W>(
         inputs: &[PackInput<'_>],
         format: ObjectFormat,
         options: &PackWriteOptions,
+        writer: &mut W,
+    ) -> Result<PackWriteSummary>
+    where
+        W: Write,
+    {
+        Self::write_packed_with_known_ids_and_options_and_hints_to_writer(
+            inputs,
+            format,
+            options,
+            PackPlanningHints::new(),
+            writer,
+        )
+    }
+
+    /// Writer-backed known-id pack generation with repository planning hints.
+    pub fn write_packed_with_known_ids_and_options_and_hints_to_writer<W>(
+        inputs: &[PackInput<'_>],
+        format: ObjectFormat,
+        options: &PackWriteOptions,
+        hints: PackPlanningHints<'_>,
         writer: &mut W,
     ) -> Result<PackWriteSummary>
     where
@@ -545,7 +583,7 @@ impl PackFile {
             objects.push(input.object);
             object_ids.push(*input.oid);
         }
-        Self::write_packed_from_parts_to_writer(objects, object_ids, format, options, writer)
+        Self::write_packed_from_parts_to_writer(objects, object_ids, format, options, hints, writer)
     }
 
     /// Write a thin pack: objects may be deltified against `external_bases`
@@ -587,7 +625,13 @@ impl PackFile {
         for object in &objects {
             object_ids.push(object.object_id(format)?);
         }
-        Self::write_packed_from_parts(objects, object_ids, format, options, None)
+        Self::write_packed_from_parts(
+            objects,
+            object_ids,
+            format,
+            options,
+            PackPlanningHints::new(),
+        )
     }
 
     pub(crate) fn write_packed_from_parts(
@@ -595,7 +639,7 @@ impl PackFile {
         object_ids: Vec<ObjectId>,
         format: ObjectFormat,
         options: &PackWriteOptions,
-        name_hashes: Option<&HashMap<ObjectId, u32>>,
+        hints: PackPlanningHints<'_>,
     ) -> Result<PackWrite> {
         let mut seen = HashSet::with_capacity(object_ids.len());
         for oid in &object_ids {
@@ -618,7 +662,7 @@ impl PackFile {
         // obtain the emit order. In-pack deltas only ever reference candidates
         // that appear earlier in `order`, so emitting in `order` guarantees a
         // base is always written before any object that deltas against it.
-        let (plan, order) = plan_pack_deltas(&objects, &object_ids, options, name_hashes)?;
+        let (plan, order) = plan_pack_deltas(&objects, &object_ids, options, hints)?;
 
         let mut pack = Vec::new();
         pack.extend_from_slice(b"PACK");
@@ -697,6 +741,7 @@ impl PackFile {
         object_ids: Vec<ObjectId>,
         format: ObjectFormat,
         options: &PackWriteOptions,
+        hints: PackPlanningHints<'_>,
         writer: &mut W,
     ) -> Result<PackWriteSummary>
     where
@@ -717,7 +762,7 @@ impl PackFile {
             }
         }
 
-        let (plan, order) = plan_pack_deltas(&objects, &object_ids, options, None)?;
+        let (plan, order) = plan_pack_deltas(&objects, &object_ids, options, hints)?;
         let mut output = PackDigestWriter::new(writer, format);
         output.write_pack_bytes(b"PACK")?;
         output.write_pack_bytes(&2u32.to_be_bytes())?;
@@ -916,11 +961,42 @@ impl PackFile {
         I: IntoIterator<Item = ObjectId>,
         F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
     {
-        Self::write_packed_from_source_to_writer_with_cancel(
+        Self::write_packed_from_source_to_writer_with_hints_and_cancel(
             selected_objects,
             object_count,
             format,
             options,
+            PackPlanningHints::new(),
+            limits,
+            read_object,
+            writer,
+            CancelFlag::never(),
+        )
+    }
+
+    /// Streaming pack write with repository-derived planning metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_packed_from_source_to_writer_with_hints<W, I, F>(
+        selected_objects: I,
+        object_count: u32,
+        format: ObjectFormat,
+        options: &PackWriteOptions,
+        hints: PackPlanningHints<'_>,
+        limits: PackWriteLimits,
+        read_object: F,
+        writer: &mut W,
+    ) -> Result<PackWriteSummary>
+    where
+        W: Write,
+        I: IntoIterator<Item = ObjectId>,
+        F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
+    {
+        Self::write_packed_from_source_to_writer_with_hints_and_cancel(
+            selected_objects,
+            object_count,
+            format,
+            options,
+            hints,
             limits,
             read_object,
             writer,
@@ -962,6 +1038,38 @@ impl PackFile {
         I: IntoIterator<Item = ObjectId>,
         F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
     {
+        Self::write_packed_from_source_to_writer_with_hints_and_cancel(
+            selected_objects,
+            object_count,
+            format,
+            options,
+            PackPlanningHints::new(),
+            limits,
+            read_object,
+            writer,
+            cancel,
+        )
+    }
+
+    /// Cancel-aware streaming pack write with repository-derived planning
+    /// metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_packed_from_source_to_writer_with_hints_and_cancel<W, I, F>(
+        selected_objects: I,
+        object_count: u32,
+        format: ObjectFormat,
+        options: &PackWriteOptions,
+        hints: PackPlanningHints<'_>,
+        limits: PackWriteLimits,
+        read_object: F,
+        writer: &mut W,
+        cancel: CancelFlag<'_>,
+    ) -> Result<PackWriteSummary>
+    where
+        W: Write,
+        I: IntoIterator<Item = ObjectId>,
+        F: FnMut(&ObjectId) -> Result<Arc<EncodedObject>>,
+    {
         validate_thin_base_formats(options, format)?;
         cancel.check()?;
         let mut stream = SourcePackStream::new(
@@ -993,7 +1101,7 @@ impl PackFile {
                 .collect::<Vec<_>>();
             let object_ids = window.iter().map(|entry| entry.oid).collect::<Vec<_>>();
             let (plan, order) =
-                plan_streaming_window_deltas(&objects, &object_ids, &base_horizon, options);
+                plan_streaming_window_deltas(&objects, &object_ids, &base_horizon, options, hints);
             let compressed_payloads = compress_streaming_planned_payloads(
                 &objects,
                 &plan,

@@ -3,19 +3,20 @@
 //! pruning, temporary-file and empty-directory cleanup, shallow repair, and
 //! the `gc.recentObjectsHook` runner.
 
-use std::collections::BTreeSet;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::{FileObjectDatabase, repository_objects_dir};
 use sley_refs::FileRefStore;
 
+use crate::roots::{GcRoot, GcRootSet, GcRootSource};
 use crate::{parse_reflog_expire_time, read_repo_config, resolve_ref_to_oid, resolve_revision};
 
 pub fn parse_prune_expire(value: &str, option: &str) -> Result<i64> {
@@ -49,15 +50,12 @@ pub fn prune_roots(
         if let Some(oid) = prune_head_root(&store, &worktree_git_dir, format)? {
             roots.insert(oid);
         }
-        for oid in prune_index_roots(&worktree_git_dir, format)? {
-            roots.insert(oid);
-        }
-        for oid in reflog_roots_from_dir(&worktree_git_dir.join("logs"), format)? {
-            roots.insert(oid);
-        }
-        for oid in prune_state_file_roots(&worktree_git_dir, format)? {
-            roots.insert(oid);
-        }
+        roots.extend(prune_index_roots(&worktree_git_dir, format)?);
+        roots.extend(reflog_roots_from_dir(
+            &worktree_git_dir.join("logs"),
+            format,
+        )?);
+        roots.extend(prune_state_file_roots(&worktree_git_dir, format)?);
     }
     for head in heads {
         roots.insert(resolve_revision(
@@ -69,6 +67,60 @@ pub fn prune_roots(
     }
     roots.extend(reflog_roots_from_dir(&common_git_dir.join("logs"), format)?);
     Ok(roots.into_iter().collect())
+}
+
+/// Collect prune roots while retaining every reason an object must stay live.
+///
+/// Callers that need diagnostics can inspect the sources without losing
+/// information when the same object appears in more than one ref, index,
+/// reflog, or state file. The ordinary [`prune_roots`] path performs the
+/// equivalent ID-only collection without paying for provenance.
+pub fn prune_roots_with_sources(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    replace_objects: bool,
+    heads: &[String],
+) -> Result<GcRootSet> {
+    let store = FileRefStore::new(common_git_dir, format);
+    let mut roots = GcRootSet::default();
+    for reference in store.list_refs()? {
+        if let Some(oid) = resolve_ref_to_oid(&store, &reference.name)? {
+            roots.insert(GcRoot {
+                oid,
+                source: GcRootSource::Ref {
+                    name: reference.name,
+                },
+            });
+        }
+    }
+    for worktree_git_dir in prune_worktree_git_dirs(git_dir, common_git_dir)? {
+        if let Some(oid) = prune_head_root(&store, &worktree_git_dir, format)? {
+            roots.insert(GcRoot {
+                oid,
+                source: GcRootSource::Head {
+                    git_dir: worktree_git_dir.clone().into(),
+                },
+            });
+        }
+        visit_prune_index_roots(&worktree_git_dir, format, &mut |root| roots.insert(root))?;
+        visit_reflog_roots_from_dir(&worktree_git_dir.join("logs"), format, &mut |root| {
+            roots.insert(root)
+        })?;
+        visit_prune_state_file_roots(&worktree_git_dir, format, &mut |root| roots.insert(root))?;
+    }
+    for head in heads {
+        roots.insert(GcRoot {
+            oid: resolve_revision(common_git_dir, format, head, replace_objects)?,
+            source: GcRootSource::CommandLine {
+                revision: head.clone(),
+            },
+        });
+    }
+    visit_reflog_roots_from_dir(&common_git_dir.join("logs"), format, &mut |root| {
+        roots.insert(root)
+    })?;
+    Ok(roots)
 }
 
 pub fn prune_worktree_git_dirs(git_dir: &Path, common_git_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -123,6 +175,32 @@ pub fn prune_index_roots(git_dir: &Path, format: ObjectFormat) -> Result<Vec<Obj
         .collect())
 }
 
+fn visit_prune_index_roots(
+    git_dir: &Path,
+    format: ObjectFormat,
+    visitor: &mut impl FnMut(GcRoot),
+) -> Result<()> {
+    let index_path = git_dir.join("index");
+    let bytes = match fs::read(&index_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let index = sley_index::Index::parse(&bytes, format)?;
+    let index_path: Arc<Path> = index_path.into();
+    for entry in index.entries {
+        if !sley_index::is_gitlink(entry.mode) {
+            visitor(GcRoot {
+                oid: entry.oid,
+                source: GcRootSource::IndexEntry {
+                    index: index_path.clone(),
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn prune_state_file_roots(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
     let mut roots = Vec::new();
     for path in [
@@ -144,6 +222,34 @@ pub fn prune_state_file_roots(git_dir: &Path, format: ObjectFormat) -> Result<Ve
     Ok(roots)
 }
 
+fn visit_prune_state_file_roots(
+    git_dir: &Path,
+    format: ObjectFormat,
+    visitor: &mut impl FnMut(GcRoot),
+) -> Result<()> {
+    for path in [
+        "rebase-apply/autostash",
+        "rebase-apply/orig-head",
+        "rebase-merge/autostash",
+        "rebase-merge/orig-head",
+    ] {
+        let path = git_dir.join(path);
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let value = contents.trim();
+        if value.len() == format.hex_len()
+            && let Ok(oid) = ObjectId::from_hex(format, value)
+        {
+            visitor(GcRoot {
+                oid,
+                source: GcRootSource::StateFile { path: path.into() },
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn reflog_roots_from_dir(logs_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
     let mut roots = Vec::new();
     let zero = vec![b'0'; format.hex_len()];
@@ -160,7 +266,7 @@ pub fn reflog_roots_from_dir(logs_dir: &Path, format: ObjectFormat) -> Result<Ve
             if entry.file_type()?.is_dir() {
                 stack.push(path);
             } else {
-                let contents = fs::read(&path)?;
+                let contents = fs::read(path)?;
                 for line in contents.split(|byte| *byte == b'\n') {
                     let mut fields = line.split(|byte| *byte == b' ');
                     for hex in [fields.next(), fields.next()].into_iter().flatten() {
@@ -176,6 +282,49 @@ pub fn reflog_roots_from_dir(logs_dir: &Path, format: ObjectFormat) -> Result<Ve
         }
     }
     Ok(roots)
+}
+
+pub(crate) fn visit_reflog_roots_from_dir(
+    logs_dir: &Path,
+    format: ObjectFormat,
+    visitor: &mut impl FnMut(GcRoot),
+) -> Result<()> {
+    let zero = vec![b'0'; format.hex_len()];
+    let mut stack: Vec<PathBuf> = vec![logs_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && dir == logs_dir => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                stack.push(path);
+            } else {
+                let contents = fs::read(&path)?;
+                let source = GcRootSource::Reflog {
+                    path: path.clone().into(),
+                };
+                for line in contents.split(|byte| *byte == b'\n') {
+                    let mut fields = line.split(|byte| *byte == b' ');
+                    for hex in [fields.next(), fields.next()].into_iter().flatten() {
+                        if hex != zero
+                            && let Ok(hex) = std::str::from_utf8(hex)
+                            && let Ok(oid) = ObjectId::from_hex(format, hex)
+                        {
+                            visitor(GcRoot {
+                                oid,
+                                source: source.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn prune_recent_object_roots(
@@ -508,4 +657,57 @@ pub fn prune_shallow_file(
         fs::write(path, out)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use crate::roots::GcRootSource;
+
+    fn test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "sley-gc-{label}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
+    }
+
+    #[test]
+    fn reflog_stream_keeps_raw_bytes_and_deduplicates_with_provenance() {
+        let root = test_dir("typed-reflog-roots");
+        let logs = root.join("logs");
+        let log_path = logs.join("HEAD");
+        fs::create_dir_all(&logs).expect("create logs");
+        let oid = "1234567890123456789012345678901234567890";
+        let mut bytes =
+            format!("{} {} ident <a@b> 0 +0000\tmessage", "0".repeat(40), oid).into_bytes();
+        bytes.extend_from_slice(b"\xff\n");
+        bytes.extend_from_slice(format!("{oid} {oid} ident <a@b> 1 +0000\tagain\n").as_bytes());
+        fs::write(&log_path, bytes).expect("write reflog");
+
+        let mut roots = GcRootSet::default();
+        visit_reflog_roots_from_dir(&logs, ObjectFormat::Sha1, &mut |root| roots.insert(root))
+            .expect("stream reflog roots");
+
+        let oid = ObjectId::from_hex(ObjectFormat::Sha1, oid).expect("valid oid");
+        let mut direct = reflog_roots_from_dir(&logs, ObjectFormat::Sha1)
+            .expect("collect allocation-light reflog roots");
+        direct.sort();
+        direct.dedup();
+        assert_eq!(
+            direct,
+            roots.sorted_object_ids().collect::<Vec<_>>(),
+            "the ID-only and provenance collectors must find the same unique roots"
+        );
+        assert_eq!(roots.object_ids().collect::<Vec<_>>(), vec![oid]);
+        assert_eq!(
+            roots.sources(&oid).expect("root provenance"),
+            &BTreeSet::from([GcRootSource::Reflog {
+                path: log_path.into()
+            }])
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
 }

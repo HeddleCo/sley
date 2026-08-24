@@ -8,7 +8,8 @@ use sley_core::{
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, tree_entry_object_type};
 use sley_pack::{
     MultiPackIndex, PackBitmapIndex, PackBitmapWriter, PackFile, PackIndex, PackIndexEntry,
-    PackIndexViewData, PackInput, PackWrite, PackWriteLimits, PackWriteOptions, PackWriteSummary,
+    PackIndexViewData, PackInput, PackPlanningHints, PackWrite, PackWriteLimits, PackWriteOptions,
+    PackWriteSummary,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
@@ -192,11 +193,21 @@ pub(crate) struct ReachablePackObjectMeta {
     pub(crate) oid: ObjectId,
     pub(crate) object_type: ObjectType,
     pub(crate) size: u64,
+    pub(crate) name_hash: u32,
 }
 
 pub(crate) enum ReachablePackObjectsForWrite {
-    Buffered(Vec<ReachablePackObject>),
+    Buffered {
+        objects: Vec<ReachablePackObject>,
+        name_hashes: HashMap<ObjectId, u32>,
+    },
     Streaming(Vec<ReachablePackObjectMeta>),
+}
+
+#[derive(Clone, Copy)]
+enum ReachablePackTraversal {
+    Natural,
+    RepackLegacy,
 }
 
 fn collect_reachable_pack_objects<R, I>(
@@ -255,13 +266,109 @@ where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
 {
+    collect_reachable_pack_objects_for_write_with_order(
+        reader,
+        format,
+        starts,
+        excluded,
+        true,
+        ReachablePackTraversal::Natural,
+    )
+}
+
+fn collect_reachable_pack_objects_for_write_with_order<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    reorder: bool,
+    traversal: ReachablePackTraversal,
+) -> Result<ReachablePackObjectsForWrite>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
     let mut buffered = Some(Vec::new());
-    let mut metadata = Vec::new();
-    walk_reachable_objects(reader, format, starts, excluded, |oid, object| {
+    let mut metadata: Vec<ReachablePackObjectMeta> = Vec::new();
+    let mut metadata_positions: HashMap<ObjectId, usize> = HashMap::new();
+    let mut seen = HashSet::new();
+    let starts = starts.into_iter().collect::<Vec<_>>();
+    let mut pending = Vec::with_capacity(starts.len());
+    match traversal {
+        ReachablePackTraversal::Natural => {
+            pending.extend(starts.into_iter().rev().map(|oid| (oid, None::<Vec<u8>>)))
+        }
+        ReachablePackTraversal::RepackLegacy => {
+            pending.extend(starts.into_iter().map(|oid| (oid, None::<Vec<u8>>)));
+        }
+    }
+    while let Some((oid, path)) = pending.pop() {
+        if excluded.contains(&oid) {
+            continue;
+        }
+        let hash = path
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .map(pack_name_hash)
+            .unwrap_or(0);
+        if !seen.insert(oid) {
+            if hash != 0
+                && let Some(position) = metadata_positions.get(&oid).copied()
+                && metadata[position].name_hash == 0
+            {
+                metadata[position].name_hash = hash;
+            }
+            continue;
+        }
+        let object = reader.read_object(&oid).map_err(|err| {
+            with_missing_object_context(err, oid, MissingObjectContext::Traversal)
+        })?;
+        match object.object_type {
+            ObjectType::Commit => {
+                let commit = Commit::parse_ref(format, &object.body)?;
+                let parents = grafted_parents(reader, &oid, commit.parents);
+                match traversal {
+                    ReachablePackTraversal::Natural => {
+                        pending.extend(parents.into_iter().rev().map(|parent| (parent, None)))
+                    }
+                    ReachablePackTraversal::RepackLegacy => {
+                        pending.extend(parents.into_iter().map(|parent| (parent, None)));
+                    }
+                }
+                pending.push((commit.tree, Some(Vec::new())));
+            }
+            ObjectType::Tree => {
+                let prefix = path.as_deref().unwrap_or_default();
+                let mut children = Vec::new();
+                for entry in TreeEntries::new(format, &object.body) {
+                    let entry = entry?;
+                    if entry.is_gitlink() {
+                        continue;
+                    }
+                    let mut child_path = Vec::with_capacity(
+                        prefix.len() + usize::from(!prefix.is_empty()) + entry.name.len(),
+                    );
+                    child_path.extend_from_slice(prefix);
+                    if !prefix.is_empty() {
+                        child_path.push(b'/');
+                    }
+                    child_path.extend_from_slice(entry.name);
+                    children.push((entry.oid, Some(child_path)));
+                }
+                pending.extend(children.into_iter().rev());
+            }
+            ObjectType::Tag => {
+                let tag = Tag::parse_ref(format, &object.body)?;
+                pending.push((tag.object, None));
+            }
+            ObjectType::Blob => {}
+        }
+        metadata_positions.insert(oid, metadata.len());
         metadata.push(ReachablePackObjectMeta {
-            oid: *oid,
+            oid,
             object_type: object.object_type,
             size: object.body.len() as u64,
+            name_hash: hash,
         });
         let should_stream = buffered
             .as_ref()
@@ -271,37 +378,34 @@ where
         }
         if let Some(objects) = buffered.as_mut() {
             objects.push(ReachablePackObject {
-                oid: *oid,
-                object: Arc::clone(object),
+                oid,
+                object: Arc::clone(&object),
             });
         }
-    })?;
+    }
 
     match buffered {
-        Some(objects) => Ok(ReachablePackObjectsForWrite::Buffered(objects)),
+        Some(objects) => Ok(ReachablePackObjectsForWrite::Buffered {
+            objects,
+            name_hashes: metadata
+                .into_iter()
+                .filter(|meta| meta.name_hash != 0)
+                .map(|meta| (meta.oid, meta.name_hash))
+                .collect(),
+        }),
         None => {
-            sort_reachable_pack_metadata(&mut metadata);
+            if reorder {
+                sort_reachable_pack_metadata(&mut metadata);
+            }
             Ok(ReachablePackObjectsForWrite::Streaming(metadata))
         }
     }
 }
 
 pub(crate) fn sort_reachable_pack_metadata(metadata: &mut [ReachablePackObjectMeta]) {
-    metadata.sort_by(|left, right| {
-        reachable_pack_type_rank(left.object_type)
-            .cmp(&reachable_pack_type_rank(right.object_type))
-            .then_with(|| right.size.cmp(&left.size))
-            .then_with(|| left.oid.as_bytes().cmp(right.oid.as_bytes()))
+    sley_pack::sort_by_pack_planning_order(metadata, |entry| {
+        (entry.oid, entry.object_type, entry.size, entry.name_hash)
     });
-}
-
-fn reachable_pack_type_rank(object_type: ObjectType) -> u8 {
-    match object_type {
-        ObjectType::Commit => 0,
-        ObjectType::Tree => 1,
-        ObjectType::Blob => 2,
-        ObjectType::Tag => 3,
-    }
 }
 
 pub(crate) fn pack_inputs(objects: &[ReachablePackObject]) -> Vec<PackInput<'_>> {
@@ -401,9 +505,12 @@ where
 {
     let objects = collect_reachable_pack_objects_for_write(reader, format, starts, excluded)?;
     match &objects {
-        ReachablePackObjectsForWrite::Buffered(objects) if objects.is_empty() => return Ok(None),
+        ReachablePackObjectsForWrite::Buffered { objects, .. } if objects.is_empty() => {
+            return Ok(None);
+        }
         ReachablePackObjectsForWrite::Streaming(objects) if objects.is_empty() => return Ok(None),
-        ReachablePackObjectsForWrite::Buffered(_) | ReachablePackObjectsForWrite::Streaming(_) => {}
+        ReachablePackObjectsForWrite::Buffered { .. }
+        | ReachablePackObjectsForWrite::Streaming(_) => {}
     }
     build_reachable_pack_objects_with_reuse(reader, format, objects).map(Some)
 }
@@ -419,28 +526,45 @@ where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
 {
-    let objects = collect_reachable_pack_objects(reader, format, starts, excluded)?;
-    if objects.is_empty() {
-        return Ok(None);
-    }
-    let inputs = pack_inputs(&objects);
     let pack_path = pack_path.as_ref();
-    if let Some(parent) = pack_path.parent() {
-        fs::create_dir_all(parent)?;
+    let parent = pack_path
+        .parent()
+        .ok_or_else(|| GitError::InvalidPath("prepared pack path has no parent".into()))?;
+    fs::create_dir_all(parent)?;
+    let temp_path = unique_temp_path(parent).with_extension("pack");
+    let result = (|| -> Result<Option<ReachablePackFile>> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        let summary = write_reachable_pack_to_writer(reader, format, starts, excluded, &mut file)?;
+        let Some(summary) = summary else {
+            return Ok(None);
+        };
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp_path, pack_path)?;
+        sync_directory(parent)?;
+        Ok(Some(ReachablePackFile {
+            pack_path: pack_path.to_path_buf(),
+            pack_size: summary.pack_size,
+            checksum: summary.checksum,
+            object_count: summary.object_count,
+            delta_count: summary.delta_count,
+        }))
+    })();
+    if result.is_err() || matches!(result.as_ref(), Ok(None)) {
+        let _ = fs::remove_file(&temp_path);
     }
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(pack_path)?;
-    let summary = PackFile::write_packed_with_known_ids_to_writer(
-        &inputs,
-        format,
-        &PackWriteOptions::new(),
-        &mut file,
-    )?;
-    file.sync_all()?;
-    Ok(Some(reachable_pack_file_result(pack_path, summary)))
+    result
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 pub fn write_reachable_pack_to_writer<R, I, W>(
@@ -455,11 +579,12 @@ where
     I: IntoIterator<Item = ObjectId>,
     W: Write,
 {
-    write_reachable_pack_to_writer_with_cancel(
+    write_reachable_pack_to_writer_with_options_and_cancel(
         reader,
         format,
         starts,
         excluded,
+        &PackWriteOptions::new(),
         writer,
         CancelFlag::never(),
     )
@@ -480,17 +605,111 @@ where
     I: IntoIterator<Item = ObjectId>,
     W: Write,
 {
-    match collect_reachable_pack_objects_for_write(reader, format, starts, excluded)? {
-        ReachablePackObjectsForWrite::Buffered(objects) => {
+    write_reachable_pack_to_writer_with_options_and_cancel(
+        reader,
+        format,
+        starts,
+        excluded,
+        &PackWriteOptions::new(),
+        writer,
+        cancel,
+    )
+}
+
+/// Option-aware and cancel-aware reachable pack streaming.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_reachable_pack_to_writer_with_options_and_cancel<R, I, W>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    options: &PackWriteOptions,
+    writer: &mut W,
+    cancel: CancelFlag<'_>,
+) -> Result<Option<ReachablePackWriteSummary>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+    W: Write,
+{
+    write_reachable_pack_to_writer_with_traversal(
+        reader,
+        format,
+        starts,
+        excluded,
+        options,
+        writer,
+        cancel,
+        ReachablePackTraversal::Natural,
+    )
+}
+
+/// Reachable pack streaming with the traversal order historically used by
+/// repository repacks. Kept crate-private so transfer callers retain their
+/// natural root and parent order.
+pub(crate) fn write_repack_reachable_pack_to_writer_with_options<R, I, W>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    options: &PackWriteOptions,
+    writer: &mut W,
+) -> Result<Option<ReachablePackWriteSummary>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+    W: Write,
+{
+    write_reachable_pack_to_writer_with_traversal(
+        reader,
+        format,
+        starts,
+        excluded,
+        options,
+        writer,
+        CancelFlag::never(),
+        ReachablePackTraversal::RepackLegacy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_reachable_pack_to_writer_with_traversal<R, I, W>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    options: &PackWriteOptions,
+    writer: &mut W,
+    cancel: CancelFlag<'_>,
+    traversal: ReachablePackTraversal,
+) -> Result<Option<ReachablePackWriteSummary>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+    W: Write,
+{
+    match collect_reachable_pack_objects_for_write_with_order(
+        reader,
+        format,
+        starts,
+        excluded,
+        options.reorder,
+        traversal,
+    )? {
+        ReachablePackObjectsForWrite::Buffered {
+            objects,
+            name_hashes,
+        } => {
             if objects.is_empty() {
                 return Ok(None);
             }
             cancel.check()?;
             let inputs = pack_inputs(&objects);
-            let summary = PackFile::write_packed_with_known_ids_to_writer(
+            let summary = PackFile::write_packed_with_known_ids_and_options_and_hints_to_writer(
                 &inputs,
                 format,
-                &PackWriteOptions::new(),
+                options,
+                PackPlanningHints::new().with_name_hashes(&name_hashes),
                 writer,
             )?;
             Ok(Some(reachable_pack_write_summary(summary)))
@@ -501,15 +720,24 @@ where
             }
             let object_count = u32::try_from(metadata.len())
                 .map_err(|_| GitError::InvalidFormat("too many pack objects".into()))?;
-            write_object_id_pack_to_writer_with_cancel(
-                reader,
-                format,
+            let name_hashes = metadata
+                .iter()
+                .filter(|meta| meta.name_hash != 0)
+                .map(|meta| (meta.oid, meta.name_hash))
+                .collect::<HashMap<_, _>>();
+            let streaming_options = options.clone().with_reorder(false);
+            let summary = PackFile::write_packed_from_source_to_writer_with_hints_and_cancel(
                 metadata.iter().map(|meta| meta.oid),
                 object_count,
+                format,
+                &streaming_options,
+                PackPlanningHints::new().with_name_hashes(&name_hashes),
+                PackWriteLimits::default(),
+                |oid| reader.read_object(oid),
                 writer,
                 cancel,
-            )
-            .map(Some)
+            )?;
+            Ok(Some(reachable_pack_write_summary(summary)))
         }
     }
 }
@@ -562,16 +790,6 @@ where
         cancel,
     )?;
     Ok(reachable_pack_write_summary(summary))
-}
-
-fn reachable_pack_file_result(path: &Path, summary: PackWriteSummary) -> ReachablePackFile {
-    ReachablePackFile {
-        pack_path: path.to_path_buf(),
-        pack_size: summary.pack_size,
-        checksum: summary.checksum,
-        object_count: summary.entries.len(),
-        delta_count: summary.delta_count,
-    }
 }
 
 fn reachable_pack_write_summary(summary: PackWriteSummary) -> ReachablePackWriteSummary {
@@ -760,7 +978,10 @@ where
     build_reachable_pack_objects_with_reuse(
         reader,
         format,
-        ReachablePackObjectsForWrite::Buffered(objects),
+        ReachablePackObjectsForWrite::Buffered {
+            objects,
+            name_hashes: HashMap::new(),
+        },
     )
     .map(Some)
 }
@@ -814,7 +1035,7 @@ fn build_reachable_pack_objects_with_reuse<R: ObjectReader>(
     objects: ReachablePackObjectsForWrite,
 ) -> Result<ReachablePackBuild> {
     let selected: HashSet<ObjectId> = match &objects {
-        ReachablePackObjectsForWrite::Buffered(objects) => {
+        ReachablePackObjectsForWrite::Buffered { objects, .. } => {
             objects.iter().map(|entry| entry.oid).collect()
         }
         ReachablePackObjectsForWrite::Streaming(objects) => {
@@ -892,7 +1113,7 @@ fn build_reachable_pack_objects_with_reuse<R: ObjectReader>(
     }
 
     let fresh_oids = match &objects {
-        ReachablePackObjectsForWrite::Buffered(objects) => objects
+        ReachablePackObjectsForWrite::Buffered { objects, .. } => objects
             .iter()
             .filter_map(|entry| (!reused_oids.contains(&entry.oid)).then_some(entry.oid))
             .collect::<Vec<_>>(),
@@ -905,7 +1126,10 @@ fn build_reachable_pack_objects_with_reuse<R: ObjectReader>(
         None
     } else {
         match &objects {
-            ReachablePackObjectsForWrite::Buffered(objects) => {
+            ReachablePackObjectsForWrite::Buffered {
+                objects,
+                name_hashes,
+            } => {
                 let inputs = objects
                     .iter()
                     .filter(|entry| !reused_oids.contains(&entry.oid))
@@ -914,7 +1138,12 @@ fn build_reachable_pack_objects_with_reuse<R: ObjectReader>(
                         object: &entry.object,
                     })
                     .collect::<Vec<_>>();
-                Some(PackFile::write_packed_with_known_ids(&inputs, format)?)
+                Some(PackFile::write_packed_with_known_ids_and_options_and_hints(
+                    &inputs,
+                    format,
+                    &PackWriteOptions::new(),
+                    PackPlanningHints::new().with_name_hashes(name_hashes),
+                )?)
             }
             ReachablePackObjectsForWrite::Streaming(_) => {
                 let mut pack = Vec::new();
@@ -969,7 +1198,7 @@ where
 {
     let objects = collect_reachable_pack_objects_for_write(reader, format, starts, excluded)?;
     let selected: HashSet<ObjectId> = match &objects {
-        ReachablePackObjectsForWrite::Buffered(objects) => {
+        ReachablePackObjectsForWrite::Buffered { objects, .. } => {
             objects.iter().map(|entry| entry.oid).collect()
         }
         ReachablePackObjectsForWrite::Streaming(objects) => {
@@ -1045,7 +1274,7 @@ where
     }
 
     let fresh_oids = match &objects {
-        ReachablePackObjectsForWrite::Buffered(objects) => objects
+        ReachablePackObjectsForWrite::Buffered { objects, .. } => objects
             .iter()
             .filter_map(|entry| (!reused_oids.contains(&entry.oid)).then_some(entry.oid))
             .collect::<Vec<_>>(),
@@ -3321,7 +3550,7 @@ fn collect_tree_name_hashes<R: ObjectReader>(
     Ok(())
 }
 
-fn pack_name_hash(name: &[u8]) -> u32 {
+pub(crate) fn pack_name_hash(name: &[u8]) -> u32 {
     let mut hash = 0u32;
     for &byte in name {
         if byte.is_ascii_whitespace() {
@@ -4849,5 +5078,298 @@ mod bitmap_name_hash_tests {
             pack_name_hash(b"a/one-long-enough-for-collisions"),
             2_544_516_325
         );
+    }
+}
+
+#[cfg(test)]
+mod reachable_pack_staging_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct MapReader {
+        objects: HashMap<ObjectId, Arc<EncodedObject>>,
+    }
+
+    impl ObjectReader for MapReader {
+        fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
+            self.objects
+                .get(oid)
+                .cloned()
+                .ok_or_else(|| GitError::object_not_found_in(*oid, MissingObjectContext::Read))
+        }
+    }
+
+    fn blob_reader(count: usize) -> (MapReader, Vec<ObjectId>) {
+        let format = ObjectFormat::Sha1;
+        let mut reader = MapReader::default();
+        let mut starts = Vec::new();
+        for index in 0..count {
+            let object = Arc::new(EncodedObject::new(
+                ObjectType::Blob,
+                format!("blob-{index}").into_bytes(),
+            ));
+            let oid = object.object_id(format).expect("blob object id");
+            reader.objects.insert(oid, object);
+            starts.push(oid);
+        }
+        (reader, starts)
+    }
+
+    fn insert_object(reader: &mut MapReader, object: EncodedObject) -> ObjectId {
+        let object = Arc::new(object);
+        let oid = object.object_id(ObjectFormat::Sha1).expect("object id");
+        reader.objects.insert(oid, object);
+        oid
+    }
+
+    fn one_entry_tree(name: &[u8], oid: ObjectId) -> EncodedObject {
+        let mut body = b"100644 ".to_vec();
+        body.extend_from_slice(name);
+        body.push(0);
+        body.extend_from_slice(oid.as_bytes());
+        EncodedObject::new(ObjectType::Tree, body)
+    }
+
+    fn commit_for_tree(tree: ObjectId, message: &str) -> EncodedObject {
+        EncodedObject::new(
+            ObjectType::Commit,
+            format!(
+                "tree {}\nauthor A <a@example.com> 1 +0000\ncommitter A <a@example.com> 1 +0000\n\n{message}\n",
+                tree.to_hex()
+            )
+            .into_bytes(),
+        )
+    }
+
+    #[test]
+    fn natural_and_repack_traversal_select_their_established_first_path() {
+        let mut reader = MapReader::default();
+        let shared = insert_object(
+            &mut reader,
+            EncodedObject::new(ObjectType::Blob, b"shared".to_vec()),
+        );
+        let first_tree = insert_object(&mut reader, one_entry_tree(b"first", shared));
+        let second_tree = insert_object(&mut reader, one_entry_tree(b"second", shared));
+        let first = insert_object(&mut reader, commit_for_tree(first_tree, "first"));
+        let second = insert_object(&mut reader, commit_for_tree(second_tree, "second"));
+
+        let natural = collect_reachable_pack_objects_for_write_with_order(
+            &reader,
+            ObjectFormat::Sha1,
+            [first, second],
+            &HashSet::new(),
+            false,
+            ReachablePackTraversal::Natural,
+        )
+        .expect("natural traversal");
+        let legacy = collect_reachable_pack_objects_for_write_with_order(
+            &reader,
+            ObjectFormat::Sha1,
+            [first, second],
+            &HashSet::new(),
+            false,
+            ReachablePackTraversal::RepackLegacy,
+        )
+        .expect("legacy traversal");
+
+        let ReachablePackObjectsForWrite::Buffered {
+            objects: natural_objects,
+            name_hashes: natural_hashes,
+        } = natural
+        else {
+            panic!("small natural traversal must stay buffered");
+        };
+        let ReachablePackObjectsForWrite::Buffered {
+            objects: legacy_objects,
+            name_hashes: legacy_hashes,
+        } = legacy
+        else {
+            panic!("small legacy traversal must stay buffered");
+        };
+        assert_eq!(
+            natural_objects
+                .iter()
+                .map(|entry| entry.oid)
+                .collect::<Vec<_>>(),
+            vec![first, first_tree, shared, second, second_tree]
+        );
+        assert_eq!(
+            legacy_objects
+                .iter()
+                .map(|entry| entry.oid)
+                .collect::<Vec<_>>(),
+            vec![second, second_tree, shared, first, first_tree]
+        );
+        assert_eq!(natural_hashes[&shared], pack_name_hash(b"first"));
+        assert_eq!(legacy_hashes[&shared], pack_name_hash(b"second"));
+    }
+
+    #[test]
+    fn reachable_pack_streaming_threshold_is_exact_and_canonical() {
+        assert_eq!(REACHABLE_PACK_STREAMING_MIN_OBJECTS, 32);
+        let (reader, starts) = blob_reader(REACHABLE_PACK_STREAMING_MIN_OBJECTS - 1);
+        let buffered = collect_reachable_pack_objects_for_write(
+            &reader,
+            ObjectFormat::Sha1,
+            starts,
+            &HashSet::new(),
+        )
+        .expect("collect buffered objects");
+        assert!(matches!(
+            buffered,
+            ReachablePackObjectsForWrite::Buffered { objects, .. }
+                if objects.len() == REACHABLE_PACK_STREAMING_MIN_OBJECTS - 1
+        ));
+
+        let (reader, starts) = blob_reader(REACHABLE_PACK_STREAMING_MIN_OBJECTS);
+        let traversal_order = starts.clone();
+        let streaming = collect_reachable_pack_objects_for_write(
+            &reader,
+            ObjectFormat::Sha1,
+            starts.iter().copied(),
+            &HashSet::new(),
+        )
+        .expect("collect streaming metadata");
+        assert!(matches!(
+            streaming,
+            ReachablePackObjectsForWrite::Streaming(metadata)
+                if metadata.len() == REACHABLE_PACK_STREAMING_MIN_OBJECTS
+        ));
+
+        let mut pack = Vec::new();
+        write_reachable_pack_to_writer_with_options_and_cancel(
+            &reader,
+            ObjectFormat::Sha1,
+            starts,
+            &HashSet::new(),
+            &PackWriteOptions::new().with_reorder(false),
+            &mut pack,
+            CancelFlag::never(),
+        )
+        .expect("write traversal-ordered pack")
+        .expect("non-empty traversal-ordered pack");
+        let parsed = PackFile::parse(&pack, ObjectFormat::Sha1).expect("parse traversal pack");
+        assert_eq!(
+            parsed
+                .entries
+                .iter()
+                .map(|entry| entry.entry.oid)
+                .collect::<Vec<_>>(),
+            traversal_order,
+            "disabling reorder must preserve traversal order across the streaming threshold"
+        );
+
+        let oid = |suffix: &str| {
+            ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                &format!("000000000000000000000000000000000000000{suffix}"),
+            )
+            .expect("planning object id")
+        };
+        let mut metadata = vec![
+            ReachablePackObjectMeta {
+                oid: oid("4"),
+                object_type: ObjectType::Commit,
+                size: 1,
+                name_hash: 0,
+            },
+            ReachablePackObjectMeta {
+                oid: oid("3"),
+                object_type: ObjectType::Tree,
+                size: 1,
+                name_hash: 0,
+            },
+            ReachablePackObjectMeta {
+                oid: oid("2"),
+                object_type: ObjectType::Blob,
+                size: 1,
+                name_hash: 0,
+            },
+            ReachablePackObjectMeta {
+                oid: oid("1"),
+                object_type: ObjectType::Tag,
+                size: 1,
+                name_hash: 0,
+            },
+        ];
+        sort_reachable_pack_metadata(&mut metadata);
+        assert_eq!(
+            metadata
+                .iter()
+                .map(|entry| entry.object_type)
+                .collect::<Vec<_>>(),
+            vec![
+                ObjectType::Tag,
+                ObjectType::Blob,
+                ObjectType::Tree,
+                ObjectType::Commit,
+            ]
+        );
+    }
+
+    #[test]
+    fn staged_reachable_pack_preserves_target_on_empty_and_failure() {
+        let format = ObjectFormat::Sha1;
+        let root = unique_temp_path(&env::temp_dir());
+        let database = FileObjectDatabase::new(root.join("objects"), format);
+        let pack_dir = root.join("prepared");
+        fs::create_dir_all(&pack_dir).expect("create prepared directory");
+        let target = pack_dir.join("target.pack");
+        fs::write(&target, b"previous-pack").expect("write existing target");
+
+        let empty = build_reachable_pack_file(
+            &database,
+            format,
+            std::iter::empty(),
+            &HashSet::new(),
+            &target,
+        )
+        .expect("empty walk");
+        assert!(empty.is_none());
+        assert_eq!(fs::read(&target).expect("read target"), b"previous-pack");
+
+        let missing_tree = ObjectId::from_hex(format, "ffffffffffffffffffffffffffffffffffffffff")
+            .expect("missing tree id");
+        let commit = database
+            .write_object(EncodedObject::new(
+                ObjectType::Commit,
+                Commit {
+                    tree: missing_tree,
+                    parents: Vec::new(),
+                    author: b"A <a@example.com> 1 +0000".to_vec(),
+                    committer: b"A <a@example.com> 1 +0000".to_vec(),
+                    encoding: None,
+                    message: b"missing tree\n".to_vec(),
+                }
+                .write(),
+            ))
+            .expect("write commit");
+        build_reachable_pack_file(&database, format, [commit], &HashSet::new(), &target)
+            .expect_err("missing tree must abort staging");
+        assert_eq!(fs::read(&target).expect("read target"), b"previous-pack");
+        assert!(
+            fs::read_dir(&pack_dir)
+                .expect("list prepared directory")
+                .filter_map(std::result::Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with("tmp_obj_")),
+            "failed and empty builds must remove temporary packs"
+        );
+
+        let blob = database
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"replacement".to_vec(),
+            ))
+            .expect("write replacement blob");
+        let prepared =
+            build_reachable_pack_file(&database, format, [blob], &HashSet::new(), &target)
+                .expect("stage replacement")
+                .expect("non-empty replacement");
+        let bytes = fs::read(&target).expect("read prepared pack");
+        let parsed = PackFile::parse(&bytes, format).expect("parse prepared pack");
+        assert_eq!(prepared.pack_size, bytes.len() as u64);
+        assert_eq!(prepared.checksum, parsed.checksum);
+        assert_eq!(prepared.object_count, 1);
+        fs::remove_dir_all(root).expect("remove staging fixture");
     }
 }

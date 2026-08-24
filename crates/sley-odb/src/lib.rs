@@ -2088,6 +2088,57 @@ mod tests {
     }
 
     #[test]
+    fn prepared_reachable_pack_preserves_target_and_cleans_staging_on_failure() {
+        struct FailingReader;
+
+        impl ObjectReader for FailingReader {
+            fn read_object(&self, _oid: &ObjectId) -> Result<Arc<EncodedObject>> {
+                Err(GitError::Command("injected read failure".into()))
+            }
+        }
+
+        let root = temp_root("sley-reachable-pack-file-failure");
+        fs::create_dir_all(&root).expect("test operation should succeed");
+        let pack_path = root.join("reachable.pack");
+        let original = b"existing pack sentinel";
+        fs::write(&pack_path, original).expect("test operation should succeed");
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "0123456789012345678901234567890123456789",
+        )
+        .expect("test operation should succeed");
+
+        let error = build_reachable_pack_file(
+            &FailingReader,
+            ObjectFormat::Sha1,
+            std::iter::once(oid),
+            &HashSet::new(),
+            &pack_path,
+        )
+        .expect_err("injected object read must fail the prepared pack");
+        assert!(error.to_string().contains("injected read failure"));
+        assert_eq!(
+            fs::read(&pack_path).expect("test operation should succeed"),
+            original
+        );
+        let remaining = fs::read_dir(&root)
+            .expect("test operation should succeed")
+            .map(|entry| entry.expect("test operation should succeed").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            remaining,
+            vec![
+                pack_path
+                    .file_name()
+                    .expect("fixture pack path has a file name")
+                    .to_owned()
+            ]
+        );
+
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
     fn large_reachable_pack_streams_objects_by_id_windows() {
         let root = temp_root("sley-reachable-pack-streamed-large");
         let git_dir = root.join(".git");
@@ -2969,6 +3020,428 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn prepared_repack_streams_installs_and_cleans_up() {
+        let format = ObjectFormat::Sha1;
+        let root = temp_root("sley-prepared-repack");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create objects");
+        let database = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let mut entries = Vec::new();
+        for index in 0..40_u8 {
+            let blob = EncodedObject::new(ObjectType::Blob, vec![index; 4096]);
+            let oid = database.write_object(blob).expect("write blob");
+            entries.push(TreeEntry {
+                mode: 0o100644,
+                name: BString::from(format!("file-{index:02}").into_bytes()),
+                oid,
+            });
+        }
+        let tree_oid = database
+            .write_object(EncodedObject::new(
+                ObjectType::Tree,
+                Tree { entries }.write(),
+            ))
+            .expect("write tree");
+        let identity = b"Example <example@example.invalid> 0 +0000".to_vec();
+        let commit_oid = database
+            .write_object(EncodedObject::new(
+                ObjectType::Commit,
+                Commit {
+                    tree: tree_oid,
+                    parents: Vec::new(),
+                    author: identity.clone(),
+                    committer: identity,
+                    encoding: None,
+                    message: b"prepared\n".to_vec(),
+                }
+                .write(),
+            ))
+            .expect("write commit");
+        let options = RepackOptions {
+            force_rewrite: true,
+            ..RepackOptions::default()
+        };
+
+        let prepared = match prepare_repack_reachable_objects_with_options(
+            &git_dir,
+            format,
+            &[commit_oid],
+            &options,
+        )
+        .expect("prepare")
+        {
+            PreparedRepackOutcome::Prepared(prepared) => prepared,
+            other => panic!("expected prepared result, got {other:?}"),
+        };
+        assert_eq!(prepared.object_count(), 42);
+        // 42 traversal reads + 42 bounded writer reloads. Bitmap provenance is
+        // metadata-only, and header-only type probes are not body reads.
+        assert_eq!(prepared.preparation_body_reads(), 84);
+        assert_eq!(prepared.retained_graph_body_count(), 0);
+        let abandoned = prepared.staged_pack_path().expect("stage").to_path_buf();
+        assert!(abandoned.exists());
+        drop(prepared);
+        assert!(!abandoned.exists(), "drop removes abandoned stage");
+
+        let mut prepared = match prepare_repack_reachable_objects_with_options(
+            &git_dir,
+            format,
+            &[commit_oid],
+            &options,
+        )
+        .expect("prepare install")
+        {
+            PreparedRepackOutcome::Prepared(prepared) => prepared,
+            other => panic!("expected prepared result, got {other:?}"),
+        };
+        let stage = prepared.staged_pack_path().expect("stage").to_path_buf();
+        let bitmap_tips = HashSet::from([commit_oid]);
+        install_prepared_repack_result_with_bitmap_options(
+            &git_dir,
+            format,
+            &mut prepared,
+            RepackInstallOptions::new(false),
+            Some(&bitmap_tips),
+            None,
+        )
+        .expect("install prepared");
+        assert!(!stage.exists());
+        assert!(prepared.staged_pack_path().is_none());
+        assert_eq!(
+            fs::read_dir(git_dir.join("objects/pack"))
+                .expect("pack dir")
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pack"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read_dir(git_dir.join("objects/pack"))
+                .expect("pack dir")
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "bitmap"))
+                .count(),
+            1,
+            "bitmap construction lazily reloads commit/tree bodies"
+        );
+
+        let steady_state = prepare_repack_reachable_objects_with_options(
+            &git_dir,
+            format,
+            &[commit_oid],
+            &RepackOptions::default(),
+        )
+        .expect("steady-state staged repack");
+        assert!(matches!(steady_state, PreparedRepackOutcome::Prepared(_)));
+        drop(steady_state);
+
+        let installed_pack = fs::read_dir(git_dir.join("objects/pack"))
+            .expect("pack dir")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "pack"))
+            .expect("installed pack");
+        fs::write(installed_pack.with_extension("keep"), b"").expect("keep sidecar");
+        assert!(matches!(
+            prepare_repack_reachable_objects_with_options(
+                &git_dir,
+                format,
+                &[commit_oid],
+                &options,
+            )
+            .expect("kept fallback"),
+            PreparedRepackOutcome::LegacyRequired
+        ));
+        fs::remove_file(installed_pack.with_extension("keep")).expect("remove keep");
+
+        fs::write(installed_pack.with_extension("promisor"), b"").expect("promisor sidecar");
+        assert!(matches!(
+            prepare_repack_reachable_objects_with_options(
+                &git_dir,
+                format,
+                &[commit_oid],
+                &options,
+            )
+            .expect("promisor fallback"),
+            PreparedRepackOutcome::LegacyRequired
+        ));
+        fs::remove_file(installed_pack.with_extension("promisor")).expect("remove promisor");
+
+        let alternate = root.join("alternate/objects");
+        fs::create_dir_all(&alternate).expect("alternate objects");
+        fs::create_dir_all(git_dir.join("objects/info")).expect("objects info");
+        fs::write(
+            git_dir.join("objects/info/alternates"),
+            format!("{}\n", alternate.display()),
+        )
+        .expect("alternates");
+        assert!(matches!(
+            prepare_repack_reachable_objects_with_options(
+                &git_dir,
+                format,
+                &[commit_oid],
+                &options,
+            )
+            .expect("alternate fallback"),
+            PreparedRepackOutcome::LegacyRequired
+        ));
+        fs::remove_file(git_dir.join("objects/info/alternates")).expect("remove alternates");
+
+        let mut replacement = match prepare_repack_reachable_objects_with_options(
+            &git_dir,
+            format,
+            &[commit_oid],
+            &options,
+        )
+        .expect("forced staged replacement")
+        {
+            PreparedRepackOutcome::Prepared(prepared) => prepared,
+            other => panic!("expected forced prepared result, got {other:?}"),
+        };
+        install_prepared_repack_result_with_bitmap_options(
+            &git_dir,
+            format,
+            &mut replacement,
+            RepackInstallOptions::new(false),
+            None,
+            None,
+        )
+        .expect("replace existing content-addressed pack");
+        assert!(replacement.staged_pack_path().is_none());
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn prepared_repack_rejects_cross_repository_install_without_writes() {
+        fn snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+            fn visit(root: &Path, directory: &Path, out: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+                let mut entries = fs::read_dir(directory)
+                    .expect("read snapshot directory")
+                    .map(|entry| entry.expect("read snapshot entry").path())
+                    .collect::<Vec<_>>();
+                entries.sort();
+                for path in entries {
+                    let relative = path.strip_prefix(root).expect("snapshot relative path");
+                    if path.is_dir() {
+                        out.push((relative.to_path_buf(), None));
+                        visit(root, &path, out);
+                    } else {
+                        out.push((
+                            relative.to_path_buf(),
+                            Some(fs::read(&path).expect("read snapshot file")),
+                        ));
+                    }
+                }
+            }
+
+            let mut out = Vec::new();
+            visit(root, root, &mut out);
+            out
+        }
+
+        let format = ObjectFormat::Sha1;
+        let source_root = temp_root("sley-prepared-bound-source");
+        let source_git_dir = source_root.join(".git");
+        fs::create_dir_all(source_git_dir.join("objects")).expect("source objects");
+        let source = FileObjectDatabase::from_git_dir(&source_git_dir, format);
+        let oid = source
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"bound source\n".to_vec(),
+            ))
+            .expect("write source object");
+        let mut prepared = match prepare_repack_reachable_objects_with_options(
+            &source_git_dir,
+            format,
+            &[oid],
+            &RepackOptions::default(),
+        )
+        .expect("prepare source")
+        {
+            PreparedRepackOutcome::Prepared(prepared) => prepared,
+            other => panic!("expected prepared source result, got {other:?}"),
+        };
+
+        let destination_root = temp_root("sley-prepared-bound-destination");
+        let destination_git_dir = destination_root.join(".git");
+        fs::create_dir_all(destination_git_dir.join("objects")).expect("destination objects");
+        let source_before = snapshot(&source_git_dir);
+        let destination_before = snapshot(&destination_git_dir);
+
+        let error = install_prepared_repack_result_with_bitmap_options(
+            &destination_git_dir,
+            format,
+            &mut prepared,
+            RepackInstallOptions::new(true),
+            None,
+            None,
+        )
+        .expect_err("cross-repository install must fail");
+        assert!(error.to_string().contains("different repository"));
+        assert_eq!(snapshot(&source_git_dir), source_before);
+        assert_eq!(snapshot(&destination_git_dir), destination_before);
+        assert!(prepared.staged_pack_path().is_some());
+
+        drop(prepared);
+        fs::remove_dir_all(source_root).expect("cleanup source");
+        fs::remove_dir_all(destination_root).expect("cleanup destination");
+    }
+
+    #[test]
+    fn prepared_repack_surfaces_missing_graph_dependency() {
+        let format = ObjectFormat::Sha1;
+        let root = temp_root("sley-prepared-missing-tree");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create objects");
+        let database = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let missing_tree =
+            ObjectId::from_hex(format, &"1".repeat(format.hex_len())).expect("missing tree id");
+        let identity = b"Example <example@example.invalid> 0 +0000".to_vec();
+        let commit = database
+            .write_object(EncodedObject::new(
+                ObjectType::Commit,
+                Commit {
+                    tree: missing_tree,
+                    parents: Vec::new(),
+                    author: identity.clone(),
+                    committer: identity,
+                    encoding: None,
+                    message: b"missing tree\n".to_vec(),
+                }
+                .write(),
+            ))
+            .expect("write commit");
+
+        let error = prepare_repack_reachable_objects_with_options(
+            &git_dir,
+            format,
+            &[commit],
+            &RepackOptions::default(),
+        )
+        .expect_err("missing reachable tree must surface");
+        assert!(matches!(error, GitError::NotFound(_)));
+        assert!(
+            fs::read_dir(git_dir.join("objects/pack"))
+                .expect("pack directory")
+                .next()
+                .is_none(),
+            "failed preparation removes its staging file"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn prepared_and_legacy_repack_match_multiple_root_lifo_order() {
+        let format = ObjectFormat::Sha1;
+        let root = temp_root("sley-prepared-repack-order");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("create objects");
+        let database = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let shared = database
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"shared body\n".to_vec(),
+            ))
+            .expect("write shared blob");
+        let mut trees = Vec::new();
+        for root_index in 0..2_u8 {
+            let mut entries = vec![TreeEntry {
+                mode: 0o100644,
+                name: BString::from(format!("shared-{root_index}").into_bytes()),
+                oid: shared,
+            }];
+            for entry_index in 0..20_u8 {
+                let oid = database
+                    .write_object(EncodedObject::new(
+                        ObjectType::Blob,
+                        vec![root_index, entry_index, b'\n'],
+                    ))
+                    .expect("write unique blob");
+                entries.push(TreeEntry {
+                    mode: 0o100644,
+                    name: BString::from(
+                        format!("root-{root_index}-file-{entry_index:02}").into_bytes(),
+                    ),
+                    oid,
+                });
+            }
+            trees.push(
+                database
+                    .write_object(EncodedObject::new(
+                        ObjectType::Tree,
+                        Tree { entries }.write(),
+                    ))
+                    .expect("write root tree"),
+            );
+        }
+        let identity = b"Example <example@example.invalid> 0 +0000".to_vec();
+        let roots = trees
+            .into_iter()
+            .enumerate()
+            .map(|(index, tree)| {
+                database
+                    .write_object(EncodedObject::new(
+                        ObjectType::Commit,
+                        Commit {
+                            tree,
+                            parents: Vec::new(),
+                            author: identity.clone(),
+                            committer: identity.clone(),
+                            encoding: None,
+                            message: format!("root {index}\n").into_bytes(),
+                        }
+                        .write(),
+                    ))
+                    .expect("write root commit")
+            })
+            .collect::<Vec<_>>();
+
+        for force_rewrite in [false, true] {
+            let options = RepackOptions {
+                force_rewrite,
+                ..RepackOptions::default()
+            };
+            let legacy = repack_reachable_objects_with_options(&git_dir, format, &roots, &options)
+                .expect("legacy repack")
+                .expect("legacy output");
+            let prepared = match prepare_repack_reachable_objects_with_options(
+                &git_dir, format, &roots, &options,
+            )
+            .expect("prepared repack")
+            {
+                PreparedRepackOutcome::Prepared(prepared) => prepared,
+                other => panic!("expected prepared result, got {other:?}"),
+            };
+            let staged = fs::read(prepared.staged_pack_path().expect("staged path"))
+                .expect("read staged pack");
+            let staged_order = PackFile::parse(&staged, format)
+                .expect("parse staged")
+                .entries
+                .into_iter()
+                .map(|entry| entry.entry.oid)
+                .collect::<Vec<_>>();
+            let legacy_order = PackFile::parse(&legacy.pack, format)
+                .expect("parse legacy")
+                .entries
+                .into_iter()
+                .map(|entry| entry.entry.oid)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                staged_order, legacy_order,
+                "prepared and legacy pack order differs; force={force_rewrite}"
+            );
+            assert_eq!(
+                staged, legacy.pack,
+                "normal and forced prepared output must preserve legacy traversal/name-hash order; force={force_rewrite}"
+            );
+        }
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     fn repack_a_unpacks_unreachable_before_pruning(format: ObjectFormat) {

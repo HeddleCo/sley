@@ -26,6 +26,7 @@ pub mod maintenance;
 pub mod midx;
 pub mod prune;
 pub mod repack;
+pub mod roots;
 pub mod trace2;
 
 use std::path::{Path, PathBuf};

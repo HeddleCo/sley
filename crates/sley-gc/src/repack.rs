@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use regex::Regex;
 use sley_config::GitConfig;
@@ -24,7 +25,9 @@ use crate::midx;
 use crate::prune::{
     prune_head_root, prune_packed_loose_objects, prune_recent_hook_roots,
     prune_repack_shallow_file, prune_worktree_git_dirs, reflog_roots_from_dir,
+    visit_reflog_roots_from_dir,
 };
+use crate::roots::{GcRoot, GcRootSet, GcRootSource};
 use crate::trace2::{self, perf_data};
 use crate::{
     GcServices, common_git_dir_for_git_dir, read_repo_config, repo_object_format,
@@ -388,6 +391,73 @@ pub(crate) fn repack_traversal_roots(
     Ok(roots)
 }
 
+/// Collect repack roots with every distinct source retained per object.
+///
+/// This allocating diagnostic API deduplicates object IDs while retaining
+/// their provenance. The ordinary repack path deliberately keeps its
+/// occurrence-preserving `Vec` so legacy LIFO traversal and pack ordering
+/// remain unchanged.
+pub fn repack_traversal_roots_with_sources(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    replace_objects: bool,
+) -> Result<GcRootSet> {
+    let mut roots = GcRootSet::default();
+    let store = FileRefStore::new(git_dir, format);
+    for reference in store.list_refs()? {
+        if let RefTarget::Direct(oid) = reference.target {
+            roots.insert(GcRoot {
+                oid,
+                source: GcRootSource::Ref {
+                    name: reference.name,
+                },
+            });
+        }
+    }
+    if let Ok(head) = resolve_revision(git_dir, format, "HEAD", replace_objects) {
+        roots.insert(GcRoot {
+            oid: head,
+            source: GcRootSource::Head {
+                git_dir: git_dir.into(),
+            },
+        });
+    }
+    visit_reflog_traversal_roots(git_dir, common_git_dir, format, &mut |root| {
+        roots.insert(root)
+    })?;
+    // Indexed objects (upstream `--indexed-objects`): cache entries, the
+    // cache-tree extension, and resolve-undo blobs all keep pending objects
+    // alive across a repack (t7700 "pending objects are repacked appropriately").
+    visit_index_traversal_roots(&git_dir.join("index"), format, &mut |root| {
+        roots.insert(root)
+    })?;
+    // Linked worktrees: upstream pack-objects examines every worktree's HEAD,
+    // index, and per-worktree reflogs by default. The current worktree is
+    // covered above (with replacement-aware HEAD resolution); the common dir
+    // and every worktrees/<id> admin dir get the raw treatment here.
+    for worktree_git_dir in prune_worktree_git_dirs(git_dir, common_git_dir)? {
+        if worktree_git_dir == git_dir {
+            continue;
+        }
+        if let Some(oid) = prune_head_root(&store, &worktree_git_dir, format)? {
+            roots.insert(GcRoot {
+                oid,
+                source: GcRootSource::Head {
+                    git_dir: worktree_git_dir.clone().into(),
+                },
+            });
+        }
+        visit_index_traversal_roots(&worktree_git_dir.join("index"), format, &mut |root| {
+            roots.insert(root)
+        })?;
+        visit_reflog_roots_from_dir(&worktree_git_dir.join("logs"), format, &mut |root| {
+            roots.insert(root)
+        })?;
+    }
+    Ok(roots)
+}
+
 fn index_traversal_roots(index_path: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
     let mut roots = Vec::new();
     let bytes = match fs::read(index_path) {
@@ -416,6 +486,60 @@ fn collect_cache_tree_oids(tree: &sley_index::CacheTree, roots: &mut Vec<ObjectI
     }
     for child in &tree.subtrees {
         collect_cache_tree_oids(&child.tree, roots);
+    }
+}
+
+fn visit_index_traversal_roots(
+    index_path: &Path,
+    format: ObjectFormat,
+    visitor: &mut impl FnMut(GcRoot),
+) -> Result<()> {
+    let bytes = match fs::read(index_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let index = sley_index::Index::parse(&bytes, format)?;
+    let index_path: Arc<Path> = index_path.into();
+    for entry in &index.entries {
+        visitor(GcRoot {
+            oid: entry.oid,
+            source: GcRootSource::IndexEntry {
+                index: index_path.clone(),
+            },
+        });
+    }
+    if let Some(cache_tree) = index.cache_tree(format)? {
+        visit_cache_tree_oids(&cache_tree, &index_path, visitor);
+    }
+    for record in index.resolve_undo_records(format)? {
+        for stage in record.stages.into_iter().flatten() {
+            visitor(GcRoot {
+                oid: stage.oid,
+                source: GcRootSource::IndexResolveUndo {
+                    index: index_path.clone(),
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
+fn visit_cache_tree_oids(
+    tree: &sley_index::CacheTree,
+    index_path: &Arc<Path>,
+    visitor: &mut impl FnMut(GcRoot),
+) {
+    if let Some(oid) = tree.oid {
+        visitor(GcRoot {
+            oid,
+            source: GcRootSource::IndexCacheTree {
+                index: index_path.clone(),
+            },
+        });
+    }
+    for child in &tree.subtrees {
+        visit_cache_tree_oids(&child.tree, index_path, visitor);
     }
 }
 
@@ -479,6 +603,19 @@ fn combine_repack_filters(
     }
 }
 
+fn visit_reflog_traversal_roots(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    visitor: &mut impl FnMut(GcRoot),
+) -> Result<()> {
+    visit_reflog_roots_from_dir(&common_git_dir.join("logs"), format, visitor)?;
+    if git_dir != common_git_dir {
+        visit_reflog_roots_from_dir(&git_dir.join("logs"), format, visitor)?;
+    }
+    Ok(())
+}
+
 fn reflog_traversal_roots(
     git_dir: &Path,
     common_git_dir: &Path,
@@ -501,6 +638,16 @@ fn repack_try_update_server_info_from_result(
     format: ObjectFormat,
     result: &sley_odb::RepackResult,
 ) -> Result<bool> {
+    repack_try_update_server_info_from_cache(common_git_dir, format, |oid| {
+        result.cached_object_type(oid)
+    })
+}
+
+fn repack_try_update_server_info_from_cache(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    cached_object_type: impl Fn(&ObjectId) -> Option<ObjectType>,
+) -> Result<bool> {
     let store = FileRefStore::new(common_git_dir, format);
     let refs = store.list_refs()?;
     let mut info_refs = Vec::with_capacity(refs.len() * (format.hex_len() + 32));
@@ -514,7 +661,7 @@ fn repack_try_update_server_info_from_result(
                 oid
             }
         };
-        match result.cached_object_type(&oid) {
+        match cached_object_type(&oid) {
             Some(ObjectType::Tag) | None => return Ok(false),
             Some(ObjectType::Commit | ObjectType::Tree | ObjectType::Blob) => {}
         }
@@ -1316,6 +1463,7 @@ pub fn run_repack(
     // `-a`: pack the reachability closure of refs/HEAD/reflogs/index (borrowed
     // objects included, unreachable ones dropped). Without `-a`, pack only
     // loose objects and leave existing packs in place.
+    let mut prepared_result = None;
     let result = if all && keep_unreachable {
         sley_odb::repack_all_objects(&common_git_dir, format)?
     } else if all {
@@ -1339,18 +1487,58 @@ pub fn run_repack(
                 filter_to.as_deref().map(Path::new),
                 max_pack_size,
             )?,
-            None => sley_odb::repack_reachable_objects_with_options(
+            None => match sley_odb::prepare_repack_reachable_objects_with_options(
                 &common_git_dir,
                 format,
                 roots,
                 &options,
-            )?,
+            )? {
+                sley_odb::PreparedRepackOutcome::Prepared(prepared) => {
+                    prepared_result = Some(prepared);
+                    None
+                }
+                sley_odb::PreparedRepackOutcome::Empty => None,
+                // Unknown future outcomes must preserve behavior rather than
+                // silently skipping a requested all-object repack.
+                _ => sley_odb::repack_reachable_objects_with_options(
+                    &common_git_dir,
+                    format,
+                    roots,
+                    &options,
+                )?,
+            },
         }
     } else {
         let roots = repack_traversal_roots(git_dir, &common_git_dir, format, replace_objects)?;
         sley_odb::repack_reachable_loose_objects(&common_git_dir, format, &roots)?
     };
     let mut loose_prune_complete = false;
+    if let Some(result) = prepared_result.as_mut() {
+        let (bitmap_tips, bitmap_pseudo_merge_groups) = if write_bitmaps {
+            let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+            (
+                Some(repack_preferred_bitmap_tips(&common_git_dir, &db, format)?),
+                Some(repack_pseudo_merge_groups(&common_git_dir, &db, format)?),
+            )
+        } else {
+            (None, None)
+        };
+        if write_bitmaps && write_bitmap_lookup_table {
+            sley_core::trace2::region("pack-bitmap-write", "writing_lookup_table");
+        }
+        sley_odb::install_prepared_repack_result_with_bitmap_options(
+            &common_git_dir,
+            format,
+            result,
+            sley_odb::RepackInstallOptions::new(prune)
+                .with_reverse_index(write_reverse_index)
+                .with_bitmap_extensions(write_bitmap_lookup_table, write_bitmap_hash_cache),
+            bitmap_tips.as_ref(),
+            bitmap_pseudo_merge_groups.as_deref(),
+        )?;
+        loose_prune_complete =
+            result.loose_object_prune_outcome() == sley_odb::LooseObjectPruneOutcome::Complete;
+    }
     if let Some(result) = result.as_ref() {
         let (bitmap_tips, bitmap_pseudo_merge_groups) = if write_bitmaps {
             let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
@@ -1399,11 +1587,16 @@ pub fn run_repack(
         midx::write(Path::new("."), &common_git_dir, &midx_args)?;
     }
     if update_server_info {
-        let updated_from_result = match result.as_ref() {
-            Some(result) => {
+        let updated_from_result = match (result.as_ref(), prepared_result.as_ref()) {
+            (Some(result), _) => {
                 repack_try_update_server_info_from_result(&common_git_dir, format, result)?
             }
-            None => false,
+            (_, Some(result)) => {
+                repack_try_update_server_info_from_cache(&common_git_dir, format, |oid| {
+                    result.cached_object_type(oid)
+                })?
+            }
+            (None, None) => false,
         };
         if !updated_from_result {
             (services.update_server_info)()?;
@@ -1422,6 +1615,64 @@ pub fn run_repack(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "sley-gc-{label}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
+    }
+
+    #[test]
+    fn traversal_roots_preserve_duplicate_occurrences_and_order() {
+        let git_dir = test_dir("ordered-repack-roots");
+        fs::create_dir_all(git_dir.join("refs/heads")).expect("create refs");
+        fs::create_dir_all(git_dir.join("logs")).expect("create reflogs");
+        let first = ObjectId::from_hex(ObjectFormat::Sha1, &"1".repeat(40)).expect("first oid");
+        let second = ObjectId::from_hex(ObjectFormat::Sha1, &"2".repeat(40)).expect("second oid");
+        fs::write(
+            git_dir.join("refs/heads/a"),
+            format!("{}\n", first.to_hex()),
+        )
+        .expect("write first ref");
+        fs::write(
+            git_dir.join("refs/heads/b"),
+            format!("{}\n", second.to_hex()),
+        )
+        .expect("write second ref");
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/a\n").expect("write HEAD");
+        fs::write(
+            git_dir.join("logs/HEAD"),
+            format!(
+                "{} {} Test <test@example.invalid> 0 +0000\tmove\n",
+                "0".repeat(40),
+                first.to_hex()
+            ),
+        )
+        .expect("write HEAD reflog");
+
+        let direct = repack_traversal_roots(&git_dir, &git_dir, ObjectFormat::Sha1, false)
+            .expect("collect allocation-light roots");
+        assert_eq!(
+            direct,
+            vec![first, second, first, first],
+            "refs, HEAD, and reflogs must retain their original occurrences"
+        );
+
+        let typed =
+            repack_traversal_roots_with_sources(&git_dir, &git_dir, ObjectFormat::Sha1, false)
+                .expect("collect typed roots");
+        let direct_unique = direct
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            direct_unique.into_iter().collect::<Vec<_>>(),
+            typed.sorted_object_ids().collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(git_dir).expect("remove fixture");
+    }
 
     #[test]
     fn index_traversal_propagates_malformed_root_extensions() {
