@@ -1,14 +1,22 @@
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
-use sley_pack::{PackFile, PackIndex, PackIndexEntry, PackInput, PackWriteOptions};
+use sley_pack::{
+    PackFile, PackIndex, PackIndexEntry, PackInput, PackPlanningHints, PackWrite, PackWriteLimits,
+    PackWriteOptions,
+};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{ObjectReader, ObjectWriter, grafted_parents};
 
-use crate::install::{replace_pack_component, write_pack_component, write_promisor_pack_sidecar};
+use crate::install::{
+    REACHABLE_PACK_STREAMING_MIN_OBJECTS, replace_pack_component, write_pack_component,
+    write_promisor_pack_sidecar,
+};
 use crate::loose::LooseObjectStore;
 use crate::pack::FileObjectDatabase;
 use crate::pack::promisor_pack_object_ids;
@@ -16,8 +24,9 @@ use crate::reachability::{
     BitmapPseudoMergeGroup, PackObjectFilter, ReachabilityBitmapOptions, ReachablePackObject,
     build_pack_bitmap_with_cached_objects, build_pack_name_hash_cache,
     collect_reachable_object_ids_excluding_promised_missing, existing_pack_files, loose_object_ids,
-    pack_inputs, prune_loose_objects, prune_obsolete_pack_paths, prune_stale_multi_pack_index,
-    remove_file_if_exists, retain_filtered_pack_objects,
+    pack_inputs, pack_name_hash, prune_loose_objects, prune_obsolete_pack_paths,
+    prune_stale_multi_pack_index, remove_file_if_exists, retain_filtered_pack_objects,
+    write_repack_reachable_pack_to_writer_with_options,
 };
 use crate::registry::{
     alternate_object_dirs, collect_packed_object_ids, object_ids_in_objects_dir,
@@ -50,6 +59,86 @@ pub struct RepackResult {
     /// retained; bitmap construction only needs their type and pack position.
     bitmap_cache: Vec<RepackBitmapObject>,
     loose_prune_outcome: LooseObjectPruneOutcome,
+}
+
+/// A repack whose pack payload is staged on the destination filesystem.
+///
+/// Unlike [`RepackResult`], this never owns the complete pack as a `Vec<u8>`.
+/// Dropping an uninstalled result removes its staging file.
+#[derive(Debug)]
+pub struct PreparedRepackResult {
+    objects_dir: PathBuf,
+    format: ObjectFormat,
+    staged_pack: Option<PathBuf>,
+    idx: Vec<u8>,
+    object_count: usize,
+    obsolete_packs: Vec<PathBuf>,
+    packed_loose: Vec<ObjectId>,
+    retained_pack_stems: Vec<String>,
+    promisor: bool,
+    pack_checksum: ObjectId,
+    index_entries: Vec<PackIndexEntry>,
+    bitmap_cache: Vec<RepackBitmapObject>,
+    loose_prune_outcome: LooseObjectPruneOutcome,
+    preparation_body_reads: u64,
+}
+
+/// Whether the staged path handled a request or deliberately deferred to the
+/// compatibility-preserving in-memory implementation.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Prepared is the success payload; no polymorphic heap boundary.
+#[non_exhaustive]
+pub enum PreparedRepackOutcome {
+    Empty,
+    Prepared(PreparedRepackResult),
+    LegacyRequired,
+}
+
+impl PreparedRepackResult {
+    /// The temporary pack path. It remains owned by this value until install.
+    pub fn staged_pack_path(&self) -> Option<&Path> {
+        self.staged_pack.as_deref()
+    }
+
+    /// Number of objects in the staged pack.
+    pub const fn object_count(&self) -> usize {
+        self.object_count
+    }
+
+    /// Return the cached object type established while preparing the repack.
+    pub fn cached_object_type(&self, oid: &ObjectId) -> Option<ObjectType> {
+        self.bitmap_cache
+            .binary_search_by(|entry| entry.oid.as_bytes().cmp(oid.as_bytes()))
+            .ok()
+            .map(|index| self.bitmap_cache[index].object_type)
+    }
+
+    pub const fn loose_object_prune_outcome(&self) -> LooseObjectPruneOutcome {
+        self.loose_prune_outcome
+    }
+
+    /// Object-body reads performed by reachability, pack writing, and bitmap
+    /// provenance preparation. Header-only metadata probes are not body reads
+    /// and are deliberately excluded.
+    pub const fn preparation_body_reads(&self) -> u64 {
+        self.preparation_body_reads
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_graph_body_count(&self) -> usize {
+        self.bitmap_cache
+            .iter()
+            .filter(|entry| entry.graph_object.is_some())
+            .count()
+    }
+}
+
+impl Drop for PreparedRepackResult {
+    fn drop(&mut self) {
+        if let Some(path) = self.staged_pack.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +417,199 @@ pub fn repack_reachable_objects_with_options(
     repack_reachable_objects_with_filter_to(git_dir, format, roots, options, None)
 }
 
+struct CountingObjectReader<'a> {
+    inner: &'a FileObjectDatabase,
+    body_reads: Cell<u64>,
+}
+
+impl ObjectReader for CountingObjectReader<'_> {
+    fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
+        self.body_reads.set(self.body_reads.get().saturating_add(1));
+        self.inner.read_object(oid)
+    }
+
+    fn is_shallow_graft(&self, oid: &ObjectId) -> bool {
+        self.inner.is_shallow_graft(oid)
+    }
+
+    fn has_shallow_grafts(&self) -> bool {
+        self.inner.has_shallow_grafts()
+    }
+
+    fn is_promised_object(&self, oid: &ObjectId) -> bool {
+        self.inner.is_promised_object(oid)
+    }
+}
+
+/// Prepare an ordinary unfiltered all-reachable repack directly in the
+/// destination pack directory.
+///
+/// The pack payload is streamed to a same-filesystem temporary file. Large
+/// walks retain object metadata rather than decoded bodies; pack bodies are
+/// reloaded through the bounded delta window, and optional bitmap graph bodies
+/// are loaded lazily during installation before the source objects are pruned.
+pub fn prepare_repack_reachable_objects_with_options(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    options: &RepackOptions,
+) -> Result<PreparedRepackOutcome> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let pack_dir = objects_dir.join("pack");
+    let shared_repository = sley_formats::SharedRepositoryPermissions::from_git_dir(git_dir);
+    shared_repository.create_dir_all(&pack_dir)?;
+    let database = if options.local {
+        FileObjectDatabase::without_alternates(objects_dir.clone(), format)
+    } else {
+        FileObjectDatabase::new(objects_dir.clone(), format)
+    };
+    let retained_pack_stems = repack_retained_pack_stems(
+        &pack_dir,
+        &options.keep_pack_stems,
+        !options.pack_kept_objects,
+    )?;
+    let mut excluded_oids = if options.pack_kept_objects {
+        HashSet::new()
+    } else {
+        pack_oids_for_stems(&pack_dir, format, &retained_pack_stems)?
+    };
+    let promisor_oids = promisor_pack_object_ids(&objects_dir, format)?;
+    // These cases have selection/reuse semantics not represented by the
+    // generic metadata writer. Keep the mature implementation authoritative.
+    if !retained_pack_stems.is_empty()
+        || !promisor_oids.is_empty()
+        || (!options.local && !alternate_object_dirs(&objects_dir).is_empty())
+    {
+        return Ok(PreparedRepackOutcome::LegacyRequired);
+    }
+    excluded_oids.extend(promisor_oids.iter().copied());
+
+    // Stale reflog roots are expected during GC. Filter only missing roots;
+    // corruption and missing objects reached from a valid root still surface.
+    let mut available_roots = Vec::with_capacity(roots.len());
+    for oid in roots {
+        if excluded_oids.contains(oid) {
+            continue;
+        }
+        if database
+            .read_object_header_without_replacement(oid)?
+            .is_some()
+        {
+            available_roots.push(*oid);
+        }
+    }
+    if available_roots.is_empty() {
+        return Ok(PreparedRepackOutcome::Empty);
+    }
+
+    let staged_pack = crate::unique_temp_path(&pack_dir);
+    let prepared = (|| -> Result<Option<PreparedRepackResult>> {
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged_pack)?;
+        let counting = CountingObjectReader {
+            inner: &database,
+            body_reads: Cell::new(0),
+        };
+        let write_options = if options.force_rewrite {
+            PackWriteOptions::new().with_reorder(false)
+        } else {
+            PackWriteOptions::new()
+        };
+        let Some(summary) = write_repack_reachable_pack_to_writer_with_options(
+            &counting,
+            format,
+            available_roots,
+            &excluded_oids,
+            &write_options,
+            &mut output,
+        )?
+        else {
+            return Ok(None);
+        };
+        output.sync_all()?;
+        drop(output);
+        validate_pack_file_checksum(&staged_pack, format, &summary.checksum, "prepared repack")?;
+        let parsed_index = PackIndex::parse(&summary.index, format)?;
+        if parsed_index.pack_checksum != summary.checksum {
+            return Err(GitError::InvalidFormat(
+                "prepared repack index does not match staged pack".into(),
+            ));
+        }
+        let new_pack_file_name = format!("pack-{}.pack", summary.checksum.to_hex());
+        let obsolete_packs = existing_pack_files(&pack_dir)?
+            .into_iter()
+            .filter(|path| {
+                path.file_name().and_then(|name| name.to_str()) != Some(&new_pack_file_name)
+            })
+            .collect();
+        let present = parsed_index
+            .entries
+            .iter()
+            .map(|entry| entry.oid)
+            .collect::<HashSet<_>>();
+        let mut packed_loose = loose_object_ids(&objects_dir, format)?
+            .into_iter()
+            .filter(|oid| present.contains(oid))
+            .collect::<Vec<_>>();
+        packed_loose.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        let bitmap_cache = bitmap_object_cache_from_index(&database, &parsed_index.entries)?;
+        let loose_prune_outcome = if retained_pack_stems.is_empty() && promisor_oids.is_empty() {
+            LooseObjectPruneOutcome::Complete
+        } else {
+            LooseObjectPruneOutcome::FollowUpRequired
+        };
+        Ok(Some(PreparedRepackResult {
+            objects_dir: fs::canonicalize(&objects_dir)?,
+            format,
+            staged_pack: Some(staged_pack.clone()),
+            idx: summary.index,
+            object_count: parsed_index.entries.len(),
+            obsolete_packs,
+            packed_loose,
+            retained_pack_stems,
+            promisor: false,
+            pack_checksum: summary.checksum,
+            index_entries: parsed_index.entries,
+            bitmap_cache,
+            loose_prune_outcome,
+            preparation_body_reads: counting.body_reads.get(),
+        }))
+    })();
+    if prepared.is_err() || matches!(prepared.as_ref(), Ok(None)) {
+        let _ = fs::remove_file(&staged_pack);
+    }
+    match prepared {
+        Ok(Some(prepared)) => Ok(PreparedRepackOutcome::Prepared(prepared)),
+        Ok(None) => Ok(PreparedRepackOutcome::Empty),
+        Err(err) => Err(err),
+    }
+}
+
+fn bitmap_object_cache_from_index(
+    database: &FileObjectDatabase,
+    entries: &[PackIndexEntry],
+) -> Result<Vec<RepackBitmapObject>> {
+    let mut cache = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some((object_type, _)) = database.read_object_header_without_replacement(&entry.oid)?
+        else {
+            return Err(GitError::object_not_found(entry.oid));
+        };
+        cache.push(RepackBitmapObject {
+            oid: entry.oid,
+            object_type,
+            // Prepared repacks build optional bitmaps before publishing or
+            // pruning. Graph bodies can therefore be read lazily from the
+            // still-complete source ODB instead of being retained here.
+            graph_object: None,
+        });
+    }
+    cache.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
+    Ok(cache)
+}
+
 /// Build the `-A` form of an all-object repack.
 ///
 /// Reachable objects go into the replacement pack. Objects found only in packs
@@ -538,9 +820,16 @@ fn repack_reachable_objects_with_filter_to(
     let promisor_oids = promisor_pack_object_ids(&objects_dir, format)?;
 
     let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut name_hashes: HashMap<ObjectId, u32> = HashMap::new();
     let mut objects: Vec<ReachablePackObject> = Vec::new();
-    let mut pending: Vec<ObjectId> = roots.to_vec();
-    while let Some(oid) = pending.pop() {
+    let mut pending: Vec<(ObjectId, Option<Vec<u8>>)> =
+        roots.iter().copied().map(|oid| (oid, None)).collect();
+    while let Some((oid, path)) = pending.pop() {
+        if let Some(path) = path.as_deref().filter(|path| !path.is_empty()) {
+            name_hashes
+                .entry(oid)
+                .or_insert_with(|| pack_name_hash(path));
+        }
         if !seen.insert(oid) {
             continue;
         }
@@ -555,20 +844,24 @@ fn repack_reachable_objects_with_filter_to(
         match object.object_type {
             ObjectType::Commit => {
                 let commit = Commit::parse_ref(format, &object.body)?;
-                pending.extend(grafted_parents(&database, &oid, commit.parents));
-                pending.push(commit.tree);
+                pending.extend(
+                    grafted_parents(&database, &oid, commit.parents)
+                        .into_iter()
+                        .map(|parent| (parent, None)),
+                );
+                pending.push((commit.tree, Some(Vec::new())));
             }
             ObjectType::Tree => {
-                for entry in TreeEntries::new(format, &object.body) {
-                    let entry = entry?;
-                    if !entry.is_gitlink() {
-                        pending.push(entry.oid);
-                    }
-                }
+                push_repack_tree_children(
+                    &mut pending,
+                    format,
+                    &object.body,
+                    path.as_deref().unwrap_or_default(),
+                )?;
             }
             ObjectType::Tag => {
                 let tag = Tag::parse_ref(format, &object.body)?;
-                pending.push(tag.object);
+                pending.push((tag.object, None));
             }
             ObjectType::Blob => {}
         }
@@ -646,14 +939,65 @@ fn repack_reachable_objects_with_filter_to(
     }
 
     let inputs = pack_inputs(&objects);
-    let written = if options.force_rewrite {
+    let bitmap_cache = bitmap_object_cache(&objects);
+    let written = if filter_to.is_none() && objects.len() >= REACHABLE_PACK_STREAMING_MIN_OBJECTS {
+        let mut metadata = objects
+            .iter()
+            .map(|entry| {
+                (
+                    entry.oid,
+                    entry.object.object_type,
+                    entry.object.body.len() as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        if !options.force_rewrite {
+            sley_pack::sort_by_pack_planning_order(&mut metadata, |entry| {
+                (
+                    entry.0,
+                    entry.1,
+                    entry.2,
+                    name_hashes.get(&entry.0).copied().unwrap_or(0),
+                )
+            });
+        }
+        let object_count = u32::try_from(metadata.len())
+            .map_err(|_| GitError::InvalidFormat("too many pack objects".into()))?;
+        let selected = metadata.iter().map(|entry| entry.0).collect::<Vec<_>>();
+        drop(inputs);
+        drop(objects);
+        let write_options = PackWriteOptions::new().with_reorder(false);
+        let mut pack = Vec::new();
+        let summary = PackFile::write_packed_from_source_to_writer_with_hints(
+            selected,
+            object_count,
+            format,
+            &write_options,
+            PackPlanningHints::new().with_name_hashes(&name_hashes),
+            PackWriteLimits::default(),
+            |oid| database.read_object(oid),
+            &mut pack,
+        )?;
+        PackWrite {
+            pack,
+            index: summary.index,
+            checksum: summary.checksum,
+            entries: summary.entries,
+            delta_count: summary.delta_count,
+        }
+    } else if options.force_rewrite {
         // A forced repack must not reproduce an existing pack through the
         // writer's canonical reorder path after bypassing whole-pack reuse.
         // Preserve traversal order while still allowing fresh delta selection.
         let write_options = PackWriteOptions::new().with_reorder(false);
         PackFile::write_packed_with_known_ids_and_options(&inputs, format, &write_options)?
     } else {
-        PackFile::write_packed_with_known_ids(&inputs, format)?
+        PackFile::write_packed_with_known_ids_and_options_and_hints(
+            &inputs,
+            format,
+            &PackWriteOptions::new(),
+            sley_pack::PackPlanningHints::new().with_name_hashes(&name_hashes),
+        )?
     };
     let object_count = written.entries.len();
 
@@ -701,9 +1045,34 @@ fn repack_reachable_objects_with_filter_to(
         promisor: false,
         pack_checksum,
         index_entries,
-        bitmap_cache: bitmap_object_cache(&objects),
+        bitmap_cache,
         loose_prune_outcome,
     }))
+}
+
+fn push_repack_tree_children(
+    pending: &mut Vec<(ObjectId, Option<Vec<u8>>)>,
+    format: ObjectFormat,
+    body: &[u8],
+    prefix: &[u8],
+) -> Result<()> {
+    let mut children = Vec::new();
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
+        if entry.is_gitlink() {
+            continue;
+        }
+        let mut child_path =
+            Vec::with_capacity(prefix.len() + usize::from(!prefix.is_empty()) + entry.name.len());
+        child_path.extend_from_slice(prefix);
+        if !prefix.is_empty() {
+            child_path.push(b'/');
+        }
+        child_path.extend_from_slice(entry.name);
+        children.push((entry.oid, Some(child_path)));
+    }
+    pending.extend(children.into_iter().rev());
+    Ok(())
 }
 
 /// Write one or more filtered packs under `prefix-<checksum>.{pack,idx}`.
@@ -1698,6 +2067,202 @@ pub fn install_repack_result_with_bitmap_options(
     Ok(())
 }
 
+/// Publish a file-backed repack after completing its requested sidecars.
+///
+/// The final pack rename is the atomic reader-visible publication point.
+/// Sidecars completed before that point may remain after an installation
+/// error, but cannot make a new pack discoverable on their own.
+pub fn install_prepared_repack_result_with_bitmap_options(
+    git_dir: &Path,
+    format: ObjectFormat,
+    result: &mut PreparedRepackResult,
+    options: RepackInstallOptions,
+    bitmap_tips: Option<&HashSet<ObjectId>>,
+    bitmap_pseudo_merge_groups: Option<&[BitmapPseudoMergeGroup]>,
+) -> Result<()> {
+    let requested_objects_dir = repository_objects_dir(git_dir);
+    let requested_objects_dir = fs::canonicalize(&requested_objects_dir).map_err(|err| {
+        GitError::InvalidPath(format!(
+            "cannot resolve prepared repack destination {}: {err}",
+            requested_objects_dir.display()
+        ))
+    })?;
+    if format != result.format || requested_objects_dir != result.objects_dir {
+        return Err(GitError::InvalidFormat(
+            "prepared repack belongs to a different repository or object format".into(),
+        ));
+    }
+    let staged_pack = result
+        .staged_pack
+        .as_deref()
+        .ok_or_else(|| GitError::InvalidFormat("prepared repack was already installed".into()))?;
+    validate_pack_file_checksum(
+        staged_pack,
+        format,
+        &result.pack_checksum,
+        "prepared repack",
+    )?;
+    let parsed_index = PackIndex::parse(&result.idx, format)?;
+    if parsed_index.pack_checksum != result.pack_checksum
+        || !pack_index_entries_match_writer(&parsed_index.entries, &result.index_entries)
+    {
+        return Err(GitError::InvalidFormat(
+            "prepared repack index does not match staged pack".into(),
+        ));
+    }
+
+    let objects_dir = repository_objects_dir(git_dir);
+    let pack_dir = objects_dir.join("pack");
+    let shared_repository = sley_formats::SharedRepositoryPermissions::from_git_dir(git_dir);
+    shared_repository.create_dir_all(&pack_dir)?;
+    let pack_name = format!("pack-{}", result.pack_checksum.to_hex());
+    let new_pack_path = pack_dir.join(format!("{pack_name}.pack"));
+    let new_rev_path = pack_dir.join(format!("{pack_name}.rev"));
+    let new_index_path = pack_dir.join(format!("{pack_name}.idx"));
+    let reverse_index = if options.write_reverse_index {
+        Some(sley_pack::PackReverseIndex::write(
+            format,
+            &sley_pack::pack_order_index_positions(&parsed_index.entries),
+            &result.pack_checksum,
+        )?)
+    } else {
+        None
+    };
+
+    let bitmap = if let Some(tips) = bitmap_tips {
+        let database = FileObjectDatabase::new(objects_dir.clone(), format);
+        let (object_types, graph_objects) = bitmap_lookup_cache(&result.bitmap_cache);
+        let bitmap_reader = RepackBitmapReader {
+            cached: &graph_objects,
+            fallback: &database,
+        };
+        let name_hash_cache = if options.write_bitmap_hash_cache {
+            Some(build_pack_name_hash_cache(
+                &bitmap_reader,
+                format,
+                &result.index_entries,
+                &object_types,
+            )?)
+        } else {
+            None
+        };
+        build_pack_bitmap_with_cached_objects(
+            &bitmap_reader,
+            format,
+            &result.index_entries,
+            &result.pack_checksum,
+            tips,
+            bitmap_pseudo_merge_groups.unwrap_or(&[]),
+            &object_types,
+            &ReachabilityBitmapOptions {
+                write_lookup_table: options.write_bitmap_lookup_table,
+                name_hash_cache,
+                restrict_to_tips: false,
+            },
+        )?
+    } else {
+        None
+    };
+
+    // Immutable sidecars are completed and made durable before the pack is
+    // published. A reader only discovers a pack through its final `.pack`
+    // name, so the pack rename below is the installation's publication point.
+    if let Some(reverse_index) = reverse_index {
+        replace_validated_pack_component(&new_rev_path, &reverse_index, &shared_repository)?;
+    } else {
+        remove_file_if_exists(&new_rev_path)?;
+    }
+    replace_validated_pack_component(&new_index_path, &result.idx, &shared_repository)?;
+    let new_promisor_path = if result.promisor {
+        let path = pack_dir.join(format!("{pack_name}.promisor"));
+        replace_validated_pack_component(&path, b"", &shared_repository)?;
+        Some(path)
+    } else {
+        None
+    };
+    if bitmap_tips.is_some() {
+        let bitmap_path = pack_dir.join(format!("{pack_name}.bitmap"));
+        if let Some(bitmap) = bitmap {
+            replace_validated_pack_component(&bitmap_path, &bitmap, &shared_repository)?;
+        } else {
+            remove_file_if_exists(&bitmap_path)?;
+        }
+    }
+    sync_parent_directory(&new_pack_path)?;
+    shared_repository.adjust_file(staged_pack)?;
+    install_staged_pack(staged_pack, &new_pack_path, format, &result.pack_checksum)?;
+    result.staged_pack = None;
+
+    if !options.prune {
+        return Ok(());
+    }
+    let present = parsed_index
+        .entries
+        .iter()
+        .map(|entry| entry.oid)
+        .collect::<HashSet<_>>();
+    prune_obsolete_pack_paths(
+        &objects_dir,
+        format,
+        &result.obsolete_packs,
+        &new_pack_path,
+        &result.retained_pack_stems,
+        result.promisor,
+    )?;
+    prune_loose_objects(&objects_dir, format, result.packed_loose.iter(), &present)?;
+    if result.promisor && new_promisor_path.is_none() {
+        return Err(GitError::InvalidFormat(
+            "promisor repack did not write sidecar".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn replace_validated_pack_component(
+    path: &Path,
+    bytes: &[u8],
+    shared_repository: &sley_formats::SharedRepositoryPermissions,
+) -> Result<()> {
+    replace_pack_component(path, bytes)?;
+    if fs::read(path)? != bytes {
+        return Err(GitError::InvalidFormat(format!(
+            "installed pack component {} does not match prepared bytes",
+            path.display()
+        )));
+    }
+    shared_repository.adjust_file(path)
+}
+
+fn install_staged_pack(
+    staged: &Path,
+    destination: &Path,
+    format: ObjectFormat,
+    checksum: &ObjectId,
+) -> Result<()> {
+    match fs::rename(staged, destination) {
+        Ok(()) => sync_parent_directory(destination),
+        Err(_) if destination.exists() => {
+            validate_pack_file_checksum(destination, format, checksum, "existing repack")?;
+            fs::remove_file(staged)?;
+            sync_parent_directory(destination)
+        }
+        Err(err) => Err(GitError::Io(err.to_string())),
+    }
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| GitError::InvalidPath("pack path has no parent".into()))?;
+        fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// Install a [`repack_geometric`] result: write the new pack, then under `prune`
 /// remove EXACTLY the rolled-up packs (those below the geometric split) plus the
 /// loose objects now packed. Unlike [`install_repack_result`], packs left in
@@ -1825,6 +2390,57 @@ fn validate_pack_checksum(
     let actual = sley_core::digest_bytes(format, &pack[..trailer_offset])?;
     let trailer = ObjectId::from_raw(format, &pack[trailer_offset..])?;
     if &actual != expected || trailer != *expected {
+        return Err(GitError::InvalidFormat(format!(
+            "{context} pack checksum does not match generated pack"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_pack_file_checksum(
+    path: &Path,
+    format: ObjectFormat,
+    expected: &ObjectId,
+    context: &str,
+) -> Result<()> {
+    if expected.format() != format {
+        return Err(GitError::InvalidObjectId(format!(
+            "{context} checksum format does not match object format"
+        )));
+    }
+    let mut file = fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let hash_len = format.raw_len() as u64;
+    if file_len < 12 + hash_len {
+        return Err(GitError::InvalidFormat(format!(
+            "{context} pack file too short"
+        )));
+    }
+    let mut signature = [0_u8; 4];
+    file.read_exact(&mut signature)?;
+    if &signature != b"PACK" {
+        return Err(GitError::InvalidFormat(format!(
+            "{context} pack file missing PACK signature"
+        )));
+    }
+    let payload_len = file_len - hash_len;
+    file.seek(SeekFrom::Start(payload_len))?;
+    let mut trailer = vec![0_u8; format.raw_len()];
+    file.read_exact(&mut trailer)?;
+    let trailer = ObjectId::from_raw(format, &trailer)?;
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut digest = sley_core::StreamingDigest::new(format);
+    let mut remaining = payload_len;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while remaining > 0 {
+        let wanted = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..wanted])?;
+        digest.update(&buffer[..wanted]);
+        remaining -= wanted as u64;
+    }
+    let actual = digest.finalize()?;
+    if actual != *expected || trailer != *expected {
         return Err(GitError::InvalidFormat(format!(
             "{context} pack checksum does not match generated pack"
         )));
@@ -2826,6 +3442,32 @@ mod tests {
         objects
     }
 
+    #[test]
+    fn failed_staged_install_preserves_existing_pack() {
+        let format = ObjectFormat::Sha1;
+        let objects = test_objects_dir("prepared-install-preserves-target");
+        let pack_dir = objects.join("pack");
+        fs::create_dir_all(&pack_dir).expect("pack dir");
+        let written = PackFile::write_undeltified(
+            &[EncodedObject::new(ObjectType::Blob, b"existing\n".to_vec())],
+            format,
+        )
+        .expect("pack");
+        let destination = pack_dir.join(format!("pack-{}.pack", written.checksum));
+        fs::write(&destination, &written.pack).expect("existing pack");
+        let missing_stage = pack_dir.join("missing-stage");
+
+        assert!(
+            install_staged_pack(&missing_stage, &destination, format, &written.checksum).is_err()
+        );
+        assert_eq!(
+            fs::read(&destination).expect("preserved pack"),
+            written.pack
+        );
+
+        fs::remove_dir_all(objects.parent().expect("test root")).expect("cleanup");
+    }
+
     fn pseudo_random_bytes(len: usize, mut seed: u32) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(len);
         for _ in 0..len {
@@ -3457,5 +4099,156 @@ mod tests {
             result.cached_object_type(&commit_oid),
             Some(ObjectType::Commit)
         );
+    }
+
+    #[test]
+    fn repack_tree_walk_assigns_the_first_canonical_path_to_shared_objects() {
+        let format = ObjectFormat::Sha1;
+        let shared = ObjectId::from_hex(format, "1111111111111111111111111111111111111111")
+            .expect("shared object id");
+        let tree = sley_object::Tree {
+            entries: vec![
+                sley_object::TreeEntry {
+                    mode: 0o100644,
+                    name: b"first".to_vec().into(),
+                    oid: shared,
+                },
+                sley_object::TreeEntry {
+                    mode: 0o100644,
+                    name: b"second".to_vec().into(),
+                    oid: shared,
+                },
+            ],
+        };
+        let mut pending = Vec::new();
+
+        push_repack_tree_children(&mut pending, format, &tree.write(), b"dir")
+            .expect("collect tree children");
+
+        let (first_oid, first_path) = pending.pop().expect("first child");
+        let (second_oid, second_path) = pending.pop().expect("second child");
+        assert_eq!(first_oid, shared);
+        assert_eq!(second_oid, shared);
+        assert_eq!(first_path.as_deref(), Some(b"dir/first".as_slice()));
+        assert_eq!(second_path.as_deref(), Some(b"dir/second".as_slice()));
+        assert_eq!(
+            pack_name_hash(first_path.as_deref().expect("named first path")),
+            pack_name_hash(b"dir/first")
+        );
+    }
+
+    fn prepared_blob_result(objects_dir: &Path) -> (PreparedRepackResult, Vec<u8>) {
+        let format = ObjectFormat::Sha1;
+        let pack_dir = objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir).expect("create pack directory");
+        let object = Arc::new(EncodedObject::new(
+            ObjectType::Blob,
+            b"prepared sidecar fixture".to_vec(),
+        ));
+        let oid = object.object_id(format).expect("blob id");
+        let written = PackFile::write_packed_with_known_ids(
+            &[PackInput {
+                oid: &oid,
+                object: &object,
+            }],
+            format,
+        )
+        .expect("write fixture pack");
+        let reverse_index = sley_pack::PackReverseIndex::write(
+            format,
+            &sley_pack::pack_order_index_positions(&written.entries),
+            &written.checksum,
+        )
+        .expect("write fixture reverse index");
+        let staged_pack = crate::unique_temp_path(&pack_dir);
+        fs::write(&staged_pack, &written.pack).expect("write staged pack");
+        (
+            PreparedRepackResult {
+                objects_dir: fs::canonicalize(objects_dir).expect("canonical object directory"),
+                format,
+                staged_pack: Some(staged_pack),
+                idx: written.index,
+                object_count: written.entries.len(),
+                obsolete_packs: vec![pack_dir.join("pack-obsolete.pack")],
+                packed_loose: Vec::new(),
+                retained_pack_stems: Vec::new(),
+                promisor: false,
+                pack_checksum: written.checksum,
+                index_entries: written.entries,
+                bitmap_cache: vec![RepackBitmapObject {
+                    oid,
+                    object_type: ObjectType::Blob,
+                    graph_object: None,
+                }],
+                loose_prune_outcome: LooseObjectPruneOutcome::Complete,
+                preparation_body_reads: 0,
+            },
+            reverse_index,
+        )
+    }
+
+    #[test]
+    fn prepared_install_publishes_pack_last_repairs_sidecars_and_retries() {
+        let format = ObjectFormat::Sha1;
+        let objects_dir = test_objects_dir("prepared-atomic-sidecars");
+        let git_dir = objects_dir.parent().expect("fixture git directory");
+        let pack_dir = objects_dir.join("pack");
+        let (mut prepared, expected_reverse_index) = prepared_blob_result(&objects_dir);
+        let pack_name = format!("pack-{}", prepared.pack_checksum.to_hex());
+        let pack_path = pack_dir.join(format!("{pack_name}.pack"));
+        let index_path = pack_dir.join(format!("{pack_name}.idx"));
+        let reverse_path = pack_dir.join(format!("{pack_name}.rev"));
+        let obsolete_path = prepared.obsolete_packs[0].clone();
+        let stage = prepared
+            .staged_pack_path()
+            .expect("owned staging path")
+            .to_path_buf();
+        fs::write(&obsolete_path, b"obsolete").expect("write obsolete pack");
+        fs::write(&reverse_path, b"corrupt reverse index").expect("write corrupt reverse index");
+        fs::create_dir(&index_path).expect("block index installation");
+
+        install_prepared_repack_result_with_bitmap_options(
+            git_dir,
+            format,
+            &mut prepared,
+            RepackInstallOptions::new(true).with_reverse_index(true),
+            None,
+            None,
+        )
+        .expect_err("blocked index must abort before pack publication");
+
+        assert!(stage.is_file(), "failed install retains staging ownership");
+        assert_eq!(prepared.staged_pack_path(), Some(stage.as_path()));
+        assert!(!pack_path.exists(), "pack is the final publication point");
+        assert!(obsolete_path.is_file(), "failed install must not prune");
+        assert_eq!(
+            fs::read(&reverse_path).expect("read repaired reverse index"),
+            expected_reverse_index,
+            "existing corrupt reverse index is atomically repaired"
+        );
+
+        fs::remove_dir(&index_path).expect("remove index blocker");
+        fs::write(&index_path, b"corrupt index").expect("write corrupt index");
+        let expected_index = prepared.idx.clone();
+        install_prepared_repack_result_with_bitmap_options(
+            git_dir,
+            format,
+            &mut prepared,
+            RepackInstallOptions::new(true).with_reverse_index(true),
+            None,
+            None,
+        )
+        .expect("retry prepared install");
+
+        assert!(pack_path.is_file());
+        assert!(!stage.exists());
+        assert!(prepared.staged_pack_path().is_none());
+        assert_eq!(
+            fs::read(&index_path).expect("read repaired index"),
+            expected_index,
+            "existing corrupt index is atomically repaired"
+        );
+        assert!(!obsolete_path.exists(), "prune runs only after publication");
+        fs::remove_dir_all(git_dir).ok();
     }
 }

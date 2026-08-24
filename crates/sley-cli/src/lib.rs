@@ -28,7 +28,7 @@ use sley::plumbing::sley_odb::{
     build_reachable_pack, collect_reachable_object_ids, grafted_parents, install_bundle_pack,
     install_reachable_pack, prune_unreachable_loose, repository_object_ids, repository_objects_dir,
 };
-use sley::plumbing::sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
+use sley::plumbing::sley_pack::{MultiPackIndex, PackFile, PackIndex};
 use sley::plumbing::sley_refs::{
     FileRefStore, PackRefDecision, Ref, RefTransactionHookUpdate, RefTransactionPhase, RefUpdate,
     ReferenceTransactionHook, ReflogEntry, branch_ref_name, check_refname_format,
@@ -67,7 +67,6 @@ mod commit_message;
 mod diff_render;
 mod discovery;
 mod dispatch;
-mod for_each_ref_helpers;
 mod global_options;
 mod init_config;
 mod interrupt_cancel;
@@ -112,12 +111,13 @@ pub(crate) use diff_render::{
     DiffEntryStatRenderOptions, DiffEntryStatSource, DiffLineStats, DiffPathspec,
     DiffRenderOptions, DiffStatEntryData, DiffStatOptions, DiffWorktreeCleanContext,
     WordDiffRequest, apply_diff_max_depth, apply_diff_order_file, apply_diff_pathspec,
-    apply_submodule_ignore_filter, collect_diff_stat_entries,
-    collect_diff_stat_entries_with_worktree_clean, collect_dirty_submodules,
-    compile_ignore_matching_regexes, diff_entry_new_content, diff_entry_old_content,
-    diff_entry_produces_output, diff_line_stats, diff_rename_limit_requires_integer_error,
-    diff_stat_decimal_width, diff_stat_totals, gitlink_diff_content,
-    is_binary_content, is_gitlink_pair, parse_diff_max_depth, parse_dirstat_params,
+    apply_submodule_ignore_filter, clean_context, cli_render_services, cli_submodule_render,
+    collect_diff_stat_entries, collect_diff_stat_entries_with_worktree_clean,
+    collect_dirty_submodules, compile_ignore_matching_regexes, diff_big_file_threshold,
+    diff_entry_new_content, diff_entry_old_content, diff_entry_produces_output, diff_lazy_fetch,
+    diff_line_stats, diff_pathspec_new, diff_rename_limit_requires_integer_error,
+    diff_stat_decimal_width, diff_stat_totals, gitlink_diff_content, is_binary_content,
+    is_gitlink_pair, make_clean_apply, parse_diff_max_depth, parse_dirstat_params,
     prefetch_diff_entry_blobs, prefetch_promisor_objects, prefetch_via_configured_upload_pack,
     promisor_remote_names, read_blob, read_object_maybe_prefetch_promisor, render_diff_entries,
     render_tree_to_tree_patch, repo_path_to_path, reverse_diff_entries, reverse_diff_entry,
@@ -125,15 +125,13 @@ pub(crate) use diff_render::{
     write_diff_dirstat, write_diff_numstat_materialized_entry, write_diff_patch_entry,
     write_diff_raw_entry, write_diff_shortstat_materialized, write_diff_stat_materialized,
     write_diff_stat_materialized_with_widths, write_diff_stat_summary_line,
-    write_diff_summary_entry, diff_lazy_fetch, diff_pathspec_new, cli_submodule_render,
-    diff_big_file_threshold, make_clean_apply, clean_context, cli_render_services,
+    write_diff_summary_entry,
 };
 
 pub(crate) use discovery::{
     is_git_dir_candidate, paths_refer_to_same_dir, read_gitdir_file, resolve_cli_path,
 };
 
-pub(crate) use for_each_ref_helpers::*;
 pub(crate) use log_cli::{
     CliLogDescribeAdapter, CliLogDescribeContext, CliLogSignatureAdapter, CliLogSignatureContext,
     CliMailmapAdapter, DecorationFilter, LogDecorationMode, LogFilterPattern, SimpleLogRegex,
@@ -199,22 +197,16 @@ pub(crate) use commit_message::*;
 // the historical unqualified names working across command modules with no
 // per-site edits.
 pub(crate) use sley_mail::encode::{
-    MailThreadHeaders, MimeAttach, Rfc2047Type, ThreadLevel, add_rfc2047, add_rfc822_quoted,
-    add_wrapped_text, build_thread_plan, format_patch_body_start,
-    format_patch_preserved_subject, format_patch_subject, last_line_length,
-    message_body_has_non_ascii, needs_rfc2047_encoding, needs_rfc822_quoting,
-    write_mime_closing, write_mime_part_header, write_mime_preamble,
-};
-pub(crate) use sley_mail::mailinfo::{
-    MailMessage as AmPatch, SubjectCleanup, commit_message_body_after_subject, hg_patch_to_mail,
-    is_diff_start, looks_like_patch_input, parse_mbox, parse_mboxrd, parse_message,
-    split_keep_newline, stgit_patch_to_mail, strip_cr, subject_of_message,
-    trim_trailing_newline, write_stored_subject_header,
+    MailThreadHeaders, MimeAttach, Rfc2047Type, ThreadLevel, add_rfc822_quoted, add_rfc2047,
+    add_wrapped_text, build_thread_plan, format_patch_body_start, format_patch_preserved_subject,
+    format_patch_subject, last_line_length, message_body_has_non_ascii, needs_rfc822_quoting,
+    needs_rfc2047_encoding, write_mime_closing, write_mime_part_header, write_mime_preamble,
 };
 pub(crate) use sley_mail::patch_id::{PatchIdOptions, get_one_patchid, split_keep_newlines};
 // Revision-resolution wrappers dissolved into `sley-rev`; the aliases keep the
 // historical unqualified names working across command modules with no per-site
 // edits.
+pub(crate) use session_globals::*;
 pub(crate) use sley::plumbing::sley_rev::resolve_revision_symbolic_full_name as rev_parse_symbolic_full_name;
 pub(crate) use sley::plumbing::sley_rev::{
     resolve_revision_commitish_with_replacement_policy as resolve_revision_commitish,
@@ -222,7 +214,6 @@ pub(crate) use sley::plumbing::sley_rev::{
     resolve_revision_with_replacement_policy as resolve_revision,
     warn_ambiguous_refname_for_object_prefix,
 };
-pub(crate) use session_globals::*;
 pub(crate) use status_format::*;
 // Tree printing moved to `sley-formats::tree_print`; the glob keeps the
 // historical unqualified names available across command modules.
@@ -243,20 +234,20 @@ pub(crate) use init_config::{
 };
 // The keyword-only hand-rolled bool parser was retired in favour of the
 // shared git-grammar primitive (keywords plus the integer fallback).
-pub(crate) use sley::plumbing::sley_config::parse_config_bool;
 pub(crate) use ls_files_pathspec::{
     LsFilesPathspec, index_entry_stage, normalize_absolute_cli_pathspec, path_component_count,
 };
+pub(crate) use sley::plumbing::sley_config::parse_config_bool;
 // Canonical implementations moved to `sley_core::paths`; the legacy local
 // spellings stay available under their historical names.
-pub(crate) use sley::plumbing::sley_core::paths::normalize_lexical as normalize_lexical_path;
-pub(crate) use sley::plumbing::sley_core::paths::{
-    relative_path_from_absolute, relative_path_from_absolute_components,
-};
 pub(crate) use reflog_parse::{
     parse_reflog_count, parse_reflog_expire_date, parse_reflog_expire_time,
     parse_reflog_max_parent_count, parse_reflog_min_parent_count, parse_reflog_skip_count,
     reflog_reference_name,
+};
+pub(crate) use sley::plumbing::sley_core::paths::normalize_lexical as normalize_lexical_path;
+pub(crate) use sley::plumbing::sley_core::paths::{
+    relative_path_from_absolute, relative_path_from_absolute_components,
 };
 pub(crate) use sley::plumbing::sley_refs::refname_pattern_matches_case;
 

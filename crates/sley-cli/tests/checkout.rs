@@ -567,3 +567,380 @@ fn checkout_patch_head_no_staged_apply_worktree_only() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// FIX-D regression tests
+// ---------------------------------------------------------------------------
+
+/// Shared fixture for the global-config cascade tests: two identical repos
+/// (upstream driven by oracle git, rust by sley) plus a temp `$HOME` holding a
+/// `~/.gitconfig`. Returns `(root, upstream, rust, home)`.
+struct GlobalConfigFixture {
+    root: PathBuf,
+    upstream: PathBuf,
+    rust: PathBuf,
+    home: PathBuf,
+}
+
+fn prepare_global_config_fixture(name: &str, global_gitconfig: &[u8]) -> GlobalConfigFixture {
+    let root = unique_temp_dir(name);
+    let home = root.join("home");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&home).expect("create temp home");
+    fs::write(home.join(".gitconfig"), global_gitconfig).expect("write global gitconfig");
+    for repo in [&upstream, &rust] {
+        fs::create_dir_all(repo).expect("create repo dir");
+        git(repo, &["init", "-q", "-b", "main"]);
+        // The attribute binding is committed: checkout resolves filter
+        // attributes from the tree/index, not an untracked worktree file.
+        fs::write(repo.join(".gitattributes"), b"hello.txt filter=upper\n")
+            .expect("write .gitattributes");
+        fs::write(repo.join("hello.txt"), b"base\n").expect("write base file");
+        git(repo, &["add", ".gitattributes", "hello.txt"]);
+        run_with_identity(repo, &["commit", "-m", "base", "-q"]);
+        fs::write(repo.join("hello.txt"), b"main\n").expect("write main file");
+        git(repo, &["add", "hello.txt"]);
+        run_with_identity(repo, &["commit", "-m", "main", "-q"]);
+    }
+    GlobalConfigFixture {
+        root,
+        upstream,
+        rust,
+        home,
+    }
+}
+
+/// Run a command with the fixture's temp `$HOME` as the global-config source.
+fn run_with_global_home(program: &str, cwd: &Path, home: &Path, args: &[&str]) -> Output {
+    Command::new(program)
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env("GIT_CONFIG_GLOBAL", home.join(".gitconfig"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+}
+
+/// S11 regression: `checkout -B <branch> <start>` must honour smudge filters
+/// defined in the *global* config. The branch-reset path previously read the
+/// repo-only config, so the same command saw different filters than an ordinary
+/// switch.
+#[test]
+fn checkout_branch_reset_honors_global_smudge_filter() {
+    let fx = prepare_global_config_fixture(
+        "checkout-b-global-smudge",
+        b"[filter \"upper\"]\n\tsmudge = tr a-z A-Z\n\tclean = tr A-Z a-z\n",
+    );
+
+    // Base commit blob content is lowercase ("base\n"); the clean filter keeps
+    // it lowercase, so both repos hold identical objects.
+    let base_oid = String::from_utf8(git(&fx.upstream, &["rev-parse", "HEAD~"]))
+        .expect("base oid utf8")
+        .trim()
+        .to_string();
+
+    let args = ["checkout", "-B", "topic", base_oid.as_str()];
+    let expected = run_with_global_home(sley_testkit::oracle_git(), &fx.upstream, &fx.home, &args);
+    let actual = run_with_global_home(sley_testkit::sley_bin!(), &fx.rust, &fx.home, &args);
+    assert_same_output(actual, expected, &args);
+
+    // The reset re-materialized hello.txt from the base tree through the
+    // global smudge filter → uppercase on disk in BOTH repos.
+    assert_eq!(
+        fs::read(fx.rust.join("hello.txt")).expect("read sley hello.txt"),
+        b"BASE\n",
+        "sley did not apply the global smudge filter on the -B path"
+    );
+    assert_eq!(
+        fs::read(fx.upstream.join("hello.txt")).expect("read git hello.txt"),
+        b"BASE\n",
+        "oracle fixture sanity: expected smudged content"
+    );
+
+    let _ = fs::remove_dir_all(&fx.root);
+}
+
+/// `-c include.path` parity: relative include paths from the command line are
+/// rejected exactly like upstream (they must come from files), and an absolute
+/// path is honoured during checkout — observable through
+/// `advice.detachedHead=false` suppressing the detached-HEAD advice block.
+#[test]
+fn checkout_dash_c_include_path_matches_oracle_cwd_and_absolute_semantics() {
+    let root = unique_temp_dir("checkout-c-include-path");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    for repo in [&upstream, &rust] {
+        fs::create_dir_all(repo.join("sub")).expect("create repo dir");
+        git(repo, &["init", "-q", "-b", "main"]);
+        fs::write(repo.join("f.txt"), b"one\n").expect("write f");
+        git(repo, &["add", "f.txt"]);
+        run_with_identity(repo, &["commit", "-m", "first", "-q"]);
+        fs::write(repo.join("f.txt"), b"two\n").expect("write f two");
+        git(repo, &["add", "f.txt"]);
+        run_with_identity(repo, &["commit", "-m", "second", "-q"]);
+        // Include lives in the SUBDIRECTORY; running from there proves the
+        // command-line include context behaves identically in both binaries.
+        fs::write(
+            repo.join("sub").join("inc.inc"),
+            b"[advice]\n\tdetachedHead = false\n",
+        )
+        .expect("write inc.inc");
+    }
+
+    // (1) Relative include from `-c`: both refuse with the same fatal message.
+    // (The surrounding error framing differs cosmetically between binaries;
+    // the contract under test is cwd-based resolution + rejection.)
+    let rel_args = ["-c", "include.path=inc.inc", "checkout", "--detach", "HEAD"];
+    let expected = run_output(sley_testkit::oracle_git(), &upstream.join("sub"), &rel_args);
+    assert_eq!(
+        expected.status.code(),
+        Some(128),
+        "oracle must reject relative -c include.path"
+    );
+    assert!(
+        String::from_utf8_lossy(&expected.stderr)
+            .contains("relative config includes must come from files"),
+        "oracle stderr missing include rejection message"
+    );
+    let actual = run_output(sley_testkit::sley_bin!(), &rust.join("sub"), &rel_args);
+    assert_eq!(actual.status.code(), expected.status.code());
+    assert!(
+        String::from_utf8_lossy(&actual.stderr)
+            .contains("relative config includes must come from files"),
+        "sley stderr missing include rejection message"
+    );
+
+    // (2) Absolute include from `-c`: advice suppressed in both stderr streams.
+    for repo in [&upstream, &rust] {
+        let inc = repo.join("sub").join("inc.inc");
+        let abs_arg = format!("include.path={}", inc.display());
+        let output = Command::new(if repo == &upstream {
+            sley_testkit::oracle_git()
+        } else {
+            sley_testkit::sley_bin!()
+        })
+        .current_dir(repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["-c", &abs_arg, "checkout", "--detach", "HEAD"])
+        .output()
+        .unwrap_or_else(|err| panic!("failed detached checkout: {err}"));
+        assert!(output.status.success(), "absolute include checkout failed");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("detached HEAD"),
+            "advice.detachedHead=false via include.path was not honoured:\n{stderr}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// S12 regression: when a D/F transition replaces a tracked directory with a
+/// file, ignored files under that directory do not block the update (they are
+/// removed with the subtree) while untracked non-ignored files still abort.
+#[test]
+fn checkout_df_transition_ignored_files_do_not_block_directory_replacement() {
+    let root = unique_temp_dir("checkout-df-ignored-subdir");
+
+    let build = |repo: &Path| {
+        fs::create_dir_all(repo).expect("create repo dir");
+        git(repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("dir")).expect("mkdir dir");
+        fs::write(repo.join("dir/file.txt"), b"tracked\n").expect("write tracked file");
+        fs::write(repo.join("keep.txt"), b"x\n").expect("write keep");
+        git(repo, &["add", "."]);
+        run_with_identity(repo, &["commit", "-m", "base", "-q"]);
+        // side replaces directory `dir` with a FILE named `dir`.
+        git(repo, &["checkout", "-q", "-b", "side"]);
+        git(repo, &["rm", "-q", "-r", "dir"]);
+        fs::write(repo.join("dir"), b"file-now\n").expect("write dir file");
+        git(repo, &["add", "dir"]);
+        run_with_identity(repo, &["commit", "-m", "df transition", "-q"]);
+        git(repo, &["checkout", "-q", "main"]);
+    };
+
+    // (1) Ignored content under dir/ does not block: nested + plain ignored.
+    {
+        let upstream = root.join("ignored-upstream");
+        let rust = root.join("ignored-rust");
+        build(&upstream);
+        build(&rust);
+        for repo in [&upstream, &rust] {
+            fs::write(repo.join(".gitignore"), b"*.log\n").expect("write .gitignore");
+            fs::write(repo.join("dir").join("ignored.log"), b"junk\n").expect("write ignored log");
+            fs::create_dir_all(repo.join("dir").join("nested")).expect("mkdir nested");
+            fs::write(repo.join("dir").join("nested").join("cache.log"), b"deep\n")
+                .expect("write nested ignored log");
+        }
+
+        let args = ["checkout", "side"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        assert!(
+            expected.status.success(),
+            "ignored files under the replaced directory must not block (git said: {})",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            fs::read(rust.join("dir")).expect("read replaced dir"),
+            b"file-now\n",
+            "sley must replace the directory with the file"
+        );
+    }
+
+    // (2) Control: untracked non-ignored content still blocks with exit 128.
+    {
+        let upstream = root.join("untracked-upstream");
+        let rust = root.join("untracked-rust");
+        build(&upstream);
+        build(&rust);
+        for repo in [&upstream, &rust] {
+            fs::write(repo.join("dir").join("untracked.txt"), b"precious\n")
+                .expect("write untracked file");
+        }
+
+        let args = ["checkout", "side"];
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+        assert_eq!(
+            expected.status.code(),
+            Some(1),
+            "untracked non-ignored files must block the checkout (git stderr: {})",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            fs::read(rust.join("dir").join("untracked.txt")).expect("read untracked file"),
+            b"precious\n",
+            "blocking untracked file must survive"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A linked worktree's `.git` is a gitfile, while `info/exclude` remains in the
+/// common git directory. D/F safety checks must therefore resolve the common
+/// directory instead of looking below the worktree's `.git` path.
+#[test]
+fn checkout_df_transition_honors_common_info_exclude_in_linked_worktree() {
+    let root = unique_temp_dir("checkout-df-linked-info-exclude");
+
+    let build = |repo: &Path, linked: &Path| {
+        fs::create_dir_all(repo).expect("create repo dir");
+        git(repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("dir")).expect("mkdir dir");
+        fs::write(repo.join("dir/tracked.txt"), b"tracked\n").expect("write tracked file");
+        git(repo, &["add", "."]);
+        run_with_identity(repo, &["commit", "-m", "base", "-q"]);
+
+        git(repo, &["checkout", "-q", "-b", "side"]);
+        git(repo, &["rm", "-q", "-r", "dir"]);
+        fs::write(repo.join("dir"), b"file-now\n").expect("write replacement file");
+        git(repo, &["add", "dir"]);
+        run_with_identity(repo, &["commit", "-m", "df transition", "-q"]);
+        git(repo, &["checkout", "-q", "main"]);
+
+        let linked_arg = linked.to_str().expect("linked worktree path utf8");
+        git(
+            repo,
+            &["worktree", "add", "-q", "--detach", linked_arg, "main"],
+        );
+        fs::write(repo.join(".git/info/exclude"), b"*.log\n").expect("write common exclude");
+        fs::write(linked.join("dir/cache.log"), b"ignored\n").expect("write ignored file");
+    };
+
+    let upstream_repo = root.join("upstream-repo");
+    let upstream_linked = root.join("upstream-linked");
+    let rust_repo = root.join("rust-repo");
+    let rust_linked = root.join("rust-linked");
+    build(&upstream_repo, &upstream_linked);
+    build(&rust_repo, &rust_linked);
+
+    let args = ["checkout", "side"];
+    let expected = run_output(sley_testkit::oracle_git(), &upstream_linked, &args);
+    assert!(
+        expected.status.success(),
+        "oracle must honor common info/exclude: {}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+    let actual = run_output(sley_testkit::sley_bin!(), &rust_linked, &args);
+    assert_same_output(actual, expected, &args);
+    assert_eq!(
+        fs::read(rust_linked.join("dir")).expect("read replacement file"),
+        b"file-now\n"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// S11 regression (discriminating): `checkout -B <branch> <start>` must see the
+/// full effective config cascade. The filter driver here is defined ONLY in
+/// `$GIT_DIR/config.worktree` (`extensions.worktreeConfig = true`) — a layer a
+/// repo-only read misses and one the filter engine's global fallback never
+/// consults — so the branch-reset path must smudge exactly like upstream.
+#[test]
+fn checkout_branch_reset_sees_config_worktree_layer() {
+    let root = unique_temp_dir("checkout-b-config-worktree");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    for repo in [&upstream, &rust] {
+        fs::create_dir_all(repo).expect("create repo dir");
+        git(repo, &["init", "-q", "-b", "main"]);
+        fs::write(
+            repo.join(".git").join("config"),
+            "[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = false\n[extensions]\n\tworktreeConfig = true\n",
+        )
+        .expect("enable extensions.worktreeConfig");
+        // The filter driver lives ONLY in the worktree-scoped config layer.
+        fs::write(
+            repo.join(".git").join("config.worktree"),
+            "[filter \"upper\"]\n\tsmudge = tr a-z A-Z\n\tclean = tr A-Z a-z\n",
+        )
+        .expect("write config.worktree");
+        fs::write(repo.join(".gitattributes"), b"hello.txt filter=upper\n")
+            .expect("write .gitattributes");
+        fs::write(repo.join("hello.txt"), b"base\n").expect("write base file");
+        git(repo, &["add", ".gitattributes", "hello.txt"]);
+        run_with_identity(repo, &["commit", "-m", "base", "-q"]);
+        fs::write(repo.join("hello.txt"), b"main\n").expect("write main file");
+        git(repo, &["add", "hello.txt"]);
+        run_with_identity(repo, &["commit", "-m", "main", "-q"]);
+    }
+
+    let base_oid = String::from_utf8(git(&upstream, &["rev-parse", "HEAD~"]))
+        .expect("base oid utf8")
+        .trim()
+        .to_string();
+
+    // Quiet mode: keeps stdout empty on both sides so the assertion isolates
+    // the filter cascade (the smudged file content) from unrelated
+    // change-summary rendering differences.
+    let args = ["checkout", "-q", "-B", "topic", base_oid.as_str()];
+    let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+    assert!(
+        expected.status.success(),
+        "oracle -B failed: {}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+    let actual = run_output(sley_testkit::sley_bin!(), &rust, &args);
+    assert_same_output(actual, expected, &args);
+
+    assert_eq!(
+        fs::read(rust.join("hello.txt")).expect("read sley hello.txt"),
+        b"BASE\n",
+        "sley ignored $GIT_DIR/config.worktree on the -B branch-reset path"
+    );
+    assert_eq!(
+        fs::read(upstream.join("hello.txt")).expect("read git hello.txt"),
+        b"BASE\n",
+        "oracle fixture sanity: expected smudged content"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

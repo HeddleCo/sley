@@ -135,12 +135,11 @@ pub use content::{
     collect_diff_entry_blob_oids, collect_diff_stat_entries,
     collect_diff_stat_entries_with_worktree_clean, count_line_diff, diff_entry_new_content,
     diff_entry_old_content, diff_entry_produces_output, diff_line_stats, gitlink_diff_content,
-    is_binary_content, is_gitlink_pair, read_blob,
-    repo_path_to_path,
+    is_binary_content, is_gitlink_pair, read_blob, repo_path_to_path,
 };
 pub use filters::{
     DIRTY_SUBMODULE_MODIFIED, DIRTY_SUBMODULE_UNTRACKED, DiffPathspec, LoadRepoConfig,
-    SubmoduleDirtSource, SubmoduleDiffConfig, apply_diff_max_depth, apply_diff_order_file,
+    SubmoduleDiffConfig, SubmoduleDirtSource, apply_diff_max_depth, apply_diff_order_file,
     apply_diff_pathspec, apply_submodule_ignore_filter, collect_dirty_submodules,
     compile_ignore_matching_regexes, diff_rename_limit_requires_integer_error,
     parse_diff_max_depth, render_tree_to_tree_patch, reverse_diff_entries, reverse_diff_entry,
@@ -150,8 +149,7 @@ pub use options::{
     CleanFilterApply, DiffEntryRawRenderOptions, DiffEntryRenderContext, DiffEntryRenderModes,
     DiffEntryStatRenderOptions, DiffEntryStatSource, DiffRenderOptions, DiffStatWidths,
     DiffWorktreeCleanContext, DirstatMode, DirstatOptions, LazyObjectFetch, PatchDriver,
-    PatchUserdiff,
-    SubmoduleDiffFormat, SubmoduleIgnoreMode, SubmodulePatchRender, WordDiffRequest,
+    PatchUserdiff, SubmoduleDiffFormat, SubmoduleIgnoreMode, SubmodulePatchRender, WordDiffRequest,
     parse_submodule_ignore_mode,
 };
 pub use patch_entry::write_diff_patch_entry;

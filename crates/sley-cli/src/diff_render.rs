@@ -10,30 +10,32 @@
 use crate::{
     BString, DEFAULT_BIG_FILE_THRESHOLD, GitConfig, GitError, ObjectFormat, ObjectId, Result,
     commit_encoding, commit_subject, core_big_file_threshold, log_reencode_message,
-    normalize_absolute_cli_pathspec, read_repo_config, repository_object_format,
-    sley_diff_merge, sley_pretty, sley_remote, sley_rev, sley_worktree,
+    normalize_absolute_cli_pathspec, read_repo_config, repository_object_format, sley_diff_merge,
+    sley_pretty, sley_remote, sley_rev, sley_worktree,
 };
 use sley::plumbing::sley_object::{Commit, EncodedObject};
 use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
-use sley_diff_merge::porcelain::{LazyObjectFetch, PatchDriver, PatchUserdiff, SubmodulePatchRender};
 pub(crate) use sley_diff_merge::porcelain::DiffRenderOptions;
+use sley_diff_merge::porcelain::{
+    LazyObjectFetch, PatchDriver, PatchUserdiff, SubmodulePatchRender,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub(crate) use sley_diff_merge::porcelain::{
-    LineStats as DiffLineStats, StatEntry as DiffStatEntryData, StatOptions as DiffStatOptions,
     DiffEntryRawRenderOptions, DiffEntryRenderContext, DiffEntryRenderModes,
-    DiffEntryStatRenderOptions, DiffEntryStatSource, DiffPathspec, WordDiffRequest,
-    apply_diff_max_depth, apply_diff_order_file, apply_diff_pathspec,
+    DiffEntryStatRenderOptions, DiffEntryStatSource, DiffPathspec, DiffWorktreeCleanContext,
+    LineStats as DiffLineStats, StatEntry as DiffStatEntryData, StatOptions as DiffStatOptions,
+    WordDiffRequest, apply_diff_max_depth, apply_diff_order_file, apply_diff_pathspec,
     apply_submodule_ignore_filter, collect_diff_stat_entries,
     collect_diff_stat_entries_with_worktree_clean, compile_ignore_matching_regexes,
     diff_entry_new_content, diff_entry_old_content, diff_entry_produces_output, diff_line_stats,
     diff_rename_limit_requires_integer_error, diff_stat_decimal_width, diff_stat_totals,
-    gitlink_diff_content, is_binary_content, is_gitlink_pair, parse_diff_max_depth, read_blob,
-    parse_dirstat_params, render_diff_entries, repo_path_to_path, reverse_diff_entries,
-    reverse_diff_entry, validate_diff_rename_limit, write_diff_dirstat, DiffWorktreeCleanContext,
+    gitlink_diff_content, is_binary_content, is_gitlink_pair, parse_diff_max_depth,
+    parse_dirstat_params, read_blob, render_diff_entries, repo_path_to_path, reverse_diff_entries,
+    reverse_diff_entry, validate_diff_rename_limit, write_diff_dirstat,
     write_diff_numstat_materialized_entry, write_diff_patch_entry, write_diff_raw_entry,
     write_diff_shortstat_materialized, write_diff_stat_summary_line, write_diff_summary_entry,
 };
@@ -284,8 +286,7 @@ pub(crate) fn diff_pathspec_new(
     let mut filters = Vec::new();
     for arg in path_args {
         let parse_arg = normalize_absolute_cli_pathspec(&root, &cwd, arg)?;
-        let element =
-            sley_pathspec::parse_normalized_pathspec_element(&prefix, &parse_arg, magic)?;
+        let element = sley_pathspec::parse_normalized_pathspec_element(&prefix, &parse_arg, magic)?;
         let arg_path = Path::new(arg);
         let absolute = if arg_path.is_absolute() {
             arg_path.to_path_buf()
@@ -317,17 +318,19 @@ pub(crate) fn make_clean_apply<'a>(
     config: &'a GitConfig,
     attributes: &'a sley_worktree::WorktreeAttributes,
 ) -> CliCleanApply<'a> {
-    Box::new(move |path: &[u8], content: &[u8], index_blob: Option<&ObjectId>| {
-        // Honour has_crlf_in_index so text=auto does not strip CRLF when the
-        // recorded (old/index) blob already has CRLF — otherwise unstaged
-        // diffs show mixed endings (`-a\r` / `+b`) and break apply
-        // round-trips (t4124).
-        let index_blob = match index_blob {
-            Some(oid) => sley_worktree::SafeCrlfIndexBlob::Lookup { odb: db, oid: *oid },
-            None => sley_worktree::SafeCrlfIndexBlob::None,
-        };
-        attributes.apply_clean_filter_respecting_index(config, path, content, index_blob)
-    })
+    Box::new(
+        move |path: &[u8], content: &[u8], index_blob: Option<&ObjectId>| {
+            // Honour has_crlf_in_index so text=auto does not strip CRLF when the
+            // recorded (old/index) blob already has CRLF — otherwise unstaged
+            // diffs show mixed endings (`-a\r` / `+b`) and break apply
+            // round-trips (t4124).
+            let index_blob = match index_blob {
+                Some(oid) => sley_worktree::SafeCrlfIndexBlob::Lookup { odb: db, oid: *oid },
+                None => sley_worktree::SafeCrlfIndexBlob::None,
+            };
+            attributes.apply_clean_filter_respecting_index(config, path, content, index_blob)
+        },
+    )
 }
 
 /// Borrow a boxed clean-filter closure as the engine's context type.
@@ -336,7 +339,6 @@ pub(crate) fn clean_context<'a>(apply: &'a CliCleanApply<'a>) -> DiffWorktreeCle
         apply_clean: apply.as_ref(),
     }
 }
-
 
 // Userdiff / textconv seam
 
@@ -502,9 +504,9 @@ fn write_submodule_patch_entry(
     .filter(|_| entry.new_mode == Some(0o160000))
     .unwrap_or_else(|| ObjectId::null(options.format));
 
-    let diff_dirty_only =
-        options.submodule_format == sley_rev::diff_options::SubmoduleDiffFormat::Diff
-            && dirt & sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0;
+    let diff_dirty_only = options.submodule_format
+        == sley_rev::diff_options::SubmoduleDiffFormat::Diff
+        && dirt & sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0;
     if old_oid == new_oid && !diff_dirty_only {
         return Ok(());
     }
@@ -526,12 +528,12 @@ fn write_submodule_patch_entry(
         None => (None, None),
     };
 
-    let old_present = sub_db
-        .as_ref()
-        .is_some_and(|db| old_oid.is_null() || sley_submodule::history::submodule_commit_tree(db, &old_oid).is_ok());
-    let new_present = sub_db
-        .as_ref()
-        .is_some_and(|db| new_oid.is_null() || sley_submodule::history::submodule_commit_tree(db, &new_oid).is_ok());
+    let old_present = sub_db.as_ref().is_some_and(|db| {
+        old_oid.is_null() || sley_submodule::history::submodule_commit_tree(db, &old_oid).is_ok()
+    });
+    let new_present = sub_db.as_ref().is_some_and(|db| {
+        new_oid.is_null() || sley_submodule::history::submodule_commit_tree(db, &new_oid).is_ok()
+    });
     if old_oid == new_oid && diff_dirty_only {
         if let (Some(sub_db), Some(sub_format)) = (sub_db.as_ref(), sub_format) {
             write_submodule_inline_diff(
@@ -621,7 +623,6 @@ fn submodule_commit_subject(commit: &Commit) -> String {
     let message = log_reencode_message(&commit.message, &encoding, "UTF-8");
     commit_subject(&message)
 }
-
 
 fn nested_submodule_options<'a>(
     options: &DiffRenderOptions<'a>,
@@ -784,4 +785,3 @@ fn submodule_collect_patch_dirt(
     }
     Ok(dirt)
 }
-

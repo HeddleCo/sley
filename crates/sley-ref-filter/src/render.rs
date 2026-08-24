@@ -1,41 +1,73 @@
-//! Shared `for-each-ref` / `refs list` render half plus the CLI-owned adapters
-//! (describe engine, trailer formatting). The typed model — sort keys,
-//! upstream/push tracking, contents assembly, atom families, colors, worktree
-//! and disk-size lookups — lives in `sley-ref-filter` and reaches command
-//! modules through the crate-root `sley_ref_filter` re-export.
-#![allow(clippy::expect_used)]
+//! The `for-each-ref` output half: expand a parsed [`ForEachRefFormat`] for one
+//! ref, mirroring ref-filter.c's atom dispatch order exactly. The two atoms that
+//! bind to engines living above this crate (trailers formatting via
+//! sley-pretty, and `%(describe)` via the describe engine) reach the renderer
+//! through the injected [`ForEachRefRenderHooks`]; option *parsing* for those
+//! atoms stays on the CLI side of the boundary.
 
-use crate::{GitError, Result, sley_rev};
-use sley_ref_filter::{
-    ForEachRefAtom, ForEachRefFormat, ForEachRefFormatContext, for_each_ref_copy_subject,
-    for_each_ref_message_parts, for_each_ref_sanitize_subject, write_for_each_ref_format,
-    write_for_each_ref_signature, write_for_each_ref_typed_atom,
+use super::{
+    ForEachRefAtom, ForEachRefFormat, ForEachRefFormatContext, for_each_ref_abbrev_oid,
+    for_each_ref_ahead_behind_with_diagnostic, for_each_ref_color_escape,
+    for_each_ref_copy_subject, for_each_ref_lstrip_name, for_each_ref_message,
+    for_each_ref_message_parts, for_each_ref_oid_atom_arg, for_each_ref_oid_atom_width,
+    for_each_ref_rstrip_name, for_each_ref_sanitize_subject, for_each_ref_track_short,
+    for_each_ref_try_date_atom, for_each_ref_try_email_atom, for_each_ref_try_name_atom,
+    parse_for_each_ref_abbrev_width, parse_for_each_ref_contents_lines_count,
+    parse_for_each_ref_strip_count, write_for_each_ref_contents_lines, write_for_each_ref_format,
+    write_for_each_ref_identity, write_for_each_ref_signature, write_for_each_ref_track,
+    write_for_each_ref_typed_atom,
 };
+use sley_core::{GitError, Result};
 use std::collections::HashMap;
 use std::io::Write;
 
-// Atom families whose option grammar is shared with ref-filter but which bind
-// to CLI-only engines here (trailers formatting, describe).
-use sley_ref_filter::{
-    for_each_ref_ahead_behind_with_diagnostic, for_each_ref_color_escape, for_each_ref_message,
-    for_each_ref_oid_atom_arg, for_each_ref_oid_atom_width, for_each_ref_try_date_atom,
-    for_each_ref_try_email_atom, for_each_ref_try_name_atom,
-    write_for_each_ref_contents_lines,
-};
+/// Render through an atom-recognizer hook. The dispatch arms above only reach
+/// the recognizers whose placeholder grammar they match, so `None` here is a
+/// dispatch invariant violation; report it as an error instead of panicking.
+fn write_recognized_atom(placeholder: &str, recognized: Option<Result<()>>) -> Result<()> {
+    match recognized {
+        Some(rendered) => rendered,
+        None => Err(GitError::InvalidFormat(format!(
+            "unrecognized for-each-ref atom %({placeholder})"
+        ))),
+    }
+}
 
-pub(crate) fn print_for_each_ref_format(
+/// Trailers formatting for `%(trailers...)` / `%(contents:trailers...)`.
+/// Returns `Some(Err(_))` after reporting a bad-argument diagnostic, `None`
+/// when the placeholder is not a trailers atom (dispatch falls through).
+pub type ForEachRefTrailersFormatter =
+    dyn Fn(&mut Vec<u8>, &str, &ForEachRefFormatContext<'_>) -> Option<Result<()>> + Send + Sync;
+
+/// `%(describe[:opts])` rendering. Returns `Ok(false)` when the placeholder is
+/// not a describe atom (dispatch falls through); `Ok(true)` after rendering
+/// (possibly an empty expansion, matching git's failure-is-empty semantics).
+pub type ForEachRefDescribeRenderer =
+    dyn Fn(&mut Vec<u8>, &str, &ForEachRefFormatContext<'_>) -> Result<bool> + Send + Sync;
+
+/// The engine hooks injected into the per-atom dispatch. Both bounds are
+/// `Send + Sync` so the CLI can hold one shared static instance.
+#[derive(Clone, Copy)]
+pub struct ForEachRefRenderHooks<'a> {
+    pub trailers_formatter: &'a ForEachRefTrailersFormatter,
+    pub describe_renderer: &'a ForEachRefDescribeRenderer,
+}
+
+pub fn print_for_each_ref_format(
     stdout: &mut impl Write,
     format_spec: &ForEachRefFormat,
     context: &ForEachRefFormatContext<'_>,
+    hooks: ForEachRefRenderHooks<'_>,
 ) -> Result<()> {
-    print_for_each_ref_format_with_is_bases(stdout, format_spec, context, &HashMap::new())
+    print_for_each_ref_format_with_is_bases(stdout, format_spec, context, &HashMap::new(), hooks)
 }
 
-pub(crate) fn print_for_each_ref_format_with_is_bases(
+pub fn print_for_each_ref_format_with_is_bases(
     stdout: &mut impl Write,
     format_spec: &ForEachRefFormat,
     context: &ForEachRefFormatContext<'_>,
     is_base_refs: &HashMap<String, String>,
+    hooks: ForEachRefRenderHooks<'_>,
 ) -> Result<()> {
     let reset_color_at_eol = context.color && format_spec.ends_with_unreset_color();
     write_for_each_ref_format(
@@ -59,7 +91,7 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                 }
                 "objectname" => write!(stdout, "{}", context.oid)?,
                 "objectname:short" => stdout.write_all(
-                    sley_ref_filter::for_each_ref_abbrev_oid(
+                    for_each_ref_abbrev_oid(
                         context.oid,
                         context.objectname_abbrev,
                         context.objectname_candidates,
@@ -74,7 +106,7 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                 "*objectname:short" => {
                     if let Some(peeled) = &context.peeled_object {
                         stdout.write_all(
-                            sley_ref_filter::for_each_ref_abbrev_oid(
+                            for_each_ref_abbrev_oid(
                                 &peeled.oid,
                                 context.objectname_abbrev,
                                 context.objectname_candidates,
@@ -172,17 +204,17 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                 )?,
                 "upstream:track" => {
                     if let Some(track) = context.upstream_track {
-                        sley_ref_filter::write_for_each_ref_track(stdout, track, true)?;
+                        write_for_each_ref_track(stdout, track, true)?;
                     }
                 }
                 "upstream:track,nobracket" | "upstream:nobracket,track" => {
                     if let Some(track) = context.upstream_track {
-                        sley_ref_filter::write_for_each_ref_track(stdout, track, false)?;
+                        write_for_each_ref_track(stdout, track, false)?;
                     }
                 }
                 "upstream:trackshort" => {
                     if let Some(track) = context.upstream_track {
-                        stdout.write_all(sley_ref_filter::for_each_ref_track_short(track).as_bytes())?;
+                        stdout.write_all(for_each_ref_track_short(track).as_bytes())?;
                     }
                 }
                 "push" => stdout.write_all(
@@ -220,17 +252,17 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                 )?,
                 "push:track" => {
                     if let Some(track) = context.push_track {
-                        sley_ref_filter::write_for_each_ref_track(stdout, track, true)?;
+                        write_for_each_ref_track(stdout, track, true)?;
                     }
                 }
                 "push:track,nobracket" | "push:nobracket,track" => {
                     if let Some(track) = context.push_track {
-                        sley_ref_filter::write_for_each_ref_track(stdout, track, false)?;
+                        write_for_each_ref_track(stdout, track, false)?;
                     }
                 }
                 "push:trackshort" => {
                     if let Some(track) = context.push_track {
-                        stdout.write_all(sley_ref_filter::for_each_ref_track_short(track).as_bytes())?;
+                        stdout.write_all(for_each_ref_track_short(track).as_bytes())?;
                     }
                 }
                 "signature"
@@ -339,14 +371,14 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                         write!(stdout, "{}", for_each_ref_message_parts(message).bare.len())?;
                     }
                 }
-                "author" => sley_ref_filter::write_for_each_ref_identity(
+                "author" => write_for_each_ref_identity(
                     stdout,
                     context
                         .contents
                         .as_ref()
                         .and_then(|contents| contents.author.as_deref()),
                 )?,
-                "*author" => sley_ref_filter::write_for_each_ref_identity(
+                "*author" => write_for_each_ref_identity(
                     stdout,
                     context
                         .peeled_object
@@ -354,21 +386,21 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                         .and_then(|peeled| peeled.author.as_deref()),
                 )?,
                 "authorname" | "*authorname" => {
-                    for_each_ref_try_name_atom(stdout, placeholder, context)
-                        .expect("name atom recognized")?
+                    let recognized = for_each_ref_try_name_atom(stdout, placeholder, context);
+                    write_recognized_atom(placeholder, recognized)?
                 }
                 "authoremail" | "*authoremail" => {
-                    for_each_ref_try_email_atom(stdout, placeholder, context)
-                        .expect("email atom recognized")?
+                    let recognized = for_each_ref_try_email_atom(stdout, placeholder, context);
+                    write_recognized_atom(placeholder, recognized)?
                 }
-                "committer" => sley_ref_filter::write_for_each_ref_identity(
+                "committer" => write_for_each_ref_identity(
                     stdout,
                     context
                         .contents
                         .as_ref()
                         .and_then(|contents| contents.committer.as_deref()),
                 )?,
-                "*committer" => sley_ref_filter::write_for_each_ref_identity(
+                "*committer" => write_for_each_ref_identity(
                     stdout,
                     context
                         .peeled_object
@@ -376,37 +408,37 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                         .and_then(|peeled| peeled.committer.as_deref()),
                 )?,
                 "committername" | "*committername" => {
-                    for_each_ref_try_name_atom(stdout, placeholder, context)
-                        .expect("name atom recognized")?
+                    let recognized = for_each_ref_try_name_atom(stdout, placeholder, context);
+                    write_recognized_atom(placeholder, recognized)?
                 }
                 "committeremail" | "*committeremail" => {
-                    for_each_ref_try_email_atom(stdout, placeholder, context)
-                        .expect("email atom recognized")?
+                    let recognized = for_each_ref_try_email_atom(stdout, placeholder, context);
+                    write_recognized_atom(placeholder, recognized)?
                 }
-                "tagger" => sley_ref_filter::write_for_each_ref_identity(
+                "tagger" => write_for_each_ref_identity(
                     stdout,
                     context
                         .contents
                         .as_ref()
                         .and_then(|contents| contents.tagger.as_deref()),
                 )?,
-                "*tagger" => sley_ref_filter::write_for_each_ref_identity(stdout, None)?,
+                "*tagger" => write_for_each_ref_identity(stdout, None)?,
                 "taggername" | "*taggername" => {
-                    for_each_ref_try_name_atom(stdout, placeholder, context)
-                        .expect("name atom recognized")?
+                    let recognized = for_each_ref_try_name_atom(stdout, placeholder, context);
+                    write_recognized_atom(placeholder, recognized)?
                 }
                 "taggeremail" | "*taggeremail" => {
-                    for_each_ref_try_email_atom(stdout, placeholder, context)
-                        .expect("email atom recognized")?
+                    let recognized = for_each_ref_try_email_atom(stdout, placeholder, context);
+                    write_recognized_atom(placeholder, recognized)?
                 }
-                "creator" => sley_ref_filter::write_for_each_ref_identity(
+                "creator" => write_for_each_ref_identity(
                     stdout,
                     context
                         .contents
                         .as_ref()
                         .and_then(|contents| contents.creator.as_deref()),
                 )?,
-                "*creator" => sley_ref_filter::write_for_each_ref_identity(
+                "*creator" => write_for_each_ref_identity(
                     stdout,
                     context
                         .peeled_object
@@ -415,8 +447,8 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                 )?,
                 "authordate" | "*authordate" | "committerdate" | "*committerdate"
                 | "taggerdate" | "*taggerdate" | "creatordate" | "*creatordate" => {
-                    for_each_ref_try_date_atom(stdout, placeholder, context)
-                        .expect("date atom recognized")?
+                    let recognized = for_each_ref_try_date_atom(stdout, placeholder, context);
+                    write_recognized_atom(placeholder, recognized)?
                 }
                 "tree" => {
                     if let Some(tree) = context
@@ -507,82 +539,68 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                         .strip_prefix("refname:lstrip=")
                         .or_else(|| other.strip_prefix("refname:strip="))
                     {
-                        let count = sley_ref_filter::parse_for_each_ref_strip_count(value)?;
+                        let count = parse_for_each_ref_strip_count(value)?;
                         stdout.write_all(
-                            sley_ref_filter::for_each_ref_lstrip_name(context.refname, count)
-                                .as_bytes(),
+                            for_each_ref_lstrip_name(context.refname, count).as_bytes(),
                         )?;
                     } else if let Some(value) = other.strip_prefix("refname:rstrip=") {
-                        let count = sley_ref_filter::parse_for_each_ref_strip_count(value)?;
+                        let count = parse_for_each_ref_strip_count(value)?;
                         stdout.write_all(
-                            sley_ref_filter::for_each_ref_rstrip_name(context.refname, count)
-                                .as_bytes(),
+                            for_each_ref_rstrip_name(context.refname, count).as_bytes(),
                         )?;
                     } else if let Some(value) = other
                         .strip_prefix("upstream:lstrip=")
                         .or_else(|| other.strip_prefix("upstream:strip="))
                     {
-                        let count = sley_ref_filter::parse_for_each_ref_strip_count(value)?;
+                        let count = parse_for_each_ref_strip_count(value)?;
                         let upstream = context
                             .upstream
                             .as_ref()
                             .map(|upstream| upstream.refname.as_str())
                             .unwrap_or("");
-                        stdout.write_all(
-                            sley_ref_filter::for_each_ref_lstrip_name(upstream, count).as_bytes(),
-                        )?;
+                        stdout.write_all(for_each_ref_lstrip_name(upstream, count).as_bytes())?;
                     } else if let Some(value) = other.strip_prefix("upstream:rstrip=") {
-                        let count = sley_ref_filter::parse_for_each_ref_strip_count(value)?;
+                        let count = parse_for_each_ref_strip_count(value)?;
                         let upstream = context
                             .upstream
                             .as_ref()
                             .map(|upstream| upstream.refname.as_str())
                             .unwrap_or("");
-                        stdout.write_all(
-                            sley_ref_filter::for_each_ref_rstrip_name(upstream, count).as_bytes(),
-                        )?;
+                        stdout.write_all(for_each_ref_rstrip_name(upstream, count).as_bytes())?;
                     } else if let Some(value) = other
                         .strip_prefix("push:lstrip=")
                         .or_else(|| other.strip_prefix("push:strip="))
                     {
-                        let count = sley_ref_filter::parse_for_each_ref_strip_count(value)?;
+                        let count = parse_for_each_ref_strip_count(value)?;
                         let push = context
                             .push
                             .as_ref()
                             .and_then(|push| push.refname.as_deref())
                             .unwrap_or("");
-                        stdout.write_all(
-                            sley_ref_filter::for_each_ref_lstrip_name(push, count).as_bytes(),
-                        )?;
+                        stdout.write_all(for_each_ref_lstrip_name(push, count).as_bytes())?;
                     } else if let Some(value) = other.strip_prefix("push:rstrip=") {
-                        let count = sley_ref_filter::parse_for_each_ref_strip_count(value)?;
+                        let count = parse_for_each_ref_strip_count(value)?;
                         let push = context
                             .push
                             .as_ref()
                             .and_then(|push| push.refname.as_deref())
                             .unwrap_or("");
-                        stdout.write_all(
-                            sley_ref_filter::for_each_ref_rstrip_name(push, count).as_bytes(),
-                        )?;
+                        stdout.write_all(for_each_ref_rstrip_name(push, count).as_bytes())?;
                     } else if let Some(value) = other
                         .strip_prefix("symref:lstrip=")
                         .or_else(|| other.strip_prefix("symref:strip="))
                     {
-                        let count = sley_ref_filter::parse_for_each_ref_strip_count(value)?;
+                        let count = parse_for_each_ref_strip_count(value)?;
                         let symref = context.symref.unwrap_or("");
-                        stdout.write_all(
-                            sley_ref_filter::for_each_ref_lstrip_name(symref, count).as_bytes(),
-                        )?;
+                        stdout.write_all(for_each_ref_lstrip_name(symref, count).as_bytes())?;
                     } else if let Some(value) = other.strip_prefix("symref:rstrip=") {
-                        let count = sley_ref_filter::parse_for_each_ref_strip_count(value)?;
+                        let count = parse_for_each_ref_strip_count(value)?;
                         let symref = context.symref.unwrap_or("");
-                        stdout.write_all(
-                            sley_ref_filter::for_each_ref_rstrip_name(symref, count).as_bytes(),
-                        )?;
+                        stdout.write_all(for_each_ref_rstrip_name(symref, count).as_bytes())?;
                     } else if let Some(width) = other.strip_prefix("objectname:short=") {
-                        let width = sley_ref_filter::parse_for_each_ref_abbrev_width(width)?;
+                        let width = parse_for_each_ref_abbrev_width(width)?;
                         stdout.write_all(
-                            sley_ref_filter::for_each_ref_abbrev_oid(
+                            for_each_ref_abbrev_oid(
                                 context.oid,
                                 Some(width),
                                 context.objectname_candidates,
@@ -590,10 +608,10 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                             .as_bytes(),
                         )?;
                     } else if let Some(width) = other.strip_prefix("*objectname:short=") {
-                        let width = sley_ref_filter::parse_for_each_ref_abbrev_width(width)?;
+                        let width = parse_for_each_ref_abbrev_width(width)?;
                         if let Some(peeled) = &context.peeled_object {
                             stdout.write_all(
-                                sley_ref_filter::for_each_ref_abbrev_oid(
+                                for_each_ref_abbrev_oid(
                                     &peeled.oid,
                                     Some(width),
                                     context.objectname_candidates,
@@ -610,12 +628,8 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                             .and_then(|contents| contents.tree.as_ref())
                         {
                             stdout.write_all(
-                                sley_ref_filter::for_each_ref_abbrev_oid(
-                                    tree,
-                                    width,
-                                    context.objectname_candidates,
-                                )
-                                .as_bytes(),
+                                for_each_ref_abbrev_oid(tree, width, context.objectname_candidates)
+                                    .as_bytes(),
                             )?;
                         }
                     } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "*tree") {
@@ -627,12 +641,8 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                             .and_then(|peeled| peeled.tree.as_ref())
                         {
                             stdout.write_all(
-                                sley_ref_filter::for_each_ref_abbrev_oid(
-                                    tree,
-                                    width,
-                                    context.objectname_candidates,
-                                )
-                                .as_bytes(),
+                                for_each_ref_abbrev_oid(tree, width, context.objectname_candidates)
+                                    .as_bytes(),
                             )?;
                         }
                     } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "parent") {
@@ -644,7 +654,7 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                                     stdout.write_all(b" ")?;
                                 }
                                 stdout.write_all(
-                                    sley_ref_filter::for_each_ref_abbrev_oid(
+                                    for_each_ref_abbrev_oid(
                                         parent,
                                         width,
                                         context.objectname_candidates,
@@ -662,7 +672,7 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                                     stdout.write_all(b" ")?;
                                 }
                                 stdout.write_all(
-                                    sley_ref_filter::for_each_ref_abbrev_oid(
+                                    for_each_ref_abbrev_oid(
                                         parent,
                                         width,
                                         context.objectname_candidates,
@@ -671,8 +681,7 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                                 )?;
                             }
                         }
-                    } else if let Some(result) =
-                        for_each_ref_try_trailers_atom(stdout, other, context)
+                    } else if let Some(result) = (hooks.trailers_formatter)(stdout, other, context)
                     {
                         result?;
                     } else if let Some(result) = for_each_ref_try_email_atom(stdout, other, context)
@@ -708,14 +717,12 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                             write!(stdout, "{} {}", track.ahead, track.behind)?;
                         }
                     } else if let Some(value) = other.strip_prefix("contents:lines=") {
-                        let count =
-                            sley_ref_filter::parse_for_each_ref_contents_lines_count(value)?;
+                        let count = parse_for_each_ref_contents_lines_count(value)?;
                         if let Some(contents) = &context.contents {
                             write_for_each_ref_contents_lines(stdout, &contents.message, count)?;
                         }
                     } else if let Some(value) = other.strip_prefix("*contents:lines=") {
-                        let count =
-                            sley_ref_filter::parse_for_each_ref_contents_lines_count(value)?;
+                        let count = parse_for_each_ref_contents_lines_count(value)?;
                         if let Some(message) = context
                             .peeled_object
                             .as_ref()
@@ -731,30 +738,11 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
                         // above recognized — git reports the bare contents arg.
                         eprintln!("fatal: unrecognized %(contents) argument: {arg}");
                         return Err(GitError::Exit(128));
-                    } else if let Some((peeled, opts)) = for_each_ref_describe_atom(other) {
-                        // %(describe[:opts]) / %(*describe[:opts]) reuse the same
-                        // describe engine as log's %(describe); git treats describe
-                        // failures as an empty placeholder.
-                        let spec = for_each_ref_parse_describe_opts(opts)?;
-                        let target = if peeled {
-                            context.peeled_object.as_ref().map(|object| object.oid)
-                        } else {
-                            Some(*context.oid)
-                        };
-                        if let Some(target) = target
-                            && let Some(text) = crate::commands::describe::describe_for_format(
-                                context.git_dir,
-                                context.format,
-                                context.db,
-                                &target,
-                                spec.tags,
-                                spec.abbrev,
-                                &spec.matches,
-                                &spec.excludes,
-                            )?
-                        {
-                            stdout.write_all(text.as_bytes())?;
-                        }
+                    } else if (hooks.describe_renderer)(stdout, other, context)? {
+                        // %(describe[:opts]) / %(*describe[:opts]) are rendered by
+                        // the CLI-injected describe engine (the engine itself lives
+                        // above this crate to keep sley-ref-filter acyclic); git
+                        // treats describe failures as an empty placeholder.
                     } else if other.starts_with("HEAD:") {
                         // git's head_atom_parser: %(HEAD) takes no arguments.
                         eprintln!("fatal: %(HEAD) does not take arguments");
@@ -778,114 +766,4 @@ pub(crate) fn print_for_each_ref_format_with_is_bases(
             Ok(())
         },
     )
-}
-
-/// If `placeholder` is a trailers atom (`%(trailers[:opts])` or
-/// `%(contents:trailers[:opts])`, with optional `*` peel), render it. Returns
-/// `Some(Err(_))` (after reporting to stderr) for the bad-argument cases.
-pub(crate) fn for_each_ref_try_trailers_atom(
-    stdout: &mut impl Write,
-    placeholder: &str,
-    context: &ForEachRefFormatContext<'_>,
-) -> Option<Result<()>> {
-    let (base, peeled) = placeholder
-        .strip_prefix('*')
-        .map(|rest| (rest, true))
-        .unwrap_or((placeholder, false));
-
-    // Accept `trailers`, `trailers:ARG`, `contents:trailers`,
-    // `contents:trailers:ARG`. The `contents:` prefix shares git's
-    // `%(contents)` bad-argument error for `contents:trailersXXX`.
-    let arg: Option<&str> = if base == "trailers" {
-        None
-    } else if let Some(rest) = base.strip_prefix("trailers:") {
-        Some(rest)
-    } else {
-        let rest = base.strip_prefix("contents:")?;
-        if rest == "trailers" {
-            None
-        } else {
-            let rest = rest.strip_prefix("trailers:")?;
-            Some(rest)
-        }
-    };
-
-    let options = match arg {
-        None => sley_pretty::ForEachRefTrailerOptions::default(),
-        Some(arg) => match sley_pretty::parse_for_each_ref_trailer_options(arg) {
-            Ok(options) => options,
-            Err(None) => {
-                eprintln!("fatal: expected %(trailers:key=<value>)");
-                return Some(Err(GitError::Exit(128)));
-            }
-            Err(Some(invalid)) => {
-                eprintln!("fatal: unknown %(trailers) argument: {invalid}");
-                return Some(Err(GitError::Exit(128)));
-            }
-        },
-    };
-
-    Some((|| -> Result<()> {
-        if let Some(message) = for_each_ref_message(context, peeled) {
-            // git formats trailers over the message from the subject start to
-            // the signature start (sig stripped).
-            let parts = for_each_ref_message_parts(message);
-            let sig_len = parts.signature.len();
-            let trailer_src = &parts.bare[..parts.bare.len().saturating_sub(sig_len)];
-            let rendered = sley_pretty::format_trailers_from_commit(trailer_src, &options);
-            stdout.write_all(&rendered)?;
-        }
-        Ok(())
-    })())
-}
-
-/// Recognize the `%(describe)` family. Returns `(peeled, opts)` where `peeled`
-/// is set for the deref form `%(*describe…)` and `opts` is whatever follows the
-/// colon (empty when there is none). Returns `None` for non-describe atoms.
-pub(crate) fn for_each_ref_describe_atom(placeholder: &str) -> Option<(bool, &str)> {
-    let (peeled, rest) = match placeholder.strip_prefix('*') {
-        Some(rest) => (true, rest),
-        None => (false, placeholder),
-    };
-    if rest == "describe" {
-        Some((peeled, ""))
-    } else {
-        rest.strip_prefix("describe:").map(|opts| (peeled, opts))
-    }
-}
-
-/// Parse `%(describe:opts)` like git's `describe_atom_parser`: walk the
-/// comma-separated options, and on the first unrecognized token report
-/// `unrecognized %(describe) argument: <bad-token-through-end>` (git keeps the
-/// rest of the string, not just the offending token).
-pub(crate) fn for_each_ref_parse_describe_opts(opts: &str) -> Result<sley_pretty::DescribeSpec> {
-    let mut spec = sley_pretty::DescribeSpec::default();
-    let mut rest = opts;
-    while !rest.is_empty() {
-        let (part, next) = match rest.split_once(',') {
-            Some((part, next)) => (part, next),
-            None => (rest, ""),
-        };
-        if part == "tags" {
-            spec.tags = true;
-        } else if let Some(value) = part.strip_prefix("abbrev=") {
-            match value.parse::<usize>() {
-                Ok(width) => spec.abbrev = Some(width),
-                Err(_) => return Err(for_each_ref_bad_describe_arg(rest)),
-            }
-        } else if let Some(value) = part.strip_prefix("match=") {
-            spec.matches.push(value.to_string());
-        } else if let Some(value) = part.strip_prefix("exclude=") {
-            spec.excludes.push(value.to_string());
-        } else {
-            return Err(for_each_ref_bad_describe_arg(rest));
-        }
-        rest = next;
-    }
-    Ok(spec)
-}
-
-pub(crate) fn for_each_ref_bad_describe_arg(bad: &str) -> GitError {
-    eprintln!("fatal: unrecognized %(describe) argument: {bad}");
-    GitError::Exit(128)
 }

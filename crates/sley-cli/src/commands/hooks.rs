@@ -1,14 +1,12 @@
 //! Thin CLI wrapper over [`sley::hooks`].
 
 use crate::session::CliSession;
-use crate::{GitError, ObjectFormat, ObjectId, Result};
+use crate::{ObjectFormat, ObjectId, Result};
 pub(crate) use sley::hooks::{
     HookRun, KNOWN_HOOKS, run_reference_transaction_hook_at, run_traditional_hook_at,
 };
 use sley::plumbing::sley_config::GitConfig;
-use std::env;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 fn hook_environment(cli_session: &CliSession) -> Result<sley::hooks::HookEnvironment> {
     let git_dir = cli_session.git_dir()?;
@@ -94,56 +92,7 @@ pub(crate) fn run_recent_objects_hooks(
     format: ObjectFormat,
     cwd: &Path,
 ) -> Result<Vec<ObjectId>> {
-    let mut roots = Vec::new();
-    for hook in config
-        .get_all("gc", None, "recentObjectsHook")
-        .into_iter()
-        .flatten()
-    {
-        let mut command = recent_objects_hook_command(hook);
-        let output = command
-            .current_dir(cwd)
-            // Hook stdout is the object-id protocol; stderr remains user-facing
-            // and must pass through byte-for-byte, including on failure.
-            .stderr(Stdio::inherit())
-            .output()?;
-        if !output.status.success() {
-            eprintln!("fatal: unable to enumerate additional recent objects");
-            return Err(GitError::Exit(128));
-        }
-        for line in output.stdout.split(|byte| *byte == b'\n') {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if line.is_empty() {
-                continue;
-            }
-            let value = std::str::from_utf8(line).map_err(|_| {
-                GitError::InvalidFormat("invalid object ID from gc.recentObjectsHook".into())
-            })?;
-            roots.push(ObjectId::from_hex(format, value)?);
-        }
-    }
-    Ok(roots)
-}
-
-fn recent_objects_hook_command(script: &str) -> Command {
-    if let Some(shell) = env::var_os("GIT_SHELL_PATH") {
-        let mut command = Command::new(shell);
-        command.arg("-c").arg(script);
-        return command;
-    }
-    #[cfg(windows)]
-    {
-        let shell = env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-        let mut command = Command::new(shell);
-        command.arg("/C").arg(script);
-        command
-    }
-    #[cfg(not(windows))]
-    {
-        let mut command = Command::new("/bin/sh");
-        command.arg("-c").arg(script);
-        command
-    }
+    sley_gc::prune::run_recent_objects_hooks(config, format, cwd)
 }
 
 #[cfg(test)]
@@ -175,7 +124,7 @@ mod tests {
             GitConfig::parse(b"[gc]\n\trecentObjectsHook = false\n").expect("parse config");
         assert!(matches!(
             run_recent_objects_hooks(&config, ObjectFormat::Sha1, Path::new(".")),
-            Err(GitError::Exit(128))
+            Err(crate::GitError::Exit(128))
         ));
     }
 }

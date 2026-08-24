@@ -4,14 +4,15 @@
 
 use flate2::{Compress, Compression, FlushCompress, Status};
 use sley_core::{
-    primitives::{u16_be, u32_be, u64_be},
     ByteBudget, CancelFlag, GitError, ObjectFormat, ObjectId, ResourceLimitKind, Result,
     StreamingDigest,
+    primitives::{u16_be, u32_be, u64_be},
 };
 use sley_formats::Bundle;
 use sley_object::{EncodedObject, ObjectType};
 use std::borrow::Borrow;
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::Write;
@@ -127,6 +128,62 @@ pub struct PackWriteSummary {
 pub struct PackInput<'a> {
     pub oid: &'a ObjectId,
     pub object: &'a EncodedObject,
+}
+
+/// Repository-derived metadata that can improve pack planning without
+/// changing the encoding policy in [`PackWriteOptions`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PackPlanningHints<'a> {
+    name_hashes: Option<&'a HashMap<ObjectId, u32>>,
+}
+
+impl<'a> PackPlanningHints<'a> {
+    pub const fn new() -> Self {
+        Self { name_hashes: None }
+    }
+
+    /// Supply Git-compatible path-name hashes keyed by object id. Missing
+    /// objects retain Git's unnamed zero hash.
+    pub const fn with_name_hashes(mut self, name_hashes: &'a HashMap<ObjectId, u32>) -> Self {
+        self.name_hashes = Some(name_hashes);
+        self
+    }
+
+    pub(crate) const fn name_hashes(self) -> Option<&'a HashMap<ObjectId, u32>> {
+        self.name_hashes
+    }
+}
+
+/// Sort items using the pack writer's current delta-planning order.
+///
+/// `metadata` returns the object id, type, decoded size, and Git-compatible
+/// path-name hash for an item. Keeping the comparison here prevents writer
+/// clients from duplicating the pack writer's ordering policy.
+pub fn sort_by_pack_planning_order<T>(
+    items: &mut [T],
+    mut metadata: impl FnMut(&T) -> (ObjectId, ObjectType, u64, u32),
+) {
+    items.sort_by(|left, right| compare_pack_planning_metadata(metadata(left), metadata(right)));
+}
+
+fn compare_pack_planning_metadata(
+    left: (ObjectId, ObjectType, u64, u32),
+    right: (ObjectId, ObjectType, u64, u32),
+) -> Ordering {
+    pack_planning_type_rank(left.1)
+        .cmp(&pack_planning_type_rank(right.1))
+        .then_with(|| right.3.cmp(&left.3))
+        .then_with(|| right.2.cmp(&left.2))
+        .then_with(|| left.0.as_bytes().cmp(right.0.as_bytes()))
+}
+
+const fn pack_planning_type_rank(object_type: ObjectType) -> u8 {
+    match object_type {
+        ObjectType::Tag => 0,
+        ObjectType::Blob => 1,
+        ObjectType::Tree => 2,
+        ObjectType::Commit => 3,
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PackObjectKind {

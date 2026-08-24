@@ -3,12 +3,12 @@
 
 use super::content::{diff_entry_new_content, diff_entry_old_content, diff_line_stats};
 use super::options::{
-    DiffEntryRenderModes, DiffEntryRenderContext, DiffEntryStatSource, DiffStatWidths, DiffWorktreeCleanContext,
-    DirstatMode, DirstatOptions, LazyObjectFetch,
+    DiffEntryRenderContext, DiffEntryRenderModes, DiffEntryStatSource, DiffStatWidths,
+    DiffWorktreeCleanContext, DirstatMode, DirstatOptions, LazyObjectFetch,
 };
 use super::{
-    LineStats, NameStatusEntry, RawOptions, RenderError, RenderServices, StatEntry,
-    StatOptions, decimal_width,
+    LineStats, NameStatusEntry, RawOptions, RenderError, RenderServices, StatEntry, StatOptions,
+    decimal_width,
 };
 use sley_config::GitConfig;
 use sley_core::{ObjectFormat, Result};
@@ -16,7 +16,9 @@ use sley_odb::FileObjectDatabase;
 use std::io::Write;
 use std::path::Path;
 
-fn map_porcelain_render(result: std::result::Result<super::RenderOutcome, RenderError>) -> Result<()> {
+fn map_porcelain_render(
+    result: std::result::Result<super::RenderOutcome, RenderError>,
+) -> Result<()> {
     match result {
         Ok(_) => Ok(()),
         Err(RenderError::Output(error)) => Err(error.into()),

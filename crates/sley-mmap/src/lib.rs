@@ -210,18 +210,22 @@ macro_rules! define_map_or_read {
 }
 
 impl MappedFile {
+    define_map_or_read!("index file (`index`)", open_index_or_read, open_index);
     define_map_or_read!(
-        "index file (`index`)",
-        open_index_or_read,
-        open_index
+        "pack/index file (`*.pack` / `*.idx`)",
+        open_pack_or_read,
+        open_pack
     );
-    define_map_or_read!("pack/index file (`*.pack` / `*.idx`)", open_pack_or_read, open_pack);
     define_map_or_read!(
         "multi-pack-index file",
         open_multi_pack_index_or_read,
         open_multi_pack_index
     );
-    define_map_or_read!("commit-graph file", open_commit_graph_or_read, open_commit_graph);
+    define_map_or_read!(
+        "commit-graph file",
+        open_commit_graph_or_read,
+        open_commit_graph
+    );
 }
 
 /// Owned bytes of an immutable git file: memory-mapped when possible, otherwise

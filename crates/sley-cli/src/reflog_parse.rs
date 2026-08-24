@@ -2,9 +2,9 @@
 
 use sley::{GitError, ObjectFormat, Result};
 
+use crate::sley_core::date;
 use crate::sley_refs::{FileRefStore, branch_ref_name};
 use crate::sley_rev;
-use crate::sley_core::date;
 
 pub(crate) fn parse_reflog_expire_time(value: &str, option: &str) -> Result<i64> {
     // git's `parse_expiry_date`: "never"/"false" never expire; "all"/"now" expire

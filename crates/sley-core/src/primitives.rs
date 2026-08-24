@@ -249,12 +249,27 @@ mod tests {
 
     #[test]
     fn offset_readers_report_truncation() {
-        assert_eq!(err_string(read_u16(&[0x12], 0)), "invalid format: truncated uint16");
+        assert_eq!(
+            err_string(read_u16(&[0x12], 0)),
+            "invalid format: truncated uint16"
+        );
         assert_eq!(read_u16(&[0x12, 0x34], 0).expect("in bounds"), 0x1234);
-        assert_eq!(err_string(read_u24(&[1, 2], 0)), "invalid format: truncated uint24");
-        assert_eq!(read_u24(&[0, 0xab, 0xcd, 0xef], 1).expect("in bounds"), 0xab_cdef);
-        assert_eq!(err_string(read_u32(&[0; 3], 0)), "invalid format: truncated uint32");
-        assert_eq!(err_string(read_u64(&[0; 7], 0)), "invalid format: truncated uint64");
+        assert_eq!(
+            err_string(read_u24(&[1, 2], 0)),
+            "invalid format: truncated uint24"
+        );
+        assert_eq!(
+            read_u24(&[0, 0xab, 0xcd, 0xef], 1).expect("in bounds"),
+            0xab_cdef
+        );
+        assert_eq!(
+            err_string(read_u32(&[0; 3], 0)),
+            "invalid format: truncated uint32"
+        );
+        assert_eq!(
+            err_string(read_u64(&[0; 7], 0)),
+            "invalid format: truncated uint64"
+        );
     }
 
     #[test]
@@ -297,8 +312,7 @@ mod tests {
         write_biased_varint(0xffff_ffff_ffff_ffff, &mut out);
 
         let mut cursor = 0usize;
-        let decoded =
-            read_biased_varint(&out, &mut cursor).expect("test operation should succeed");
+        let decoded = read_biased_varint(&out, &mut cursor).expect("test operation should succeed");
         assert_eq!(decoded, 0xffff_ffff_ffff_ffff);
         assert_eq!(cursor, out.len());
 
@@ -332,7 +346,10 @@ mod tests {
 
     #[test]
     fn common_prefix_counts_shared_elements() {
-        assert_eq!(common_prefix_len(b"refs/heads/main", b"refs/heads/next"), 11);
+        assert_eq!(
+            common_prefix_len(b"refs/heads/main", b"refs/heads/next"),
+            11
+        );
         assert_eq!(common_prefix_len(b"", b""), 0);
         assert_eq!(common_prefix_len(b"abc", b"abd"), 2);
         assert_eq!(common_prefix_len(b"ab", b"abcd"), 2);

@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 pub(crate) use crate::sley_worktree::discovery::probes::discovery_filesystem_boundary;
 pub(crate) use crate::sley_worktree::discovery::probes::paths_refer_to_same_dir;
 pub(crate) use crate::sley_worktree::discovery::probes::resolve_git_dir_walk_only;
-pub(crate) use crate::sley_worktree::discovery::{is_git_dir as is_git_dir_candidate, read_gitdir_link as read_gitdir_file};
+pub(crate) use crate::sley_worktree::discovery::{
+    is_git_dir as is_git_dir_candidate, read_gitdir_link as read_gitdir_file,
+};
 
 /// Resolve a user-provided textual path against the invocation cwd when it is
 /// not already absolute.

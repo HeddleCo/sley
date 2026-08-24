@@ -88,14 +88,12 @@ fn packet_trace_sink() -> Option<Box<dyn Write>> {
 /// process-lifetime trace setup semantics.
 fn packet_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        match std::env::var("GIT_TRACE_PACKET") {
-            Ok(value) => {
-                let lower = value.to_ascii_lowercase();
-                !matches!(lower.as_str(), "" | "0" | "false")
-            }
-            Err(_) => false,
+    *ENABLED.get_or_init(|| match std::env::var("GIT_TRACE_PACKET") {
+        Ok(value) => {
+            let lower = value.to_ascii_lowercase();
+            !matches!(lower.as_str(), "" | "0" | "false")
         }
+        Err(_) => false,
     })
 }
 
@@ -955,9 +953,8 @@ pub(crate) fn parse_pkt_len(bytes: &[u8]) -> Result<usize> {
 }
 
 fn hex_nibble(byte: u8) -> Result<u8> {
-    sley_core::hex_nibble_value(byte).ok_or_else(|| {
-        GitError::InvalidFormat(format!("invalid pkt-line length byte {byte:#04x}"))
-    })
+    sley_core::hex_nibble_value(byte)
+        .ok_or_else(|| GitError::InvalidFormat(format!("invalid pkt-line length byte {byte:#04x}")))
 }
 fn validate_protocol_error_message(message: &str) -> Result<()> {
     if message.is_empty() {

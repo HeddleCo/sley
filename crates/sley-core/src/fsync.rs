@@ -46,9 +46,8 @@ impl FsyncComponents {
     pub const DERIVED_METADATA: Self = Self(Self::PACK_METADATA.0 | Self::COMMIT_GRAPH.0);
 
     /// Upstream `FSYNC_COMPONENTS_DEFAULT`: everything except loose objects.
-    pub const DEFAULT: Self = Self(
-        (Self::OBJECTS.0 | Self::DERIVED_METADATA.0) & !Self::LOOSE_OBJECT.0,
-    );
+    pub const DEFAULT: Self =
+        Self((Self::OBJECTS.0 | Self::DERIVED_METADATA.0) & !Self::LOOSE_OBJECT.0);
 
     /// Upstream `FSYNC_COMPONENTS_COMMITTED`.
     pub const COMMITTED: Self = Self(Self::OBJECTS.0 | Self::REFERENCE.0);
@@ -261,7 +260,8 @@ impl Policy {
     /// values leave the corresponding platform default in place.
     pub fn from_values(core_fsync: Option<&str>, core_fsync_method: Option<&str>) -> Self {
         Self {
-            components: core_fsync.map_or(FsyncComponents::PLATFORM_DEFAULT, FsyncComponents::parse),
+            components: core_fsync
+                .map_or(FsyncComponents::PLATFORM_DEFAULT, FsyncComponents::parse),
             method: FsyncMethod::from_config(core_fsync_method),
             use_fsync: test_fsync_enabled(),
         }
@@ -357,7 +357,9 @@ mod tests {
         );
         assert_eq!(
             FsyncComponents::COMMITTED.bits(),
-            FsyncComponents::OBJECTS.union(FsyncComponents::REFERENCE).bits()
+            FsyncComponents::OBJECTS
+                .union(FsyncComponents::REFERENCE)
+                .bits()
         );
         assert_eq!(
             FsyncComponents::ADDED.bits(),
@@ -388,10 +390,7 @@ mod tests {
         assert!(FsyncComponents::parse("-reference,reference").contains(reference));
         // `none` resets the running base; earlier positives still apply.
         assert!(FsyncComponents::parse("reference,none").contains(reference));
-        assert!(FsyncComponents::parse(
-            "committed,-loose-object"
-        )
-        .contains(reference));
+        assert!(FsyncComponents::parse("committed,-loose-object").contains(reference));
         // Prefix matching reaches aggregate rows: upstream's strncmp scan
         // makes "pack" also select pack-metadata.
         assert!(FsyncComponents::parse("pack").contains(FsyncComponents::PACK_METADATA));

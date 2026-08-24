@@ -15,51 +15,25 @@ use std::path::{Path, PathBuf};
 
 use sley_core::{GitError, Result};
 
-use super::ownership;
-use super::{device_of, discovery_ceiling_directories, git_env_bool, is_git_dir};
+use super::{
+    RepositoryDiscoveryOptions, RepositoryDiscoverySafety, device_of, discover_repository,
+    discovery_ceiling_directories, git_env_bool, is_git_dir,
+};
 
 /// Walk-up discovery only — no `--git-dir` / `GIT_DIR` / `--bare` overrides.
 ///
 /// Used when resolving a *remote* local-path repository so local invocation
 /// overrides do not leak across the transport boundary.
 pub fn resolve_git_dir_walk_only(start: impl AsRef<Path>) -> Result<PathBuf> {
-    resolve_git_dir_by_walk(start)
-}
-
-fn resolve_git_dir_by_walk(start: impl AsRef<Path>) -> Result<PathBuf> {
-    let start = start.as_ref();
-    let ceilings = discovery_ceiling_directories();
-    let filesystem_boundary = discovery_filesystem_boundary(start);
-    for candidate in start.ancestors() {
-        if candidate != start
-            && ceilings
-                .iter()
-                .any(|ceiling| ceiling.matches_discovery_candidate(candidate))
-        {
-            break;
-        }
-        let dot_git = candidate.join(".git");
-        match probe_dot_git(&dot_git)? {
-            DotGitProbe::Repo {
-                git_dir,
-                via_gitfile,
-            } => {
-                let gitfile = via_gitfile.then_some(dot_git.as_path());
-                ownership::ensure_valid_ownership(Some(candidate), &git_dir, gitfile)?;
-                return Ok(git_dir);
-            }
-            DotGitProbe::Continue => {}
-        }
-        if candidate.join("HEAD").is_file() && candidate.join("objects").is_dir() {
-            ownership::note_implicit_bare_repository(candidate)?;
-            ownership::ensure_valid_ownership(None, candidate, None)?;
-            return Ok(candidate.to_path_buf());
-        }
-        if candidate.parent() == filesystem_boundary.as_deref() {
-            break;
-        }
-    }
-    Err(GitError::repository_not_found("not a git repository"))
+    let mut options = RepositoryDiscoveryOptions::ancestors();
+    options.across_filesystem = git_env_bool("GIT_DISCOVERY_ACROSS_FILESYSTEM");
+    options.respect_ceiling_directories = true;
+    options.strict_gitfile_errors = true;
+    options.safety = RepositoryDiscoverySafety {
+        safe_directory: true,
+        safe_bare_repository: true,
+    };
+    discover_repository(start, options).map(super::DiscoveredRepository::into_git_dir)
 }
 
 /// The parent which upward discovery must not enter because it is on another
@@ -90,12 +64,12 @@ pub fn discovery_filesystem_boundary(start: &Path) -> Option<PathBuf> {
     None
 }
 
-enum DotGitProbe {
+pub(super) enum DotGitProbe {
     Repo { git_dir: PathBuf, via_gitfile: bool },
     Continue,
 }
 
-fn probe_dot_git(dot_git: &Path) -> Result<DotGitProbe> {
+pub(super) fn probe_dot_git(dot_git: &Path) -> Result<DotGitProbe> {
     let metadata = match fs::metadata(dot_git) {
         Ok(metadata) => metadata,
         Err(err) => {

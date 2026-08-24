@@ -717,6 +717,7 @@ pub(crate) fn for_each_ref_core_with_config(
             &format_spec,
             &format_context,
             &is_base_refs,
+            FOR_EACH_REF_RENDER_HOOKS,
         )?;
         if !omit_empty || !line.is_empty() {
             stdout.write_all(&line)?;
@@ -901,12 +902,171 @@ fn for_each_ref_validate_describe(format_spec: &ForEachRefFormat) -> Result<()> 
         let ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw(placeholder)) = segment else {
             continue;
         };
-        if let Some((_peeled, opts)) = crate::for_each_ref_describe_atom(placeholder) {
-            crate::for_each_ref_parse_describe_opts(opts)?;
+        if let Some((_peeled, opts)) = for_each_ref_describe_atom(placeholder) {
+            for_each_ref_parse_describe_opts(opts)?;
         }
     }
     Ok(())
 }
+
+// --- render hooks: the CLI side of the sley-ref-filter sink boundary ---
+//
+// `sley-pretty` depends on `sley-ref-filter`, so the trailers/describe option
+// grammars cannot move into ref-filter without a dependency cycle. The option
+// parsing stays here; only rendering is delegated through
+// `ForEachRefRenderHooks`, held as one shared static by every for-each-ref
+// consumer (for-each-ref, refs list, branch list, tag).
+
+/// Recognize the `%(describe)` family. Returns `(peeled, opts)` where `peeled`
+/// is set for the deref form `%(*describe…)` and `opts` is whatever follows the
+/// colon (empty when there is none). Returns `None` for non-describe atoms.
+fn for_each_ref_describe_atom(placeholder: &str) -> Option<(bool, &str)> {
+    let (peeled, rest) = match placeholder.strip_prefix('*') {
+        Some(rest) => (true, rest),
+        None => (false, placeholder),
+    };
+    if rest == "describe" {
+        Some((peeled, ""))
+    } else {
+        rest.strip_prefix("describe:").map(|opts| (peeled, opts))
+    }
+}
+
+/// Parse `%(describe:opts)` like git's `describe_atom_parser`: walk the
+/// comma-separated options, and on the first unrecognized token report
+/// `unrecognized %(describe) argument: <bad-token-through-end>` (git keeps the
+/// rest of the string, not just the offending token).
+pub(crate) fn for_each_ref_parse_describe_opts(opts: &str) -> Result<sley_pretty::DescribeSpec> {
+    let mut spec = sley_pretty::DescribeSpec::default();
+    let mut rest = opts;
+    while !rest.is_empty() {
+        let (part, next) = match rest.split_once(',') {
+            Some((part, next)) => (part, next),
+            None => (rest, ""),
+        };
+        if part == "tags" {
+            spec.tags = true;
+        } else if let Some(value) = part.strip_prefix("abbrev=") {
+            match value.parse::<usize>() {
+                Ok(width) => spec.abbrev = Some(width),
+                Err(_) => return Err(for_each_ref_bad_describe_arg(rest)),
+            }
+        } else if let Some(value) = part.strip_prefix("match=") {
+            spec.matches.push(value.to_string());
+        } else if let Some(value) = part.strip_prefix("exclude=") {
+            spec.excludes.push(value.to_string());
+        } else {
+            return Err(for_each_ref_bad_describe_arg(rest));
+        }
+        rest = next;
+    }
+    Ok(spec)
+}
+
+fn for_each_ref_bad_describe_arg(bad: &str) -> GitError {
+    eprintln!("fatal: unrecognized %(describe) argument: {bad}");
+    GitError::Exit(128)
+}
+
+/// Trailers hook: render `%(trailers[:opts])` / `%(contents:trailers[:opts])`
+/// (with optional `*` peel), or return `None` for non-trailers placeholders.
+/// Returns `Some(Err(_))` after reporting a bad-argument diagnostic.
+fn for_each_ref_render_trailers(
+    stdout: &mut Vec<u8>,
+    placeholder: &str,
+    context: &ForEachRefFormatContext<'_>,
+) -> Option<Result<()>> {
+    let (base, peeled) = placeholder
+        .strip_prefix('*')
+        .map(|rest| (rest, true))
+        .unwrap_or((placeholder, false));
+
+    // Accept `trailers`, `trailers:ARG`, `contents:trailers`,
+    // `contents:trailers:ARG`. The `contents:` prefix shares git's
+    // `%(contents)` bad-argument error for `contents:trailersXXX`.
+    let arg: Option<&str> = if base == "trailers" {
+        None
+    } else if let Some(rest) = base.strip_prefix("trailers:") {
+        Some(rest)
+    } else {
+        let rest = base.strip_prefix("contents:")?;
+        if rest == "trailers" {
+            None
+        } else {
+            let rest = rest.strip_prefix("trailers:")?;
+            Some(rest)
+        }
+    };
+
+    let options = match arg {
+        None => sley_pretty::ForEachRefTrailerOptions::default(),
+        Some(arg) => match sley_pretty::parse_for_each_ref_trailer_options(arg) {
+            Ok(options) => options,
+            Err(None) => {
+                eprintln!("fatal: expected %(trailers:key=<value>)");
+                return Some(Err(GitError::Exit(128)));
+            }
+            Err(Some(invalid)) => {
+                eprintln!("fatal: unknown %(trailers) argument: {invalid}");
+                return Some(Err(GitError::Exit(128)));
+            }
+        },
+    };
+
+    Some((|| -> Result<()> {
+        if let Some(message) = for_each_ref_message(context, peeled) {
+            // git formats trailers over the message from the subject start to
+            // the signature start (sig stripped).
+            let parts = for_each_ref_message_parts(message);
+            let sig_len = parts.signature.len();
+            let trailer_src = &parts.bare[..parts.bare.len().saturating_sub(sig_len)];
+            let rendered = sley_pretty::format_trailers_from_commit(trailer_src, &options);
+            stdout.write_all(&rendered)?;
+        }
+        Ok(())
+    })())
+}
+
+/// Describe hook: render the `%(describe...)` family with the shared describe
+/// engine (`Ok(false)` falls through to the remaining dispatch arms); git
+/// treats describe failures as an empty placeholder.
+fn for_each_ref_render_describe(
+    stdout: &mut Vec<u8>,
+    placeholder: &str,
+    context: &ForEachRefFormatContext<'_>,
+) -> Result<bool> {
+    let Some((peeled, opts)) = for_each_ref_describe_atom(placeholder) else {
+        return Ok(false);
+    };
+    let spec = for_each_ref_parse_describe_opts(opts)?;
+    let target = if peeled {
+        context.peeled_object.as_ref().map(|object| object.oid)
+    } else {
+        Some(*context.oid)
+    };
+    if let Some(target) = target
+        && let Some(text) = crate::commands::describe::describe_for_format(
+            context.git_dir,
+            context.format,
+            context.db,
+            &target,
+            spec.tags,
+            spec.abbrev,
+            &spec.matches,
+            &spec.excludes,
+        )?
+    {
+        stdout.write_all(text.as_bytes())?;
+    }
+    Ok(true)
+}
+
+/// One shared hook table for every for-each-ref format renderer call site.
+pub(crate) static FOR_EACH_REF_RENDER_HOOKS: ForEachRefRenderHooks<'static> =
+    ForEachRefRenderHooks {
+        trailers_formatter: &for_each_ref_render_trailers,
+        describe_renderer: &for_each_ref_render_describe,
+    };
 
 fn for_each_ref_resolve_revision(
     git_dir: &Path,

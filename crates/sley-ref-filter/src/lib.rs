@@ -13,8 +13,9 @@ use std::collections::HashMap;
 use std::io::Write;
 
 mod atoms;
-mod context;
 mod contents;
+mod context;
+mod render;
 mod repo;
 mod sort;
 mod tracking;
@@ -27,19 +28,23 @@ pub use atoms::{
     for_each_ref_typed_identity, for_each_ref_typed_refname, for_each_ref_write_email,
     setup_for_each_ref_email_options, write_for_each_ref_signature, write_for_each_ref_typed_atom,
 };
-pub use context::{
-    ForEachRefFormatContext, ForEachRefMailmapRewrite, ForEachRefSignatureVerification,
-};
 pub use contents::{
     ForEachRefContents, ForEachRefPeeledObject, for_each_ref_contents,
     for_each_ref_validate_tag_pointer, write_for_each_ref_contents_lines,
+};
+pub use context::{
+    ForEachRefFormatContext, ForEachRefMailmapRewrite, ForEachRefSignatureVerification,
+};
+pub use render::{
+    ForEachRefDescribeRenderer, ForEachRefRenderHooks, ForEachRefTrailersFormatter,
+    print_for_each_ref_format, print_for_each_ref_format_with_is_bases,
 };
 pub use repo::{
     for_each_ref_loose_object_disk_size, for_each_ref_worktree_path, for_each_ref_worktree_paths,
 };
 pub use sort::{
-    ForEachRefDateSortField, ForEachRefIdentityPart, ForEachRefIdentitySortField,
-    ForEachRefIdentitySource, ForEachRefIdentityRole, for_each_ref_sort_date_key,
+    ForEachRefDateSortField, ForEachRefIdentityPart, ForEachRefIdentityRole,
+    ForEachRefIdentitySortField, ForEachRefIdentitySource, for_each_ref_sort_date_key,
     for_each_ref_sort_identity_key, parse_for_each_ref_identity_sort,
 };
 pub use tracking::{
@@ -1562,7 +1567,6 @@ mod tests {
             for_each_ref_copy_subject("héllo\r\nwörld\né".as_bytes()),
             "héllo wörld é"
         );
-
 
         // "日本語テスト" renders in 12 terminal columns but occupies 18 bytes;
         // git's strbuf_utf8_align pads to the column width (oracle:

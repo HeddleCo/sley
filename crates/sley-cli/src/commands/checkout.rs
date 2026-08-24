@@ -1050,7 +1050,12 @@ pub(crate) fn cmd_checkout(
     };
     let branch = checkout_message.branch();
 
-    let config = read_repo_config(git_dir)?;
+    // Effective cascade (system+global+repo+config.worktree+`-c`), like the
+    // switch path and `reset --keep`: the branch-reset engine below consults
+    // `filter.<driver>.smudge` (checkout filters) and `submodule.active`, so a
+    // repo-only read would silently drop settings inherited from the global
+    // config or `$GIT_DIR/config.worktree` on `checkout -B`.
+    let config = commands::remote::read_effective_repo_config(git_dir, cwd)?;
     let branch_ref = branch_ref_name(branch)?;
     let checkout_reflog_from = checkout_reflog_from_name(store);
     if !ignore_other_worktrees
@@ -1099,6 +1104,7 @@ pub(crate) fn cmd_checkout(
                 worktree_root,
                 format,
                 db,
+                &config,
                 Some(&old_tree),
                 &target_tree,
                 commands::read_tree::UnpackPorcelain::Checkout,
@@ -2589,6 +2595,7 @@ fn checkout_twoway_dirty(
         worktree_root,
         format,
         db,
+        &context.config,
         old_tree.as_ref(),
         &target_tree,
         commands::read_tree::UnpackPorcelain::Checkout,

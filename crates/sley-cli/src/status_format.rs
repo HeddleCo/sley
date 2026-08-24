@@ -6,8 +6,8 @@
 
 use std::io::Write;
 
-use sley::plumbing::sley_formats::{quoted_path, write_quoted_path};
 use sley::Result;
+use sley::plumbing::sley_formats::{quoted_path, write_quoted_path};
 
 pub(crate) fn status_quote_path(path: &[u8], quote_space: bool) -> String {
     status_quote_path_full(path, quote_space, true)

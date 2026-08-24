@@ -1,32 +1,18 @@
 use super::*;
 use sley::plumbing::{sley_refs, sley_rev};
 
+// Stage-B1 relocation: canonical implementations live in
+// `sley_sequencer::apply`; these shims keep the historical paths.
 pub(crate) fn commit_tree_oid(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     commit_oid: &ObjectId,
 ) -> Result<ObjectId> {
-    let object = db.read_object(commit_oid)?;
-    if object.object_type != ObjectType::Commit {
-        return Err(GitError::InvalidObject(format!(
-            "expected commit {commit_oid}, found {}",
-            object.object_type.as_str()
-        )));
-    }
-    Ok(Commit::parse_ref(format, &object.body)?.tree)
+    sley_sequencer::apply::commit_tree_oid(db, format, commit_oid)
 }
 
-// ===== cherry-pick / revert (single-commit 3-way replay) =====
-
 pub(crate) fn head_commit_oid(refs: &FileRefStore) -> Result<Option<ObjectId>> {
-    match refs.read_ref("HEAD")? {
-        Some(RefTarget::Symbolic(branch)) => match refs.read_ref(&branch)? {
-            Some(RefTarget::Direct(oid)) => Ok(Some(oid)),
-            _ => Ok(None),
-        },
-        Some(RefTarget::Direct(oid)) => Ok(Some(oid)),
-        None => Ok(None),
-    }
+    sley_sequencer::apply::head_commit_oid(refs)
 }
 
 pub(crate) fn cmd_merge_base(

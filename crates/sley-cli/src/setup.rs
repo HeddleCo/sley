@@ -19,7 +19,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-pub(crate) use crate::sley_worktree::discovery::setup::{setup_git_directory, SetupResult};
+pub(crate) use crate::sley_worktree::discovery::setup::{SetupResult, setup_git_directory};
 
 use crate::git_env_bool;
 

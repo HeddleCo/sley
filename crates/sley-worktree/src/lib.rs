@@ -8,8 +8,7 @@
 
 use sley_config::GitConfig;
 use sley_core::{
-    BString, GitError, MissingObjectContext, MissingObjectKind, ObjectFormat, ObjectId,
-    Result,
+    BString, GitError, MissingObjectContext, MissingObjectKind, ObjectFormat, ObjectId, Result,
 };
 use sley_index::{
     BorrowedIndex, CacheTree, Index, IndexEntry, IndexEntryRef, SPARSE_DIR_MODE, SplitIndexLink,
@@ -50,12 +49,15 @@ mod read_tree;
 mod status;
 mod status_plan;
 mod types_admin;
+mod unpack_worktree;
 
 // Environment-respecting repository discovery, shared with the facade setup
 // path and the hook engine (see the `discovery` module docs).
 pub use discovery::{
-    discover_git_dir_respecting_environment, environment_git_dir, environment_work_tree,
-    is_git_dir, read_gitdir_link, resolve_explicit_git_dir, resolve_path_from_cwd,
+    DiscoveredRepository, RepositoryDiscoveryMode, RepositoryDiscoveryOptions,
+    RepositoryDiscoverySafety, discover_git_dir_respecting_environment, discover_repository,
+    environment_git_dir, environment_work_tree, is_git_dir, read_gitdir_link,
+    resolve_exact_git_dir, resolve_explicit_git_dir, resolve_path_from_cwd,
 };
 // Consolidated setup/ownership engine (git's `setup_git_directory_gently` and
 // `ensure_valid_ownership`), shared by the CLI layer and embedders.
@@ -64,8 +66,8 @@ pub use discovery::probes::{
     discovery_filesystem_boundary, paths_refer_to_same_dir, resolve_git_dir_walk_only,
 };
 pub use discovery::setup::{
-    effective_worktree_for_git_dir, invocation_git_dir, optional_worktree_from_config,
-    setup_git_directory, SetupEnvironment, SetupResult, WorktreePolicy,
+    SetupEnvironment, SetupResult, WorktreePolicy, effective_worktree_for_git_dir,
+    invocation_git_dir, optional_worktree_from_config, setup_git_directory,
 };
 
 // `attributes` and `index_io` hold only crate-internal helpers (no `pub`
@@ -83,6 +85,17 @@ pub use read_tree::*;
 pub use status::*;
 pub use status_plan::*;
 pub use types_admin::*;
+// `unpack_worktree` is re-exported explicitly (not via glob) because several of
+// its internal helpers intentionally keep module-private names that would
+// otherwise collide with the crate-wide prelude.
+pub use unpack_worktree::{
+    ReadTreeWorktree, SubmoduleCheckoutHook, SubmoduleHooks, SubmoduleRemoveHook, UnpackPorcelain,
+    checkout_two_way_engine, gitlink_should_recurse, load_superproject_submodules,
+    prune_empty_dirs, refuse_if_unpack_entries_turn_cwd_into_file,
+    refuse_if_unpack_result_removes_current_directory, remove_path_in_the_way,
+    remove_worktree_path, safe_worktree_path, verify_uptodate_path, write_tree_entry_to_worktree,
+    write_tree_entry_to_worktree_with_hooks,
+};
 
 #[cfg(test)]
 mod tests {

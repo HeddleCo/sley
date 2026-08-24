@@ -82,11 +82,7 @@ fn assert_envsubst_matches_oracle(args: &[&str], stdin_text: &str, env: &[(&str,
 fn sh_i18n_envsubst_multibyte_passthrough_matches_upstream_git() {
     let translated = "ja:日本語 de:éö Börde $WHO 😀 end\n";
     let format = "$WHO";
-    assert_envsubst_matches_oracle(
-        &[format],
-        translated,
-        &[("WHO", "wörld"), ("HOME", "/tmp")],
-    );
+    assert_envsubst_matches_oracle(&[format], translated, &[("WHO", "wörld"), ("HOME", "/tmp")]);
     // Same template with a variable-free format filter passes everything through.
     assert_envsubst_matches_oracle(
         &["ja:$IGNORED"],
@@ -94,20 +90,12 @@ fn sh_i18n_envsubst_multibyte_passthrough_matches_upstream_git() {
         &[("WHO", "x"), ("IGNORED", "y")],
     );
     // Braced form substitutes identically to upstream.
-    assert_envsubst_matches_oracle(
-        &[],
-        "日本 ${WHO} é",
-        &[],
-    );
+    assert_envsubst_matches_oracle(&[], "日本 ${WHO} é", &[]);
 }
 
 #[test]
 fn sh_i18n_envsubst_variables_listing_matches_upstream_git() {
-    assert_envsubst_matches_oracle(
-        &["--variables"],
-        "a $one ${two_2} 日本 $one $9 $_ok",
-        &[],
-    );
+    assert_envsubst_matches_oracle(&["--variables"], "a $one ${two_2} 日本 $one $9 $_ok", &[]);
 }
 
 /// Upstream's argc arms all end in success; malformed invocations only print an

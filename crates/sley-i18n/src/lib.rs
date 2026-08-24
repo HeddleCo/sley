@@ -883,8 +883,14 @@ mod tests {
             "ja:\u{65e5}\u{672c}\u{8a9e} de:\u{e9}\u{f6} B\u{f6}rde \u{1F600} 42 end"
         );
         // Unsubstituted multibyte text (no format variables at all) round-trips.
-        assert_eq!(envsubst("\u{65e5}\u{672c}$x", "", |_| None), "\u{65e5}\u{672c}$x");
-        assert_eq!(envsubst("$\u{e9} $\u{65e5}", "$\u{e9}", |_| None), "$\u{e9} $\u{65e5}");
+        assert_eq!(
+            envsubst("\u{65e5}\u{672c}$x", "", |_| None),
+            "\u{65e5}\u{672c}$x"
+        );
+        assert_eq!(
+            envsubst("$\u{e9} $\u{65e5}", "$\u{e9}", |_| None),
+            "$\u{e9} $\u{65e5}"
+        );
     }
 
     #[test]

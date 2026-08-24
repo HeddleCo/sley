@@ -1,4 +1,86 @@
 // Auto-generated from upstream git Documentation/*.adoc synopses
+//
+// Single source of usage truth for `-h` / `--help-all` output. Plain
+// parse-options-free synopses live in SYNOPSES below; commands whose usage is
+// generated from an option table (legacy credential pages with no modern
+// `[synopsis]` block) live in COMMAND_USAGE_OVERRIDES and are rendered through
+// the same option-table machinery as migrated commands.
+
+use sley_options::{OptFlags, OptValue, OptionSpec, usage_with_options};
+
+/// Command help that cannot be generated from Documentation's modern
+/// `[synopsis]`/`[verse]` blocks. These legacy credential pages describe helper
+/// configuration rather than the builtins' parse-options usage, so keep Git's
+/// actual command metadata explicitly and render it through the same option
+/// table machinery as migrated commands.
+struct CommandUsageSpec<'a> {
+    command: &'a str,
+    usage: &'a [&'a str],
+    options: &'a [OptionSpec<'a>],
+}
+
+const CREDENTIAL_CACHE_OPTIONS: &[OptionSpec<'static>] = &[
+    OptionSpec {
+        short: None,
+        long: Some("timeout"),
+        value: OptValue::Str("n"),
+        flags: OptFlags::NONE,
+        help: "number of seconds to cache credentials",
+    },
+    OptionSpec {
+        short: None,
+        long: Some("socket"),
+        value: OptValue::Str("path"),
+        flags: OptFlags::NONE,
+        help: "path of cache-daemon socket",
+    },
+];
+
+const CREDENTIAL_STORE_OPTIONS: &[OptionSpec<'static>] = &[OptionSpec {
+    short: None,
+    long: Some("file"),
+    value: OptValue::Str("path"),
+    flags: OptFlags::NONE,
+    help: "fetch and store credentials in <path>",
+}];
+
+const COMMAND_USAGE_OVERRIDES: &[CommandUsageSpec<'static>] = &[
+    CommandUsageSpec {
+        command: "credential",
+        usage: &["git credential (fill|approve|reject)"],
+        options: &[],
+    },
+    CommandUsageSpec {
+        command: "credential-cache",
+        usage: &["git credential-cache [<options>] <action>"],
+        options: CREDENTIAL_CACHE_OPTIONS,
+    },
+    CommandUsageSpec {
+        command: "credential-store",
+        usage: &["git credential-store [<options>] <action>"],
+        options: CREDENTIAL_STORE_OPTIONS,
+    },
+];
+
+pub(crate) fn command_usage_override(command: &str) -> Option<String> {
+    let spec = COMMAND_USAGE_OVERRIDES
+        .iter()
+        .find(|spec| spec.command == command)?;
+    if !spec.options.is_empty() {
+        return Some(usage_with_options(spec.options, spec.usage));
+    }
+    let mut out = String::new();
+    for (index, line) in spec.usage.iter().enumerate() {
+        if index == 0 {
+            out.push_str("usage: ");
+        } else {
+            out.push_str("   or: ");
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
+}
 
 static SYNOPSES: &[(&str, &[&str])] = &[
     (
@@ -1110,6 +1192,16 @@ pub(crate) fn synopsis_for(command: &str) -> Option<&'static [&'static str]> {
         .iter()
         .find(|(name, _)| *name == command)
         .map(|(_, lines)| *lines)
+}
+
+/// Print the usage block for `command`, preferring an explicit override spec
+/// and falling back to the Documentation synopsis table.
+pub(crate) fn print_command_usage(command: &str) {
+    if let Some(usage) = command_usage_override(command) {
+        print!("{usage}");
+        return;
+    }
+    print_command_synopsis(command);
 }
 
 /// Print the `-h` usage synopsis for `command`, matching upstream's

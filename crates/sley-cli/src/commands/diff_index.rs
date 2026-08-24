@@ -690,7 +690,7 @@ fn render(
                 line_ranges: None,
                 indent_heuristic: ctx.indent_heuristic,
                 big_file_threshold: crate::diff_big_file_threshold(ctx.db),
-                submodule_render: crate::cli_submodule_render()
+                submodule_render: crate::cli_submodule_render(),
             };
             write_diff_patch_entry(&mut stdout, entry, options)?;
         }

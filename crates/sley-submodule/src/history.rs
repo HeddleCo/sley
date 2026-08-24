@@ -33,7 +33,8 @@ pub fn new_gitlink_oid(
         Some(oid) => Some(oid),
         None => match (use_worktree, worktree_root) {
             (true, Some(root)) => {
-                let sub_root = root.join(sley_diff_merge::porcelain::repo_path_to_path(&entry.path));
+                let sub_root =
+                    root.join(sley_diff_merge::porcelain::repo_path_to_path(&entry.path));
                 sley_diff_merge::gitlink_head_oid(&sub_root, db.object_format()).or(entry.old_oid)
             }
             _ => entry.old_oid,

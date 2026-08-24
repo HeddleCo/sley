@@ -15,8 +15,8 @@ pub mod fetch_profile;
 
 pub use cancel::{
     AtomicCancel, CancelFlag, CancellableRead, DynCancelFlag, OperationCancelled, StreamControl,
-    cancelled_io_error, is_cancelled_error, is_cancelled_io,
-    kill_child_if_cancelled, map_cancel_io,
+    cancelled_io_error, is_cancelled_error, is_cancelled_io, kill_child_if_cancelled,
+    map_cancel_io,
 };
 
 pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.55.0";
@@ -26,18 +26,17 @@ pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.55.0";
 /// plus a final direct ref and reports a dangling/looped ref at five hops.
 pub const MAX_SYMREF_DEPTH: usize = 5;
 
-pub mod precompose;
-pub mod date;
 pub mod atomic;
+pub mod date;
 pub mod fsync;
 pub mod paths;
+pub mod precompose;
 pub mod primitives;
 pub mod text;
 pub use precompose::{
     activate_precompose_unicode, has_non_ascii, precompose_argv_if_needed,
-    precompose_bytes_if_needed, precompose_os_str_bytes_if_needed,
-    precompose_path_if_needed, precompose_string_if_needed, precompose_unicode_enabled,
-    set_precompose_unicode,
+    precompose_bytes_if_needed, precompose_os_str_bytes_if_needed, precompose_path_if_needed,
+    precompose_string_if_needed, precompose_unicode_enabled, set_precompose_unicode,
 };
 
 pub mod namespace;
@@ -1972,8 +1971,7 @@ impl GitError {
             Self::Cancelled => true,
             Self::Io(message) => message.contains("cancelled"),
             Self::IoKind { kind, message } => {
-                matches!(kind, std::io::ErrorKind::Interrupted)
-                    || message.contains("cancelled")
+                matches!(kind, std::io::ErrorKind::Interrupted) || message.contains("cancelled")
             }
             _ => false,
         }
@@ -1991,7 +1989,10 @@ impl From<std::io::Error> for GitError {
         // Typed payloads installed across io boundaries (e.g. sideband demux
         // surfacing `SidebandFatal`/`InvalidFormat` as `io::Error`) survive
         // this conversion unchanged.
-        if let Some(inner) = value.get_ref().and_then(|err| err.downcast_ref::<GitError>()) {
+        if let Some(inner) = value
+            .get_ref()
+            .and_then(|err| err.downcast_ref::<GitError>())
+        {
             return inner.clone();
         }
         Self::IoKind {
@@ -2488,9 +2489,11 @@ mod tests {
     #[test]
     fn is_cancelled_covers_structured_and_legacy_shapes() {
         assert!(GitError::Cancelled.is_cancelled());
-        let interrupted =
-            GitError::from(std::io::Error::new(ErrorKind::Interrupted, "wake-up"));
-        assert!(interrupted.is_cancelled(), "Interrupted kind is cancel-flavored");
+        let interrupted = GitError::from(std::io::Error::new(ErrorKind::Interrupted, "wake-up"));
+        assert!(
+            interrupted.is_cancelled(),
+            "Interrupted kind is cancel-flavored"
+        );
         assert!(GitError::Io("operation cancelled".into()).is_cancelled());
         assert!(!GitError::from(std::io::Error::other("disk full")).is_cancelled());
         assert_eq!(
@@ -2511,7 +2514,10 @@ mod tests {
             ErrorKind::InvalidData,
             GitError::SidebandFatal("boom".into()),
         );
-        assert_eq!(GitError::from(wrapped), GitError::SidebandFatal("boom".into()));
+        assert_eq!(
+            GitError::from(wrapped),
+            GitError::SidebandFatal("boom".into())
+        );
     }
 
     #[test]

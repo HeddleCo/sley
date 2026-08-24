@@ -94,12 +94,12 @@ jobs:
             sley-unpack-trees
             sley-worktree
             sley-hooks
-            sley-sequencer
-            sley-notes
             sley-protocol
             sley-strbuf-expand
             sley-ref-filter
             sley-pretty
+            sley-sequencer
+            sley-notes
             sley-fsck
             sley-transport
             sley-remote

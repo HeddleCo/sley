@@ -1366,7 +1366,12 @@ pub(super) fn print_branch_format_reference(
         warn_ambiguous_refs,
     };
     let mut line = Vec::new();
-    print_for_each_ref_format(&mut line, format_spec, &context)?;
+    print_for_each_ref_format(
+        &mut line,
+        format_spec,
+        &context,
+        super::super::for_each_ref::FOR_EACH_REF_RENDER_HOOKS,
+    )?;
     if omit_empty && line.is_empty() {
         return Ok(());
     }

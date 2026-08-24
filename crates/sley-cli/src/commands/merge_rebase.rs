@@ -29,16 +29,13 @@ pub(crate) use merge_base::{
 };
 pub(crate) use merge_util::{
     MergePathResult, MergePathResults, MergeTreeMap, RenameMergeConfig, clear_merge_df_blockers,
-    merge_conflict_style_from_config, merge_favor_from_strategy_opt,
-    merge_favor_from_strategy_opts, merge_index_entry, merge_read_blob,
-    merge_refuse_if_current_working_directory_becomes_file, merge_remove_worktree_file,
-    merge_worktree_content, merge_write_worktree_file, three_way_merge_trees,
-    three_way_merge_trees_inner_with_info,
+    merge_conflict_style_from_config, merge_favor_from_strategy_opt, merge_index_entry,
+    merge_read_blob, merge_refuse_if_current_working_directory_becomes_file,
+    merge_remove_worktree_file, merge_worktree_content, merge_write_worktree_file,
+    three_way_merge_trees, three_way_merge_trees_inner_with_info,
     three_way_merge_trees_inner_with_info_opts_and_path_favor,
-    three_way_merge_trees_inner_with_info_opts_and_path_resolvers,
     three_way_merge_trees_outcome_with_info_opts_and_path_resolvers, three_way_merge_trees_styled,
-    three_way_merge_trees_styled_with_strategy_options, three_way_merge_trees_with_favor,
-    virtual_ancestor_entry_map, worktree_file_matches_ours,
+    three_way_merge_trees_with_favor, virtual_ancestor_entry_map, worktree_file_matches_ours,
 };
 pub(crate) use pull::{
     cmd_pull, fetch_head_merge_record, read_commit_tree, resolve_fetch_head_revision,

@@ -2988,7 +2988,10 @@ fn map_push_sideband_stream_io_error(err: std::io::Error) -> GitError {
     if sley_core::is_cancelled_io(&err) {
         return GitError::Cancelled;
     }
-    if let Some(inner) = err.get_ref().and_then(|inner| inner.downcast_ref::<GitError>()) {
+    if let Some(inner) = err
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<GitError>())
+    {
         return inner.clone();
     }
     GitError::from(err)

@@ -12,8 +12,10 @@ use sley_config::remotes::{
     remote_config_values, remote_exists, resolve_remote_fetch_url, resolve_remote_push_url,
 };
 use sley_core::{GitError, Result};
-use sley_odb::repository_common_dir;
 use sley_transport::{RemoteTransport, RemoteUrl, parse_remote_url};
+use sley_worktree::discovery::{
+    DiscoveredRepository, RepositoryDiscoveryOptions, discover_repository,
+};
 
 use crate::{FetchSource, PushDestination, RemoteTransportKind};
 
@@ -225,10 +227,11 @@ fn source_from_parsed(parsed: &RemoteUrl, relative_base: &Path) -> Result<Concre
         | RemoteTransport::Git => Ok(ConcreteRemote::Network(parsed.clone())),
         RemoteTransport::Local | RemoteTransport::File => {
             let repo_path = local_repository_path(parsed, relative_base)?;
-            let git_dir = discover_git_dir(&repo_path)?;
+            let found = discover_git_dir(&repo_path)?;
+            let common_git_dir = found.common_dir().to_path_buf();
             Ok(ConcreteRemote::Local {
-                common_git_dir: repository_common_dir(&git_dir),
-                git_dir,
+                common_git_dir,
+                git_dir: found.into_git_dir(),
             })
         }
     }
@@ -319,31 +322,8 @@ fn local_repository_path_from_url(repository: &str, cwd: &Path) -> Result<PathBu
 }
 
 pub fn discover_local_git_dir(path: &Path) -> Result<PathBuf> {
-    let dot_git_path = path_with_dot_git_suffix(path);
-    let candidates = [
-        path.join(".git"),
-        path.to_path_buf(),
-        dot_git_path.join(".git"),
-        dot_git_path,
-    ];
-    for candidate in candidates {
-        if is_git_dir(&candidate) {
-            return Ok(candidate);
-        }
-        if candidate.is_file()
-            && let Some(git_dir) = read_gitdir_link(&candidate)?
-            && is_git_dir(&git_dir)
-        {
-            return std::fs::canonicalize(git_dir).map_err(|err| GitError::Io(err.to_string()));
-        }
-    }
-    Err(GitError::repository_not_found("not a git repository"))
-}
-
-fn path_with_dot_git_suffix(path: &Path) -> PathBuf {
-    let mut suffixed = path.as_os_str().to_os_string();
-    suffixed.push(".git");
-    PathBuf::from(suffixed)
+    discover_repository(path, RepositoryDiscoveryOptions::local_remote())
+        .map(sley_worktree::discovery::DiscoveredRepository::into_git_dir)
 }
 
 fn percent_decode_url_path(value: &str) -> Result<String> {
@@ -354,44 +334,10 @@ fn percent_decode_url_path(value: &str) -> Result<String> {
 }
 
 /// Discover the git directory containing `start` (working tree or bare repo).
-fn discover_git_dir(start: &Path) -> Result<PathBuf> {
-    for candidate in start.ancestors() {
-        let dot_git = candidate.join(".git");
-        if dot_git.is_dir() {
-            return Ok(dot_git);
-        }
-        if dot_git.is_file()
-            && let Some(git_dir) = read_gitdir_link(&dot_git)?
-            && is_git_dir(&git_dir)
-        {
-            return Ok(git_dir);
-        }
-        if is_git_dir(candidate) {
-            return Ok(candidate.to_path_buf());
-        }
-    }
-    Err(GitError::repository_not_found(format!(
-        "not a git repository: {}",
-        start.display()
-    )))
-}
-
-fn is_git_dir(path: &Path) -> bool {
-    path.join("HEAD").is_file()
-        && (path.join("objects").is_dir() || path.join("commondir").is_file())
-}
-
-fn read_gitdir_link(path: &Path) -> Result<Option<PathBuf>> {
-    let contents = std::fs::read_to_string(path)?;
-    let Some(target) = contents.trim().strip_prefix("gitdir:") else {
-        return Ok(None);
-    };
-    let target = PathBuf::from(target.trim());
-    Ok(Some(if target.is_absolute() {
-        target
-    } else {
-        path.parent().unwrap_or_else(|| Path::new("")).join(target)
-    }))
+fn discover_git_dir(start: &Path) -> Result<DiscoveredRepository> {
+    let mut options = RepositoryDiscoveryOptions::ancestors();
+    options.across_filesystem = true;
+    discover_repository(start, options)
 }
 
 #[cfg(test)]
@@ -502,6 +448,29 @@ mod tests {
                 .expect("resolved remote")
                 .url,
             "local"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn local_remote_discovery_ignores_stale_core_worktree() {
+        let root = std::env::temp_dir().join(format!(
+            "sley-remote-stale-worktree-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let git_dir = root.join("remote.git");
+        std::fs::create_dir_all(git_dir.join("objects")).expect("objects");
+        std::fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("HEAD");
+        std::fs::write(
+            git_dir.join("config"),
+            b"[core]\n\tbare = false\n\tworktree = missing\n",
+        )
+        .expect("config");
+
+        assert_eq!(
+            discover_local_git_dir(&git_dir).expect("discover local remote"),
+            git_dir
         );
         std::fs::remove_dir_all(root).expect("cleanup");
     }

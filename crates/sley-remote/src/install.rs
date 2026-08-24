@@ -298,7 +298,8 @@ pub(crate) fn emit_remote_sideband_progress(sink: &mut dyn ProgressSink, chunk: 
     for line in text.lines() {
         sink.diagnostic(&format!("remote: {line}{suffix}"));
     }
-}fn install_upload_pack_sideband_response_from_reader_with_cancel<I, R>(
+}
+fn install_upload_pack_sideband_response_from_reader_with_cancel<I, R>(
     _format: ObjectFormat,
     reader: &mut R,
     destination: &I,
@@ -365,7 +366,10 @@ fn map_sideband_stream_io_error(err: std::io::Error) -> sley_core::GitError {
     if sley_core::is_cancelled_io(&err) {
         return sley_core::GitError::Cancelled;
     }
-    if let Some(inner) = err.get_ref().and_then(|inner| inner.downcast_ref::<sley_core::GitError>()) {
+    if let Some(inner) = err
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<sley_core::GitError>())
+    {
         return inner.clone();
     }
     sley_core::GitError::from(err)

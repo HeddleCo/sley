@@ -442,7 +442,8 @@ fn run_dir_difftool(
         let rel = repo_path_to_path(&entry.path);
         write_dir_materialized(
             &left.join(&rel),
-            diff_entry_old_content(entry, repo.objects(), crate::diff_lazy_fetch(lazy_fetch))?.as_deref(),
+            diff_entry_old_content(entry, repo.objects(), crate::diff_lazy_fetch(lazy_fetch))?
+                .as_deref(),
             entry.old_mode,
         )?;
         let right_path = right.join(&rel);
@@ -581,7 +582,10 @@ fn can_symlink_right_side(
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Ok(false);
     }
-    Ok(read_blob(repo.objects(), oid, crate::diff_lazy_fetch(lazy_fetch))? == fs::read(worktree_path)?)
+    Ok(
+        read_blob(repo.objects(), oid, crate::diff_lazy_fetch(lazy_fetch))?
+            == fs::read(worktree_path)?,
+    )
 }
 
 fn is_regular_file_mode(mode: Option<u32>) -> bool {

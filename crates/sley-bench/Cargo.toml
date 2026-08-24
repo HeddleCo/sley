@@ -60,5 +60,9 @@ harness = false
 name = "pack_write_stream"
 harness = false
 
+[[bench]]
+name = "repack_measure"
+harness = false
+
 [lints]
 workspace = true

@@ -2058,7 +2058,12 @@ fn commit_graph_origin_stack(
     let display_path = config_path
         .strip_prefix(cli_session.cwd())
         .unwrap_or(&config_path);
-    let _ = stack.push_file(display_path, sley_config::ConfigScope::Local, true, &context);
+    let _ = stack.push_file(
+        display_path,
+        sley_config::ConfigScope::Local,
+        true,
+        &context,
+    );
     if let Ok(parameters) = crate::injected_config_parameters() {
         let _ = stack.push_parameters_with_includes(&parameters, &context);
     }

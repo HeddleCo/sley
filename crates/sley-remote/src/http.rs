@@ -978,9 +978,7 @@ pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
                 &local_db,
                 request.max_input_size,
                 cancel,
-                Some(&mut |chunk: &[u8]| {
-                    emit_remote_sideband_progress(&mut *progress, chunk)
-                }),
+                Some(&mut |chunk: &[u8]| emit_remote_sideband_progress(&mut *progress, chunk)),
             )?;
         } else {
             let installer = ProgressInstaller::new(&local_db, progress);
@@ -1013,9 +1011,7 @@ pub fn install_fetch_pack_via_http_upload_pack<C: HttpClient + ?Sized>(
                 &local_db,
                 request.max_input_size,
                 cancel,
-                Some(&mut |chunk: &[u8]| {
-                    emit_remote_sideband_progress(&mut *progress, chunk)
-                }),
+                Some(&mut |chunk: &[u8]| emit_remote_sideband_progress(&mut *progress, chunk)),
             )?;
         shallow_info
     } else {
@@ -1204,9 +1200,7 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch_with_want_refs<C: HttpClien
             true,
             max_input_size,
             cancel,
-            Some(&mut |chunk: &[u8]| {
-                emit_remote_sideband_progress(&mut *progress, chunk)
-            }),
+            Some(&mut |chunk: &[u8]| emit_remote_sideband_progress(&mut *progress, chunk)),
         )?;
     } else {
         let installer = ProgressInstaller::new(&local_db, progress);

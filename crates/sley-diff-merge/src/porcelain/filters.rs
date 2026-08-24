@@ -4,8 +4,8 @@
 
 use super::content::repo_path_to_path;
 use super::options::{
-    DiffRenderOptions, LazyObjectFetch, SubmoduleDiffFormat,
-    SubmoduleIgnoreMode, parse_submodule_ignore_mode,
+    DiffRenderOptions, LazyObjectFetch, SubmoduleDiffFormat, SubmoduleIgnoreMode,
+    parse_submodule_ignore_mode,
 };
 use super::patch_entry::write_diff_patch_entry;
 use crate::{IndexGitlinkEntry, NameStatus, NameStatusEntry};
@@ -62,7 +62,10 @@ pub fn submodule_diff_config_with_config(
     repo_config: Option<&GitConfig>,
     load_repo_config: LoadRepoConfig<'_>,
 ) -> SubmoduleDiffConfig {
-    let loaded_config = repo_config.is_none().then(|| load_repo_config(git_dir)).flatten();
+    let loaded_config = repo_config
+        .is_none()
+        .then(|| load_repo_config(git_dir))
+        .flatten();
     let repo_config = repo_config.or(loaded_config.as_ref());
     let base = repo_config
         .and_then(|config| config.get("diff", None, "ignoresubmodules"))
@@ -155,9 +158,7 @@ pub fn collect_dirty_submodules(
     let gitlinks: &[IndexGitlinkEntry] = match precomputed_gitlinks {
         Some(gitlinks) => gitlinks,
         None => {
-            owned_gitlinks = source
-                .index_gitlinks(git_dir, format)?
-                .unwrap_or_default();
+            owned_gitlinks = source.index_gitlinks(git_dir, format)?.unwrap_or_default();
             &owned_gitlinks
         }
     };
@@ -336,10 +337,7 @@ pub fn apply_diff_order_file(
     Ok(entries)
 }
 
-fn diff_order_rank(
-    entry: &NameStatusEntry,
-    patterns: &[Vec<u8>],
-) -> Option<usize> {
+fn diff_order_rank(entry: &NameStatusEntry, patterns: &[Vec<u8>]) -> Option<usize> {
     patterns.iter().position(|pattern| {
         diff_order_pattern_matches(pattern, entry.path.as_bytes())
             || entry
@@ -637,4 +635,3 @@ fn diff_path_component_count(path: &[u8]) -> i64 {
         diff_path_slash_depth(path) + 1
     }
 }
-

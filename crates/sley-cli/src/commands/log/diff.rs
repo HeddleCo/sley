@@ -387,7 +387,13 @@ impl LogDiffContext<'_> {
 
         let opts = self.opts;
         let stat_entries = if opts.numstat || opts.stat || opts.compact_summary || opts.shortstat {
-            collect_diff_stat_entries(&entries, self.db, None, false, crate::diff_lazy_fetch(self.lazy_fetch))?
+            collect_diff_stat_entries(
+                &entries,
+                self.db,
+                None,
+                false,
+                crate::diff_lazy_fetch(self.lazy_fetch),
+            )?
         } else {
             Vec::new()
         };
@@ -457,42 +463,42 @@ impl LogDiffContext<'_> {
                     out,
                     entry,
                     DiffRenderOptions {
-                binary: false,
-                anchors: &[],
-                allow_textconv: true,
-                db: self.db,
-                lazy_fetch: crate::diff_lazy_fetch(self.lazy_fetch),
-                worktree_root: None,
-                use_worktree_new: false,
-                format: self.format,
-                abbrev: self.patch_abbrev,
-                src_prefix: "a/",
-                dst_prefix: "b/",
-                context: self.opts.context.unwrap_or(3),
-                userdiff: Some(self.userdiff),
-                funcname: None,
-                colors: None,
-                word_diff: word_request.as_ref(),
-                line_indicators: opts.line_indicators,
-                suppress_blank_empty: self
+                        binary: false,
+                        anchors: &[],
+                        allow_textconv: true,
+                        db: self.db,
+                        lazy_fetch: crate::diff_lazy_fetch(self.lazy_fetch),
+                        worktree_root: None,
+                        use_worktree_new: false,
+                        format: self.format,
+                        abbrev: self.patch_abbrev,
+                        src_prefix: "a/",
+                        dst_prefix: "b/",
+                        context: self.opts.context.unwrap_or(3),
+                        userdiff: Some(self.userdiff),
+                        funcname: None,
+                        colors: None,
+                        word_diff: word_request.as_ref(),
+                        line_indicators: opts.line_indicators,
+                        suppress_blank_empty: self
                             .config
                             .get_bool("diff", None, "suppressblankempty")
                             .unwrap_or(false),
-                no_index_contents: None,
-                submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
-                submodule_dirt: None,
-                ws_error: None,
-                color_moved: None,
-                interhunk: 0,
-                ws_ignore: self.opts.ws_ignore,
-                diff_algorithm: self.opts.diff_algorithm,
-                ignore_blank_lines: self.opts.ignore_blank_lines,
-                ignore_regexes: &self.opts.ignore_regexes,
-                line_ranges: None,
-                indent_heuristic: self.opts.indent_heuristic,
-                big_file_threshold: crate::diff_big_file_threshold(self.db),
-                submodule_render: crate::cli_submodule_render()
-            },
+                        no_index_contents: None,
+                        submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+                        submodule_dirt: None,
+                        ws_error: None,
+                        color_moved: None,
+                        interhunk: 0,
+                        ws_ignore: self.opts.ws_ignore,
+                        diff_algorithm: self.opts.diff_algorithm,
+                        ignore_blank_lines: self.opts.ignore_blank_lines,
+                        ignore_regexes: &self.opts.ignore_regexes,
+                        line_ranges: None,
+                        indent_heuristic: self.opts.indent_heuristic,
+                        big_file_threshold: crate::diff_big_file_threshold(self.db),
+                        submodule_render: crate::cli_submodule_render(),
+                    },
                 )?;
             }
         }
@@ -642,42 +648,42 @@ impl LogDiffContext<'_> {
                     &mut file_out,
                     entry,
                     DiffRenderOptions {
-                binary: false,
-                anchors: &[],
-                allow_textconv: true,
-                db: self.db,
-                lazy_fetch: crate::diff_lazy_fetch(self.lazy_fetch),
-                worktree_root: None,
-                use_worktree_new: false,
-                format: self.format,
-                abbrev: self.patch_abbrev,
-                src_prefix: "a/",
-                dst_prefix: "b/",
-                context: self.opts.context.unwrap_or(3),
-                userdiff: Some(self.userdiff),
-                funcname: None,
-                colors: None,
-                word_diff: word_request.as_ref(),
-                line_indicators: opts.line_indicators,
-                suppress_blank_empty: self
+                        binary: false,
+                        anchors: &[],
+                        allow_textconv: true,
+                        db: self.db,
+                        lazy_fetch: crate::diff_lazy_fetch(self.lazy_fetch),
+                        worktree_root: None,
+                        use_worktree_new: false,
+                        format: self.format,
+                        abbrev: self.patch_abbrev,
+                        src_prefix: "a/",
+                        dst_prefix: "b/",
+                        context: self.opts.context.unwrap_or(3),
+                        userdiff: Some(self.userdiff),
+                        funcname: None,
+                        colors: None,
+                        word_diff: word_request.as_ref(),
+                        line_indicators: opts.line_indicators,
+                        suppress_blank_empty: self
                             .config
                             .get_bool("diff", None, "suppressblankempty")
                             .unwrap_or(false),
-                no_index_contents: None,
-                submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
-                submodule_dirt: None,
-                ws_error: None,
-                color_moved: None,
-                interhunk: 0,
-                ws_ignore: self.opts.ws_ignore,
-                diff_algorithm: self.opts.diff_algorithm,
-                ignore_blank_lines: self.opts.ignore_blank_lines,
-                ignore_regexes: &self.opts.ignore_regexes,
-                line_ranges: None,
-                indent_heuristic: self.opts.indent_heuristic,
-                big_file_threshold: crate::diff_big_file_threshold(self.db),
-                submodule_render: crate::cli_submodule_render()
-            },
+                        no_index_contents: None,
+                        submodule_format: commands::diff_options::SubmoduleDiffFormat::Short,
+                        submodule_dirt: None,
+                        ws_error: None,
+                        color_moved: None,
+                        interhunk: 0,
+                        ws_ignore: self.opts.ws_ignore,
+                        diff_algorithm: self.opts.diff_algorithm,
+                        ignore_blank_lines: self.opts.ignore_blank_lines,
+                        ignore_regexes: &self.opts.ignore_regexes,
+                        line_ranges: None,
+                        indent_heuristic: self.opts.indent_heuristic,
+                        big_file_threshold: crate::diff_big_file_threshold(self.db),
+                        submodule_render: crate::cli_submodule_render(),
+                    },
                 )?;
                 // Inject remerge CONFLICT header after the first "diff --git" line.
                 if let Some(header) = conflict_headers.get(entry.path.as_bytes()) {
@@ -772,7 +778,13 @@ impl LogDiffContext<'_> {
             }
         }
         let stat_entries = if opts.numstat || opts.stat || opts.compact_summary || opts.shortstat {
-            collect_diff_stat_entries(&first_parent_entries, self.db, None, false, crate::diff_lazy_fetch(self.lazy_fetch))?
+            collect_diff_stat_entries(
+                &first_parent_entries,
+                self.db,
+                None,
+                false,
+                crate::diff_lazy_fetch(self.lazy_fetch),
+            )?
         } else {
             Vec::new()
         };

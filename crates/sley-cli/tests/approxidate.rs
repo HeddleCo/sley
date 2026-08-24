@@ -124,8 +124,14 @@ fn relative_forms_track_now_within_one_second() {
 fn sentinels_and_rejections_match_exit_codes() {
     let repo = init_repo("approxidate-sentinels");
     for value in [
-        "never", "false", "all", // sentinels: exact stdout too
-        "abc", "True", "~/dir", ":(optional)no-such-path", "", // rejections
+        "never",
+        "false",
+        "all", // sentinels: exact stdout too
+        "abc",
+        "True",
+        "~/dir",
+        ":(optional)no-such-path",
+        "", // rejections
     ] {
         let expected = expiry_date_output(sley_testkit::oracle_git(), &repo, value);
         let actual = expiry_date_output(sley_testkit::sley_bin!(), &repo, value);
@@ -137,7 +143,10 @@ fn sentinels_and_rejections_match_exit_codes() {
             String::from_utf8_lossy(&actual.stderr),
         );
         if value == "never" || value == "false" || value == "all" {
-            assert_eq!(actual.stdout, expected.stdout, "stdout differed for {value:?}");
+            assert_eq!(
+                actual.stdout, expected.stdout,
+                "stdout differed for {value:?}"
+            );
         }
     }
 }

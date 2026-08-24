@@ -15,9 +15,7 @@ use sley::RefStore as FileRefStore;
 use sley::{GitConfig, Repository, ResolvedRepositoryOpen};
 use sley::{ObjectFormat, Result};
 
-use crate::{
-    common_git_dir_for_git_dir, read_repo_config, repository_abbrev_from_config, session,
-};
+use crate::{common_git_dir_for_git_dir, read_repo_config, repository_abbrev_from_config, session};
 
 /// Object-database behavior required by a command's invocation snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

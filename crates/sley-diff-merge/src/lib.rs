@@ -11,6 +11,7 @@ mod patch;
 pub mod porcelain;
 pub mod range;
 pub mod render;
+pub mod rerere;
 pub mod ws;
 
 pub use sley_core::BString;
@@ -22,6 +23,7 @@ pub use merge_trees::*;
 pub use name_status::*;
 pub use orchestration::*;
 pub use patch::*;
+pub use rerere::*;
 
 #[cfg(test)]
 mod tests {

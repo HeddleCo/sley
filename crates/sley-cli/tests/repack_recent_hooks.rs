@@ -1,5 +1,7 @@
 use filetime::FileTime;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,6 +62,48 @@ fn write_unreachable_blob(repo: &Path, contents: &[u8]) -> String {
         .expect("object id utf8")
         .trim()
         .to_string()
+}
+
+#[cfg(unix)]
+#[test]
+fn pre_auto_gc_hook_vetoes_before_advertising_gc() {
+    let repo = initialize_repo("pre-auto-gc-veto");
+    let git = sley_testkit::oracle_git();
+    let sley = sley_testkit::sley_bin!();
+
+    // These two payloads have SHA-1 object IDs in the 17 fanout. Git and Sley
+    // sample that fanout to decide whether gc.auto's loose-object limit has
+    // been exceeded.
+    for (name, contents) in [
+        ("263.t", b"263\n".as_slice()),
+        ("410.t", b"410\n".as_slice()),
+    ] {
+        fs::write(repo.join(name), contents).expect("write gc.auto trigger blob");
+        success(git, &repo, &["hash-object", "-w", name]);
+    }
+    success(git, &repo, &["config", "gc.auto", "3"]);
+    success(git, &repo, &["config", "gc.autoDetach", "false"]);
+
+    let hook = repo.join(".git/hooks/pre-auto-gc");
+    fs::write(&hook, b"#!/bin/sh\necho PRE-AUTO-GC-VETO >&2\nexit 1\n").expect("write hook");
+    let mut permissions = fs::metadata(&hook).expect("hook metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&hook, permissions).expect("make hook executable");
+
+    let output = run(sley, &repo, &["gc", "--auto"]);
+    assert!(output.status.success(), "a hook veto is a successful no-op");
+    assert!(
+        output.stdout.is_empty(),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "PRE-AUTO-GC-VETO\n"
+    );
+    assert!(!repo.join(".git/gc.pid").exists(), "veto leaked gc.pid");
+
+    fs::remove_dir_all(repo).ok();
 }
 
 #[test]

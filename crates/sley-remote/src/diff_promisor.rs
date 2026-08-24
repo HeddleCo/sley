@@ -140,27 +140,26 @@ pub fn prefetch_promisor_objects(
             .or(Some(sley_odb::PackObjectFilter::BlobNone));
         let quiet = config.get_bool("promisor", None, "quiet").unwrap_or(false);
         trace2_promisor_fetch_child_start(&remote_name, quiet);
-        let hydrated_ok = if let Ok(remote_git_dir) =
-            crate::resolve_local_remote_git_dir(resolution, url)
-        {
-            crate::install_fetch_pack_via_local_upload_pack(
-                &git_dir,
-                &remote_git_dir,
-                db.object_format(),
-                missing.clone(),
-                None,
-                true,
-                false,
-                filter,
-                None,
-                false,
-                None,
-            )
-            .is_ok()
-        } else {
-            maybe_hydrate_promisor_via_http(&git_dir, db, url, &missing, filter.clone())
-                .unwrap_or_default()
-        };
+        let hydrated_ok =
+            if let Ok(remote_git_dir) = crate::resolve_local_remote_git_dir(resolution, url) {
+                crate::install_fetch_pack_via_local_upload_pack(
+                    &git_dir,
+                    &remote_git_dir,
+                    db.object_format(),
+                    missing.clone(),
+                    None,
+                    true,
+                    false,
+                    filter,
+                    None,
+                    false,
+                    None,
+                )
+                .is_ok()
+            } else {
+                maybe_hydrate_promisor_via_http(&git_dir, db, url, &missing, filter.clone())
+                    .unwrap_or_default()
+            };
         if !hydrated_ok {
             continue;
         }
@@ -379,8 +378,9 @@ fn trace2_promisor_fetch_child_start(remote_name: &str, quiet: bool) {
         .map(|arg| format!("\"{}\"", trace2_json_escape(arg)))
         .collect::<Vec<_>>()
         .join(",");
-    let line =
-        format!("{{\"event\":\"child_start\",\"sid\":\"sley\",\"child_id\":0,\"argv\":[{argv}]}}\n");
+    let line = format!(
+        "{{\"event\":\"child_start\",\"sid\":\"sley\",\"child_id\":0,\"argv\":[{argv}]}}\n"
+    );
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = file.write_all(line.as_bytes());
     }

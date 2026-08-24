@@ -9,10 +9,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub fn for_each_ref_loose_object_disk_size(
-    git_dir: &Path,
-    oid: &ObjectId,
-) -> Result<Option<u64>> {
+pub fn for_each_ref_loose_object_disk_size(git_dir: &Path, oid: &ObjectId) -> Result<Option<u64>> {
     let hex = oid.to_hex();
     if hex.len() < 2 {
         return Ok(None);
@@ -32,9 +29,9 @@ pub fn for_each_ref_worktree_path(
     head_ref: Option<&str>,
     refname: &str,
 ) -> Result<Option<String>> {
-    let main_worktree_root = main_worktree_root.map(PathBuf::from).or_else(|| {
-        worktree_root_for_git_dir(git_dir).ok().flatten()
-    });
+    let main_worktree_root = main_worktree_root
+        .map(PathBuf::from)
+        .or_else(|| worktree_root_for_git_dir(git_dir).ok().flatten());
     if head_ref == Some(refname)
         && let Some(worktree_root) = main_worktree_root
     {
@@ -93,9 +90,9 @@ pub fn for_each_ref_worktree_paths(
     head_ref: Option<&str>,
 ) -> Result<HashMap<String, String>> {
     let mut paths = HashMap::new();
-    let main_worktree_root = main_worktree_root.map(PathBuf::from).or_else(|| {
-        worktree_root_for_git_dir(git_dir).ok().flatten()
-    });
+    let main_worktree_root = main_worktree_root
+        .map(PathBuf::from)
+        .or_else(|| worktree_root_for_git_dir(git_dir).ok().flatten());
     if let Some(head_ref) = head_ref
         && let Some(worktree_root) = main_worktree_root
     {

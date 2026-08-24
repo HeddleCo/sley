@@ -939,3 +939,160 @@ fn am_reject_partially_applies_and_writes_reject_like_git() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+/// `am --abort` after a NON-conflict stop must still rewind to the pre-series
+/// HEAD. Regression: abort-safety was only refreshed at conflict stops, so a
+/// series whose first patch applies clean and whose second patch stops without
+/// a conflict (empty patch under `--empty=stop`) compared against the stale
+/// pre-series tip, printed the false "You seem to have moved HEAD" warning,
+/// deleted the state, and left patch 1 applied.
+#[test]
+fn am_abort_after_non_conflict_stop_rewinds_to_pre_series_head() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("am-abort-nonconflict");
+    let source = root.join("source");
+    init_repo(&source, "A\nB\nC\n");
+
+    // Patch 1 applies cleanly onto the base; patch 2 is an empty commit, so
+    // `--empty=stop` halts the series after patch 1 has already landed.
+    write(&source, "file.txt", "A\nPATCHED\nC\n");
+    git_ok(&source, &["add", "file.txt"]);
+    git_ok(&source, &["commit", "-q", "-m", "real patch"]);
+
+    let patches_dir = root.join("patches");
+    fs::create_dir_all(&patches_dir).expect("patches dir");
+    // Second patch: an empty (no-diff) commit so format-patch emits a patch
+    // with headers but no diff body.
+    git_ok(
+        &source,
+        &["commit", "-q", "--allow-empty", "-m", "empty patch"],
+    );
+    git_ok(
+        &source,
+        &[
+            "format-patch",
+            "-2",
+            "-o",
+            patches_dir.to_string_lossy().as_ref(),
+            "HEAD",
+        ],
+    );
+    let patches = patch_paths(&patches_dir);
+    assert_eq!(patches.len(), 2, "expected a two-patch series");
+    let patch_args: Vec<&str> = patches.iter().map(String::as_str).collect();
+
+    let git_target = root.join("git");
+    let rs_target = root.join("rs");
+    init_repo(&git_target, "A\nB\nC\n");
+    init_repo(&rs_target, "A\nB\nC\n");
+    let base = git_ok(&git_target, &["rev-parse", "HEAD"]);
+
+    let mut start = vec!["am", "--empty=stop"];
+    start.extend_from_slice(&patch_args);
+    let g = git(&git_target, &start);
+    let r = sley(&rs_target, &start);
+    assert_outputs_equal("am --empty=stop", &g, &r);
+    assert!(!g.status.success(), "oracle must stop on the empty patch");
+    assert!(git_target.join(".git/rebase-apply").exists());
+    assert!(rs_target.join(".git/rebase-apply").exists());
+    // Both sides applied patch 1 before stopping.
+    assert_ne!(
+        git_ok(&rs_target, &["rev-parse", "HEAD"]),
+        base,
+        "fixture requires patch 1 to have committed before the stop"
+    );
+
+    let g_abort = git(&git_target, &["am", "--abort"]);
+    let r_abort = sley(&rs_target, &["am", "--abort"]);
+    assert_outputs_equal("am --abort after non-conflict stop", &g_abort, &r_abort);
+
+    // The abort must rewind to the PRE-SERIES head on both sides — no false
+    // "moved HEAD" warning, and the state directory removed.
+    assert!(!git_target.join(".git/rebase-apply").exists());
+    assert!(!rs_target.join(".git/rebase-apply").exists());
+    assert_repos_equal(&git_target, &rs_target);
+    assert_eq!(git_ok(&rs_target, &["rev-parse", "HEAD"]), base);
+    assert_eq!(
+        fs::read(rs_target.join("file.txt")).expect("worktree restored"),
+        b"A\nB\nC\n".to_vec(),
+        "patch 1 must not survive the abort"
+    );
+    assert_eq!(
+        git_ok(&rs_target, &["status", "--porcelain"]),
+        "",
+        "index/worktree must be clean after the rewind"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// `am --quit` must clear rerere's in-progress state like --abort/--skip do.
+/// Regression: quit skipped am_rerere_clear, leaving MERGE_RR behind to seed
+/// phantom conflicts in later operations.
+#[test]
+fn am_quit_clears_rerere_state() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("am-quit-rerere");
+    let source = root.join("source");
+    init_repo(&source, "A\nB\nC\n");
+    write(&source, "file.txt", "A\nPATCHED\nC\n");
+    git_ok(&source, &["add", "file.txt"]);
+    git_ok(&source, &["commit", "-q", "-m", "patch commit"]);
+
+    let patches_dir = root.join("patches");
+    fs::create_dir_all(&patches_dir).expect("patches dir");
+    git_ok(
+        &source,
+        &[
+            "format-patch",
+            "-1",
+            "-o",
+            patches_dir.to_string_lossy().as_ref(),
+            "HEAD",
+        ],
+    );
+    let patches = patch_paths(&patches_dir);
+    let patch_args: Vec<&str> = patches.iter().map(String::as_str).collect();
+
+    let git_target = root.join("git");
+    let rs_target = root.join("rs");
+    for target in [&git_target, &rs_target] {
+        init_repo(target, "A\nB\nC\n");
+        write(target, "file.txt", "A\nLOCAL\nC\n");
+        git_ok(target, &["add", "file.txt"]);
+        git_ok(target, &["commit", "-q", "-m", "local change"]);
+        git_ok(target, &["config", "rerere.enabled", "true"]);
+    }
+
+    let mut start = vec!["am", "-3"];
+    start.extend_from_slice(&patch_args);
+    let _ = git(&git_target, &start);
+    let _ = sley(&rs_target, &start);
+
+    // The conflicted three-way merge records its preimage in MERGE_RR on both
+    // sides (plain apply-path conflicts never touch rerere).
+    assert!(
+        git_target.join(".git/MERGE_RR").exists(),
+        "oracle fixture must exercise rerere recording"
+    );
+    assert!(
+        rs_target.join(".git/MERGE_RR").exists(),
+        "sley fixture must exercise rerere recording"
+    );
+
+    let g_quit = git(&git_target, &["am", "--quit"]);
+    let r_quit = sley(&rs_target, &["am", "--quit"]);
+    assert_outputs_equal("am --quit with rerere", &g_quit, &r_quit);
+    assert!(!git_target.join(".git/rebase-apply").exists());
+    assert!(!rs_target.join(".git/rebase-apply").exists());
+    assert!(
+        !rs_target.join(".git/MERGE_RR").exists(),
+        "am --quit must clear MERGE_RR (stale seeds cause phantom conflicts)"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}

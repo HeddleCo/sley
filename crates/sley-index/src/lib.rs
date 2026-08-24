@@ -8,9 +8,7 @@
 //! ([`CacheTree`]) that caches the tree object ids a fully-staged index would
 //! write.
 
-use sley_core::primitives::{
-    common_prefix_len, u16_be, u32_be, u64_be, write_biased_varint,
-};
+use sley_core::primitives::{common_prefix_len, u16_be, u32_be, u64_be, write_biased_varint};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

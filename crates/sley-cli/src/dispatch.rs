@@ -431,7 +431,7 @@ fn dispatch_command(
                 || (commands::help::runs_setup_before_command_help(command)
                     && setup::setup_git_directory(cli_session).is_none()));
         if generic_short_help || generic_full_help {
-            commands::help::print_command_usage(command);
+            crate::command_synopsis::print_command_usage(command);
             return Err(GitError::Exit(129));
         }
     }

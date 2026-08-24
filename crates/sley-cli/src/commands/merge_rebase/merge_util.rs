@@ -1,23 +1,49 @@
 use super::*;
-use sley::plumbing::{sley_core, sley_diff_merge, sley_index};
+use sley::plumbing::{sley_core, sley_diff_merge};
+use std::sync::Arc;
 
 // ===== git merge (3-way) =====
+//
+// Stage-B1 relocation: the canonical implementations of the flattened-tree
+// merge adapter, the index/worktree appliers, and the strategy-option plumbing
+// live in `sley_sequencer::apply`; the historical `commands::merge_rebase::*`
+// paths below are thin shims that inject the CLI's partial-clone hydration.
 
-pub(crate) type MergeTreeMap = BTreeMap<Vec<u8>, (u32, ObjectId)>;
+/// Canonical types shared with the sequencer engines.
+pub(crate) use sley_sequencer::apply::{
+    MergeConflictPaths, MergeInfoMessages, MergePathBinaryResolver, MergePathFavorResolver,
+    MergePathMarkerSizeResolver, MergePathResult, MergePathResults, MergeTreeMap,
+    ThreeWayMergeOutcome, merge_index_entry,
+    merge_refuse_if_current_working_directory_becomes_file, merge_remove_worktree_file,
+    merge_write_worktree_file,
+};
+
+/// Host-side partial-clone hydration handed to the sequencer apply backend.
+struct MergePrefetch;
+
+impl sley_sequencer::apply::PromisorObjectFetch for MergePrefetch {
+    fn read_object_maybe_prefetch(
+        &self,
+        db: &FileObjectDatabase,
+        oid: &ObjectId,
+    ) -> Result<Arc<EncodedObject>> {
+        crate::read_object_maybe_prefetch_promisor(db, oid, true)
+    }
+}
+
+fn apply_fetch(
+    lazy_fetch: bool,
+) -> Option<&'static dyn sley_sequencer::apply::PromisorObjectFetch> {
+    static PREFETCH: MergePrefetch = MergePrefetch;
+    lazy_fetch.then_some(&PREFETCH)
+}
 
 pub(crate) fn merge_read_blob(
     db: &FileObjectDatabase,
     oid: &ObjectId,
     lazy_fetch: bool,
 ) -> Result<Vec<u8>> {
-    let object = crate::read_object_maybe_prefetch_promisor(db, oid, lazy_fetch)?;
-    if object.object_type != ObjectType::Blob {
-        return Err(GitError::InvalidObject(format!(
-            "expected blob {oid}, found {}",
-            object.object_type.as_str()
-        )));
-    }
-    Ok(object.body.clone())
+    sley_sequencer::apply::merge_read_blob_with_fetch(db, oid, apply_fetch(lazy_fetch))
 }
 
 pub(crate) fn merge_worktree_content(
@@ -26,151 +52,7 @@ pub(crate) fn merge_worktree_content(
     oid: &ObjectId,
     lazy_fetch: bool,
 ) -> Result<Vec<u8>> {
-    if sley_index::is_gitlink(mode) {
-        Ok(Vec::new())
-    } else {
-        merge_read_blob(db, oid, lazy_fetch)
-    }
-}
-
-fn prefetch_content_merge_blobs(
-    db: &FileObjectDatabase,
-    base: &MergeTreeMap,
-    ours: &MergeTreeMap,
-    theirs: &MergeTreeMap,
-    lazy_fetch: bool,
-) -> Result<()> {
-    let mut paths = BTreeSet::new();
-    paths.extend(base.keys().cloned());
-    paths.extend(ours.keys().cloned());
-    paths.extend(theirs.keys().cloned());
-
-    for path in paths {
-        let base_entry = base.get(&path);
-        let ours_entry = ours.get(&path);
-        let theirs_entry = theirs.get(&path);
-        if ours_entry == theirs_entry || ours_entry == base_entry || theirs_entry == base_entry {
-            continue;
-        }
-        let content_mergeable = ours_entry
-            .is_some_and(|(mode, _)| sley_diff_merge::is_mergeable_file_mode(*mode))
-            && theirs_entry.is_some_and(|(mode, _)| sley_diff_merge::is_mergeable_file_mode(*mode))
-            && base_entry
-                .map(|(mode, _)| sley_diff_merge::is_mergeable_file_mode(*mode))
-                .unwrap_or(true);
-        if !content_mergeable {
-            continue;
-        }
-        for (_, oid) in [base_entry, ours_entry, theirs_entry].into_iter().flatten() {
-            let _ = merge_read_blob(db, oid, lazy_fetch)?;
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn merge_index_entry(path: &[u8], mode: u32, oid: ObjectId, stage: u16) -> IndexEntry {
-    let flags = ((stage & 0x3) << 12) | (path.len().min(0x0fff) as u16);
-    IndexEntry {
-        ctime_seconds: 0,
-        ctime_nanoseconds: 0,
-        mtime_seconds: 0,
-        mtime_nanoseconds: 0,
-        dev: 0,
-        ino: 0,
-        mode,
-        uid: 0,
-        gid: 0,
-        size: 0,
-        oid,
-        flags,
-        flags_extended: 0,
-        path: BString::from(path),
-    }
-}
-
-pub(crate) fn merge_write_worktree_file(
-    worktree_root: &Path,
-    path: &[u8],
-    content: &[u8],
-    mode: u32,
-) -> Result<()> {
-    let rel = std::str::from_utf8(path)
-        .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
-    let full = worktree_root.join(rel);
-    if let Some(parent) = full.parent() {
-        // A regular file may occupy one of the ancestor path components (the D/F
-        // case: HEAD had `dir` as a file, the merge now needs `dir/<child>`). git
-        // removes the blocking file before materializing the directory subtree, so
-        // clear any non-directory ancestor before `create_dir_all`, which would
-        // otherwise fail with EEXIST/ENOTDIR.
-        remove_blocking_file_ancestors(worktree_root, rel)?;
-        fs::create_dir_all(parent)?;
-    }
-    if sley_index::is_gitlink(mode) {
-        // Gitlink (submodule) entry: the `oid` is a *commit*, not a blob, so it
-        // must NOT be written as file content (the prior unconditional blob write
-        // produced an "Is a directory"/garbage-content failure that gated the
-        // revert/cherry-pick-over-submodule worktree apply, e.g.
-        // create_lib_submodule_repo's `git revert HEAD`). git's entry.c
-        // `write_entry` S_IFGITLINK arm only `mkdir`s the submodule directory
-        // (`submodule_move_head` — the embedded checkout — is a higher layer sley
-        // does not perform), preserving an already-populated submodule checkout.
-        if full.is_dir() {
-            return Ok(());
-        }
-        merge_unlink_path_in_the_way(&full)?;
-        fs::create_dir_all(&full)?;
-        return Ok(());
-    }
-    // Unlink whatever is in the way first (git's entry.c `write_entry`), so a type
-    // change (regular file ⇄ symlink) is overwritten rather than written *through*
-    // an existing symlink or left stale — the symlink-stash-apply / merge cases.
-    merge_unlink_path_in_the_way(&full)?;
-    if (mode & 0o170000) == 0o120000 {
-        // Symlink entry (mode 120000): the blob bytes are the link target.
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStringExt;
-            let target = std::path::PathBuf::from(std::ffi::OsString::from_vec(content.to_vec()));
-            std::os::unix::fs::symlink(&target, &full)?;
-        }
-        #[cfg(not(unix))]
-        fs::write(&full, content)?;
-    } else {
-        fs::write(&full, content)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(if mode == 0o100755 { 0o755 } else { 0o644 });
-            fs::set_permissions(&full, perms)?;
-        }
-    }
-    Ok(())
-}
-
-/// Remove whatever currently occupies `full` (lstat-based, so a dangling symlink
-/// is removed as the link, not followed) before a merge materializes a new object
-/// there. A directory in the way is removed recursively (D/F transition).
-fn merge_unlink_path_in_the_way(full: &Path) -> Result<()> {
-    match fs::symlink_metadata(full) {
-        Ok(metadata) => {
-            if metadata.is_dir() {
-                if merge_path_is_original_cwd(full) {
-                    return merge_refuse_remove_current_working_directory(full);
-                }
-                match fs::remove_dir_all(full) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(err.into()),
-                }
-            } else {
-                fs::remove_file(full)?;
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
-    }
-    Ok(())
+    sley_sequencer::apply::merge_worktree_content(db, mode, oid, apply_fetch(lazy_fetch))
 }
 
 /// Clear worktree files that block any directory path in the merged result.
@@ -191,37 +73,25 @@ pub(crate) fn clear_merge_df_blockers(worktree_root: &Path, results: &MergePathR
             continue;
         }
         if let Ok(rel) = std::str::from_utf8(path) {
-            let _ = remove_blocking_file_ancestors(worktree_root, rel);
+            let mut prefix = String::new();
+            let mut components = rel.split('/').peekable();
+            while let Some(component) = components.next() {
+                if components.peek().is_none() {
+                    break;
+                }
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(component);
+                let candidate = worktree_root.join(&prefix);
+                // Best-effort: errors are swallowed so a genuine I/O problem
+                // surfaces from the subsequent checkout instead.
+                if fs::symlink_metadata(&candidate).is_ok_and(|meta| !meta.is_dir()) {
+                    let _ = fs::remove_file(&candidate);
+                }
+            }
         }
     }
-}
-
-/// Remove any regular file occupying an ancestor directory component of `rel`
-/// (relative worktree path). This clears the D/F case where a file (e.g. `dir`)
-/// blocks the creation of a directory subtree (`dir/child`). Only plain files
-/// are removed — an existing directory ancestor is left intact, and a symlink
-/// ancestor is unlinked (git would not write through it).
-fn remove_blocking_file_ancestors(worktree_root: &Path, rel: &str) -> Result<()> {
-    let mut prefix = String::new();
-    let mut components = rel.split('/').peekable();
-    while let Some(component) = components.next() {
-        // Stop before the leaf — only ancestors (directory components) matter.
-        if components.peek().is_none() {
-            break;
-        }
-        if !prefix.is_empty() {
-            prefix.push('/');
-        }
-        prefix.push_str(component);
-        let candidate = worktree_root.join(&prefix);
-        match fs::symlink_metadata(&candidate) {
-            Ok(meta) if !meta.is_dir() => fs::remove_file(&candidate)?,
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Ok(())
 }
 
 /// True when it is safe to delete the worktree file at `path` during a merge:
@@ -250,167 +120,6 @@ pub(crate) fn worktree_file_matches_ours(
     let format = ours_oid.format();
     let on_disk = sley_core::object_id_for_bytes(format, "blob", &bytes)?;
     Ok(&on_disk == ours_oid)
-}
-
-pub(crate) fn merge_remove_worktree_file(worktree_root: &Path, path: &[u8]) -> Result<()> {
-    let rel = std::str::from_utf8(path)
-        .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
-    let full = worktree_root.join(rel);
-    // lstat (symlink_metadata): `Path::exists` follows symlinks and misses a
-    // dangling one, leaving it behind on removal.
-    match fs::symlink_metadata(&full) {
-        Ok(metadata) if metadata.is_dir() => {
-            if merge_path_is_original_cwd(&full) {
-                return Ok(());
-            }
-            // A directory occupies a tracked path being removed: this is a
-            // gitlink (submodule checkout). git's entry.c `unlink_entry` ⇒
-            // `remove_or_warn(mode, ..)` dispatches on `S_ISGITLINK(mode)` to
-            // `rmdir_or_warn` (vs `unlink_or_warn` for blobs/symlinks), so the
-            // submodule's *directory* is removed, never `unlink`ed (which is the
-            // `EISDIR` "Is a directory" failure that gated revert/cherry-pick
-            // over a populated submodule — t1013/t7112/t6438 setup). git first
-            // deinits via `submodule_move_head` (a higher layer sley does not
-            // perform), then `rmdir`s; `rmdir` of a still-populated submodule
-            // fails with ENOTEMPTY and git only *warns*, leaving the directory
-            // in place rather than erroring (`warn_if_unremovable`). Mirror that:
-            // try to remove the (now-empty-or-not) directory, but never fail the
-            // operation on a non-empty submodule directory.
-            match fs::remove_dir(&full) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => {
-                    // ENOTEMPTY (populated submodule) and friends: git warns and
-                    // continues. Match the warn-and-continue, do not propagate.
-                    eprintln!("warning: unable to rmdir '{rel}': Directory not empty");
-                }
-            }
-        }
-        Ok(_) => fs::remove_file(&full)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        // ENOTDIR: a path component is a (non-directory) file, so the target
-        // cannot exist — it was already removed (e.g. a directory→file typechange
-        // cleared the parent before this delete ran). git's `unlink_or_warn`
-        // treats this as already-gone; mirror that.
-        Err(err) if err.raw_os_error() == Some(20) => {}
-        Err(err) => return Err(err.into()),
-    }
-    merge_prune_empty_dirs(worktree_root, full.parent());
-    Ok(())
-}
-
-pub(crate) fn merge_refuse_if_current_working_directory_becomes_file(
-    worktree_root: &Path,
-    target_entries: &MergeTreeMap,
-) -> Result<()> {
-    let Some(cwd) = merge_original_cwd_relative_to(worktree_root) else {
-        return Ok(());
-    };
-    if target_entries.iter().any(|(path, (mode, _))| {
-        path == &cwd && !sley_index::is_gitlink(*mode) && (mode & 0o170000) != 0o040000
-    }) {
-        let full = worktree_root.join(path_from_git_bytes_lossy(&cwd));
-        if fs::symlink_metadata(&full).is_ok_and(|metadata| metadata.is_dir()) {
-            return merge_refuse_remove_current_working_directory(&full);
-        }
-    }
-    Ok(())
-}
-
-fn merge_original_cwd_absolute() -> Option<PathBuf> {
-    let cwd = sley_core::original_cwd().or_else(|| env::current_dir().ok())?;
-    Some(fs::canonicalize(&cwd).unwrap_or(cwd))
-}
-
-fn merge_original_cwd_relative_to(worktree_root: &Path) -> Option<Vec<u8>> {
-    let root = fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
-    let cwd = merge_original_cwd_absolute()?;
-    if cwd == root {
-        return None;
-    }
-    let rel = cwd.strip_prefix(&root).ok()?;
-    Some(path_to_git_bytes_lossy(rel))
-}
-
-fn merge_path_is_original_cwd(path: &Path) -> bool {
-    let Some(cwd) = merge_original_cwd_absolute() else {
-        return false;
-    };
-    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    path == cwd
-}
-
-fn merge_refuse_remove_current_working_directory(path: &Path) -> Result<()> {
-    eprintln!(
-        "error: Refusing to remove the current working directory:\n{}",
-        path.display()
-    );
-    Err(GitError::Exit(128))
-}
-
-fn merge_prune_empty_dirs(root: &Path, mut dir: Option<&Path>) {
-    while let Some(path) = dir {
-        if path == root || merge_path_is_original_cwd(path) {
-            break;
-        }
-        if fs::remove_dir(path).is_err() {
-            break;
-        }
-        dir = path.parent();
-    }
-}
-
-fn path_to_git_bytes_lossy(path: &Path) -> Vec<u8> {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-        .into_bytes()
-}
-
-fn path_from_git_bytes_lossy(path: &[u8]) -> PathBuf {
-    String::from_utf8_lossy(path).split('/').collect()
-}
-
-/// Per-path outcome of a 3-way tree merge.
-// Conflict data is intentionally inline so the merge hot path avoids one heap
-// allocation per conflicted path.
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum MergePathResult {
-    /// Cleanly resolved; `None` means the path is deleted in the result.
-    Resolved(Option<(u32, ObjectId)>),
-    /// Conflicted: carries the (mode, oid) for each present stage and the bytes
-    /// (with conflict markers) plus mode to materialize in the worktree.
-    Conflict {
-        base: Option<(u32, ObjectId)>,
-        ours: Option<(u32, ObjectId)>,
-        theirs: Option<(u32, ObjectId)>,
-        worktree: Option<(u32, Vec<u8>)>,
-        /// The conflict classification, so the porcelain renders the correct
-        /// `CONFLICT (…)` message line (content / modify-delete / rename-delete /
-        /// file-directory) instead of always claiming a content conflict.
-        kind: Option<sley_diff_merge::MergeConflictKind>,
-        /// True when a textual 3-way content merge ran for this path; drives the
-        /// `Auto-merging <path>` info line (git emits it only for content merges).
-        auto_merged: bool,
-    },
-}
-
-pub(crate) type MergePathResults = BTreeMap<Vec<u8>, MergePathResult>;
-pub(crate) type MergeConflictPaths = Vec<Vec<u8>>;
-pub(crate) type MergeInfoMessages = Vec<sley_diff_merge::MergeInfoMessage>;
-pub(crate) type MergePathFavorResolver<'a> = dyn Fn(&[u8]) -> sley_diff_merge::MergeFavor + 'a;
-pub(crate) type MergePathMarkerSizeResolver<'a> = dyn Fn(&[u8]) -> usize + 'a;
-pub(crate) type MergePathBinaryResolver<'a> = dyn Fn(&[u8]) -> bool + 'a;
-
-/// Complete engine outcome for a three-way merge. Most porcelain adapters only
-/// need the reshaped path results; `git merge` additionally persists `tree` as
-/// the `AUTO_MERGE` pseudo-ref when conflicts remain.
-pub(crate) struct ThreeWayMergeOutcome {
-    pub(crate) results: MergePathResults,
-    pub(crate) conflicts: MergeConflictPaths,
-    pub(crate) info_messages: MergeInfoMessages,
-    pub(crate) tree: ObjectId,
 }
 
 /// 3-way merge of three flattened trees. Writes any cleanly-merged blob content
@@ -825,105 +534,29 @@ pub(crate) fn three_way_merge_trees_outcome_with_info_opts_and_path_resolvers(
     path_marker_size: Option<&MergePathMarkerSizeResolver<'_>>,
     path_is_binary: Option<&MergePathBinaryResolver<'_>>,
 ) -> Result<ThreeWayMergeOutcome> {
-    // The shared merge engine only sees an object database, while the CLI knows
-    // how to hydrate promised blobs. Fetch just the blobs a non-trivial textual
-    // merge will inspect, preserving partial-clone laziness for unrelated blobs.
-    prefetch_content_merge_blobs(db, base, ours, theirs, renames.lazy_fetch)?;
-
-    let merge = sley_diff_merge::merge_entry_maps(
+    // Canonical engine in `sley_sequencer::apply`; the CLI shape's
+    // `lazy_fetch` flag is injected as the promisor hydration adapter.
+    sley_sequencer::apply::three_way_merge_trees_outcome_with_info_opts_and_path_resolvers(
         db,
         format,
         base,
         ours,
         theirs,
-        &sley_diff_merge::MergeTreesOptions {
-            ours_label,
-            theirs_label,
-            ancestor_label,
-            favor,
-            path_favor,
-            path_marker_size,
-            path_is_binary,
+        ours_label,
+        theirs_label,
+        ancestor_label,
+        favor,
+        style,
+        ws_ignore,
+        sley_sequencer::apply::RenameMergeConfig {
             detect_renames: renames.detect_renames,
             rename_threshold: renames.rename_threshold,
             rename_limit: renames.rename_limit,
-            // Directory-rename detection only fires when file-rename detection is
-            // enabled (it is inferred from the file renames found). With renames
-            // off, force it off too so `--no-renames` disables both.
-            directory_renames: if renames.detect_renames {
-                renames.directory_renames
-            } else {
-                sley_diff_merge::DirectoryRenames::False
-            },
-            style,
-            ws_ignore,
+            directory_renames: renames.directory_renames,
         },
-    )?;
-
-    let tree = merge.tree;
-    let mut results = BTreeMap::new();
-    let mut conflicts = Vec::new();
-    let info_messages = merge.info_messages.clone();
-    let cleanup_paths = merge.cleanup_paths;
-    for entry in merge.paths {
-        // A directory-rename location "conflict" (=conflict mode) is purely
-        // advisory: git stages the re-homed content cleanly at stage 0 and only
-        // emits an informational `CONFLICT (file location)` message + nonzero
-        // exit. Carry the resolved leaf in the `ours` stage slot and rely on the
-        // index/worktree writers to stage `DirRenameLocation` at stage 0.
-        let advisory_location = matches!(
-            entry.conflict,
-            Some(sley_diff_merge::MergeConflictKind::DirRenameLocation {
-                back_to_self: false,
-                ..
-            }) | Some(sley_diff_merge::MergeConflictKind::DirRenameImplicitCollision { .. })
-        );
-        if entry.conflict.is_some() {
-            conflicts.push(entry.path.clone());
-            if advisory_location {
-                let worktree = match entry.result {
-                    Some((mode, oid)) => {
-                        Some((mode, merge_read_blob(db, &oid, renames.lazy_fetch)?))
-                    }
-                    None => None,
-                };
-                results.insert(
-                    entry.path,
-                    MergePathResult::Conflict {
-                        base: None,
-                        ours: entry.result,
-                        theirs: None,
-                        worktree,
-                        kind: entry.conflict,
-                        auto_merged: entry.auto_merged,
-                    },
-                );
-            } else {
-                results.insert(
-                    entry.path,
-                    MergePathResult::Conflict {
-                        base: entry.stages.base,
-                        ours: entry.stages.ours,
-                        theirs: entry.stages.theirs,
-                        worktree: entry.worktree,
-                        kind: entry.conflict,
-                        auto_merged: entry.auto_merged,
-                    },
-                );
-            }
-        } else {
-            results.insert(entry.path, MergePathResult::Resolved(entry.result));
-        }
-    }
-    for path in cleanup_paths {
-        results
-            .entry(path)
-            .or_insert(MergePathResult::Resolved(None));
-    }
-    Ok(ThreeWayMergeOutcome {
-        results,
-        conflicts,
-        info_messages,
-        tree,
-    })
+        path_favor,
+        path_marker_size,
+        path_is_binary,
+        apply_fetch(renames.lazy_fetch),
+    )
 }

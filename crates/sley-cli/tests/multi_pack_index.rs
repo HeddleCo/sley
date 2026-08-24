@@ -766,3 +766,164 @@ fn multi_pack_index_expire_removes_repacked_packs() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Fault injection for expire ordering: the rewritten multi-pack-index must
+/// land BEFORE any expired pack is unlinked, so a failure while writing the
+/// new midx (forced here by corrupting a surviving pack's .idx) leaves every
+/// pack — and the old, still-valid midx — untouched. The pre-fix order deleted
+/// the zero-ref pack first and only then rewrote the midx.
+#[test]
+fn multi_pack_index_expire_deletes_nothing_when_midx_rewrite_fails() {
+    let root = unique_temp_dir("midx-expire-order");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["init", "-q", "-b", "main"],
+        );
+        fs::write(root.join("f1.txt"), "content one\n").expect("write f1");
+        run_success(sley_testkit::oracle_git(), &root, &["add", "f1.txt"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &[
+                "-c",
+                "user.name=A U Thor",
+                "-c",
+                "user.email=author@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "c1",
+            ],
+        );
+        fs::write(root.join("f2.txt"), "content two\n").expect("write f2");
+        run_success(sley_testkit::oracle_git(), &root, &["add", "f2.txt"]);
+        run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &[
+                "-c",
+                "user.name=A U Thor",
+                "-c",
+                "user.email=author@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "c2",
+            ],
+        );
+
+        let pack_dir = root.join(".git").join("objects").join("pack");
+
+        // Pack B (created first): a strict subset pack holding only the root
+        // tree, so every object it has is also in pack A.
+        let tree_oid = run_success(
+            sley_testkit::oracle_git(),
+            &root,
+            &["rev-parse", "HEAD~1^{tree}"],
+        );
+        let tree_oid = String::from_utf8(tree_oid)
+            .expect("utf8 tree oid")
+            .trim()
+            .to_string();
+        let subset_hash = run_success_with_stdin(
+            sley_testkit::oracle_git(),
+            &root,
+            &[
+                "pack-objects",
+                pack_dir.join("pack").to_str().expect("pack prefix"),
+            ],
+            format!("{tree_oid}\n").as_bytes(),
+        );
+        let subset_hash = String::from_utf8(subset_hash)
+            .expect("utf8 subset pack hash")
+            .trim()
+            .to_string();
+
+        // Pack A (created second): full history, strictly newer than pack B so
+        // cross-pack duplicate resolution attributes the shared tree to it.
+        run_success_with_stdin(
+            sley_testkit::oracle_git(),
+            &root,
+            &[
+                "pack-objects",
+                "--revs",
+                pack_dir.join("pack").to_str().expect("pack prefix"),
+            ],
+            b"HEAD\n",
+        );
+        // Make the age ordering explicit regardless of filesystem timestamp
+        // granularity: backdate pack B well into the past.
+        for ext in ["pack", "idx"] {
+            let path = pack_dir.join(format!("pack-{subset_hash}.{ext}"));
+            assert!(path.exists(), "missing {}", path.display());
+            let status = Command::new("touch")
+                .args(["-t", "202001010000"])
+                .arg(&path)
+                .status()
+                .expect("touch subset pack");
+            assert!(status.success(), "touch failed for {}", path.display());
+        }
+
+        run_success(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["multi-pack-index", "write"],
+        );
+
+        // Sanity: with both packs intact, expire would drop the fully-covered
+        // subset pack — verify that expectation against an uncorrupted copy of
+        // this layout is implicit in the num_packs assertion below.
+        let full_idx_name = {
+            let mut idx_names: Vec<String> = fs::read_dir(&pack_dir)
+                .expect("read pack dir")
+                .filter_map(|entry| {
+                    entry
+                        .ok()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                })
+                .filter(|name| name.ends_with(".idx"))
+                .collect();
+            idx_names.sort();
+            assert_eq!(idx_names.len(), 2, "expected exactly two packs");
+            idx_names
+                .into_iter()
+                .find(|name| name != &format!("pack-{subset_hash}.idx"))
+                .expect("full-history pack idx present")
+        };
+
+        // Fault injection: corrupt the SURVIVING pack's index so rewriting the
+        // midx over the remaining packs fails during parse. Pack files are
+        // read-only, so drop the old one first.
+        let full_idx_path = pack_dir.join(&full_idx_name);
+        fs::remove_file(&full_idx_path).expect("drop read-only idx");
+        fs::write(&full_idx_path, vec![0u8; 128]).expect("corrupt idx");
+
+        let out = run(
+            sley_testkit::sley_bin!(),
+            &root,
+            &["multi-pack-index", "expire"],
+        );
+        assert!(
+            !out.status.success(),
+            "expire should fail while the new midx cannot be written"
+        );
+
+        // The zero-ref pack must still exist: deletion happens only after the
+        // replacement midx lands.
+        for ext in ["pack", "idx"] {
+            assert!(
+                pack_dir.join(format!("pack-{subset_hash}.{ext}")).exists(),
+                "expired pack {ext} was unlinked before the midx rewrite succeeded"
+            );
+        }
+        // The old midx is untouched and still lists both packs.
+        let midx = fs::read(pack_dir.join("multi-pack-index")).expect("read midx");
+        assert!(midx.len() >= 12, "midx too short");
+        let num_packs = u32::from_be_bytes(midx[8..12].try_into().expect("4 bytes"));
+        assert_eq!(num_packs, 2, "old midx should still list both packs");
+    };
+    let _ = fs::remove_dir_all(&root);
+}

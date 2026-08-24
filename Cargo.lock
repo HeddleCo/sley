@@ -1556,6 +1556,7 @@ dependencies = [
  "sley-core",
  "sley-formats",
  "sley-fsck",
+ "sley-gc",
  "sley-grep",
  "sley-i18n",
  "sley-mail",
@@ -1606,6 +1607,7 @@ dependencies = [
  "sley-pack",
  "sley-pathspec",
  "sley-refs",
+ "tempfile",
 ]
 
 [[package]]
@@ -1627,6 +1629,24 @@ dependencies = [
  "sley-object",
  "sley-odb",
  "sley-submodule",
+]
+
+[[package]]
+name = "sley-gc"
+version = "0.8.0"
+dependencies = [
+ "regex",
+ "sley-config",
+ "sley-core",
+ "sley-formats",
+ "sley-index",
+ "sley-object",
+ "sley-odb",
+ "sley-pack",
+ "sley-procinfo",
+ "sley-refs",
+ "sley-rev",
+ "sley-worktree",
 ]
 
 [[package]]
@@ -1834,9 +1854,15 @@ dependencies = [
 name = "sley-sequencer"
 version = "0.8.0"
 dependencies = [
+ "sley-config",
  "sley-core",
+ "sley-diff-merge",
+ "sley-index",
+ "sley-mail",
  "sley-object",
  "sley-odb",
+ "sley-pretty",
+ "sley-ref-filter",
  "sley-refs",
  "sley-rev",
  "sley-worktree",
