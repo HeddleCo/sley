@@ -3,9 +3,12 @@
 //! register/unregister config-file editing, and the OS scheduler integrations
 //! (cron, systemd, launchctl, schtasks).
 //!
-//! `maintenance.lock` / `schedule.lock` are created with `create_new` and the
-//! early-return failure paths deliberately leak the lock file — stale-lock
-//! recovery depends on that. Preserve this verbatim; no Drop guards.
+//! `maintenance.lock` / `schedule.lock` are created with `create_new` and
+//! record the acquiring pid. A pre-existing lock older than twelve hours
+//! (gc.pid's staleness window) counts as abandoned and is removed before one
+//! re-acquire attempt; anything fresher blocks the run. The lock is removed on
+//! every exit path, including individual task failures, so a failed run can
+//! never wedge later `--auto` runs.
 
 use std::collections::HashSet;
 use std::env;
@@ -161,6 +164,42 @@ fn maintenance_schedule_rank(value: &str) -> Result<u8> {
     }
 }
 
+/// A maintenance-style lock is considered abandoned after this long without
+/// progress, mirroring gc.pid's twelve-hour staleness window.
+const MAINTENANCE_LOCK_STALE_SECONDS: u64 = 12 * 60 * 60;
+
+fn try_acquire_lock(lock: &Path) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(lock)?;
+    // Record the holder for diagnostics; the mtime of this write doubles as
+    // the staleness timestamp.
+    writeln!(file, "{}", std::process::id())
+}
+
+fn lock_age_seconds(lock: &Path) -> Option<u64> {
+    let modified = fs::metadata(lock).ok()?.modified().ok()?;
+    modified.elapsed().ok().map(|elapsed| elapsed.as_secs())
+}
+
+/// Acquire a create-new lock, treating a pre-existing lock older than
+/// [`MAINTENANCE_LOCK_STALE_SECONDS`] as abandoned: it is removed and one
+/// re-acquire is attempted. Returns `false` when a live lock is held elsewhere.
+fn acquire_lock_with_stale_recovery(lock: &Path) -> bool {
+    if try_acquire_lock(lock).is_ok() {
+        return true;
+    }
+    match lock_age_seconds(lock) {
+        Some(age) if age >= MAINTENANCE_LOCK_STALE_SECONDS => {}
+        _ => return false,
+    }
+    if fs::remove_file(lock).is_err() {
+        return false;
+    }
+    try_acquire_lock(lock).is_ok()
+}
+
 pub fn maintenance_run_selected(
     services: &mut GcServices,
     common_git_dir: &Path,
@@ -171,12 +210,7 @@ pub fn maintenance_run_selected(
     detach: bool,
 ) -> Result<()> {
     let lock = repository_objects_dir(common_git_dir).join("maintenance.lock");
-    if fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock)
-        .is_err()
-    {
+    if !acquire_lock_with_stale_recovery(&lock) {
         if auto {
             return Ok(());
         }
@@ -187,14 +221,17 @@ pub fn maintenance_run_selected(
         trace2::region("region_enter", "maintenance", "detach");
         trace2::region("region_leave", "maintenance", "detach");
     }
-    for task in tasks {
-        if auto && !maintenance_task_needed(common_git_dir, config, task)? {
-            continue;
+    let run = (|| -> Result<()> {
+        for task in tasks {
+            if auto && !maintenance_task_needed(common_git_dir, config, task)? {
+                continue;
+            }
+            maintenance_run_one(services, common_git_dir, config, task, quiet, auto)?;
         }
-        maintenance_run_one(services, common_git_dir, config, task, quiet, auto)?;
-    }
-    let _ = fs::remove_file(lock);
-    Ok(())
+        Ok(())
+    })();
+    let _ = fs::remove_file(&lock);
+    run
 }
 
 fn maintenance_run_one(
@@ -281,7 +318,7 @@ pub fn maintenance_task_needed(common_git_dir: &Path, config: &GitConfig, task: 
             config,
             "loose-objects",
             100,
-            loose_object_ids(common_git_dir)?.len(),
+            loose_object_ids(common_git_dir, repo_object_format(common_git_dir)?)?.len(),
         )?,
         "incremental-repack" => maintenance_pack_count_exceeds_limit(
             config,
@@ -485,7 +522,7 @@ fn maintenance_loose_objects(common_git_dir: &Path, config: &GitConfig, quiet: b
         prune_args.push("--quiet");
     }
     run_sley_child(&prune_args, None)?;
-    let loose = loose_object_ids(common_git_dir)?;
+    let loose = loose_object_ids(common_git_dir, repo_object_format(common_git_dir)?)?;
     if loose.is_empty() {
         return Ok(());
     }
@@ -509,7 +546,8 @@ fn maintenance_loose_objects(common_git_dir: &Path, config: &GitConfig, quiet: b
     run_sley_child(&args, Some(&input))
 }
 
-fn loose_object_ids(common_git_dir: &Path) -> Result<Vec<String>> {
+fn loose_object_ids(common_git_dir: &Path, format: ObjectFormat) -> Result<Vec<String>> {
+    let hex_len = format.hex_len();
     let objects = common_git_dir.join("objects");
     let mut out = Vec::new();
     if !objects.exists() {
@@ -528,7 +566,7 @@ fn loose_object_ids(common_git_dir: &Path) -> Result<Vec<String>> {
             let Some(suffix) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
-            if suffix.len() == 38 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if suffix.len() == hex_len - 2 && suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
                 out.push(format!("{prefix}{suffix}"));
             }
         }
@@ -568,6 +606,18 @@ fn maintenance_auto_pack_size(common_git_dir: &Path) -> Result<u64> {
         .min(i32::MAX as u64))
 }
 
+/// Collect the `parent` headers from a commit object's body, stopping at the
+/// blank line that ends the header block so commit-message text mentioning
+/// "parent " cannot fabricate edges.
+fn commit_parent_oids(format: ObjectFormat, body: &[u8]) -> Vec<ObjectId> {
+    let text = String::from_utf8_lossy(body);
+    text.lines()
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.strip_prefix("parent "))
+        .filter_map(|hex| ObjectId::from_hex(format, hex).ok())
+        .collect()
+}
+
 fn count_reachable_commits(common_git_dir: &Path) -> Result<usize> {
     let format = repo_object_format(common_git_dir)?;
     let refs = FileRefStore::new(common_git_dir, format);
@@ -589,15 +639,7 @@ fn count_reachable_commits(common_git_dir: &Path) -> Result<usize> {
             Ok(object) if object.object_type == ObjectType::Commit => object,
             _ => continue,
         };
-        if let Ok(text) = std::str::from_utf8(&object.body) {
-            for line in text.lines() {
-                if let Some(parent) = line.strip_prefix("parent ")
-                    && let Ok(parent) = ObjectId::from_hex(format, parent)
-                {
-                    stack.push(parent);
-                }
-            }
-        }
+        stack.extend(commit_parent_oids(format, &object.body));
     }
     Ok(seen.len())
 }
@@ -632,15 +674,7 @@ fn count_reachable_commits_not_in_graph(common_git_dir: &Path) -> Result<usize> 
             _ => continue,
         };
         missing += 1;
-        if let Ok(text) = std::str::from_utf8(&object.body) {
-            for line in text.lines() {
-                if let Some(parent) = line.strip_prefix("parent ")
-                    && let Ok(parent) = ObjectId::from_hex(format, parent)
-                {
-                    stack.push(parent);
-                }
-            }
-        }
+        stack.extend(commit_parent_oids(format, &object.body));
     }
     Ok(missing)
 }
@@ -982,39 +1016,36 @@ pub fn update_background_schedule(
     enable: Option<MaintenanceScheduler>,
 ) -> Result<()> {
     let lock = repository_objects_dir(common_git_dir).join("schedule.lock");
-    if fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock)
-        .is_err()
-    {
+    if !acquire_lock_with_stale_recovery(&lock) {
         eprintln!("error: Another scheduled git-maintenance(1) process seems to be running");
         return Err(GitError::Exit(128));
     }
-    if let Some(scheduler) = enable
-        && let Err(err) = validate_scheduler_available(scheduler)
-    {
-        let _ = fs::remove_file(lock);
-        return Err(err);
-    }
-    for scheduler in [
-        MaintenanceScheduler::Cron,
-        MaintenanceScheduler::Systemd,
-        MaintenanceScheduler::Launchctl,
-        MaintenanceScheduler::Schtasks,
-    ] {
-        if enable == Some(scheduler) {
-            continue;
+    let run = (|| -> Result<()> {
+        if let Some(scheduler) = enable
+            && let Err(err) = validate_scheduler_available(scheduler)
+        {
+            return Err(err);
         }
-        if scheduler_available(scheduler) {
-            let _ = update_scheduler(common_git_dir, scheduler, false);
+        for scheduler in [
+            MaintenanceScheduler::Cron,
+            MaintenanceScheduler::Systemd,
+            MaintenanceScheduler::Launchctl,
+            MaintenanceScheduler::Schtasks,
+        ] {
+            if enable == Some(scheduler) {
+                continue;
+            }
+            if scheduler_available(scheduler) {
+                let _ = update_scheduler(common_git_dir, scheduler, false);
+            }
         }
-    }
-    if let Some(scheduler) = enable {
-        update_scheduler(common_git_dir, scheduler, true)?;
-    }
-    let _ = fs::remove_file(lock);
-    Ok(())
+        if let Some(scheduler) = enable {
+            update_scheduler(common_git_dir, scheduler, true)?;
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_file(&lock);
+    run
 }
 
 fn update_scheduler(

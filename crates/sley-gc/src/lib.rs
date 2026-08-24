@@ -37,9 +37,10 @@ use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 ///
 /// The engine never discovers process-global state on its own; the CLI builds
 /// one of these per invocation from its session. Lock/pid/log file semantics
-/// are NOT services — they are byte-preserved engine behavior (including the
-/// deliberate early-return lock leaks in `maintenance.lock` /
-/// `schedule.lock` handling, which stale-lock recovery depends on).
+/// are NOT services — they are byte-preserved engine behavior (including
+/// `maintenance.lock` / `schedule.lock` acquisition, stale-lock recovery, and
+/// removal on every exit path; see `maintenance::run_selected` /
+/// `update_background_schedule`).
 pub struct GcServices<'a> {
     /// `GIT_TRACE_LINE` delegate (`setup::git_trace_line`).
     pub git_trace_line: &'a dyn Fn(&str, &str),

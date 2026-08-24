@@ -3,7 +3,9 @@
 //! MIDX, and the default-MIDX rewrite used after repack/expire.
 //!
 //! Temp-file names (`.bitmap.tmp`, `multi-pack-index-{checksum}.{midx,
-//! bitmap,rev}`) are byte-preserved upstream artifacts.
+//! bitmap,rev}`) are byte-preserved upstream artifacts. Every midx/chain
+//! artifact write lands via a sibling `*.tmp` file plus rename so readers
+//! never observe a truncated index (matching the `.bitmap` precedent).
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -19,10 +21,22 @@ use sley_odb::{
 use sley_odb::ObjectReader as _;
 use sley_pack::{
     pack_order_index_positions, MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex,
-    PackInput, PackReverseIndex, PackWriteOptions,
+    PackReverseIndex, PackWriteLimits, PackWriteOptions,
 };
 
 const MULTI_PACK_INDEX_USAGE: &str = "\n";
+
+/// Write `bytes` to `path` through a sibling `*.tmp` file and rename, so a
+/// crash mid-write can never leave a truncated midx, chain, or sidecar file
+/// behind (a half-written chain would wedge incremental midx operations).
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut temp_name = path.as_os_str().to_owned();
+    temp_name.push(".tmp");
+    let temp = PathBuf::from(temp_name);
+    fs::write(&temp, bytes)?;
+    fs::rename(&temp, path)?;
+    Ok(())
+}
 
 use crate::repack::{repack_preferred_bitmap_tips, repack_pseudo_merge_groups};
 use crate::{read_repo_config, repo_object_format, resolve_path_under};
@@ -233,12 +247,12 @@ pub fn write_with_pack_names(
 
     // The engine constructs every dependent artifact before the MIDX lands;
     // a bitmap closure failure therefore leaves no partially updated index.
-    fs::write(pack_dir.join("multi-pack-index"), &layer.midx)?;
+    atomic_write(&pack_dir.join("multi-pack-index"), &layer.midx)?;
     remove_incremental_midx_dir(&pack_dir)?;
 
     let rev_name = format!("multi-pack-index-{midx_checksum}.rev");
     if let Some(reverse_index) = &layer.reverse_index {
-        fs::write(pack_dir.join(&rev_name), reverse_index)?;
+        atomic_write(&pack_dir.join(&rev_name), reverse_index)?;
     }
 
     // Clear midx bitmap/rev sidecars that don't belong to this write: stale
@@ -500,16 +514,16 @@ fn install_incremental_midx_layer(
     let midx_dir = incremental_midx_dir(pack_dir);
     fs::create_dir_all(&midx_dir)?;
     let midx_path = midx_dir.join(format!("multi-pack-index-{}.midx", layer.checksum));
-    fs::write(&midx_path, &layer.midx)?;
+    atomic_write(&midx_path, &layer.midx)?;
     if let Some(bitmap) = &layer.bitmap {
-        fs::write(
-            midx_dir.join(format!("multi-pack-index-{}.bitmap", layer.checksum)),
+        atomic_write(
+            &midx_dir.join(format!("multi-pack-index-{}.bitmap", layer.checksum)),
             bitmap,
         )?;
     }
     if let Some(rev) = &layer.rev {
-        fs::write(
-            midx_dir.join(format!("multi-pack-index-{}.rev", layer.checksum)),
+        atomic_write(
+            &midx_dir.join(format!("multi-pack-index-{}.rev", layer.checksum)),
             rev,
         )?;
     }
@@ -572,7 +586,7 @@ fn write_midx_chain(pack_dir: &Path, chain: &[String]) -> Result<()> {
         contents.push_str(checksum);
         contents.push('\n');
     }
-    fs::write(midx_chain_path(pack_dir), contents)?;
+    atomic_write(&midx_chain_path(pack_dir), contents.as_bytes())?;
     Ok(())
 }
 
@@ -606,7 +620,7 @@ fn migrate_single_midx_to_incremental(
     let midx_dir = incremental_midx_dir(pack_dir);
     fs::create_dir_all(&midx_dir)?;
     let layer_path = midx_dir.join(format!("multi-pack-index-{checksum}.midx"));
-    fs::write(&layer_path, &bytes)?;
+    atomic_write(&layer_path, &bytes)?;
     let _ = fs::remove_file(&midx_path);
     for ext in ["bitmap", "rev"] {
         let from = pack_dir.join(format!("multi-pack-index-{checksum}.{ext}"));
@@ -676,7 +690,6 @@ pub fn compact(
     let format = repo_object_format(git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     let mut write_bitmap = false;
-    let mut incremental = false;
     let mut endpoints = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -692,8 +705,9 @@ pub fn compact(
             }
             "--bitmap" => write_bitmap = true,
             "--no-bitmap" => write_bitmap = false,
-            "--incremental" => incremental = true,
-            "--no-incremental" => incremental = false,
+            // Compaction is inherently an incremental-chain operation; both
+            // spellings are accepted and behave identically.
+            "--incremental" | "--no-incremental" => {}
             "--progress" | "--no-progress" => {}
             other if other.starts_with('-') => {
                 return Err(GitError::Unsupported(format!(
@@ -715,12 +729,6 @@ pub fn compact(
     {
         eprintln!("fatal: cannot perform MIDX compaction with v1 format");
         return Err(GitError::Exit(128));
-    }
-    if !incremental {
-        incremental = true;
-    }
-    if !incremental {
-        return Ok(());
     }
 
     let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(git_dir));
@@ -835,7 +843,10 @@ pub fn compact(
 /// resolution (keep the copy from the newest pack, ties broken by lowest pack
 /// id). This is the default `multi-pack-index write` behaviour, factored out so
 /// `repack` and `expire` can rewrite the midx after changing the pack set.
-fn write_default_midx(object_dir: &Path, format: ObjectFormat) -> Result<()> {
+/// Packs named in `skip` (by `.idx` basename) are left out of the new midx —
+/// `expire` passes the packs it is about to delete so the rewritten index
+/// lands before any unlink.
+fn write_default_midx(object_dir: &Path, format: ObjectFormat, skip: &[String]) -> Result<()> {
     let pack_dir = object_dir.join("pack");
     let mut pack_names = Vec::new();
     for entry in fs::read_dir(&pack_dir)? {
@@ -843,7 +854,9 @@ fn write_default_midx(object_dir: &Path, format: ObjectFormat) -> Result<()> {
         if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
             continue;
         }
-        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+        if let Some(name) = path.file_name().and_then(|name| name.to_str())
+            && !skip.iter().any(|skipped| skipped == name)
+        {
             pack_names.push(name.to_string());
         }
     }
@@ -894,7 +907,6 @@ fn write_default_midx(object_dir: &Path, format: ObjectFormat) -> Result<()> {
     objects.dedup_by(|next, kept| next.oid == kept.oid);
 
     let midx = MultiPackIndex::write(format, 1, &pack_names, &objects)?;
-    let midx_checksum = ObjectId::from_raw(format, &midx[midx.len() - format.raw_len()..])?;
 
     // Clear stale bitmap/rev sidecars not produced by this (non-bitmap) write.
     for entry in fs::read_dir(&pack_dir)? {
@@ -906,9 +918,8 @@ fn write_default_midx(object_dir: &Path, format: ObjectFormat) -> Result<()> {
             let _ = fs::remove_file(&path);
         }
     }
-    let _ = midx_checksum;
 
-    fs::write(pack_dir.join("multi-pack-index"), &midx)?;
+    atomic_write(&pack_dir.join("multi-pack-index"), &midx)?;
     Ok(())
 }
 
@@ -1092,46 +1103,42 @@ pub fn repack(
     }
 
     // Collect the oids whose copy lives in an included pack, then build one new
-    // pack from them and rewrite the midx.
+    // pack from them and rewrite the midx. Objects stream through the writer's
+    // bounded compression windows instead of all being resident at once.
     let db = FileObjectDatabase::new(object_dir.clone(), format);
-    let mut inputs_oids = Vec::new();
-    for entry in &midx.objects {
-        if include
-            .get(entry.pack_int_id as usize)
-            .copied()
-            .unwrap_or(false)
-        {
-            inputs_oids.push(entry.oid);
-        }
-    }
-
-    let mut encoded = Vec::with_capacity(inputs_oids.len());
-    for oid in &inputs_oids {
-        encoded.push(db.read_object(oid)?);
-    }
-    let inputs: Vec<PackInput<'_>> = inputs_oids
+    let inputs_oids: Vec<ObjectId> = midx
+        .objects
         .iter()
-        .zip(&encoded)
-        .map(|(oid, object)| PackInput {
-            oid,
-            object: object.as_ref(),
+        .filter(|entry| {
+            include
+                .get(entry.pack_int_id as usize)
+                .copied()
+                .unwrap_or(false)
         })
+        .map(|entry| entry.oid)
         .collect();
+    let object_count = u32::try_from(inputs_oids.len())
+        .map_err(|_| GitError::InvalidFormat("too many objects to repack".into()))?;
 
-    let written = PackFile::write_packed_with_known_ids_and_options(
-        &inputs,
+    let mut pack_bytes = Vec::new();
+    let summary = PackFile::write_packed_from_source_to_writer(
+        inputs_oids.iter().copied(),
+        object_count,
         format,
         &PackWriteOptions::new(),
+        PackWriteLimits::default(),
+        |oid| db.read_object(oid),
+        &mut pack_bytes,
     )?;
-    let checksum = written.checksum.to_hex();
+    let checksum = summary.checksum.to_hex();
     let base = pack_dir.join(format!("pack-{checksum}"));
-    let positions = pack_order_index_positions(&written.entries);
-    let reverse_index = PackReverseIndex::write(format, &positions, &written.checksum)?;
-    fs::write(base.with_extension("pack"), &written.pack)?;
+    let positions = pack_order_index_positions(&summary.entries);
+    let reverse_index = PackReverseIndex::write(format, &positions, &summary.checksum)?;
+    fs::write(base.with_extension("pack"), &pack_bytes)?;
     fs::write(base.with_extension("rev"), &reverse_index)?;
-    fs::write(base.with_extension("idx"), &written.index)?;
+    fs::write(base.with_extension("idx"), &summary.index)?;
 
-    write_default_midx(&object_dir, format)
+    write_default_midx(&object_dir, format, &[])
 }
 
 pub fn verify(
@@ -1529,7 +1536,7 @@ pub fn expire(
         }
     }
 
-    let mut dropped_any = false;
+    let mut dropped = Vec::new();
     for (i, name) in midx.pack_names.iter().enumerate() {
         if count[i] != 0 {
             continue;
@@ -1538,16 +1545,23 @@ pub fn expire(
         if pack_has_keep(&pack_dir, name) || pack_is_cruft(&pack_dir, name) {
             continue;
         }
-        // Drop the pack and all its companions.
-        let stem = pack_dir.join(name);
-        for ext in ["pack", "idx", "rev", "bitmap", "mtimes", "keep"] {
-            let _ = fs::remove_file(stem.with_extension(ext));
-        }
-        dropped_any = true;
+        dropped.push(name.clone());
     }
 
-    if dropped_any {
-        write_default_midx(&object_dir, format)?;
+    if !dropped.is_empty() {
+        // Upstream rewrites the multi-pack-index BEFORE unlinking the expired
+        // packs: a crash (or parse failure) in between must never leave a live
+        // midx referencing deleted packs — our own verify would call that
+        // state corrupt. This mirrors the compaction order above, where the
+        // replacement layer is installed before the old ones are removed.
+        write_default_midx(&object_dir, format, &dropped)?;
+        for name in &dropped {
+            // Drop the pack and all its companions.
+            let stem = pack_dir.join(name);
+            for ext in ["pack", "idx", "rev", "bitmap", "mtimes", "keep"] {
+                let _ = fs::remove_file(stem.with_extension(ext));
+            }
+        }
     }
     Ok(())
 }

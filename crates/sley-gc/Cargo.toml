@@ -17,6 +17,7 @@ sley-index.workspace = true
 sley-object.workspace = true
 sley-odb.workspace = true
 sley-pack.workspace = true
+sley-procinfo.workspace = true
 sley-refs.workspace = true
 sley-rev.workspace = true
 sley-worktree.workspace = true

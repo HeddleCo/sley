@@ -262,10 +262,13 @@ impl CountPackedObjectLookup {
                 self.summaries.as_slice(),
             )?);
         }
+        // A failed index load simply drops that pack from the lookup, so the
+        // slice can never be empty here — but fall back to "not packed" rather
+        // than panicking on the impossible case.
         Ok(self
             .indexes
-            .as_ref()
-            .expect("count pack indexes are loaded")
+            .as_deref()
+            .unwrap_or(&[])
             .iter()
             .any(|index| index.contains(oid)))
     }

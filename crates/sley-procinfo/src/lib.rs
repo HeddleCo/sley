@@ -33,6 +33,20 @@ pub fn duplicate_fd(fd: i32) -> std::io::Result<std::fs::File> {
     Ok(unsafe { std::fs::File::from_raw_fd(duplicated) })
 }
 
+#[cfg(unix)]
+#[must_use]
+pub fn process_alive(pid: u32) -> bool {
+    platform::process_alive(pid)
+}
+
+#[cfg(not(unix))]
+#[must_use]
+pub fn process_alive(_pid: u32) -> bool {
+    // No portable liveness probe on this platform; callers must fail toward
+    // "alive" (conservative for lock-recovery decisions).
+    true
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use std::mem::{MaybeUninit, size_of};
@@ -105,6 +119,19 @@ mod platform {
         names
     }
 
+    pub(super) fn process_alive(pid: u32) -> bool {
+        // kill(pid, 0) probes existence/permission without signaling: rc == 0
+        // means the process exists and we may signal it; EPERM means it exists
+        // but runs under another uid; ESRCH means no such process.
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 performs a read-only existence probe and touches no
+        // Rust-managed memory.
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
     fn proc_info(pid: libc::pid_t) -> Option<ProcInfo> {
         let mut proc = MaybeUninit::<ProcBsdInfo>::uninit();
         let size = size_of::<ProcBsdInfo>();
@@ -174,6 +201,13 @@ mod platform {
         names
     }
 
+    pub(super) fn process_alive(pid: u32) -> bool {
+        // /proc/<pid> existence is the safe liveness probe on Linux.
+        let mut path = proc_path(pid);
+        path.push("stat");
+        fs::metadata(path).is_ok()
+    }
+
     fn process_name(pid: u32) -> Option<String> {
         let mut path = proc_path(pid);
         path.push("comm");
@@ -216,6 +250,10 @@ mod platform {
 mod platform {
     pub(super) fn process_ancestry() -> Vec<String> {
         Vec::new()
+    }
+
+    pub(super) fn process_alive(_pid: u32) -> bool {
+        true
     }
 }
 

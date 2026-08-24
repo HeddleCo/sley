@@ -676,3 +676,252 @@ fn repack_d_keeps_repository_complete() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+fn commit_base_files(repo: &Path) {
+    write_file(repo, "f.txt", "hello\n");
+    git_ok(repo, &["add", "."]);
+    git_ok(repo, &["commit", "-qm", "base"]);
+}
+
+fn backdate_mtime(path: &Path, hours_ago: i64) {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_secs() as i64
+        - hours_ago * 3600;
+    filetime::set_file_mtime(
+        path,
+        filetime::FileTime::from_unix_time(stamp, 0),
+    )
+    .expect("backdate mtime");
+}
+
+/// A failing task must not leak maintenance.lock: after one failed run, the
+/// next run has to proceed instead of silently no-oping forever.
+#[test]
+fn maintenance_lock_removed_when_task_fails() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("maint-lock-fail");
+    let repo = root.join("repo");
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("utf8 repository path"),
+        ],
+    );
+    commit_base_files(&repo);
+    // A remote pointing nowhere makes the prefetch child fail hard.
+    git_ok(&repo, &["remote", "add", "origin", "/nonexistent/sley-no-such-remote"]);
+
+    let out = sley(&repo, &["maintenance", "run", "--task=prefetch"]);
+    assert!(
+        !out.status.success(),
+        "prefetch against a bogus remote unexpectedly succeeded"
+    );
+
+    let lock = repo.join(".git").join("objects").join("maintenance.lock");
+    assert!(!lock.exists(), "maintenance.lock leaked after task failure");
+
+    // The next run proceeds rather than being wedged by the stale lock.
+    let out = sley(&repo, &["maintenance", "run", "--task=pack-refs"]);
+    assert!(
+        out.status.success(),
+        "next run blocked by leaked lock: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A lock older than the staleness window counts as abandoned and is
+/// recovered; a fresh foreign lock still blocks.
+#[test]
+fn maintenance_stale_lock_is_recovered_fresh_lock_refused() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("maint-stale-lock");
+    let repo = root.join("repo");
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("utf8 repository path"),
+        ],
+    );
+    commit_base_files(&repo);
+    let lock = repo.join(".git").join("objects").join("maintenance.lock");
+
+    // Stale lock: backdate beyond the 12-hour window and expect recovery.
+    fs::write(&lock, b"424242 abandoned\n").expect("write stale lock");
+    backdate_mtime(&lock, 13);
+    let out = sley(&repo, &["maintenance", "run", "--task=pack-refs"]);
+    assert!(
+        out.status.success(),
+        "stale lock was not recovered: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!lock.exists(), "recovered lock should have been replaced");
+
+    // Fresh foreign lock: explicit runs refuse, --auto silently skips, and
+    // the foreign file is left untouched either way.
+    fs::write(&lock, b"in use\n").expect("write fresh lock");
+    let out = sley(&repo, &["maintenance", "run", "--auto", "--task=pack-refs"]);
+    assert!(
+        out.status.success(),
+        "--auto against a live lock should exit cleanly: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read(&lock).expect("read foreign lock"),
+        b"in use\n",
+        "--auto run disturbed a live lock"
+    );
+    let out = sley(&repo, &["maintenance", "run", "--task=pack-refs"]);
+    assert!(
+        !out.status.success(),
+        "explicit run unexpectedly succeeded against a live lock"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("'maintenance' lock held by another process"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// schedule.lock gets the same treatment as maintenance.lock.
+#[test]
+fn maintenance_schedule_lock_is_recovered_when_stale() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("maint-schedule-lock");
+    let repo = root.join("repo");
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("utf8 repository path"),
+        ],
+    );
+    let lock = repo.join(".git").join("objects").join("schedule.lock");
+
+    fs::write(&lock, b"424242 abandoned\n").expect("write stale schedule.lock");
+    backdate_mtime(&lock, 13);
+    let out = Command::new(sley_testkit::sley_bin!())
+        .current_dir(&repo)
+        .args(["maintenance", "start"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", root.join("global-config"))
+        .env("HOME", &root)
+        .env("XDG_CONFIG_HOME", root.join("xdg"))
+        .env(
+            "GIT_TEST_MAINT_SCHEDULER",
+            "crontab:true,systemctl:true,launchctl:true,schtasks:true",
+        )
+        .output()
+        .expect("run maintenance start");
+    assert!(
+        out.status.success(),
+        "stale schedule.lock was not recovered: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!lock.exists(), "recovered schedule.lock should be gone");
+
+    // A fresh schedule.lock still refuses registration.
+    fs::write(&lock, b"in use\n").expect("write fresh schedule.lock");
+    let out = Command::new(sley_testkit::sley_bin!())
+        .current_dir(&repo)
+        .args(["maintenance", "start"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", root.join("global-config"))
+        .env("HOME", &root)
+        .env("XDG_CONFIG_HOME", root.join("xdg"))
+        .env(
+            "GIT_TEST_MAINT_SCHEDULER",
+            "crontab:true,systemctl:true,launchctl:true,schtasks:true",
+        )
+        .output()
+        .expect("run maintenance start");
+    assert!(
+        !out.status.success(),
+        "fresh schedule.lock did not block registration"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(
+            "Another scheduled git-maintenance(1) process seems to be running"
+        ),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(lock.exists(), "fresh foreign schedule.lock was removed");
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// SHA-256 repositories must trigger the loose-objects auto task: the loose
+/// object suffix length follows the hash length (62 hex chars), not SHA-1's 38.
+#[test]
+fn maintenance_loose_objects_auto_triggers_on_sha256_repo() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("maint-sha256-loose");
+    let repo = root.join("repo");
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            "--object-format=sha256",
+            repo.to_str().expect("utf8 repository path"),
+        ],
+    );
+    commit_base_files(&repo);
+    git_ok(
+        &repo,
+        &["config", "maintenance.loose-objects.auto", "1"],
+    );
+
+    let out = sley(&repo, &["maintenance", "run", "--auto", "--task=loose-objects"]);
+    assert!(
+        out.status.success(),
+        "sha256 loose-objects maintenance failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The loose object must now live in a loose-* batch pack.
+    let pack_dir = repo.join(".git").join("objects").join("pack");
+    let loose_packs: Vec<PathBuf> = fs::read_dir(&pack_dir)
+        .expect("read pack dir")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("loose-") && name.ends_with(".pack"))
+        })
+        .collect();
+    assert!(
+        !loose_packs.is_empty(),
+        "loose-objects task packed nothing on a sha256 repo"
+    );
+
+    // The packed object must remain readable afterwards.
+    let fsck = git(&repo, &["fsck", "--no-progress"]);
+    assert!(
+        fsck.status.success(),
+        "git fsck failed after sha256 loose-objects maintenance: {}",
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+
+    fs::remove_dir_all(&root).ok();
+}

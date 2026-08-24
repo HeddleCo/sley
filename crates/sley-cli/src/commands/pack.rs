@@ -1306,18 +1306,6 @@ pub(crate) fn cmd_gc(cli_session: &crate::session::CliSession, args: &[String]) 
         if gc_engine::gc_recent_log_blocks_auto(&common_git_dir, &config)? {
             return Ok(());
         }
-        if gc_engine::gc_lock_held(&common_git_dir)? && !options.force {
-            return Ok(());
-        }
-        if commands::hooks::run_hook(
-            cli_session,
-            "pre-auto-gc",
-            commands::hooks::HookRun::default(),
-        )
-        .is_err()
-        {
-            return Ok(());
-        }
         if !options.quiet {
             if gc_engine::gc_should_detach(&config, options.detach) {
                 eprintln!("Auto packing the repository in background for optimum performance.");
@@ -1326,12 +1314,38 @@ pub(crate) fn cmd_gc(cli_session: &crate::session::CliSession, args: &[String]) 
             }
             eprintln!("See \"git help gc\" for manual housekeeping.");
         }
-    } else if gc_engine::gc_lock_held(&common_git_dir)? && !options.force {
-        eprintln!("fatal: gc is already running");
-        return Err(GitError::Exit(128));
     }
 
-    gc_engine::gc_write_pid(&common_git_dir)?;
+    // Single-step acquisition closes the old check-then-write race where two
+    // gcs could both pass a stale-lock probe and run concurrent `-d` repacks.
+    // With --force an existing foreign lock is left untouched (and not removed
+    // on exit): we never owned it.
+    let owned_pid_lock = if options.force {
+        None
+    } else {
+        match gc_engine::gc_acquire_pid_lock(&common_git_dir)? {
+            gc_engine::GcPidLock::Acquired => Some(common_git_dir.join("gc.pid")),
+            gc_engine::GcPidLock::Held => {
+                if options.auto {
+                    return Ok(());
+                }
+                eprintln!("fatal: gc is already running");
+                return Err(GitError::Exit(128));
+            }
+        }
+    };
+    if options.auto
+        && commands::hooks::run_hook(
+            cli_session,
+            "pre-auto-gc",
+            commands::hooks::HookRun::default(),
+        )
+        .is_err()
+    {
+        // Hook vetoed auto gc: release the lock we just acquired.
+        let _ = fs::remove_file(common_git_dir.join("gc.pid"));
+        return Ok(());
+    }
     let common_for_services = common_git_dir.clone();
     let git_dir_for_reflog = git_dir.clone();
     let mut services = GcServices {
@@ -1344,12 +1358,13 @@ pub(crate) fn cmd_gc(cli_session: &crate::session::CliSession, args: &[String]) 
             )
         },
         reflog_expire: &mut |expire_args: &[String]| {
-            let _ = crate::commands::refs::reflog_expire_at(
+            // Upstream treats reflog-expire failure as FAILED_RUN; propagate
+            // instead of double-swallowing with gc_before_repack.
+            crate::commands::refs::reflog_expire_at(
                 &git_dir_for_reflog,
                 expire_args,
                 cli_session.replace_objects(),
-            );
-            Ok(())
+            )
         },
         commit_graph_write_reachable: &mut |progress: bool| {
             let progress_arg = if progress { "--progress" } else { "--no-progress" };
@@ -1381,7 +1396,9 @@ pub(crate) fn cmd_gc(cli_session: &crate::session::CliSession, args: &[String]) 
         prune_expire,
         auto_mode,
     );
-    let _ = fs::remove_file(common_git_dir.join("gc.pid"));
+    if let Some(pid_path) = owned_pid_lock {
+        let _ = fs::remove_file(pid_path);
+    }
     if result.is_ok() && !options.auto {
         let _ = fs::remove_file(common_git_dir.join("gc.log"));
     }

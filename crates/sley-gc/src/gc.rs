@@ -5,8 +5,10 @@
 //!
 //! Lock/pid/log semantics are byte-preserved engine behavior:
 //!
-//! * `gc.pid` is written by [`gc_write_pid`] and removed only by the caller on
-//!   every exit path; the stale-pid probe (`>12h`) never deletes the file.
+//! * `gc.pid` is acquired single-step (create-new) by [`gc_acquire_pid_lock`],
+//!   records the holder pid, is probed for liveness before the twelve-hour
+//!   staleness window applies, and is removed only by the owner on every exit
+//!   path.
 //! * `gc.log` is cleared only after a successful non-auto run.
 //! * The maintenance/schedule lock early-return paths deliberately leak their
 //!   locks (see `maintenance::run_selected` / `update_background_schedule`);
@@ -155,6 +157,15 @@ pub fn gc_run_locked(
                 true,
                 options.expire_to.as_deref().map(Path::new),
             )?;
+            // Upstream's `repack --cruft` vacuums loose unreachable objects
+            // into the cruft side as well, so expired ones never survive a gc.
+            // Our cruft engine only classifies packed candidates; expire the
+            // stale loose remainder here (recent ones fail closed toward
+            // preservation inside gc_prune_expired_loose).
+            if let Some(spec) = prune_expire.as_deref() {
+                let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
+                gc_prune_expired_loose(common_git_dir, format, &roots, expire)?;
+            }
         }
         sley_odb::GcRepackMode::Reachable => {
             // gc.cruftPacks=false: repack reachable objects, then prune loose
@@ -173,7 +184,7 @@ pub fn gc_run_locked(
                     local: true,
                     force_rewrite: false,
                     pack_kept_objects: false,
-                    keep_pack_stems,
+                    keep_pack_stems: keep_pack_stems.clone(),
                 };
                 if let Some(result) = sley_odb::repack_reachable_objects_with_options(
                     common_git_dir,
@@ -186,6 +197,7 @@ pub fn gc_run_locked(
                         format,
                         &roots,
                         prune_expire.as_deref(),
+                        &keep_pack_stems,
                         &result,
                     )?;
                     sley_odb::install_repack_result(common_git_dir, format, &result, true)?;
@@ -338,7 +350,9 @@ pub fn gc_before_repack(
                 expire_args.join(" ")
             ),
         );
-        let _ = (services.reflog_expire)(&expire_args);
+        // Upstream aborts the run (FAILED_RUN) when reflog expire fails;
+        // swallowing here let gc report success while reflogs were stale.
+        (services.reflog_expire)(&expire_args)?;
     }
     let _ = (git_dir, format);
     Ok(())
@@ -450,40 +464,83 @@ fn gc_unpack_recent_unreachable_from_repack(
     format: ObjectFormat,
     roots: &[ObjectId],
     prune_expire: Option<&str>,
+    kept_pack_stems: &HashSet<String>,
     result: &sley_odb::RepackResult,
 ) -> Result<()> {
-    let Some(spec) = prune_expire else {
-        return Ok(());
+    // `--no-prune` (None) and `--prune=never` (i64::MIN) both mean every
+    // unreachable object must survive: upstream runs `repack -A -d` without an
+    // expiration, loosening ALL unreachable packed objects. The loosening here
+    // is exactly what keeps them alive when `install_repack_result(prune=true)`
+    // removes their source packs below — so these modes loosen everything
+    // instead of early-returning.
+    let expire = match prune_expire {
+        None => None,
+        Some(spec) => {
+            let parsed = parse_prune_expire(spec, "gc.pruneExpire")?;
+            if parsed == i64::MIN {
+                None
+            } else {
+                Some(parsed)
+            }
+        }
     };
-    let expire = parse_prune_expire(spec, "gc.pruneExpire")?;
-    if expire == i64::MIN {
-        return Ok(());
-    }
 
     let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    let mut preserve_roots = roots.to_vec();
-    preserve_roots.extend(prune_recent_object_roots(
-        &db,
-        common_git_dir,
-        format,
-        expire,
-    )?);
-    preserve_roots.extend(prune_recent_hook_roots(common_git_dir, format)?);
-    preserve_roots.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    preserve_roots.dedup();
-
     let new_index = sley_pack::PackIndex::parse(&result.idx, format)?;
     let newly_packed: HashSet<ObjectId> = new_index
         .entries
         .into_iter()
         .map(|entry| entry.oid)
         .collect();
-    let mut preserve =
-        sley_odb::collect_reachable_object_ids_tolerating_missing(&db, format, preserve_roots)?
+
+    let mut preserve = match expire {
+        None => {
+            // Everything packed that the new pack and the retained packs
+            // (bigPackThreshold / --keep-largest-pack) do not already carry is
+            // unreachable and must be materialized loose before its source
+            // pack is removed.
+            let mut unreachable =
+                sley_odb::packed_object_ids(repository_objects_dir(common_git_dir), format)?;
+            let pack_dir = repository_objects_dir(common_git_dir).join("pack");
+            for stem in kept_pack_stems {
+                let Ok(bytes) = fs::read(pack_dir.join(format!("{stem}.idx"))) else {
+                    continue;
+                };
+                if let Ok(index) = sley_pack::PackIndex::parse(&bytes, format) {
+                    for entry in index.entries {
+                        unreachable.remove(&entry.oid);
+                    }
+                }
+            }
+            unreachable
+                .into_iter()
+                .filter(|oid| !newly_packed.contains(oid))
+                .collect::<Vec<_>>()
+        }
+        Some(expire) => {
+            let mut preserve_roots = roots.to_vec();
+            preserve_roots.extend(prune_recent_object_roots(
+                &db,
+                common_git_dir,
+                format,
+                expire,
+            )?);
+            preserve_roots.extend(prune_recent_hook_roots(common_git_dir, format)?);
+            preserve_roots.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            preserve_roots.dedup();
+
+            sley_odb::collect_reachable_object_ids_tolerating_missing(
+                &db,
+                format,
+                preserve_roots,
+            )?
             .into_iter()
             .filter(|oid| !newly_packed.contains(oid))
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+        }
+    };
     preserve.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    preserve.dedup();
 
     for oid in preserve {
         let object = match db.read_object(&oid) {
@@ -613,27 +670,91 @@ pub fn gc_recent_log_blocks_auto(common_git_dir: &Path, config: &GitConfig) -> R
     }
 }
 
-pub fn gc_lock_held(common_git_dir: &Path) -> Result<bool> {
-    let path = common_git_dir.join("gc.pid");
-    let Ok(metadata) = fs::metadata(path) else {
-        return Ok(false);
-    };
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.elapsed().ok())
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(u64::MAX);
-    Ok(modified <= 12 * 60 * 60)
+/// `gc.pid` staleness window for files whose holder cannot be probed (no
+/// parsable pid, or no liveness facility on this platform).
+const GC_PID_STALE_SECONDS: u64 = 12 * 60 * 60;
+
+/// Outcome of attempting to take the `gc.pid` repository lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcPidLock {
+    /// This process now owns `gc.pid`; it must remove it on every exit path.
+    Acquired,
+    /// Another (live) gc holds the lock.
+    Held,
 }
 
-pub fn gc_write_pid(common_git_dir: &Path) -> Result<()> {
+/// Acquire the `gc.pid` lock in one step via `O_EXCL` creation, so the old
+/// check-then-write window (two gcs could pass the staleness probe and both
+/// proceed to concurrent `-d` repacks) cannot occur.
+///
+/// A pre-existing `gc.pid` is honored only while its recorded pid is alive;
+/// a dead holder (crashed gc) is recovered immediately instead of blocking
+/// manual gc runs for the full twelve-hour staleness window. Files without a
+/// parsable pid fall back to the mtime window.
+pub fn gc_acquire_pid_lock(common_git_dir: &Path) -> Result<GcPidLock> {
+    let path = common_git_dir.join("gc.pid");
+    match gc_try_create_pid_file(&path) {
+        Ok(()) => Ok(GcPidLock::Acquired),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            if !gc_pid_lock_abandoned(&path) {
+                return Ok(GcPidLock::Held);
+            }
+            // The recorded holder is gone: recover. If another gc wins the
+            // recovery race between our remove and re-create, its fresh
+            // create-new failure reports Held.
+            let _ = fs::remove_file(&path);
+            if gc_try_create_pid_file(&path).is_ok() {
+                Ok(GcPidLock::Acquired)
+            } else {
+                Ok(GcPidLock::Held)
+            }
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn gc_try_create_pid_file(path: &Path) -> io::Result<()> {
+    use io::Write as _;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
     let host = env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
-    fs::write(
-        common_git_dir.join("gc.pid"),
-        format!("{} {host}", std::process::id()),
-    )?;
-    Ok(())
+    writeln!(file, "{} {host}", std::process::id())
+}
+
+/// True when the existing `gc.pid` can be treated as abandoned: it records a
+/// dead pid, or (unparsable content) is older than [`GC_PID_STALE_SECONDS`].
+fn gc_pid_lock_abandoned(path: &Path) -> bool {
+    if let Ok(contents) = fs::read_to_string(path)
+        && let Some(pid_text) = contents.split_whitespace().next()
+        && let Ok(pid) = pid_text.parse::<u32>()
+        && pid != 0
+    {
+        return !gc_process_alive(pid);
+    }
+    gc_pid_file_age_seconds(path).is_some_and(|age| age >= GC_PID_STALE_SECONDS)
+}
+
+#[cfg(unix)]
+fn gc_process_alive(pid: u32) -> bool {
+    sley_procinfo::process_alive(pid)
+}
+
+#[cfg(not(unix))]
+fn gc_process_alive(_pid: u32) -> bool {
+    // No liveness facility: fail toward "held" and honor the staleness window.
+    true
+}
+
+fn gc_pid_file_age_seconds(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .elapsed()
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
 }
 
 fn trace_gc_repack(services: &GcServices, args: &[&str]) {
@@ -888,4 +1009,95 @@ fn display_git_config_path(git_dir: &Path, config_path: &Path) -> String {
         return ".git/config".to_string();
     }
     config_path.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod pid_lock_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!(
+            "sley-gc-pidlock-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// A pid that is guaranteed dead: reap a spawned process, then reuse its id.
+    fn reaped_pid() -> Option<u32> {
+        let mut child = Command::new("sleep").arg("30").spawn().ok()?;
+        let pid = child.id();
+        child.kill().ok()?;
+        child.wait().ok()?;
+        Some(pid)
+    }
+
+    #[test]
+    fn acquire_creates_pid_file_and_blocks_second_acquire() {
+        let dir = temp_dir("acquire");
+        assert_eq!(gc_acquire_pid_lock(&dir), Ok(GcPidLock::Acquired));
+        let contents = fs::read_to_string(dir.join("gc.pid")).expect("read gc.pid");
+        let expected = std::process::id().to_string();
+        assert_eq!(contents.split_whitespace().next(), Some(expected.as_str()));
+        assert_eq!(gc_acquire_pid_lock(&dir), Ok(GcPidLock::Held));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_pid_holder_is_recovered_immediately() {
+        let Some(dead) = reaped_pid() else {
+            return;
+        };
+        let dir = temp_dir("dead-pid");
+        fs::write(dir.join("gc.pid"), format!("{dead} crashed-host\n"))
+            .expect("write foreign gc.pid");
+        // A freshly-written file with a dead pid must not wait out the 12h
+        // mtime window.
+        assert_eq!(gc_acquire_pid_lock(&dir), Ok(GcPidLock::Acquired));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn live_pid_holder_blocks_even_when_file_is_fresh() {
+        let mut child = match Command::new("sleep").arg("60").spawn() {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let live = child.id();
+        let dir = temp_dir("live-pid");
+        fs::write(dir.join("gc.pid"), format!("{live} live-host\n")).expect("write gc.pid");
+        assert_eq!(gc_acquire_pid_lock(&dir), Ok(GcPidLock::Held));
+        assert!(dir.join("gc.pid").exists(), "foreign lock must be untouched");
+        fs::remove_dir_all(&dir).ok();
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    #[test]
+    fn unparsable_pid_falls_back_to_staleness_window() {
+        let dir = temp_dir("unparsable");
+        fs::write(dir.join("gc.pid"), b"not-a-pid\n").expect("write fresh gc.pid");
+        assert_eq!(gc_acquire_pid_lock(&dir), Ok(GcPidLock::Held));
+
+        // Backdate past the window: recoverable.
+        let path = dir.join("gc.pid");
+        let stale = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(GC_PID_STALE_SECONDS + 60))
+            .expect("stale timestamp");
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open gc.pid")
+            .set_modified(stale)
+            .expect("backdate gc.pid");
+        assert_eq!(gc_acquire_pid_lock(&dir), Ok(GcPidLock::Acquired));
+        fs::remove_dir_all(&dir).ok();
+    }
 }

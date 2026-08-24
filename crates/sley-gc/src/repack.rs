@@ -21,7 +21,10 @@ use sley_refs::{FileRefStore, RefTarget};
 
 use crate::gc::parse_gc_size;
 use crate::midx;
-use crate::prune::{prune_recent_hook_roots, prune_repack_shallow_file, prune_packed_loose_objects};
+use crate::prune::{
+    prune_head_root, prune_recent_hook_roots, prune_repack_shallow_file,
+    prune_packed_loose_objects, prune_worktree_git_dirs, reflog_roots_from_dir,
+};
 use crate::trace2::{self, perf_data};
 use crate::{common_git_dir_for_git_dir, GcServices, read_repo_config, repo_object_format, resolve_ref_to_oid, resolve_revision};
 
@@ -328,6 +331,17 @@ pub(crate) fn repack_pseudo_merge_groups(
 /// ref target, `HEAD`, both sides of every reflog entry, and the blobs in the
 /// index. Unresolvable roots are skipped (the closure walk also tolerates
 /// missing objects — stale reflogs are expected).
+///
+/// Like upstream, this examines *every* linked worktree: each worktree's
+/// `HEAD`, its index (cached/staged objects), and its own reflogs all anchor
+/// reachability. Without them a `repack -a -d` would drop commits that only a
+/// linked worktree's detached HEAD or staged files reference.
+///
+/// KNOWN GAP (documented, not fixed here): [`FileRefStore::list_refs`] walks
+/// only the current worktree's ref storage, so per-worktree refs (e.g.
+/// `refs/bisect/*` while a bisect is active in another worktree) are not
+/// collected either; upstream protects those. Closing this needs a sley-refs
+/// API for enumerating per-worktree ref stores — see review #232 (FIX-C M2).
 pub(crate) fn repack_traversal_roots(
     git_dir: &Path,
     common_git_dir: &Path,
@@ -348,24 +362,52 @@ pub(crate) fn repack_traversal_roots(
     // Indexed objects (upstream `--indexed-objects`): cache entries, the
     // cache-tree extension, and resolve-undo blobs all keep pending objects
     // alive across a repack (t7700 "pending objects are repacked appropriately").
-    if let Ok(bytes) = fs::read(git_dir.join("index"))
-        && let Ok(index) = sley_index::Index::parse(&bytes, format)
-    {
-        for entry in &index.entries {
-            roots.push(entry.oid);
+    roots.extend(index_traversal_roots(&git_dir.join("index"), format));
+    // Linked worktrees: upstream pack-objects examines every worktree's HEAD,
+    // index, and per-worktree reflogs by default. The current worktree is
+    // covered above (with replacement-aware HEAD resolution); the common dir
+    // and every worktrees/<id> admin dir get the raw treatment here.
+    for worktree_git_dir in prune_worktree_git_dirs(git_dir, common_git_dir)? {
+        if worktree_git_dir == git_dir {
+            continue;
         }
-        if let Ok(Some(cache_tree)) = index.cache_tree(format) {
-            collect_cache_tree_oids(&cache_tree, &mut roots);
+        if let Some(oid) = prune_head_root(&store, &worktree_git_dir, format)? {
+            roots.push(oid);
         }
-        if let Ok(records) = index.resolve_undo_records(format) {
-            for record in records {
-                for stage in record.stages.into_iter().flatten() {
-                    roots.push(stage.oid);
-                }
+        roots.extend(index_traversal_roots(
+            &worktree_git_dir.join("index"),
+            format,
+        ));
+        roots.extend(reflog_roots_from_dir(
+            &worktree_git_dir.join("logs"),
+            format,
+        )?);
+    }
+    Ok(roots)
+}
+
+fn index_traversal_roots(index_path: &Path, format: ObjectFormat) -> Vec<ObjectId> {
+    let mut roots = Vec::new();
+    let Ok(bytes) = fs::read(index_path) else {
+        return roots;
+    };
+    let Ok(index) = sley_index::Index::parse(&bytes, format) else {
+        return roots;
+    };
+    for entry in &index.entries {
+        roots.push(entry.oid);
+    }
+    if let Ok(Some(cache_tree)) = index.cache_tree(format) {
+        collect_cache_tree_oids(&cache_tree, &mut roots);
+    }
+    if let Ok(records) = index.resolve_undo_records(format) {
+        for record in records {
+            for stage in record.stages.into_iter().flatten() {
+                roots.push(stage.oid);
             }
         }
     }
-    Ok(roots)
+    roots
 }
 
 fn collect_cache_tree_oids(tree: &sley_index::CacheTree, roots: &mut Vec<ObjectId>) {
@@ -1222,9 +1264,9 @@ pub fn run_repack(
                 "--unpack-unreachable cannot be combined with --filter".into(),
             ));
         }
-        let roots = repack_roots
-            .as_deref()
-            .expect("all-object repacks prepared traversal roots");
+        let roots = repack_roots.as_deref().ok_or_else(|| {
+            GitError::Command("internal: all-object repack missing traversal roots".into())
+        })?;
         let keep_pack_stems: HashSet<String> = keep_packs.iter().cloned().collect();
         let options = sley_odb::RepackOptions {
             local,
@@ -1290,9 +1332,9 @@ pub fn run_repack(
     let result = if all && keep_unreachable {
         sley_odb::repack_all_objects(&common_git_dir, format)?
     } else if all {
-        let roots = repack_roots
-            .as_deref()
-            .expect("all-object repacks prepared traversal roots");
+        let roots = repack_roots.as_deref().ok_or_else(|| {
+            GitError::Command("internal: all-object repack missing traversal roots".into())
+        })?;
         let keep_pack_stems: HashSet<String> = keep_packs.iter().cloned().collect();
         let options = sley_odb::RepackOptions {
             local,
@@ -1385,10 +1427,10 @@ pub fn run_repack(
             (services.update_server_info)()?;
         }
     }
-    if all && prune {
-        let roots = repack_roots
-            .as_deref()
-            .expect("all-object repacks prepared traversal roots");
+    if all
+        && prune
+        && let Some(roots) = repack_roots.as_deref()
+    {
         prune_repack_shallow_file(&common_git_dir, format, roots)?;
     }
     let _ = quiet;

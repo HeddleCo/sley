@@ -1643,6 +1643,7 @@ dependencies = [
  "sley-object",
  "sley-odb",
  "sley-pack",
+ "sley-procinfo",
  "sley-refs",
  "sley-rev",
  "sley-worktree",

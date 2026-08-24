@@ -14,7 +14,6 @@ use std::process::Command;
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::{repository_objects_dir, FileObjectDatabase};
-use sley_odb::ObjectReader as _;
 use sley_refs::FileRefStore;
 
 use crate::{parse_reflog_expire_time, read_repo_config, resolve_ref_to_oid, resolve_revision};
@@ -190,7 +189,9 @@ pub fn prune_recent_object_roots(
         if i64::from(mtime) <= expire {
             continue;
         }
-        if db.read_object(&oid).is_ok() {
+        // Presence probe only: these ids come from the loose-object walk, so
+        // inflating full objects just to test existence is wasted work.
+        if db.loose().exists(&oid)? {
             roots.push(oid);
         }
     }
@@ -277,13 +278,12 @@ pub fn prune_object_is_expired(db: &FileObjectDatabase, oid: &ObjectId, expire: 
         return Ok(true);
     }
     let path = db.loose().object_path(oid)?;
-    let modified = fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
-        .unwrap_or(0);
-    Ok(modified <= expire)
+    let Some(mtime) = fs::metadata(path).ok().as_ref().and_then(file_mtime_seconds) else {
+        // An object we cannot stat must fail closed toward preservation, the
+        // way upstream skips objects whose mtime it cannot read.
+        return Ok(false);
+    };
+    Ok(mtime <= expire)
 }
 
 pub fn prune_temporary_files(path: &Path, expire: i64, dry_run: bool, verbose: bool) -> Result<()> {
@@ -301,7 +301,9 @@ pub fn prune_temporary_files(path: &Path, expire: i64, dry_run: bool, verbose: b
         }
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
-        if file_mtime_seconds(&metadata) > expire {
+        // An unreadable mtime fails closed toward preservation: skip the entry
+        // rather than treating it as ancient.
+        if file_mtime_seconds(&metadata).is_none_or(|mtime| mtime > expire) {
             continue;
         }
         if dry_run || verbose {
@@ -323,13 +325,14 @@ pub fn prune_temporary_files(path: &Path, expire: i64, dry_run: bool, verbose: b
     Ok(())
 }
 
-fn file_mtime_seconds(metadata: &fs::Metadata) -> i64 {
+/// Seconds since the unix epoch for the metadata's mtime, or `None` when the
+/// timestamp cannot be read (callers must fail closed toward preservation).
+fn file_mtime_seconds(metadata: &fs::Metadata) -> Option<i64> {
     metadata
         .modified()
         .ok()
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
-        .unwrap_or(0)
 }
 
 pub fn prune_packed_loose_objects(git_dir: &Path, format: ObjectFormat, dry_run: bool) -> Result<()> {
