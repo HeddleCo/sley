@@ -36,7 +36,7 @@ jobs:
   certify:
     # This label is intentionally dedicated: hosted runners are too variable
     # for blocking p95/p99 and 5% regression gates.
-    runs-on: [self-hosted, linux, x64, sley-performance]
+    runs-on: [self-hosted, linux, x64, heddleco]
     timeout-minutes: 480
 
     steps:
