@@ -28,7 +28,7 @@ concurrency:
 jobs:
   cargo-deny:
     name: cargo-deny
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, heddleco]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +42,7 @@ jobs:
 
   cargo-audit:
     name: cargo-audit
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, heddleco]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4

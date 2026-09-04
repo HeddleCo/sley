@@ -40,7 +40,7 @@ env:
 jobs:
   upstream-parity:
     name: Upstream parity (curated oracle comparison)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, heddleco]
     # The manifest currently resolves 891 scripts. Keep enough room for both
     # isolated target runs, a cache-miss Git build, and long-running scripts.
     timeout-minutes: 180

@@ -33,7 +33,7 @@ jobs:
   # Cheap: `cargo metadata --no-deps` reads manifests only (no build).
   publish-list-check:
     name: Publish crate-list check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, heddleco]
     timeout-minutes: 10
 
     steps:
@@ -70,7 +70,7 @@ jobs:
   # parallelism cost.
   check-and-test:
     name: Check & test
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, heddleco]
     timeout-minutes: 60
 
     steps:
