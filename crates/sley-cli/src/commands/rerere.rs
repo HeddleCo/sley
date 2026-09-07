@@ -10,9 +10,9 @@
 
 use crate::commands::cli_options::opt_bool;
 use crate::*;
-use sley::plumbing::{sley_diff_merge, sley_worktree};
 use sley_options::{OptionSpec, parse_options};
 use std::io;
+use {sley_diff_merge, sley_worktree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RerereSubcommand {

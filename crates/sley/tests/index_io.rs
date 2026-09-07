@@ -1,3 +1,5 @@
+#![cfg(feature = "full")]
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,7 +34,7 @@ impl Drop for TempDir {
 }
 
 fn index_path(repo: &Repository) -> PathBuf {
-    sley::plumbing::sley_worktree::repository_index_path(repo.git_dir())
+    sley_worktree::repository_index_path(repo.git_dir())
 }
 
 fn index_lock_path(repo: &Repository) -> PathBuf {

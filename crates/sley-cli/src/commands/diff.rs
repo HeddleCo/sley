@@ -1,7 +1,7 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_config, sley_index, sley_rev, sley_worktree};
+use {sley_config, sley_index, sley_rev, sley_worktree};
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -607,7 +607,7 @@ impl WhitespaceRuleResolver {
     /// Resolve the effective rule for `path`. A conflicting attribute *value*
     /// is fatal (git `die`s), like a conflicting `core.whitespace`.
     pub(crate) fn rule_for_path(&self, path: &[u8]) -> Result<sley_diff_merge::ws::WsRule> {
-        use sley::plumbing::sley_diff_merge::ws::{WsAttr, resolve_whitespace_rule};
+        use sley_diff_merge::ws::{WsAttr, resolve_whitespace_rule};
         let Some(matcher) = &self.matcher else {
             return Ok(self.config_rule);
         };
@@ -627,7 +627,7 @@ impl WhitespaceRuleResolver {
     }
 
     fn check_rules_for_path(&self, path: &[u8]) -> Result<DiffCheckRules> {
-        use sley::plumbing::sley_diff_merge::ws::{WsAttr, resolve_whitespace_rule};
+        use sley_diff_merge::ws::{WsAttr, resolve_whitespace_rule};
         let Some(matcher) = &self.matcher else {
             return Ok(DiffCheckRules {
                 whitespace: self.config_rule,
@@ -810,7 +810,7 @@ fn check_one_diff(
     rule: sley_diff_merge::ws::WsRule,
     conflict_marker_size: usize,
 ) -> Result<bool> {
-    use sley::plumbing::sley_diff_merge::ws;
+    use sley_diff_merge::ws;
     let old = sley_diff_merge::split_lines(old_content);
     let new = sley_diff_merge::split_lines(new_content);
     let ops = sley_diff_merge::myers_diff_lines(&old, &new);

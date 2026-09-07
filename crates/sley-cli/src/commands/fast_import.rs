@@ -34,10 +34,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use crate::*;
-use sley::plumbing::{sley_config, sley_odb, sley_pack, sley_refs, sley_rev};
 use std::cell::RefCell;
 use std::io::{BufRead, Write};
 use std::sync::Arc;
+use {sley_config, sley_odb, sley_pack, sley_refs, sley_rev};
 
 #[derive(Default)]
 struct FastImportOptions {

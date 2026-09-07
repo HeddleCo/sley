@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, BufRead, Write};
 
-use sley::plumbing::sley_sequencer::history::{
+use sley_sequencer::history::{
     HistoryRefScope, HistoryRewordAnalysis, HistoryRewordRequest, HistorySplitAnalysis,
     HistorySplitRequest, HistorySplitSelection, analyze_history_reword, analyze_history_split,
     execute_history_reword, execute_history_split, validate_history_reword_targets,

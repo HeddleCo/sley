@@ -15,8 +15,8 @@ use super::resolve::{RemoteCommandContext, local_remote_git_dir, ls_remote_git_d
 use crate::commands::config_cmd::{ConfigKey, config_set_value};
 use crate::remote::{remote_config_values, resolve_remote_fetch_url, rewrite_url_with_config};
 use crate::*;
-use sley::plumbing::sley_odb::ObjectReader;
-use sley::plumbing::sley_remote::{FetchOptions, PackGenerationProgress, TransferProgress};
+use sley_odb::ObjectReader;
+use sley_remote::{FetchOptions, PackGenerationProgress, TransferProgress};
 use std::env;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};

@@ -7,9 +7,9 @@
 //! lives with the log output code.
 
 use crate::*;
-use sley::plumbing::sley_rev::{CommitRecord, resolve_tree_path_entry};
 use sley_rev::line_log::{FileRange, RangeList, is_funcname_line, line_at, line_ends};
 pub(crate) use sley_rev::line_log::{LineLogResult, PrintedFile};
+use sley_rev::{CommitRecord, resolve_tree_path_entry};
 
 /// One `-L` argument before resolution: the raw `<range>:<file>` string.
 #[derive(Debug, Clone)]

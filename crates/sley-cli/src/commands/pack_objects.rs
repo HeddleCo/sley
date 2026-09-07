@@ -18,15 +18,15 @@
 //! reuse exactly like upstream.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_config, sley_core, sley_odb, sley_rev};
 use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::io::IsTerminal;
 use std::sync::Arc;
+use {sley_config, sley_core, sley_odb, sley_rev};
 
 use crate::*;
 use sley::PackWriteOptions;
-use sley::plumbing::sley_pack::{PackInput, PackReverseIndex, pack_order_index_positions};
+use sley_pack::{PackInput, PackReverseIndex, pack_order_index_positions};
 
 struct PackObjectsOptions {
     base_name: Option<String>,

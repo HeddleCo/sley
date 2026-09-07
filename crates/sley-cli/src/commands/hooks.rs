@@ -5,7 +5,7 @@ use crate::{ObjectFormat, ObjectId, Result};
 pub(crate) use sley::hooks::{
     HookRun, KNOWN_HOOKS, run_reference_transaction_hook_at, run_traditional_hook_at,
 };
-use sley::plumbing::sley_config::GitConfig;
+use sley_config::GitConfig;
 use std::path::Path;
 
 fn hook_environment(cli_session: &CliSession) -> Result<sley::hooks::HookEnvironment> {

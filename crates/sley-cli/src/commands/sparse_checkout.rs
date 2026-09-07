@@ -21,13 +21,13 @@
 use crate::*;
 
 use crate::commands::ref_command_stream::unquote_c_style;
-use sley::plumbing::sley_worktree::{
+use sley_worktree::{
     SparseCheckout, SparseCheckoutMode, apply_sparse_checkout_with_mode, path_in_sparse_checkout,
 };
 
 // Bytes↔path conversion helpers live in `sley_core::paths` (canonical);
 // the local copies were consolidated there.
-use sley::plumbing::sley_core::paths::{bytes_to_os_path, os_str_to_bytes};
+use sley_core::paths::{bytes_to_os_path, os_str_to_bytes};
 
 const SPARSE_USAGE: &str = "usage: git sparse-checkout (init | list | set | add | reapply | disable | check-rules | clean) [<options>]";
 

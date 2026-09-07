@@ -306,7 +306,7 @@ fn resolve_candidate(
     } else {
         return Ok(None);
     };
-    let common_dir = sley_formats::repository_common_dir(&git_dir, false)?;
+    let common_dir = crate::repository_common_dir(&git_dir, false)?;
     let (worktree, bare) = match kind {
         CandidateKind::Worktree => (path.parent().map(Path::to_path_buf), false),
         CandidateKind::Bare | CandidateKind::Exact => {
@@ -686,29 +686,13 @@ mod tests {
         options.across_filesystem = true;
         let outer = discover_repository_with_device(&start, options, simulated_device)
             .expect("unbounded discovery reaches outer repository");
-        let unbounded_paths =
-            crate::untracked_paths(temp.path(), outer.git_dir(), sley_core::ObjectFormat::Sha1)
-                .expect("walk outer worktree");
-        assert!(
-            unbounded_paths.contains(&b"sibling/outside.txt".to_vec()),
-            "fixture must prove an unbounded discovery includes the outer sibling"
-        );
-
+        assert_eq!(outer.worktree(), Some(temp.path()));
+        assert!(sibling_file.starts_with(outer.worktree().expect("outer worktree")));
         options.across_filesystem = false;
         let bounded = discover_repository_with_device(&start, options, simulated_device);
-        let bounded_paths = match bounded {
-            Ok(found) => crate::untracked_paths(
-                found.worktree().expect("discovered worktree"),
-                found.git_dir(),
-                sley_core::ObjectFormat::Sha1,
-            )
-            .expect("walk discovered worktree"),
-            Err(GitError::NotFound(_)) => Vec::new(),
-            Err(err) => panic!("unexpected discovery error: {err}"),
-        };
         assert!(
-            !bounded_paths.contains(&b"sibling/outside.txt".to_vec()),
-            "filesystem-bound discovery must never report a sibling outside the mounted worktree"
+            matches!(bounded, Err(GitError::NotFound(_))),
+            "filesystem-bound discovery must not expose the outer worktree"
         );
     }
 

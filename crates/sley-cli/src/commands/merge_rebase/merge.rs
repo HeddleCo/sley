@@ -1,5 +1,5 @@
 use super::*;
-use sley::plumbing::{sley_config, sley_core, sley_index, sley_refs, sley_rev, sley_worktree};
+use {sley_config, sley_core, sley_index, sley_refs, sley_rev, sley_worktree};
 
 /// Repository-scoped handles shared by one merge-family command invocation.
 ///
@@ -2645,7 +2645,7 @@ pub(crate) fn directory_renames_config(config: &GitConfig) -> sley_diff_merge::D
 }
 
 fn directory_renames_from_config(config: &GitConfig) -> sley_diff_merge::DirectoryRenames {
-    use sley::plumbing::sley_diff_merge::DirectoryRenames;
+    use sley_diff_merge::DirectoryRenames;
     let value = config
         .get("merge", None, "directoryRenames")
         .map(str::to_string);

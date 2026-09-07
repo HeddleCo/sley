@@ -5,8 +5,8 @@ use std::fs;
 use std::io::{self};
 use std::path::{Path, PathBuf};
 
-use sley::plumbing::sley_config;
 use sley::{GitError, Result};
+use sley_config;
 use sley_transport::{
     CredentialOpType, GitCredential, cmd_credential_cache as transport_cmd_credential_cache,
     cmd_credential_cache_daemon as transport_cmd_credential_cache_daemon,

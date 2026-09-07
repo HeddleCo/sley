@@ -1,7 +1,7 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
 use crate::*;
-use sley::plumbing::{sley_core, sley_index, sley_worktree};
+use {sley_core, sley_index, sley_worktree};
 
 mod interactive;
 

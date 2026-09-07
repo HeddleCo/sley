@@ -13,25 +13,31 @@ sley-object.workspace = true
 sley-config.workspace = true
 sley-diff-merge.workspace = true
 sley-formats.workspace = true
-sley-grep.workspace = true
-sley-hooks.workspace = true
+sley-grep = { workspace = true, optional = true }
+sley-hooks = { workspace = true, optional = true }
 sley-index.workspace = true
-sley-notes.workspace = true
+sley-notes = { workspace = true, optional = true }
 sley-odb.workspace = true
 sley-pack.workspace = true
-sley-pretty.workspace = true
+sley-pretty = { workspace = true, optional = true }
 sley-protocol.workspace = true
 sley-refs.workspace = true
 sley-rev.workspace = true
-sley-sequencer.workspace = true
-sley-worktree.workspace = true
+sley-sequencer = { workspace = true, optional = true }
+sley-worktree = { workspace = true, optional = true }
 sley-remote = { workspace = true, optional = true }
 
 [features]
-default = ["remote", "mmap", "fast-sha1"]
+default = ["mmap", "fast-sha1"]
+# Explicit porcelain surfaces. The compatibility executable enables full.
+worktree = ["dep:sley-worktree"]
+history-editing = ["worktree", "dep:sley-sequencer", "dep:sley-notes"]
+rendering = ["dep:sley-pretty", "dep:sley-grep"]
+hooks = ["worktree", "dep:sley-hooks"]
+full = ["remote", "worktree", "history-editing", "rendering", "hooks"]
 # Callable fetch/push/clone/ls-remote orchestration (heddle transport surface).
-# Enabled by default; disable with `default-features = false` for a smaller dep tree.
-remote = ["dep:sley-remote", "sley-remote/http"]
+# Opt in explicitly. Includes live checkout and receive-pack worktree behavior.
+remote = ["dep:sley-remote", "sley-remote/http", "worktree", "hooks"]
 # The (de)compression backend is the default-on zlib-rs (pure Rust, ~zlib-ng
 # speed, no C). The `pure-rust` miniz_oxide fallback lives on sley-odb / sley-pack
 # as a leaf-crate feature (`--no-default-features --features pure-rust`); it is

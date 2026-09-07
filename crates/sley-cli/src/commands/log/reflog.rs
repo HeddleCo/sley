@@ -1,5 +1,5 @@
 use super::*;
-use sley::plumbing::sley_rev;
+use sley_rev;
 
 pub(super) struct ReflogWalkOptions<'a> {
     pub(super) max_count: Option<usize>,

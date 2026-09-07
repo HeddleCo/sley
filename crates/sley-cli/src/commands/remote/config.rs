@@ -1,8 +1,8 @@
 //! Repository config read/write and remote name helpers.
 
 use crate::*;
-use sley::plumbing::{sley_config, sley_refs};
 use std::path::Path;
+use {sley_config, sley_refs};
 
 pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
     // Single effective-config reader shared with the library crates: resolves

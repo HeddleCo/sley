@@ -1,3 +1,5 @@
+#![cfg(feature = "full")]
+
 //! Engine parity tests: library APIs vs oracle git.
 //!
 //! Ported from `crates/sley-cli/tests/{rev_parse,cat_file,config}.rs` patterns.

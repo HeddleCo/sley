@@ -9,10 +9,10 @@ use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use sley::plumbing::sley_config::{ConfigEntry, ConfigSection, GitConfig};
-#[cfg(unix)]
-use sley::plumbing::sley_worktree::{FsmonitorDaemonSession, FsmonitorDaemonState};
 use sley::{GitError, Repository, Result};
+use sley_config::{ConfigEntry, ConfigSection, GitConfig};
+#[cfg(unix)]
+use sley_worktree::{FsmonitorDaemonSession, FsmonitorDaemonState};
 
 const USAGE: &str = "usage: scalar [-C <directory>] [-c <key>=<value>] <command> [<options>]";
 const CLONE_USAGE: &str = "usage: scalar clone [--single-branch] [--branch <main-branch>] [--full-clone]\n\t[--[no-]src] [--[no-]tags] [--[no-]maintenance] <url> [<enlistment>]";
@@ -391,7 +391,7 @@ fn stop_maintenance(worktree: &Path) -> Result<()> {
 fn trace_maintenance(args: &[&str]) {
     let mut argv = vec!["git".to_string(), "maintenance".to_string()];
     argv.extend(args.iter().map(|arg| (*arg).to_string()));
-    sley::plumbing::sley_core::trace2::child_start("scalar", &argv);
+    sley_core::trace2::child_start("scalar", &argv);
 }
 
 #[cfg(unix)]
@@ -496,9 +496,9 @@ fn remove_global_value(section: &str, key: &str, value: &str) -> Result<()> {
 
 fn edit_global_config(edit: impl FnOnce(&mut GitConfig)) -> Result<()> {
     let path = global_config_path()?;
-    sley::plumbing::sley_config::raw_edit::edit_config_file_locked(
+    sley_config::raw_edit::edit_config_file_locked(
         path,
-        sley::plumbing::sley_config::raw_edit::ConfigFileWriteOptions::default(),
+        sley_config::raw_edit::ConfigFileWriteOptions::default(),
         |original| {
             let mut config = if original.is_empty() {
                 GitConfig::default()
@@ -510,10 +510,8 @@ fn edit_global_config(edit: impl FnOnce(&mut GitConfig)) -> Result<()> {
         },
     )
     .map_err(|error| match error {
-        sley::plumbing::sley_config::raw_edit::ConfigFileEditError::Edit(error) => error,
-        sley::plumbing::sley_config::raw_edit::ConfigFileEditError::Write(error) => {
-            GitError::Io(error.to_string())
-        }
+        sley_config::raw_edit::ConfigFileEditError::Edit(error) => error,
+        sley_config::raw_edit::ConfigFileEditError::Write(error) => GitError::Io(error.to_string()),
     })
 }
 
@@ -651,7 +649,7 @@ fn clone(args: &[String], base: &Path) -> Result<()> {
         worktree.to_string_lossy().into_owned(),
     ])?;
     if parsed.maintenance {
-        sley::plumbing::sley_core::trace2::child_start(
+        sley_core::trace2::child_start(
             "scalar",
             &["git".into(), "maintenance".into(), "start".into()],
         );
@@ -743,7 +741,7 @@ fn trace_scalar_fetch(progress: bool, tags: bool) {
     if !tags {
         argv.push("--no-tags".into());
     }
-    sley::plumbing::sley_core::trace2::child_start("scalar", &argv);
+    sley_core::trace2::child_start("scalar", &argv);
 }
 
 fn clone_usage_error(message: &str) -> GitError {

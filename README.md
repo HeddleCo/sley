@@ -120,6 +120,11 @@ Linux certification commands.
 
 ## Architecture
 
+The facade defaults to repository layout, objects, refs, graph and pack operations.
+Porcelain is opt-in through `worktree`, `history-editing`, `rendering`, `hooks`,
+and `remote`; `full` enables the complete compatibility surface. See the
+[0.10 migration map](docs/SLEY_0.10_MIGRATION.md) for feature and import changes.
+
 The `sley::Repository` facade and engine crates are the embedder entry points.
 `sley-cli` still contains substantial command behavior alongside its
 argv/setup/dispatch and rendering code. Prefer

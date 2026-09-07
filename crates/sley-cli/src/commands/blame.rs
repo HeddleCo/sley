@@ -29,7 +29,7 @@
 //! `git blame` exactly, and for explicit revisions it always matches.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use sley::plumbing::{sley_index, sley_rev, sley_worktree};
+use {sley_index, sley_rev, sley_worktree};
 // Glob the crate root for shared plumbing (RepositoryContext, repository_abbrev,
 // FileObjectDatabase, FileRefStore, Commit, Tree, the identity/date formatting
 // helpers, and so on). See commands::stash for the rationale: a submodule can
@@ -37,7 +37,7 @@ use sley::plumbing::{sley_index, sley_rev, sley_worktree};
 // root is in scope here without re-listing it.
 use crate::*;
 use sley::Signature;
-use sley::plumbing::sley_rev::blame::{
+use sley_rev::blame::{
     BlameContentConverter, BlameObjectSource, BlameRequest, LineBlame, PreviousMap,
 };
 
@@ -844,7 +844,7 @@ fn parse_blame_args(args: &[String]) -> Result<BlameArgs> {
 /// Parse a `--diff-algorithm <value>` argument to a [`DiffAlgorithm`]. An
 /// unknown value is the same fatal git reports.
 fn parse_blame_diff_algorithm(value: &str) -> Result<sley_diff_merge::DiffAlgorithm> {
-    use sley::plumbing::sley_diff_merge::DiffAlgorithm;
+    use sley_diff_merge::DiffAlgorithm;
     Ok(match value {
         "myers" | "default" => DiffAlgorithm::Myers,
         "minimal" => DiffAlgorithm::Minimal,

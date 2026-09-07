@@ -2,7 +2,7 @@
 #![allow(clippy::expect_used)]
 
 use crate::*;
-use sley::plumbing::{sley_refs, sley_rev, sley_worktree};
+use {sley_refs, sley_rev, sley_worktree};
 
 use super::commit_graph::commit_graph_commit_time_from_committer;
 

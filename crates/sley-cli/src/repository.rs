@@ -5,9 +5,9 @@
 //! behavior in one place while preserving command-specific parsing and errors.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::{sley_core, sley_odb, sley_rev};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use {sley_core, sley_odb, sley_rev};
 
 use crate::sley_worktree;
 use sley::ObjectDatabase as FileObjectDatabase;

@@ -1,16 +1,16 @@
 //! `git fast-export` — emit a fast-import stream for the given revisions.
 
 use crate::*;
-use sley::plumbing::sley_diff_merge::{
+use sley_diff_merge::{
     DiffNameStatusOptions, NameStatus, NameStatusEntry, diff_name_status_empty_tree_with_options,
     diff_name_status_trees_with_options,
 };
-use sley::plumbing::sley_rev::revlist::{rev_list_topo_order, rev_list_walk_commits_with_missing};
-use sley::plumbing::sley_rev::{
+use sley_pathspec::{Pathspec, normalized_revwalk_pathspec};
+use sley_rev::revlist::{rev_list_topo_order, rev_list_walk_commits_with_missing};
+use sley_rev::{
     CommitRecord, SimplifyOptions, ancestry_path_on_set, peel_to_commit,
     simplify_history_with_bottoms,
 };
-use sley_pathspec::{Pathspec, normalized_revwalk_pathspec};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SignMode {

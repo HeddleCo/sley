@@ -160,7 +160,7 @@ pub(crate) fn git_trace_line(file_line: &str, message: &str) {
 /// leave an argument unquoted when every byte is alphanumeric or one of
 /// `+,-./:=@_^`; otherwise single-quote it, escaping `'` and `!` as
 /// `'\''`-style sequences. An empty argument becomes `''`.
-pub(crate) use sley::plumbing::sley_core::text::sq_quote_pretty as trace_quote_sq;
+pub(crate) use sley_core::text::sq_quote_pretty as trace_quote_sq;
 
 /// `HH:MM:SS.uuuuuu` local-time timestamp matching git's trace prefix.
 fn trace_timestamp() -> String {

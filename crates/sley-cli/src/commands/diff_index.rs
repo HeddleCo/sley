@@ -15,9 +15,9 @@
 //! `write_diff_stat`, etc.). This keeps every output mode byte-identical with
 //! `git diff` for the formats both commands share.
 
-use sley::plumbing::{sley_core, sley_diff_merge, sley_index, sley_rev};
 use std::io::{self, Write};
 use std::path::Path;
+use {sley_core, sley_diff_merge, sley_index, sley_rev};
 
 use sley::{GitError, ObjectFormat, ObjectId, Result};
 

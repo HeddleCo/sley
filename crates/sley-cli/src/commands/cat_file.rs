@@ -1,18 +1,18 @@
 //! `git cat-file`: inspect objects and run the batch object-query protocol.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use sley::plumbing::{sley_index, sley_rev, sley_worktree};
 use std::fmt::Write as _;
 use std::io::{self, BufRead, BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
+use {sley_index, sley_rev, sley_worktree};
 
 use super::args::{GitArgCursor, LongOption, option_takes_no_value, switch_requires_value};
 use crate::*;
 use sley::ObjectDatabase as FileObjectDatabase;
-use sley::plumbing::sley_object::ObjectType;
-use sley::plumbing::sley_odb::ObjectStorageInfo;
 use sley::{GitError, ObjectFormat, ObjectId, Result};
+use sley_object::ObjectType;
+use sley_odb::ObjectStorageInfo;
 
 pub(crate) fn cmd_cat_file(
     cli_session: &crate::session::CliSession,

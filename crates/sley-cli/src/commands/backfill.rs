@@ -8,16 +8,16 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{self, BufRead};
 use std::path::Path;
 
-use sley::plumbing::sley_object::{Commit, ObjectType, TreeEntries, tree_entry_object_type};
-use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
-use sley::plumbing::sley_rev::{
+use sley_object::{Commit, ObjectType, TreeEntries, tree_entry_object_type};
+use sley_odb::{FileObjectDatabase, ObjectReader};
+use sley_rev::{
     RevWalk, RevWalkDateWindow, RevWalkOrder, RevisionOptions, RevisionOrder, RevisionSetupContext,
     setup_revisions,
 };
-use sley::plumbing::{sley_remote, sley_rev, sley_worktree};
 use sley_worktree::{
     SparseCheckout, SparseCheckoutMode, path_in_sparse_checkout, worktree_root_for_git_dir,
 };
+use {sley_remote, sley_rev, sley_worktree};
 
 use crate::promisor_remote_names;
 use crate::*;

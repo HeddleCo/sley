@@ -9,8 +9,8 @@
 //! real command's output and exit codes.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::sley_rev;
-use sley::plumbing::sley_rev::name_rev::{
+use sley_rev;
+use sley_rev::name_rev::{
     CommitMetadataCache, RevName, Tip, committer_timestamp, name_all_tips, rev_name_string,
 };
 // Glob the crate root for shared plumbing; see commands::stash for rationale.

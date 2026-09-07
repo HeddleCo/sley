@@ -12,7 +12,7 @@ enum ColumnEnable {
 
 pub(crate) fn cmd_column(args: &[String]) -> Result<()> {
     let mut enable = ColumnEnable::Never;
-    let mut options = sley::plumbing::sley_pretty::ColumnOptions {
+    let mut options = sley_pretty::ColumnOptions {
         width: env::var("COLUMNS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -42,15 +42,15 @@ pub(crate) fn cmd_column(args: &[String]) -> Result<()> {
                         set_enable = true;
                     }
                     "plain" => {
-                        options.layout = sley::plumbing::sley_pretty::ColumnLayout::Plain;
+                        options.layout = sley_pretty::ColumnLayout::Plain;
                         set_layout = true;
                     }
                     "column" => {
-                        options.layout = sley::plumbing::sley_pretty::ColumnLayout::ColumnFirst;
+                        options.layout = sley_pretty::ColumnLayout::ColumnFirst;
                         set_layout = true;
                     }
                     "row" => {
-                        options.layout = sley::plumbing::sley_pretty::ColumnLayout::RowFirst;
+                        options.layout = sley_pretty::ColumnLayout::RowFirst;
                         set_layout = true;
                     }
                     "dense" => options.dense = true,
@@ -110,11 +110,11 @@ pub(crate) fn cmd_column(args: &[String]) -> Result<()> {
         ColumnEnable::Auto => io::stdout().is_terminal(),
     };
     if !enabled {
-        options.layout = sley::plumbing::sley_pretty::ColumnLayout::Plain;
+        options.layout = sley_pretty::ColumnLayout::Plain;
         options.indent.clear();
         options.line_terminator = vec![b'\n'];
     }
-    let output = sley::plumbing::sley_pretty::format_columns(&items, &options);
+    let output = sley_pretty::format_columns(&items, &options);
     io::stdout().write_all(&output)?;
     Ok(())
 }

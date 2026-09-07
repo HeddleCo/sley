@@ -4,10 +4,10 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
 
-use sley::plumbing::sley_object::{Commit, ObjectType};
-use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
-use sley::plumbing::sley_refs::{FileRefStore, RefUpdate, ReflogEntry, branch_ref_name};
 use sley::{GitError, ObjectFormat, ObjectId, ReferenceTarget as RefTarget, Result};
+use sley_object::{Commit, ObjectType};
+use sley_odb::{FileObjectDatabase, ObjectReader};
+use sley_refs::{FileRefStore, RefUpdate, ReflogEntry, branch_ref_name};
 
 use crate::commands::remote::read_repo_config;
 use crate::commit_subject_bytes;

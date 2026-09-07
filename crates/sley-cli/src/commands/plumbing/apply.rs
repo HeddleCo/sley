@@ -2,7 +2,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use crate::*;
-use sley::plumbing::{sley_core, sley_rev, sley_worktree};
+use {sley_core, sley_rev, sley_worktree};
 
 use super::add::add_intent_to_add;
 
@@ -2781,8 +2781,8 @@ fn apply_patch_whitespace(
     error_count: &mut usize,
     squelched: &mut usize,
 ) {
-    use sley::plumbing::sley_diff_merge::HunkLine;
-    use sley::plumbing::sley_diff_merge::ws;
+    use sley_diff_merge::HunkLine;
+    use sley_diff_merge::ws;
 
     let fixing = matches!(action, WsAction::Fix);
 

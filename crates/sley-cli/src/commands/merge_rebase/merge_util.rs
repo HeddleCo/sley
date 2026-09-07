@@ -1,6 +1,6 @@
 use super::*;
-use sley::plumbing::{sley_core, sley_diff_merge};
 use std::sync::Arc;
+use {sley_core, sley_diff_merge};
 
 // ===== git merge (3-way) =====
 //

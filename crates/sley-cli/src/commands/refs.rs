@@ -1,10 +1,10 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
-use sley::plumbing::{sley_config, sley_formats::ReftableWriteOptions, sley_refs, sley_rev};
 use std::cell::RefCell;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use {sley_config, sley_formats::ReftableWriteOptions, sley_refs, sley_rev};
 
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
@@ -1347,7 +1347,7 @@ pub(crate) fn update_server_info_at(git_dir: &Path, args: &[String]) -> Result<(
     let store = FileRefStore::new(&common_git_dir, format);
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let shared_repository =
-        sley::plumbing::sley_formats::SharedRepositoryPermissions::from_git_dir(&common_git_dir);
+        sley_formats::SharedRepositoryPermissions::from_git_dir(&common_git_dir);
 
     let info_dir = common_git_dir.join("info");
     shared_repository.create_dir_all(&info_dir)?;
@@ -1412,7 +1412,7 @@ fn update_server_info_file(
     path: &Path,
     content: &[u8],
     force: bool,
-    shared_repository: &sley::plumbing::sley_formats::SharedRepositoryPermissions,
+    shared_repository: &sley_formats::SharedRepositoryPermissions,
 ) -> Result<()> {
     if force || !fs::read(path).is_ok_and(|existing| existing == content) {
         fs::write(path, content)?;

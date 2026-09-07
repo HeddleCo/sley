@@ -1,7 +1,7 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
 use crate::*;
-use sley::plumbing::{sley_index, sley_worktree};
+use {sley_index, sley_worktree};
 
 use super::add::{
     active_sparse_checkout_for_add, add_git_path_bytes, add_index_entries_path_range,

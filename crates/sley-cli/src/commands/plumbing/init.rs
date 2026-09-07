@@ -1,7 +1,7 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
 use crate::*;
-use sley::plumbing::sley_config;
+use sley_config;
 
 fn init_repo_is_implicitly_bare(
     cli_session: &crate::session::CliSession,
@@ -370,7 +370,7 @@ pub(crate) fn cmd_init(
         init_config_git_dir.as_deref(),
     )?;
     let shared_repository = match shared_repository {
-        Some(value) => sley::plumbing::sley_formats::canonical_shared_repository_value(&value)?,
+        Some(value) => sley_formats::canonical_shared_repository_value(&value)?,
         None => None,
     };
     let template_dir = resolve_init_template_dir(

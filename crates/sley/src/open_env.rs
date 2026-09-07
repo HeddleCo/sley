@@ -4,7 +4,7 @@
 //! [`super::OpenOptions::respect_environment`] and [`super::Repository::open_from_environment`]
 //! route through this module so embedders and harnesses get git-correct layout
 //! resolution without a CLI front-end. The environment-discovery primitives
-//! themselves live in [`sley_worktree::discovery`] so the hook engine
+//! themselves live in [`sley_formats::discovery`] so the hook engine
 //! (`sley-hooks`) shares the exact same resolution rules.
 
 use std::env;
@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use sley_core::GitError;
-use sley_worktree::discovery::{
+use sley_formats::discovery::{
     discover_git_dir_respecting_environment, environment_git_dir, environment_work_tree,
     is_git_dir, resolve_explicit_git_dir, resolve_path_from_cwd,
 };

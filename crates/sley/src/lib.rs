@@ -8,33 +8,34 @@
 //! underlying plumbing objects ([`sley_odb::FileObjectDatabase`],
 //! [`sley_refs::FileRefStore`], [`sley_config::GitConfig`]) on demand.
 //!
-//! **Embedder surface** (feature `remote`, on by default):
+//! **Embedder surface** (`remote` is opt-in):
 //!
 //! * [`Repository::config_snapshot`] — full git config with `include` /
 //!   `includeIf` / `hasconfig:` resolution.
 //! * [`Repository::init_mirror`] — bare mirror defaults (`+refs/*:refs/*`,
 //!   `mirror = true` on `origin`).
 //! * [`Repository::copy_reachable_from`] — pack-based object transfer.
-//! * [`clone_repository`] — thin free-function clone of a resolved remote
-//!   (re-export of [`sley_remote::clone`]).
-//! * [`Repository::remote`] / [`remote::RemoteContext`] — URL rewriting and
-//!   [`sley_remote`] fetch/push/clone/ls-remote orchestration (HTTP v2 fetch,
+//! * `clone_repository` — thin free-function clone of a resolved remote
+//!   (re-export of `sley_remote::clone`).
+//! * `Repository::remote` / `remote::RemoteContext` — URL rewriting and
+//!   `sley_remote` fetch/push/clone/ls-remote orchestration (HTTP v2 fetch,
 //!   SSH, bundle fetch, thin-pack push). Porcelain paths on the facade
-//!   ([`Repository::push`], and future commit/checkout helpers) invoke git
-//!   hooks via [`hooks`] when a hook is configured.
+//!   (`Repository::push`, and future commit/checkout helpers) invoke git
+//!   hooks via `hooks` when a hook is configured.
 //! * Cancel — cooperative stream cancellation for pack receive/generate:
-//!   [`AtomicCancel`], [`CancelFlag`], [`CancellableRead`], [`OperationContext`],
+//!   [`AtomicCancel`], [`CancelFlag`], [`CancellableRead`], `OperationContext`,
 //!   plus `Repository::{fetch,push,push_actions}_with_cancel`.
 //! * [`pack`] / [`protocol`] — repository-free parallel pack indexing and
 //!   upload-pack sideband demultiplexing for custom storage pipelines.
-//! * [`hooks`] — traditional and config-defined hook discovery/execution.
+//! * `hooks` — traditional and config-defined hook discovery/execution.
 //! * [`OpenOptions::respect_environment`] / [`Repository::open_from_environment`]
 //!   — honor `GIT_DIR`, `GIT_WORK_TREE`, and related discovery env vars.
-//! * [`notes`] — git notes read/write for round-trip fidelity.
+//! * `notes` — git notes read/write for round-trip fidelity.
 //!
-//! For power users the engine crates are re-exported under [`plumbing`] (and the
-//! most common types are re-exported at the crate root), so a single
-//! `git = { path = ... }` dependency is enough to reach the whole stack.
+//! The default surface provides repository layout, configuration, objects, refs,
+//! revision graphs and packs. Enable `worktree`, `history-editing`, `rendering`,
+//! `hooks`, or `remote` for their corresponding operations; `full` enables all.
+//! Depend directly on an engine crate for APIs outside this focused facade.
 //!
 //! ```no_run
 //! use sley::Repository;
@@ -55,11 +56,14 @@ mod diff;
 /// Hook engine ([`sley_hooks`]) — traditional `$GIT_DIR/hooks/<name>` scripts
 /// and configured `hook.*` commands, with `git hook list` / `run` porcelain.
 /// Re-exported unchanged so embedder paths (`sley::hooks::*`) stay stable.
+#[cfg(feature = "hooks")]
 pub mod hooks {
     pub use sley_hooks::*;
 }
+#[cfg(feature = "worktree")]
 mod index_io;
 mod local_clone;
+#[cfg(feature = "history-editing")]
 mod notes_repo;
 mod objects;
 mod open_env;
@@ -68,6 +72,7 @@ mod refs;
 mod refspec;
 mod remote_edit;
 mod rev_graph;
+#[cfg(feature = "worktree")]
 mod status_plan;
 mod tags;
 
@@ -90,14 +95,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeBuilder};
-use sley_odb::{
-    FileObjectDatabase, ObjectReader, ObjectReplacements, ObjectWriter, install_reachable_pack,
-};
+use sley_odb::{FileObjectDatabase, ObjectReplacements, install_reachable_pack};
 use sley_refs::{FileRefStore, RefTarget};
 use sley_rev::ResolvedTreePath;
+#[cfg(feature = "history-editing")]
 use sley_sequencer::create_annotated_tag;
 
 /// Git notes read/write ([`sley_notes`]).
+#[cfg(feature = "history-editing")]
 pub mod notes {
     pub use sley_notes::*;
 }
@@ -119,33 +124,6 @@ pub mod protocol {
     };
 }
 
-/// Re-exports of the underlying plumbing crates for callers that need direct
-/// access to the engine. Everything reachable through [`Repository`] is built
-/// from these, and they remain available for the operations the facade does not
-/// (yet) wrap.
-pub mod plumbing {
-    pub use sley_config;
-    pub use sley_core;
-    pub use sley_diff_merge;
-    pub use sley_diff_merge::format;
-    pub use sley_formats;
-    pub use sley_grep;
-    pub use sley_hooks;
-    pub use sley_index;
-    pub use sley_notes;
-    pub use sley_object;
-    pub use sley_odb;
-    pub use sley_pack;
-    pub use sley_pretty;
-    pub use sley_protocol;
-    pub use sley_refs;
-    #[cfg(feature = "remote")]
-    pub use sley_remote;
-    pub use sley_rev;
-    pub use sley_sequencer;
-    pub use sley_worktree;
-}
-
 // The most frequently used plumbing types are also re-exported at the crate root
 // so the common path (`use sley::{Repository, ObjectId, ...}`) stays short.
 pub use sley_config::GitConfig;
@@ -154,25 +132,30 @@ pub use sley_core::{
     GitError, GitTime, MissingObjectContext, MissingObjectKind, NotFoundKind, ObjectFormat,
     ObjectId, ResourceLimitKind, Result, Signature, StreamControl,
 };
+#[cfg(feature = "rendering")]
 pub use sley_diff_merge::format as diff_format;
 pub use sley_diff_merge::{DiffNameStatusOptions, NameStatusEntry};
+use sley_formats::discovery::{
+    DiscoveredRepository, RepositoryDiscoveryOptions, RepositoryDiscoverySafety,
+    discover_repository, is_git_dir, resolve_exact_git_dir,
+};
+#[cfg(feature = "rendering")]
 pub use sley_grep as grep;
 pub use sley_index::{Index, IndexEntry, Stage as IndexStage};
 pub use sley_object::{
     Commit as CommitObject, ObjectType as GitObjectType, Tag as TagObject, Tree as TreeObject,
 };
 pub use sley_object::{EntryKind, TreeBuilder as TreeEditor};
-pub use sley_odb::FileObjectDatabase as ObjectDatabase;
+pub use sley_odb::{FileObjectDatabase as ObjectDatabase, ObjectReader, ObjectWriter};
 pub use sley_pack::{PackWriteLimits, PackWriteOptions};
+#[cfg(feature = "rendering")]
 pub use sley_pretty as pretty;
 pub use sley_refs::{
     FileRefStore as RefStore, RefDeleteError, RefPrecondition, RefTarget as ReferenceTarget,
 };
+#[cfg(feature = "history-editing")]
 pub use sley_sequencer::TagCreate;
-use sley_worktree::discovery::{
-    DiscoveredRepository, RepositoryDiscoveryOptions, RepositoryDiscoverySafety,
-    discover_repository, is_git_dir, resolve_exact_git_dir,
-};
+#[cfg(feature = "worktree")]
 pub use sley_worktree::{
     AtomicMetadataWriteOptions, AtomicMetadataWriteResult, IndexStatProbe, IndexStatProbeCache,
     ShortStatusEntry, ShortStatusOptions, ShortStatusRow, StatusIgnoredMode, StatusUntrackedMode,
@@ -185,10 +168,12 @@ pub use config_edit::{
     ConfigValue, RemoteConfig, RemoteConfigRefusal, RemoteConfigRemove, RemoteConfigSet,
     RemoteConfigSnapshot, RemoteConfigSource, RemoteConfigValue, WorktreeConfig,
 };
+#[cfg(feature = "hooks")]
 pub use hooks::{
     HookEnvironment, HookRun, KNOWN_HOOKS, cmd_hook, hook_exists, run_hook, run_hook_l,
     run_post_index_change_hook, run_reference_transaction_hook_at, run_traditional_hook_at,
 };
+#[cfg(feature = "worktree")]
 pub use index_io::{IndexError, IndexWriteError, IndexWriteOptions, IndexWriteResult};
 pub use local_clone::{LocalCloneOptions, LocalCloneSummary, clone_local_to_bare};
 pub use objects::{BlobStore, LoadedObject};
@@ -202,6 +187,7 @@ pub use refs::{
 };
 pub use refspec::{NegativeRefSpec, RefSpec};
 pub use rev_graph::{ReachableCommit, ReachableCommitOptions, RevGraph};
+#[cfg(feature = "worktree")]
 pub use status_plan::{OwnedStatusRow, StatusCode, StatusPlan, StatusPlanBuilder, StatusRow};
 pub use tags::{
     TagQueryEntry, TagQueryError, TagQueryOptions, TagQueryOutcome, TagQueryResult,
@@ -527,10 +513,10 @@ impl DiscoveryPolicy {
 /// new repository).
 ///
 /// Porcelain operations exposed on this type run git hooks when configured:
-/// [`Repository::push`] (and future commit/checkout helpers) invoke the
-/// matching `pre-*` / `post-*` hooks through [`hooks`], matching CLI behavior.
+/// `Repository::push` (and future commit/checkout helpers) invoke the
+/// matching `pre-*` / `post-*` hooks through `hooks`, matching CLI behavior.
 /// Low-level helpers ([`Repository::write_object`], [`Repository::apply_ref_changes`],
-/// etc.) do not run hooks — callers opt in explicitly via [`run_hook`].
+/// etc.) do not run hooks — callers opt in explicitly via `run_hook`.
 ///
 /// The handle is cheap to clone and shares a session-scoped object database
 /// ([`Repository::objects`]) whose read caches survive across calls until
@@ -847,7 +833,7 @@ impl Repository {
         if let Some(work_tree) = &self.work_tree_override {
             return Some(work_tree.clone());
         }
-        sley_worktree::worktree_root_for_git_dir(&self.git_dir)
+        sley_formats::worktree_root_for_git_dir(&self.git_dir)
             .ok()
             .flatten()
     }
@@ -855,7 +841,7 @@ impl Repository {
     /// Whether this repository is shallow — created or fetched with a depth
     /// limit, so a `shallow` file records its grafted history boundaries.
     pub fn is_shallow(&self) -> bool {
-        sley_worktree::is_shallow_repository(&self.git_dir)
+        self.common_dir.join("shallow").exists()
     }
 
     /// Return short-status entries for this repository's working tree using
@@ -863,6 +849,7 @@ impl Repository {
     ///
     /// Bare repositories have no working tree and return
     /// [`GitError::Unsupported`].
+    #[cfg(feature = "worktree")]
     pub fn short_status(&self) -> Result<Vec<ShortStatusEntry>> {
         self.short_status_with_options(ShortStatusOptions::default())
     }
@@ -872,6 +859,7 @@ impl Repository {
     ///
     /// Bare repositories have no working tree and return
     /// [`GitError::Unsupported`].
+    #[cfg(feature = "worktree")]
     pub fn stream_short_status<F>(&self, emit: F) -> Result<()>
     where
         F: for<'a> FnMut(ShortStatusRow<'a>) -> Result<StreamControl>,
@@ -882,6 +870,7 @@ impl Repository {
     /// Return short-status entries for this repository's working tree.
     ///
     /// This facade collects entries from [`sley_worktree::stream_short_status_with_options`].
+    #[cfg(feature = "worktree")]
     pub fn short_status_with_options(
         &self,
         options: ShortStatusOptions,
@@ -895,6 +884,7 @@ impl Repository {
     }
 
     /// Stream short-status entries for this repository's working tree.
+    #[cfg(feature = "worktree")]
     pub fn stream_short_status_with_options<F>(
         &self,
         options: ShortStatusOptions,
@@ -916,6 +906,7 @@ impl Repository {
     }
 
     /// Count short-status entries for this repository's working tree.
+    #[cfg(feature = "worktree")]
     pub fn short_status_count_with_options(&self, options: ShortStatusOptions) -> Result<usize> {
         let workdir = self.workdir().ok_or_else(|| {
             GitError::Unsupported("short status requires a repository worktree".into())
@@ -930,6 +921,7 @@ impl Repository {
 
     /// Compare one tracked entry to this repository's worktree, using the same
     /// racy-clean/stat-cache rules as [`Repository::short_status_with_options`].
+    #[cfg(feature = "worktree")]
     pub fn worktree_entry_state(
         &self,
         path: impl AsRef<Path>,
@@ -1185,6 +1177,7 @@ impl Repository {
     ///
     /// This creates only the tag *object*; updating `refs/tags/<name>` is the
     /// caller's responsibility (see [`Repository::apply_ref_changes`]).
+    #[cfg(feature = "history-editing")]
     pub fn write_annotated_tag(&self, tag: TagCreate) -> Result<ObjectId> {
         let mut objects = self.objects_mut();
         create_annotated_tag(&mut objects, tag)
@@ -1353,12 +1346,14 @@ impl Repository {
 
     /// Read this repository's index (`.git/index`), returning `None` when the
     /// index file does not exist yet.
+    #[cfg(feature = "worktree")]
     pub fn open_index(&self) -> Result<Option<Index>> {
         sley_worktree::read_repository_index(&self.git_dir, self.format)
     }
 
     /// Build a fresh index mirroring `tree_oid` (stage-0 entries with a zeroed
     /// stat), the way `git read-tree <tree>` would. Does not touch `.git/index`.
+    #[cfg(feature = "worktree")]
     pub fn index_from_tree(&self, tree_oid: &ObjectId) -> Result<Index> {
         sley_worktree::index_from_tree(self.object_database(), self.format, tree_oid)
     }
@@ -1424,7 +1419,7 @@ fn discover_git_dir(start: &Path, across_filesystem: bool) -> Result<PathBuf> {
     let mut options = RepositoryDiscoveryOptions::ancestors();
     options.across_filesystem = across_filesystem;
     discover_repository(start, options)
-        .map(sley_worktree::discovery::DiscoveredRepository::into_git_dir)
+        .map(sley_formats::discovery::DiscoveredRepository::into_git_dir)
 }
 
 #[cfg(test)]
@@ -1838,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn blob_boundary_and_status_plan_are_embedder_facing_facades() {
+    fn blob_read_is_local_and_missing_is_typed() {
         let temp = TempDir::new();
         let repo = Repository::init(temp.path()).expect("init");
         let blob_oid = repo.write_blob(b"payload").expect("write blob");
@@ -1856,7 +1851,13 @@ mod tests {
             }
             other => panic!("expected typed missing blob, got {other:?}"),
         }
+    }
 
+    #[cfg(feature = "worktree")]
+    #[test]
+    fn status_plan_executes_with_explicit_options() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
         let status = repo
             .status_plan()
             .include_untracked(false)
@@ -2125,7 +2126,7 @@ mod tests {
         // Policy shape: permissive disables both protections, strict enables
         // both. (The enforcement branches are exercised end-to-end by the CLI
         // dubious-ownership / safe.bareRepository probes, which run the same
-        // `sley_worktree::discovery::ownership` engine.)
+        // `sley_formats::discovery::ownership` engine.)
         assert_eq!(DiscoveryPolicy::permissive(), DiscoveryPolicy::default());
         assert_ne!(DiscoveryPolicy::permissive(), DiscoveryPolicy::strict());
         assert!(DiscoveryPolicy::strict().safe_directory);
@@ -2291,15 +2292,15 @@ mod tests {
     }
 
     #[test]
-    fn plumbing_reexports_are_reachable() {
+    fn engine_types_are_reachable() {
         // Smoke test that the re-exports compile and resolve to the right types.
-        let _format: plumbing::sley_core::ObjectFormat = ObjectFormat::Sha1;
-        let _: fn(&[u8]) -> Result<plumbing::sley_config::GitConfig> =
-            plumbing::sley_config::GitConfig::parse;
-        let _: plumbing::sley_diff_merge::DiffNameStatusOptions =
-            plumbing::sley_diff_merge::DiffNameStatusOptions::default();
-        let _: fn(&mut plumbing::sley_odb::FileObjectDatabase, TagCreate) -> Result<ObjectId> =
-            plumbing::sley_sequencer::create_annotated_tag;
+        let _format: sley_core::ObjectFormat = ObjectFormat::Sha1;
+        let _: fn(&[u8]) -> Result<sley_config::GitConfig> = sley_config::GitConfig::parse;
+        let _: sley_diff_merge::DiffNameStatusOptions =
+            sley_diff_merge::DiffNameStatusOptions::default();
+        #[cfg(feature = "history-editing")]
+        let _: fn(&mut sley_odb::FileObjectDatabase, TagCreate) -> Result<ObjectId> =
+            sley_sequencer::create_annotated_tag;
     }
 
     #[test]
@@ -2480,6 +2481,7 @@ mod tests {
         assert!(none.is_none());
     }
 
+    #[cfg(feature = "history-editing")]
     #[test]
     fn write_annotated_tag_round_trips() {
         let temp = TempDir::new();

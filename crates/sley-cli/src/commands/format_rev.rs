@@ -7,10 +7,10 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
-use sley::plumbing::sley_rev;
 use sley_core::DateMode;
 use sley_notes::NotesRef;
 use sley_pretty::{CompiledLogFormat, LogFormatContext, LogFormatDialect};
+use sley_rev;
 
 use crate::commands::log::{
     ResolvedPretty, compiled_format_uses_notes, expand_notes_glob, format_commit_pretty_with_notes,

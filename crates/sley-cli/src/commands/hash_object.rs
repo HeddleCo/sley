@@ -2,14 +2,14 @@
 //! apply the same worktree-to-blob conversions that Git uses for path-aware
 //! hashing.
 
-use sley::plumbing::sley_worktree;
+use sley_worktree;
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use sley::GitConfig;
-use sley::plumbing::sley_object::ObjectType;
 use sley::{GitError, ObjectFormat, Repository, Result};
+use sley_object::ObjectType;
 
 use super::args::{
     GitArgCursor, LongOption, Terminator, option_takes_no_value, switch_requires_value, usage_error,

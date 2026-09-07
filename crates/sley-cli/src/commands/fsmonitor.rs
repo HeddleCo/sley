@@ -1,8 +1,8 @@
 //! Thin CLI adapter for the engine-owned fsmonitor daemon lifecycle.
 
 use crate::session::CliSession;
-use sley::plumbing::sley_worktree::{FsmonitorDaemonSession, FsmonitorDaemonState};
 use sley::{GitError, Result};
+use sley_worktree::{FsmonitorDaemonSession, FsmonitorDaemonState};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

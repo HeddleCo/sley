@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use crate::sley_config;
-use sley::plumbing::sley_config::ConfigIncludeContext;
 use sley::{GitError, Result};
+use sley_config::ConfigIncludeContext;
 
 use crate::commands::remote::repo_current_branch_name;
 use crate::{common_git_dir_for_git_dir, injected_config_parameters};

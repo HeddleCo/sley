@@ -167,7 +167,7 @@ impl CliSession {
             }))
         }) {
             Ok(snapshot) => {
-                sley::plumbing::sley_core::activate_precompose_unicode(snapshot.config.get_bool(
+                sley_core::activate_precompose_unicode(snapshot.config.get_bool(
                     "core",
                     None,
                     "precomposeunicode",
@@ -175,7 +175,7 @@ impl CliSession {
                 Ok(Arc::clone(snapshot))
             }
             Err(err) => {
-                sley::plumbing::sley_core::activate_precompose_unicode(None);
+                sley_core::activate_precompose_unicode(None);
                 Err(err.clone())
             }
         }
@@ -607,22 +607,22 @@ mod tests {
 
         let parent = session(disabled_root, Some(enabled.git_dir().to_path_buf()));
         parent.repository_snapshot().expect("select enabled parent");
-        assert!(sley::plumbing::sley_core::precompose_unicode_enabled());
+        assert!(sley_core::precompose_unicode_enabled());
 
         let child = parent.local_repo_env_hidden_child();
         child.repository_snapshot().expect("select disabled child");
-        assert!(!sley::plumbing::sley_core::precompose_unicode_enabled());
+        assert!(!sley_core::precompose_unicode_enabled());
 
         parent
             .repository_snapshot()
             .expect("reselect cached parent");
-        assert!(sley::plumbing::sley_core::precompose_unicode_enabled());
+        assert!(sley_core::precompose_unicode_enabled());
 
         let outside = session(outside_root, None);
         outside
             .repository_snapshot()
             .expect_err("outside fixture has no repository");
-        assert!(!sley::plumbing::sley_core::precompose_unicode_enabled());
+        assert!(!sley_core::precompose_unicode_enabled());
 
         fs::remove_dir_all(root).expect("remove fixture");
     }

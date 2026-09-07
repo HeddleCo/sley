@@ -1,7 +1,7 @@
 //! Branch-related repository config read/write helpers.
 
 use crate::*;
-use sley::plumbing::sley_config;
+use sley_config;
 
 pub(super) fn rename_branch_config(
     git_dir: &Path,

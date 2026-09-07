@@ -13,12 +13,12 @@ use crate::{
     normalize_absolute_cli_pathspec, read_repo_config, repository_object_format, sley_diff_merge,
     sley_pretty, sley_remote, sley_rev, sley_worktree,
 };
-use sley::plumbing::sley_object::{Commit, EncodedObject};
-use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
 pub(crate) use sley_diff_merge::porcelain::DiffRenderOptions;
 use sley_diff_merge::porcelain::{
     LazyObjectFetch, PatchDriver, PatchUserdiff, SubmodulePatchRender,
 };
+use sley_object::{Commit, EncodedObject};
+use sley_odb::{FileObjectDatabase, ObjectReader};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;

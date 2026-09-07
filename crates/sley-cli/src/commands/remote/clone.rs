@@ -21,8 +21,8 @@ use super::resolve::{RemoteCommandContext, local_repository_git_dir_path, ls_rem
 use crate::commands::config_cmd::{config_set_value, parse_config_key};
 use crate::remote::rewrite_url_with_config;
 use crate::*;
-use sley::plumbing::sley_odb::ObjectReader;
-use sley::plumbing::sley_remote::FetchOptions;
+use sley_odb::ObjectReader;
+use sley_remote::FetchOptions;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 

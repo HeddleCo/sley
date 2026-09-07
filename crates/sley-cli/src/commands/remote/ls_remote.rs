@@ -4,7 +4,7 @@
 #[path = "ls_remote_options.rs"]
 mod ls_remote_options;
 use ls_remote_options::setup_ls_remote_options;
-use sley::plumbing::sley_config;
+use sley_config;
 
 use super::fetch::{
     check_transport_allowed_url, configured_server_options, transport_policy_config_for_context,
@@ -16,8 +16,8 @@ use super::pack::{
 };
 use super::resolve::{RemoteCommandContext, ls_remote_git_dir};
 use crate::*;
-use sley::plumbing::sley_odb::ObjectReader;
-use sley::plumbing::sley_remote::LsRemoteRecord;
+use sley_odb::ObjectReader;
+use sley_remote::LsRemoteRecord;
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 

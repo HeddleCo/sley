@@ -13,7 +13,7 @@ use super::resolve::{RemoteCommandContext, ls_remote_git_dir};
 use crate::commands::config_cmd::{ConfigKey, config_set_value};
 use crate::remote::{remote_config_values, resolve_remote_push_url, rewrite_url_with_config};
 use crate::*;
-use sley::plumbing::sley_odb::ObjectReader;
+use sley_odb::ObjectReader;
 #[cfg(test)]
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -3349,7 +3349,7 @@ fn print_push_ref(
     local_db: &FileObjectDatabase,
     remote_db: &FileObjectDatabase,
 ) {
-    use sley::plumbing::sley_remote::PushRefStatus;
+    use sley_remote::PushRefStatus;
     let (flag, summary, msg): (char, String, Option<String>) = match &reference.status {
         PushRefStatus::Ok => push_ok_summary(reference, local_db, remote_db),
         PushRefStatus::UpToDate => ('=', "[up to date]".to_string(), None),

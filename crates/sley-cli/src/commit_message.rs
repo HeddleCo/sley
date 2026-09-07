@@ -6,7 +6,7 @@
 //! reused-commit lookups stays here (replacement policy comes from the
 //! invocation session/config).
 
-pub(crate) use sley::plumbing::sley_sequencer::commit_message::{
+pub(crate) use sley_sequencer::commit_message::{
     CommitCleanupMode, commit_cleanup_message,
     commit_inter_hunk_context_expects_numerical_value_error,
     commit_inter_hunk_context_requires_value_error, commit_locate_scissors,
@@ -19,9 +19,9 @@ pub(crate) use sley::plumbing::sley_sequencer::commit_message::{
 
 use std::path::Path;
 
-use sley::plumbing::sley_object::Commit;
-use sley::plumbing::sley_sequencer::commit_message::read_reused_commit_from_db;
 use sley::{ObjectFormat, Result};
+use sley_object::Commit;
+use sley_sequencer::commit_message::read_reused_commit_from_db;
 
 use crate::repository::open_object_database;
 

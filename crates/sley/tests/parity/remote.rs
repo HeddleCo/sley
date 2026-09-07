@@ -7,18 +7,18 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use sley::plumbing::sley_core::Capability;
-use sley::plumbing::sley_odb::repository_object_ids;
-use sley::plumbing::sley_pack::PackFile;
-use sley::plumbing::sley_protocol::{
+use sley::remote::{FetchOptions, HttpClient, HttpResponse, NoCredentials, SilentProgress};
+use sley::{ObjectFormat, ObjectId, Repository};
+use sley_core::Capability;
+use sley_odb::repository_object_ids;
+use sley_pack::PackFile;
+use sley_protocol::{
     PktLineFrame, ProtocolV2FetchPackfileUri, ProtocolV2FetchResponseSection,
     ProtocolV2LsRefsRecord, ProtocolV2LsRefsRef, ProtocolVersion, TransportHandshake,
     read_protocol_v2_command_request, write_pkt_line_frame, write_pkt_line_payload,
     write_protocol_v2_advertisement, write_protocol_v2_fetch_response,
     write_protocol_v2_ls_refs_response,
 };
-use sley::remote::{FetchOptions, HttpClient, HttpResponse, NoCredentials, SilentProgress};
-use sley::{ObjectFormat, ObjectId, Repository};
 use sley_testkit::engine_parity::{EngineOutput, EngineParityCase};
 
 #[derive(Default)]

@@ -14,7 +14,7 @@ use crate::session_globals::attribute_checks_for_matching;
 use crate::sley_index;
 use crate::sley_worktree;
 
-use sley::plumbing::sley_core::paths::relative_path_bytes;
+use sley_core::paths::relative_path_bytes;
 
 pub(crate) fn index_entry_stage(entry: &sley_index::IndexEntry) -> u16 {
     (entry.flags >> 12) & 0x3

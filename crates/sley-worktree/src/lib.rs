@@ -38,7 +38,7 @@ use std::{env, fs};
 pub mod admin;
 mod attributes;
 mod checkout;
-pub mod discovery;
+pub use sley_formats::discovery;
 mod filter;
 mod fsmonitor;
 mod ignore;

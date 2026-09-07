@@ -1,6 +1,6 @@
 //! Tree-construction plumbing commands.
 
-use sley::plumbing::sley_worktree;
+use sley_worktree;
 
 use sley::{GitError, Result};
 

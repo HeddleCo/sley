@@ -2,8 +2,8 @@
 #![allow(clippy::expect_used)]
 
 use crate::*;
-use sley::plumbing::{sley_config, sley_core, sley_index, sley_worktree};
 use sley_worktree::admin::{LinkedWorktreeAdmin, WorktreeAdminOutcome, WorktreeAdminSnapshot};
+use {sley_config, sley_core, sley_index, sley_worktree};
 
 #[path = "worktree_options.rs"]
 mod worktree_options;

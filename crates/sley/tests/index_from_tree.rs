@@ -1,3 +1,5 @@
+#![cfg(feature = "full")]
+
 //! `Repository::index_from_tree` must reproduce the entries `git read-tree`
 //! produces for the same tree: same mode/oid/path at stage 0, with a zeroed
 //! stat, sorted by path.

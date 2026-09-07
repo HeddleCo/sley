@@ -2689,11 +2689,11 @@ fn buffer_is_binary(content: &[u8]) -> bool {
 }
 
 fn path_to_bytes(path: &Path) -> Vec<u8> {
-    sley::plumbing::sley_core::paths::path_to_bytes(path)
+    sley_core::paths::path_to_bytes(path)
 }
 
 fn bytes_to_path(bytes: &[u8]) -> PathBuf {
-    sley::plumbing::sley_core::paths::bytes_to_os_path(bytes)
+    sley_core::paths::bytes_to_os_path(bytes)
 }
 
 // ---------------------------------------------------------------------------

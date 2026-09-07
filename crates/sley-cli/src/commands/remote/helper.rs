@@ -7,7 +7,7 @@ use super::fetch::{
     StdoutProgress, check_transport_allowed_url, repo_config_with_transport_policy,
 };
 use crate::*;
-use sley::plumbing::sley_remote::FetchOptions;
+use sley_remote::FetchOptions;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -323,7 +323,7 @@ fn trace_remote_helper(spec: &sley_remote::RemoteHelperSpec) {
 
 fn render_remote_helper_error(error: GitError) -> GitError {
     match error {
-        GitError::Cli(sley::plumbing::sley_core::CliExit::UserError, message) => {
+        GitError::Cli(sley_core::CliExit::UserError, message) => {
             eprintln!("fatal: {message}");
             GitError::Exit(128)
         }

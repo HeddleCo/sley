@@ -28,7 +28,7 @@
 #![allow(clippy::expect_used)]
 
 use crate::*;
-use sley::plumbing::{sley_diff_merge, sley_index, sley_rev, sley_worktree};
+use {sley_diff_merge, sley_index, sley_rev, sley_worktree};
 // Engine plumbing moved down into `sley-worktree` (stage A): the unpack-trees
 // worktree probe/writer and its helpers now live in the published engine; the
 // porcelain keeps thin call wrappers with these aliases.

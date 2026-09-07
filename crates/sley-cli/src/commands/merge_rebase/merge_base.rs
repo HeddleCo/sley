@@ -1,5 +1,5 @@
 use super::*;
-use sley::plumbing::{sley_refs, sley_rev};
+use {sley_refs, sley_rev};
 
 // Stage-B1 relocation: canonical implementations live in
 // `sley_sequencer::apply`; these shims keep the historical paths.

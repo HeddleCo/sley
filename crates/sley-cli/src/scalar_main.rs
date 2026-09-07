@@ -1,5 +1,5 @@
 use sley::GitError;
-use sley::plumbing::sley_core::cli_exit_code;
+use sley_core::cli_exit_code;
 
 fn main() {
     let args = std::env::args_os()

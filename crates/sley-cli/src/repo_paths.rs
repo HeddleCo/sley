@@ -9,7 +9,7 @@ pub(crate) fn common_git_dir_for_git_dir_with_env(
     git_dir: &Path,
     honor_environment: bool,
 ) -> Result<PathBuf> {
-    sley::plumbing::sley_formats::repository_common_dir(git_dir, honor_environment)
+    sley_formats::repository_common_dir(git_dir, honor_environment)
 }
 
 pub(crate) struct CommonGitDirSnapshot {
@@ -25,7 +25,7 @@ pub(crate) fn common_git_dir_snapshot_with_env(
     honor_environment: bool,
 ) -> Result<CommonGitDirSnapshot> {
     let linked_worktree = git_dir.join("commondir").is_file();
-    let path = sley::plumbing::sley_formats::repository_common_dir(git_dir, honor_environment)?;
+    let path = sley_formats::repository_common_dir(git_dir, honor_environment)?;
     Ok(CommonGitDirSnapshot {
         path,
         linked_worktree,

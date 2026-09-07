@@ -8,10 +8,10 @@ use crate::{
     sley_rev,
 };
 use sley::ReferenceTarget as RefTarget;
-use sley::plumbing::sley_core::DateMode;
-use sley::plumbing::sley_object::{Commit, ObjectType};
-use sley::plumbing::sley_odb::{FileObjectDatabase, ObjectReader};
-use sley::plumbing::sley_refs::FileRefStore;
+use sley_core::DateMode;
+use sley_object::{Commit, ObjectType};
+use sley_odb::{FileObjectDatabase, ObjectReader};
+use sley_refs::FileRefStore;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;

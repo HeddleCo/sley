@@ -1,16 +1,16 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 #![allow(clippy::expect_used)]
 
-use sley::plumbing::sley_core;
+use sley_core;
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::commands::cli_options::{cli_usage_error, last_tri_state_bool, opt_bool, opt_str};
 use crate::*;
-use sley::plumbing::sley_formats::ReftableWriteOptions;
-use sley::plumbing::sley_object::EncodedObject;
-use sley::plumbing::sley_odb::ObjectReader;
-use sley::plumbing::sley_pack::{PackReverseIndex, pack_order_index_positions};
+use sley_formats::ReftableWriteOptions;
+use sley_object::EncodedObject;
+use sley_odb::ObjectReader;
 use sley_options::{OptFlags, OptionName, ParsedValue, parse_options};
+use sley_pack::{PackReverseIndex, pack_order_index_positions};
 use std::sync::Arc;
 
 #[derive(Debug)]

@@ -10,11 +10,11 @@
 //! this module is therefore confined to the REPL and the byte-exact prompt /
 //! table formatting that the upstream t3701 oracle pins down.
 
-use sley::plumbing::{sley_config, sley_core, sley_worktree};
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use {sley_config, sley_core, sley_worktree};
 
 use sley::GitConfig;
 use sley::{GitError, Result};

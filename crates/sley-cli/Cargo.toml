@@ -24,12 +24,25 @@ path = "src/bin/fetch-profile.rs"
 required-features = ["fetch-profile"]
 
 [dependencies]
+sley-worktree.workspace = true
+sley-rev.workspace = true
+sley-remote.workspace = true
+sley-refs.workspace = true
+sley-pack.workspace = true
+sley-odb.workspace = true
+sley-object.workspace = true
+sley-index.workspace = true
+sley-hooks.workspace = true
+sley-formats.workspace = true
+sley-diff-merge.workspace = true
+sley-core.workspace = true
+sley-config.workspace = true
 # SIGINT/Ctrl-C → cooperative AtomicCancel for fetch/clone/push (no unsafe in sley).
 ctrlc = "3.5.2"
 filetime = "0.2.29"
 regex = "1.13.1"
 pprof = { version = "0.15", optional = true }
-sley.workspace = true
+sley = { workspace = true, features = ["full"] }
 sley-archive.workspace = true
 sley-grep.workspace = true
 sley-i18n = { workspace = true, optional = true }
@@ -86,9 +99,6 @@ fetch-profile = ["dep:pprof", "sley/fetch-profile", "sley-protocol/fetch-profile
 # widen the shipped facade dependency surface (`[dependencies]` stays
 # sley + sley-options + the small facade set).
 [dev-dependencies]
-sley-core.workspace = true
-sley-formats.workspace = true
-sley-odb.workspace = true
 # Path-only (never published): integration tests drive the binary via
 # sley_testkit::sley_bin!. This is independent of the `testkit` feature above,
 # which only gates the in-binary `sley testkit` parity command.

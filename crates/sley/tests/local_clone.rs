@@ -4,11 +4,11 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sley::plumbing::sley_object::{Commit, EncodedObject};
 use sley::{
     EntryKind, FullName, GitObjectType, LocalCloneOptions, ObjectId, ReferenceTarget, Repository,
     TreeEditor,
 };
+use sley_object::{Commit, EncodedObject};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 

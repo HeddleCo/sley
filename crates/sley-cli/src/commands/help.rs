@@ -1,7 +1,7 @@
 use crate::sley_config;
 use crate::{common_git_dir_for_git_dir, injected_config_parameters, report_config_setup_error};
-use sley::plumbing::sley_config::ConfigIncludeContext;
 use sley::{GitError, Result};
+use sley_config::ConfigIncludeContext;
 use sley_options::{
     CommandFlags, CommandRegistry, CommandSpec, OptFlags, OptValue, OptionSpec,
     completion_helper_options,
