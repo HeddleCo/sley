@@ -230,9 +230,7 @@ fn discover_ancestors_with_device(
     let absolute = if start.is_absolute() {
         start.to_path_buf()
     } else {
-        env::current_dir()
-            .map_err(GitError::from)?
-            .join(start)
+        env::current_dir().map_err(GitError::from)?.join(start)
     };
     let start_device = (!options.across_filesystem)
         .then(|| device_of(&absolute))

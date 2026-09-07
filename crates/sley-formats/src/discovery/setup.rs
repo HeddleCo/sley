@@ -741,9 +741,7 @@ fn linked_worktree_root(git_dir: &Path) -> Result<Option<PathBuf>> {
     let Some(worktree) = gitfile.parent() else {
         return Ok(None);
     };
-    fs::canonicalize(worktree)
-        .map(Some)
-        .map_err(GitError::from)
+    fs::canonicalize(worktree).map(Some).map_err(GitError::from)
 }
 
 /// Read `core.bare` / `core.worktree` from `<commondir>/config` (and

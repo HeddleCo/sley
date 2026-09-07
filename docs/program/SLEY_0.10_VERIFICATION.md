@@ -37,11 +37,14 @@ PASS — exactly 31 publishable crates, topologically ordered
 
 The publish-list validator also passed its negative self-tests (missing, bogus,
 misordered, and duplicate entries are rejected). Direct nightly rustfmt with
-`--edition 2024 --config skip_children=true --check` passed for all 290 changed
-Rust files, and `git diff --check` passed. No workspace version was bumped.
+`--edition 2024 --config skip_children=true --check` passed for all 292 changed
+Rust files, including renamed files, and `git diff --check` passed. No workspace version was bumped.
 The regular Clippy result reuses the successful 12.95-second check of the same
 source; the all-feature and minimal-feature runs independently checked their
-configurations. The final full build/test run followed the lint fixes.
+configurations. The final full build/test run followed the lint fixes. GitHub caught two
+whitespace-only issues in renamed discovery files omitted by the initial scoped
+formatter list; both were corrected and the complete added/modified/renamed
+file set passes. The follow-up changes no executable behavior.
 
 ## Isolation checks that demonstrably fail
 
